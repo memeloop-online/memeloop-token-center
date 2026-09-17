@@ -62,6 +62,7 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 // The full five-chunk envelope is charged to the request's existing memory
 // reservation before the writer starts.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
+pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
 
 struct OwnedTask<T: Send + 'static> {

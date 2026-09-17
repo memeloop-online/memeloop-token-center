@@ -640,3 +640,46 @@ async fn owned_writer_queue_is_byte_bounded_and_releases_proxy_memory_after_gap(
         "the shared queue charge must release after both producer and writer settle"
     );
 }
+
+#[tokio::test]
+async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reservation() {
+    assert_eq!(
+        super::CAPTURE_DATABASE_BATCH_CHUNKS,
+        super::CAPTURE_QUEUE_CHUNKS + 1
+    );
+    assert_eq!(
+        super::CAPTURE_MEMORY_BYTES,
+        (super::CAPTURE_DATABASE_BATCH_CHUNKS + 1) * super::CHUNK_BYTES,
+        "the batch uses four complete-chunk permits plus the producer's partial chunk"
+    );
+    let (_dir, state, pool, identity) = fixture().await;
+    let mut writer = ResponseArchiveProducer::begin_for_test(&state, identity)
+        .await
+        .unwrap();
+    writer
+        .append_for_test(vec![
+            Bytes::from(vec![b'a'; super::CHUNK_BYTES]),
+            Bytes::from(vec![b'b'; super::CHUNK_BYTES]),
+            Bytes::from(vec![b'c'; super::CHUNK_BYTES]),
+            Bytes::from(vec![b'd'; super::CHUNK_BYTES]),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(writer.append_attempts, 1);
+    assert_eq!(writer.seq, 4);
+    assert_eq!(writer.bytes, (4 * super::CHUNK_BYTES) as i64);
+    writer.seal_for_test().await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i64, _>("chunk_count"), 4);
+    assert_eq!(
+        row.get::<i64, _>("byte_count"),
+        (4 * super::CHUNK_BYTES) as i64
+    );
+}
