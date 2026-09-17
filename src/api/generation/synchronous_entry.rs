@@ -169,16 +169,6 @@ async fn proxy_openai_image_generation(
             forwarded["model"] = Value::String(route.upstream_model.clone());
             ("/v1/images/generations", forwarded)
         };
-        let upstream_idempotency = image_idempotency.as_ref().map(|idempotency| {
-            scoped_upstream_image_idempotency(
-                state.config.key_pepper.as_bytes(),
-                key.tenant_id,
-                key.key_id,
-                route.route_id,
-                upstream_path,
-                &idempotency.key,
-            )
-        });
         let reservation_price = price
             .reservation_price()
             .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
@@ -190,6 +180,16 @@ async fn proxy_openai_image_generation(
                 .await?,
             )
         } else {
+            let upstream_idempotency = image_idempotency.as_ref().map(|idempotency| {
+                scoped_upstream_image_idempotency(
+                    state.config.key_pepper.as_bytes(),
+                    key.tenant_id,
+                    key.key_id,
+                    route.route_id,
+                    upstream_path,
+                    &idempotency.key,
+                )
+            });
             let outbound_http = network::client_for_config_url_no_retry(
                 &state.http,
                 &route.base_url,
