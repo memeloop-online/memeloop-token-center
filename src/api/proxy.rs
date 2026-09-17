@@ -1488,6 +1488,8 @@ pub(in crate::api) async fn proxy_with_identity(
             .await
     {
         conversation.reject_projection();
+        drop(buffered_request.conversation.take());
+        buffered_request.memory.release_rejected_request();
         drop(upstream);
         let result =
             finish_proxy_failure(&buffered_request, "upstream_response_memory_capacity").await;

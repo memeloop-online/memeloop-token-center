@@ -425,6 +425,23 @@ impl ProxyMemoryReservation {
         }
     }
 
+    /// Release every admission permit after all request-side owners have been
+    /// dropped and the request has been rejected before response buffering.
+    /// Terminal database settlement must not keep unrelated memory waiters
+    /// blocked merely because it still borrows the request record.
+    pub(crate) fn release_rejected_request(&self) {
+        if let Ok(mut held) = self.held.lock() {
+            *held = (0, None);
+        }
+        if let Ok(mut retained) = self.retained.lock() {
+            *retained = None;
+        }
+        self.response_reserved.store(false, Ordering::Release);
+        self.response_bytes.store(0, Ordering::Release);
+        self.json_body_ceiling.store(0, Ordering::Release);
+        self.json_node_ceiling.store(0, Ordering::Release);
+    }
+
     /// Keep one raw request-body copy charged after the routed request JSON and
     /// provider working buffers have both been dropped. Terminal projection
     /// reacquires the two transient copies before reparsing the retained body.
@@ -876,7 +893,14 @@ mod tests {
         budget.wait_for_response_reservation_for_test().await;
         assert!(!task.is_finished());
 
-        streams.drain(1..).for_each(drop);
+        for stream in &streams[1..] {
+            stream.release_rejected_request();
+        }
+        assert_eq!(
+            streams.len(),
+            4,
+            "loser owners remain alive through settlement"
+        );
         let (waiting, projection) = task.await.unwrap();
         assert_eq!(budget.snapshot().0, 240 * 1024 * 1024);
         drop(projection);
