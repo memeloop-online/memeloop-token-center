@@ -551,15 +551,11 @@ pub(crate) async fn observe_with_signal(
     };
     let runtime = state.plugins.clone();
     let plugin_id = policy.plugin_id.clone();
-    let execution_signal = transient_signal.or_else(|| {
-        matches!(
-            outcome,
-            GroupRoutingOutcome::HardQuota
-                | GroupRoutingOutcome::Authentication
-                | GroupRoutingOutcome::Cancelled
-        )
-        .then_some(policy.transient_signal)
-        .flatten()
+    let execution_signal = transient_signal.or_else(|| match outcome {
+        GroupRoutingOutcome::HardQuota
+        | GroupRoutingOutcome::Authentication
+        | GroupRoutingOutcome::Cancelled => policy.transient_signal,
+        GroupRoutingOutcome::Success | GroupRoutingOutcome::TransientFailure => None,
     });
     match crate::api::plugin_execution::run_group(
         state.metrics.clone(),

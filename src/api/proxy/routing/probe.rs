@@ -492,14 +492,15 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     let signal_enabled = state.group_routing.as_ref().is_some_and(|snapshot| {
         snapshot.uses_transient_signal(route_id, upstream_account_id, credential_generation)
     });
-    let transient_sample = transient_sample_for_outcome(outcome);
-    let signal = if signal_enabled && transient_sample.is_some() {
+    let signal = if let Some(transient_failure) = transient_sample_for_outcome(outcome)
+        && signal_enabled
+    {
         match state
             .db
             .record_transient_health_sample(
                 upstream_account_id,
                 credential_generation,
-                transient_sample.expect("checked conclusive transient sample"),
+                transient_failure,
             )
             .await
         {
