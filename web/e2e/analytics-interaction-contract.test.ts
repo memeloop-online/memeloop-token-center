@@ -84,7 +84,7 @@ test('analytics background exposes actual indexed buckets through pointer, keybo
       await tooltip.waitFor({ state: 'visible' });
       assert.equal(await visibleTooltips(targetPage).count(), 1, `${action}: detail must not also expose a trend tooltip`);
       const tooltipText = await tooltip.textContent() ?? '';
-      assert.match(tooltipText, /保守上限|settlement ceiling/i);
+      assert.match(tooltipText, /保守上限|conservative ceiling|settlement ceiling/i);
       assert.match(tooltipText, /供应商记录|provider records/i);
       assert.equal(await settlement.locator('.metric-value').textContent(), '$0.123456');
       await targetPage.keyboard.press('Escape');
