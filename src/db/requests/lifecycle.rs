@@ -12,6 +12,7 @@ use super::settlement::{
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
+use crate::model::MeteredUsageReservation;
 use tracing::Instrument;
 
 pub struct NewRequest {

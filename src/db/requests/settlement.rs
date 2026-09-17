@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::model::MeteredUsageReservation;
 
 impl Database {
     pub async fn delete_expired_rate_windows(&self, limit: i64) -> Result<u64, AppError> {
