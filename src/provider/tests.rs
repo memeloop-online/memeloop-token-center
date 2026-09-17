@@ -449,10 +449,18 @@ fn builtin_cbcnx_exposes_only_verified_openai_text_embedding_and_image_contracts
 }
 
 #[test]
-fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
+fn builtin_codex_routes_openai_and_verified_image_generation() {
     let catalog = ProviderCatalog::builtins();
     let codex = catalog.get("openai-codex").unwrap();
-    assert_eq!(codex.protocols, vec!["openai"]);
+    assert_eq!(codex.protocols, vec!["openai", "generation"]);
+    assert_eq!(codex.modalities, vec!["text", "image"]);
+    assert!(codex.generation_adapter.is_some());
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/image_main_model/type"),
+        Some(&json!("string"))
+    );
     assert_eq!(
         codex.config_schema.pointer("/properties/base_url/const"),
         Some(&json!("https://chatgpt.com/backend-api/codex"))

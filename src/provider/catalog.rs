@@ -503,6 +503,20 @@ impl ProviderCatalog {
         let codex = types
             .last_mut()
             .expect("OpenAI Codex provider was just inserted");
+        codex.protocols.push("generation".to_owned());
+        codex.modalities.push("image".to_owned());
+        codex.generation_adapter = Some(GenerationAdapterContribution {
+            api_version: "generation-adapter-v1".to_owned(),
+            provable_submit_idempotency: false,
+            provider_asset_reads_repeatable: false,
+        });
+        codex.config_schema["properties"]["image_main_model"] = json!({
+            "title": "Image generation main model",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Codex Responses model that invokes the image_generation tool. The verified image tool model is gpt-image-2; the public model name remains configurable on the generation route."
+        });
         codex.config_schema["properties"]["transport_policy"] = json!({
             "type": "object",
             "additionalProperties": false,
