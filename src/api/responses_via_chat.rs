@@ -24,7 +24,11 @@ pub(in crate::api) fn prepare_with_dialect(
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;
-    object.insert("model".into(), Value::String(model.to_owned()));
+    let model = match dialect {
+        ResponsesViaChatDialect::OpenAiChatV1 => model.to_owned(),
+        ResponsesViaChatDialect::KimiV1 => super::kimi_transport::normalize_model(model),
+    };
+    object.insert("model".into(), Value::String(model));
     if object.get("stream").and_then(Value::as_bool) == Some(true) {
         let options = object.entry("stream_options").or_insert_with(|| json!({}));
         let options = options
@@ -33,4 +37,25 @@ pub(in crate::api) fn prepare_with_dialect(
         options.insert("include_usage".into(), Value::Bool(true));
     }
     Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_model_normalization_is_dialect_driven() {
+        let mut kimi = json!({"input":"hello"});
+        prepare_with_dialect("kimi-k3-256k", &mut kimi, ResponsesViaChatDialect::KimiV1).unwrap();
+        assert_eq!(kimi["model"], "k3-256k");
+
+        let mut generic = json!({"input":"hello"});
+        prepare_with_dialect(
+            "kimi-k3-256k",
+            &mut generic,
+            ResponsesViaChatDialect::OpenAiChatV1,
+        )
+        .unwrap();
+        assert_eq!(generic["model"], "kimi-k3-256k");
+    }
 }
