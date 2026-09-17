@@ -1,5 +1,22 @@
 use super::*;
 
+const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const MAX_TIMEOUT_SECONDS: u64 = 600;
+
+/// `timeout_seconds` is a request-local transport policy. Read it once from
+/// the immutable route snapshot so a later candidate cannot refresh an
+/// already-dispatched attempt's deadline. Persisted configs are schema
+/// validated, but keep the runtime fallback bounded for older/manual rows.
+fn configured_timeout(config: &Value) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        config
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .clamp(1, MAX_TIMEOUT_SECONDS),
+    )
+}
+
 pub(super) async fn send_reqwest_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
@@ -7,16 +24,30 @@ pub(super) async fn send_reqwest_proxy_route(
     request_id: Uuid,
     route: &PreparedProxyRoute,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    // Start the route timeout before endpoint validation/DNS. The deadline is
+    // local to this attempt; the caller's frozen outer attempt budget remains
+    // authoritative when it selects a standby candidate.
+    let timeout = configured_timeout(&route.route.config);
+    let request_deadline = tokio::time::Instant::now() + timeout;
     let outbound_base_url = route.route.base_url.clone();
-    let outbound_http = network::client_for_config_url(
-        &state.http,
-        &outbound_base_url,
-        &route.route.config,
-        route.route.credential.proxy(),
-        state.config.allow_oauth_loopback,
+    let outbound_http = match tokio::time::timeout_at(
+        request_deadline,
+        network::client_for_config_url(
+            &state.http,
+            &outbound_base_url,
+            &route.route.config,
+            route.route.credential.proxy(),
+            state.config.allow_oauth_loopback,
+        ),
     )
     .await
-    .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    {
+        Ok(Ok(client)) => client,
+        // Endpoint validation and DNS happen before the POST leaves this
+        // process, so a route-budget expiry here is safe to fail over.
+        Err(_) => return Err(ProxySendError::RetryableConnection("dns")),
+        Ok(Err(_)) => return Err(ProxySendError::CandidateUnavailable),
+    };
     let target_url = network::upstream_api_url(
         &outbound_base_url,
         if route.responses_chat.is_some() {
@@ -27,6 +58,10 @@ pub(super) async fn send_reqwest_proxy_route(
     );
     let mut request = outbound_http
         .post(target_url)
+        // Reqwest's per-request timeout covers connection/header acquisition;
+        // the absolute deadline below also covers DNS/client setup and body
+        // reads, so no phase can restart the configured attempt budget.
+        .timeout(timeout)
         .body(route.forwarded_body.clone());
     // For a CBCNX Responses call that has opted into streaming, pin the
     // upstream representation to SSE instead of inheriting a downstream
@@ -83,7 +118,7 @@ pub(super) async fn send_reqwest_proxy_route(
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
-    let upstream_result = request.send().await;
+    let upstream_result = send_until_request_deadline(request_deadline, request.send()).await;
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -91,16 +126,42 @@ pub(super) async fn send_reqwest_proxy_route(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok(ProxyRouteResponse {
-            response: if let Some(context) = route.responses_chat.clone() {
+        Ok(response) => {
+            let response = if let Some(context) = route.responses_chat.clone() {
                 super::kimi::translate(response, context, route.upstream_stream)?
             } else {
                 UpstreamResponse::Reqwest(response)
-            },
-            upstream_activity,
-            codex_retry: CodexRetryTerminalGuard::inactive(),
-        }),
-        Err(error) => Err(classify_reqwest_send_error(error)),
+            };
+            Ok(ProxyRouteResponse {
+                // Keep one absolute deadline from before DNS through first
+                // byte and every subsequent streaming read. The inactivity
+                // window uses the same configured scalar and resets only on
+                // actual upstream progress.
+                response: response.with_body_timeouts(request_deadline, timeout),
+                upstream_activity,
+                codex_retry: CodexRetryTerminalGuard::inactive(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_until_request_deadline<F>(
+    deadline: tokio::time::Instant,
+    send: F,
+) -> Result<reqwest::Response, ProxySendError>
+where
+    F: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    tokio::pin!(send);
+    tokio::select! {
+        // A POST may have been accepted before the local deadline fired;
+        // preserve the ambiguous-delivery fence and never replay it.
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(ProxySendError::NonRetryableTransport(
+            TransportFailureKind::Timeout,
+        )),
+        result = &mut send => result.map_err(classify_reqwest_send_error),
     }
 }
 
@@ -122,4 +183,60 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
         TransportFailureKind::Other
     };
     ProxySendError::NonRetryableTransport(kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn configured_timeout_obeys_the_provider_schema_bounds() {
+        assert_eq!(configured_timeout(&json!({})), Duration::from_secs(120));
+        assert_eq!(
+            configured_timeout(&json!({"timeout_seconds": 1})),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            configured_timeout(&json!({"timeout_seconds": 600})),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            configured_timeout(&json!({"timeout_seconds": 0})),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            configured_timeout(&json!({"timeout_seconds": 601})),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            configured_timeout(&json!({"timeout_seconds": -1})),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_timeout_is_ambiguous_and_never_replayable() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let result = send_until_request_deadline(deadline, std::future::pending()).await;
+        assert!(matches!(
+            result,
+            Err(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Timeout
+            ))
+        ));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = send_until_request_deadline(deadline, async {
+            std::future::pending::<Result<reqwest::Response, reqwest::Error>>().await
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Timeout
+            ))
+        ));
+    }
 }
