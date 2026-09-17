@@ -39,6 +39,33 @@ fn active_transient_defers_probe_recovery(
     !signal.should_recover(policy.recover_micros, policy.min_probe_successes)
 }
 
+fn terminal_health_config(
+    mut health: crate::config::UpstreamHealthConfig,
+    directive: Option<&crate::plugin::routing::GroupRoutingExecutionDirective>,
+    terminal: UpstreamAttemptTerminal,
+) -> crate::config::UpstreamHealthConfig {
+    if let Some(directive) = directive
+        && directive.health_directives_enabled()
+        && matches!(
+            terminal,
+            UpstreamAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::Connection
+                    | UpstreamFailureKind::Unavailable
+                    | UpstreamFailureKind::InvalidResponse,
+                ..
+            }
+        )
+    {
+        // Only active-v2 and established v1 transient failures consume plugin
+        // cooldown. Shadow v2 is observational and retains native health.
+        let cooldown = directive.directive.cooldown_ms.min(60_000) as i64;
+        health.connection_cooldown_millis = cooldown;
+        health.unavailable_cooldown_millis = cooldown;
+        health.invalid_response_cooldown_millis = cooldown;
+    }
+    health
+}
+
 struct SharedProbeLimiter {
     active: AtomicU32,
 }
@@ -103,6 +130,32 @@ fn try_shared_probe_permit(
 mod limiter_tests {
     use super::*;
 
+    fn execution_directive(
+        mode: Option<crate::plugin::routing::GroupRoutingTransientPolicyMode>,
+    ) -> crate::plugin::routing::GroupRoutingExecutionDirective {
+        use crate::plugin::routing::{GroupRoutingDirective, GroupRoutingTransientPolicy};
+        crate::plugin::routing::GroupRoutingExecutionDirective {
+            directive: GroupRoutingDirective {
+                tenant_id: Uuid::nil().to_string(),
+                route_id: Uuid::from_u128(1).to_string(),
+                account_id: Uuid::from_u128(2).to_string(),
+                generation: 1,
+                allow_transient_probe: true,
+                cooldown_ms: 1,
+                recovery_wait_ms: 1,
+                recheck_ms: 1,
+                stickiness: false,
+            },
+            transient_policy: mode.map(|mode| GroupRoutingTransientPolicy {
+                mode,
+                min_samples: 1,
+                open_micros: 1,
+                recover_micros: 1,
+                min_probe_successes: 1,
+            }),
+        }
+    }
+
     #[test]
     fn runtime_limit_changes_apply_without_revoking_in_flight_attempts() {
         let account = Uuid::new_v4();
@@ -141,6 +194,37 @@ mod limiter_tests {
         assert_eq!(
             transient_sample_for_outcome(GroupRoutingOutcome::Authentication),
             None
+        );
+    }
+
+    #[test]
+    fn shadow_v2_terminal_cooldown_retains_native_health_config() {
+        use crate::{
+            config::UpstreamHealthConfig, plugin::routing::GroupRoutingTransientPolicyMode,
+        };
+        let native = UpstreamHealthConfig::DEFAULT;
+        let terminal = UpstreamAttemptTerminal::invalid_response();
+        let shadow = execution_directive(Some(GroupRoutingTransientPolicyMode::Shadow));
+        assert_eq!(
+            terminal_health_config(native, Some(&shadow), terminal),
+            native
+        );
+
+        let active = execution_directive(Some(GroupRoutingTransientPolicyMode::Active));
+        let overridden = terminal_health_config(native, Some(&active), terminal);
+        assert_eq!(overridden.connection_cooldown_millis, 1);
+        assert_eq!(overridden.unavailable_cooldown_millis, 1);
+        assert_eq!(overridden.invalid_response_cooldown_millis, 1);
+        assert_eq!(
+            overridden.rate_limited_cooldown_millis,
+            native.rate_limited_cooldown_millis
+        );
+
+        let v1 = execution_directive(None);
+        assert_eq!(
+            terminal_health_config(native, Some(&v1), terminal),
+            overridden,
+            "v1 directive behavior remains unchanged"
         );
     }
 }
@@ -188,6 +272,7 @@ mod v2_lifecycle_tests {
             recover_micros: 600_000,
             min_probe_successes: 2,
         };
+        let policy_scope = "a".repeat(64);
         macro_rules! plugin_signal {
             ($value:expr) => {{
                 let signal = $value;
@@ -203,7 +288,14 @@ mod v2_lifecycle_tests {
 
         let first = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, true)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    &policy_scope,
+                    true,
+                    1_000,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -224,7 +316,14 @@ mod v2_lifecycle_tests {
 
         let second = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, true)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    &policy_scope,
+                    true,
+                    1_001,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -257,7 +356,14 @@ mod v2_lifecycle_tests {
         };
         let first_success = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, false)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    &policy_scope,
+                    false,
+                    1_002,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -288,7 +394,14 @@ mod v2_lifecycle_tests {
         };
         let second_success = plugin_signal!(
             database
-                .record_transient_health_sample(account, 1, false)
+                .record_transient_health_sample_at(
+                    account,
+                    1,
+                    &policy_scope,
+                    false,
+                    1_003,
+                    crate::plugin::routing::DEFAULT_TRANSIENT_HEALTH_WINDOW_MS,
+                )
                 .await
                 .unwrap()
                 .unwrap()
@@ -305,9 +418,10 @@ mod v2_lifecycle_tests {
         );
 
         let before_cancel: i64 = sqlx::query_scalar(
-            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+            "SELECT revision FROM group_routing_v2_transient_health_signals WHERE upstream_account_id = $1 AND policy_scope = $2",
         )
         .bind(account.to_string())
+        .bind(&policy_scope)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -316,9 +430,10 @@ mod v2_lifecycle_tests {
             None
         );
         let after_cancel: i64 = sqlx::query_scalar(
-            "SELECT revision FROM upstream_account_transient_health_signals WHERE upstream_account_id = $1",
+            "SELECT revision FROM group_routing_v2_transient_health_signals WHERE upstream_account_id = $1 AND policy_scope = $2",
         )
         .bind(account.to_string())
+        .bind(&policy_scope)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -697,32 +812,28 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         } => GroupRoutingOutcome::Authentication,
         UpstreamAttemptTerminal::Failed { .. } => GroupRoutingOutcome::TransientFailure,
     };
-    let signal_enabled = state.group_routing.as_ref().is_some_and(|snapshot| {
-        snapshot.uses_transient_signal(route_id, upstream_account_id, credential_generation)
+    let transient_health_scope = state.group_routing.as_ref().and_then(|snapshot| {
+        snapshot
+            .transient_health_scope(route_id, upstream_account_id, credential_generation)
+            .cloned()
     });
     let signal = if let Some(transient_failure) = transient_sample_for_outcome(outcome)
-        && signal_enabled
+        && let Some(scope) = transient_health_scope
     {
         match state
             .db
             .record_transient_health_sample(
                 upstream_account_id,
                 credential_generation,
+                &scope.id,
                 transient_failure,
+                scope.window_ms,
             )
             .await
         {
-            Ok(signal) => {
-                signal.map(
-                    |signal| crate::plugin::routing::GroupRoutingTransientSignal {
-                        sample_count: signal.sample_count.max(0) as u64,
-                        ewma_micros: signal.ewma_micros.clamp(0, 1_000_000) as u32,
-                        last_observed_at: signal.last_observed_at.max(0),
-                        recovery_successes: signal.recovery_successes.max(0) as u64,
-                        revision: signal.revision.max(0) as u64,
-                    },
-                )
-            }
+            Ok(signal) => signal.map(|signal| {
+                signal.for_group_routing_window(crate::db::unix_millis(), scope.window_ms)
+            }),
             Err(error) => {
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transient_health_sample", "transient health signal unavailable; native health policy retained");
                 None
@@ -741,25 +852,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         signal,
     )
     .await;
-    let mut health = state.config.upstream_health;
-    if let Some(directive) = directive.as_ref()
-        && matches!(
-            terminal,
-            UpstreamAttemptTerminal::Failed {
-                kind: UpstreamFailureKind::Connection
-                    | UpstreamFailureKind::Unavailable
-                    | UpstreamFailureKind::InvalidResponse,
-                ..
-            }
-        )
-    {
-        // Only transient failures consume plugin cooldown. Typed 429/reset
-        // evidence, lease ownership and uncertain POST handling remain core.
-        let cooldown = directive.directive.cooldown_ms.min(60_000) as i64;
-        health.connection_cooldown_millis = cooldown;
-        health.unavailable_cooldown_millis = cooldown;
-        health.invalid_response_cooldown_millis = cooldown;
-    }
+    let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
             if let (Some(policy), Some(signal), Some(lease_token)) = (

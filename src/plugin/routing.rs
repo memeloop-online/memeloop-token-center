@@ -17,6 +17,16 @@ pub(crate) const MAX_GROUP_ROUTING_JSON_BYTES: usize = 1024 * 1024;
 const MAX_DELAY_MS: u64 = 300_000;
 const EXECUTION_LIMIT: Duration = Duration::from_millis(100);
 pub const GROUP_ROUTING_QUOTA_VERSION: &str = "account-windows-v1";
+/// V2 transient evidence is scoped to aligned wall-clock windows. Plugins may
+/// override this through their runtime `transient_health_window_ms` config.
+pub(crate) const DEFAULT_TRANSIENT_HEALTH_WINDOW_MS: u64 = 60_000;
+/// A guest cannot retain active-breaker evidence beyond five minutes.
+pub(crate) const MAX_TRANSIENT_HEALTH_WINDOW_MS: u64 = 300_000;
+
+pub(crate) fn transient_health_window_start(now_ms: i64, window_ms: u64) -> Option<i64> {
+    let window_ms = i64::try_from(window_ms).ok()?;
+    (now_ms >= 0 && window_ms > 0).then(|| now_ms - now_ms % window_ms)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +93,27 @@ pub struct GroupRoutingTransientSignal {
 }
 
 impl GroupRoutingTransientSignal {
+    pub(crate) fn in_current_window(self, now_ms: i64, window_ms: u64) -> Self {
+        if !(1_000..=MAX_TRANSIENT_HEALTH_WINDOW_MS).contains(&window_ms) {
+            return Self::default();
+        }
+        let current_window = transient_health_window_start(now_ms, window_ms);
+        if self.sample_count > 0
+            && self.last_observed_at > 0
+            && self.revision > 0
+            && current_window.is_some()
+            && transient_health_window_start(self.last_observed_at, window_ms) == current_window
+        {
+            self
+        } else {
+            Self::default()
+        }
+    }
+
+    pub(crate) fn has_samples(self) -> bool {
+        self.sample_count > 0 && self.last_observed_at > 0 && self.revision > 0
+    }
+
     pub(crate) fn should_open(self, minimum_samples: u32, open_threshold_micros: u32) -> bool {
         self.sample_count >= u64::from(minimum_samples) && self.ewma_micros >= open_threshold_micros
     }
@@ -232,6 +263,16 @@ pub(crate) struct GroupRoutingExecutionDirective {
     pub(crate) transient_policy: Option<GroupRoutingTransientPolicy>,
 }
 
+impl GroupRoutingExecutionDirective {
+    /// V1 has no transient policy and retains its established directive
+    /// behavior. V2 shadow policy is observational only: none of its health
+    /// controls may change host admission, waiting, or cooldown state.
+    pub(crate) fn health_directives_enabled(&self) -> bool {
+        self.transient_policy
+            .is_none_or(GroupRoutingTransientPolicy::is_active)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct GroupRoutingExecutionPlan {
     pub(crate) candidates: Vec<GroupRoutingExecutionDirective>,
@@ -248,6 +289,17 @@ impl GroupRoutingTransientPolicy {
             && self.recover_micros <= self.open_micros
             && (1..=64).contains(&self.min_probe_successes)
     }
+}
+
+pub(crate) fn transient_health_window_ms(config: &Value) -> Result<u64, AppError> {
+    let Some(value) = config.get("transient_health_window_ms") else {
+        return Ok(DEFAULT_TRANSIENT_HEALTH_WINDOW_MS);
+    };
+    let window_ms = value.as_u64().ok_or_else(invalid)?;
+    if !(1_000..=MAX_TRANSIENT_HEALTH_WINDOW_MS).contains(&window_ms) {
+        return Err(invalid());
+    }
+    Ok(window_ms)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -631,6 +683,7 @@ impl PluginRuntime {
         }
         self.validate_group_routing_configuration(plugin_id, &input.config)?;
         if version == GROUP_ROUTING_V2_VERSION {
+            transient_health_window_ms(&input.config)?;
             let signals = transient_signals
                 .filter(|signals| signals.len() == input.candidates.len())
                 .ok_or_else(invalid)?;
@@ -718,6 +771,7 @@ impl PluginRuntime {
         // validate_directive requires recovery_wait_ms == 0 in that case:
         // observation never extends the original request's wait deadline.
         if version == GROUP_ROUTING_V2_VERSION {
+            transient_health_window_ms(&input.config)?;
             let signal = transient_signal.ok_or_else(invalid)?;
             let v2 = GroupRoutingObserveInputV2 {
                 tenant_id: input.tenant_id.clone(),
@@ -983,6 +1037,44 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_transient_health_window_has_bounded_runtime_override_and_expires_snapshots() {
+        for (config, expected) in [
+            (serde_json::json!({}), DEFAULT_TRANSIENT_HEALTH_WINDOW_MS),
+            (
+                serde_json::json!({"transient_health_window_ms": 1_000}),
+                1_000,
+            ),
+            (
+                serde_json::json!({"transient_health_window_ms": MAX_TRANSIENT_HEALTH_WINDOW_MS}),
+                MAX_TRANSIENT_HEALTH_WINDOW_MS,
+            ),
+        ] {
+            assert_eq!(transient_health_window_ms(&config).unwrap(), expected);
+        }
+        for config in [
+            serde_json::json!({"transient_health_window_ms": 999}),
+            serde_json::json!({"transient_health_window_ms": MAX_TRANSIENT_HEALTH_WINDOW_MS + 1}),
+            serde_json::json!({"transient_health_window_ms": "60000"}),
+        ] {
+            assert!(transient_health_window_ms(&config).is_err());
+        }
+
+        let signal = GroupRoutingTransientSignal {
+            sample_count: 8,
+            ewma_micros: 900_000,
+            last_observed_at: 119_999,
+            recovery_successes: 0,
+            revision: 8,
+        };
+        assert_eq!(signal.in_current_window(119_999, 60_000), signal);
+        assert_eq!(
+            signal.in_current_window(120_000, 60_000),
+            GroupRoutingTransientSignal::default(),
+            "an expired failure signal cannot open or defer recovery"
         );
     }
 

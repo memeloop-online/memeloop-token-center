@@ -3,63 +3,64 @@ use super::*;
 pub(crate) const TRANSIENT_EWMA_SCALE: i64 = 1_000_000;
 
 const RECORD_TRANSIENT_HEALTH_SAMPLE_SQL: &str =
-    "INSERT INTO upstream_account_transient_health_signals (
-         upstream_account_id, credential_generation, sample_count,
-         ewma_micros, last_observed_at, recovery_successes, revision
-     ) SELECT $1, $2, 1, $3, $4, $5, 1
+    "INSERT INTO group_routing_v2_transient_health_signals (
+         upstream_account_id, credential_generation, policy_scope, sample_count,
+         ewma_micros, last_observed_at, recovery_successes, revision,
+         transient_window_ms, window_started_at
+     ) SELECT $1, $2, $3, 1, $4, $5, $6, 1, $7, $8
        FROM upstream_accounts account
       WHERE account.id = $1 AND account.status = 'active'
         AND account.credential_generation = $2
-     ON CONFLICT (upstream_account_id) DO UPDATE SET
-         credential_generation = excluded.credential_generation,
+     ON CONFLICT (upstream_account_id, credential_generation, policy_scope) DO UPDATE SET
+         window_started_at = excluded.window_started_at,
          sample_count = CASE
-             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+             WHEN group_routing_v2_transient_health_signals.window_started_at <> excluded.window_started_at
                  THEN 1
-             WHEN upstream_account_transient_health_signals.sample_count < 9223372036854775807
-                 THEN upstream_account_transient_health_signals.sample_count + 1
-             ELSE upstream_account_transient_health_signals.sample_count
+             WHEN group_routing_v2_transient_health_signals.sample_count < 9223372036854775807
+                 THEN group_routing_v2_transient_health_signals.sample_count + 1
+             ELSE group_routing_v2_transient_health_signals.sample_count
          END,
          ewma_micros = CASE
-             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+             WHEN group_routing_v2_transient_health_signals.window_started_at <> excluded.window_started_at
                  THEN excluded.ewma_micros
              ELSE (
-                 upstream_account_transient_health_signals.ewma_micros * 3 + excluded.ewma_micros + 2
+                 group_routing_v2_transient_health_signals.ewma_micros * 3 + excluded.ewma_micros + 2
              ) / 4
          END,
          last_observed_at = CASE
-             WHEN upstream_account_transient_health_signals.credential_generation < excluded.credential_generation
-                  OR upstream_account_transient_health_signals.last_observed_at < excluded.last_observed_at
+             WHEN group_routing_v2_transient_health_signals.window_started_at <> excluded.window_started_at
+                  OR group_routing_v2_transient_health_signals.last_observed_at < excluded.last_observed_at
                  THEN excluded.last_observed_at
-             ELSE upstream_account_transient_health_signals.last_observed_at
+             ELSE group_routing_v2_transient_health_signals.last_observed_at
          END,
          recovery_successes = CASE
-             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+             WHEN group_routing_v2_transient_health_signals.window_started_at <> excluded.window_started_at
                  THEN excluded.recovery_successes
              WHEN excluded.ewma_micros > 0 THEN 0
-             WHEN upstream_account_transient_health_signals.recovery_successes < 9223372036854775807
-                 THEN upstream_account_transient_health_signals.recovery_successes + 1
-             ELSE upstream_account_transient_health_signals.recovery_successes
+             WHEN group_routing_v2_transient_health_signals.recovery_successes < 9223372036854775807
+                 THEN group_routing_v2_transient_health_signals.recovery_successes + 1
+             ELSE group_routing_v2_transient_health_signals.recovery_successes
          END,
-         revision = CASE
-             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
-                 THEN 1
-             WHEN upstream_account_transient_health_signals.revision < 9223372036854775807
-                 THEN upstream_account_transient_health_signals.revision + 1
-             ELSE upstream_account_transient_health_signals.revision
-         END
-     WHERE upstream_account_transient_health_signals.credential_generation <= excluded.credential_generation
+         revision = CASE WHEN group_routing_v2_transient_health_signals.revision < 9223372036854775807
+                         THEN group_routing_v2_transient_health_signals.revision + 1
+                         ELSE group_routing_v2_transient_health_signals.revision END
+     WHERE group_routing_v2_transient_health_signals.transient_window_ms = excluded.transient_window_ms
+       AND group_routing_v2_transient_health_signals.window_started_at <= excluded.window_started_at
        AND EXISTS (
          SELECT 1 FROM upstream_accounts account
-          WHERE account.id = upstream_account_transient_health_signals.upstream_account_id
+          WHERE account.id = group_routing_v2_transient_health_signals.upstream_account_id
             AND account.status = 'active'
             AND account.credential_generation = excluded.credential_generation
      )
      RETURNING sample_count, ewma_micros, last_observed_at,
-               recovery_successes, revision";
+               recovery_successes, revision, transient_window_ms, window_started_at";
 
 /// Credential-free, generation-fenced transient observations. The integer
-/// EWMA uses a fixed alpha of 1/4 so both database backends produce identical
-/// values without floating-point drift.
+/// EWMA uses a fixed alpha of 1/4 inside one aligned policy-scoped time window.
+/// Each route/group/plugin revision/configuration has an independent row, so a
+/// late request can update only the scope it captured. Crossing a boundary
+/// starts fresh evidence and old-window writes are rejected. Integer arithmetic
+/// keeps both database backends equal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransientHealthSignal {
     pub(crate) sample_count: i64,
@@ -67,6 +68,31 @@ pub(crate) struct TransientHealthSignal {
     pub(crate) last_observed_at: i64,
     pub(crate) recovery_successes: i64,
     pub(crate) revision: i64,
+    pub(crate) transient_window_ms: i64,
+    pub(crate) window_started_at: i64,
+}
+
+impl TransientHealthSignal {
+    pub(crate) fn for_group_routing_window(
+        self,
+        now_ms: i64,
+        window_ms: u64,
+    ) -> crate::plugin::routing::GroupRoutingTransientSignal {
+        if i64::try_from(window_ms).ok() != Some(self.transient_window_ms)
+            || crate::plugin::routing::transient_health_window_start(now_ms, window_ms)
+                != Some(self.window_started_at)
+        {
+            return crate::plugin::routing::GroupRoutingTransientSignal::default();
+        }
+        crate::plugin::routing::GroupRoutingTransientSignal {
+            sample_count: self.sample_count.max(0) as u64,
+            ewma_micros: self.ewma_micros.clamp(0, TRANSIENT_EWMA_SCALE) as u32,
+            last_observed_at: self.last_observed_at.max(0),
+            recovery_successes: self.recovery_successes.max(0) as u64,
+            revision: self.revision.max(0) as u64,
+        }
+        .in_current_window(now_ms, window_ms)
+    }
 }
 
 /// A tenant-scoped, credential-free snapshot; no row means the candidate is
@@ -106,9 +132,41 @@ impl Database {
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        policy_scope: &str,
         transient_failure: bool,
+        window_ms: u64,
     ) -> Result<Option<TransientHealthSignal>, AppError> {
-        let now = unix_millis();
+        self.record_transient_health_sample_at(
+            upstream_account_id,
+            credential_generation,
+            policy_scope,
+            transient_failure,
+            unix_millis(),
+            window_ms,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_transient_health_sample_at(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        policy_scope: &str,
+        transient_failure: bool,
+        now: i64,
+        window_ms: u64,
+    ) -> Result<Option<TransientHealthSignal>, AppError> {
+        if policy_scope.len() != 64
+            || !policy_scope.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !(1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
+                .contains(&window_ms)
+        {
+            return Err(AppError::Internal);
+        }
+        let window_ms = window_ms as i64;
+        let window_started_at =
+            crate::plugin::routing::transient_health_window_start(now, window_ms as u64)
+                .ok_or(AppError::Internal)?;
         let sample = if transient_failure {
             TRANSIENT_EWMA_SCALE
         } else {
@@ -117,9 +175,12 @@ impl Database {
         let row = sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
             .bind(upstream_account_id.to_string())
             .bind(credential_generation)
+            .bind(policy_scope)
             .bind(sample)
             .bind(now)
             .bind(i64::from(!transient_failure))
+            .bind(window_ms)
+            .bind(window_started_at)
             .fetch_optional(&self.pool)
             .await?;
         row.map(|row| {
@@ -129,6 +190,8 @@ impl Database {
                 last_observed_at: row.try_get("last_observed_at")?,
                 recovery_successes: row.try_get("recovery_successes")?,
                 revision: row.try_get("revision")?,
+                transient_window_ms: row.try_get("transient_window_ms")?,
+                window_started_at: row.try_get("window_started_at")?,
             })
         })
         .transpose()

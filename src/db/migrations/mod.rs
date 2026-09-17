@@ -548,6 +548,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "persistent upstream transient health signals",
         sql: include_str!("../../../migrations/common/0103_upstream_transient_health_signals.sql"),
     },
+    Migration {
+        version: 104,
+        name: "bounded transient health signal windows",
+        sql: include_str!("../../../migrations/common/0104_transient_health_signal_windows.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1081,6 +1086,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 103,
         name: "persistent upstream transient health signals",
         sql: include_str!("../../../migrations/common/0103_upstream_transient_health_signals.sql"),
+    },
+    Migration {
+        version: 104,
+        name: "bounded transient health signal windows",
+        sql: include_str!("../../../migrations/common/0104_transient_health_signal_windows.sql"),
     },
 ];
 

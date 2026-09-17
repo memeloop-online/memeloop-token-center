@@ -42,8 +42,18 @@ pub(crate) fn capture(state: &AppState) -> Result<Option<serde_json::Value>, App
         snapshot
             .policies
             .values()
-            .any(|policy| &policy.plugin_id == id)
+            .any(|policy| policy.durable_v1_compatible() && &policy.plugin_id == id)
     });
+    // DurablePlan v1 predates v2 health scope identity and its CandidatePolicy
+    // uses deny_unknown_fields. Keep the wire shape readable by rolling old
+    // workers: selection is already frozen, while v2 health falls back to the
+    // native host policy until a separately versioned durable contract exists.
+    let policies = snapshot
+        .policies
+        .values()
+        .filter(|policy| policy.durable_v1_compatible())
+        .cloned()
+        .collect();
     let value = serde_json::to_value(DurablePlan {
         version: 1,
         tenant_id: snapshot.tenant_id,
@@ -52,7 +62,7 @@ pub(crate) fn capture(state: &AppState) -> Result<Option<serde_json::Value>, App
         deadline_at,
         application_revision,
         fingerprints,
-        policies: snapshot.policies.values().cloned().collect(),
+        policies,
     })
     .map_err(|_| AppError::Internal)?;
     if serde_json::to_vec(&value)
@@ -137,6 +147,11 @@ pub(crate) async fn restore_selected(
     let available = restored.plugins.group_routing_fingerprints();
     let mut policies = BTreeMap::new();
     for policy in stored.policies {
+        // Accept already-enqueued v1 snapshots produced by the prior release,
+        // but never reactivate their unscoped v2 signal on this worker.
+        if policy.transient_signal_enabled {
+            continue;
+        }
         if !policy.has_valid_transient_snapshot() {
             return Err(AppError::Internal);
         }

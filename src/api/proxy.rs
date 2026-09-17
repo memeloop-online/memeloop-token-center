@@ -294,11 +294,14 @@ async fn next_sendable_proxy_route(
         let (next_input_token_ceiling, next_output_token_ceiling) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
         let admission = if let Some(snapshot) = state.group_routing.as_ref()
-            && let Some(policy) = snapshot.policy(
-                planned.route.route_id,
-                planned.route.account_id,
-                planned.route.credential_generation,
-            ) {
+            && let Some((allow_probe, cooldown_ms)) = snapshot
+                .policy(
+                    planned.route.route_id,
+                    planned.route.account_id,
+                    planned.route.credential_generation,
+                )
+                .and_then(|policy| policy.transient_probe_controls())
+        {
             state
                 .db
                 .claim_upstream_account_attempt_with_strategy(
@@ -306,8 +309,8 @@ async fn next_sendable_proxy_route(
                     planned.route.account_id,
                     planned.route.credential_generation,
                     state.config.upstream_health,
-                    policy.allow_probe(),
-                    Some(policy.cooldown_ms()),
+                    allow_probe,
+                    Some(cooldown_ms),
                     false,
                 )
                 .await?
@@ -721,11 +724,14 @@ async fn execute_component_primary(
     // strategy execution/native fallback. A missing policy never disables the
     // generation fence or revives hard quota. This path never replays a send.
     let admission = if let Some(snapshot) = request.state.group_routing.as_ref()
-        && let Some(policy) = snapshot.policy(
-            primary.route.route_id,
-            primary.route.account_id,
-            primary.route.credential_generation,
-        ) {
+        && let Some((allow_probe, cooldown_ms)) = snapshot
+            .policy(
+                primary.route.route_id,
+                primary.route.account_id,
+                primary.route.credential_generation,
+            )
+            .and_then(|policy| policy.transient_probe_controls())
+    {
         request
             .state
             .db
@@ -734,8 +740,8 @@ async fn execute_component_primary(
                 primary.route.account_id,
                 primary.route.credential_generation,
                 request.state.config.upstream_health,
-                policy.allow_probe(),
-                Some(policy.cooldown_ms()),
+                allow_probe,
+                Some(cooldown_ms),
                 false,
             )
             .await?
