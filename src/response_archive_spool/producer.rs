@@ -776,6 +776,11 @@ impl ResponseArchiveWriter {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn append_state_for_test(&self) -> (u64, i64, i64) {
+        (self.append_attempts, self.seq, self.bytes)
+    }
+
     async fn seal_inner(self) -> Result<(), AppError> {
         if !observe_writer_database(
             self.identity,

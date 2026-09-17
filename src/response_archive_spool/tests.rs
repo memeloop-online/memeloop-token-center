@@ -673,9 +673,10 @@ async fn streaming_writer_batches_four_chunks_without_growing_its_memory_reserva
         ])
         .await
         .unwrap();
-    assert_eq!(writer.append_attempts, 1);
-    assert_eq!(writer.seq, 4);
-    assert_eq!(writer.bytes, (4 * super::CHUNK_BYTES) as i64);
+    assert_eq!(
+        writer.append_state_for_test(),
+        (1, 4, (4 * super::CHUNK_BYTES) as i64)
+    );
     writer.seal_for_test().await.unwrap();
     let row = sqlx::query(
         "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",

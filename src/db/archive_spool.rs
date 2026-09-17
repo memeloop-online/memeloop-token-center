@@ -407,6 +407,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -425,6 +426,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_response_archive_spool_batch(
         &self,
         identity: ArchiveSpoolIdentity,
