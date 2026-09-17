@@ -88,6 +88,7 @@ struct CodexModelAvailability {
     openai_source_seen: bool,
     openai_multi_agent_v2: bool,
     codex_model_capabilities: Option<crate::provider::CodexModelCapabilities>,
+    third_party_capabilities_invalid: bool,
     native_source_seen: bool,
     third_party_source_seen: bool,
 }
@@ -118,6 +119,7 @@ fn codex_models_response(
 fn should_advertise_codex_model(model: &str, availability: &CodexModelAvailability) -> bool {
     availability.third_party_source_seen
         && !availability.native_source_seen
+        && !availability.third_party_capabilities_invalid
         && availability.openai_multi_agent_v2
         && !crate::provider::is_bundled_codex_model_slug(model)
         && availability
@@ -139,7 +141,16 @@ fn usable_codex_model_capabilities(capabilities: &crate::provider::CodexModelCap
             .input_modalities
             .iter()
             .any(|modality| modality == "text")
+        // The current Responses-via-Chat bridge maps only the supported image
+        // detail vocabulary; it cannot preserve `original` semantics exactly.
+        // Never advertise that capability until a versioned bridge implements
+        // it without silent degradation.
+        && !capabilities.supports_image_detail_original
         && !capabilities.supported_reasoning_levels.is_empty()
+        && capabilities
+            .supported_reasoning_levels
+            .iter()
+            .all(|level| !level.effort.trim().is_empty() && !level.description.trim().is_empty())
         && capabilities
             .default_reasoning_level
             .as_ref()
@@ -184,21 +195,30 @@ fn codex_model_availability(
             // conservative. This avoids claiming V2 when a public model
             // can route to an incompatible OpenAI provider.
             availability.openai_multi_agent_v2 &= compatible;
-            if !native {
-                availability.codex_model_capabilities = if availability.openai_multi_agent_v2 {
-                    match (availability.codex_model_capabilities.take(), capabilities) {
-                        (Some(left), Some(right)) => merge_codex_model_capabilities(left, right),
-                        (None, Some(right)) => Some(right),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-            }
         } else {
             availability.openai_source_seen = true;
             availability.openai_multi_agent_v2 = compatible;
-            availability.codex_model_capabilities = capabilities;
+        }
+        if !native && compatible {
+            let Some(capabilities) = capabilities else {
+                // A compatible third-party candidate without its complete
+                // versioned capability declaration must poison the alias.
+                // Do not let a later source repopulate it based on ordering.
+                availability.third_party_capabilities_invalid = true;
+                availability.codex_model_capabilities = None;
+                continue;
+            };
+            if availability.third_party_capabilities_invalid {
+                continue;
+            }
+            let merged = match availability.codex_model_capabilities.take() {
+                Some(left) => merge_codex_model_capabilities(left, capabilities),
+                None => Some(capabilities),
+            };
+            if merged.is_none() {
+                availability.third_party_capabilities_invalid = true;
+            }
+            availability.codex_model_capabilities = merged;
         }
     }
     models
@@ -245,10 +265,12 @@ fn merge_codex_model_capabilities(
                 .supported_reasoning_levels
                 .iter()
                 .find(|right_level| right_level.effort == left_level.effort)?;
-            let description = if left_level.description == right_level.description {
+            let description = if left_level.description == right_level.description
+                && !left_level.description.trim().is_empty()
+            {
                 left_level.description
             } else {
-                None
+                return None;
             };
             Some(crate::provider::CodexReasoningLevel {
                 effort: left_level.effort,
@@ -337,7 +359,10 @@ fn codex_model_info(
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": capabilities.and_then(|capabilities| capabilities.apply_patch_tool_type.as_deref()),
-        "web_search_tool_type": "text",
+        // The bridge only preserves function/custom/namespace tools. Do not
+        // advertise a built-in web-search tool that would be rejected or
+        // silently dropped during Responses-to-Chat conversion.
+        "web_search_tool_type": "disabled",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
         "supports_image_detail_original": capabilities
             .is_some_and(|capabilities| capabilities.supports_image_detail_original),
@@ -455,6 +480,7 @@ mod tests {
             5
         );
         assert_eq!(compatible["supports_image_detail_original"], false);
+        assert_eq!(compatible["web_search_tool_type"], "disabled");
         assert!(
             compatible["base_instructions"]
                 .as_str()
@@ -486,6 +512,13 @@ mod tests {
         mismatched_version.version = "future-capabilities-v2".to_owned();
         assert!(
             merge_codex_model_capabilities(kimi_capabilities.clone(), mismatched_version).is_none()
+        );
+        let mut mismatched_description = kimi_capabilities.clone();
+        mismatched_description.supported_reasoning_levels[0].description =
+            "provider-specific wording".to_owned();
+        assert!(
+            merge_codex_model_capabilities(kimi_capabilities.clone(), mismatched_description)
+                .is_none()
         );
 
         let ordinary = codex_model_info("ordinary", false, Some(kimi_capabilities));
@@ -598,6 +631,55 @@ mod tests {
                 .codex_model_capabilities
                 .is_none()
         );
+    }
+
+    #[test]
+    fn codex_catalog_fails_closed_when_any_compatible_third_party_candidate_lacks_capabilities() {
+        fn source(model: &str, driver: &str) -> crate::db::GrantedModelCapabilitySource {
+            crate::db::GrantedModelCapabilitySource {
+                public_model: model.into(),
+                upstream_model: "private-upstream-name".into(),
+                protocol: "openai".into(),
+                driver: driver.into(),
+                config_json: "{}".into(),
+            }
+        }
+
+        let mut providers = crate::provider::ProviderCatalog::builtins();
+        let mut incomplete = providers
+            .get("kimi-oauth")
+            .expect("builtin Kimi provider")
+            .clone();
+        incomplete.id = "kimi-incomplete-capabilities".into();
+        incomplete.codex_model_capabilities = None;
+        providers
+            .extend([incomplete])
+            .expect("cloned provider contribution is schema-valid");
+
+        for sources in [
+            vec![
+                source("order-independent", "kimi-incomplete-capabilities"),
+                source("order-independent", "kimi-oauth"),
+            ],
+            vec![
+                source("order-independent", "kimi-oauth"),
+                source("order-independent", "kimi-incomplete-capabilities"),
+            ],
+        ] {
+            let availability = codex_model_availability(&providers, &sources);
+            let availability = &availability["order-independent"];
+            assert!(availability.openai_multi_agent_v2);
+            assert!(availability.third_party_capabilities_invalid);
+            assert!(availability.codex_model_capabilities.is_none());
+            assert!(!should_advertise_codex_model(
+                "order-independent",
+                availability
+            ));
+            assert_eq!(
+                codex_models_response(&providers, &sources)["models"],
+                json!([])
+            );
+        }
     }
 
     #[test]

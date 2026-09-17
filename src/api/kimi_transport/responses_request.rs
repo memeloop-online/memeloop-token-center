@@ -101,6 +101,69 @@ fn content(value: &Value) -> Value {
     )
 }
 
+fn validate_tools(value: &Value) -> Result<(), AppError> {
+    let Some(tools) = value.as_array() else {
+        return Err(AppError::BadRequest(
+            "Responses-via-Chat tools must be an array".into(),
+        ));
+    };
+    for tool in tools {
+        let kind = tool["type"].as_str().unwrap_or("function");
+        match kind {
+            "function" | "custom" => {}
+            "namespace" => validate_tools(&tool["tools"])?,
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported Responses tool type for Responses-via-Chat: {kind}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_details(value: &Value) -> Result<(), AppError> {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("input_image")
+                && object.get("detail").and_then(Value::as_str) == Some("original")
+            {
+                return Err(AppError::BadRequest(
+                    "Responses-via-Chat does not support original image detail".into(),
+                ));
+            }
+            for child in object.values() {
+                validate_image_details(child)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                validate_image_details(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reject request features that this bridge cannot preserve exactly. The
+/// gateway must not advertise a tool/image capability and then silently drop
+/// or downgrade it while converting Responses to Chat.
+pub(super) fn validate_bridge_features(request: &Value) -> Result<(), AppError> {
+    validate_image_details(request)?;
+    if request.get("tools").is_some() {
+        validate_tools(&request["tools"])?;
+    }
+    if let Some(input) = request["input"].as_array() {
+        for item in input {
+            if item["type"] == "additional_tools" {
+                validate_tools(&item["tools"])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn combine(existing: &mut String, incoming: &str) {
     if incoming.trim().is_empty() || existing == incoming {
         return;
@@ -119,7 +182,7 @@ fn combine(existing: &mut String, incoming: &str) {
 /// rather than being guessed at.
 fn agent_message(item: &Value) -> Result<Value, AppError> {
     let parts = item["content"].as_array().ok_or_else(|| {
-        AppError::BadRequest("Kimi agent messages require readable content".into())
+        AppError::BadRequest("Responses-via-Chat agent messages require readable content".into())
     })?;
     let mut readable = Vec::with_capacity(parts.len() + 1);
     readable.push(json!({"type":"input_text", "text":format!(
@@ -145,13 +208,13 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
                 readable.push(image);
             }
             _ => return Err(AppError::BadRequest(
-                "unsupported agent message content for Kimi; resend the complete agent task as readable input".into(),
+                "unsupported agent message content for Responses-via-Chat; resend the complete agent task as readable input".into(),
             )),
         }
     }
     if parts.is_empty() {
         return Err(AppError::BadRequest(
-            "Kimi agent messages require readable content".into(),
+            "Responses-via-Chat agent messages require readable content".into(),
         ));
     }
     Ok(json!({"type":"message", "role":"user", "content":readable}))
@@ -160,13 +223,14 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
 /// Convert the source's Responses message/tool forms without a service bridge.
 /// Tool outputs remain adjacent to their calls even when interleaved user
 /// messages occur in the input timeline.
-pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
+pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
+    validate_bridge_features(request)?;
     if request
         .get("previous_response_id")
         .is_some_and(|id| !id.is_null())
     {
         return Err(AppError::BadRequest(
-            "Kimi Responses continuation requires the complete input history".into(),
+            "Responses-via-Chat continuation requires the complete input history".into(),
         ));
     }
     let mut output =
@@ -303,7 +367,7 @@ pub(super) fn convert(request: &Value) -> Result<Value, AppError> {
             }
             _ => {
                 return Err(AppError::BadRequest(
-                    "unsupported Responses input item for Kimi".into(),
+                    "unsupported Responses input item for Responses-via-Chat".into(),
                 ));
             }
         }
@@ -463,7 +527,7 @@ mod tests {
             "delegated task fixture"
         );
 
-        let output = convert(&request).expect("fixture converts to Kimi Chat");
+        let output = convert(&request).expect("fixture converts to Responses-via-Chat");
         let spawn_agent = output["tools"]
             .as_array()
             .and_then(|tools| {
@@ -555,16 +619,21 @@ mod tests {
     }
 
     #[test]
-    fn first_tool_declaration_controls_reverse_mapping_and_image_detail() {
+    fn unsupported_original_image_detail_fails_closed() {
         let request = json!({"input":[{"role":"user","content":[
             {"type":"input_image","image_url":"data:image/png;base64,fixture","detail":"original"}]},
             {"type":"additional_tools","tools":[{"type":"custom","name":"same"}]}],
             "tools":[{"type":"function","name":"same","parameters":{}}]});
         assert!(!tools(&request)["same"].0.custom);
-        let output = convert(&request).unwrap();
-        assert_eq!(
-            output["messages"][0]["content"][0]["image_url"]["detail"],
-            "high"
-        );
+        assert!(convert(&request).is_err());
+    }
+
+    #[test]
+    fn unsupported_builtin_tool_fails_closed() {
+        let request = json!({
+            "input": "hello",
+            "tools": [{"type":"computer_use_preview","display_width":1024}]
+        });
+        assert!(convert(&request).is_err());
     }
 }

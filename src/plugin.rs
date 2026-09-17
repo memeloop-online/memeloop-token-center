@@ -2391,6 +2391,14 @@ fn validate_provider_contribution(
             provider.id
         )));
     }
+    if provider.request_compatibility.codex_multi_agent_v2
+        && !provider.request_compatibility.responses_via_chat_v1
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare responses_via_chat_v1 for Codex MultiAgentV2 compatibility",
+            provider.id
+        )));
+    }
     if provider.codex_model_capabilities.is_some()
         && !provider.request_compatibility.codex_multi_agent_v2
     {

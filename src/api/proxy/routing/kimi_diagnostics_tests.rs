@@ -181,6 +181,6 @@ async fn owned_failure_keeps_ingress_identity_clock_and_never_logs_payload() {
         "upstream_response_event_too_large"
     );
     assert_eq!(value["fields"]["event_class"], "sse");
-    assert_eq!(value["fields"]["phase"], "kimi_response_translation");
+    assert_eq!(value["fields"]["phase"], "responses_chat_translation");
     assert!(value["fields"]["request_elapsed_ms"].as_i64().unwrap() >= 60_000);
 }

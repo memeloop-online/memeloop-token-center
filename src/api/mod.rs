@@ -57,6 +57,7 @@ pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_r
 mod proxy_diagnostics;
 mod request_detail;
 mod request_normalization;
+mod responses_via_chat;
 mod router;
 mod routes;
 mod routing;

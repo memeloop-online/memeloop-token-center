@@ -342,7 +342,7 @@ mod tests {
                     config_json: "{}".into(),
                 },
             )),
-            kimi_response: None,
+            responses_chat: None,
         };
 
         let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();

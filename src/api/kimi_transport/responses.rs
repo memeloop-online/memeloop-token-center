@@ -73,7 +73,7 @@ fn usage(value: &Value) -> Result<Value, &'static str> {
         .ok_or("usage_output_invalid")?;
     let total = value["total_tokens"]
         .as_u64()
-        .ok_or("kimi_usage_field_type")?;
+        .ok_or("responses_chat_usage_field_type")?;
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -543,7 +543,7 @@ mod tests {
         value["usage"]["prompt_tokens_details"] = json!({"cached_tokens":11});
         assert_eq!(
             buffered(&context, &value),
-            Err("kimi_cached_tokens_conflict")
+            Err("responses_chat_cached_tokens_conflict")
         );
     }
 
@@ -603,5 +603,54 @@ mod tests {
         assert!(last.contains("response.completed"));
         assert!(last.contains("\"text\":\"hello\""));
         assert!(stream.finish().is_err());
+    }
+
+    #[test]
+    fn streamed_collaboration_calls_complete_and_reverse_map_namespaces() {
+        let request = json!({
+            "model": "kimi-k3-256k",
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object"}},
+                {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+            ]}]
+        });
+        let mut stream = Stream::new(Context::new(&request));
+        stream
+            .observe(&json!({
+                "created": 7,
+                "choices": [{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"spawn-call","function":{"name":"collaboration__spawn_agent","arguments":r#"{"message":"spawn"#}}]},
+                "finish_reason":null}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":r#" agent"}"#}},
+                    {"index":1,"id":"followup-call","function":{"name":"collaboration__followup_task","arguments":r#"{"message":"follow"}"#}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices": [],
+                "usage": {"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+            }))
+            .unwrap();
+
+        let events = stream.finish().unwrap();
+        let wire = String::from_utf8(events.concat()).unwrap();
+        assert!(wire.contains("response.function_call_arguments.done"));
+        assert!(wire.contains("response.completed"));
+        assert!(wire.contains("\"name\":\"spawn_agent\""));
+        assert!(wire.contains("\"name\":\"followup_task\""));
+        assert!(wire.matches("\"namespace\":\"collaboration\"").count() >= 2);
+        assert!(wire.contains("spawn agent"));
+        assert!(wire.contains("follow"));
     }
 }

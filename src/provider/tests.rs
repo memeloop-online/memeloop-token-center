@@ -318,6 +318,12 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     assert!(kimi_capabilities.include_skills_usage_instructions);
     assert!(kimi_capabilities.include_plugin_usage_instructions);
     assert!(kimi_capabilities.include_apps_usage_instructions);
+    assert!(
+        kimi_capabilities
+            .supported_reasoning_levels
+            .iter()
+            .all(|level| !level.effort.is_empty() && !level.description.is_empty())
+    );
     assert_eq!(
         kimi_capabilities.default_reasoning_level.as_deref(),
         Some("medium")

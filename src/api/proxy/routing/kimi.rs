@@ -1,8 +1,8 @@
 use super::super::chat_sse_usage::ChatSseUsageState;
 use super::*;
 use crate::api::{
-    kimi_transport::responses,
     proxy::upstream_response::{UPSTREAM_STREAM_ERROR, UpstreamByteStream},
+    responses_via_chat,
     sse::{BoundedSseFramer, parse_sse_event},
 };
 use std::collections::VecDeque;
@@ -13,7 +13,8 @@ pub(super) fn prepare_forwarded_request(
     request: &Value,
     prepare_multi_agent_tools: bool,
     normalize_multi_agent: bool,
-) -> Result<(Value, Option<responses::Context>), AppError> {
+    responses_via_chat: bool,
+) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
     if normalize_multi_agent {
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
@@ -23,29 +24,42 @@ pub(super) fn prepare_forwarded_request(
             prepare_multi_agent_tools,
         )?;
     }
-    if route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
+    let is_kimi = route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER;
+    if is_kimi {
+        if route.base_url != crate::oauth::managed::kimi::BASE_URL {
+            return Err(AppError::BadRequest(
+                "Kimi OAuth requires its fixed base URL".into(),
+            ));
+        }
+        crate::oauth::managed::kimi::validate_credential(&route.credential)?;
+        if matches!(protocol, Protocol::OpenAiResponses) {
+            let context = crate::api::kimi_transport::prepare_kimi_responses(
+                &route.upstream_model,
+                &mut forwarded,
+            )?;
+            return Ok((forwarded, Some(context)));
+        }
+        crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
+        return Ok((forwarded, None));
+    }
+    if responses_via_chat && matches!(protocol, Protocol::OpenAiResponses) {
+        let context =
+            crate::api::responses_via_chat::prepare(&route.upstream_model, &mut forwarded)?;
+        return Ok((forwarded, Some(context)));
+    }
+    {
         if let Some(model) = forwarded.get_mut("model") {
             *model = Value::String(route.upstream_model.clone());
         }
         return Ok((forwarded, None));
     }
-    if route.base_url != crate::oauth::managed::kimi::BASE_URL {
-        return Err(AppError::BadRequest(
-            "Kimi OAuth requires its fixed base URL".into(),
-        ));
-    }
-    crate::oauth::managed::kimi::validate_credential(&route.credential)?;
-    let context =
-        matches!(protocol, Protocol::OpenAiResponses).then(|| responses::Context::new(request));
-    crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
-    Ok((forwarded, context))
 }
 
 struct StreamState {
     upstream: UpstreamByteStream,
     framer: BoundedSseFramer,
     usage: ChatSseUsageState,
-    translator: responses::Stream,
+    translator: responses_via_chat::Stream,
     pending: VecDeque<Result<Bytes, &'static str>>,
     terminal: bool,
     failed: bool,
@@ -185,16 +199,17 @@ fn report_failure(
     done_observed: bool,
 ) {
     // All labels are code-owned. Never emit provider text, JSON, or serde errors.
-    tracing::warn!(phase = "kimi_response_translation", request_id = %context.request_id,
+    tracing::warn!(phase = "responses_chat_translation", request_id = %context.request_id,
         request_elapsed_ms = context.elapsed_millis_at(std::time::Instant::now()),
         stage, error_kind = reason, event_class, usage_observed, done_observed,
-        "Kimi response translation failed");
+        "Responses-via-Chat translation failed");
 }
 
 pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
-    context: responses::Context,
+    context: responses_via_chat::Context,
     streaming: bool,
+    kimi_dialect: bool,
 ) -> Result<UpstreamResponse, ProxySendError> {
     if !response.status().is_success() {
         return Ok(response.into());
@@ -259,8 +274,12 @@ pub(in crate::api::proxy) fn translate(
         let state = StreamState {
             upstream: parts.stream,
             framer: BoundedSseFramer::default(),
-            usage: ChatSseUsageState::for_kimi(),
-            translator: responses::Stream::new(context),
+            usage: if kimi_dialect {
+                ChatSseUsageState::for_kimi()
+            } else {
+                ChatSseUsageState::default()
+            },
+            translator: responses_via_chat::Stream::new(context),
             pending: VecDeque::new(),
             terminal: false,
             failed: false,
@@ -294,7 +313,7 @@ pub(in crate::api::proxy) fn translate(
                     crate::api::sse::parse_unique_json(&body).map_err(|_| "json_invalid")?;
                 usage_observed = !value["usage"].is_null();
                 drop(body);
-                let response = responses::buffered(&context, &value)?;
+                let response = responses_via_chat::buffered(&context, &value)?;
                 drop(value);
                 serde_json::to_vec(&response)
                     .map(Bytes::from)
@@ -434,7 +453,8 @@ mod tests {
         let (_server, response) = mock_response(body).await;
         let translated = translate(
             response,
-            responses::Context::new(&json!({"model":"kimi-k3"})),
+            responses_via_chat::Context::new(&json!({"model":"kimi-k3"})),
+            true,
             true,
         )
         .unwrap();
@@ -465,7 +485,8 @@ mod tests {
             let (_server, response) = mock_response(body).await;
             let translated = translate(
                 response,
-                responses::Context::new(&json!({"model":"kimi-k3"})),
+                responses_via_chat::Context::new(&json!({"model":"kimi-k3"})),
+                true,
                 true,
             )
             .unwrap();
@@ -502,6 +523,7 @@ mod tests {
             &request,
             true,
             false,
+            false,
         )
         .unwrap();
 
@@ -533,6 +555,7 @@ mod tests {
             &request,
             false,
             true,
+            false,
         )
         .unwrap();
 
@@ -542,6 +565,28 @@ mod tests {
         assert_eq!(
             forwarded["messages"][0]["content"][0]["text"],
             "delegated task"
+        );
+    }
+
+    #[test]
+    fn third_party_route_rejects_opaque_agent_message_before_dispatch() {
+        let request = json!({
+            "model": "public-model",
+            "input": [{"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            ]}]
+        });
+        let error = prepare_forwarded_request(
+            &kimi_route(),
+            Protocol::OpenAiResponses,
+            &request,
+            false,
+            true,
+            false,
+        )
+        .expect_err("opaque delegated content must fail closed before dispatch");
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("agent_message"))
         );
     }
 }

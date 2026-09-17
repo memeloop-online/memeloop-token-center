@@ -256,7 +256,7 @@
                     "items": {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["effort"],
+                      "required": ["effort", "description"],
                       "properties": {
                         "effort": {
                           "type": "string",

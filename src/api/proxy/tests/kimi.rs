@@ -43,7 +43,8 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             .unwrap();
         let translated = routing::kimi::translate(
             raw,
-            crate::api::kimi_transport::responses::Context::new(&json!({"model":fixture.model})),
+            crate::api::responses_via_chat::Context::new(&json!({"model":fixture.model})),
+            true,
             true,
         )
         .unwrap();
@@ -148,8 +149,8 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         .await
         .unwrap();
     assert!(response.content_length().is_some());
-    let context = crate::api::kimi_transport::responses::Context::new(&json!({"model":"kimi"}));
-    let translated = routing::kimi::translate(response, context, false).unwrap();
+    let context = crate::api::responses_via_chat::Context::new(&json!({"model":"kimi"}));
+    let translated = routing::kimi::translate(response, context, false, true).unwrap();
     assert!(translated.content_length().is_none());
     let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
         crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
@@ -171,6 +172,136 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
     assert_eq!(budget.snapshot().0, 192 * 1024 * 1024);
     drop(memory);
     assert_eq!(budget.snapshot().0, 0);
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn generic_via_chat_provider_uses_chat_endpoint_credentials_and_reverse_maps_tools() {
+    let upstream = MockServer::start().await;
+    let mut fixture = response_usage_fixture_with_uri_contract_and_driver(
+        "generic-via-chat-bridge",
+        upstream.uri(),
+        0,
+        Some("openai-chat-usage-only"),
+        "fake-via-chat",
+    )
+    .await;
+
+    let mut fake_provider = fixture
+        .state
+        .providers
+        .get(crate::oauth::managed::kimi::PROVIDER_DRIVER)
+        .expect("Kimi supplies a complete provider capability fixture")
+        .clone();
+    fake_provider.id = "fake-via-chat".into();
+    fake_provider.display_name = "Fake Responses-via-Chat provider".into();
+    fixture.state.providers.extend([fake_provider]).unwrap();
+
+    let auth = header_matcher("authorization", "Bearer compatibility-upstream-secret");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(auth.clone())
+        .and(body_partial_json(json!({
+            "model": fixture.model,
+            "messages": [{"role":"user"}],
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "fake-buffered",
+            "choices": [{
+                "index": 0,
+                "message": {"role":"assistant","tool_calls":[{
+                    "id":"followup-call",
+                    "type":"function",
+                    "function":{"name":"collaboration__followup_task","arguments":r#"{"message":"follow up"}"#}
+                }]},
+                "finish_reason":"tool_calls"
+            }],
+            "usage": {"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let buffered = send_response_usage_request(
+        &fixture,
+        &json!({
+            "model": fixture.model,
+            "input": "buffered delegated task",
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+            ]}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered_body: Value = serde_json::from_slice(
+        &to_bytes(buffered.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(buffered_body["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call"
+                && item["name"] == "followup_task"
+                && item["namespace"] == "collaboration"
+        })
+    }));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(auth)
+        .and(body_partial_json(json!({
+            "model": fixture.model,
+            "stream": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            [
+                format!(
+                    "data: {}\n\n",
+                    json!({"id":"fake-stream","created":7,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"spawn-call","function":{"name":"collaboration__spawn_agent","arguments":r#"{"message":"spawn task"}"#}}]},"finish_reason":null}],"usage":null})
+                ),
+                format!(
+                    "data: {}\n\n",
+                    json!({"id":"fake-stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null})
+                ),
+                format!(
+                    "data: {}\n\n",
+                    json!({"id":"fake-stream","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
+                ),
+                "data: [DONE]\n\n".into(),
+            ]
+            .concat(),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let streamed = send_response_usage_request(
+        &fixture,
+        &json!({
+            "model": fixture.model,
+            "input": "stream delegated task",
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+            ]}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let streamed_body = String::from_utf8(
+        to_bytes(streamed.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(streamed_body.contains("response.function_call_arguments.done"));
+    assert!(streamed_body.contains("response.completed"));
+    assert!(streamed_body.contains(r#""name":"spawn_agent""#));
+    assert!(streamed_body.contains(r#""namespace":"collaboration""#));
     upstream.verify().await;
 }
 

@@ -83,14 +83,12 @@ pub struct GenerationAdapterContribution {
 }
 
 /// Fixed reasoning metadata accepted by the Codex model-directory contract.
-/// Descriptions are optional because a conservative intersection may retain
-/// an effort while the provider descriptions differ.
+/// Codex 0.154 requires a non-empty description for every advertised effort.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodexReasoningLevel {
     pub effort: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: String,
 }
 
 /// Versioned, non-secret model-directory capabilities contributed by a
@@ -179,7 +177,10 @@ impl RequestCompatibility {
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
-        self.third_party && self.codex_multi_agent_v2
+        // Third-party MultiAgentV2 is executable only through an explicitly
+        // declared Responses-via-Chat transport. Native Codex has its own
+        // upstream Responses transport and does not use this predicate.
+        self.third_party && self.codex_multi_agent_v2 && self.responses_via_chat_v1
     }
 }
 
@@ -621,27 +622,23 @@ impl ProviderCatalog {
             supported_reasoning_levels: vec![
                 CodexReasoningLevel {
                     effort: "low".to_owned(),
-                    description: Some("Fast responses with lighter reasoning".to_owned()),
+                    description: "Fast responses with lighter reasoning".to_owned(),
                 },
                 CodexReasoningLevel {
                     effort: "medium".to_owned(),
-                    description: Some(
-                        "Balances speed and reasoning depth for everyday tasks".to_owned(),
-                    ),
+                    description: "Balances speed and reasoning depth for everyday tasks".to_owned(),
                 },
                 CodexReasoningLevel {
                     effort: "high".to_owned(),
-                    description: Some("Greater reasoning depth for complex problems".to_owned()),
+                    description: "Greater reasoning depth for complex problems".to_owned(),
                 },
                 CodexReasoningLevel {
                     effort: "xhigh".to_owned(),
-                    description: Some("Extra high reasoning depth for complex problems".to_owned()),
+                    description: "Extra high reasoning depth for complex problems".to_owned(),
                 },
                 CodexReasoningLevel {
                     effort: "max".to_owned(),
-                    description: Some(
-                        "Maximum reasoning depth for the hardest problems".to_owned(),
-                    ),
+                    description: "Maximum reasoning depth for the hardest problems".to_owned(),
                 },
             ],
             default_reasoning_level: Some("medium".to_owned()),

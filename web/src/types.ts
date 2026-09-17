@@ -707,7 +707,7 @@ export interface ProviderType {
     include_apps_usage_instructions?: boolean;
     supported_reasoning_levels?: Array<{
       effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
-      description?: string;
+      description: string;
     }>;
     default_reasoning_level?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null;
   };
