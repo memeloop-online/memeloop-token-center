@@ -439,7 +439,10 @@ async fn prepare_inner(
                 // seeded rendezvous tier. Others preserve plugin plan order.
                 sort_execution_candidates(selection_seed, &mut plan.candidates);
                 for (position, execution) in plan.candidates.into_iter().enumerate() {
-                    let directive = execution.directive;
+                    let crate::plugin::routing::GroupRoutingExecutionDirective {
+                        directive,
+                        transient_policy,
+                    } = execution;
                     let candidate = planned_candidate(&input, &directive)
                         .expect("validated exact candidate permutation")
                         .clone();
@@ -481,7 +484,7 @@ async fn prepare_inner(
                                 config: config.clone(),
                                 candidate,
                                 directive,
-                                transient_policy: execution.transient_policy,
+                                transient_policy,
                                 transient_signal_enabled: plugin_is_v2,
                                 transient_signal: frozen_signal,
                             },
