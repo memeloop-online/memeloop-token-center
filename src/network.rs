@@ -754,6 +754,11 @@ fn embedded_ipv4(high: u16, low: u16) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
 
     #[test]
     fn upstream_api_url_accepts_origin_and_versioned_api_bases() {
@@ -844,6 +849,55 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn no_retry_config_client_does_not_replay_an_accepted_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_server = attempts.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tokio::pin!(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        attempts_for_server.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        drop(stream);
+                    }
+                }
+            }
+        });
+        let shared = crate::build_http_client().unwrap();
+        let endpoint = format!("http://{address}");
+        let config = serde_json::json!({
+            "base_url": endpoint,
+            "network_scope": "public"
+        });
+        let client = client_for_config_url_no_retry(
+            &shared,
+            config["base_url"].as_str().unwrap(),
+            &config,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let result = client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let _ = shutdown_tx.send(());
+        server.await.unwrap();
     }
 
     #[tokio::test]
