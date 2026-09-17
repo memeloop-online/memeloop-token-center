@@ -1,6 +1,6 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
 import { requestOutcome } from '../../requestStatusPresentation.js';
-import { requestUsageIsActual } from '../../requestTablePresentation.js';
+import { requestDisplayedCost, requestUsageIsActual } from '../../requestTablePresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -64,9 +64,15 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
       if (Number.isFinite(request.input_tokens)) totalTokens += request.input_tokens;
       if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
     }
+    // Local settlement amounts follow the shared displayed-cost policy: failed
+    // requests without observed supplier usage settle at zero regardless of any
+    // nonzero historic ledger amount. The policy amount is only parsed when a
+    // currency is recorded, and totals stay grouped per currency.
     const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
-    const cost = currency ? Number(request.cost) : NaN;
-    if (currency && Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
+    if (currency) {
+      const cost = Number(requestDisplayedCost(request));
+      if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
+    }
     const outcome = requestOutcome(request);
     if (outcome === 'running' || outcome === 'delivering') {
       running += 1;

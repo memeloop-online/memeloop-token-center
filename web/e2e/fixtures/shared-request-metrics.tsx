@@ -14,7 +14,7 @@ const base: RequestView = { request_id: 'running', created_at: start, completed_
 const requests: RequestView[] = [
   { ...base, input_tokens: 120, output_tokens: 30 },
   { ...base, request_id: 'success', created_at: start + 30_000, completed_at: start + 50_000, status_code: 200, duration_ms: 20_000, input_tokens: 200, output_tokens: 100, usage_basis: 'provider_reported', currency: 'USD', cost: '1.50' },
-  { ...base, request_id: 'failure', created_at: start + 60_000, completed_at: start + 90_000, status_code: 502, duration_ms: 30_000, input_tokens: 40, output_tokens: 10, usage_basis: 'provider_reported', currency: 'EUR', cost: '0.25' },
+  { ...base, request_id: 'failure', created_at: start + 60_000, completed_at: start + 90_000, status_code: 502, duration_ms: 30_000, input_tokens: 40, output_tokens: 10, usage_basis: 'not_observed', currency: 'EUR', cost: '0.25' },
 ];
 window.fetch = async input => {
   const path = new URL(String(input), location.origin).pathname;
