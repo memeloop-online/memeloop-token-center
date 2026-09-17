@@ -419,7 +419,7 @@ async fn terminal_cost_policy_flows_into_request_aggregates_without_rewriting_se
         .fetch_one(&fixture.database.pool)
         .await
         .unwrap();
-        let expected_status = if status_code >= 200 && status_code < 400 && error_code.is_none() {
+        let expected_status = if (200..400).contains(&status_code) && error_code.is_none() {
             "success"
         } else {
             "failure"
