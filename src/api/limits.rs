@@ -14,8 +14,7 @@ pub(super) const MAX_AUDIO_RESPONSE_BODY: usize = 4 * 1024 * 1024;
 // Codex can legitimately emit a single Responses event containing a large
 // tool payload. Keep the event ceiling aligned with the separately bounded
 // per-network-chunk framing product so valid events are not cut off at 256 KiB.
-pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize =
-    MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
+pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize = MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
 // Bound decoder products independently of the 64 MiB response budget. This
 // prevents tiny legal events or fields from multiplying frame metadata,
 // archive batching, and JSON classification work before downstream
