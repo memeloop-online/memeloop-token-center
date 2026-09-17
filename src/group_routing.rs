@@ -192,6 +192,9 @@ impl CandidatePolicy {
         core.min(snapshot.started + Duration::from_millis(self.directive.recovery_wait_ms))
     }
     pub(crate) fn active_transient_policy(&self) -> Option<GroupRoutingTransientPolicy> {
+        if self.candidate.health != GroupRoutingHealth::Transient {
+            return None;
+        }
         self.transient_policy.filter(|policy| policy.is_active())
     }
 }

@@ -558,7 +558,16 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 directive
                     .as_ref()
                     .and_then(|entry| entry.transient_policy)
-                    .filter(|policy| policy.is_active()),
+                    .filter(|policy| {
+                        policy.is_active()
+                            && state.group_routing.as_ref().is_some_and(|snapshot| {
+                                snapshot.active_transient_policy(
+                                    route_id,
+                                    upstream_account_id,
+                                    credential_generation,
+                                ) == Some(*policy)
+                            })
+                    }),
                 signal,
                 lease_token,
             ) && !signal.should_recover(policy.recover_micros, policy.min_probe_successes)
