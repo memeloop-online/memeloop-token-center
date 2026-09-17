@@ -1,16 +1,27 @@
 use super::super::*;
 
-async fn insert_completed_session_request(
-    database: &Database,
-    key: &AuthenticatedKey,
-    price: &ModelPrice,
-    model: &str,
-    session_id: &str,
+struct CompletedSessionRequest<'a> {
+    key: &'a AuthenticatedKey,
+    price: &'a ModelPrice,
+    model: &'a str,
+    session_id: &'a str,
     upstream_account_id: Uuid,
     status_code: i64,
-    error_code: Option<&str>,
+    error_code: Option<&'a str>,
     observed_at: i64,
-) {
+}
+
+async fn insert_completed_session_request(database: &Database, input: CompletedSessionRequest<'_>) {
+    let CompletedSessionRequest {
+        key,
+        price,
+        model,
+        session_id,
+        upstream_account_id,
+        status_code,
+        error_code,
+        observed_at,
+    } = input;
     let request_id = Uuid::now_v7();
     database
         .start_proxy_request(StartProxyRequest {
@@ -102,14 +113,16 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
 
     insert_completed_session_request(
         &database,
-        &key,
-        &price,
-        model,
-        session_id,
-        failed_account,
-        502,
-        Some("upstream_transport_connection_reset"),
-        observed_at,
+        CompletedSessionRequest {
+            key: &key,
+            price: &price,
+            model,
+            session_id,
+            upstream_account_id: failed_account,
+            status_code: 502,
+            error_code: Some("upstream_transport_connection_reset"),
+            observed_at,
+        },
     )
     .await;
     assert_eq!(
@@ -124,14 +137,16 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
     // session still retains its own latest terminal ordering evidence.
     insert_completed_session_request(
         &database,
-        &key,
-        &price,
-        model,
-        "unrelated-successful-session",
-        recovered_account,
-        200,
-        None,
-        observed_at + 1,
+        CompletedSessionRequest {
+            key: &key,
+            price: &price,
+            model,
+            session_id: "unrelated-successful-session",
+            upstream_account_id: recovered_account,
+            status_code: 200,
+            error_code: None,
+            observed_at: observed_at + 1,
+        },
     )
     .await;
     assert_eq!(
@@ -146,14 +161,16 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
     // rather than retaining stale failure evidence.
     insert_completed_session_request(
         &database,
-        &key,
-        &price,
-        model,
-        session_id,
-        recovered_account,
-        200,
-        None,
-        observed_at + 2,
+        CompletedSessionRequest {
+            key: &key,
+            price: &price,
+            model,
+            session_id,
+            upstream_account_id: recovered_account,
+            status_code: 200,
+            error_code: None,
+            observed_at: observed_at + 2,
+        },
     )
     .await;
     assert_eq!(
@@ -166,14 +183,16 @@ async fn latest_explicit_session_transport_502_deprioritizes_only_that_account()
 
     insert_completed_session_request(
         &database,
-        &key,
-        &price,
-        model,
-        session_id,
-        failed_account,
-        502,
-        Some("upstream_invalid_response"),
-        observed_at + 3,
+        CompletedSessionRequest {
+            key: &key,
+            price: &price,
+            model,
+            session_id,
+            upstream_account_id: failed_account,
+            status_code: 502,
+            error_code: Some("upstream_invalid_response"),
+            observed_at: observed_at + 3,
+        },
     )
     .await;
     assert_eq!(
