@@ -43,23 +43,27 @@ fn streaming_upstream_evidence(
     sse_summary: Option<&ResponsesSseSummary>,
     error_code: Option<&str>,
 ) -> StreamingUpstreamEvidence {
-    // These are local resource-policy boundaries, not evidence that the
-    // account or its network path is unhealthy. In particular, tripping an
-    // event ceiling must not cool down the only otherwise healthy account and
-    // turn subsequent independent requests into `upstream_unavailable`.
-    if matches!(
-        transport_error,
-        Some(
-            "upstream_response_event_too_large"
-                | "upstream_response_event_batch_too_large"
-                | "upstream_response_too_large"
-                | "upstream_response_memory_capacity"
-        )
-    ) {
-        return StreamingUpstreamEvidence::Inconclusive;
+    // A local boundary must not erase stronger semantic evidence observed on
+    // an earlier event. Event-limit-derived invalidity is tracked separately
+    // so the boundary alone remains request-scoped and inconclusive.
+    if sse_summary.is_some_and(|summary| summary.independently_observed_protocol_invalid) {
+        return StreamingUpstreamEvidence::InvalidResponse;
     }
     if sse_summary.is_some_and(|summary| summary.observed_protocol_invalid) {
-        return StreamingUpstreamEvidence::InvalidResponse;
+        return transport_error.map_or(StreamingUpstreamEvidence::InvalidResponse, |error| {
+            match super::super::buffered_upstream::upstream_error_health_terminal(error) {
+                UpstreamAttemptTerminal::Inconclusive => StreamingUpstreamEvidence::Inconclusive,
+                _ => StreamingUpstreamEvidence::InvalidResponse,
+            }
+        });
+    }
+    if transport_error.is_some_and(|error| {
+        matches!(
+            super::super::buffered_upstream::upstream_error_health_terminal(error),
+            UpstreamAttemptTerminal::Inconclusive
+        )
+    }) {
+        return StreamingUpstreamEvidence::Inconclusive;
     }
     if matches!(
         transport_error,
@@ -360,6 +364,7 @@ mod tests {
             usage: None,
             usage_invalid: false,
             observed_protocol_invalid,
+            independently_observed_protocol_invalid: observed_protocol_invalid,
             protocol_invalid,
         }
     }
@@ -394,10 +399,12 @@ mod tests {
 
     #[test]
     fn local_resource_boundaries_are_inconclusive_evidence() {
-        let protocol_incomplete = summary(ResponsesSseOutcome::Incomplete, true, true);
+        let mut boundary_derived = summary(ResponsesSseOutcome::Incomplete, true, true);
+        boundary_derived.independently_observed_protocol_invalid = false;
         for error in [
             "upstream_response_event_too_large",
             "upstream_response_event_batch_too_large",
+            "upstream_response_terminal_too_large",
             "upstream_response_too_large",
             "upstream_response_memory_capacity",
         ] {
@@ -405,12 +412,26 @@ mod tests {
                 streaming_upstream_evidence(
                     false,
                     Some(error),
-                    Some(&protocol_incomplete),
+                    Some(&boundary_derived),
                     Some(error)
                 ),
                 StreamingUpstreamEvidence::Inconclusive
             );
         }
+    }
+
+    #[test]
+    fn local_boundary_preserves_prior_semantic_protocol_failure() {
+        let semantic_invalid = summary(ResponsesSseOutcome::Incomplete, true, true);
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                Some("upstream_response_event_batch_too_large"),
+                Some(&semantic_invalid),
+                Some("upstream_response_event_batch_too_large")
+            ),
+            StreamingUpstreamEvidence::InvalidResponse
+        );
     }
 
     #[test]

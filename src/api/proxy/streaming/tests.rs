@@ -176,6 +176,7 @@ fn batch_limit_without_prior_invalidity_has_no_observed_protocol_violation() {
     ));
     let summary = capture.finish_summary();
     assert!(!summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 
@@ -189,6 +190,7 @@ fn batch_limit_preserves_a_prior_semantic_protocol_violation() {
     ));
     let summary = capture.finish_summary();
     assert!(summary.observed_protocol_invalid);
+    assert!(summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 
@@ -202,6 +204,7 @@ fn event_limit_is_observed_protocol_invalidity() {
     ));
     let summary = capture.finish_summary();
     assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
     assert!(summary.protocol_invalid);
 }
 

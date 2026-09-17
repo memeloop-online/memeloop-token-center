@@ -44,6 +44,7 @@ pub(super) struct ResponsesSseCapture {
     response_id: Option<String>,
     invalid: bool,
     observed_protocol_invalid: bool,
+    independently_observed_protocol_invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
     terminal_incomplete: bool,
@@ -89,6 +90,7 @@ pub(super) struct ResponsesSseSummary {
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
+    pub(super) independently_observed_protocol_invalid: bool,
     pub(super) protocol_invalid: bool,
 }
 
@@ -198,6 +200,7 @@ impl ResponsesSseCapture {
             self.finish_delivery_event(bytes, class);
         }
         self.observed_protocol_invalid |= self.invalid;
+        self.independently_observed_protocol_invalid |= self.invalid;
         Ok(())
     }
 
@@ -219,6 +222,7 @@ impl ResponsesSseCapture {
             self.usage_invalid |= usage_invalid;
             self.invalid |= usage_invalid;
             self.observed_protocol_invalid |= usage_invalid;
+            self.independently_observed_protocol_invalid |= usage_invalid;
         }
         if !self.framer.is_complete() {
             self.invalid = true;
@@ -242,6 +246,7 @@ impl ResponsesSseCapture {
             usage: self.usage,
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: self.observed_protocol_invalid,
+            independently_observed_protocol_invalid: self.independently_observed_protocol_invalid,
             protocol_invalid,
         }
     }

@@ -34,7 +34,7 @@ use crate::{
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
     provider::AuthorizedUpstreamCandidate,
 };
-use buffered_upstream::read_bounded_upstream;
+use buffered_upstream::{read_bounded_upstream, upstream_error_health_terminal};
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
@@ -566,7 +566,7 @@ async fn finish_non_sse_proxy_response(
             buffer_phase.finish(error.code(), Some(status.as_u16()), None);
             let result = finish_proxy_failure(buffered_request, error.code()).await;
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::invalid_response())
+                .complete(upstream_error_health_terminal(error.code()))
                 .await;
             return result;
         }
@@ -1609,16 +1609,7 @@ async fn proxy_with_identity_and_conversation_spool(
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
                 upstream_attempt
-                    .complete(
-                        if matches!(
-                            error_code,
-                            "upstream_read_timeout" | "upstream_request_timeout"
-                        ) {
-                            UpstreamAttemptTerminal::Inconclusive
-                        } else {
-                            UpstreamAttemptTerminal::invalid_response()
-                        },
-                    )
+                    .complete(upstream_error_health_terminal(error_code))
                     .await;
                 codex_retry.complete(CodexRetryTerminal::Failed);
                 return result;
@@ -2180,13 +2171,9 @@ async fn execute_component_provider(
         Ok(body) => body,
         Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_response", "component provider request failed");
-            if !matches!(
-                error,
-                buffered_upstream::BoundedUpstreamError::MemoryCapacity
-            ) && let Some(attempt) = upstream_attempt.as_mut()
-            {
+            if let Some(attempt) = upstream_attempt.as_mut() {
                 attempt
-                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .complete(upstream_error_health_terminal(error.code()))
                     .await;
             }
             return finish_component_provider_failure(&request, error.code()).await;
