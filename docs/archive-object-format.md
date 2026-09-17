@@ -54,9 +54,9 @@ version/ETag where the backend provides them.
    upstream request bytes remain unchanged. Unknown fields and non-JSON bodies
    retain their original bytes; the policy does not guess from entropy or
    redact ordinary tool fields named `data`, `b64_json` or
-   `encrypted_content`. Ambiguous duplicate-key JSON is retained only as
-   metadata because its exact bytes can contain a value hidden by normal JSON
-   object projection.
+   `encrypted_content`. Ambiguous duplicate-key requests are rejected before
+   dispatch; duplicate-key upstream JSON is retained only as metadata because
+   its exact bytes can contain a value hidden by normal JSON object projection.
 3. Historical recompression must write a new object, verify original
    length/digest, CAS-bind the new locator, and reclaim the old object only
    through lease/reference-safe GC. It is not part of enabling new writes.
