@@ -397,6 +397,22 @@ impl Database {
         } else {
             None
         };
+        if matches!(self.backend, DatabaseBackend::PostgreSql)
+            && let Some(request_created_at) = request_created_at
+        {
+            sqlx::query(
+                "SELECT id FROM request_records WHERE id = $1 AND created_at = $2 FOR UPDATE",
+            )
+            .bind(&request_id)
+            .bind(request_created_at)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        }
+        // Conversation reconciliation may merge session projections later in this transaction.
+        // The request row is locked first to match terminal writers and source-pruning maintenance;
+        // take the statistics lock before any conversation advisory or row lock after that.
+        lock_request_stats_projection_in_transaction(transaction).await?;
 
         if matches!(self.backend, DatabaseBackend::PostgreSql)
             && let Some(session_id) = hints.session_id.as_deref()
@@ -1406,6 +1422,9 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
+    // This path can reconcile clusters and merge their session projections. Acquire the shared
+    // statistics lock before reading or locking conversation state to preserve the global order.
+    lock_request_stats_projection_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()
         || upstream_response_id.len() > 256

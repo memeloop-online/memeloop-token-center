@@ -203,6 +203,7 @@ async fn project_metered_request_fact_in_transaction(
     request_id: &str,
     project_session_rollups: bool,
 ) -> Result<(), AppError> {
+    lock_request_stats_projection_in_transaction(transaction).await?;
     sqlx::query(
         "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, status_class, error_code, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + excluded.requests, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
     )

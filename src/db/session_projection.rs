@@ -29,6 +29,7 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     request_id: &str,
 ) -> Result<(), AppError> {
+    lock_request_stats_projection_in_transaction(tx).await?;
     sqlx::query(
         r#"INSERT INTO session_usage_totals (
                tenant_id, key_id, session_id, currency, last_activity_at,
@@ -110,6 +111,7 @@ pub(crate) async fn reclassify_request_session_in_transaction(
     tx: &mut Transaction<'_, Any>,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
+    lock_request_stats_projection_in_transaction(tx).await?;
     let request_id = request_id.to_string();
     let row = sqlx::query(
         r#"SELECT fact.tenant_id, fact.key_id, fact.session_id, fact.created_at,
@@ -191,6 +193,7 @@ pub(crate) async fn merge_request_session_projection_in_transaction(
     source_session_id: &str,
     target_session_id: &str,
 ) -> Result<(), AppError> {
+    lock_request_stats_projection_in_transaction(tx).await?;
     if source_session_id == target_session_id {
         return Ok(());
     }
@@ -408,6 +411,7 @@ pub(crate) async fn rebuild_request_session_projection_in_transaction(
     key_id: &str,
     session_id: &str,
 ) -> Result<(), AppError> {
+    lock_request_stats_projection_in_transaction(tx).await?;
     for table in [
         "session_usage_totals",
         "session_usage_hourly",

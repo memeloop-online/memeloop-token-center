@@ -11,6 +11,7 @@ pub(super) async fn aggregate_terminal_generation_job(
     job_id: &str,
     now: i64,
 ) -> Result<(), AppError> {
+    super::super::lock_request_stats_projection_in_transaction(transaction).await?;
     let claimed = sqlx::query(
         "UPDATE generation_jobs SET stats_aggregated_at = $1 WHERE id = $2 AND stats_aggregated_at IS NULL AND status IN ('succeeded', 'failed', 'cancelled')",
     )

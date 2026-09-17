@@ -135,6 +135,7 @@ impl Database {
         }
 
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_in_transaction(&mut transaction).await?;
         let candidates = select_candidates(
             &mut transaction,
             self.backend,
@@ -769,7 +770,7 @@ mod tests {
                 .await
                 .unwrap();
         let reservation_cost: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(actual_micros), 0) FROM usage_reservations WHERE key_id = $1",
+            "SELECT CAST(COALESCE(SUM(actual_micros), 0) AS BIGINT) FROM usage_reservations WHERE key_id = $1",
         )
         .bind(fixture.key.key_id.to_string())
         .fetch_one(&fixture.database.pool)
@@ -795,8 +796,9 @@ mod tests {
             "session_usage_hourly",
             "session_usage_daily",
         ] {
-            let statement =
-                format!("SELECT COALESCE(SUM(cost_micros), 0) FROM {table} WHERE key_id = $1");
+            let statement = format!(
+                "SELECT CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) FROM {table} WHERE key_id = $1"
+            );
             costs.push(
                 sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
                     .bind(fixture.key.key_id.to_string())
@@ -912,6 +914,230 @@ mod tests {
         );
     }
 
+    async fn wait_for_postgres_blocker(observer: &AnyPool, waiter_pid: i32, blocker_pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active' AND wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(waiter_pid)
+                .bind(blocker_pid)
+                .fetch_one(observer)
+                .await
+                .unwrap();
+                if waiting {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backfill did not wait for the request statistics writer lock");
+    }
+
+    async fn exercise_postgres_projection_serialization(
+        fixture: &Fixture,
+        database_url: &str,
+        observer: &AnyPool,
+    ) {
+        seed_historical_case(
+            fixture,
+            503,
+            None,
+            Some(RequestUsageBasis::ProviderEstimated),
+        )
+        .await;
+        let writer_request_id = Uuid::now_v7();
+        let writer = Database::connect_with_max(database_url, 1).await.unwrap();
+        let reservation = writer
+            .start_proxy_request(StartProxyRequest {
+                request_id: writer_request_id,
+                key: &fixture.key,
+                price: &fixture.price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai",
+                model: &fixture.model,
+                request_object: "gap://failed-cost-backfill/concurrent-writer/request",
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+
+        let mut lock_bytes = [0_u8; 8];
+        lock_bytes.copy_from_slice(&writer_request_id.as_bytes()[8..]);
+        let pause_lock = i64::from_be_bytes(lock_bytes) & i64::MAX;
+        let pause_function = format!(
+            "CREATE FUNCTION mtc_pause_failed_cost_writer() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock({pause_lock}); RETURN NEW; END $$"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(pause_function))
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER mtc_pause_failed_cost_writer AFTER INSERT ON request_stats_facts FOR EACH ROW EXECUTE FUNCTION mtc_pause_failed_cost_writer()",
+        )
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+
+        let gate = Database::connect_with_max(database_url, 1).await.unwrap();
+        let mut gate_tx = gate.begin_write_transaction().await.unwrap();
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate_tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(pause_lock)
+            .execute(&mut *gate_tx)
+            .await
+            .unwrap();
+
+        let writer_tenant_id = fixture.key.tenant_id;
+        let writer_task = tokio::spawn(async move {
+            let response_object = "gap://failed-cost-backfill/concurrent-writer/response";
+            writer
+                .finish_proxy_request(FinishProxyRequest {
+                    usage_basis: Some(RequestUsageBasis::ProviderReported),
+                    first_output_ms: None,
+                    generation_duration_ms: None,
+                    request_id: writer_request_id,
+                    tenant_id: writer_tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 10,
+                    output_token_ceiling: 10,
+                    requested_service_tier: None,
+                    status_code: 503,
+                    duration_ms: 25,
+                    usage: TokenUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        ..TokenUsage::default()
+                    },
+                    error_code: None,
+                    response_object,
+                    routing_session_id: None,
+                    routing_terminal_observed_at: None,
+                    conversation: None,
+                })
+                .await
+        });
+        wait_for_postgres_blocker(observer, writer_pid, gate_pid).await;
+
+        let backfill = Database::connect_with_max(database_url, 1).await.unwrap();
+        let waiter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&backfill.pool)
+            .await
+            .unwrap();
+        let backfill_task = tokio::spawn(async move {
+            backfill
+                .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                    apply: true,
+                    batch_size: 1,
+                    after: None,
+                })
+                .await
+        });
+        wait_for_postgres_blocker(observer, waiter_pid, writer_pid).await;
+        gate_tx.commit().await.unwrap();
+        let writer_result = writer_task.await.unwrap().unwrap();
+        let writer_cost = match writer_result {
+            FinishProxyRequestResult::Finished { cost_micros, .. }
+            | FinishProxyRequestResult::AlreadyFinished { cost_micros, .. } => cost_micros,
+        };
+        let report = backfill_task.await.unwrap().unwrap();
+        assert_eq!(report.changed_rows, 1);
+        assert!(
+            aggregate_costs(fixture)
+                .await
+                .into_iter()
+                .all(|cost| cost == writer_cost)
+        );
+        sqlx::query("DROP TRIGGER mtc_pause_failed_cost_writer ON request_stats_facts")
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION mtc_pause_failed_cost_writer()")
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+
+        seed_historical_case(
+            fixture,
+            503,
+            None,
+            Some(RequestUsageBasis::ProviderEstimated),
+        )
+        .await;
+        seed_historical_case(
+            fixture,
+            503,
+            None,
+            Some(RequestUsageBasis::ProviderEstimated),
+        )
+        .await;
+        let gate = Database::connect_with_max(database_url, 1).await.unwrap();
+        let mut gate_tx = gate.begin_write_transaction().await.unwrap();
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *gate_tx)
+            .await
+            .unwrap();
+        lock_request_stats_projection_in_transaction(&mut gate_tx)
+            .await
+            .unwrap();
+        let first = Database::connect_with_max(database_url, 1).await.unwrap();
+        let second = Database::connect_with_max(database_url, 1).await.unwrap();
+        let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&first.pool)
+            .await
+            .unwrap();
+        let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&second.pool)
+            .await
+            .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_task = tokio::spawn(async move {
+            first_barrier.wait().await;
+            first
+                .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                    apply: true,
+                    batch_size: 1,
+                    after: None,
+                })
+                .await
+        });
+        let second_barrier = barrier.clone();
+        let second_task = tokio::spawn(async move {
+            second_barrier.wait().await;
+            second
+                .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                    apply: true,
+                    batch_size: 1,
+                    after: None,
+                })
+                .await
+        });
+        barrier.wait().await;
+        wait_for_postgres_blocker(observer, first_pid, gate_pid).await;
+        wait_for_postgres_blocker(observer, second_pid, gate_pid).await;
+        gate_tx.commit().await.unwrap();
+        let first_report = first_task.await.unwrap().unwrap();
+        let second_report = second_task.await.unwrap().unwrap();
+        assert_eq!(first_report.changed_rows + second_report.changed_rows, 2);
+        assert!(
+            aggregate_costs(fixture)
+                .await
+                .into_iter()
+                .all(|cost| cost == writer_cost)
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_backfill_is_bounded_resumable_idempotent_and_rebuilds_from_facts() {
         let directory = tempfile::tempdir().unwrap();
@@ -1013,7 +1239,11 @@ mod tests {
             .append_pair("options", &format!("-c search_path={schema}"));
         let fixture = fixture(isolated.as_str(), None).await;
         exercise_backfill(&fixture).await;
+        let concurrency_fixture = fixture(isolated.as_str(), None).await;
+        exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
+            .await;
         fixture.database.close().await;
+        concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await

@@ -71,6 +71,7 @@ mod plugin_installations;
 mod plugin_kv;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;
+mod projection_lock;
 mod providers;
 mod requests;
 mod rotation;
@@ -86,6 +87,7 @@ mod usage_analysis;
 mod validation;
 
 use constants::*;
+pub(crate) use projection_lock::lock_request_stats_projection_in_transaction;
 use rotation::*;
 use rows::generation_asset_download;
 pub use session_analytics::LogicalSessionListFilter;
