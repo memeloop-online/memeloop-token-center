@@ -188,7 +188,16 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
         .unwrap();
 
     const REQUESTS: usize = 1024;
+    // Exercise substantially more work than the connection pool can hold, but
+    // keep active transactions below the 64-connection pool. Releasing all
+    // 1024 tasks directly into pool acquisition makes the assertion depend on
+    // runner I/O completing the global event-cursor queue before SQLx's pool
+    // timeout; a pool timeout is not evidence about metered-unlimited budget
+    // isolation. The test remains strict: every request is admitted exactly
+    // once, with 48 admissions or settlements running concurrently.
+    const MAX_IN_FLIGHT: usize = 48;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let admission_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut admissions = Vec::with_capacity(REQUESTS);
     for index in 0..REQUESTS {
         let database = database.clone();
@@ -196,10 +205,12 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
         let price = price.clone();
         let model = model.clone();
         let barrier = barrier.clone();
+        let admission_limit = admission_limit.clone();
         admissions.push(tokio::spawn(async move {
             let request_id = Uuid::now_v7();
             let request_object = format!("objects/blake3/metered-unlimited-request-{index}");
             barrier.wait().await;
+            let _permit = admission_limit.acquire_owned().await.unwrap();
             let reservation = database
                 .start_proxy_request(StartProxyRequest {
                     request_id,
@@ -244,13 +255,16 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
     assert_eq!(admission_state, (REQUESTS as i64, 0, 0, 0, 0));
 
     let finish_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let finish_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut finishes = Vec::with_capacity(REQUESTS);
     for (request_id, reservation) in admitted {
         let database = database.clone();
         let finish_barrier = finish_barrier.clone();
+        let finish_limit = finish_limit.clone();
         let tenant_id = key.tenant_id;
         finishes.push(tokio::spawn(async move {
             finish_barrier.wait().await;
+            let _permit = finish_limit.acquire_owned().await.unwrap();
             database
                 .finish_proxy_request(FinishProxyRequest {
                     usage_basis: None,
