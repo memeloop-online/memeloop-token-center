@@ -47,15 +47,16 @@ version/ETag where the backend provides them.
    garbage collection, and old/new dual reads. Existing semantic atoms are
    normalized and cannot reconstruct exact JSON whitespace, SSE framing, or
    opaque fields. They must not replace the raw byte contract implicitly.
-2. Encrypted/opaque non-retention is an explicit protocol/provider policy, not
-   entropy sniffing or a JSON-parse-failure fallback. The current Codex adapter
-   explicitly requests `reasoning.encrypted_content`; response.metadata is
-   already treated as opaque by the Responses sanitizer. A follow-up should
-   enumerate typed encrypted fields and use an explicit `archive_mode =
-   metadata_only` decision for whole-body retention, preserving delivery,
-   billing, source IDs and an honest non-retained detail state. Unknown bodies
-   remain unchanged until such a policy exists; this PR does not claim they
-   have been removed.
+2. Text proxy archives apply a typed retention policy before encryption:
+   encrypted fields inside explicit reasoning/encrypted protocol envelopes,
+   inline image/audio/video data URLs, and typed media body fields become
+   bounded metadata markers. Delivery, billing, conversation projection and
+   upstream request bytes remain unchanged. Unknown fields and non-JSON bodies
+   retain their original bytes; the policy does not guess from entropy or
+   redact ordinary tool fields named `data`, `b64_json` or
+   `encrypted_content`. Ambiguous duplicate-key requests are rejected before
+   dispatch; duplicate-key upstream JSON is retained only as metadata because
+   its exact bytes can contain a value hidden by normal JSON object projection.
 3. Historical recompression must write a new object, verify original
    length/digest, CAS-bind the new locator, and reclaim the old object only
    through lease/reference-safe GC. It is not part of enabling new writes.

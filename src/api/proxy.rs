@@ -15,6 +15,7 @@ pub(crate) async fn classify_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
+mod archive_retention;
 mod buffered_upstream;
 mod chat_sse_usage;
 mod conversation_hints;
@@ -920,7 +921,7 @@ async fn proxy_with_identity_and_conversation_spool(
         return Err(AppError::Overloaded);
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = serde_json::from_slice(&body)
+    let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     json_parse.finish("completed", None, Some(body.len()));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
@@ -1067,6 +1068,25 @@ async fn proxy_with_identity_and_conversation_spool(
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
+    let retained_request_json = archive_retention::prepare_request_json(original_request_json);
+    let archive_output_memory = if let Some(retained) = retained_request_json.as_ref() {
+        let Some(reservation) =
+            memory.try_reserve_archive_output(archive_retention::encoded_json_len(retained))
+        else {
+            state
+                .metrics
+                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
+            return Err(AppError::Overloaded);
+        };
+        Some(reservation)
+    } else {
+        None
+    };
+    let archive_request_body = retained_request_json.as_ref().map_or_else(
+        || body.clone(),
+        |retained| archive_retention::encode_json_body(&body, retained),
+    );
+    drop(retained_request_json);
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
@@ -1086,7 +1106,7 @@ async fn proxy_with_identity_and_conversation_spool(
                 upstream_account_id,
                 model_route_id,
             },
-            &body,
+            &archive_request_body,
             state.config.key_pepper.as_bytes(),
             state.config.archive_spool_compression_enabled,
         )
@@ -1094,12 +1114,18 @@ async fn proxy_with_identity_and_conversation_spool(
     {
         Ok(reservation) => reservation,
         Err(error) => {
-            admission.finish(error.diagnostic_category(), None, Some(body.len()));
+            admission.finish(
+                error.diagnostic_category(),
+                None,
+                Some(archive_request_body.len()),
+            );
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
     };
-    admission.finish("completed", None, Some(body.len()));
+    admission.finish("completed", None, Some(archive_request_body.len()));
+    drop(archive_request_body);
+    drop(archive_output_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -1114,7 +1140,6 @@ async fn proxy_with_identity_and_conversation_spool(
         client_name,
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
-    drop(original_request_json);
     drop(request_capture_memory);
     memory.release(
         body.len(),
@@ -2419,30 +2444,52 @@ async fn finish_buffered_request_with_upstream_attribution(
     // Seal the independent response spool in the terminal transaction. Only
     // its durable ACK gates delivery, never an object-store upload.
     let capture_started = Instant::now();
-    let response_capture_memory = request.state.metrics.memory_usage(
-        crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
-    );
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
-    let response_archive = if request.memory.has_buffered_response()
+    let base_capture_bytes = body.len().max(256);
+    let response_capture_admitted = request.memory.has_buffered_response()
         || response_capture_permit.try_grow(
-            body.len(),
+            base_capture_bytes,
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        ) {
-        BufferedArchive::new(
-            crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id: request.tenant_id,
-                reservation_id: request.reservation.id,
-            },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            &body,
-            request.state.config.key_pepper.as_bytes(),
-            request.state.config.archive_spool_compression_enabled,
+        );
+    let response_capture_memory = response_capture_admitted.then(|| {
+        request.state.metrics.memory_usage(
+            crate::metrics::MemoryComponent::StreamCapture,
+            base_capture_bytes.saturating_mul(3),
         )
+    });
+    let archive_body = if response_capture_admitted {
+        let retained_response_json = archive_retention::prepare_json_body_if_valid(&body);
+        let encoded_len = retained_response_json
+            .as_ref()
+            .map_or(body.len(), archive_retention::encoded_json_len);
+        let extra_output_bytes = encoded_len.saturating_sub(base_capture_bytes);
+        if extra_output_bytes > 0 && !response_capture_permit.try_grow(extra_output_bytes, 1) {
+            None
+        } else {
+            Some(retained_response_json.as_ref().map_or_else(
+                || body.clone(),
+                |retained| archive_retention::encode_json_body(&body, retained),
+            ))
+        }
     } else {
-        Err(AppError::Overloaded)
+        None
     };
+    let response_archive = archive_body.as_ref().map_or_else(
+        || Err(AppError::Overloaded),
+        |archive_body| {
+            BufferedArchive::new(
+                crate::db::ArchiveSpoolIdentity {
+                    request_id,
+                    tenant_id: request.tenant_id,
+                    reservation_id: request.reservation.id,
+                },
+                crate::response_archive_spool::BufferedArchivePurpose::Response,
+                archive_body,
+                request.state.config.key_pepper.as_bytes(),
+                request.state.config.archive_spool_compression_enabled,
+            )
+        },
+    );
     let stored_response = format!("gap://{request_id}/response");
     let projection_deadline =
         tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(request.started.elapsed());

@@ -149,7 +149,46 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(crate) struct ArchiveOutputMemory {
+    reservation: Arc<ProxyMemoryReservation>,
+    bytes: usize,
+}
+
+impl Drop for ArchiveOutputMemory {
+    fn drop(&mut self) {
+        self.reservation.release(self.bytes, 1);
+    }
+}
+
 impl ProxyMemoryReservation {
+    pub(crate) fn try_reserve_archive_output(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<ArchiveOutputMemory> {
+        let bytes = bytes.max(256);
+        self.try_grow(bytes, 1).then(|| ArchiveOutputMemory {
+            reservation: self.clone(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn try_reserve_archive_json_transform(
+        self: &Arc<Self>,
+        body: &[u8],
+    ) -> Option<ArchiveOutputMemory> {
+        let nodes = JsonMemoryScanner::default().observe(body);
+        // SSE retention simultaneously owns bounded framing bytes/lines,
+        // joined data, a parsed Value, serialized retained data, and the
+        // reconstructed event. Charge all six byte-sized copies plus tree
+        // nodes before parsing; the producer queue acquires its own permit
+        // when the final Bytes is handed off.
+        let bytes = body
+            .len()
+            .checked_mul(6)?
+            .checked_add(nodes.checked_mul(256)?)?;
+        self.try_reserve_archive_output(bytes)
+    }
+
     /// Snapshot the selected account's policy for this request. Retries cannot
     /// replace its selected queue policy or metrics owner.
     pub(crate) fn configure_admission(
@@ -620,6 +659,43 @@ mod tests {
         assert!(!request.try_grow(64 * 1024 * 1024, REQUEST_MEMORY_WEIGHT));
         assert!(!request.try_grow(usize::MAX, REQUEST_MEMORY_WEIGHT));
         assert!(request.try_grow(1024, REQUEST_MEMORY_WEIGHT));
+    }
+
+    #[test]
+    fn archive_json_transform_is_hard_bounded_and_releases_its_permit() {
+        let budget = ProxyMemoryBudget::new(256 * 1024);
+        let blocker = budget.reservation();
+        assert!(blocker.try_grow(256 * 1024, 1));
+        let archive = budget.reservation();
+        assert!(
+            archive
+                .try_reserve_archive_json_transform(br#"{"data":"data:image/x,"}"#)
+                .is_none()
+        );
+        drop(blocker);
+        let permit = archive
+            .try_reserve_archive_json_transform(br#"{"data":"data:image/x,"}"#)
+            .expect("archive transform fits after capacity is released");
+        assert!(budget.snapshot().0 > 0);
+        drop(permit);
+        drop(archive);
+        assert_eq!(budget.snapshot().0, 0);
+
+        let large_frame = vec![b'x'; 64 * 1024];
+        let insufficient = ProxyMemoryBudget::new(6 * 64 * 1024);
+        assert!(
+            insufficient
+                .reservation()
+                .try_reserve_archive_json_transform(&large_frame)
+                .is_none()
+        );
+        let sufficient = ProxyMemoryBudget::new(8 * 64 * 1024);
+        assert!(
+            sufficient
+                .reservation()
+                .try_reserve_archive_json_transform(&large_frame)
+                .is_some()
+        );
     }
 
     #[test]
