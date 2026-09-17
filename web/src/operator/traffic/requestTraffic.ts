@@ -65,9 +65,9 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
       if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
     }
     // Local settlement amounts follow the shared displayed-cost policy: failed
-    // requests without observed supplier usage settle at zero regardless of any
-    // nonzero historic ledger amount. The policy amount is only parsed when a
-    // currency is recorded, and totals stay grouped per currency.
+    // requests retain cost only when usage is provider-reported. The policy
+    // amount is only parsed when a currency is recorded, and totals stay grouped
+    // per currency.
     const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
     if (currency) {
       const cost = Number(requestDisplayedCost(request));

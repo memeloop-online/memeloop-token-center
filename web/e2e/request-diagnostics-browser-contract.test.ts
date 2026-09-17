@@ -270,12 +270,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await ceiling.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
     assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/);
     assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
-    const reviewCost = ceiling.getByLabel('Review required', { exact: true });
-    assert.equal(await reviewCost.innerText(), '—');
-    await reviewCost.focus();
-    const ledgerTip = page.getByRole('tooltip').filter({ hasText: 'Local ledger amount:' });
-    await ledgerTip.waitFor();
-    assert.match(await ledgerTip.innerText(), /0\.001234/, 'the original local ledger amount remains inspectable, never rewritten to free');
+    const ceilingCost = ceiling.locator('.request-detail-primary > div').last().locator('span[tabindex="0"]');
+    assert.equal(await ceilingCost.innerText(), '$0.00');
+    await ceilingCost.focus();
+    const ceilingCostTip = page.getByRole('tooltip').filter({ hasText: 'cost is 0' });
+    await ceilingCostTip.waitFor();
 
     await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html?usage-basis=not_observed`);
     const failedUnobservedRow = page.locator('tbody tr').first();
@@ -288,9 +287,9 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.doesNotMatch(await failedUnobservedRow.locator('.request-cost-cell').innerText(), /35/);
     const failedUnobservedCostValue = failedUnobservedRow.locator('.request-cost-cell .request-value-info');
     await failedUnobservedCostValue.focus();
-    const failedUnobservedCostTooltip = page.getByRole('tooltip').filter({ hasText: 'defaults to 0' });
+    const failedUnobservedCostTooltip = page.getByRole('tooltip').filter({ hasText: 'cost is 0' });
     await failedUnobservedCostTooltip.waitFor();
-    assert.match(await failedUnobservedCostTooltip.innerText(), /defaults to 0/);
+    assert.match(await failedUnobservedCostTooltip.innerText(), /cost is 0/);
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);
