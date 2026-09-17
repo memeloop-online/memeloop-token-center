@@ -210,6 +210,9 @@ fn policy(tenant: Uuid, route: Uuid, account: Uuid) -> CandidatePolicy {
             recheck_ms: 100,
             stickiness: false,
         },
+        transient_policy: None,
+        transient_signal_enabled: false,
+        transient_signal: None,
     }
 }
 
@@ -226,7 +229,22 @@ async fn native_fallback_has_no_implicit_controls_and_policy_identity_is_exact()
     let selected = snapshot.policy(route, account, 3).unwrap();
     assert!(!selected.allow_probe());
     assert_eq!(selected.cooldown_ms(), 42);
+    assert!(!snapshot.uses_transient_signal(route, account, 3));
     assert!(snapshot.policy(route, account, 4).is_none());
+
+    let mut hard = policy(snapshot.tenant_id, Uuid::now_v7(), Uuid::now_v7());
+    hard.candidate.health = GroupRoutingHealth::HardQuota;
+    hard.transient_policy = Some(GroupRoutingTransientPolicy {
+        mode: crate::plugin::routing::GroupRoutingTransientPolicyMode::Active,
+        min_samples: 1,
+        open_micros: 1,
+        recover_micros: 0,
+        min_probe_successes: 1,
+    });
+    assert!(
+        hard.active_transient_policy().is_none(),
+        "hard quota recovery remains core-owned"
+    );
     assert!(snapshot.policy(Uuid::now_v7(), account, 3).is_none());
     assert!(snapshot.policy(route, Uuid::now_v7(), 3).is_none());
 }

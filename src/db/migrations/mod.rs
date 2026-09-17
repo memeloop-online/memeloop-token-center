@@ -543,6 +543,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request session routing terminals",
         sql: include_str!("../../../migrations/common/0102_request_session_routing_terminal.sql"),
     },
+    Migration {
+        version: 103,
+        name: "persistent upstream transient health signals",
+        sql: include_str!("../../../migrations/common/0103_upstream_transient_health_signals.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1071,6 +1076,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 102,
         name: "request session routing terminals",
         sql: include_str!("../../../migrations/common/0102_request_session_routing_terminal.sql"),
+    },
+    Migration {
+        version: 103,
+        name: "persistent upstream transient health signals",
+        sql: include_str!("../../../migrations/common/0103_upstream_transient_health_signals.sql"),
     },
 ];
 

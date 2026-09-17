@@ -7,8 +7,9 @@ use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
-        GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth, GroupRoutingInput,
-        GroupRoutingObserveInput, GroupRoutingOutcome,
+        GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
+        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
+        GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
     },
     provider::AuthorizedUpstreamCandidate,
 };
@@ -23,6 +24,10 @@ type BucketMember = (
 );
 type StrategyBuckets = BTreeMap<(std::cmp::Reverse<i32>, String), Vec<BucketMember>>;
 type CandidateKey = (Uuid, Uuid, i64);
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 /// The native/no-hook entrance is synchronous: do not add an unbounded
 /// configuration query before the core scheduling deadline has been frozen.
@@ -68,9 +73,29 @@ fn reserve_native_bucket_ranks(
     start
 }
 
+#[cfg(test)]
 fn sort_plan_candidates(selection_seed: Uuid, directives: &mut [GroupRoutingDirective]) {
     // Stable sort preserves plugin order among non-sticky candidates.
     directives.sort_by_key(|directive| {
+        let rank = if directive.stickiness {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(selection_seed.as_bytes());
+            hasher.update(directive.route_id.as_bytes());
+            hasher.update(directive.account_id.as_bytes());
+            u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().unwrap())
+        } else {
+            0
+        };
+        (!directive.stickiness, rank)
+    });
+}
+
+fn sort_execution_candidates(
+    selection_seed: Uuid,
+    directives: &mut [crate::plugin::routing::GroupRoutingExecutionDirective],
+) {
+    directives.sort_by_key(|entry| {
+        let directive = &entry.directive;
         let rank = if directive.stickiness {
             let mut hasher = blake3::Hasher::new();
             hasher.update(selection_seed.as_bytes());
@@ -93,6 +118,12 @@ pub(crate) struct CandidatePolicy {
     config: serde_json::Value,
     candidate: GroupRoutingCandidate,
     directive: GroupRoutingDirective,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transient_policy: Option<GroupRoutingTransientPolicy>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    transient_signal_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transient_signal: Option<GroupRoutingTransientSignal>,
 }
 
 pub(crate) struct RequestGroupRouting {
@@ -112,9 +143,39 @@ impl RequestGroupRouting {
     ) -> Option<&CandidatePolicy> {
         self.policies.get(&(route, account, generation))
     }
+
+    pub(crate) fn uses_transient_signal(
+        &self,
+        route: Uuid,
+        account: Uuid,
+        generation: i64,
+    ) -> bool {
+        self.policy(route, account, generation)
+            .is_some_and(|policy| policy.transient_signal_enabled)
+    }
+
+    pub(crate) fn active_transient_policy(
+        &self,
+        route: Uuid,
+        account: Uuid,
+        generation: i64,
+    ) -> Option<GroupRoutingTransientPolicy> {
+        self.policy(route, account, generation)
+            .and_then(CandidatePolicy::active_transient_policy)
+    }
 }
 
 impl CandidatePolicy {
+    fn has_valid_transient_snapshot(&self) -> bool {
+        if self.transient_signal_enabled {
+            return self.transient_signal.is_some()
+                && self
+                    .transient_policy
+                    .is_some_and(|policy| policy.is_valid());
+        }
+        self.transient_signal.is_none() && self.transient_policy.is_none()
+    }
+
     pub(crate) fn allow_probe(&self) -> bool {
         self.directive.allow_transient_probe
     }
@@ -130,6 +191,12 @@ impl CandidatePolicy {
         core: tokio::time::Instant,
     ) -> tokio::time::Instant {
         core.min(snapshot.started + Duration::from_millis(self.directive.recovery_wait_ms))
+    }
+    pub(crate) fn active_transient_policy(&self) -> Option<GroupRoutingTransientPolicy> {
+        if self.candidate.health != GroupRoutingHealth::Transient {
+            return None;
+        }
+        self.transient_policy.filter(|policy| policy.is_active())
     }
 }
 
@@ -290,6 +357,8 @@ async fn prepare_inner(
         }
         let config = members[0].2.config.clone();
         let plugin_id = members[0].2.plugin_id.clone();
+        let plugin_is_v2 =
+            state.plugins.group_routing_version(&plugin_id) == Some(GROUP_ROUTING_V2_VERSION);
         let native_health = state.plugins.group_routing_uses_native_health(&plugin_id);
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
@@ -336,6 +405,29 @@ async fn prepare_inner(
             candidates: inputs,
             quota_context,
         };
+        let transient_signals = plugin_is_v2.then(|| {
+            members
+                .iter()
+                .map(|member| {
+                    let candidate = &member.1;
+                    let signal = bindings
+                        .get(&(
+                            candidate.route_id,
+                            candidate.account_id,
+                            candidate.credential_generation,
+                        ))
+                        .expect("bucket members originate from the frozen binding snapshot")
+                        .transient_signal;
+                    GroupRoutingTransientSignal {
+                        sample_count: signal.sample_count.max(0) as u64,
+                        ewma_micros: signal.ewma_micros.clamp(0, 1_000_000) as u32,
+                        last_observed_at: signal.last_observed_at.max(0),
+                        recovery_successes: signal.recovery_successes.max(0) as u64,
+                        revision: signal.revision.max(0) as u64,
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
         let runtime = state.plugins.clone();
         let execute_id = plugin_id.clone();
         let execute_input = input.clone();
@@ -344,7 +436,13 @@ async fn prepare_inner(
             crate::api::plugin_execution::run_group(
                 state.metrics.clone(),
                 crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
-                move || runtime.execute_group_routing_plan(&execute_id, &execute_input),
+                move || {
+                    runtime.execute_group_routing_plan_with_health(
+                        &execute_id,
+                        &execute_input,
+                        transient_signals.as_deref(),
+                    )
+                },
             ),
         )
         .await
@@ -354,8 +452,12 @@ async fn prepare_inner(
             Ok(mut plan) => {
                 // Sticky candidates form a deterministic, tenant/key/session
                 // seeded rendezvous tier. Others preserve plugin plan order.
-                sort_plan_candidates(selection_seed, &mut plan.candidates);
-                for (position, directive) in plan.candidates.into_iter().enumerate() {
+                sort_execution_candidates(selection_seed, &mut plan.candidates);
+                for (position, execution) in plan.candidates.into_iter().enumerate() {
+                    let crate::plugin::routing::GroupRoutingExecutionDirective {
+                        directive,
+                        transient_policy,
+                    } = execution;
                     let candidate = planned_candidate(&input, &directive)
                         .expect("validated exact candidate permutation")
                         .clone();
@@ -366,6 +468,28 @@ async fn prepare_inner(
                     );
                     ranks.insert(key, bucket_rank + position);
                     if !native_health {
+                        let frozen_signal =
+                            bindings.get(&key).filter(|_| plugin_is_v2).map(|binding| {
+                                GroupRoutingTransientSignal {
+                                    sample_count: binding.transient_signal.sample_count.max(0)
+                                        as u64,
+                                    ewma_micros: binding
+                                        .transient_signal
+                                        .ewma_micros
+                                        .clamp(0, 1_000_000)
+                                        as u32,
+                                    last_observed_at: binding
+                                        .transient_signal
+                                        .last_observed_at
+                                        .max(0),
+                                    recovery_successes: binding
+                                        .transient_signal
+                                        .recovery_successes
+                                        .max(0)
+                                        as u64,
+                                    revision: binding.transient_signal.revision.max(0) as u64,
+                                }
+                            });
                         policies.insert(
                             key,
                             CandidatePolicy {
@@ -375,6 +499,9 @@ async fn prepare_inner(
                                 config: config.clone(),
                                 candidate,
                                 directive,
+                                transient_policy,
+                                transient_signal_enabled: plugin_is_v2,
+                                transient_signal: frozen_signal,
                             },
                         );
                     }
@@ -408,14 +535,15 @@ async fn prepare_inner(
     Ok(())
 }
 
-pub(crate) async fn observe(
+pub(crate) async fn observe_with_signal(
     state: &AppState,
     request_id: Uuid,
     route: Uuid,
     account: Uuid,
     generation: i64,
     outcome: GroupRoutingOutcome,
-) -> Option<GroupRoutingDirective> {
+    transient_signal: Option<GroupRoutingTransientSignal>,
+) -> Option<crate::plugin::routing::GroupRoutingExecutionDirective> {
     #[cfg(test)]
     test_observe_gate::wait(request_id).await;
     let snapshot = state.group_routing.as_ref()?;
@@ -441,19 +569,45 @@ pub(crate) async fn observe(
     };
     let runtime = state.plugins.clone();
     let plugin_id = policy.plugin_id.clone();
+    let execution_signal = transient_signal.or(match outcome {
+        GroupRoutingOutcome::HardQuota
+        | GroupRoutingOutcome::Authentication
+        | GroupRoutingOutcome::Cancelled => policy.transient_signal,
+        GroupRoutingOutcome::Success | GroupRoutingOutcome::TransientFailure => None,
+    });
     match crate::api::plugin_execution::run_group(
         state.metrics.clone(),
         crate::metrics::plugin_execution::Phase::GroupRoutingObserve,
-        move || runtime.execute_group_routing_observe(&plugin_id, &input),
+        move || {
+            runtime.execute_group_routing_observe_with_health(&plugin_id, &input, execution_signal)
+        },
     )
     .await
     {
-        Ok(directive) => Some(directive),
+        Ok(directive) if directive.transient_policy == policy.transient_policy => Some(directive),
+        Ok(_) => {
+            tracing::warn!(%request_id, upstream_account_id=%account,stage="group_routing_observe_fallback",reason="policy_changed","group observe changed its frozen transient policy; native health policy retained");
+            None
+        }
         _ => {
             tracing::warn!(%request_id, upstream_account_id=%account,stage="group_routing_observe_fallback","group observe failed; native health policy retained");
             None
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn observe(
+    state: &AppState,
+    request_id: Uuid,
+    route: Uuid,
+    account: Uuid,
+    generation: i64,
+    outcome: GroupRoutingOutcome,
+) -> Option<GroupRoutingDirective> {
+    observe_with_signal(state, request_id, route, account, generation, outcome, None)
+        .await
+        .map(|execution| execution.directive)
 }
 
 #[cfg(test)]

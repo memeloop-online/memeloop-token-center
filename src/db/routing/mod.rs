@@ -25,5 +25,6 @@ pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
 pub(crate) use health::{
-    UpstreamAttemptAdmission, UpstreamFailureKind, upstream_probe_heartbeat_interval,
+    TransientHealthSignal, UpstreamAttemptAdmission, UpstreamFailureKind,
+    upstream_probe_heartbeat_interval,
 };

@@ -1,4 +1,5 @@
 //! Strategy selection follows authorization; these queries never grant routes.
+use super::routing::TransientHealthSignal;
 use super::{AppError, Database, GroupRoutingStrategy};
 use sqlx::Row;
 use uuid::Uuid;
@@ -11,6 +12,7 @@ pub(crate) struct CandidateGroupStrategy {
     pub strategy: GroupRoutingStrategy,
     pub health: String,
     pub generation: i64,
+    pub transient_signal: TransientHealthSignal,
 }
 
 impl Database {
@@ -77,27 +79,40 @@ impl Database {
             SELECT DISTINCT input.route_id, input.account_id, input.generation,
                 CASE WHEN a.status <> 'active' OR a.credential_generation <> input.generation THEN 'authentication'
                      WHEN COALESCE(h.consecutive_failures,0) = 0 THEN 'healthy'
-                     ELSE h.last_failure_kind END AS health
+                     ELSE h.last_failure_kind END AS health,
+                COALESCE(signal.sample_count,0) AS transient_sample_count,
+                COALESCE(signal.ewma_micros,0) AS transient_ewma_micros,
+                COALESCE(signal.last_observed_at,0) AS transient_last_observed_at,
+                COALESCE(signal.recovery_successes,0) AS transient_recovery_successes,
+                COALESCE(signal.revision,0) AS transient_signal_revision
             FROM input
             JOIN model_routes r ON r.id = input.route_id AND r.tenant_id = $1
             JOIN upstream_accounts a ON a.id = input.account_id AND a.tenant_id = $1
             LEFT JOIN upstream_account_health h ON h.upstream_account_id = a.id AND h.credential_generation = input.generation
+            LEFT JOIN upstream_account_transient_health_signals signal ON signal.upstream_account_id = a.id AND signal.credential_generation = input.generation
         ), bindings AS (
-            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind, c.health, c.generation
+            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind, c.health, c.generation,
+                   c.transient_sample_count, c.transient_ewma_micros, c.transient_last_observed_at,
+                   c.transient_recovery_successes, c.transient_signal_revision
             FROM candidate_scope c
             JOIN model_route_included_provider_groups inclusion ON inclusion.model_route_id = c.route_id AND inclusion.tenant_id = $1
             JOIN provider_groups g ON g.id = inclusion.provider_group_id AND g.tenant_id = $1
             JOIN upstream_account_provider_groups m ON m.tenant_id = $1 AND m.provider_group_id = g.id AND m.upstream_account_id = c.account_id
             WHERE g.routing_strategy IS NOT NULL
             UNION ALL
-            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'route' AS kind, c.health, c.generation
+            SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'route' AS kind, c.health, c.generation,
+                   c.transient_sample_count, c.transient_ewma_micros, c.transient_last_observed_at,
+                   c.transient_recovery_successes, c.transient_signal_revision
             FROM candidate_scope c
             JOIN model_route_group_memberships m ON m.model_route_id = c.route_id AND m.tenant_id = $1
             JOIN route_groups g ON g.id = m.route_group_id AND g.tenant_id = $1
             WHERE g.routing_strategy IS NOT NULL
         ), ranked AS (
             SELECT bindings.*, ROW_NUMBER() OVER (PARTITION BY route_id, account_id, generation ORDER BY routing_priority DESC, id ASC, kind ASC) AS position FROM bindings
-        ) SELECT route_id, account_id, id, routing_priority, strategy_version, routing_strategy, kind, health, generation FROM ranked WHERE position = 1");
+        ) SELECT route_id, account_id, id, routing_priority, strategy_version, routing_strategy, kind, health, generation,
+                 transient_sample_count, transient_ewma_micros, transient_last_observed_at,
+                 transient_recovery_successes, transient_signal_revision
+            FROM ranked WHERE position = 1");
         // Interpolation contains only host-generated placeholder positions;
         // every identifier value remains a bound parameter.
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(tenant_id.to_string());
@@ -127,6 +142,13 @@ impl Database {
                         version: row.try_get("strategy_version")?,
                         health: row.try_get("health")?,
                         generation: row.try_get("generation")?,
+                        transient_signal: TransientHealthSignal {
+                            sample_count: row.try_get("transient_sample_count")?,
+                            ewma_micros: row.try_get("transient_ewma_micros")?,
+                            last_observed_at: row.try_get("transient_last_observed_at")?,
+                            recovery_successes: row.try_get("transient_recovery_successes")?,
+                            revision: row.try_get("transient_signal_revision")?,
+                        },
                         strategy: serde_json::from_str(
                             &row.try_get::<String, _>("routing_strategy")?,
                         )

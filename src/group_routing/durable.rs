@@ -137,6 +137,9 @@ pub(crate) async fn restore_selected(
     let available = restored.plugins.group_routing_fingerprints();
     let mut policies = BTreeMap::new();
     for policy in stored.policies {
+        if !policy.has_valid_transient_snapshot() {
+            return Err(AppError::Internal);
+        }
         let input = GroupRoutingInput {
             tenant_id: tenant_id.to_string(),
             seed: stored.seed,

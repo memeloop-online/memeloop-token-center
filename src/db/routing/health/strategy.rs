@@ -1,5 +1,74 @@
 use super::*;
 
+pub(crate) const TRANSIENT_EWMA_SCALE: i64 = 1_000_000;
+
+const RECORD_TRANSIENT_HEALTH_SAMPLE_SQL: &str =
+    "INSERT INTO upstream_account_transient_health_signals (
+         upstream_account_id, credential_generation, sample_count,
+         ewma_micros, last_observed_at, recovery_successes, revision
+     ) SELECT $1, $2, 1, $3, $4, $5, 1
+       FROM upstream_accounts account
+      WHERE account.id = $1 AND account.status = 'active'
+        AND account.credential_generation = $2
+     ON CONFLICT (upstream_account_id) DO UPDATE SET
+         credential_generation = excluded.credential_generation,
+         sample_count = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN 1
+             WHEN upstream_account_transient_health_signals.sample_count < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.sample_count + 1
+             ELSE upstream_account_transient_health_signals.sample_count
+         END,
+         ewma_micros = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN excluded.ewma_micros
+             ELSE (
+                 upstream_account_transient_health_signals.ewma_micros * 3 + excluded.ewma_micros + 2
+             ) / 4
+         END,
+         last_observed_at = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation < excluded.credential_generation
+                  OR upstream_account_transient_health_signals.last_observed_at < excluded.last_observed_at
+                 THEN excluded.last_observed_at
+             ELSE upstream_account_transient_health_signals.last_observed_at
+         END,
+         recovery_successes = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN excluded.recovery_successes
+             WHEN excluded.ewma_micros > 0 THEN 0
+             WHEN upstream_account_transient_health_signals.recovery_successes < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.recovery_successes + 1
+             ELSE upstream_account_transient_health_signals.recovery_successes
+         END,
+         revision = CASE
+             WHEN upstream_account_transient_health_signals.credential_generation <> excluded.credential_generation
+                 THEN 1
+             WHEN upstream_account_transient_health_signals.revision < 9223372036854775807
+                 THEN upstream_account_transient_health_signals.revision + 1
+             ELSE upstream_account_transient_health_signals.revision
+         END
+     WHERE upstream_account_transient_health_signals.credential_generation <= excluded.credential_generation
+       AND EXISTS (
+         SELECT 1 FROM upstream_accounts account
+          WHERE account.id = upstream_account_transient_health_signals.upstream_account_id
+            AND account.status = 'active'
+            AND account.credential_generation = excluded.credential_generation
+     )
+     RETURNING sample_count, ewma_micros, last_observed_at,
+               recovery_successes, revision";
+
+/// Credential-free, generation-fenced transient observations. The integer
+/// EWMA uses a fixed alpha of 1/4 so both database backends produce identical
+/// values without floating-point drift.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TransientHealthSignal {
+    pub(crate) sample_count: i64,
+    pub(crate) ewma_micros: i64,
+    pub(crate) last_observed_at: i64,
+    pub(crate) recovery_successes: i64,
+    pub(crate) revision: i64,
+}
+
 /// A tenant-scoped, credential-free snapshot; no row means the candidate is
 /// inactive, absent, or stale, not that it is healthy.
 #[derive(Clone, Debug)]
@@ -30,6 +99,75 @@ impl GroupRoutingHealth {
 }
 
 impl Database {
+    /// Persist one conclusive success/failure sample independently of circuit
+    /// state. Cancelled and otherwise inconclusive attempts never call this
+    /// method. The account generation and active status fence stale requests.
+    pub(crate) async fn record_transient_health_sample(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transient_failure: bool,
+    ) -> Result<Option<TransientHealthSignal>, AppError> {
+        let now = unix_millis();
+        let sample = if transient_failure {
+            TRANSIENT_EWMA_SCALE
+        } else {
+            0
+        };
+        let row = sqlx::query(RECORD_TRANSIENT_HEALTH_SAMPLE_SQL)
+            .bind(upstream_account_id.to_string())
+            .bind(credential_generation)
+            .bind(sample)
+            .bind(now)
+            .bind(i64::from(!transient_failure))
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok(TransientHealthSignal {
+                sample_count: row.try_get("sample_count")?,
+                ewma_micros: row.try_get("ewma_micros")?,
+                last_observed_at: row.try_get("last_observed_at")?,
+                recovery_successes: row.try_get("recovery_successes")?,
+                revision: row.try_get("revision")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// A valid probe that has not yet met an explicitly active v2 recovery
+    /// threshold releases only its exact lease. It leaves hard state intact
+    /// and schedules the next bounded probe without replaying this request.
+    pub(crate) async fn defer_upstream_account_probe_recovery(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+        cooldown_millis: u64,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let result = sqlx::query(
+            "UPDATE upstream_account_health
+                SET cooldown_until = $1, probe_lease_until = 0,
+                    probe_lease_token = '', updated_at = $2
+              WHERE upstream_account_id = $3 AND credential_generation = $4
+                AND consecutive_failures > 0 AND probe_lease_token = $5
+                AND EXISTS (
+                    SELECT 1 FROM upstream_accounts account
+                     WHERE account.id = upstream_account_health.upstream_account_id
+                       AND account.status = 'active'
+                       AND account.credential_generation = $4
+                )",
+        )
+        .bind(now.saturating_add(cooldown_millis.min(60_000) as i64))
+        .bind(now)
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn group_routing_health(
         &self,
         tenant_id: Uuid,

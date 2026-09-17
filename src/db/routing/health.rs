@@ -7,6 +7,8 @@ use crate::config::UpstreamHealthConfig;
 mod delivery;
 mod strategy;
 
+pub(crate) use strategy::TransientHealthSignal;
+
 #[cfg(test)]
 mod quota_tests;
 
