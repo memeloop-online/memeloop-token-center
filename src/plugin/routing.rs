@@ -263,6 +263,16 @@ pub(crate) struct GroupRoutingExecutionDirective {
     pub(crate) transient_policy: Option<GroupRoutingTransientPolicy>,
 }
 
+impl GroupRoutingExecutionDirective {
+    /// V1 has no transient policy and retains its established directive
+    /// behavior. V2 shadow policy is observational only: none of its health
+    /// controls may change host admission, waiting, or cooldown state.
+    pub(crate) fn health_directives_enabled(&self) -> bool {
+        self.transient_policy
+            .is_none_or(GroupRoutingTransientPolicy::is_active)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct GroupRoutingExecutionPlan {
     pub(crate) candidates: Vec<GroupRoutingExecutionDirective>,

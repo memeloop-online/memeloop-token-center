@@ -181,6 +181,11 @@ impl RequestGroupRouting {
 }
 
 impl CandidatePolicy {
+    fn health_directives_enabled(&self) -> bool {
+        self.transient_policy
+            .is_none_or(GroupRoutingTransientPolicy::is_active)
+    }
+
     fn current_transient_signal(&self) -> Option<GroupRoutingTransientSignal> {
         self.transient_signal.map(|signal| {
             signal.in_current_window(crate::db::unix_millis(), self.transient_health_window_ms)
@@ -201,21 +206,26 @@ impl CandidatePolicy {
             && self.transient_health_window_ms == DEFAULT_TRANSIENT_HEALTH_WINDOW_MS
     }
 
-    pub(crate) fn allow_probe(&self) -> bool {
-        self.directive.allow_transient_probe
+    pub(crate) fn transient_probe_controls(&self) -> Option<(bool, u64)> {
+        self.health_directives_enabled().then_some((
+            self.directive.allow_transient_probe,
+            self.directive.cooldown_ms,
+        ))
     }
-    pub(crate) fn cooldown_ms(&self) -> u64 {
-        self.directive.cooldown_ms
-    }
-    pub(crate) fn recheck(&self) -> Duration {
-        Duration::from_millis(self.directive.recheck_ms.clamp(25, 5_000))
-    }
-    pub(crate) fn wait_deadline(
+
+    pub(crate) fn recovery_timing(
         &self,
         snapshot: &RequestGroupRouting,
         core: tokio::time::Instant,
-    ) -> tokio::time::Instant {
-        core.min(snapshot.started + Duration::from_millis(self.directive.recovery_wait_ms))
+        native_recheck: Duration,
+    ) -> (tokio::time::Instant, Duration) {
+        if !self.health_directives_enabled() {
+            return (core, native_recheck);
+        }
+        (
+            core.min(snapshot.started + Duration::from_millis(self.directive.recovery_wait_ms)),
+            Duration::from_millis(self.directive.recheck_ms.clamp(25, 5_000)),
+        )
     }
     pub(crate) fn active_transient_policy(&self) -> Option<GroupRoutingTransientPolicy> {
         if self.candidate.health != GroupRoutingHealth::Transient {

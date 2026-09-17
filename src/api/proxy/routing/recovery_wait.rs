@@ -191,7 +191,7 @@ pub(crate) async fn wait(
             .map(|policy| (snapshot, policy))
     });
     let (deadline, recheck) = policy.map_or((deadline, RECHECK), |(snapshot, policy)| {
-        (policy.wait_deadline(snapshot, deadline), policy.recheck())
+        policy.recovery_timing(snapshot, deadline, RECHECK)
     });
     bounded_wait_with_recheck(
         deadline,
@@ -217,11 +217,14 @@ pub(crate) async fn wait(
                     return Ok(Check::Stop);
                 }
                 let admission = if let Some(snapshot) = state.group_routing.as_ref()
-                    && let Some(policy) = snapshot.policy(
-                        route.route_id,
-                        route.account_id,
-                        route.credential_generation,
-                    ) {
+                    && let Some((allow_probe, cooldown_ms)) = snapshot
+                        .policy(
+                            route.route_id,
+                            route.account_id,
+                            route.credential_generation,
+                        )
+                        .and_then(|policy| policy.transient_probe_controls())
+                {
                     state
                         .db
                         .claim_upstream_account_attempt_with_strategy(
@@ -229,8 +232,8 @@ pub(crate) async fn wait(
                             route.account_id,
                             route.credential_generation,
                             state.config.upstream_health,
-                            policy.allow_probe(),
-                            Some(policy.cooldown_ms()),
+                            allow_probe,
+                            Some(cooldown_ms),
                             true,
                         )
                         .await?

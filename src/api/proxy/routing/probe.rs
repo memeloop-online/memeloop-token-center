@@ -39,6 +39,33 @@ fn active_transient_defers_probe_recovery(
     !signal.should_recover(policy.recover_micros, policy.min_probe_successes)
 }
 
+fn terminal_health_config(
+    mut health: crate::config::UpstreamHealthConfig,
+    directive: Option<&crate::plugin::routing::GroupRoutingExecutionDirective>,
+    terminal: UpstreamAttemptTerminal,
+) -> crate::config::UpstreamHealthConfig {
+    if let Some(directive) = directive
+        && directive.health_directives_enabled()
+        && matches!(
+            terminal,
+            UpstreamAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::Connection
+                    | UpstreamFailureKind::Unavailable
+                    | UpstreamFailureKind::InvalidResponse,
+                ..
+            }
+        )
+    {
+        // Only active-v2 and established v1 transient failures consume plugin
+        // cooldown. Shadow v2 is observational and retains native health.
+        let cooldown = directive.directive.cooldown_ms.min(60_000) as i64;
+        health.connection_cooldown_millis = cooldown;
+        health.unavailable_cooldown_millis = cooldown;
+        health.invalid_response_cooldown_millis = cooldown;
+    }
+    health
+}
+
 struct SharedProbeLimiter {
     active: AtomicU32,
 }
@@ -103,6 +130,32 @@ fn try_shared_probe_permit(
 mod limiter_tests {
     use super::*;
 
+    fn execution_directive(
+        mode: Option<crate::plugin::routing::GroupRoutingTransientPolicyMode>,
+    ) -> crate::plugin::routing::GroupRoutingExecutionDirective {
+        use crate::plugin::routing::{GroupRoutingDirective, GroupRoutingTransientPolicy};
+        crate::plugin::routing::GroupRoutingExecutionDirective {
+            directive: GroupRoutingDirective {
+                tenant_id: Uuid::nil().to_string(),
+                route_id: Uuid::from_u128(1).to_string(),
+                account_id: Uuid::from_u128(2).to_string(),
+                generation: 1,
+                allow_transient_probe: true,
+                cooldown_ms: 1,
+                recovery_wait_ms: 1,
+                recheck_ms: 1,
+                stickiness: false,
+            },
+            transient_policy: mode.map(|mode| GroupRoutingTransientPolicy {
+                mode,
+                min_samples: 1,
+                open_micros: 1,
+                recover_micros: 1,
+                min_probe_successes: 1,
+            }),
+        }
+    }
+
     #[test]
     fn runtime_limit_changes_apply_without_revoking_in_flight_attempts() {
         let account = Uuid::new_v4();
@@ -141,6 +194,37 @@ mod limiter_tests {
         assert_eq!(
             transient_sample_for_outcome(GroupRoutingOutcome::Authentication),
             None
+        );
+    }
+
+    #[test]
+    fn shadow_v2_terminal_cooldown_retains_native_health_config() {
+        use crate::{
+            config::UpstreamHealthConfig, plugin::routing::GroupRoutingTransientPolicyMode,
+        };
+        let native = UpstreamHealthConfig::DEFAULT;
+        let terminal = UpstreamAttemptTerminal::invalid_response();
+        let shadow = execution_directive(Some(GroupRoutingTransientPolicyMode::Shadow));
+        assert_eq!(
+            terminal_health_config(native, Some(&shadow), terminal),
+            native
+        );
+
+        let active = execution_directive(Some(GroupRoutingTransientPolicyMode::Active));
+        let overridden = terminal_health_config(native, Some(&active), terminal);
+        assert_eq!(overridden.connection_cooldown_millis, 1);
+        assert_eq!(overridden.unavailable_cooldown_millis, 1);
+        assert_eq!(overridden.invalid_response_cooldown_millis, 1);
+        assert_eq!(
+            overridden.rate_limited_cooldown_millis,
+            native.rate_limited_cooldown_millis
+        );
+
+        let v1 = execution_directive(None);
+        assert_eq!(
+            terminal_health_config(native, Some(&v1), terminal),
+            overridden,
+            "v1 directive behavior remains unchanged"
         );
     }
 }
@@ -757,25 +841,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         signal,
     )
     .await;
-    let mut health = state.config.upstream_health;
-    if let Some(directive) = directive.as_ref()
-        && matches!(
-            terminal,
-            UpstreamAttemptTerminal::Failed {
-                kind: UpstreamFailureKind::Connection
-                    | UpstreamFailureKind::Unavailable
-                    | UpstreamFailureKind::InvalidResponse,
-                ..
-            }
-        )
-    {
-        // Only transient failures consume plugin cooldown. Typed 429/reset
-        // evidence, lease ownership and uncertain POST handling remain core.
-        let cooldown = directive.directive.cooldown_ms.min(60_000) as i64;
-        health.connection_cooldown_millis = cooldown;
-        health.unavailable_cooldown_millis = cooldown;
-        health.invalid_response_cooldown_millis = cooldown;
-    }
+    let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
             if let (Some(policy), Some(signal), Some(lease_token)) = (

@@ -129,7 +129,9 @@ pub(crate) async fn admit(
     {
         return Err(AppError::Forbidden);
     }
-    let admission = if let Some(policy) = policy {
+    let admission = if let Some((allow_probe, cooldown_ms)) =
+        policy.and_then(|policy| policy.transient_probe_controls())
+    {
         state
             .db
             .claim_upstream_account_attempt_with_strategy(
@@ -137,8 +139,8 @@ pub(crate) async fn admit(
                 route.account_id,
                 route.credential_generation,
                 state.config.upstream_health,
-                policy.allow_probe(),
-                Some(policy.cooldown_ms()),
+                allow_probe,
+                Some(cooldown_ms),
                 false,
             )
             .await?
