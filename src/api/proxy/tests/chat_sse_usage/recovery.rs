@@ -310,6 +310,42 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
     let (uri, upstream) =
         fragmented_sse_upstream(vec![oversized, recovered_terminal.into_bytes()]).await;
     let fixture = response_usage_fixture_with_uri("chat-oversized-event", uri, 0).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let credential_generation: i64 =
+        sqlx::query_scalar("SELECT credential_generation FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    fixture
+        .state
+        .db
+        .record_upstream_account_failure(
+            fixture.upstream_account_id,
+            credential_generation,
+            UpstreamFailureKind::Connection,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upstream_account_health SET cooldown_until = 0
+         WHERE upstream_account_id = $1 AND credential_generation = $2",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .bind(credential_generation)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let health_before = sqlx::query(
+        "SELECT consecutive_failures, cooldown_until, last_failure_kind
+         FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND credential_generation = $2",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .bind(credential_generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
@@ -345,6 +381,32 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
         refs.response_object.as_deref(),
         Some(format!("gap://{}/response", rows[0].request_id).as_str())
     );
+    let health_after = sqlx::query(
+        "SELECT consecutive_failures, cooldown_until, last_failure_kind
+         FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND credential_generation = $2",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .bind(credential_generation)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        health_after.get::<i64, _>("consecutive_failures"),
+        health_before.get::<i64, _>("consecutive_failures"),
+        "a local SSE event limit must not add an upstream failure"
+    );
+    assert_eq!(
+        health_after.get::<i64, _>("cooldown_until"),
+        health_before.get::<i64, _>("cooldown_until"),
+        "a local SSE event limit must not install account cooldown"
+    );
+    assert_eq!(
+        health_after.get::<String, _>("last_failure_kind"),
+        health_before.get::<String, _>("last_failure_kind"),
+        "a local SSE event limit must not overwrite prior upstream evidence"
+    );
+    pool.close().await;
 }
 
 #[tokio::test]
