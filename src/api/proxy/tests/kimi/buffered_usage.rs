@@ -62,12 +62,12 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         requested_service_tier: None,
         conversation: Some(ProxyConversation {
             key: key.clone(),
-            request_body: Bytes::from(
+            request_body: ConversationBody::InMemory(Bytes::from(
                 serde_json::to_vec(
                     &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
                 )
                 .unwrap(),
-            ),
+            )),
             hints: crate::conversation::ConversationHints::default(),
             client_name: None,
             projection_admission: std::sync::Mutex::new(

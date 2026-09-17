@@ -1,6 +1,35 @@
 use super::*;
 
 #[tokio::test]
+async fn source_backed_conversation_releases_all_raw_request_permits() {
+    use axum::body::Body;
+
+    let directory = tempfile::tempdir().unwrap();
+    let admission = crate::gateway_body::request_spool::RequestSpoolAdmission::new(
+        directory.path().to_owned(),
+        1024 * 1024,
+    );
+    let source = Bytes::from_static(br#"{"model":"gpt-5.6-sol","input":"source-backed"}"#);
+    let spool = std::sync::Arc::new(
+        admission
+            .capture(Body::from(source.clone()), source.len(), Some(source.len()))
+            .await
+            .unwrap(),
+    );
+    let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+    let memory = budget.reservation();
+    assert!(memory.try_grow(
+        source.len(),
+        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT
+    ));
+
+    let body = ConversationBody::Spool(spool);
+    body.release_working_copies(&memory);
+    assert_eq!(budget.snapshot().0, 0);
+    assert_eq!(body.read().await.unwrap(), source);
+}
+
+#[tokio::test]
 async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     let fixture = std::sync::Arc::new(codex_route_fixture("large-stream-admission").await);
     // The gateway conservatively reserves input bytes as tokens. Admit both

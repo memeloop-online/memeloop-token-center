@@ -449,6 +449,13 @@ impl ProxyMemoryReservation {
         self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
     }
 
+    /// A durable request spool can replace the raw in-memory conversation copy
+    /// after routing. Unlike the in-memory path, no byte-sized reservation
+    /// remains live while the upstream response is in flight.
+    pub(crate) fn release_source_backed_conversation_working_copies(&self, bytes: usize) {
+        self.release(bytes, REQUEST_MEMORY_WEIGHT);
+    }
+
     /// Fairly reserve the transient JSON-tree copies required to project a
     /// retained raw conversation body. The returned permit is independent of
     /// the long-lived request reservation and never occupies the buffered

@@ -78,7 +78,7 @@ pub(super) async fn proxy_openai_responses(
         );
         AppError::Overloaded
     })?;
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses, memory).await
+    super::proxy::proxy_spooled_responses(state, headers, body, memory, spool).await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
