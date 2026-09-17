@@ -3,10 +3,6 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use sqlx::{Row, any::AnyRow};
 
-use super::effective_cost::{
-    request_adjustment_join_sql, request_fact_effective_cost_sql,
-    request_rollup_effective_cost_for_bucket_sql,
-};
 use super::{
     AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, micros_to_decimal_string,
     unix_millis,
@@ -393,20 +389,10 @@ fn validate_range(
 /// makes the left join preserve unobserved current accounts without inventing
 /// a terminal result. The four source arms exactly cover the inclusive window.
 fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
-    let (table, bucket_column, bucket_millis) = match granularity {
-        AvailabilityGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", HOUR_MILLIS),
-        AvailabilityGranularity::Day => ("usage_analysis_daily", "day_bucket", DAY_MILLIS),
+    let (table, bucket_column) = match granularity {
+        AvailabilityGranularity::Hour => ("usage_analysis_hourly", "hour_bucket"),
+        AvailabilityGranularity::Day => ("usage_analysis_daily", "day_bucket"),
     };
-    let effective_rollup_cost = request_rollup_effective_cost_for_bucket_sql(
-        "aggregate",
-        "rollup_fact",
-        "rollup_request",
-        "rollup_feed",
-        "rollup_adjustments",
-        bucket_column,
-        bucket_millis,
-        true,
-    );
     let rollup = format!(
         r#"SELECT aggregate.upstream_account_id, aggregate.status_class, aggregate.currency,
                   aggregate.requests, aggregate.input_tokens, aggregate.output_tokens,
@@ -416,7 +402,7 @@ fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
                   aggregate.duration_bucket_3, aggregate.duration_bucket_4, aggregate.duration_bucket_5,
                   aggregate.duration_bucket_6, aggregate.duration_bucket_7, aggregate.duration_bucket_8,
                   aggregate.duration_bucket_9, aggregate.duration_bucket_10, aggregate.duration_bucket_11,
-                  {effective_rollup_cost} AS cost_micros
+                  aggregate.cost_micros
             FROM {table} aggregate
              JOIN accounts account
                ON account.upstream_account_id = aggregate.upstream_account_id
@@ -424,7 +410,6 @@ fn window_metrics_sql(granularity: AvailabilityGranularity) -> String {
             WHERE aggregate.tenant_id = (SELECT tenant_id FROM tenant_scope)
               AND aggregate.{bucket_column} >= $2
               AND aggregate.{bucket_column} < $3"#,
-        effective_rollup_cost = effective_rollup_cost,
     );
     let left_requests = fact_metrics_sql("request_stats_facts", "f", "$4", "$5");
     let left_generations = fact_metrics_sql("generation_stats_facts", "f", "$4", "$5");
@@ -487,7 +472,6 @@ SELECT account.upstream_account_id, metrics.currency,
 }
 
 fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter: &str) -> String {
-    let is_request = table == "request_stats_facts";
     let token_projection = if table == "request_stats_facts" {
         format!(
             r#"CASE
@@ -503,20 +487,6 @@ fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter
                   CAST(0 AS BIGINT) AS cached_input_tokens,
                   CAST(0 AS BIGINT) AS cache_write_tokens"#
             .to_owned()
-    };
-    let effective_cost = if is_request {
-        request_fact_effective_cost_sql(alias, "billing_request", "billing_adjustments")
-    } else {
-        format!("{alias}.cost_micros")
-    };
-    let request_join = if is_request {
-        let adjustment_joins =
-            request_adjustment_join_sql(alias, "billing_feed", "billing_adjustments");
-        format!(
-            "LEFT JOIN request_records billing_request ON billing_request.id = {alias}.request_id AND billing_request.created_at = {alias}.created_at\n             {adjustment_joins}"
-        )
-    } else {
-        String::new()
     };
     format!(
         r#"SELECT {alias}.upstream_account_id, {alias}.status_class, {alias}.currency,
@@ -535,18 +505,15 @@ fn fact_metrics_sql(table: &str, alias: &str, from_parameter: &str, to_parameter
                   CASE WHEN {alias}.duration_ms > 10000 AND {alias}.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
                   CASE WHEN {alias}.duration_ms > 30000 AND {alias}.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
                   CASE WHEN {alias}.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  {effective_cost} AS cost_micros
+                  {alias}.cost_micros
              FROM {table} {alias}
              JOIN accounts account
                ON account.upstream_account_id = {alias}.upstream_account_id
               AND account.tenant_id = {alias}.tenant_id
-             {request_join}
             WHERE CAST({from_parameter} AS BIGINT) <= CAST({to_parameter} AS BIGINT)
               AND {alias}.tenant_id = (SELECT tenant_id FROM tenant_scope)
               AND {alias}.created_at >= {from_parameter}
               AND {alias}.created_at <= {to_parameter}"#,
-        effective_cost = effective_cost,
-        request_join = request_join,
     )
 }
 

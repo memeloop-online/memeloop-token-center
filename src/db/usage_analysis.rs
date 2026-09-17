@@ -15,10 +15,6 @@ use sqlx::{
 };
 use uuid::Uuid;
 
-use super::effective_cost::{
-    request_adjustment_join_sql, request_fact_effective_cost_sql,
-    request_rollup_effective_cost_for_bucket_sql,
-};
 use super::{
     AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, parse_uuid, search_prefix,
     unix_millis,
@@ -776,16 +772,6 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
         )
     };
     let rollup_filters = branch_filters("a");
-    let effective_rollup_cost = request_rollup_effective_cost_for_bucket_sql(
-        "a",
-        "rollup_fact",
-        "rollup_request",
-        "rollup_feed",
-        "rollup_adjustments",
-        bucket_column,
-        bucket_millis,
-        true,
-    );
     let rollup = format!(
         r#"SELECT a.tenant_id, a.key_id,
                   a.{bucket_column} * {bucket_millis} AS bucket_start,
@@ -798,11 +784,10 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
                   a.duration_bucket_3, a.duration_bucket_4, a.duration_bucket_5,
                   a.duration_bucket_6, a.duration_bucket_7, a.duration_bucket_8,
                   a.duration_bucket_9, a.duration_bucket_10, a.duration_bucket_11,
-                  {effective_rollup_cost} AS cost_micros
+                  a.cost_micros
              FROM {table} a
             WHERE a.{bucket_column} >= $3 AND a.{bucket_column} < $4
-                  {rollup_filters}"#,
-        effective_rollup_cost = effective_rollup_cost
+              {rollup_filters}"#
     );
     let request_filters = branch_filters("f");
     let generation_filters = request_filters.clone();
@@ -860,9 +845,6 @@ fn usage_analysis_request_fact_sql(
     bucket_millis: i64,
     branch_filters: &str,
 ) -> String {
-    let effective_cost =
-        request_fact_effective_cost_sql("f", "billing_request", "billing_adjustments");
-    let adjustment_joins = request_adjustment_join_sql("f", "billing_feed", "billing_adjustments");
     format!(
         r#"SELECT f.tenant_id, f.key_id,
                   (f.created_at / {bucket_millis}) * {bucket_millis} AS bucket_start,
@@ -898,18 +880,12 @@ fn usage_analysis_request_fact_sql(
                   CASE WHEN f.duration_ms > 10000 AND f.duration_ms <= 30000 THEN 1 ELSE 0 END AS duration_bucket_9,
                   CASE WHEN f.duration_ms > 30000 AND f.duration_ms <= 60000 THEN 1 ELSE 0 END AS duration_bucket_10,
                   CASE WHEN f.duration_ms > 60000 THEN 1 ELSE 0 END AS duration_bucket_11,
-                  {effective_cost} AS cost_micros
+                  f.cost_micros
             FROM request_stats_facts f
-            LEFT JOIN request_records billing_request
-              ON billing_request.id = f.request_id
-             AND billing_request.created_at = f.created_at
-            {adjustment_joins}
             WHERE {from_parameter} <= {to_parameter}
               AND f.created_at >= {from_parameter}
               AND f.created_at <= {to_parameter}
-              {branch_filters}"#,
-        effective_cost = effective_cost,
-        adjustment_joins = adjustment_joins
+              {branch_filters}"#
     )
 }
 

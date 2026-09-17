@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::effective_cost::request_session_total_effective_cost_sql;
 use super::*;
 use crate::model::{
     ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary,
@@ -264,7 +263,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
        )
        SELECT recent.*, key_record.alias AS key_alias,
               COALESCE(totals.currency, '') AS currency,
-              __SESSION_TOTAL_EFFECTIVE_COST__ AS cost_micros,
+              COALESCE(totals.cost_micros, 0) AS cost_micros,
               COALESCE(completed.requests, 0) AS requests,
               COALESCE(completed.errors, 0) AS errors,
               COALESCE(completed.input_tokens, 0) AS input_tokens,
@@ -317,23 +316,6 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
           AND latest_activity.activity_rank = 1
                  ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
                          recent.key_id DESC, totals.currency ASC"#;
-
-pub(super) fn recent_sessions_first_page_sql() -> String {
-    effective_session_query(RECENT_SESSIONS_FIRST_PAGE_SQL)
-}
-
-fn effective_session_query(template: &str) -> String {
-    template.replace(
-        "__SESSION_TOTAL_EFFECTIVE_COST__",
-        &request_session_total_effective_cost_sql(
-            "totals",
-            "billing_fact",
-            "billing_request",
-            "billing_feed",
-            "billing_adjustments",
-        ),
-    )
-}
 
 pub(super) fn should_use_candidate_first_page(
     allow_candidate_first: bool,
@@ -686,7 +668,7 @@ impl Database {
                )
                SELECT recent.*, key_record.alias AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
-                      __SESSION_TOTAL_EFFECTIVE_COST__ AS cost_micros,
+                      COALESCE(totals.cost_micros, 0) AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,
                       COALESCE(completed.errors, 0) AS errors,
                       COALESCE(completed.input_tokens, 0) AS input_tokens,
@@ -739,13 +721,12 @@ impl Database {
                   AND latest_activity.activity_rank = 1
                ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
                          recent.key_id DESC, totals.currency ASC"#;
-        let reference_query = effective_session_query(reference_query);
         let session_query = if use_candidate_first_page {
-            recent_sessions_first_page_sql()
+            RECENT_SESSIONS_FIRST_PAGE_SQL
         } else {
             reference_query
         };
-        let mut session_query = sqlx::query(sqlx::AssertSqlSafe(session_query))
+        let mut session_query = sqlx::query(session_query)
             .bind(tenant_id)
             .bind(&key_id)
             .bind(limit);
