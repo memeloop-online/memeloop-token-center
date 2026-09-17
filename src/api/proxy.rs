@@ -1137,10 +1137,11 @@ async fn proxy_with_identity_and_conversation_spool(
     };
     // Admission ACK includes reservation, request record, and encrypted sealed
     // request spool in one transaction. No upstream work starts before it.
-    // Native streams retain their charged request under the process-wide
-    // budget, without occupying buffered-response headroom while waiting for
-    // headers. An unexpected JSON response must reserve capacity before its
-    // first body read. Non-stream and component paths keep their partition.
+    // Native streams and source-backed Responses retain their charged request
+    // under the process-wide budget without occupying buffered-response
+    // headroom while waiting for headers. An unexpected JSON response must
+    // reserve capacity before its first body read. Other non-stream and
+    // component paths keep their retained partition.
     let retained_admission =
         proxy_diagnostics::Phase::new(diagnostic_context, "retained_memory_admission");
     let source_backed_conversation = buffered_request
