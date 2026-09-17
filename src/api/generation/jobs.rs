@@ -225,6 +225,7 @@ pub(in crate::api) async fn create_generation_for_modality(
     }
 }
 
+#[cfg(test)]
 pub(in crate::api) fn normalize_seedance_duration(input: &mut Value) -> Result<i64, AppError> {
     crate::generation::normalize_seedance_duration(input)
 }
