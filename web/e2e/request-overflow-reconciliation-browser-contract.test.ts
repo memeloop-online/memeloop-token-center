@@ -70,39 +70,39 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     assert.equal(await page.evaluate(() => window.requestQueryReads), 3, 'one clean trailing pass ends the catch-up episode');
     await model('live-during-reconcile').waitFor();
 
+    // Exercise the React pause lane while the page is still on the live first
+    // page. Explicitly loaded history deliberately stays stable, so it is not
+    // a valid auto-reconciliation target.
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => window.emitRequestOverflow(1_000));
+    await page.clock.fastForward(requestOverflowReconcileCooldownMs * 2);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 3,
+      'pause blocks reconciliation without discarding the live overflow edge');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await page.clock.fastForward(requestOverflowReconcileDelayMs);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 4,
+      'resume performs one bounded reconciliation for the retained overflow');
+    await page.evaluate(() => window.resolveNextRequestQuery('post-pause-reconcile'));
+    await model('post-pause-reconcile').waitFor();
+
     // Exercise RequestsPage.load(filters, true), not just the coordinator in
     // isolation: pagination aborts the active first-page query, loads history,
     // then restores the one sticky reconciliation it interrupted.
     await page.evaluate(() => window.emitRequestOverflow(1_000));
     await page.clock.fastForward(requestOverflowReconcileDelayMs);
-    assert.equal(await page.evaluate(() => window.requestQueryReads), 4);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 5);
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
     await model('older-page').waitFor();
-    assert.equal(await page.evaluate(() => window.requestQueryReads), 5);
-    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older']);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 6);
+    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'first', 'older']);
 
     await page.clock.fastForward(requestOverflowReconcileDelayMs);
-    assert.equal(await page.evaluate(() => window.requestQueryReads), 6);
-    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older', 'first'],
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 7);
+    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'first', 'older', 'first'],
       'the interrupted sticky overflow is restored as a first-page query after pagination');
     await page.evaluate(() => window.resolveNextRequestQuery('post-pagination-reconcile'));
     await model('post-pagination-reconcile').waitFor();
     await model('older-page').waitFor();
-
-    // Exercise the React pause lane: an overflow received while paused stays
-    // sticky, does not issue background queries, and resumes as exactly one
-    // authoritative first-page query rather than being dropped or fanning out.
-    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
-    await page.evaluate(() => window.emitRequestOverflow(1_000));
-    await page.clock.fastForward(requestOverflowReconcileCooldownMs * 2);
-    assert.equal(await page.evaluate(() => window.requestQueryReads), 6,
-      'pause blocks reconciliation without discarding the overflow edge');
-    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
-    await page.clock.fastForward(requestOverflowReconcileDelayMs);
-    assert.equal(await page.evaluate(() => window.requestQueryReads), 7,
-      'resume performs one bounded reconciliation for the retained overflow');
-    await page.evaluate(() => window.resolveNextRequestQuery('post-pause-reconcile'));
-    await model('post-pause-reconcile').waitFor();
   } finally {
     await browser.close();
     await server.close();
