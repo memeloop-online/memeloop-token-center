@@ -2108,16 +2108,15 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 manifest.id
             )));
         }
-        if let Some(data_endpoint) = contribution.data_endpoint.as_deref() {
-            if !endpoints
+        if let Some(data_endpoint) = contribution.data_endpoint.as_deref()
+            && !endpoints
                 .iter()
                 .any(|endpoint| endpoint.id == data_endpoint)
-            {
-                return Err(AppError::BadRequest(format!(
-                    "plugin {} operator UI contribution references an unknown data endpoint",
-                    manifest.id
-                )));
-            }
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} operator UI contribution references an unknown data endpoint",
+                manifest.id
+            )));
         }
         match contribution.slot {
             PluginOperatorUiSlot::SidebarTab => {
