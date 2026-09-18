@@ -22,9 +22,11 @@ pub(super) async fn promote_active_plaintext(
     pepper: Option<&[u8]>,
 ) -> Result<(), sqlx::Error> {
     if matches!(backend, DatabaseBackend::PostgreSql) {
-        // Fence old-version writers as well as rotations for the entire
-        // promotion + DROP transaction, not just while reading each page.
-        sqlx::query("LOCK TABLE key_records, key_credentials, key_credential_recovery_secrets IN SHARE ROW EXCLUSIVE MODE")
+        // Fence old-version readers and writers for the whole promotion +
+        // DROP transaction. A weaker lock lets an old copy reader hold an
+        // envelope read lock while waiting to promote plaintext, deadlocking
+        // this transaction when DROP upgrades to an exclusive lock.
+        sqlx::query("LOCK TABLE key_records, key_credentials, key_credential_recovery_secrets IN ACCESS EXCLUSIVE MODE")
             .execute(&mut **tx)
             .await?;
     }

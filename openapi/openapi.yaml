@@ -173,8 +173,9 @@ paths:
         `created_at` and `key_id` as the paired, exclusive `before_created_at` and
         `before_id` cursor. The response never contains a credential secret, so a caller
         that lost a create response can reconcile the stable `key_id`, `account_id`,
-        fingerprint, generation, policy and balance, then rotate if secret recovery is
-        required.
+        fingerprint, generation, policy and balance, then use the explicit copy action
+        when `credential_copy_available` is true. Historical hash-only credentials
+        cannot be reconstructed.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:read
       parameters:
