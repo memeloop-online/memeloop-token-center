@@ -100,7 +100,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await clientCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
     const copyPanel = clientCopy.locator('.credential-secret-priority');
     await copyPanel.getByText('mtc_client_copied', { exact: true }).waitFor();
-    await clientCopy.getByRole('status').filter({ hasText: 'Copyable client credential is shown.' }).waitFor();
+    await clientCopy.getByRole('status').filter({ hasText: 'Copyable client credential is ready. Select the value or use Copy credential.' }).waitFor();
     assert.equal(await clientCopy.getByRole('dialog').count(), 0, 'copy is a direct, confirmation-free action');
     assert.equal(await clientCopy.locator('html').getAttribute('data-copied-fixture-credential'), null, 'fetching a credential never writes it to the clipboard implicitly');
     await copyPanel.getByRole('button', { name: 'Copy credential', exact: true }).click();
