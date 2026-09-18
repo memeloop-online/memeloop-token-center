@@ -12,9 +12,7 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{
-        ProviderCatalog, UpstreamCredential, open_private_json, seal_private_json, validate_config,
-    },
+    provider::{ProviderCatalog, UpstreamCredential, open_private_json, seal_private_json},
 };
 
 use super::{
@@ -22,6 +20,7 @@ use super::{
     endpoint::{
         oauth_adapter_endpoint_scope, validate_oauth_endpoint, validate_oauth_endpoint_with_scope,
     },
+    validate_oauth_login_config,
 };
 
 const CURSOR_SESSION_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-session/v2";
@@ -195,9 +194,12 @@ pub async fn start_cursor_login(
     key_material: &[u8],
     now: i64,
 ) -> Result<OAuthLoginStart, AppError> {
-    if input.account_name.trim().is_empty() {
+    if input.account_name.trim().is_empty()
+        || input.account_name.trim().len() > 200
+        || input.account_name.chars().any(char::is_control)
+    {
         return Err(AppError::BadRequest(
-            "OAuth account name is required".into(),
+            "OAuth account name must contain 1 to 200 non-control characters".into(),
         ));
     }
     if !matches!(input.oauth_driver.as_str(), "cursor" | "provider_adapter") {
@@ -206,7 +208,7 @@ pub async fn start_cursor_login(
         ));
     }
     let oauth_driver = input.oauth_driver.clone();
-    let _ = validate_config(&input.provider_config)?;
+    let _ = validate_oauth_login_config(&input.provider_config)?;
     let provider_scope = network::scope_from_config(&input.provider_config);
     let (mut login_url, poll_url, refresh_url) = if oauth_driver == "provider_adapter" {
         (

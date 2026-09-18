@@ -36,6 +36,8 @@ OAuth accounts are created through management-side login flows, with tokens stor
 
 Login management interfaces require `oauth:write`. Existing accounts support `POST /internal/v1/upstreams/{account_id}/oauth/refresh` and `POST /internal/v1/upstreams/{account_id}/oauth/disconnect`.
 
+OAuth start requests accept an optional `proxy_url`. Set it to a private IP-literal `socks5h://` endpoint when the provider login requires that network path; omit it for a direct connection. The selected transport is encrypted with the login session and then retained by the account for polling or completion, token refresh, revocation and runtime traffic. Reauthorization reuses the account's current setting. Plugin adapters describe their setup fields through the provider `config_schema`; the validated `provider_config` is encrypted in the bounded login session and becomes the account configuration after completion.
+
 ## Account proxies
 
 An account can use a private SOCKS5 proxy. The proxy URL (including optional proxy username and password) is encrypted and viewed or changed only through dedicated management interfaces:

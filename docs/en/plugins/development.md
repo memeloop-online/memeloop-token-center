@@ -69,6 +69,8 @@ Components never see credentials. A `stream=true` declaration, cross-origin path
 
 A Provider can declare `oauth_adapter` (`api_version: "oauth-adapter-v1"`, `flow_kind: "cursor_pkce"`, with `login_url`, `poll_url`, and `refresh_url`), which the control plane executes through the versioned PKCE protocol. It can also declare `authorization_code_pkce` for the generic authorization-code flow. In both cases, tokens enter only the core encrypted credential table; components and plugin KV never receive tokens.
 
+Provider-specific onboarding fields belong in the provider `config_schema`. The start request supplies the validated `provider_config` plus an optional account `proxy_url`; the control plane encrypts the bounded login state and applies one transport choice to authorization polling, refresh and account traffic.
+
 ## Minimal manifest
 
 ```json

@@ -2141,13 +2141,26 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             config_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["base_url", "network_scope"],
+                "required": ["base_url", "network_scope", "region", "workspace"],
                 "properties": {
                     "base_url": {"type": "string", "format": "uri"},
-                    "network_scope": {"const": "private"}
+                    "network_scope": {"const": "private"},
+                    "region": {"type": "string", "enum": ["east", "west"]},
+                    "workspace": {"type": "string", "minLength": 1}
                 }
             }),
-            credential_schema: json!({"type": "object"}),
+            credential_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "access_token", "refresh_token", "expires_at"],
+                "properties": {
+                    "type": {"const": "oauth"},
+                    "access_token": {"type": "string", "minLength": 1, "writeOnly": true},
+                    "refresh_token": {"type": "string", "minLength": 1, "writeOnly": true},
+                    "expires_at": {"type": "integer"},
+                    "adapter_state": {"type": ["object", "null"], "writeOnly": true}
+                }
+            }),
             oauth_adapter: Some(crate::provider::OAuthAdapterContribution {
                 api_version: "oauth-adapter-v1".to_owned(),
                 flow_kind: crate::provider::OAuthFlowKind::CursorPkce,
@@ -2162,7 +2175,9 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             source: "plugin:test@1.0.0".to_owned(),
         }])
         .unwrap();
-    let response = router_for_role(state, RuntimeRole::Control)
+    let application = router_for_role(state, RuntimeRole::Control);
+    let response = application
+        .clone()
         .oneshot(
             Request::post("/internal/v1/oauth/provider-adapter/start")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -2173,8 +2188,11 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                         "provider_driver": "plugin-provider",
                         "provider_config": {
                             "base_url": "http://127.0.0.1:8188",
-                            "network_scope": "private"
-                        }
+                            "network_scope": "private",
+                            "region": "east",
+                            "workspace": "team-a"
+                        },
+                        "proxy_url": "socks5h://127.0.0.1:1080"
                     })
                     .to_string(),
                 ))
@@ -2187,6 +2205,60 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        !body
+            .windows("127.0.0.1:1080".len())
+            .any(|window| window == b"127.0.0.1:1080")
+    );
+    let direct = application
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/oauth/provider-adapter/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::from(
+                    serde_json::json!({
+                        "account_name": "plugin-direct",
+                        "provider_driver": "plugin-provider",
+                        "provider_config": {
+                            "base_url": "http://127.0.0.1:8188",
+                            "network_scope": "private",
+                            "region": "west",
+                            "workspace": "team-b"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), StatusCode::OK);
+
+    let undeclared = application
+        .oneshot(
+            Request::post("/internal/v1/oauth/provider-adapter/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::from(
+                    serde_json::json!({
+                        "account_name": "plugin-invalid",
+                        "provider_driver": "plugin-provider",
+                        "provider_config": {
+                            "base_url": "http://127.0.0.1:8188",
+                            "network_scope": "private",
+                            "region": "east",
+                            "workspace": "team-c",
+                            "login_context": {"parallel": true}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(undeclared.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

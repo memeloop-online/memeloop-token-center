@@ -36,6 +36,8 @@ OAuth 账户通过管理端登录流程创建，令牌加密存储：
 
 登录相关的管理接口需要 `oauth:write`。既有账户支持 `POST /internal/v1/upstreams/{account_id}/oauth/refresh` 与 `POST /internal/v1/upstreams/{account_id}/oauth/disconnect`。
 
+OAuth start 请求可携带 `proxy_url`。供应商登录需要指定网络出口时，填写私网 IP 字面值形式的 `socks5h://` 地址；直连环境可留空。所选网络路径随登录会话加密保存，并由账户继续用于轮询或换票、令牌刷新、撤销与运行时流量。重新授权沿用账户当前设置。插件适配器通过供应商 `config_schema` 声明表单字段；完成校验的 `provider_config` 进入有界加密登录会话，授权完成后成为账户配置。
+
 ## 账户代理
 
 账户可以配置私有 SOCKS5 代理。代理 URL（含可选的代理用户名密码）加密存储，通过专用管理接口查看和修改：

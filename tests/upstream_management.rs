@@ -139,7 +139,7 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
         .await
         .unwrap();
 
-    let (status, rejected_activation) = json_request(
+    let (status, activated) = json_request(
         &state,
         "PATCH",
         &format!("/internal/v1/upstreams/{}", upstream.id),
@@ -152,18 +152,15 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        !rejected_activation
-            .to_string()
-            .contains("codex-access-secret")
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(activated["status"], "active");
+    assert!(!activated.to_string().contains("codex-access-secret"));
 
     let proxy_url = "socks5h://proxy-user:proxy-secret@100.64.0.16:1080";
     let rotation = json!({
         "tenant_external_id": "codex-proxy-tenant",
         "proxy_url": proxy_url,
-        "expected_updated_at": upstream.updated_at,
+        "expected_updated_at": activated["updated_at"],
         "expected_credential_generation": upstream.credential_generation
     });
     let path = format!("/internal/v1/upstreams/{}/transport-proxy", upstream.id);

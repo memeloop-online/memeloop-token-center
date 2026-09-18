@@ -1,7 +1,8 @@
 use super::super::*;
 use super::{
     accounts::{
-        validate_provider_config_schema, validate_provider_schema, validate_upstream_destination,
+        validate_provider_config_schema, validate_provider_schema,
+        validate_upstream_destination_with_proxy,
     },
     oauth::reauthorization_target,
 };
@@ -15,6 +16,8 @@ pub(in crate::api) struct StartClaudeOAuthRequest {
     account_name: String,
     #[serde(default)]
     upstream_account_id: Option<Uuid>,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 pub(in crate::api) async fn start_claude_oauth(
@@ -25,6 +28,19 @@ pub(in crate::api) async fn start_claude_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
+        return Err(AppError::BadRequest(
+            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
+                .into(),
+        ));
+    }
+    if let Some(proxy_url) = body.proxy_url.as_deref() {
+        require_global_service(&service)?;
+        crate::provider::validate_oauth_remote_dns_proxy_url(
+            proxy_url,
+            state.config.allow_oauth_loopback,
+        )?;
+    }
     let provider_config = if let Some(account_id) = body.upstream_account_id {
         state
             .db
@@ -45,8 +61,31 @@ pub(in crate::api) async fn start_claude_oauth(
         claude::OAUTH_DRIVER,
     )
     .await?;
-    validate_upstream_destination(claude::PROVIDER_DRIVER, &provider_config, &service, &state)
-        .await?;
+    let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
+        state
+            .db
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                target.account_id,
+                &body.tenant_external_id,
+                target.expected_updated_at,
+                target.expected_credential_generation,
+                claude::OAUTH_DRIVER,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?
+    } else {
+        body.proxy_url
+    };
+    validate_upstream_destination_with_proxy(
+        claude::PROVIDER_DRIVER,
+        &provider_config,
+        session_proxy_url
+            .as_deref()
+            .map(|url| (url, OutboundScope::Private)),
+        &service,
+        &state,
+    )
+    .await?;
     Ok(Json(
         claude::start_claude_login(
             &state.db,
@@ -55,6 +94,7 @@ pub(in crate::api) async fn start_claude_oauth(
                 account_name: body.account_name,
                 operator_service_id: service.service_id,
                 provider_config,
+                proxy_url: session_proxy_url,
                 reauthorize,
             },
             state.config.key_pepper.as_bytes(),
@@ -137,9 +177,10 @@ async fn finish_claude_login(
         &ready.provider_config,
         &ready.credential,
     )?;
-    validate_upstream_destination(
+    validate_upstream_destination_with_proxy(
         claude::PROVIDER_DRIVER,
         &ready.provider_config,
+        ready.credential.proxy(),
         service,
         state,
     )
