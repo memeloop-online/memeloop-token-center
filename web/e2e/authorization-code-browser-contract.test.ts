@@ -14,6 +14,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
     let starts = 0; let completes = 0; let reads = 0; let tokenCalls = 0; let continuations = 0;
     await page.route('**/internal/v1/upstreams', async route => {
       assert.equal(route.request().method(), 'GET'); reads++;
@@ -23,6 +24,10 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
       const body = route.request().postDataJSON();
       if (route.request().url().endsWith('/start')) {
         starts++; assert.equal(body.provider_driver, 'fixture-plugin'); assert.equal('client' in body, false);
+        if (starts <= 2) {
+          assert.equal(body.proxy_url, 'socks5h://10.0.0.8:1080');
+          assert.equal(body.proxy_network_scope, 'private');
+        } else assert.equal('proxy_url' in body, false, 'direct login omits proxy fields after scope reset');
         if (starts === 1) return route.fulfill({ status: 409, json: { error: { message: 'default OAuth client configuration is not provisioned' } } });
         return route.fulfill({ json: { driver: 'fixture-plugin', login_url: 'https://login.example.invalid/authorize', session_token: 'fixture-session-secret', expires_at: Date.now() + 600_000, recovery_expires_at: Date.now() + 87_000_000 } });
       }
@@ -43,9 +48,21 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html`);
     const start = page.getByRole('button', { name: '开始登录', exact: true });
+    assert.equal(await start.isEnabled(), true, 'plugin OAuth starts directly when the current network can reach the provider');
+    await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
+    const proxy = page.getByLabel(/^代理地址/);
+    assert.equal(await start.isDisabled(), true);
+    await proxy.fill('socks5h://10.0.0.8:1080');
+    assert.equal(await start.isEnabled(), true);
     await start.click(); await page.getByRole('alert').waitFor();
-    assert.equal(await page.getByRole('alert').innerText(), '此提供商的默认 OAuth 客户端尚未配置。请联系管理员。');
+    assert.equal(await page.getByRole('alert').innerText(), 'OAuth 客户端配置待管理员完成，请联系管理员。');
     await start.click(); await page.getByLabel('完整回调地址', { exact: true }).waitFor();
+    const copyLogin = page.getByRole('button', { name: '复制登录地址', exact: true });
+    const openLogin = page.getByRole('link', { name: '打开授权页', exact: true });
+    assert.equal(await openLogin.getAttribute('href'), 'https://login.example.invalid/authorize');
+    assert.equal(await openLogin.getAttribute('target'), '_blank');
+    await copyLogin.click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'https://login.example.invalid/authorize');
     await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
     await page.getByRole('alert').waitFor();
@@ -62,7 +79,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     await start.click();
     await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost:8080/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
-    await page.getByText('账号已保存，但暂时无法刷新账号列表。请重试读取列表，无需重新登录或再次提交授权码。', { exact: true }).waitFor();
+    await page.getByText('账号已保存。重新读取账号列表即可查看。', { exact: true }).waitFor();
     assert.equal(reads, 1, 'successful account creation automatically refreshes the account list');
     assert.match(await page.locator('body').innerText(), /可继续接入至/);
     assert.equal(completes, 2);
@@ -83,7 +100,7 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     assert.equal(tokenCalls, 3);
     await page.clock.setFixedTime(new Date(Date.now() + 11 * 60_000));
     await page.getByRole('button', { name: '继续完成接入', exact: true }).click();
-    await page.getByText('暂时无法继续完成接入。请先检查账号列表；本次未发送授权码。你可以稍后在截止时间前手动继续。', { exact: true }).waitFor();
+    await page.getByText('接入进度仍在确认中。请先检查账号列表，或在截止时间前再次继续。', { exact: true }).waitFor();
     assert.equal(tokenCalls, 3, 'unissued continuation must not call the token endpoint');
     assert.equal(continuations, 1, 'passing the initial ten-minute deadline does not destroy continuation state');
     await page.getByRole('button', { name: '继续完成接入', exact: true }).click();

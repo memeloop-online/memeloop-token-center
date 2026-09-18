@@ -46,20 +46,20 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
     const path = `${origin}/e2e/fixtures/authorization-code.html`;
     for (const mode of ['legacy', 'other']) {
       await page.goto(`${path}?reauthorize=${mode}`);
-      await page.getByRole('status').filter({ hasText: '不具备原位重新授权条件' }).waitFor();
+      await page.getByRole('status').filter({ hasText: '保持账号连接唯一' }).waitFor();
       assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).count(), 0);
     }
     assert.equal(starts, 0);
     await page.goto(`${path}?reauthorize=eligible`);
     assert.equal(await page.getByLabel('上游名称', { exact: true }).isDisabled(), true);
-    assert.equal(await page.getByRole('checkbox', { name: '使用代理', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).count(), 0);
     assert.match(await page.locator('body').innerText(), /原来的 Google 身份/);
     const start = page.getByRole('button', { name: '开始登录', exact: true });
     await start.click();
     const callback = page.getByLabel('完整回调地址', { exact: true });
     await callback.fill('http://localhost/callback?code=fixture-code&state=fixture-state');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
-    await page.getByRole('alert').filter({ hasText: '本次登录已终止' }).waitFor();
+    await page.getByRole('alert').filter({ hasText: '登录身份与原账号不同' }).waitFor();
     assert.equal(await page.getByRole('button', { name: '继续完成重新授权', exact: true }).count(), 0);
     assert.equal(await callback.count(), 0);
     assert.equal(await start.count(), 0, 'a rejected session requires explicit draft reset before another start');

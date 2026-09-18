@@ -9,18 +9,18 @@ const copy = {
   'zh-CN': {
     start: '开始登录', openAuthorization: '打开授权页', check: '检查授权结果', countdown: /秒后可检查/,
     method: '账户授权', reauthorize: '重新授权', backToSetup: '返回登录设置', reload: '重新读取账号列表',
-    savedListUnavailable: '账号已保存，但列表暂时无法读取。请重试读取，无需重新登录。',
+    savedListUnavailable: '账号已保存。重新读取列表即可查看。',
     expired: '本次登录已过期。请返回登录设置后重新开始。',
     hint: '请在 Kimi 页面完成确认，然后检查授权结果。', validUntil: /有效期至/,
-    security: '才在 Kimi 页面确认', openaiSecurity: /才在 OpenAI 页面继续/,
+    security: '在 Kimi 页面确认本次登录', openaiSecurity: /在 OpenAI 页面确认本次登录/,
   },
   en: {
     start: 'Start login', openAuthorization: 'Open authorization', check: 'Check authorization', countdown: /Check in \d+s/,
     method: 'Account authorization', reauthorize: 'Authorize again', backToSetup: 'Back to login setup', reload: 'Reload account list',
-    savedListUnavailable: 'The account is saved, but the list could not be loaded. Retry loading; no new login is needed.',
+    savedListUnavailable: 'Account saved. Reload the list to view it.',
     expired: 'This login expired. Return to login setup to start again.',
     hint: 'Confirm on Kimi, then check authorization.', validUntil: /Valid until/,
-    security: 'Confirm on Kimi only if you just started this login', openaiSecurity: /Continue on OpenAI/,
+    security: 'Confirm this login on Kimi', openaiSecurity: /Confirm this login on OpenAI/,
   },
 } as const;
 

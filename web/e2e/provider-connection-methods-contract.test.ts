@@ -42,12 +42,12 @@ test('OAuth-only providers are not shown as direct credential providers', () => 
   assert.equal(directCredentialSchema(oauthOnly.credential_schema), undefined);
 });
 
-test('native creation proxy policy preserves Codex and does not invent Kimi or plugin support', () => {
-  assert.equal(oauthCreationProxyMode(dualMethodProvider), 'required');
+test('every interactive adapter receives the same optional account-proxy choice', () => {
+  assert.equal(oauthCreationProxyMode(dualMethodProvider), 'optional');
   for (const [id, flow] of [['cursor', 'cursor_pkce'], ['github-copilot', 'github_device_copilot']] as const) {
     const provider = { ...dualMethodProvider, id, source: 'builtin', oauth_adapter: { ...dualMethodProvider.oauth_adapter!, flow_kind: flow } };
     assert.equal(oauthCreationProxyMode(provider), 'optional');
-    assert.equal(oauthCreationProxyMode({ ...provider, source: 'plugin' }), 'none');
+    assert.equal(oauthCreationProxyMode({ ...provider, source: 'plugin' }), 'optional');
   }
   assert.equal(oauthCreationProxyMode({ ...dualMethodProvider, id: 'kimi-oauth', oauth_adapter: undefined }), 'none');
 });

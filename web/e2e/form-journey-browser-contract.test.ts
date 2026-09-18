@@ -5,7 +5,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
-test('real form composition keeps Codex proxy required and route drafts across disclosure', { timeout: 60_000 }, async () => {
+test('real form composition keeps OAuth proxy optional and route drafts across disclosure', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -21,7 +21,9 @@ test('real form composition keeps Codex proxy required and route drafts across d
     await page.goto(`${origin}/e2e/fixtures/form-journey.html`);
     await page.getByRole('button', { name: '新增上游', exact: true }).click();
     await page.getByRole('button', { name: '账户授权', exact: true }).click();
-    assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), false, 'no proxy never permits Codex login');
+    assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), true, 'direct network environments can start Codex login');
+    await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
+    assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), false, 'enabling the proxy waits for a valid address');
     await page.locator('.authorization-form input[type="password"]').fill('socks5://100.64.0.20:1080');
     assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), false, 'local DNS proxy is rejected');
     await page.locator('.authorization-form input[type="password"]').fill('socks5h://100.64.0.20:1080');

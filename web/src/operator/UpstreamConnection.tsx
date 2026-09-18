@@ -17,7 +17,7 @@ interface ProxyConnection {
   credential_generation: number;
 }
 
-function ProxyValue({ value, onChange, disabled = false, id, invalid = false, describedBy, actions }: { value: string; onChange?: (value: string) => void; disabled?: boolean; id?: string; invalid?: boolean; describedBy?: string; actions?: ReactNode }) {
+function ProxyValue({ value, onChange, disabled = false, id, invalid = false, describedBy, actions, required = false }: { value: string; onChange?: (value: string) => void; disabled?: boolean; id?: string; invalid?: boolean; describedBy?: string; actions?: ReactNode; required?: boolean }) {
   const { locale, t } = useI18n();
   const copy = providerConnectionCopy(locale);
   const input = useRef<HTMLInputElement>(null);
@@ -30,20 +30,20 @@ function ProxyValue({ value, onChange, disabled = false, id, invalid = false, de
     return () => { window.removeEventListener('blur', hide); document.removeEventListener('visibilitychange', hide); };
   }, []);
   return <div className="provider-proxy-value" onKeyDown={event => { if (event.key === 'Escape' && visible) { setVisible(false); event.stopPropagation(); } }}>
-    <input ref={input} id={id} type={visible ? 'text' : 'password'} readOnly={!onChange} required={Boolean(onChange)} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} aria-label={t('connection.proxyUrl')} autoComplete="off" spellCheck={false} onChange={event => onChange?.(event.target.value)} />
+    <input ref={input} id={id} type={visible ? 'text' : 'password'} readOnly={!onChange} required={required} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} aria-label={t('connection.proxyUrl')} autoComplete="off" spellCheck={false} onChange={event => onChange?.(event.target.value)} />
     <Button type="button" appearance="secondary" disabled={disabled} aria-pressed={visible} onClick={() => setVisible(current => !current)}>{visible ? copy.hideProxy : copy.viewProxy}</Button>
     {value && !disabled && <CopyButton value={value} label={copy.copyProxy} />}
     {actions}
   </div>;
 }
 
-export function ProxyInput({ value, onChange, disabled = false, generic = false, plaintext = false, hint }: { value: string; onChange: (value: string) => void; disabled?: boolean; generic?: boolean; plaintext?: boolean; hint?: string }) {
+export function ProxyInput({ value, onChange, disabled = false, generic = false, plaintext = false, hint, required = false }: { value: string; onChange: (value: string) => void; disabled?: boolean; generic?: boolean; plaintext?: boolean; hint?: string; required?: boolean }) {
   const { t } = useI18n();
   const id = useId();
   const invalid = Boolean(value && !(generic ? isGenericProxyUrlInput(value.trim()) : isPrivateProxyUrl(value.trim())));
   return <div className="upstream-proxy-editor">
-    <label htmlFor={id}>{t('connection.proxyUrl')} · {t('connection.required')}</label>
-    {plaintext ? <ProxyValue id={id} value={value} onChange={onChange} disabled={disabled} invalid={invalid} describedBy={`${id}-hint${invalid ? ` ${id}-error` : ''}`} /> : <SecretInput id={id} label={t('connection.proxyUrl')} required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />}
+    <label htmlFor={id}>{t('connection.proxyUrl')}{required ? ` · ${t('connection.required')}` : ''}</label>
+    {plaintext ? <ProxyValue id={id} value={value} onChange={onChange} disabled={disabled} invalid={invalid} describedBy={`${id}-hint${invalid ? ` ${id}-error` : ''}`} required={required} /> : <SecretInput id={id} label={t('connection.proxyUrl')} required={required} aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />}
     <p id={`${id}-hint`}>{hint ?? t(generic ? 'connection.genericProxyHint' : 'connection.proxyHint')}</p>
     {invalid && <p id={`${id}-error`} role="alert">{t(generic ? 'connection.genericProxyHint' : 'connection.proxyInvalid')}</p>}
   </div>;
@@ -143,7 +143,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
     {!requested && !disabled && canEditProxy && <Button type="button" appearance="secondary" onClick={() => setRequested(true)}>{copy.viewProxy}</Button>}
     {canEditProxy && <>{!readableProxy && editProxyAction}
       {editing && <div className="upstream-proxy-editor" onKeyDown={(event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement) { event.preventDefault(); void save(); } }}>
-        <ProxyInput value={proxy} onChange={setProxy} disabled={busy} generic={!strictOAuthProxy} plaintext hint={strictOAuthProxy && !codex ? (locale.startsWith('zh') ? '使用私网或 Tailnet IP 的 socks5h:// 代理，用于登录及该账号后续请求。' : 'Use a private or Tailnet IP socks5h:// proxy for login and subsequent account requests.') : undefined} />
+        <ProxyInput value={proxy} onChange={setProxy} disabled={busy} generic={!strictOAuthProxy} plaintext required hint={strictOAuthProxy && !codex ? (locale.startsWith('zh') ? '使用私网或 Tailnet IP 的 socks5h:// 代理，用于登录及该账号后续请求。' : 'Use a private or Tailnet IP socks5h:// proxy for login and subsequent account requests.') : undefined} />
         <Button className="provider-primary-action" appearance="primary" type="button" onClick={() => void save()} disabled={disabled || busy || !valid}>{t(busy ? 'common.loading' : 'connection.saveProxy')}</Button>
       </div>}
     </>}

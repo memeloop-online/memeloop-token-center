@@ -39,7 +39,7 @@ function availabilityLabel(availability: ModelPickerOption['availability'], t: (
   return availability ? t(`modelPicker.availability.${availability}`) : undefined;
 }
 
-export function ModelPicker({ label, value, onChange, options, disabled = false, editable = false, onQueryChange, onOpen, loading = false, error = '', popupLabel, invalid = false, describedBy }: {
+export function ModelPicker({ label, value, onChange, options, disabled = false, editable = false, onQueryChange, onOpen, loading = false, error = '', popupLabel, searchPlaceholder, searchAriaLabel, emptyText, groupBy = 'hierarchy', invalid = false, describedBy }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
@@ -51,6 +51,12 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
   loading?: boolean;
   error?: string;
   popupLabel?: string;
+  /** Copy belongs to the consuming workflow; this picker is also used for providers. */
+  searchPlaceholder?: string;
+  searchAriaLabel?: string;
+  emptyText?: string;
+  /** Provider directories are flat by default when grouping adds no information. */
+  groupBy?: 'hierarchy' | 'none';
   invalid?: boolean;
   describedBy?: string;
 }) {
@@ -111,21 +117,21 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
       if (event.target === event.currentTarget && panel.current === event.currentTarget
         && event.newState === 'closed' && !event.currentTarget.matches(':popover-open')) close();
     }}>
-      {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
+      {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={searchAriaLabel ?? t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={searchPlaceholder ?? t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
       <small className="model-picker-keyboard-hint">{t('modelPicker.keyboardHint')}</small>
       {loading && <small role="status">{t('common.loading')}</small>}
       {error && <small role="alert" className="error-text">{error}</small>}
       <div id={`${id}-list`} role="listbox" aria-label={label} aria-busy={loading}>
-        {(matching.some((option) => option.providerGroup) ? [...groupOptions(matching, 'providerGroup')] : [[undefined, matching] as const]).map(([providerGroup, groupModels]) => <div role="group" aria-label={providerGroup || undefined} key={providerGroup || 'all-providers'}>
+        {(groupBy === 'none' ? [[undefined, matching] as const] : matching.some((option) => option.providerGroup) ? [...groupOptions(matching, 'providerGroup')] : [[undefined, matching] as const]).map(([providerGroup, groupModels]) => <div role={groupBy === 'none' ? undefined : 'group'} aria-label={groupBy === 'none' ? undefined : providerGroup || undefined} key={providerGroup || 'all-providers'}>
           {providerGroup && <h3>{providerGroup}</h3>}
-          {[...groupOptions(groupModels, 'provider')].map(([provider, models]) => <div role="group" aria-label={provider} key={provider}><h4>{provider}</h4>
-            {[...groupOptions(models, 'upstream')].map(([upstream, entries]) => <div role="group" aria-label={upstream} key={upstream}><h5>{upstream}</h5>
+          {(groupBy === 'none' ? [[undefined, groupModels] as const] : [...groupOptions(groupModels, 'provider')]).map(([provider, models]) => <div role={groupBy === 'none' ? undefined : 'group'} aria-label={groupBy === 'none' ? undefined : provider} key={provider || 'all'}>{groupBy !== 'none' && <h4>{provider}</h4>}
+            {(groupBy === 'none' ? [[undefined, models] as const] : [...groupOptions(models, 'upstream')]).map(([upstream, entries]) => <div role={groupBy === 'none' ? undefined : 'group'} aria-label={groupBy === 'none' ? undefined : upstream} key={upstream || 'all'}>{groupBy !== 'none' && <h5>{upstream}</h5>}
               {entries.map((option) => { const index = matching.indexOf(option); const availability = availabilityLabel(option.availability, t); const health = healthLabel(option.health, t); return <button type="button" role="option" tabIndex={-1} id={`${id}-option-${index}`} key={option.key} aria-selected={option.value === value} aria-disabled={option.disabled || undefined} disabled={option.disabled} className={`${index === active ? 'active' : ''}${option.disabled ? ' unavailable' : ''}`} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => !option.disabled && setActive(index)} onClick={() => choose(option)}><b>{option.label}</b>{option.description && <small>{option.description}</small>}<span className="model-picker-metadata">{availability && <small className={`model-picker-availability ${option.availability}`}>{availability}</small>}{health && <small className={`model-picker-health ${option.health}`}>{health}</small>}{option.capabilities?.map((capability) => <small className="model-picker-capability" key={capability}>{capability}</small>)}</span></button>; })}
             </div>)}
           </div>)}
         </div>)}
       </div>
-      {!loading && !error && matching.length === 0 && <small>{t('filter.catalogEmpty')}</small>}
+      {!loading && !error && matching.length === 0 && <small>{emptyText ?? t('filter.catalogEmpty')}</small>}
     </section>}
   </div>;
 }
