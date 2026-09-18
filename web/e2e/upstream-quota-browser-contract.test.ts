@@ -23,7 +23,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
-    await page.clock.install();
+    await page.clock.install({ time: new Date('2026-09-15T00:00:00Z') });
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.route('**/*', (route) => {
@@ -105,7 +105,6 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     assert.equal(await reset.count(), 0, 'cancelled preparation remains locked');
     // Re-entering the page recovers the durable prepared operation without its
     // confirmation secret, while keeping the exact deadline and live countdown visible.
-    await page.clock.setFixedTime(new Date('2026-09-15T00:00:00Z'));
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=prepared-current`);
     await view.click();
     const recoveredExpiry = page.locator('[data-reset-operation-expiry]');
