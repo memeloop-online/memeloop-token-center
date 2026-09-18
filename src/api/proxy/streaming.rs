@@ -155,6 +155,7 @@ pub(super) struct StreamingResponse<'a> {
     /// content.
     pub(super) upstream_account_id: Uuid,
     pub(super) credential_generation: i64,
+    pub(super) sse_framing_limits: crate::provider::SseFramingLimits,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -182,6 +183,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         public_model,
         upstream_account_id,
         credential_generation,
+        sse_framing_limits,
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
@@ -272,20 +274,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             });
             let mut sse_capture = is_sse.then(|| match protocol {
                 Protocol::OpenAiChat if is_codex_route => {
-                    ResponsesSseCapture::for_codex_responses()
+                    ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
                 Protocol::OpenAiChat if strict_openai_chat_usage => {
-                    chat_usage_capture(is_kimi_route)
+                    chat_usage_capture_with_limits(is_kimi_route, sse_framing_limits)
                 }
                 Protocol::OpenAiResponses if is_codex_route => {
-                    ResponsesSseCapture::for_codex_responses()
+                    ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
-                Protocol::OpenAiResponses => ResponsesSseCapture::for_responses(),
-                _ => ResponsesSseCapture::for_delivery(),
+                Protocol::OpenAiResponses => {
+                    ResponsesSseCapture::for_responses_with_limits(sse_framing_limits)
+                }
+                _ => ResponsesSseCapture::for_delivery_with_limits(sse_framing_limits),
             });
             let mut responses_streaming_sanitizer = (is_sse
                 && (is_codex_route || matches!(protocol, Protocol::OpenAiResponses)))
-            .then(crate::api::sse::ResponsesStreamingSanitizer::default);
+            .then(|| crate::api::sse::ResponsesStreamingSanitizer::with_limits(sse_framing_limits));
             let codex_responses_progress_heartbeat =
                 is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);
             let mut transport_error: Option<&'static str> = None;
@@ -293,7 +297,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
-            let mut terminal_frames = delivery::TerminalFrames::default();
+            let mut terminal_frames =
+                delivery::TerminalFrames::with_limit(sse_framing_limits.terminal_hold_bytes);
             let mut output_timing = timing::OutputTiming::default();
             let mut terminal_memory = background_state
                 .metrics
@@ -429,9 +434,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         if downstream_closed_observed && !flushing_terminal {
                             downstream_ready_bytes =
                                 downstream_ready_bytes.saturating_add(raw_chunk_len);
-                            if downstream_ready_bytes
-                                > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES
-                            {
+                            if downstream_ready_bytes > sse_framing_limits.terminal_hold_bytes {
                                 transport_error = Some("downstream_disconnected");
                                 drop(archive_sender.take());
                                 break;
@@ -626,9 +629,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     archive_failed = true;
                                     break;
                                 };
-                                if !spool
-                                    .append(vec![super::archive_retention::sse_frame(&frame.bytes)])
-                                {
+                                if !spool.append(vec![
+                                    super::archive_retention::sse_frame_with_limits(
+                                        &frame.bytes,
+                                        sse_framing_limits,
+                                    ),
+                                ]) {
                                     archive_failed = true;
                                     break;
                                 }
@@ -1026,11 +1032,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .map_err(|_| AppError::Internal)
 }
 
+#[cfg(test)]
 fn chat_usage_capture(is_kimi_route: bool) -> ResponsesSseCapture {
+    chat_usage_capture_with_limits(is_kimi_route, crate::provider::SseFramingLimits::default())
+}
+
+fn chat_usage_capture_with_limits(
+    is_kimi_route: bool,
+    limits: crate::provider::SseFramingLimits,
+) -> ResponsesSseCapture {
     if is_kimi_route {
-        ResponsesSseCapture::for_kimi_chat_usage()
+        ResponsesSseCapture::for_kimi_chat_usage_with_limits(limits)
     } else {
-        ResponsesSseCapture::for_openai_chat_usage()
+        ResponsesSseCapture::for_openai_chat_usage_with_limits(limits)
     }
 }
 

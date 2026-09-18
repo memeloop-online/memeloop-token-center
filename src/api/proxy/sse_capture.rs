@@ -95,43 +95,76 @@ pub(super) struct ResponsesSseSummary {
 }
 
 impl ResponsesSseCapture {
+    #[cfg(test)]
     pub(super) fn for_responses() -> Self {
-        Self {
-            require_explicit_completed: true,
-            responses_delivery: Some(ResponsesDeliveryContract::Compatible),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
+        Self::for_responses_with_limits(crate::provider::SseFramingLimits::default())
     }
 
+    pub(super) fn for_responses_with_limits(limits: crate::provider::SseFramingLimits) -> Self {
+        let mut capture = Self::with_limits(limits);
+        capture.require_explicit_completed = true;
+        capture.responses_delivery = Some(ResponsesDeliveryContract::Compatible);
+        capture.delivery = Some(SseDeliveryState::default());
+        capture
+    }
+
+    #[cfg(test)]
     pub(super) fn for_codex_responses() -> Self {
-        Self {
-            require_explicit_completed: true,
-            responses_delivery: Some(ResponsesDeliveryContract::Codex),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
+        Self::for_codex_responses_with_limits(crate::provider::SseFramingLimits::default())
     }
 
+    pub(super) fn for_codex_responses_with_limits(
+        limits: crate::provider::SseFramingLimits,
+    ) -> Self {
+        let mut capture = Self::with_limits(limits);
+        capture.require_explicit_completed = true;
+        capture.responses_delivery = Some(ResponsesDeliveryContract::Codex);
+        capture.delivery = Some(SseDeliveryState::default());
+        capture
+    }
+
+    #[cfg(test)]
     pub(super) fn for_delivery() -> Self {
-        Self {
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
+        Self::for_delivery_with_limits(crate::provider::SseFramingLimits::default())
     }
 
+    pub(super) fn for_delivery_with_limits(limits: crate::provider::SseFramingLimits) -> Self {
+        let mut capture = Self::with_limits(limits);
+        capture.delivery = Some(SseDeliveryState::default());
+        capture
+    }
+
+    #[cfg(test)]
     pub(super) fn for_openai_chat_usage() -> Self {
-        Self {
-            chat_usage: Some(ChatSseUsageState::default()),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
+        Self::for_openai_chat_usage_with_limits(crate::provider::SseFramingLimits::default())
     }
 
+    pub(super) fn for_openai_chat_usage_with_limits(
+        limits: crate::provider::SseFramingLimits,
+    ) -> Self {
+        let mut capture = Self::with_limits(limits);
+        capture.chat_usage = Some(ChatSseUsageState::default());
+        capture.delivery = Some(SseDeliveryState::default());
+        capture
+    }
+
+    #[cfg(test)]
     pub(super) fn for_kimi_chat_usage() -> Self {
+        Self::for_kimi_chat_usage_with_limits(crate::provider::SseFramingLimits::default())
+    }
+
+    pub(super) fn for_kimi_chat_usage_with_limits(
+        limits: crate::provider::SseFramingLimits,
+    ) -> Self {
+        let mut capture = Self::with_limits(limits);
+        capture.chat_usage = Some(ChatSseUsageState::for_kimi());
+        capture.delivery = Some(SseDeliveryState::default());
+        capture
+    }
+
+    fn with_limits(limits: crate::provider::SseFramingLimits) -> Self {
         Self {
-            chat_usage: Some(ChatSseUsageState::for_kimi()),
-            delivery: Some(SseDeliveryState::default()),
+            framer: crate::api::sse::BoundedSseFramer::with_limits(limits),
             ..Self::default()
         }
     }

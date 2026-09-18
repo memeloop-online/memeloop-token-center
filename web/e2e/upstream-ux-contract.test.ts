@@ -18,6 +18,19 @@ test('versioned failover fields retain schema bounds and receive editor labels',
   assert.equal('title' in fields.version, false);
 });
 
+test('SSE framing policy fields stay in the runtime connection policy editor', () => {
+  const fields = {
+    max_sse_event_bytes: { type: 'integer' as const, minimum: 262144, maximum: 16777216, default: 8388608 },
+    max_sse_framed_bytes: { type: 'integer' as const, minimum: 262144, maximum: 16842752, default: 8454144 },
+    max_sse_terminal_hold_bytes: { type: 'integer' as const, minimum: 262144, maximum: 16842752, default: 8454144 },
+  };
+  const output = connectionSchema({ properties: { transport_policy: { properties: fields, additionalProperties: false } } }, 'Fixed endpoint');
+  const policy = output.properties?.transport_policy as { properties: Record<string, { title?: string }> };
+  assert.equal(policy.properties.max_sse_event_bytes.title, 'Maximum SSE event (bytes)');
+  assert.equal(policy.properties.max_sse_framed_bytes.title, 'Maximum framed chunk (bytes)');
+  assert.equal(policy.properties.max_sse_terminal_hold_bytes.title, 'Maximum terminal hold (bytes)');
+});
+
 test('Codex proxies mirror private backend ranges without narrowing generic hostname schemas', () => {
   for (const [url, valid] of [
     ['socks5h://10.0.0.10:1080', true], ['socks5h://100.64.0.16', true], ['socks5h://[fd00::1]:1080', true],

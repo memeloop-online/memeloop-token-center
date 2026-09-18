@@ -291,13 +291,21 @@ mod delivery_log_tests {
 }
 
 /// Keep only the bounded terminal tail, never the streamed response body.
-#[derive(Default)]
 pub(super) struct TerminalFrames {
     frames: Vec<SseDeliveryFrame>,
     bytes: usize,
+    limit_bytes: usize,
 }
 
 impl TerminalFrames {
+    pub(super) fn with_limit(limit_bytes: usize) -> Self {
+        Self {
+            frames: Vec::new(),
+            bytes: 0,
+            limit_bytes,
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
@@ -306,7 +314,7 @@ impl TerminalFrames {
             return Ok(Some(frame));
         }
         self.bytes = self.bytes.checked_add(frame.bytes.len()).ok_or(())?;
-        if self.bytes > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES {
+        if self.bytes > self.limit_bytes {
             return Err(());
         }
         self.frames.push(frame);
@@ -320,6 +328,12 @@ impl TerminalFrames {
 
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+impl Default for TerminalFrames {
+    fn default() -> Self {
+        Self::with_limit(crate::provider::SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES)
     }
 }
 

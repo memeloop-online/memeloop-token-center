@@ -27,6 +27,9 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
       connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。',
       read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
       request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
+      max_sse_event_bytes: '单个上游 SSE 事件允许保留的最大字节数；Responses 终止事件可能包含完整响应对象。',
+      max_sse_framed_bytes: '单个网络分片可产出的完整 SSE 帧总字节数，必须不小于单事件上限。',
+      max_sse_terminal_hold_bytes: '等待 EOF 验证时可暂存的终止事件总字节数，必须不小于单事件上限。',
     })) {
       const field = policy.properties?.[name];
       if (field && typeof field === 'object') field.description = description;

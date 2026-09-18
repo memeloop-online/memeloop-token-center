@@ -202,6 +202,7 @@ pub(in crate::api::proxy) fn translate(
     response: reqwest::Response,
     context: responses_via_chat::Context,
     streaming: bool,
+    sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<UpstreamResponse, ProxySendError> {
     if !response.status().is_success() {
         return Ok(response.into());
@@ -266,7 +267,7 @@ pub(in crate::api::proxy) fn translate(
     let translated = if streaming {
         let state = StreamState {
             upstream: parts.stream,
-            framer: BoundedSseFramer::default(),
+            framer: BoundedSseFramer::with_limits(sse_framing_limits),
             usage: if kimi_dialect {
                 ChatSseUsageState::for_kimi()
             } else {
@@ -448,6 +449,7 @@ mod tests {
             response,
             responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
             true,
+            crate::provider::SseFramingLimits::default(),
         )
         .unwrap();
         let chunks = translated.bytes_stream().collect::<Vec<_>>().await;
@@ -479,6 +481,7 @@ mod tests {
                 response,
                 responses_via_chat::Context::for_kimi(&json!({"model":"kimi-k3"})),
                 true,
+                crate::provider::SseFramingLimits::default(),
             )
             .unwrap();
             let chunks = translated.bytes_stream().collect::<Vec<_>>().await;

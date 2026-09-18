@@ -224,6 +224,33 @@ fn strict_chat_event_limit_does_not_turn_missing_terminal_usage_into_semantic_ev
 }
 
 #[test]
+fn chat_capture_uses_the_request_framing_snapshot() {
+    let limits = crate::provider::SseFramingLimits {
+        event_bytes: 300 * 1024,
+        framed_bytes: 320 * 1024,
+        terminal_hold_bytes: 320 * 1024,
+    };
+    let mut event = b"data: ".to_vec();
+    event.extend(vec![b'x'; limits.event_bytes]);
+    event.extend_from_slice(b"\n\n");
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage_with_limits(limits);
+    let split = 257 * 1024;
+    assert!(
+        capture
+            .push_delivery_frames(&event[..split])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        capture.push_delivery_frames(&event[split..]),
+        Err(crate::api::sse::SseFramerRejection::EventLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(summary.observed_protocol_invalid);
+    assert!(!summary.independently_observed_protocol_invalid);
+}
+
+#[test]
 fn codex_capture_accepts_a_fragmented_large_terminal_without_archive_or_billing_pollution() {
     const OBSERVED_LARGE_EVENT_BYTES: usize = 346_759;
     const FRAGMENT_BYTES: usize = 64 * 1024;

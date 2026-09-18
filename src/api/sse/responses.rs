@@ -5,7 +5,7 @@ use super::{
     BoundedSseEvent, BoundedSseFramer, SAFE_SSE_HEARTBEAT_COMMENT, SseIdleControl,
     parse_unique_json,
 };
-use crate::api::{limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES, proxy::safe_response_id};
+use crate::{api::proxy::safe_response_id, provider::SseFramingLimits};
 
 // Codex records `response.failed` as a terminal Responses error. A generic
 // `error` event is valid SSE but is ignored by the Codex Responses parser, so
@@ -109,27 +109,43 @@ impl ResponseIdentityGate {
 /// bound covers one maximum-sized event and its small terminal control tail,
 /// so EOF validation cannot turn a completed response into an unbounded
 /// buffer.
-#[derive(Default)]
-enum ResponseTerminalHold {
-    #[default]
+enum ResponseTerminalHoldState {
     Idle,
     Holding(Vec<u8>),
 }
 
+struct ResponseTerminalHold {
+    state: ResponseTerminalHoldState,
+    max_bytes: usize,
+}
+
+impl Default for ResponseTerminalHold {
+    fn default() -> Self {
+        Self::with_limit(SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES)
+    }
+}
+
 impl ResponseTerminalHold {
+    fn with_limit(max_bytes: usize) -> Self {
+        Self {
+            state: ResponseTerminalHoldState::Idle,
+            max_bytes,
+        }
+    }
+
     fn begin(&mut self) {
-        *self = Self::Holding(Vec::new());
+        self.state = ResponseTerminalHoldState::Holding(Vec::new());
     }
 
     fn is_active(&self) -> bool {
-        matches!(self, Self::Holding(_))
+        matches!(&self.state, ResponseTerminalHoldState::Holding(_))
     }
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
-        let Self::Holding(held) = self else {
+        let ResponseTerminalHoldState::Holding(held) = &mut self.state else {
             return Ok(());
         };
-        if held.len().saturating_add(bytes.len()) > MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES {
+        if held.len().saturating_add(bytes.len()) > self.max_bytes {
             return Err("upstream_response_terminal_too_large");
         }
         held.extend_from_slice(bytes);
@@ -137,9 +153,9 @@ impl ResponseTerminalHold {
     }
 
     fn release(&mut self) -> Bytes {
-        match std::mem::take(self) {
-            Self::Idle => Bytes::new(),
-            Self::Holding(held) => Bytes::from(held),
+        match std::mem::replace(&mut self.state, ResponseTerminalHoldState::Idle) {
+            ResponseTerminalHoldState::Idle => Bytes::new(),
+            ResponseTerminalHoldState::Holding(held) => Bytes::from(held),
         }
     }
 }
@@ -147,7 +163,6 @@ impl ResponseTerminalHold {
 /// Validates and redacts the standard Responses SSE protocol before delivery.
 /// It shares the raw SSE framer with capture and headerless admission so every
 /// path observes identical CR/LF/CRLF and EOF boundaries.
-#[derive(Default)]
 pub(in crate::api) struct ResponsesStreamingSanitizer {
     framer: BoundedSseFramer,
     terminal: Option<StreamTerminal>,
@@ -165,7 +180,26 @@ pub(in crate::api) struct ResponsesStreamingSanitizer {
     last_rejection_stage: Option<&'static str>,
 }
 
+impl Default for ResponsesStreamingSanitizer {
+    fn default() -> Self {
+        Self::with_limits(SseFramingLimits::default())
+    }
+}
+
 impl ResponsesStreamingSanitizer {
+    pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
+        Self {
+            framer: BoundedSseFramer::with_limits(limits),
+            terminal: None,
+            saw_protocol_event: false,
+            forward_crlf_continuation: false,
+            identity: ResponseIdentityGate::default(),
+            terminal_hold: ResponseTerminalHold::with_limit(limits.terminal_hold_bytes),
+            progress_heartbeat: None,
+            last_rejection_stage: None,
+        }
+    }
+
     pub(in crate::api) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
         let mut output = Vec::new();
         let batch = self.framer.push(chunk);

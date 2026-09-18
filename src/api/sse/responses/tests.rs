@@ -297,6 +297,37 @@ fn sanitizer_accepts_a_fragmented_real_responses_terminal_above_the_legacy_limit
 }
 
 #[test]
+fn sanitizer_uses_the_request_terminal_hold_snapshot() {
+    let limits = crate::provider::SseFramingLimits {
+        event_bytes: 300 * 1024,
+        framed_bytes: 320 * 1024,
+        terminal_hold_bytes: 300 * 1024,
+    };
+    let completed = format!(
+        "data: {}\n\n",
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp-policy", "padding": "x".repeat(limits.terminal_hold_bytes)},
+        })
+    );
+    let mut sanitizer = ResponsesStreamingSanitizer::with_limits(limits);
+    assert_eq!(
+        sanitizer.push(completed.as_bytes()),
+        Err("upstream_response_event_too_large")
+    );
+
+    let mut terminal_limited =
+        ResponsesStreamingSanitizer::with_limits(crate::provider::SseFramingLimits {
+            event_bytes: 320 * 1024,
+            ..limits
+        });
+    assert_eq!(
+        terminal_limited.push(completed.as_bytes()),
+        Err("upstream_response_terminal_too_large")
+    );
+}
+
+#[test]
 fn sanitizer_accepts_exact_field_limit_and_rejects_the_next_without_delivery() {
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(

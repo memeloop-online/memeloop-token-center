@@ -1271,7 +1271,14 @@ async fn proxy_with_identity_and_conversation_spool(
     let mut candidate_rank = 0_usize;
     let mut deferred_shared_probes = std::collections::VecDeque::new();
     let mut next_failover_reason = None;
-    let (mut active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
+    let (
+        mut active_route,
+        upstream,
+        upstream_activity,
+        mut codex_retry,
+        sse_framing_limits,
+        mut upstream_attempt,
+    ) = loop {
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 policy_version = attempt_budget.version, "proxy request budget exhausted");
@@ -1466,6 +1473,7 @@ async fn proxy_with_identity_and_conversation_spool(
                     result.response,
                     result.upstream_activity,
                     result.codex_retry,
+                    result.sse_framing_limits,
                     upstream_attempt,
                 );
             }
@@ -1635,6 +1643,7 @@ async fn proxy_with_identity_and_conversation_spool(
             &buffered_request.memory,
             buffered_request.started,
             buffered_request.conversation.as_ref(),
+            sse_framing_limits,
         )
         .await
         {
@@ -1771,6 +1780,7 @@ async fn proxy_with_identity_and_conversation_spool(
         public_model: model.clone(),
         upstream_account_id: active_route.route.account_id,
         credential_generation: active_route.route.credential_generation,
+        sse_framing_limits,
         buffered_request,
         proxy_lifecycle_permit,
     })

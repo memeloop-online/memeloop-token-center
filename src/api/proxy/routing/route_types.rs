@@ -119,4 +119,5 @@ pub(in crate::api::proxy) struct ProxyRouteResponse {
     pub(in crate::api::proxy) response: UpstreamResponse,
     pub(in crate::api::proxy) upstream_activity: crate::metrics::ActivityGuard,
     pub(in crate::api::proxy) codex_retry: CodexRetryTerminalGuard,
+    pub(in crate::api::proxy) sse_framing_limits: crate::provider::SseFramingLimits,
 }

@@ -457,6 +457,9 @@ pub(in crate::api) async fn update_upstream(
             connect_timeout_millis = policy.connect_timeout_millis,
             read_timeout_millis = policy.read_timeout_millis,
             request_timeout_millis = policy.request_timeout_millis,
+            max_sse_event_bytes = policy.max_sse_event_bytes,
+            max_sse_framed_bytes = policy.max_sse_framed_bytes,
+            max_sse_terminal_hold_bytes = policy.max_sse_terminal_hold_bytes,
             stage = "upstream_transport_policy_update_accepted",
             "authorized upstream transport policy update accepted");
     }
