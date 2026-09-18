@@ -96,7 +96,8 @@ where
     tokio::pin!(timer);
     let mut completed = Vec::new();
     loop {
-        let next_job = jobs.as_mut().next();
+        let mut jobs_ref = jobs.as_mut();
+        let next_job = jobs_ref.next();
         tokio::pin!(next_job);
         let next = tokio::select! {
             result = &mut next_job => result,
