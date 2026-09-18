@@ -162,11 +162,18 @@ async fn buffered_incomplete_keeps_502_and_settles_only_valid_actual_usage_once(
             .await
             .unwrap();
         let locator = refs.response_object.unwrap();
-        assert!(!locator.starts_with("gap://"));
-        assert_eq!(
-            fixture.state.archive.get(&locator).await.unwrap(),
-            delivered.as_ref()
-        );
+        if valid {
+            assert!(!locator.starts_with("gap://"));
+            assert_eq!(
+                fixture.state.archive.get(&locator).await.unwrap(),
+                delivered.as_ref()
+            );
+        } else {
+            let inline = locator
+                .strip_prefix("inline-json:")
+                .expect("fixed local error is retained inline");
+            assert_eq!(inline.as_bytes(), delivered.as_ref());
+        }
         upstream.verify().await;
     }
 }

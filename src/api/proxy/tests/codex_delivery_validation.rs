@@ -74,21 +74,7 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     drain_completed_response_archive(&fixture).await;
-    for row in rows {
-        let refs = fixture
-            .state
-            .db
-            .request_archive_refs(fixture.key_id, row.request_id)
-            .await
-            .unwrap();
-        let archived = fixture
-            .state
-            .archive
-            .get(refs.response_object.as_deref().unwrap())
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&archived).contains("temporary high demand secret"));
-    }
+    assert_response_archives_omit(&fixture, "temporary high demand secret").await;
     pool.close().await;
     upstream.verify().await;
 }

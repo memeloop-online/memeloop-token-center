@@ -535,10 +535,14 @@ async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &
         if response_object.starts_with("gap://") {
             continue;
         }
-        let archived = fixture.state.archive.get(&response_object).await.unwrap();
+        let archived = if let Some(inline) = response_object.strip_prefix("inline-json:") {
+            inline.as_bytes().to_vec()
+        } else {
+            fixture.state.archive.get(&response_object).await.unwrap()
+        };
         assert!(
             !String::from_utf8_lossy(&archived).contains(sensitive),
-            "upstream error body must not be archived"
+            "upstream error body must not be retained"
         );
     }
 }
