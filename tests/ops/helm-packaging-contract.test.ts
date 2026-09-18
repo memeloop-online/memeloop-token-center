@@ -29,8 +29,8 @@ interface RuntimeDeployment {
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ env: Array<{ name: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
-    initContainers: Array<{ name: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
 }
@@ -52,6 +52,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       profiling: render('profiling', ['--show-only', 'templates/deployment.yaml', '--set', 'config.runtimeProfiling.enabled=true']),
       archiveCompression: render('archive-compression', ['--show-only', 'templates/deployment.yaml', '--set', 'config.archiveSpoolCompression.enabled=true', '--set', 'config.archiveObjectCompression.enabled=true']),
       digest: render('digest', ['--set-string', 'image.tag=must-not-render', '--set-string', `image.digest=${reviewed}`]),
+      retainedWorker: render('retained-worker', [...runtimeFlags, '--set-string', `image.digest=${reviewed}`, '--set-string', 'roles.worker.image.repository=ghcr.io/memeloop-online/memeloop-token-center', '--set-string', `roles.worker.image.digest=${artifact}`]),
       configmap: render('configmap-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingConfigMap=token-center-plugins']),
       pvc: render('pvc-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingClaim=token-center-plugins']),
       oci: render('oci-plugin', [
@@ -159,6 +160,12 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
     count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:0.1.0"', 4);
     count('digest', `image: "ghcr.io/memeloop-online/memeloop-token-center@${reviewed}"`, 4); lacks('digest', 'must-not-render');
+    for (const deployment of parseAllDocuments(output.retainedWorker!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const expected = `ghcr.io/memeloop-online/memeloop-token-center@${role === 'worker' ? artifact : reviewed}`;
+      assert.equal(deployment.spec.template.spec.containers[0]!.image, expected, `${role}: rollback role image`);
+      assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
+    }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
     has('configmap', 'configMap:'); has('pvc', 'persistentVolumeClaim:');
     for (const needle of ['name: install-plugin-0', `image: "ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@${installer}"`, '- --registry-username-file', '- --registry-password-file', '- --cosign-public-key', 'medium: Memory', 'sizeLimit: "16Mi"', 'secretName: plugin-cosign-keys', 'secretName: plugin-registry-auth']) count('oci', needle, 3);

@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 export const ARCHIVE_RESERVATION_SCHEMA = 106;
 export const ARCHIVE_RESERVATION_TTL_MS = 10 * 60 * 1000;
 const OBSERVATION_MAX_AGE_MS = 30_000;
-const roles = ['worker', 'gateway', 'control'] as const;
+const roles = ['worker', 'gateway', 'control', 'all'] as const;
 type Role = typeof roles[number];
 type Version = { schemaVersion: number; replicas: number };
 // Live replicas include terminating Pods; readyReplicas counts only Pods whose
@@ -62,6 +62,12 @@ export function validateArchiveBudgetRollout(
     if (desired[role] !== undefined) validateVersion(desired[role]!, `desired.${role}`);
   }
   if (Object.keys(desired).some(role => !roles.includes(role as Role))) throw new Error('unsupported role in rollout target');
+  // A combined process cannot retain its reclaimer while rolling its producer
+  // back. Managed releases require the independently deployable role topology.
+  if (observed.roles.all.replicas > 0 || (desired.all?.replicas ?? 0) > 0) {
+    throw new Error('managed archive-budget rollout requires split roles; all mode is unsupported');
+  }
+  if (desired.all !== undefined) throw new Error('all mode changes require a separate split-role transition');
   const worker = desired.worker ?? observed.roles.worker;
   const producers = ['gateway', 'control'] as const;
   const hasNewProducer = producers.some(role => reclaims(desired[role] ?? observed.roles[role]));

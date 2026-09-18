@@ -12,7 +12,7 @@ const version = (schemaVersion: number) => ({ schemaVersion, replicas: 1, readyR
 function snapshot(schema = 105): ArchiveRolloutObservation {
   return {
     observedAtMillis: now,
-    roles: { worker: version(schema), gateway: version(schema), control: version(schema) },
+    roles: { worker: version(schema), gateway: version(schema), control: version(schema), all: { schemaVersion: schema, replicas: 0, readyReplicas: 0 } },
     reservationCount: 0,
     lastReservationProducerStoppedAtMillis: null,
   };
@@ -66,4 +66,12 @@ test('rollout retirement TTL stays aligned with durable reservation expiry', () 
   assert.ok(expression, 'the worker TTL must remain readable by the rollout contract');
   const rustTtl = expression.split('*').map(term => Number(term.replaceAll('_', '').trim())).reduce((total, factor) => total * factor, 1);
   assert.equal(ARCHIVE_RESERVATION_TTL_MS, rustTtl);
+});
+
+test('combined role cannot bypass the retained-reclaimer boundary', () => {
+  const live = snapshot(106);
+  live.roles.all = version(106);
+  assert.throws(() => validateArchiveBudgetRollout('rollback', live, { all: version(105) }, now), /split roles/);
+  assert.throws(() => validateArchiveBudgetRollout('upgrade', snapshot(), { all: version(106) }, now), /split roles/);
+  assert.throws(() => validateArchiveBudgetRollout('retire-reclaimer', live, { worker: version(105) }, now), /split roles/);
 });
