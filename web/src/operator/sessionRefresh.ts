@@ -124,14 +124,17 @@ function compareSessionOrder(left: SessionIdentity & { last_activity_at: number 
 }
 
 export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { last_activity_at: number }>({
-  current, updates, requested, firstPageSize, firstPageLimit, hasMore,
+  current, updates, requested, firstPageSize, firstPageLimit, loadedOlder, serverHasMore,
 }: {
   current: T[];
   updates: T[];
   requested: SessionIdentity[];
   firstPageSize: number;
   firstPageLimit: number;
-  hasMore: boolean;
+  /** Older rows are already in `current`, after the authoritative first page. */
+  loadedOlder: boolean;
+  /** The server cursor still has rows after the loaded window. */
+  serverHasMore: boolean;
 }): { sessions: T[]; requiresFullReload: boolean } {
   const requestedKeys = new Set(requested.map(sessionIdentityKey));
   const updatesByKey = new Map(updates.map((summary) => [sessionIdentityKey(summary), summary]));
@@ -145,18 +148,30 @@ export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { l
 
   const firstPage = current.slice(0, firstPageSize);
   const boundary = firstPage.at(-1);
+  const insertedKeys = new Set<string>();
   for (const update of updates) {
     const index = currentIndex.get(sessionIdentityKey(update));
     if (index === undefined) {
-      // A full first page without a next cursor was previously exhaustive. An
-      // unseen row, even one after the old boundary, must rebuild that page so
-      // it cannot become a permanently inaccessible fifty-first item.
-      if (firstPageSize < firstPageLimit || !hasMore || !boundary || compareSessionOrder(update, boundary) < 0) {
+      if (firstPageSize < firstPageLimit || !boundary || compareSessionOrder(update, boundary) < 0) {
         return { sessions: current, requiresFullReload: true };
       }
+      if (loadedOlder) {
+        const tailBoundary = current.at(-1);
+        // An unseen identity that belongs inside the loaded tail must be
+        // inserted now. The existing cursor remains after `tailBoundary`, so
+        // it neither skips this row nor duplicates it on Load older.
+        if (!serverHasMore || !tailBoundary || compareSessionOrder(update, tailBoundary) < 0) {
+          insertedKeys.add(sessionIdentityKey(update));
+        }
+        continue;
+      }
+      // A full first page without a server cursor was exhaustive. An unseen
+      // older row needs an authoritative snapshot so it cannot become a
+      // permanently inaccessible fifty-first item.
+      if (!serverHasMore) return { sessions: current, requiresFullReload: true };
       continue;
     }
-    if (index < firstPageSize && hasMore && boundary && compareSessionOrder(update, boundary) > 0) {
+    if (index < firstPageSize && (loadedOlder || serverHasMore) && boundary && compareSessionOrder(update, boundary) > 0) {
       // A first-page row moving below the previous boundary can admit an
       // unseen row. Exact summaries cannot prove which row should replace it.
       return { sessions: current, requiresFullReload: true };
@@ -171,6 +186,9 @@ export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { l
     .filter((summary, index) => index < firstPageSize || !requestedKeys.has(sessionIdentityKey(summary))
       || updatesByKey.has(sessionIdentityKey(summary)))
     .map((summary) => updatesByKey.get(sessionIdentityKey(summary)) ?? summary);
+  for (const update of updates) {
+    if (insertedKeys.has(sessionIdentityKey(update))) replaced.push(update);
+  }
   replaced.sort(compareSessionOrder);
   return { sessions: replaced, requiresFullReload: false };
 }

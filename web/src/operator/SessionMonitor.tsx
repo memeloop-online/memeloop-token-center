@@ -412,7 +412,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
               requested: targets.identities,
               firstPageSize: firstPageSize.current,
               firstPageLimit: sessionPageLimit,
-              hasMore: loadedOlderList.current || nextCursorRef.current !== null,
+              loadedOlder: loadedOlderList.current,
+              serverHasMore: nextCursorRef.current !== null,
             });
             if (merged.requiresFullReload) {
               listLoaded = await loadSessions(false, filtersRef.current, true);

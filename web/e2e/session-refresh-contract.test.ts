@@ -201,7 +201,8 @@ test('incremental summaries replace and reorder only affected rows when first-pa
     requested: [updated],
     firstPageSize: 3,
     firstPageLimit: 50,
-    hasMore: false,
+    loadedOlder: false,
+    serverHasMore: false,
   });
   assert.equal(merged.requiresFullReload, false);
   assert.deepEqual(merged.sessions.map((session) => session.session_id), ['session-b', 'session-a', 'session-c']);
@@ -221,7 +222,8 @@ test('incremental summaries use the backend UTF-8 cursor order for equal timesta
     requested: [updated],
     firstPageSize: 2,
     firstPageLimit: 50,
-    hasMore: false,
+    loadedOlder: false,
+    serverHasMore: false,
   });
   assert.equal(merged.requiresFullReload, false);
   assert.deepEqual(merged.sessions.map((session) => session.session_id), ['中', 'a'],
@@ -240,7 +242,8 @@ test('incremental summaries reload only when an affected identity can change fir
     requested: [newRecent],
     firstPageSize: 2,
     firstPageLimit: 2,
-    hasMore: true,
+    loadedOlder: false,
+    serverHasMore: true,
   }).requiresFullReload, true, 'a newly visible identity must refill the authoritative page');
 
   const oldInvisible = { key_id: 'key-b', session_id: 'session-old', last_activity_at: 10 };
@@ -250,7 +253,8 @@ test('incremental summaries reload only when an affected identity can change fir
     requested: [oldInvisible],
     firstPageSize: 2,
     firstPageLimit: 2,
-    hasMore: true,
+    loadedOlder: false,
+    serverHasMore: true,
   });
   assert.equal(ignored.requiresFullReload, false);
   assert.deepEqual(ignored.sessions, current, 'an identity remaining below the page boundary does not disturb the list');
@@ -261,7 +265,8 @@ test('incremental summaries reload only when an affected identity can change fir
     requested: [oldInvisible],
     firstPageSize: 2,
     firstPageLimit: 2,
-    hasMore: false,
+    loadedOlder: false,
+    serverHasMore: false,
   }).requiresFullReload, true,
     'an unseen row after an exhaustive full page needs a new cursor-bearing snapshot');
 
@@ -271,7 +276,8 @@ test('incremental summaries reload only when an affected identity can change fir
     requested: [current[0]],
     firstPageSize: 2,
     firstPageLimit: 2,
-    hasMore: true,
+    loadedOlder: false,
+    serverHasMore: true,
   }).requiresFullReload, true, 'a visible row removed by state/model/search filters must be backfilled');
 });
 
@@ -289,11 +295,35 @@ test('incremental summaries keep the loaded tail globally ordered without changi
     requested: [updatedTail],
     firstPageSize: 2,
     firstPageLimit: 2,
-    hasMore: true,
+    loadedOlder: true,
+    serverHasMore: true,
   });
   assert.equal(merged.requiresFullReload, false);
   assert.deepEqual(merged.sessions.map((session) => session.session_id),
     ['session-a', 'session-b', 'session-d', 'session-c']);
   assert.deepEqual(merged.sessions.slice(0, 2), current.slice(0, 2),
     'tail-only movement must preserve the authoritative first-page membership');
+});
+
+test('an unseen summary inside a loaded tail is inserted without invalidating its older cursor', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 500 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 400 },
+    { key_id: 'key-a', session_id: 'session-c', last_activity_at: 300 },
+    { key_id: 'key-a', session_id: 'session-d', last_activity_at: 100 },
+  ];
+  const unseenBetweenBoundaries = { key_id: 'key-b', session_id: 'session-new', last_activity_at: 200 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [unseenBetweenBoundaries],
+    requested: [unseenBetweenBoundaries],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: true,
+    serverHasMore: true,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id),
+    ['session-a', 'session-b', 'session-c', 'session-new', 'session-d'],
+    'the new row belongs before the loaded tail cursor and must not be silently skipped');
 });
