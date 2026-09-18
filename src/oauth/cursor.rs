@@ -293,7 +293,7 @@ pub async fn start_cursor_login(
         .to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id,
-        state_ciphertext: seal_private_json(&state, key_material, CURSOR_STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state, key_material, CURSOR_STATE_AAD)?,
         next_poll_at: now,
         expires_at,
     })

@@ -179,19 +179,8 @@ impl Database {
         #[cfg(not(test))]
         let _ = (account_id, phase);
         #[cfg(test)]
-        {
-            let seam = {
-                let seam = self.oauth_refresh_write_phase_seam.lock().await;
-                seam.as_ref()
-                    .filter(|seam| seam.account_id == account_id)
-                    .map(|seam| (seam.entered.clone(), seam.resume.clone()))
-            };
-            if let Some((entered, resume)) = seam
-                && entered.send(phase).is_ok()
-            {
-                let _ = resume.lock().await.recv().await;
-            }
-        }
+        self.pause_oauth_refresh_write_phase(account_id, phase)
+            .await;
         Ok(transaction)
     }
 
@@ -967,12 +956,26 @@ impl Database {
                 OAuthRefreshWritePhase::RequestStart,
             )
             .await?;
+        let account_select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1"
+            }
+        };
+        let credential_generation: i64 = sqlx::query_scalar(account_select)
+            .bind(account_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
         let started = sqlx::query(
-            "UPDATE upstream_oauth_refresh_leases SET request_started_at = $1 WHERE account_id = $2 AND idempotency_key = $3 AND request_started_at IS NULL AND pending_credential_ciphertext IS NULL AND credential_generation = (SELECT credential_generation FROM upstream_accounts WHERE id = $2)",
+            "UPDATE upstream_oauth_refresh_leases SET request_started_at = $1 WHERE account_id = $2 AND idempotency_key = $3 AND request_started_at IS NULL AND pending_credential_ciphertext IS NULL AND credential_generation = $4",
         )
         .bind(now)
         .bind(account_id.to_string())
         .bind(idempotency_key)
+        .bind(credential_generation)
         .execute(&mut *tx)
         .await?;
         if started.rows_affected() != 1 {
@@ -1605,6 +1608,113 @@ mod tests {
             resume: std::sync::Arc::new(tokio::sync::Mutex::new(resumes)),
         });
         (phases, resume)
+    }
+
+    #[tokio::test]
+    async fn postgres_provider_secret_rotation_serializes_refresh_dispatch() {
+        let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping OAuth/config lock-order test");
+            return;
+        };
+        let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+        database.migrate().await.unwrap();
+        let unique = Uuid::now_v7();
+        let tenant = format!("oauth-config-lock-{unique}");
+        let key = b"OAuth config/refresh lock-order fixture key";
+        let credential = |secret: &str| {
+            UpstreamCredential::OAuth {
+                access_token: "synthetic-access".into(),
+                refresh_token: Some("synthetic-refresh".into()),
+                expires_at: Some(unix_millis() + 3_600_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            }
+            .with_provider_adapter_secret_patch(&json!([
+                {"path":["client_secret"],"value":secret}
+            ]))
+            .unwrap()
+        };
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.clone(),
+                    name: format!("OAuth config lock {unique}"),
+                    driver: "http-json".into(),
+                    config: json!({"base_url":"https://provider.example/api"}),
+                    credential: credential("secret-v1"),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("provider_adapter".into()),
+                    oauth_refresh_url: Some("https://provider.example/refresh".into()),
+                },
+                key,
+            )
+            .await
+            .unwrap();
+        assert!(
+            database
+                .begin_upstream_oauth_refresh(account.id, "refresh-lock-order", key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (mut phases, resume) = arm_refresh_phase_seam(&database, account.id).await;
+        let updater_database = database.clone();
+        let updater_account = account.clone();
+        let updater_tenant = tenant.clone();
+        let updater = tokio::spawn(async move {
+            updater_database
+                .update_upstream_account(
+                    updater_account.id,
+                    &updater_tenant,
+                    UpdateUpstreamAccountInput {
+                        name: updater_account.name,
+                        config: updater_account.config,
+                        expected_updated_at: updater_account.updated_at,
+                        expected_credential_generation: Some(1),
+                        credential: Some(credential("secret-v2")),
+                    },
+                    key,
+                )
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), phases.recv())
+                .await
+                .unwrap(),
+            Some(OAuthRefreshWritePhase::ProviderConfigUpdate)
+        );
+        *database.oauth_refresh_write_phase_seam.lock().await = None;
+
+        let lock_probe = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let mut probe_transaction = lock_probe.begin_write_transaction().await.unwrap();
+        let lock_error = sqlx::query(
+            "SELECT credential_generation FROM upstream_accounts WHERE id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(account.id.to_string())
+        .execute(&mut *probe_transaction)
+        .await
+        .expect_err("provider config update must hold the account row lock");
+        let lock_error_code = lock_error
+            .as_database_error()
+            .and_then(|error| error.code().map(|code| code.into_owned()));
+        assert_eq!(lock_error_code.as_deref(), Some("55P03"));
+        probe_transaction.rollback().await.unwrap();
+
+        resume
+            .send(OAuthRefreshWritePhase::ProviderConfigUpdate)
+            .unwrap();
+        let updated = updater.await.unwrap().unwrap();
+        assert_eq!(updated.credential_generation, 2);
+        assert!(matches!(
+            database
+                .mark_upstream_oauth_refresh_request_started(account.id, "refresh-lock-order")
+                .await,
+            Err(AppError::Conflict(_))
+        ));
     }
 
     #[tokio::test]

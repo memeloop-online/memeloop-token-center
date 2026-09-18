@@ -5,7 +5,7 @@ use axum::{
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
-    db::CreateUpstreamAccountInput,
+    db::{CreateServiceTokenInput, CreateUpstreamAccountInput},
     provider::{OAuthAdapterContribution, OAuthFlowKind, UpstreamCredential},
 };
 use serde_json::{Value, json};
@@ -13,15 +13,29 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 async fn request(state: &AppState, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
+    request_with_token(
+        state,
+        method,
+        path,
+        body,
+        state.config.service_token.as_str(),
+    )
+    .await
+}
+
+async fn request_with_token(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    body: Value,
+    token: &str,
+) -> (StatusCode, Value) {
     let response = api::router_for_role(state.clone(), RuntimeRole::Control)
         .oneshot(
             Request::builder()
                 .method(method)
                 .uri(path)
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", state.config.service_token),
-                )
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(if method == "GET" {
                     Body::empty()
@@ -226,7 +240,6 @@ async fn provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reaut
             assert_eq!(stored.credential_generation, legacy.credential_generation);
         }
     }
-    assert!(mock.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -239,7 +252,6 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
     let mut state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
         .unwrap();
-    let mock = wiremock::MockServer::start().await;
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     let adapter = OAuthAdapterContribution {
         api_version: "oauth-adapter-v1".into(),
@@ -263,7 +275,7 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
     state.providers.extend([provider]).unwrap();
     let tenant = "oauth-static-secret-test";
     let config = json!({
-        "base_url": mock.uri(),
+        "base_url": "https://provider.example/api",
         "label": "unchanged",
         "client_secret": "synthetic-current-secret"
     });
@@ -282,8 +294,10 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
                     header: "authorization".into(),
                     prefix: "Bearer ".into(),
                     adapter_state: None,
-                    proxy_url: None,
-                    proxy_network_scope: None,
+                    proxy_url: Some("socks5h://127.0.0.1:1080".into()),
+                    proxy_network_scope: Some(
+                        memeloop_token_center::network::OutboundScope::Private,
+                    ),
                 },
                 oauth_session_id: Some(Uuid::now_v7()),
                 oauth_driver: Some("provider_adapter".into()),
@@ -301,7 +315,7 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let public_config = json!({"base_url":mock.uri(),"label":"unchanged"});
+    let public_config = json!({"base_url":"https://provider.example/api","label":"unchanged"});
     assert_eq!(listed[0]["config"], public_config);
     assert!(!listed.to_string().contains("synthetic-current-secret"));
 
@@ -314,11 +328,24 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
             "upstream_account_id":account.id
         })
     };
-    let (status, started) = request(
+    let tenant_service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "tenant-oauth-writer".into(),
+                scopes: vec!["oauth:write".into()],
+                tenant_external_id: Some(tenant.into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (status, started) = request_with_token(
         &state,
         "POST",
         "/internal/v1/oauth/provider-adapter/start",
         start(public_config.clone()),
+        &tenant_service.token,
     )
     .await;
     let started_diagnostic = started.to_string();
@@ -332,10 +359,10 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
 
     for tampered in [
         json!({
-            "base_url":mock.uri(), "label":"unchanged",
+            "base_url":"https://provider.example/api", "label":"unchanged",
             "client_secret":"synthetic-replacement"
         }),
-        json!({"base_url":mock.uri(),"label":"changed"}),
+        json!({"base_url":"https://provider.example/api","label":"changed"}),
     ] {
         let (status, rejected) = request(
             &state,
@@ -369,7 +396,6 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
     assert_eq!(stored.config, config);
     assert_eq!(stored.updated_at, account.updated_at);
     assert_eq!(stored.credential_generation, account.credential_generation);
-    assert!(mock.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -25,6 +25,8 @@ pub struct UpdateUpstreamAccountInput {
     pub name: String,
     pub config: serde_json::Value,
     pub expected_updated_at: i64,
+    pub expected_credential_generation: Option<i64>,
+    pub credential: Option<UpstreamCredential>,
 }
 
 impl Database {
@@ -179,7 +181,9 @@ impl Database {
         .ok_or(AppError::NotFound)?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
-        Ok((upstream_account_view(row)?, credential))
+        let mut account = upstream_account_view(row)?;
+        account.config = credential.hydrate_provider_adapter_config(account.config)?;
+        Ok((account, credential))
     }
 
     /// Loads one bounded operator page of accounts and current credentials in
@@ -218,10 +222,12 @@ impl Database {
             .map(|row| {
                 let account_id = parse_uuid(row.try_get("id")?)?;
                 let ciphertext: Option<String> = row.try_get("credential_ciphertext")?;
-                let result = upstream_account_view(row).and_then(|account| {
+                let result = upstream_account_view(row).and_then(|mut account| {
                     ciphertext.ok_or(AppError::NotFound).and_then(|ciphertext| {
-                        open_credential(&ciphertext, key_material)
-                            .map(|credential| (account, credential))
+                        let credential = open_credential(&ciphertext, key_material)?;
+                        account.config =
+                            credential.hydrate_provider_adapter_config(account.config)?;
+                        Ok((account, credential))
                     })
                 });
                 Ok(BatchUpstreamAccountCredential { account_id, result })
@@ -257,6 +263,7 @@ impl Database {
         let oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let mut view = upstream_account_view(row)?;
+        view.config = credential.hydrate_provider_adapter_config(view.config)?;
         view.can_update_transport_proxy = active && credential.supports_transport_proxy();
         Ok((view, credential, active, oauth_driver))
     }
@@ -285,20 +292,41 @@ impl Database {
         account_id: Uuid,
         tenant_external_id: &str,
         input: UpdateUpstreamAccountInput,
+        key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
+        let credential_ciphertext = input
+            .credential
+            .as_ref()
+            .map(|credential| seal_credential(credential, key_material))
+            .transpose()?;
         let mut tx = self.begin_write_transaction().await?;
-        let current = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
-        )
-        .bind(account_id.to_string())
-        .bind(tenant_external_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(AppError::NotFound)?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let current = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
         let current_view = upstream_account_view(current)?;
-        if current_view.name == input.name.trim() && current_view.config == input.config {
+        #[cfg(test)]
+        self.pause_oauth_refresh_write_phase(
+            account_id,
+            super::super::OAuthRefreshWritePhase::ProviderConfigUpdate,
+        )
+        .await;
+        if current_view.name == input.name.trim()
+            && current_view.config == input.config
+            && credential_ciphertext.is_none()
+        {
             tx.commit().await?;
             return Ok(current_view);
         }
@@ -321,16 +349,65 @@ impl Database {
                 "another upstream provider already uses this name".into(),
             ));
         }
-        let updated_at = unix_millis().max(current_view.updated_at.saturating_add(1));
+        let now = unix_millis();
+        let updated_at = now.max(current_view.updated_at.saturating_add(1));
+        let mut credential_generation = current_view.credential_generation;
+        if let Some(ciphertext) = credential_ciphertext {
+            if input.expected_credential_generation != Some(current_view.credential_generation) {
+                return Err(AppError::Conflict(
+                    "upstream credential changed while saving provider configuration; retry".into(),
+                ));
+            }
+            let refresh_in_flight = sqlx::query(
+                "SELECT 1 FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND (request_started_at IS NOT NULL OR pending_credential_ciphertext IS NOT NULL)",
+            )
+            .bind(account_id.to_string())
+            .bind(current_view.credential_generation)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if refresh_in_flight {
+                return Err(AppError::Conflict(
+                    "OAuth refresh is in progress; retry the provider configuration update".into(),
+                ));
+            }
+            credential_generation = current_view.credential_generation.saturating_add(1);
+            let revoked = sqlx::query(
+                "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(account_id.to_string())
+            .bind(current_view.credential_generation)
+            .execute(&mut *tx)
+            .await?;
+            if revoked.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "upstream credential changed while saving provider configuration; retry".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(account_id.to_string())
+            .bind(credential_generation)
+            .bind(ciphertext)
+            .bind(input.credential.as_ref().and_then(UpstreamCredential::expires_at))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         let changed = sqlx::query(
-            "UPDATE upstream_accounts SET name = $1, config_json = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5 AND updated_at = $6",
+            "UPDATE upstream_accounts SET name = $1, config_json = $2, credential_generation = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6 AND updated_at = $7 AND credential_generation = $8",
         )
         .bind(input.name.trim())
         .bind(config_json)
+        .bind(credential_generation)
         .bind(updated_at)
         .bind(account_id.to_string())
         .bind(current_view.tenant_id.to_string())
         .bind(input.expected_updated_at)
+        .bind(current_view.credential_generation)
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() != 1 {
@@ -342,6 +419,7 @@ impl Database {
         Ok(UpstreamAccountView {
             name: input.name.trim().to_owned(),
             config: input.config,
+            credential_generation,
             updated_at,
             ..current_view
         })
@@ -932,7 +1010,10 @@ mod tests {
                     name: account.name.clone(),
                     config: account.config.clone(),
                     expected_updated_at: account.updated_at,
+                    expected_credential_generation: None,
+                    credential: None,
                 },
+                PEPPER,
             )
             .await;
         assert!(
@@ -952,10 +1033,190 @@ mod tests {
                     name: account.name.clone(),
                     config: account.config.clone(),
                     expected_updated_at: account.updated_at,
+                    expected_credential_generation: None,
+                    credential: None,
                 },
+                PEPPER,
             )
             .await
             .expect("the same valid no-op mutation succeeds without contention");
         assert_eq!(unchanged.updated_at, account.updated_at);
+    }
+
+    #[tokio::test]
+    async fn provider_secret_patch_rotates_immutably_and_merges_with_latest_public_config() {
+        let directory = tempfile::tempdir().expect("provider secret patch directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("provider-secret-patch.db").display()
+        );
+        let database = Database::connect(&database_url)
+            .await
+            .expect("connect provider secret patch database");
+        database.migrate().await.expect("migrate database");
+        let credential = |access: &str, secret: &str| {
+            UpstreamCredential::OAuth {
+                access_token: access.into(),
+                refresh_token: Some("synthetic-refresh".into()),
+                expires_at: Some(i64::MAX),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: Some(serde_json::json!({
+                    "authorization_code": {"client_id": "fixture"}
+                })),
+                proxy_url: None,
+                proxy_network_scope: None,
+            }
+            .with_provider_adapter_secret_patch(&serde_json::json!([
+                {"path":["client_secret"],"value":secret}
+            ]))
+            .unwrap()
+        };
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.into(),
+                    name: "provider-secret-patch".into(),
+                    driver: "http-json".into(),
+                    config: serde_json::json!({
+                        "base_url":"https://provider.example/api",
+                        "label":"before"
+                    }),
+                    credential: credential("access-v1", "secret-v1"),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("provider_adapter".into()),
+                    oauth_refresh_url: Some("https://provider.example/refresh".into()),
+                },
+                PEPPER,
+            )
+            .await
+            .expect("create provider account");
+        let original_ciphertext: String = sqlx::query_scalar(
+            "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let refresh_race = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.into(),
+                    name: "provider-secret-refresh-race".into(),
+                    driver: "http-json".into(),
+                    config: serde_json::json!({
+                        "base_url":"https://provider.example/api",
+                        "label":"before"
+                    }),
+                    credential: credential("access-v1", "secret-v1"),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("provider_adapter".into()),
+                    oauth_refresh_url: Some("https://provider.example/refresh".into()),
+                },
+                PEPPER,
+            )
+            .await
+            .expect("create refresh race account");
+        assert!(
+            database
+                .begin_upstream_oauth_refresh(refresh_race.id, "refresh-race", PEPPER)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database
+            .mark_upstream_oauth_refresh_request_started(refresh_race.id, "refresh-race")
+            .await
+            .unwrap();
+        let blocked = database
+            .update_upstream_account(
+                refresh_race.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: refresh_race.name.clone(),
+                    config: serde_json::json!({
+                        "base_url":"https://provider.example/api",
+                        "label":"after"
+                    }),
+                    expected_updated_at: refresh_race.updated_at,
+                    expected_credential_generation: Some(1),
+                    credential: Some(credential("access-v1", "secret-v2")),
+                },
+                PEPPER,
+            )
+            .await;
+        assert!(matches!(blocked, Err(AppError::Conflict(_))));
+        let refreshed = database
+            .rotate_upstream_credential(
+                account.id,
+                credential("access-v2", "secret-v1"),
+                "refresh-finished",
+                PEPPER,
+            )
+            .await
+            .unwrap();
+        let public_only = database
+            .update_upstream_account(
+                account.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: account.name.clone(),
+                    config: serde_json::json!({
+                        "base_url":"https://provider.example/api",
+                        "label":"public-only"
+                    }),
+                    expected_updated_at: refreshed.updated_at,
+                    expected_credential_generation: None,
+                    credential: None,
+                },
+                PEPPER,
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_only.credential_generation, 2);
+        let updated = database
+            .update_upstream_account(
+                account.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: account.name.clone(),
+                    config: serde_json::json!({
+                        "base_url":"https://provider.example/api",
+                        "label":"after"
+                    }),
+                    expected_updated_at: public_only.updated_at,
+                    expected_credential_generation: Some(2),
+                    credential: Some(credential("access-v2", "secret-v2")),
+                },
+                PEPPER,
+            )
+            .await
+            .expect("update provider secret patch");
+        assert_eq!(updated.credential_generation, 3);
+        let raw_config: String =
+            sqlx::query_scalar("SELECT config_json FROM upstream_accounts WHERE id = $1")
+                .bind(account.id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert!(!raw_config.contains("secret-v"));
+        let retained_v1: String = sqlx::query_scalar(
+            "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_v1, original_ciphertext);
+        let (hydrated, installed) = database
+            .upstream_account_with_credential(account.id, PEPPER)
+            .await
+            .unwrap();
+        assert_eq!(hydrated.config["label"], "after");
+        assert_eq!(hydrated.config["client_secret"], "secret-v2");
+        assert!(matches!(
+            installed,
+            UpstreamCredential::OAuth { access_token, .. } if access_token == "access-v2"
+        ));
     }
 }

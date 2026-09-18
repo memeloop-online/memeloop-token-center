@@ -59,10 +59,15 @@ async fn reauthorization_target_from_public_config(
     let Some(account_id) = account_id else {
         return Ok(None);
     };
-    let account = state
+    let mut account = state
         .db
         .upstream_account_for_reauthorization(account_id, tenant_external_id)
         .await?;
+    let credential = state
+        .db
+        .upstream_oauth_identity_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    account.config = credential.hydrate_provider_adapter_config(account.config)?;
     let complete_config = account.config.clone();
     // Preserve the existing fail-closed admission error for a legacy account
     // whose current schema cannot safely participate in an OAuth lifecycle.
@@ -520,6 +525,9 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         "provider_adapter",
     )
     .await?;
+    let (_, secret_patch) =
+        super::config_secrets::split_for_storage(&provider.config_schema, &body.provider_config)?;
+    crate::provider::validate_provider_adapter_secret_patch(&secret_patch)?;
     let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
         state
             .db
@@ -636,7 +644,7 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 .into_response())
         }
         CursorPollResult::Ready { lease_owner, login } => {
-            let ready = *login;
+            let mut ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
             validate_provider_schema(
                 &state,
@@ -652,6 +660,22 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 &state,
             )
             .await?;
+            if ready.oauth_driver == "provider_adapter" {
+                let provider = state.providers.get(&ready.provider_driver).ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "unknown provider driver: {}",
+                        ready.provider_driver
+                    ))
+                })?;
+                let (public_config, secret_patch) = super::config_secrets::split_for_storage(
+                    &provider.config_schema,
+                    &ready.provider_config,
+                )?;
+                ready.credential = ready
+                    .credential
+                    .with_provider_adapter_secret_patch(&secret_patch)?;
+                ready.provider_config = public_config;
+            }
             let reauthorizing = ready.reauthorize.is_some();
             let account = match ready.reauthorize {
                 Some(target) => {
@@ -684,7 +708,7 @@ pub(in crate::api) async fn poll_cursor_oauth(
                                 oauth_session_id: ready.session_id,
                                 oauth_driver: ready.oauth_driver,
                                 oauth_refresh_url: Some(ready.refresh_url),
-                                provider_config: None,
+                                provider_config: Some(ready.provider_config),
                                 credential: ready.credential,
                             },
                             state.config.key_pepper.as_bytes(),

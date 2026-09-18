@@ -1054,9 +1054,14 @@ impl Database {
         let Some(row) = row else {
             return Ok(None);
         };
-        let config: serde_json::Value =
+        let persisted_config: serde_json::Value =
             serde_json::from_str(&row.try_get::<String, _>("config_json")?)
                 .map_err(|_| AppError::Internal)?;
+        let credential = open_credential(
+            &row.try_get::<String, _>("credential_ciphertext")?,
+            key_material,
+        )?;
+        let config = credential.hydrate_provider_adapter_config(persisted_config)?;
         let base_url = validate_config(&config)?;
         let route_id = row
             .try_get::<Option<String>, _>("model_route_id")?
@@ -1072,10 +1077,7 @@ impl Database {
             base_url,
             config,
             upstream_model: row.try_get("model")?,
-            credential: open_credential(
-                &row.try_get::<String, _>("credential_ciphertext")?,
-                key_material,
-            )?,
+            credential,
         }))
     }
 }

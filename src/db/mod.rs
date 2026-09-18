@@ -231,6 +231,8 @@ pub(crate) enum OAuthRefreshWritePhase {
     Stage,
     Finalize,
     Abort,
+    #[cfg(test)]
+    ProviderConfigUpdate,
 }
 
 #[cfg(test)]
@@ -243,6 +245,25 @@ pub(crate) struct OAuthRefreshWritePhaseSeam {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) async fn pause_oauth_refresh_write_phase(
+        &self,
+        account_id: Uuid,
+        phase: OAuthRefreshWritePhase,
+    ) {
+        let seam = {
+            let seam = self.oauth_refresh_write_phase_seam.lock().await;
+            seam.as_ref()
+                .filter(|seam| seam.account_id == account_id)
+                .map(|seam| (seam.entered.clone(), seam.resume.clone()))
+        };
+        if let Some((entered, resume)) = seam
+            && entered.send(phase).is_ok()
+        {
+            let _ = resume.lock().await.recv().await;
+        }
+    }
+
     pub async fn readiness_check(&self) -> Result<(), AppError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         self.archive_staging_readiness_check().await?;

@@ -15,6 +15,8 @@ const CURRENT_ENVELOPE_VERSION: &str = "v2";
 pub(super) const LEGACY_ENVELOPE_VERSION: &str = "v1";
 pub(super) const ENVELOPE_AAD: &[u8] = b"memeloop-token-center/upstream-credential/v1";
 const PROXY_FINGERPRINT_DOMAIN: &[u8] = b"memeloop-token-center/upstream-proxy-fingerprint/v1";
+const PROVIDER_ADAPTER_SECRET_PATCH_KEY: &str = "__mtc_provider_config_secret_patch_v1";
+const MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES: usize = 48 * 1024;
 
 pub(super) const MAX_ADAPTER_STATE_BYTES: usize = 16 * 1024;
 pub(super) const MAX_ADAPTER_STATE_DEPTH: usize = 8;
@@ -255,6 +257,50 @@ impl UpstreamCredential {
         }
     }
 
+    pub(crate) fn with_provider_adapter_secret_patch(
+        mut self,
+        patch: &Value,
+    ) -> Result<Self, AppError> {
+        let patch = validate_provider_adapter_secret_patch(patch)?;
+        let encoded = URL_SAFE_NO_PAD.encode(patch);
+        match &mut self {
+            Self::OAuth { adapter_state, .. } => {
+                let state = adapter_state
+                    .get_or_insert_with(|| Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        AppError::Conflict(
+                            "provider adapter returned unsupported credential state".into(),
+                        )
+                    })?;
+                state.insert(
+                    PROVIDER_ADAPTER_SECRET_PATCH_KEY.into(),
+                    Value::String(encoded),
+                );
+                validate_adapter_state(adapter_state.as_ref().ok_or(AppError::Internal)?)?;
+                Ok(self)
+            }
+            _ => Err(AppError::Internal),
+        }
+    }
+
+    pub(crate) fn provider_adapter_secret_patch(&self) -> Result<Option<Value>, AppError> {
+        let Some(state) = self.adapter_state() else {
+            return Ok(None);
+        };
+        decode_provider_adapter_secret_patch(state)
+    }
+
+    pub(crate) fn hydrate_provider_adapter_config(
+        &self,
+        persisted: Value,
+    ) -> Result<Value, AppError> {
+        let Some(patch) = self.provider_adapter_secret_patch()? else {
+            return Ok(persisted);
+        };
+        apply_provider_adapter_secret_patch(persisted, &patch)
+    }
+
     pub fn proxy(&self) -> Option<(&str, OutboundScope)> {
         match self {
             Self::ProxiedApiKey {
@@ -427,6 +473,16 @@ impl UpstreamCredential {
     }
 }
 
+pub(crate) fn validate_provider_adapter_secret_patch(patch: &Value) -> Result<Vec<u8>, AppError> {
+    let patch = serde_json::to_vec(patch).map_err(|_| AppError::Internal)?;
+    if patch.len() > MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES {
+        return Err(AppError::BadRequest(
+            "OAuth provider secret configuration exceeds its storage limit".into(),
+        ));
+    }
+    Ok(patch)
+}
+
 fn validate_optional_private_proxy(
     proxy_url: Option<&str>,
     proxy_network_scope: Option<OutboundScope>,
@@ -505,7 +561,13 @@ where
 }
 
 pub fn validate_adapter_state(state: &Value) -> Result<(), AppError> {
-    let encoded = serde_json::to_vec(state).map_err(|_| AppError::Internal)?;
+    let mut provider_state = state.clone();
+    if let Some(object) = provider_state.as_object_mut()
+        && object.remove(PROVIDER_ADAPTER_SECRET_PATCH_KEY).is_some()
+    {
+        decode_provider_adapter_secret_patch(state)?.ok_or(AppError::Internal)?;
+    }
+    let encoded = serde_json::to_vec(&provider_state).map_err(|_| AppError::Internal)?;
     if encoded.len() > MAX_ADAPTER_STATE_BYTES {
         return Err(AppError::BadRequest(
             "managed OAuth adapter state exceeds its size limit".into(),
@@ -527,12 +589,76 @@ pub fn validate_adapter_state(state: &Value) -> Result<(), AppError> {
         }
     }
     let mut nodes = 0;
-    if !visit(state, 0, &mut nodes) {
+    if !visit(&provider_state, 0, &mut nodes) {
         return Err(AppError::BadRequest(
             "managed OAuth adapter state exceeds its structural limit".into(),
         ));
     }
     Ok(())
+}
+
+fn decode_provider_adapter_secret_patch(state: &Value) -> Result<Option<Value>, AppError> {
+    let Some(encoded) = state
+        .as_object()
+        .and_then(|object| object.get(PROVIDER_ADAPTER_SECRET_PATCH_KEY))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| AppError::Internal)?;
+    if decoded.len() > MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES {
+        return Err(AppError::BadRequest(
+            "OAuth provider secret configuration exceeds its storage limit".into(),
+        ));
+    }
+    serde_json::from_slice(&decoded)
+        .map(Some)
+        .map_err(|_| AppError::Internal)
+}
+
+fn apply_provider_adapter_secret_patch(
+    mut config: Value,
+    patch: &Value,
+) -> Result<Value, AppError> {
+    let entries = patch.as_array().ok_or(AppError::Internal)?;
+    for entry in entries {
+        let entry = entry.as_object().ok_or(AppError::Internal)?;
+        if entry.len() != 2 {
+            return Err(AppError::Internal);
+        }
+        let path = entry
+            .get("path")
+            .and_then(Value::as_array)
+            .ok_or(AppError::Internal)?
+            .iter()
+            .map(|segment| {
+                segment
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or(AppError::Internal)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = entry.get("value").cloned().ok_or(AppError::Internal)?;
+        if path.is_empty() {
+            config = value;
+            continue;
+        }
+        let mut target = &mut config;
+        for segment in &path[..path.len() - 1] {
+            target = target
+                .as_object_mut()
+                .ok_or(AppError::Internal)?
+                .entry(segment.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        }
+        target
+            .as_object_mut()
+            .ok_or(AppError::Internal)?
+            .insert(path.last().cloned().ok_or(AppError::Internal)?, value);
+    }
+    Ok(config)
 }
 
 pub(super) fn authorization_header() -> String {
@@ -857,6 +983,38 @@ mod proxy_tests {
         }
         .preserve_proxy_from(&credential);
         assert_eq!(replacement.proxy(), credential.proxy());
+    }
+
+    #[test]
+    fn provider_adapter_secret_patch_is_carried_only_inside_the_encrypted_credential() {
+        let secret = "synthetic-provider-config-secret";
+        let patch = serde_json::json!([{"path":["client_secret"],"value":secret}]);
+        let credential = UpstreamCredential::OAuth {
+            access_token: "synthetic-access".into(),
+            refresh_token: Some("synthetic-refresh".into()),
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        }
+        .with_provider_adapter_secret_patch(&patch)
+        .unwrap();
+        let envelope = seal_credential(&credential, b"test-key-material").unwrap();
+        assert!(!envelope.contains(secret));
+        let opened = open_credential(&envelope, b"test-key-material").unwrap();
+        assert_eq!(
+            opened
+                .hydrate_provider_adapter_config(serde_json::json!({
+                    "base_url": "https://provider.example/api"
+                }))
+                .unwrap(),
+            serde_json::json!({
+                "base_url": "https://provider.example/api",
+                "client_secret": secret
+            })
+        );
     }
 
     #[test]

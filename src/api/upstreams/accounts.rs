@@ -34,6 +34,11 @@ pub(in crate::api) async fn create_upstream(
     validate_provider_credential_schema(&state, &body.driver, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
+    if credential.provider_adapter_secret_patch()?.is_some() {
+        return Err(AppError::BadRequest(
+            "provider OAuth secret state is managed by the authorization flow".into(),
+        ));
+    }
     if !state
         .providers
         .supports_direct_credential(&body.driver, credential.auth_kind())
@@ -509,6 +514,25 @@ pub(in crate::api) async fn update_upstream(
     } else {
         None
     };
+    let credential = if current.auth_kind == "oauth" && provider.oauth_adapter.is_some() {
+        let (public_config, secret_patch) =
+            super::config_secrets::split_for_storage(&provider.config_schema, &body.config)?;
+        body.config = public_config;
+        let current_patch = current_credential
+            .provider_adapter_secret_patch()?
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        if current_patch == secret_patch {
+            None
+        } else {
+            Some(
+                current_credential
+                    .clone()
+                    .with_provider_adapter_secret_patch(&secret_patch)?,
+            )
+        }
+    } else {
+        None
+    };
     let mut account = state
         .db
         .update_upstream_account(
@@ -518,7 +542,12 @@ pub(in crate::api) async fn update_upstream(
                 name: body.name,
                 config: body.config,
                 expected_updated_at: body.expected_updated_at,
+                expected_credential_generation: credential
+                    .as_ref()
+                    .map(|_| current.credential_generation),
+                credential,
             },
+            state.config.key_pepper.as_bytes(),
         )
         .await?;
     if let Some(policy) = policy_change {
@@ -692,6 +721,11 @@ pub(in crate::api) async fn rotate_upstream_credential(
     crate::schema::validate_instance(&provider.credential_schema, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
+    if credential.provider_adapter_secret_patch()?.is_some() {
+        return Err(AppError::BadRequest(
+            "provider OAuth secret state is managed by the authorization flow".into(),
+        ));
+    }
     let changes_proxy = credential.proxy().is_some();
     let (account_before_rotation, current_credential, _, _) = state
         .db

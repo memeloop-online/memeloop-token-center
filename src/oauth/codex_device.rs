@@ -297,7 +297,7 @@ async fn start_codex_device_login_at(
         flow_kind: "openai_codex_device".to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id: state.operator_service_id,
-        state_ciphertext: seal_private_json(&state, key_material, STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state, key_material, STATE_AAD)?,
         next_poll_at: not_before,
         expires_at,
     })
