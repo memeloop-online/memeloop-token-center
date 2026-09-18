@@ -194,20 +194,22 @@ pub async fn client_for_config_url_no_retry(
 /// this layer owns the SOCKS5H transport boundary. When a proxy is present the
 /// target hostname is deliberately not resolved locally.
 pub(crate) async fn client_for_oauth_url_no_retry(
-    shared_http: &reqwest::Client,
+    _shared_http: &reqwest::Client,
     value: &str,
     proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
     let target = checked_http_url(value)?;
     let Some((proxy_url, proxy_scope)) = proxy else {
-        return client_for_url(
-            shared_http,
-            value,
-            OutboundScope::Public,
-            allow_test_loopback,
-        )
-        .await;
+        let (host, addresses, loopback) =
+            validated_endpoint(&target, OutboundScope::Public, allow_test_loopback).await?;
+        validate_transport_security(target.scheme(), &addresses, OutboundScope::Public, loopback)?;
+        let pins: Vec<_> = host
+            .as_deref()
+            .map(|host| (host, addresses.as_slice()))
+            .into_iter()
+            .collect();
+        return crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal);
     };
     if proxy_scope != OutboundScope::Private {
         return Err(AppError::BadRequest(
@@ -321,10 +323,9 @@ async fn config_url_client(
 /// constructing a second HTTP client. The caller uses a shared fingerprinted
 /// client and attaches the already validated proxy to the individual request.
 ///
-/// Production Codex traffic is intentionally fail-closed unless it uses an
-/// operator-approved private IP-literal `socks5h://` endpoint. Unit tests may
-/// reach their task-local loopback server without a proxy when the normal test
-/// loopback switch is enabled.
+/// A configured proxy must be an operator-approved private IP-literal
+/// `socks5h://` endpoint. Accounts without a proxy use the fixed public HTTPS
+/// target directly; the HTTP builders never inherit environment proxies.
 pub(crate) async fn validate_codex_transport(
     value: &str,
     config: &Value,
@@ -342,12 +343,14 @@ pub(crate) async fn validate_codex_transport(
         ));
     }
     let Some((proxy_url, proxy_scope)) = proxy else {
-        // Do not even resolve the production hostname when the required
-        // account proxy is absent. Direct-target DNS is owned by socks5h.
         if fixed_production_target {
-            return Err(AppError::BadRequest(
-                "OpenAI Codex requires an approved remote-DNS proxy".into(),
-            ));
+            return (target_scope == OutboundScope::Public)
+                .then_some(())
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "OpenAI Codex target must use its fixed public HTTPS endpoint".into(),
+                    )
+                });
         }
         let (_, target_addresses, target_test_loopback) =
             validated_endpoint(&target, target_scope, allow_test_loopback).await?;
@@ -358,7 +361,9 @@ pub(crate) async fn validate_codex_transport(
             target_test_loopback,
         )?;
         return target_test_loopback.then_some(()).ok_or_else(|| {
-            AppError::BadRequest("OpenAI Codex requires an approved remote-DNS proxy".into())
+            AppError::BadRequest(
+                "OpenAI Codex target must use its fixed public HTTPS endpoint".into(),
+            )
         });
     };
     // The product Codex route has an independently enforced fixed public base
@@ -387,12 +392,8 @@ pub(crate) async fn validate_codex_transport(
 
 /// Build a one-operation client for a fixed Codex control-plane URL.
 ///
-/// Unlike the generic provider transport, production Codex traffic has no
-/// direct-client branch: validation must prove an account-bound private
-/// IP-literal `socks5h` proxy before the client is created. Target DNS is left
-/// to that proxy, so this path neither leaks a local lookup nor inherits an
-/// environment proxy. The sole no-proxy case is a loopback target admitted by
-/// the non-serializable marker set only by `Config::for_test`.
+/// A configured account proxy owns target DNS. Accounts without one connect
+/// directly to the fixed public target with an explicit no-proxy client.
 pub(crate) async fn client_for_codex_url(
     shared_test_client: &reqwest::Client,
     value: &str,
@@ -432,11 +433,9 @@ pub(crate) async fn client_for_codex_url_without_retries(
 
 /// Build the no-retry transport used by the native Codex OAuth lifecycle.
 ///
-/// Production targets are an exact `auth.openai.com` allowlist and always
-/// require the account/session's private IP-literal `socks5h` proxy. The target
-/// hostname is deliberately never resolved here: connection-time DNS belongs
-/// to that proxy. A direct client is admitted only for a task-local loopback
-/// endpoint behind the non-serializable `Config::for_test` marker.
+/// Production targets are an exact `auth.openai.com` allowlist. A configured
+/// account/session proxy owns target DNS; otherwise the fixed target is reached
+/// by a direct client that explicitly ignores environment proxy settings.
 pub(crate) async fn client_for_codex_oauth_url(
     shared_test_client: &reqwest::Client,
     value: &str,
@@ -463,11 +462,7 @@ pub(crate) async fn client_for_codex_oauth_url(
 
     let Some((proxy_url, proxy_scope)) = proxy else {
         if fixed_production_target {
-            // Reject before resolving the supplier hostname. There is no
-            // environment-proxy or direct-target fallback for production.
-            return Err(AppError::BadRequest(
-                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
-            ));
+            return pinned_no_retry_public_client(&target, allow_test_loopback).await;
         }
         let (_, target_addresses, target_test_loopback) =
             validated_endpoint(&target, OutboundScope::Public, allow_test_loopback).await?;
@@ -524,9 +519,10 @@ async fn codex_client_for_url(
 ) -> Result<reqwest::Client, AppError> {
     validate_codex_transport(value, config, proxy, allow_test_loopback).await?;
     let Some((proxy_url, _)) = proxy else {
-        // `validate_codex_transport` admits this branch only for a loopback
-        // endpoint guarded by Config::for_test. Reuse the supplied test client
-        // so a production configuration has no direct Codex client here.
+        if checked_http_url(value)?.host_str() == Some("chatgpt.com") {
+            let target = checked_http_url(value)?;
+            return pinned_no_retry_public_client(&target, allow_test_loopback).await;
+        }
         return Ok(shared_test_client.clone());
     };
     if no_retry {
@@ -535,6 +531,21 @@ async fn codex_client_for_url(
         crate::build_explicit_proxy_http_client(proxy_url, &[])
     }
     .map_err(|_| AppError::Internal)
+}
+
+async fn pinned_no_retry_public_client(
+    target: &Url,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    let (host, addresses, loopback) =
+        validated_endpoint(target, OutboundScope::Public, allow_test_loopback).await?;
+    validate_transport_security(target.scheme(), &addresses, OutboundScope::Public, loopback)?;
+    let pins: Vec<_> = host
+        .as_deref()
+        .map(|host| (host, addresses.as_slice()))
+        .into_iter()
+        .collect();
+    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
 }
 
 async fn validated_endpoint(
@@ -1024,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_transport_requires_private_remote_dns_proxy() {
+    async fn codex_transport_accepts_direct_or_private_remote_dns_proxy() {
         let config = serde_json::json!({
             "base_url": "https://chatgpt.com/backend-api/codex",
             "network_scope": "public"
@@ -1037,7 +1048,7 @@ mod tests {
                 false,
             )
             .await
-            .is_err()
+            .is_ok()
         );
         assert!(
             validate_codex_transport(
@@ -1083,11 +1094,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_oauth_transport_is_fixed_remote_dns_and_fail_closed() {
+    async fn codex_oauth_transport_accepts_direct_or_fixed_remote_dns_proxy() {
         let shared = crate::build_http_client().unwrap();
         let endpoint = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+        assert!(
+            client_for_codex_oauth_url(&shared, endpoint, None, false)
+                .await
+                .is_ok()
+        );
         for proxy in [
-            None,
             Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
             Some(("socks5h://10.20.30.40:1080", OutboundScope::Public)),
             Some(("socks5h://proxy.example.test:1080", OutboundScope::Private)),

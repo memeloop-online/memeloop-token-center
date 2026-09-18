@@ -102,16 +102,23 @@ pub(super) fn validate_provider_credential_schema(
 /// OAuth flows produce a canonical core credential with default header fields.
 /// Provider schemas describe their external credential shape, so first accept
 /// a schema that explicitly declares those fields, then retry with core-owned
-/// defaults removed. Custom non-default header behaviour is never stripped.
+/// defaults and transport metadata removed. Custom non-default header behaviour
+/// is never stripped; proxy validity remains enforced by the canonical
+/// credential and transport validators.
 fn validate_provider_credential_schema_from_canonical(
     state: &AppState,
     driver: &str,
     credential: &UpstreamCredential,
 ) -> Result<(), AppError> {
-    let mut value = serde_json::to_value(credential).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_value(credential).map_err(|_| AppError::Internal)?;
     if validate_provider_credential_schema(state, driver, &value).is_ok() {
         return Ok(());
     }
+    let value = external_provider_credential_projection(value);
+    validate_provider_credential_schema(state, driver, &value)
+}
+
+fn external_provider_credential_projection(mut value: Value) -> Value {
     if let Some(object) = value.as_object_mut() {
         if object.get("header").and_then(Value::as_str) == Some("authorization") {
             object.remove("header");
@@ -119,8 +126,10 @@ fn validate_provider_credential_schema_from_canonical(
         if object.get("prefix").and_then(Value::as_str) == Some("Bearer ") {
             object.remove("prefix");
         }
+        object.remove("proxy_url");
+        object.remove("proxy_network_scope");
     }
-    validate_provider_credential_schema(state, driver, &value)
+    value
 }
 
 pub(super) fn validate_provider_config_schema(
@@ -145,6 +154,16 @@ pub(super) async fn validate_upstream_destination(
     service: &AuthenticatedService,
     state: &AppState,
 ) -> Result<(), AppError> {
+    validate_upstream_destination_with_proxy(driver, config, None, service, state).await
+}
+
+pub(super) async fn validate_upstream_destination_with_proxy(
+    driver: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    service: &AuthenticatedService,
+    state: &AppState,
+) -> Result<(), AppError> {
     let base_url = validate_config(config)?;
     let scope = network::scope_from_config(config);
     if scope == OutboundScope::Private {
@@ -156,21 +175,48 @@ pub(super) async fn validate_upstream_destination(
                 "OpenAI Codex must use the fixed official upstream endpoint".into(),
             ));
         }
-        // The account-bound socks5h endpoint owns target DNS. Destination
-        // validation for Codex is a fixed-string check and must not resolve or
-        // construct a direct client for chatgpt.com.
+        network::validate_codex_transport(
+            &base_url,
+            config,
+            proxy,
+            state.config.codex_test_loopback,
+        )
+        .await?;
         return validate_provider_config(driver, config);
     }
-    // Building the operation client validates and pins every public DNS answer.
-    let _ = network::client_for_url(
-        &state.http,
-        &base_url,
-        scope,
-        state.config.allow_oauth_loopback,
-    )
-    .await?;
-    validate_secondary_outbound_urls(config, scope, state).await?;
+    validate_destination_url(&base_url, config, proxy, state).await?;
+    validate_secondary_outbound_urls(config, scope, proxy, state).await?;
     validate_provider_config(driver, config)
+}
+
+async fn validate_destination_url(
+    url: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let parsed = network::checked_http_url(url)?;
+    if proxy.is_some() && parsed.scheme() == "https" {
+        // A remote-DNS account proxy owns provider hostname resolution. This
+        // validates the explicit proxy without leaking a local DNS lookup.
+        let _ = network::client_for_oauth_url_no_retry(
+            &state.http,
+            url,
+            proxy,
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+    } else {
+        let _ = network::client_for_config_url(
+            &state.http,
+            url,
+            config,
+            proxy,
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn validate_upstream_proxy(
@@ -206,6 +252,7 @@ async fn validate_upstream_proxy(
 async fn validate_secondary_outbound_urls(
     config: &Value,
     scope: OutboundScope,
+    proxy: Option<(&str, OutboundScope)>,
     state: &AppState,
 ) -> Result<(), AppError> {
     if let Some(refresh_url) = config.pointer("/oauth/refresh_url").and_then(Value::as_str) {
@@ -216,13 +263,31 @@ async fn validate_secondary_outbound_urls(
         } else {
             OutboundScope::Public
         };
-        let _ = network::client_for_url(
-            &state.http,
-            refresh_url,
-            oauth_scope,
-            state.config.allow_oauth_loopback,
-        )
-        .await?;
+        if proxy.is_some() && network::checked_http_url(refresh_url)?.scheme() == "https" {
+            let _ = network::client_for_oauth_url_no_retry(
+                &state.http,
+                refresh_url,
+                proxy,
+                state.config.allow_oauth_loopback,
+            )
+            .await?;
+        } else {
+            let refresh_config = json!({
+                "base_url": refresh_url,
+                "network_scope": match oauth_scope {
+                    OutboundScope::Public => "public",
+                    OutboundScope::Private => "private",
+                }
+            });
+            let _ = network::client_for_config_url(
+                &state.http,
+                refresh_url,
+                &refresh_config,
+                proxy,
+                state.config.allow_oauth_loopback,
+            )
+            .await?;
+        }
     }
     for result_origin in config
         .get("result_origins")
@@ -237,13 +302,24 @@ async fn validate_secondary_outbound_urls(
                 "generation result_origins must be exact HTTP(S) origins".into(),
             ));
         }
-        let _ = network::client_for_url(
-            &state.http,
-            result_origin,
-            scope,
-            state.config.allow_oauth_loopback,
-        )
-        .await?;
+        if proxy.is_some() && parsed.scheme() == "https" {
+            let _ = network::client_for_oauth_url_no_retry(
+                &state.http,
+                result_origin,
+                proxy,
+                state.config.allow_oauth_loopback,
+            )
+            .await?;
+        } else {
+            let _ = network::client_for_config_url(
+                &state.http,
+                result_origin,
+                config,
+                proxy,
+                state.config.allow_oauth_loopback,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -832,6 +908,33 @@ mod tests {
         assert!(require_proxied_rotation_kind(&oauth, &plain_oauth).is_ok());
         assert!(require_proxied_rotation_kind(&api_key, &plain_oauth).is_err());
         assert!(require_proxied_rotation_kind(&oauth, &plain_api_key).is_err());
+    }
+
+    #[test]
+    fn plugin_credential_projection_omits_core_transport_metadata() {
+        let credential = UpstreamCredential::OAuth {
+            access_token: "oauth-access".into(),
+            refresh_token: Some("oauth-refresh".into()),
+            expires_at: Some(4_102_444_800_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: Some("socks5h://100.64.0.16:1080".into()),
+            proxy_network_scope: Some(crate::network::OutboundScope::Private),
+        };
+        let projected = external_provider_credential_projection(
+            serde_json::to_value(credential).expect("canonical OAuth credential"),
+        );
+        assert_eq!(
+            projected,
+            json!({
+                "type": "oauth",
+                "access_token": "oauth-access",
+                "refresh_token": "oauth-refresh",
+                "expires_at": 4_102_444_800_000_i64,
+                "adapter_state": null
+            })
+        );
     }
 
     #[test]

@@ -2313,11 +2313,11 @@ paths:
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
       description: |
-        A new account requires a global operator and a write-only private
-        IP-literal SOCKS5H proxy. Reauthorization omits `proxy_url` and reuses
-        the existing encrypted account proxy. User-code, polling, token exchange,
-        JWKS verification and later managed refresh all use that same proxy with
-        remote target DNS; missing or invalid proxy state fails before network I/O.
+        A global operator may bind a new account to a write-only private
+        IP-literal SOCKS5H proxy. When omitted, authorization and runtime use a
+        direct connection. Reauthorization reuses the existing account setting.
+        User-code, polling, token exchange, JWKS verification, managed refresh,
+        quota operations and model requests share the selected transport.
       requestBody:
         required: true
         content:
@@ -7428,6 +7428,13 @@ components:
         provider_driver: { type: string, default: http-json }
         provider_config: { type: object, additionalProperties: true }
         upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, driver, and configuration must match this request. }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Optional account proxy for the complete OAuth and runtime lifecycle. Omit for a direct connection. Reauthorization reuses the current account setting.
         endpoints:
           type: [object, 'null']
           additionalProperties: false
@@ -7447,6 +7454,13 @@ components:
         provider_driver: { type: string, minLength: 1 }
         provider_config: { type: object, additionalProperties: true }
         upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, driver, and configuration must match this request. }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Optional account proxy for login polling, token refresh and runtime traffic. Omit for a direct connection. Reauthorization reuses the current account setting.
     StartCodexOAuthRequest:
       type: object
       additionalProperties: false
@@ -7461,7 +7475,7 @@ components:
           minLength: 1
           maxLength: 2048
           writeOnly: true
-          description: Required for a new account and must be a private IP-literal SOCKS5H endpoint. Reauthorization must omit it and reuses the existing encrypted account proxy.
+          description: Optional private IP-literal SOCKS5H endpoint used by the complete OAuth and runtime lifecycle. Omit for a direct connection. Reauthorization reuses the existing account setting.
     StartProviderAuthorizationCodeRequest:
       type: object
       additionalProperties: false
@@ -7493,6 +7507,13 @@ components:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1 }
         upstream_account_id: { type: string, format: uuid, description: Existing stable Claude upstream identity to reauthorize. }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Optional account proxy for token exchange, profile lookup, refresh, revocation and runtime traffic. Omit for a direct connection. Reauthorization reuses the current account setting.
     CompleteClaudeOAuthRequest:
       type: object
       additionalProperties: false
@@ -7542,6 +7563,13 @@ components:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1 }
         upstream_account_id: { type: string, format: uuid, description: Existing stable GitHub Copilot upstream identity to reauthorize. }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Optional account proxy for the complete OAuth and runtime lifecycle. Omit for a direct connection. Reauthorization reuses the current account setting.
     CopilotDeviceLoginStart:
       type: object
       additionalProperties: false

@@ -926,7 +926,7 @@ fn builtin_managed_oauth_provider(
                 "expires_at": {"type": "integer", "description": "Unix milliseconds"},
                 "header": {"const": "authorization"},
                 "prefix": {"const": "Bearer "},
-                "proxy_url": {"type": "string", "pattern": "^socks5h?://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
+                "proxy_url": {"type": "string", "pattern": "^socks5h://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
                 "proxy_network_scope": {"type": "string", "const": "private"},
                 "adapter_state": {"type": "object", "writeOnly": true}
             }
@@ -981,6 +981,8 @@ fn builtin_interactive_oauth_provider(
                 "expires_at": {"type": "integer", "description": "Unix milliseconds"},
                 "header": {"const": "authorization"},
                 "prefix": {"const": "Bearer "},
+                "proxy_url": {"type": "string", "pattern": "^socks5h://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
+                "proxy_network_scope": {"type": "string", "const": "private"},
                 "adapter_state": {"type": "object", "writeOnly": true}
             }
         }),

@@ -1,7 +1,7 @@
 use super::super::*;
 use super::accounts::{
     default_provider_driver, validate_provider_config_schema, validate_provider_schema,
-    validate_upstream_destination,
+    validate_upstream_destination_with_proxy,
 };
 
 pub(super) async fn reauthorization_target(
@@ -113,73 +113,61 @@ pub(in crate::api) async fn start_codex_oauth(
                 .into(),
         ));
     }
-    let (provider_config, session_proxy_url, reauthorize) = if let Some(account_id) =
-        body.upstream_account_id
-    {
-        let (account, credential, _, oauth_driver) = state
-            .db
-            .upstream_account_with_current_credential(
-                account_id,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?;
-        if account.tenant_external_id.as_deref() != Some(body.tenant_external_id.as_str()) {
-            return Err(AppError::Forbidden);
-        }
-        if !account.can_reauthorize
-            || account.driver != CODEX_PROVIDER_DRIVER
-            || account.name != body.account_name.trim()
-            || oauth_driver.as_deref() != Some(CODEX_OAUTH_DRIVER)
-        {
-            return Err(AppError::Conflict(
+    let (provider_config, session_proxy_url, reauthorize) =
+        if let Some(account_id) = body.upstream_account_id {
+            let (account, credential, _, oauth_driver) = state
+                .db
+                .upstream_account_with_current_credential(
+                    account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            if account.tenant_external_id.as_deref() != Some(body.tenant_external_id.as_str()) {
+                return Err(AppError::Forbidden);
+            }
+            if !account.can_reauthorize
+                || account.driver != CODEX_PROVIDER_DRIVER
+                || account.name != body.account_name.trim()
+                || oauth_driver.as_deref() != Some(CODEX_OAUTH_DRIVER)
+            {
+                return Err(AppError::Conflict(
                 "reauthorization must use the existing OpenAI Codex upstream and OAuth lifecycle"
                     .into(),
             ));
-        }
-        let (proxy_url, proxy_scope) = credential.proxy().ok_or_else(|| {
-            AppError::BadRequest(
-                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+            }
+            let proxy_url = credential.proxy().map(|(url, _)| url.to_owned());
+            let target = OAuthReauthorizationTarget {
+                account_id,
+                expected_updated_at: account.updated_at,
+                expected_credential_generation: account.credential_generation,
+            };
+            (account.config, proxy_url, Some(target))
+        } else {
+            require_global_service(&service)?;
+            (
+                json!({
+                    "base_url": crate::oauth::codex_device::BASE_URL,
+                    "network_scope": "public",
+                    "reservation_token_bounds": {},
+                }),
+                body.proxy_url.clone(),
+                None,
             )
-        })?;
-        if proxy_scope != OutboundScope::Private {
-            return Err(AppError::BadRequest(
-                "OpenAI Codex authorization proxy is outside the approved private network".into(),
-            ));
-        }
-        let target = OAuthReauthorizationTarget {
-            account_id,
-            expected_updated_at: account.updated_at,
-            expected_credential_generation: account.credential_generation,
         };
-        (account.config, proxy_url.to_owned(), Some(target))
-    } else {
-        require_global_service(&service)?;
-        let proxy_url = body.proxy_url.clone().ok_or_else(|| {
-            AppError::BadRequest(
-                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
-            )
-        })?;
-        (
-            json!({
-                "base_url": crate::oauth::codex_device::BASE_URL,
-                "network_scope": "public",
-                "reservation_token_bounds": {},
-            }),
-            proxy_url,
-            None,
-        )
-    };
     validate_provider_config_schema(&state, CODEX_PROVIDER_DRIVER, &provider_config)?;
-    crate::provider::validate_codex_proxy_url(&session_proxy_url)?;
-    network::validate_codex_transport(
-        crate::oauth::codex_device::BASE_URL,
+    if let Some(proxy_url) = session_proxy_url.as_deref() {
+        crate::provider::validate_codex_proxy_url(proxy_url)?;
+    }
+    validate_upstream_destination_with_proxy(
+        CODEX_PROVIDER_DRIVER,
         &provider_config,
-        Some((&session_proxy_url, OutboundScope::Private)),
-        false,
+        session_proxy_url
+            .as_deref()
+            .map(|url| (url, OutboundScope::Private)),
+        &service,
+        &state,
     )
     .await?;
-    validate_upstream_destination(CODEX_PROVIDER_DRIVER, &provider_config, &service, &state)
-        .await?;
     Ok(Json(
         start_codex_device_login(
             &state.db,
@@ -189,7 +177,7 @@ pub(in crate::api) async fn start_codex_oauth(
                 account_name: body.account_name,
                 operator_service_id: service.service_id,
                 provider_config,
-                proxy_url: Some(session_proxy_url),
+                proxy_url: session_proxy_url,
                 reauthorize,
             },
             state.config.key_pepper.as_bytes(),
@@ -262,9 +250,10 @@ pub(in crate::api) async fn poll_codex_oauth(
                 &ready.provider_config,
                 &ready.credential,
             )?;
-            validate_upstream_destination(
+            validate_upstream_destination_with_proxy(
                 CODEX_PROVIDER_DRIVER,
                 &ready.provider_config,
+                ready.credential.proxy(),
                 &service,
                 &state,
             )
@@ -309,9 +298,7 @@ pub(in crate::api) async fn poll_codex_oauth(
                         .await?
                 }
                 None => {
-                    let missing_transport_proxy = ready.credential.proxy().is_none();
-                    let tenant_external_id = ready.tenant_external_id.clone();
-                    let created = state
+                    state
                         .db
                         .create_upstream_account(
                             CreateUpstreamAccountInput {
@@ -328,20 +315,7 @@ pub(in crate::api) async fn poll_codex_oauth(
                             },
                             state.config.key_pepper.as_bytes(),
                         )
-                        .await?;
-                    if missing_transport_proxy {
-                        state
-                            .db
-                            .set_upstream_account_status(
-                                created.id,
-                                &tenant_external_id,
-                                "disabled",
-                                created.updated_at,
-                            )
-                            .await?
-                    } else {
-                        created
-                    }
+                        .await?
                 }
             };
             state
@@ -446,9 +420,12 @@ pub(in crate::api) async fn start_cursor_oauth(
         )?;
     }
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
-    validate_upstream_destination(
+    validate_upstream_destination_with_proxy(
         &body.provider_driver,
         &body.provider_config,
+        session_proxy_url
+            .as_deref()
+            .map(|url| (url, OutboundScope::Private)),
         &service,
         &state,
     )
@@ -491,6 +468,8 @@ pub(in crate::api) struct StartProviderAdapterOAuthRequest {
     provider_config: Value,
     #[serde(default)]
     upstream_account_id: Option<Uuid>,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 pub(in crate::api) async fn start_provider_adapter_oauth(
@@ -501,6 +480,19 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
+        return Err(AppError::BadRequest(
+            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
+                .into(),
+        ));
+    }
+    if let Some(proxy_url) = body.proxy_url.as_deref() {
+        require_global_service(&service)?;
+        crate::provider::validate_oauth_remote_dns_proxy_url(
+            proxy_url,
+            state.config.allow_oauth_loopback,
+        )?;
+    }
     let provider = state.providers.get(&body.provider_driver).ok_or_else(|| {
         AppError::BadRequest(format!("unknown provider driver: {}", body.provider_driver))
     })?;
@@ -528,10 +520,28 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         "provider_adapter",
     )
     .await?;
+    let session_proxy_url = if let Some(target) = reauthorize.as_ref() {
+        state
+            .db
+            .upstream_oauth_reauthorization_proxy_snapshot(
+                target.account_id,
+                &body.tenant_external_id,
+                target.expected_updated_at,
+                target.expected_credential_generation,
+                "provider_adapter",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?
+    } else {
+        body.proxy_url
+    };
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
-    validate_upstream_destination(
+    validate_upstream_destination_with_proxy(
         &body.provider_driver,
         &body.provider_config,
+        session_proxy_url
+            .as_deref()
+            .map(|url| (url, OutboundScope::Private)),
         &service,
         &state,
     )
@@ -551,7 +561,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
                     refresh_url: adapter.refresh_url.clone(),
                 },
                 oauth_driver: "provider_adapter".to_owned(),
-                proxy_url: None,
+                proxy_url: session_proxy_url,
                 reauthorize,
             },
             service.service_id,
@@ -634,9 +644,10 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 &ready.provider_config,
                 &ready.credential,
             )?;
-            validate_upstream_destination(
+            validate_upstream_destination_with_proxy(
                 &ready.provider_driver,
                 &ready.provider_config,
+                ready.credential.proxy(),
                 &service,
                 &state,
             )
@@ -1005,8 +1016,10 @@ fn supports_oauth_refresh_proxy(driver: &str) -> bool {
         crate::oauth::codex_device::OAUTH_DRIVER
             | crate::oauth::managed::kimi::PROVIDER_DRIVER
             | crate::oauth::authorization_code::FLOW
+            | crate::oauth::claude::OAUTH_DRIVER
             | crate::oauth::copilot::OAUTH_DRIVER
             | "cursor"
+            | "provider_adapter"
     )
 }
 
@@ -1028,9 +1041,10 @@ mod oauth_proxy_tests {
         assert!(supports_oauth_refresh_proxy(
             crate::oauth::copilot::OAUTH_DRIVER
         ));
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::claude::OAUTH_DRIVER
+        ));
         assert!(supports_oauth_refresh_proxy("cursor"));
-        for driver in [crate::oauth::claude::OAUTH_DRIVER, "provider_adapter"] {
-            assert!(!supports_oauth_refresh_proxy(driver), "{driver}");
-        }
+        assert!(supports_oauth_refresh_proxy("provider_adapter"));
     }
 }

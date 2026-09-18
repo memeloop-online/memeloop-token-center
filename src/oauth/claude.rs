@@ -15,10 +15,10 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json, validate_config},
+    provider::{UpstreamCredential, open_private_json, seal_private_json},
 };
 
-use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard};
+use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard, validate_oauth_login_config};
 
 pub const PROVIDER_DRIVER: &str = "anthropic-claude";
 pub const OAUTH_DRIVER: &str = "anthropic_claude_manual_pkce";
@@ -47,6 +47,7 @@ pub struct StartClaudeLogin {
     pub account_name: String,
     pub operator_service_id: Option<Uuid>,
     pub provider_config: Value,
+    pub proxy_url: Option<String>,
     pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
@@ -107,6 +108,8 @@ struct ClaudeLoginState {
     account_name: String,
     operator_service_id: Option<Uuid>,
     provider_config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_url: Option<String>,
     verifier: String,
     state: String,
     expires_at: i64,
@@ -214,7 +217,7 @@ async fn start_claude_login_at(
 ) -> Result<ClaudeLoginStart, AppError> {
     validate_account_text(&input.tenant_external_id, "tenant")?;
     validate_account_text(input.account_name.trim(), "account name")?;
-    let _ = validate_config(&input.provider_config)?;
+    let _ = validate_oauth_login_config(&input.provider_config)?;
     let mut verifier_bytes = [0_u8; 32];
     let mut state_bytes = [0_u8; 32];
     fill(&mut verifier_bytes).map_err(|_| AppError::Internal)?;
@@ -244,6 +247,7 @@ async fn start_claude_login_at(
         account_name: input.account_name.trim().to_owned(),
         operator_service_id: input.operator_service_id,
         provider_config: input.provider_config,
+        proxy_url: input.proxy_url,
         verifier,
         state: state_value,
         expires_at,
@@ -450,6 +454,7 @@ async fn finish_claimed_login(
         allow_test_loopback,
         endpoints.timeout,
         None,
+        state.proxy_url.as_deref(),
     )
     .await?;
     validate_token_response(&tokens, true)?;
@@ -459,6 +464,7 @@ async fn finish_claimed_login(
         &tokens.access_token,
         allow_test_loopback,
         endpoints.timeout,
+        state.proxy_url.as_deref(),
     )
     .await?;
     let expires_at = expiry_millis(now, tokens.expires_in)?;
@@ -479,8 +485,8 @@ async fn finish_claimed_login(
                 "schema": "anthropic-claude-oauth-v1",
                 "account_id": account_id,
             })),
-            proxy_url: None,
-            proxy_network_scope: None,
+            proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
+            proxy_url: state.proxy_url,
         },
         reauthorize: state.reauthorize,
     })
@@ -534,6 +540,7 @@ async fn refresh_claude_credential_at(
         allow_test_loopback,
         endpoints.timeout,
         Some(request_guard),
+        credential.proxy().map(|(url, _)| url),
     )
     .await?;
     validate_token_response(&tokens, false)?;
@@ -547,8 +554,8 @@ async fn refresh_claude_credential_at(
         header: "authorization".into(),
         prefix: "Bearer ".into(),
         adapter_state: adapter_state.clone(),
-        proxy_url: None,
-        proxy_network_scope: None,
+        proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
+        proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })
 }
 
@@ -585,7 +592,14 @@ async fn revoke_claude_credential_at(
         });
     };
     validate_secret(refresh_token)?;
-    let client = match oauth_client(http, &endpoints.revoke, allow_test_loopback).await {
+    let client = match oauth_client(
+        http,
+        &endpoints.revoke,
+        credential.proxy().map(|(url, _)| url),
+        allow_test_loopback,
+    )
+    .await
+    {
         Ok(client) => client,
         Err(_) => {
             return Ok(ClaudeRevokeStatus {
@@ -650,8 +664,9 @@ async fn post_token_grant<T: Serialize + ?Sized>(
     allow_test_loopback: bool,
     timeout: Duration,
     request_guard: Option<&dyn OAuthRefreshRequestGuard>,
+    proxy_url: Option<&str>,
 ) -> Result<TokenResponse, AppError> {
-    let client = oauth_client(http, endpoint, allow_test_loopback).await?;
+    let client = oauth_client(http, endpoint, proxy_url, allow_test_loopback).await?;
     let request = client
         .post(endpoint)
         .header(ACCEPT, "application/json")
@@ -677,9 +692,10 @@ async fn fetch_profile_account_id(
     access_token: &str,
     allow_test_loopback: bool,
     timeout: Duration,
+    proxy_url: Option<&str>,
 ) -> Result<Uuid, AppError> {
     validate_secret(access_token)?;
-    let client = oauth_client(http, endpoint, allow_test_loopback).await?;
+    let client = oauth_client(http, endpoint, proxy_url, allow_test_loopback).await?;
     let response = client
         .get(endpoint)
         .header(ACCEPT, "application/json")
@@ -700,11 +716,17 @@ async fn fetch_profile_account_id(
 async fn oauth_client(
     http: &reqwest::Client,
     endpoint: &str,
+    proxy_url: Option<&str>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
-    network::client_for_url(http, endpoint, OutboundScope::Public, allow_test_loopback)
-        .await
-        .map_err(|_| claude_error())
+    network::client_for_oauth_url_no_retry(
+        http,
+        endpoint,
+        proxy_url.map(|url| (url, OutboundScope::Private)),
+        allow_test_loopback,
+    )
+    .await
+    .map_err(|_| claude_error())
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -798,7 +820,14 @@ fn claude_error() -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::Mutex,
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
@@ -806,6 +835,55 @@ mod tests {
 
     const KEY: &[u8] = b"claude-oauth-test-key-material-at-least-32-bytes";
     const ACCOUNT_UUID: &str = "719c8604-7a46-4e7d-8fd7-bf6a1be077b5";
+
+    async fn socks5h_proxy(
+        target: std::net::SocketAddr,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hosts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = hosts.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut greeting = [0_u8; 2];
+                    client.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting[0], 5);
+                    let mut methods = vec![0_u8; usize::from(greeting[1])];
+                    client.read_exact(&mut methods).await.unwrap();
+                    assert!(methods.contains(&0));
+                    client.write_all(&[5, 0]).await.unwrap();
+
+                    let mut request = [0_u8; 4];
+                    client.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request, &[5, 1, 0, 3]);
+                    let mut length = [0_u8; 1];
+                    client.read_exact(&mut length).await.unwrap();
+                    let mut hostname = vec![0_u8; usize::from(length[0])];
+                    client.read_exact(&mut hostname).await.unwrap();
+                    let hostname = String::from_utf8(hostname).unwrap();
+                    let mut port = [0_u8; 2];
+                    client.read_exact(&mut port).await.unwrap();
+                    assert_eq!(u16::from_be_bytes(port), target.port());
+                    recorded.lock().await.push(hostname);
+
+                    let mut upstream = TcpStream::connect(target).await.unwrap();
+                    client
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (format!("socks5h://{address}"), hosts, task)
+    }
 
     async fn database_url() -> (tempfile::TempDir, String, Database) {
         let directory = tempfile::tempdir().expect("Claude OAuth temporary directory");
@@ -827,6 +905,7 @@ mod tests {
                 "base_url": "https://api.anthropic.com",
                 "network_scope": "public"
             }),
+            proxy_url: None,
             reauthorize,
         }
     }
@@ -1191,6 +1270,95 @@ mod tests {
             }
             other => panic!("unexpected credential: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn account_proxy_carries_exchange_profile_refresh_and_revocation() {
+        let server = MockServer::start().await;
+        let target = *server.address();
+        let origin = format!("http://claude-oauth.test:{}", target.port());
+        let endpoints = ClaudeEndpoints::for_test(&origin);
+        let (proxy_url, proxy_hosts, proxy_task) = socks5h_proxy(target).await;
+        mount_success(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("\"grant_type\":\"refresh_token\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "refreshed-access",
+                "refresh_token": "refreshed-refresh",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token/revoke"))
+            .and(body_string_contains("\"token\":\"refreshed-refresh\""))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_directory, _url, database) = database_url().await;
+        let now = crate::db::unix_millis();
+        let mut login = input(None);
+        login.proxy_url = Some(proxy_url.clone());
+        let started = start_claude_login_at(&database, login, KEY, now, &endpoints)
+            .await
+            .unwrap();
+        let state = query_value(&started.login_url, "state");
+        let ready = match complete_claude_login_at(
+            &database,
+            &crate::build_http_client().unwrap(),
+            &started.session_token,
+            &format!("manual-code#{state}"),
+            KEY,
+            now + 1,
+            ClaudeCompleteScope {
+                required_tenant: Some("claude-test"),
+                operator_service_id: None,
+            },
+            true,
+            &endpoints,
+        )
+        .await
+        .unwrap()
+        {
+            ClaudeCompleteResult::Ready { login, .. } => *login,
+            other => panic!("unexpected completion: {other:?}"),
+        };
+        assert_eq!(
+            ready.credential.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
+        let refreshed = refresh_claude_credential_at(
+            &crate::build_http_client().unwrap(),
+            &ready.credential,
+            now + 2,
+            true,
+            &endpoints,
+            &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refreshed.proxy(),
+            Some((proxy_url.as_str(), OutboundScope::Private))
+        );
+        let revoked = revoke_claude_credential_at(
+            &crate::build_http_client().unwrap(),
+            &refreshed,
+            true,
+            &endpoints,
+        )
+        .await
+        .unwrap();
+        assert!(revoked.revoked);
+        server.verify().await;
+        let hosts = proxy_hosts.lock().await.clone();
+        assert_eq!(hosts.len(), 4);
+        assert!(hosts.iter().all(|host| host == "claude-oauth.test"));
+        proxy_task.abort();
     }
 
     #[tokio::test]

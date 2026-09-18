@@ -26,6 +26,18 @@ pub(crate) use endpoint::validate_oauth_endpoint;
 pub(crate) use endpoint::{oauth_adapter_endpoint_scope, validate_oauth_adapter_endpoint};
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_OAUTH_LOGIN_CONFIG_BYTES: usize = 64 * 1024;
+
+pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<String, AppError> {
+    let base_url = crate::provider::validate_config(config)?;
+    let bytes = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    if bytes.len() > MAX_OAUTH_LOGIN_CONFIG_BYTES {
+        return Err(AppError::BadRequest(
+            "OAuth provider configuration exceeds the login-session limit".into(),
+        ));
+    }
+    Ok(base_url)
+}
 
 #[async_trait::async_trait]
 pub trait OAuthRefreshRequestGuard: Send + Sync {
@@ -165,6 +177,8 @@ mod tests {
     #[tokio::test]
     async fn provider_adapter_allows_private_cluster_http_but_rejects_public_http() {
         let (_directory, database) = sqlite_database().await;
+        let proxy_url = "socks5h://127.0.0.1:1080";
+        let plugin_config_value = "plugin-login-session-value";
         let private = start_cursor_login(
             &database,
             StartCursorLogin {
@@ -174,7 +188,8 @@ mod tests {
                 provider_driver: "plugin-provider".to_owned(),
                 provider_config: json!({
                     "base_url": "http://plugin-upstream.default.svc",
-                    "network_scope": "private"
+                    "network_scope": "private",
+                    "workspace": plugin_config_value
                 }),
                 endpoints: CursorOAuthEndpoints {
                     login_url: "http://oauth-adapter.default.svc/login".to_owned(),
@@ -182,7 +197,7 @@ mod tests {
                     refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
                 },
                 oauth_driver: "provider_adapter".to_owned(),
-                proxy_url: None,
+                proxy_url: Some(proxy_url.to_owned()),
                 reauthorize: None,
             },
             None,
@@ -192,6 +207,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(private.driver, "provider_adapter");
+        assert!(!private.session_token.contains(plugin_config_value));
+        assert!(!private.session_token.contains(proxy_url));
         assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
         assert!(
             oauth_adapter_endpoint_scope(
@@ -273,6 +290,26 @@ mod tests {
             .1,
             OutboundScope::Public
         );
+    }
+
+    #[test]
+    fn oauth_login_provider_configuration_is_bounded() {
+        let accepted = json!({
+            "base_url": "https://provider.example",
+            "network_scope": "public",
+            "plugin_field": "x".repeat(60 * 1024)
+        });
+        assert!(validate_oauth_login_config(&accepted).is_ok());
+
+        let oversized = json!({
+            "base_url": "https://provider.example",
+            "network_scope": "public",
+            "plugin_field": "x".repeat(65 * 1024)
+        });
+        assert!(matches!(
+            validate_oauth_login_config(&oversized),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
