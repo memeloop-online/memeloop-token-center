@@ -316,10 +316,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /internal/v1/keys/{key_id}/credential-recovery:
+  /internal/v1/keys/{key_id}/credential:
     put:
       tags: [Client credentials]
-      operationId: storeClientCredentialRecovery
+      operationId: storeClientCredential
       summary: Store an already-active client credential for direct authorized copying
       description: |
         Verifies the supplied credential against the active stable key and stores its original
@@ -332,7 +332,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/StoreClientCredentialRecoveryRequest' }
+            schema: { $ref: '#/components/schemas/StoreClientCredentialRequest' }
       responses:
         '204': { description: Original credential stored; no secret is returned. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
@@ -340,7 +340,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /internal/v1/keys/{key_id}/credential-recovery/copy:
+  /internal/v1/keys/{key_id}/copy:
     post:
       tags: [Client credentials]
       operationId: copyClientCredential
@@ -351,7 +351,7 @@ paths:
         contain the secret. This operation never rotates or replaces the credential; repeated
         authorized calls return the same current-generation credential. A hash-only historical
         key returns 404 unless an authorized importer still has and stores its original value.
-        Legacy encrypted values are verified against the active generation before copying.
+        The stored original is verified against the active credential hash before copying.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -362,7 +362,7 @@ paths:
             Cache-Control: { schema: { const: no-store } }
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/RecoveredClientCredential' }
+              schema: { $ref: '#/components/schemas/CopiedClientCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -628,7 +628,7 @@ paths:
             Cache-Control: { schema: { const: no-store } }
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/RecoveredServiceCredential' }
+              schema: { $ref: '#/components/schemas/CopiedServiceCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -6830,7 +6830,7 @@ components:
         credential_generation: { type: integer, format: int64, minimum: 1 }
         key: { type: string, writeOnly: true, description: One-time native credential secret. }
         fingerprint: { type: string }
-    StoreClientCredentialRecoveryRequest:
+    StoreClientCredentialRequest:
       type: object
       additionalProperties: false
       required: [key]
@@ -6841,7 +6841,7 @@ components:
           maxLength: 512
           writeOnly: true
           description: Existing active credential supplied by an authorized source importer. It is never echoed.
-    RecoveredClientCredential:
+    CopiedClientCredential:
       type: object
       additionalProperties: false
       required: [key_id, credential_generation, key]
@@ -6852,7 +6852,7 @@ components:
     ManagedClientCredential:
       type: object
       additionalProperties: false
-      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, fingerprint, credential_recovery_available, created_at, updated_at, policy, available_balance, reserved_balance]
+      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, fingerprint, credential_copy_available, created_at, updated_at, policy, available_balance, reserved_balance]
       properties:
         creation_source: { type: string, enum: [manual, api, unknown] }
         archived_at: { type: [integer, 'null'], format: int64 }
@@ -6865,7 +6865,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: [string, 'null'] }
-        credential_recovery_available: { type: boolean, description: Whether the active credential can be copied through the explicit management action. }
+        credential_copy_available: { type: boolean, description: Whether the active credential can be copied through the explicit management action. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
@@ -7030,7 +7030,7 @@ components:
         tenant_external_id: { type: [string, 'null'] }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
-    RecoveredServiceCredential:
+    CopiedServiceCredential:
       type: object
       additionalProperties: false
       required: [service_id, credential_generation, token]

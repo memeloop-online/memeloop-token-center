@@ -1,10 +1,6 @@
 use std::collections::BTreeSet;
 
 use super::super::*;
-use super::recovery::{
-    remove_key_credential_recovery_secrets_in_transaction,
-    store_issued_key_credential_recovery_secret_in_transaction,
-};
 use crate::db::routing::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
@@ -234,8 +230,6 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         insert_credential(tx, &issued, 1, now).await?;
-        store_issued_key_credential_recovery_secret_in_transaction(tx, &issued, 1, pepper, now)
-            .await?;
         Ok((
             tenant_id,
             ProvisionedCloudCredential {
@@ -311,7 +305,7 @@ impl Database {
             // surrounding tenant/principal predicates still enforce the
             // caller's management scope, and cursor semantics remain intact.
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) AND (LOWER(k.alias) LIKE LOWER($7) ESCAPE '!' OR LOWER(p.external_id) LIKE LOWER($7) ESCAPE '!') AND ($8 = '' OR k.status = $8) AND k.archived_at IS NULL AND ($9 = '' OR k.creation_source = $9 OR ($9 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND credential.secret_plaintext IS NOT NULL) THEN 1 ELSE 0 END AS credential_copy_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1 AND ($2 = '' OR t.external_id = $2) AND ($3 = '' OR p.external_id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) AND (LOWER(k.alias) LIKE LOWER($7) ESCAPE '!' OR LOWER(p.external_id) LIKE LOWER($7) ESCAPE '!') AND ($8 = '' OR k.status = $8) AND k.archived_at IS NULL AND ($9 = '' OR k.creation_source = $9 OR ($9 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
             )
             .bind(key_id.to_string())
             .bind(tenant_external_id.unwrap_or_default())
@@ -326,7 +320,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential LEFT JOIN key_credential_recovery_secrets recovery ON recovery.credential_id = credential.id WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND (credential.secret_plaintext IS NOT NULL OR recovery.credential_id IS NOT NULL)) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) AND (LOWER(k.alias) LIKE LOWER($6) ESCAPE '!' OR LOWER(p.external_id) LIKE LOWER($6) ESCAPE '!') AND ($7 = '' OR k.status = $7) AND k.archived_at IS NULL AND ($8 = '' OR k.creation_source = $8 OR ($8 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+                "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.creation_source, k.archived_at, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credentials credential WHERE credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL AND credential.secret_plaintext IS NOT NULL) THEN 1 ELSE 0 END AS credential_copy_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) AND (LOWER(k.alias) LIKE LOWER($6) ESCAPE '!' OR LOWER(p.external_id) LIKE LOWER($6) ESCAPE '!') AND ($7 = '' OR k.status = $7) AND k.archived_at IS NULL AND ($8 = '' OR k.creation_source = $8 OR ($8 = 'manual_or_unknown' AND k.creation_source IN ('manual', 'unknown'))) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
             )
             .bind(tenant_external_id.unwrap_or_default())
             .bind(principal_external_id.unwrap_or_default())
@@ -374,18 +368,11 @@ impl Database {
         if status == "revoked" {
             let now = unix_millis();
             sqlx::query(
-                "UPDATE key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
+                "UPDATE key_credentials SET revoked_at = $1, secret_plaintext = NULL WHERE key_id = $2 AND revoked_at IS NULL",
             )
             .bind(now)
             .bind(key_id.to_string())
             .execute(&mut *transaction)
-            .await?;
-            remove_key_credential_recovery_secrets_in_transaction(
-                &mut transaction,
-                key_id,
-                current.try_get("credential_generation")?,
-                now,
-            )
             .await?;
         }
         transaction.commit().await?;
@@ -628,10 +615,6 @@ impl Database {
         .await?;
 
         insert_credential(&mut tx, &issued, 1, now).await?;
-        store_issued_key_credential_recovery_secret_in_transaction(
-            &mut tx, &issued, 1, pepper, now,
-        )
-        .await?;
         if initial_balance_micros != 0 {
             sqlx::query(
                 "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) VALUES ($1, $2, $3, 'grant', $4, $5, 'initial', $6)",
@@ -732,19 +715,13 @@ impl Database {
         let issued = crypto::issue_credential(key_id, pepper);
 
         sqlx::query(
-            "UPDATE key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
+            "UPDATE key_credentials SET revoked_at = $1, secret_plaintext = NULL WHERE key_id = $2 AND revoked_at IS NULL",
         )
         .bind(now)
         .bind(key_id.to_string())
         .execute(&mut *tx)
         .await?;
         insert_credential(&mut tx, &issued, generation, now).await?;
-        remove_key_credential_recovery_secrets_in_transaction(&mut tx, key_id, generation - 1, now)
-            .await?;
-        store_issued_key_credential_recovery_secret_in_transaction(
-            &mut tx, &issued, generation, pepper, now,
-        )
-        .await?;
         sqlx::query(
             "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
         )
@@ -1273,7 +1250,7 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         archived_at: row.try_get("archived_at")?,
         credential_generation: row.try_get("credential_generation")?,
         fingerprint: row.try_get("fingerprint")?,
-        credential_recovery_available: row.try_get::<i64, _>("credential_recovery_available")? != 0,
+        credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
@@ -1374,22 +1351,23 @@ mod tests {
     use super::super::super::*;
 
     #[tokio::test]
-    async fn durable_recovery_envelope_keeps_the_active_key_unchanged() {
+    async fn direct_copy_checks_scope_tenant_hash_and_revocation() {
         let directory = tempfile::tempdir().unwrap();
-        let database_url = format!(
+        let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("credential-recovery.db").display()
-        );
-        let database = Database::connect(&database_url).await.unwrap();
+            directory.path().join("direct-copy.db").display()
+        ))
+        .await
+        .unwrap();
         database.migrate().await.unwrap();
-        let pepper = b"credential recovery pepper longer than thirty-two bytes";
+        let pepper = b"direct copy test pepper longer than thirty-two bytes";
         let issued = database
             .create_key(
                 CreateKeyInput {
-                    tenant_external_id: "credential-recovery".to_owned(),
-                    principal_external_id: "member".to_owned(),
-                    alias: "recoverable".to_owned(),
-                    currency: "USD".to_owned(),
+                    tenant_external_id: "direct-copy".into(),
+                    principal_external_id: "member".into(),
+                    alias: "copyable".into(),
+                    currency: "USD".into(),
                     policy: KeyPolicy::default(),
                     initial_balance: Decimal::ZERO,
                     idempotency_key: None,
@@ -1398,245 +1376,82 @@ mod tests {
             )
             .await
             .unwrap();
-
         let listed = database
-            .list_managed_keys(Some("credential-recovery"), Some("member"))
+            .list_managed_keys(Some("direct-copy"), Some("member"))
             .await
             .unwrap();
-        assert!(listed[0].credential_recovery_available);
-        let scope_denied_actor = Uuid::now_v7();
+        assert!(listed[0].credential_copy_available);
         assert!(matches!(
             database
-                .copy_key_credential(
-                    issued.key_id,
-                    pepper,
-                    Some(scope_denied_actor),
-                    Some("credential-recovery"),
-                    false,
-                )
+                .copy_key_credential(issued.key_id, pepper, None, false)
                 .await,
             Err(AppError::Forbidden)
         ));
-        let tenant_denied_actor = Uuid::now_v7();
         assert!(matches!(
             database
-                .copy_key_credential(
-                    issued.key_id,
-                    pepper,
-                    Some(tenant_denied_actor),
-                    Some("another-tenant"),
-                    true,
-                )
+                .copy_key_credential(issued.key_id, pepper, Some("foreign"), true)
                 .await,
             Err(AppError::Forbidden)
         ));
-        let copied = database
-            .copy_key_credential(issued.key_id, pepper, None, None, true)
-            .await
-            .unwrap();
-        assert_eq!(copied.key, issued.key);
-        assert_eq!(copied.credential_generation, 1);
-        assert_eq!(
-            database
-                .authenticate_key(&copied.key, pepper)
+        for _ in 0..3 {
+            let copied = database
+                .copy_key_credential(issued.key_id, pepper, Some("direct-copy"), true)
                 .await
-                .unwrap()
-                .credential_generation,
-            1
-        );
-
-        let ciphertext: String =
-            sqlx::query("SELECT ciphertext FROM key_credential_recovery_secrets WHERE key_id = $1")
-                .bind(issued.key_id.to_string())
-                .fetch_one(&database.pool)
-                .await
-                .unwrap()
-                .try_get("ciphertext")
                 .unwrap();
-        assert!(!ciphertext.contains(&issued.key));
-        let plaintext: String = sqlx::query_scalar(
-            "SELECT secret_plaintext FROM key_credentials WHERE key_id = $1 AND generation = 1",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-        assert_eq!(plaintext, issued.key);
-        let audit = sqlx::query(
-            "SELECT action, actor_service_id FROM key_credential_recovery_audit WHERE key_id = $1 ORDER BY created_at, id",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_all(&database.pool)
-        .await
-        .unwrap();
-        assert_eq!(audit.len(), 2);
-        assert_eq!(audit[0].try_get::<String, _>("action").unwrap(), "stored");
-        assert_eq!(
-            audit[1].try_get::<String, _>("action").unwrap(),
-            "retrieved"
-        );
-        assert!(audit.iter().all(|row| {
-            row.try_get::<Option<String>, _>("actor_service_id")
-                .unwrap()
-                .is_none()
-        }));
-        let access_audit = sqlx::query(
-            "SELECT tenant_id, outcome, actor_service_id FROM key_credential_recovery_access_audit WHERE key_id = $1 ORDER BY created_at, id",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_all(&database.pool)
-        .await
-        .unwrap();
-        assert_eq!(access_audit.len(), 3);
-        let mut outcomes = access_audit
-            .iter()
-            .map(|row| row.try_get::<String, _>("outcome").unwrap())
-            .collect::<Vec<_>>();
-        outcomes.sort();
-        assert_eq!(outcomes, ["retrieved", "scope_denied", "tenant_denied"]);
-        assert!(
-            access_audit
-                .iter()
-                .all(|row| { !row.try_get::<String, _>("tenant_id").unwrap().is_empty() })
-        );
-        assert_eq!(
-            access_audit
-                .iter()
-                .filter(|row| row
-                    .try_get::<Option<String>, _>("actor_service_id")
-                    .unwrap()
-                    .is_none())
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn unavailable_credential_can_be_authorizedly_supplemented_without_rotation() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_url = format!(
-            "sqlite://{}?mode=rwc",
-            directory
-                .path()
-                .join("credential-recovery-supplement.db")
-                .display()
-        );
-        let database = Database::connect(&database_url).await.unwrap();
-        database.migrate().await.unwrap();
-        let pepper = b"credential recovery supplement pepper longer than thirty-two bytes";
-        let issued = database
-            .create_key(
-                CreateKeyInput {
-                    tenant_external_id: "credential-recovery-supplement".to_owned(),
-                    principal_external_id: "member".to_owned(),
-                    alias: "supplementable".to_owned(),
-                    currency: "USD".to_owned(),
-                    policy: KeyPolicy::default(),
-                    initial_balance: Decimal::ZERO,
-                    idempotency_key: None,
-                },
-                pepper,
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1 AND generation = 1",
-        )
-            .bind(issued.key_id.to_string())
-            .execute(&database.pool)
-            .await
-            .unwrap();
-        // Pre-0084 envelopes remain copyable and are promoted to the direct
-        // plaintext column only after their integrity and active generation
-        // have been verified.
-        let copied = database
-            .copy_key_credential(issued.key_id, pepper, None, None, true)
-            .await
-            .unwrap();
-        assert_eq!(copied.key, issued.key);
-        let promoted: String = sqlx::query_scalar(
-            "SELECT secret_plaintext FROM key_credentials WHERE key_id = $1 AND generation = 1",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-        assert_eq!(promoted, issued.key);
-        sqlx::query("DELETE FROM key_credential_recovery_secrets WHERE key_id = $1")
-            .bind(issued.key_id.to_string())
-            .execute(&database.pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1 AND generation = 1",
-        )
-        .bind(issued.key_id.to_string())
-        .execute(&database.pool)
-        .await
-        .unwrap();
+            assert!(copied.key == issued.key);
+            assert_eq!(copied.credential_generation, 1);
+        }
+        sqlx::query("UPDATE key_credentials SET secret_plaintext = 'wrong-original-value' WHERE key_id = $1")
+            .bind(issued.key_id.to_string()).execute(&database.pool).await.unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None, None, true)
+                .copy_key_credential(issued.key_id, pepper, None, true)
+                .await,
+            Err(AppError::Internal)
+        ));
+        sqlx::query("UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1")
+            .bind(issued.key_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            database
+                .copy_key_credential(issued.key_id, pepper, None, true)
                 .await,
             Err(AppError::NotFound)
         ));
         assert!(matches!(
             database
-                .store_key_credential_recovery_secret(
-                    issued.key_id,
-                    "mtc_not_the_active_credential_material",
-                    pepper,
-                    None,
-                )
+                .store_key_credential_plaintext(issued.key_id, "wrong-original-value", pepper)
                 .await,
             Err(AppError::BadRequest(_))
         ));
         database
-            .store_key_credential_recovery_secret(issued.key_id, &issued.key, pepper, None)
+            .store_key_credential_plaintext(issued.key_id, &issued.key, pepper)
             .await
             .unwrap();
         let copied = database
-            .copy_key_credential(issued.key_id, pepper, None, None, true)
+            .copy_key_credential(issued.key_id, pepper, None, true)
             .await
             .unwrap();
-        assert_eq!(copied.key, issued.key);
-        assert_eq!(copied.credential_generation, 1);
-
+        assert!(copied.key == issued.key);
         database
             .set_key_status(issued.key_id, "revoked")
             .await
             .unwrap();
         assert!(matches!(
             database
-                .copy_key_credential(issued.key_id, pepper, None, None, true)
+                .copy_key_credential(issued.key_id, pepper, None, true)
                 .await,
             Err(AppError::Forbidden)
         ));
-        let remaining: i64 = sqlx::query(
-            "SELECT COUNT(*) AS count FROM key_credential_recovery_secrets WHERE key_id = $1",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_one(&database.pool)
-        .await
-        .unwrap()
-        .try_get("count")
-        .unwrap();
-        assert_eq!(remaining, 0);
-        let mut access_outcomes = sqlx::query(
-            "SELECT outcome FROM key_credential_recovery_access_audit WHERE key_id = $1",
-        )
-        .bind(issued.key_id.to_string())
-        .fetch_all(&database.pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("outcome").unwrap())
-        .collect::<Vec<_>>();
-        access_outcomes.sort();
-        assert_eq!(
-            access_outcomes,
-            ["inactive", "retrieved", "retrieved", "unavailable"]
-        );
+        let plaintext: Option<String> =
+            sqlx::query_scalar("SELECT secret_plaintext FROM key_credentials WHERE key_id = $1")
+                .bind(issued.key_id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert!(plaintext.is_none());
     }
 
     #[tokio::test]
@@ -1703,7 +1518,7 @@ mod tests {
         assert_eq!(authenticated.policy.requests_per_minute, 60);
         assert_eq!(
             database
-                .copy_key_credential(issued.key_id, pepper, None, None, true)
+                .copy_key_credential(issued.key_id, pepper, None, true)
                 .await
                 .unwrap()
                 .key,

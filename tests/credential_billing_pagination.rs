@@ -848,7 +848,7 @@ async fn exercise_credential_deletion(state: &AppState) {
     let (status, _) = json_request(
         state,
         "POST",
-        &format!("/internal/v1/keys/{key_id}/credential-recovery/copy"),
+        &format!("/internal/v1/keys/{key_id}/copy"),
         BOOTSTRAP_TOKEN,
         None,
         None,

@@ -149,7 +149,7 @@ impl Database {
         }
         if status == "revoked" {
             sqlx::query(
-                "UPDATE service_credentials SET revoked_at = $1 WHERE service_principal_id = $2 AND revoked_at IS NULL",
+                "UPDATE service_credentials SET revoked_at = $1, secret_plaintext = NULL WHERE service_principal_id = $2 AND revoked_at IS NULL",
             )
             .bind(unix_millis())
             .bind(service_id.to_string())
@@ -267,7 +267,7 @@ impl Database {
         let name: String = row.try_get("name")?;
         let issued = crypto::issue_service_credential(service_id, pepper);
         sqlx::query(
-            "UPDATE service_credentials SET revoked_at = $1 WHERE service_principal_id = $2 AND revoked_at IS NULL",
+            "UPDATE service_credentials SET revoked_at = $1, secret_plaintext = NULL WHERE service_principal_id = $2 AND revoked_at IS NULL",
         )
         .bind(now)
         .bind(service_id.to_string())
@@ -325,9 +325,10 @@ impl Database {
     pub async fn copy_service_token(
         &self,
         service_id: Uuid,
-    ) -> Result<RecoveredServiceCredential, AppError> {
+        pepper: &[u8],
+    ) -> Result<CopiedServiceCredential, AppError> {
         let row = sqlx::query(
-            "SELECT p.status, p.credential_generation, c.secret_plaintext FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
+            "SELECT p.status, p.credential_generation, c.secret_hash, c.secret_plaintext FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
         )
         .bind(service_id.to_string())
         .fetch_optional(&self.pool)
@@ -338,7 +339,11 @@ impl Database {
         }
         let token: Option<String> = row.try_get("secret_plaintext")?;
         let token = token.ok_or(AppError::NotFound)?;
-        Ok(RecoveredServiceCredential {
+        let expected: Vec<u8> = row.try_get("secret_hash")?;
+        if !crypto::verify_credential(&token, pepper, &expected) {
+            return Err(AppError::Internal);
+        }
+        Ok(CopiedServiceCredential {
             service_id,
             credential_generation: row.try_get("credential_generation")?,
             token,
@@ -438,6 +443,62 @@ pub(crate) fn validate_service_scopes(scopes: &[String]) -> Result<(), AppError>
 mod tests {
     use super::super::super::*;
     use super::SUPPORTED_SERVICE_SCOPES;
+
+    #[tokio::test]
+    async fn service_copy_verifies_the_stored_original_and_active_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("service-copy.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"service copy test pepper longer than thirty-two bytes";
+        let issued = database
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: "copy-test".into(),
+                    scopes: vec!["keys:write".into()],
+                    tenant_external_id: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let copied = database
+            .copy_service_token(issued.service_id, pepper)
+            .await
+            .unwrap();
+        assert!(copied.token == issued.token);
+        assert_eq!(copied.credential_generation, 1);
+        assert!(matches!(
+            database
+                .copy_service_token(issued.service_id, b"wrong pepper")
+                .await,
+            Err(AppError::Internal)
+        ));
+        sqlx::query("UPDATE service_credentials SET secret_plaintext = 'incorrect-original-value' WHERE service_principal_id = $1")
+            .bind(issued.service_id.to_string()).execute(&database.pool).await.unwrap();
+        assert!(matches!(
+            database.copy_service_token(issued.service_id, pepper).await,
+            Err(AppError::Internal)
+        ));
+        sqlx::query("UPDATE service_credentials SET secret_plaintext = NULL WHERE service_principal_id = $1")
+            .bind(issued.service_id.to_string()).execute(&database.pool).await.unwrap();
+        assert!(matches!(
+            database.copy_service_token(issued.service_id, pepper).await,
+            Err(AppError::NotFound)
+        ));
+        database
+            .set_service_token_status(issued.service_id, "revoked")
+            .await
+            .unwrap();
+        assert!(matches!(
+            database.copy_service_token(issued.service_id, pepper).await,
+            Err(AppError::NotFound)
+        ));
+    }
 
     #[test]
     fn managed_service_scope_allowlist_matches_the_public_json_schema() {

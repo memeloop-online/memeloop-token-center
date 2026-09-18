@@ -178,7 +178,7 @@ async fn run() -> Result<(), &'static str> {
             .await
             .map_err(|_| "database_connect_failed")?;
             database
-                .migrate()
+                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
                 .await
                 .map_err(|_| "database_migration_failed")?;
             info!("database schema is current");

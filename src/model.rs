@@ -227,7 +227,7 @@ pub struct IssuedKey {
 /// A credential that an explicitly authorized management caller requested to
 /// copy. This is never included in a list or self-service representation.
 #[derive(Serialize)]
-pub struct RecoveredClientCredential {
+pub struct CopiedClientCredential {
     pub key_id: Uuid,
     pub credential_generation: i64,
     pub key: String,
@@ -236,7 +236,7 @@ pub struct RecoveredClientCredential {
 /// A service credential that an explicitly authorized global management caller
 /// requested to copy. This is never included in service-token lists.
 #[derive(Serialize)]
-pub struct RecoveredServiceCredential {
+pub struct CopiedServiceCredential {
     pub service_id: Uuid,
     pub credential_generation: i64,
     pub token: String,
@@ -312,7 +312,7 @@ pub struct ManagedKeyView {
     pub archived_at: Option<i64>,
     pub credential_generation: i64,
     pub fingerprint: Option<String>,
-    pub credential_recovery_available: bool,
+    pub credential_copy_available: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub policy: KeyPolicy,

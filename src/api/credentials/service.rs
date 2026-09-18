@@ -87,7 +87,13 @@ pub(in crate::api) async fn copy_service_token(
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "service_tokens:write").await?;
     require_global_service(&service)?;
-    let mut response = Json(state.db.copy_service_token(service_id).await?).into_response();
+    let mut response = Json(
+        state
+            .db
+            .copy_service_token(service_id, state.config.key_pepper.as_bytes())
+            .await?,
+    )
+    .into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
