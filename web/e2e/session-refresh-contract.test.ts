@@ -198,6 +198,25 @@ test('incremental summaries replace and reorder only affected rows when first-pa
   assert.equal(merged.sessions[1], current[0], 'an unaffected row retains its exact object identity');
 });
 
+test('incremental summaries use the backend UTF-8 cursor order for equal timestamps', () => {
+  const current = [
+    { key_id: 'key-a', session_id: '中', last_activity_at: 300, requests: 1 },
+    { key_id: 'key-a', session_id: 'a', last_activity_at: 300, requests: 1 },
+  ];
+  const updated = { ...current[1], requests: 2 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [updated],
+    requested: [updated],
+    firstPageSize: 2,
+    firstPageLimit: 50,
+    hasMore: false,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id), ['中', 'a'],
+    'UTF-8 byte ordering must match the PostgreSQL cursor rather than browser locale collation');
+});
+
 test('incremental summaries reload only when an affected identity can change first-page membership', () => {
   const current = [
     { key_id: 'key-a', session_id: 'session-a', last_activity_at: 300 },
@@ -224,6 +243,16 @@ test('incremental summaries reload only when an affected identity can change fir
   });
   assert.equal(ignored.requiresFullReload, false);
   assert.deepEqual(ignored.sessions, current, 'an identity remaining below the page boundary does not disturb the list');
+
+  assert.equal(mergeIncrementalSessionSummaries({
+    current,
+    updates: [oldInvisible],
+    requested: [oldInvisible],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    hasMore: false,
+  }).requiresFullReload, true,
+    'an unseen row after an exhaustive full page needs a new cursor-bearing snapshot');
 
   assert.equal(mergeIncrementalSessionSummaries({
     current,

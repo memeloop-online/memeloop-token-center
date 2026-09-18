@@ -50,8 +50,9 @@ struct SessionAccumulator {
 }
 
 // A request can finish without an upstream HTTP status (for example a local
-// cancellation or transport failure). `completed_at`, rather than that
-// optional status, is therefore the authoritative active/terminal boundary.
+// cancellation or transport failure). `completed_at` therefore closes the
+// active predicate as well as the status check; retaining the status check
+// also lets PostgreSQL use the existing active-session partial index.
 //
 // The default first page is the latency-sensitive Sessions entry point.  Each
 // source below first produces one row per logical session, then contributes at
@@ -82,6 +83,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              FROM request_records request
             WHERE request.tenant_id = $1
               AND ($2 = '' OR request.key_id = $2)
+              AND request.status_code IS NULL
               AND request.completed_at IS NULL
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
@@ -147,6 +149,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
               AND request.key_id = recent.key_id
               AND COALESCE(request.conversation_cluster_id,
                       'unlinked:' || request.key_id) = recent.session_id
+              AND request.status_code IS NULL
               AND request.completed_at IS NULL
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
@@ -511,6 +514,7 @@ impl Database {
                      FROM request_records request
                     WHERE request.tenant_id = $1
                       AND ($2 = '' OR request.key_id = $2)
+                      AND request.status_code IS NULL
                       AND request.completed_at IS NULL
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
@@ -583,6 +587,7 @@ impl Database {
                                  AND model_active.key_id = ranked.key_id
                                  AND COALESCE(model_active.conversation_cluster_id,
                                      'unlinked:' || model_active.key_id) = ranked.session_id
+                                 AND model_active.status_code IS NULL
                                  AND model_active.completed_at IS NULL
                                  AND model_active.model = $7)
                            OR EXISTS (
@@ -823,6 +828,7 @@ impl Database {
                       AND request.key_id = requested.key_id
                       AND COALESCE(request.conversation_cluster_id,
                               'unlinked:' || request.key_id) = requested.session_id
+                      AND request.status_code IS NULL
                       AND request.completed_at IS NULL
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
@@ -887,7 +893,7 @@ impl Database {
         let query_parameter = state_parameter + 2;
         write!(
             statement,
-            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
+            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.status_code IS NULL AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
             format_args!("${state_parameter}"),
             format_args!("${model_parameter}"),
             format_args!("${query_parameter}"),

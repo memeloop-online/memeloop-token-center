@@ -93,10 +93,23 @@ export function sessionSummaryTargets(eventIdentities: ReadonlySet<string>) {
   };
 }
 
+function compareUtf8(left: string, right: string) {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
+// PostgreSQL orders the cursor's text columns bytewise under the deployment's
+// C.UTF-8 collation. Do not use localeCompare here: a locale-dependent merge
+// can silently put a refreshed session on the wrong side of that cursor.
 function compareSessionOrder(left: SessionIdentity & { last_activity_at: number }, right: SessionIdentity & { last_activity_at: number }) {
   return right.last_activity_at - left.last_activity_at
-    || right.session_id.localeCompare(left.session_id)
-    || right.key_id.localeCompare(left.key_id);
+    || compareUtf8(right.session_id, left.session_id)
+    || compareUtf8(right.key_id, left.key_id);
 }
 
 export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { last_activity_at: number }>({
@@ -124,7 +137,10 @@ export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { l
   for (const update of updates) {
     const index = currentIndex.get(sessionIdentityKey(update));
     if (index === undefined) {
-      if (firstPageSize < firstPageLimit || !boundary || compareSessionOrder(update, boundary) < 0) {
+      // A full first page without a next cursor was previously exhaustive. An
+      // unseen row, even one after the old boundary, must rebuild that page so
+      // it cannot become a permanently inaccessible fifty-first item.
+      if (firstPageSize < firstPageLimit || !hasMore || !boundary || compareSessionOrder(update, boundary) < 0) {
         return { sessions: current, requiresFullReload: true };
       }
       continue;
