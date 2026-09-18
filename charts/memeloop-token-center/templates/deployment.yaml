@@ -42,6 +42,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+  annotations:
+    # Worker joins ServiceAccount/PVC creation in wave 0. Argo waits for it
+    # before applying split-role producers, including on a fresh installation.
+    argocd.argoproj.io/sync-wave: {{ ternary "1" "0" (or (eq $role "gateway") (eq $role "control")) | quote }}
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
@@ -94,7 +98,7 @@ spec:
       initContainers:
         {{- if $.Values.plugins.runtimeInventory.enabled }}
         - name: prepare-plugin-inventory
-          image: {{ include "memeloop-token-center.image" $ | quote }}
+          image: {{ include "memeloop-token-center.roleImage" (dict "root" $ "role" $role) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args:
             - prepare-plugin-inventory
@@ -166,7 +170,7 @@ spec:
       {{- end }}
       containers:
         - name: token-center
-          image: {{ include "memeloop-token-center.image" $ | quote }}
+          image: {{ include "memeloop-token-center.roleImage" (dict "root" $ "role" $role) | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args: ["serve", "--role", {{ $role | quote }}]
           ports:

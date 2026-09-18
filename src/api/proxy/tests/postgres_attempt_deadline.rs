@@ -145,7 +145,7 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pg_stat_activity
                  WHERE application_name = $1 AND wait_event_type = 'Lock'
-                   AND query LIKE 'SELECT cipher_bytes%FROM response_archive_spool_budget%FOR UPDATE%'",
+                   AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
             )
             .bind(&application_name)
             .fetch_one(&admin)

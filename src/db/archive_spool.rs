@@ -1,10 +1,12 @@
-//! Bounded encrypted spool. Buffered lifecycle transactions serialize
-//! budget-first; streaming append and GC take request-local spool rows first
-//! and update the budget only at the transaction tail. All paths acquire the
-//! global event cursor after the budget. No transaction encompasses object I/O.
+//! Bounded encrypted spool. Buffered lifecycle transactions use durable private
+//! reservations; streaming append and GC update the global counter only at
+//! their transaction tail. No global budget lock spans account/session work or
+//! buffered compression. No transaction encompasses object I/O.
 use crate::response_archive_spool::BufferedArchivePurpose;
 mod hold_diagnostics;
+mod reservations;
 pub(crate) use hold_diagnostics::BudgetHold;
+pub(crate) use reservations::ArchiveBudgetReservation;
 
 use std::time::{Duration, Instant};
 
@@ -177,12 +179,31 @@ impl Database {
     /// Captures a large body without retaining its amplified ciphertext in
     /// memory. Per-chunk nonces live in `archive`, so a transaction retry after
     /// an unknown COMMIT acknowledgement regenerates identical ciphertext.
+    #[cfg(test)]
     pub(super) async fn capture_buffered_archive_body_in_transaction(
         &self,
         tx: &mut Transaction<'_, Any>,
         now: i64,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
         prepared_first_batch: Option<crate::response_archive_spool::PreparedArchiveBatch>,
+    ) -> Result<bool, AppError> {
+        self.capture_reserved_buffered_archive_body_in_transaction(
+            tx,
+            now,
+            archive,
+            prepared_first_batch,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn capture_reserved_buffered_archive_body_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        now: i64,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+        prepared_first_batch: Option<crate::response_archive_spool::PreparedArchiveBatch>,
+        reservation: Option<&ArchiveBudgetReservation>,
     ) -> Result<bool, AppError> {
         let identity = archive.identity();
         let purpose = archive.purpose();
@@ -262,9 +283,12 @@ impl Database {
             }
             return Ok(true);
         }
-        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-            .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?;
-        if budget.rows_affected() != 1 {
+        let reserved = match reservation {
+            Some(reservation) => reservation.consume(tx, identity, purpose, accounted).await?,
+            None => sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
+                .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?.rows_affected() == 1,
+        };
+        if !reserved {
             return Ok(false);
         }
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, next_attempt_at, created_at, updated_at, expires_at) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $7, $7, $8)")))
@@ -314,15 +338,19 @@ impl Database {
             if spool.rows_affected() != 1 {
                 return Err(AppError::Internal);
             }
-            let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
-                purpose,
-                "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1 AND cipher_bytes >= $1",
-            )))
-            .bind(refund)
-            .execute(&mut **tx)
-            .await?;
-            if budget.rows_affected() != 1 {
-                return Err(AppError::Internal);
+            if let Some(reservation) = reservation {
+                reservation.refund_in_transaction(tx, refund).await?;
+            } else {
+                let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+                    purpose,
+                    "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1 AND cipher_bytes >= $1",
+                )))
+                .bind(refund)
+                .execute(&mut **tx)
+                .await?;
+                if budget.rows_affected() != 1 {
+                    return Err(AppError::Internal);
+                }
             }
         }
         Ok(true)
@@ -941,6 +969,7 @@ impl Database {
             // its COMMIT/rollback protocol before that connection is reused.
             let db = self.clone();
             let batch = tokio::spawn(async move {
+                let recovered = db.cleanup_expired_archive_budget_reservation().await?;
                 let first = if index % 2 == 0 {
                     BufferedArchivePurpose::Response
                 } else {
@@ -952,8 +981,11 @@ impl Database {
                     BufferedArchivePurpose::Response
                 };
                 match db.cleanup_archive_spool_batch(first).await? {
-                    Some(result) => Ok(Some(result)),
-                    None => db.cleanup_archive_spool_batch(second).await,
+                    Some(result) => Ok::<_, AppError>(Some(result)),
+                    None => Ok(db
+                        .cleanup_archive_spool_batch(second)
+                        .await?
+                        .or(recovered.then_some(false))),
                 }
             })
             .await
@@ -1140,6 +1172,7 @@ impl Database {
         Ok((tx, now))
     }
 
+    #[cfg(test)]
     pub(super) async fn tracked_spool_transaction(
         &self,
         operation: &'static str,

@@ -33,6 +33,9 @@ serviceAccount:
   annotations: {}
 
 roles:
+  # Each role accepts image: {repository: ..., digest: sha256:...}.
+  # Pin the installed v106+ worker when rolling gateway/control back; retire it
+  # only after scripts/deploy/archive-budget-rollout.ts approves live evidence.
   gateway:
     enabled: true
     replicaCount: 2

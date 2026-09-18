@@ -104,7 +104,7 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
     );
 
     // Pause a real insert, not a scheduler delay. An unrelated tenant must
-    // publish an event while this admission still holds the archive budget.
+    // publish an event while this admission owns only private capacity.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION pause_request_chunk() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN PERFORM pg_advisory_xact_lock({}); RETURN NEW; END $body$;
          CREATE TRIGGER pause_request_chunk BEFORE INSERT ON request_archive_spool_chunks FOR EACH ROW EXECUTE FUNCTION pause_request_chunk();",
@@ -122,7 +122,7 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'SELECT cipher_bytes%FROM response_archive_spool_budget%FOR UPDATE%'",
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
             )
             .bind(&fixture.schema)
             .fetch_one(&fixture.admin)
@@ -135,7 +135,7 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
         }
     })
     .await
-    .expect("admission must wait at the original budget-first boundary");
+    .expect("admission must reserve capacity before starting request work");
     budget_holder.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -147,6 +147,18 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
             tokio::task::yield_now().await;
         }
     }).await.expect("admission must reach the real chunk insert barrier");
+    let mut available_budget = fixture.db.pool.begin().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query(
+            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
+        )
+        .execute(&mut *available_budget),
+    )
+    .await
+    .expect("real buffered admission must release the shared budget before chunk insertion")
+    .unwrap();
+    available_budget.rollback().await.unwrap();
     let mut other_tenant = fixture.db.pool.begin().await.unwrap();
     let other_request = Uuid::new_v4().to_string();
     let other_tenant_id = Uuid::new_v4().to_string();
@@ -612,7 +624,13 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         .unwrap();
         assert_eq!(count, 0);
     }
-    assert_eq!(budget(db).await, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget(db).await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed admission must return its independently reserved capacity");
     sqlx::query("DROP TRIGGER reject_admission_chunk ON request_archive_spool_chunks")
         .execute(&db.pool)
         .await
@@ -816,6 +834,12 @@ impl PgFixture {
             .unwrap();
             sqlx::raw_sql(include_str!(
                 "../../../migrations/common/0080_request_archive_spool.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0106_archive_budget_reservations.sql"
             ))
             .execute(&db.pool)
             .await
@@ -1366,3 +1390,5 @@ async fn postgres_complete_cancelled_inside_commit_keeps_atomic_binding() {
 
 #[path = "postgres_load_tests.rs"]
 mod postgres_load_tests;
+#[path = "postgres_reservation_tests.rs"]
+mod postgres_reservation_tests;

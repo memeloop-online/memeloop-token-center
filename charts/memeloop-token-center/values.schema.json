@@ -1009,6 +1009,16 @@
       "additionalProperties": false,
       "required": ["enabled", "replicaCount", "service", "resources", "autoscaling", "podDisruptionBudget"],
       "properties": {
+        "image": {
+          "description": "Immutable per-role image pin; retain the worker image during a gateway/control rollback.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "digest"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          }
+        },
         "enabled": { "type": "boolean" },
         "replicaCount": { "type": "integer", "minimum": 0 },
         "service": { "$ref": "#/definitions/service" },

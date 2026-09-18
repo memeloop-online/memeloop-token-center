@@ -773,7 +773,7 @@ jobs:
       - name: Lint, render, reject invalid values, and validate Kubernetes resources
         env:
           KUBECONFORM_BIN: /tmp/kubeconform
-        run: node --test tests/ops/helm-packaging-contract.test.ts
+        run: node --test tests/ops/helm-packaging-contract.test.ts tests/ops/archive-budget-rollout.test.ts
       - name: Validate release workflow and Docker build contracts
         run: node --test tests/ops/release-packaging-contract.test.ts
       - name: Validate fail-closed BuildKit attestation verification

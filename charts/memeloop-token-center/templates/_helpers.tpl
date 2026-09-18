@@ -33,6 +33,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{- define "memeloop-token-center.roleImage" -}}
+{{- $role := index .root.Values.roles .role -}}
+{{- if $role.image -}}
+{{- printf "%s@%s" $role.image.repository $role.image.digest -}}
+{{- else -}}
+{{- include "memeloop-token-center.image" .root -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "memeloop-token-center.env" -}}
 - name: MTC_DATABASE_URL
   valueFrom:
