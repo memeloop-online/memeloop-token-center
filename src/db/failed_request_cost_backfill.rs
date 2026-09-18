@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::*;
 
 pub const FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE: i64 = 1_000;
+pub const FAILED_REQUEST_COST_CORRECTION_VERSION: &str = "failed-request-projection-cost-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FailedRequestCostBackfillCursor {
@@ -14,16 +15,28 @@ pub struct FailedRequestCostBackfillCursor {
 pub struct FailedRequestCostBackfillInput {
     pub apply: bool,
     pub batch_size: i64,
+    pub from_created_at: i64,
+    pub to_created_at: i64,
     pub after: Option<FailedRequestCostBackfillCursor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FailedRequestCostBackfillReport {
+    pub correction_version: &'static str,
     pub applied: bool,
     pub candidate_rows: u64,
     pub changed_rows: u64,
     pub candidate_cost_micros: i64,
     pub changed_cost_micros: i64,
+    pub candidate_corrected_cost_micros: i64,
+    pub candidate_cost_delta_micros: i64,
+    pub changed_cost_delta_micros: i64,
+    pub candidate_cost_reduction_micros: i64,
+    pub affected_request_daily_dimensions: u64,
+    pub affected_usage_daily_dimensions: u64,
+    pub affected_usage_analysis_hourly_dimensions: u64,
+    pub affected_usage_analysis_daily_dimensions: u64,
+    pub affected_session_projections: u64,
     pub request_daily_dimensions_rebuilt: u64,
     pub usage_daily_dimensions_rebuilt: u64,
     pub usage_analysis_hourly_dimensions_rebuilt: u64,
@@ -31,6 +44,19 @@ pub struct FailedRequestCostBackfillReport {
     pub session_projections_rebuilt: u64,
     pub has_more: bool,
     pub next_cursor: Option<FailedRequestCostBackfillCursor>,
+    pub candidates: Vec<FailedRequestCostCorrectionPreview>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FailedRequestCostCorrectionPreview {
+    pub request_id: String,
+    pub created_at: i64,
+    pub status_code: i64,
+    pub error_code: String,
+    pub usage_basis: Option<String>,
+    pub evidence_kind: String,
+    pub original_cost_micros: i64,
+    pub corrected_cost_micros: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +75,14 @@ struct Candidate {
     currency: String,
     session_id: String,
     cost_micros: i64,
+    request_cost_micros: i64,
+    corrected_cost_micros: i64,
+    status_code: i64,
+    usage_basis: Option<String>,
+    evidence_kind: String,
+    reservation_id: String,
+    reservation_reserved_micros: i64,
+    reservation_actual_micros: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -113,6 +147,20 @@ impl Database {
                 "batch size must be between 1 and {FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE}"
             )));
         }
+        if input.from_created_at < 0 || input.to_created_at <= input.from_created_at {
+            return Err(AppError::BadRequest(
+                "backfill requires a non-negative, non-empty created_at interval".into(),
+            ));
+        }
+        if input
+            .after
+            .as_ref()
+            .is_some_and(|cursor| cursor.created_at < input.from_created_at)
+        {
+            return Err(AppError::BadRequest(
+                "backfill cursor precedes the requested interval".into(),
+            ));
+        }
         if input
             .after
             .as_ref()
@@ -126,6 +174,8 @@ impl Database {
         if !input.apply {
             let candidates = select_candidates_from_pool(
                 &self.pool,
+                input.from_created_at,
+                input.to_created_at,
                 input.after.as_ref(),
                 input.batch_size.saturating_add(1),
             )
@@ -139,6 +189,8 @@ impl Database {
         let candidates = select_candidates(
             &mut transaction,
             self.backend,
+            input.from_created_at,
+            input.to_created_at,
             input.after.as_ref(),
             input.batch_size.saturating_add(1),
         )
@@ -149,22 +201,63 @@ impl Database {
             return Ok(report);
         }
 
+        let applied_at = unix_millis();
         let mut changed = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let result = sqlx::query(
-                "UPDATE request_stats_facts SET cost_micros = 0 WHERE request_id = $1 AND cost_micros = $2",
+            let inserted = sqlx::query(
+                r#"INSERT INTO request_cost_projection_corrections (
+                       correction_version, request_id, request_created_at, evidence_kind,
+                       observed_status_code, observed_error_code, observed_usage_basis,
+                       reservation_id, reservation_reserved_micros, reservation_actual_micros,
+                       original_request_cost_micros, original_fact_cost_micros,
+                       corrected_fact_cost_micros, applied_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                   ON CONFLICT (correction_version, request_id) DO NOTHING"#,
             )
+            .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+            .bind(&candidate.request_id)
+            .bind(candidate.created_at)
+            .bind(&candidate.evidence_kind)
+            .bind(candidate.status_code)
+            .bind(&candidate.error_code)
+            .bind(&candidate.usage_basis)
+            .bind(&candidate.reservation_id)
+            .bind(candidate.reservation_reserved_micros)
+            .bind(candidate.reservation_actual_micros)
+            .bind(candidate.request_cost_micros)
+            .bind(candidate.cost_micros)
+            .bind(candidate.corrected_cost_micros)
+            .bind(applied_at)
+            .execute(&mut *transaction)
+            .await?;
+            if inserted.rows_affected() == 0 {
+                continue;
+            }
+            let updated = sqlx::query(
+                "UPDATE request_stats_facts SET cost_micros = $1 WHERE request_id = $2 AND cost_micros = $3",
+            )
+            .bind(candidate.corrected_cost_micros)
             .bind(&candidate.request_id)
             .bind(candidate.cost_micros)
             .execute(&mut *transaction)
             .await?;
-            if result.rows_affected() == 1 {
-                report.changed_rows += 1;
-                report.changed_cost_micros = report
-                    .changed_cost_micros
-                    .saturating_add(candidate.cost_micros);
-                changed.push(candidate);
+            if updated.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "historical request cost changed while correction was being applied".into(),
+                ));
             }
+            report.changed_rows += 1;
+            report.changed_cost_micros = report.changed_cost_micros.saturating_add(
+                candidate
+                    .cost_micros
+                    .saturating_sub(candidate.corrected_cost_micros),
+            );
+            report.changed_cost_delta_micros = report.changed_cost_delta_micros.saturating_add(
+                candidate
+                    .corrected_cost_micros
+                    .saturating_sub(candidate.cost_micros),
+            );
+            changed.push(candidate);
         }
 
         let usage_daily_keys = changed
@@ -252,12 +345,60 @@ fn prepare_batch(
     let candidate_cost_micros = candidates
         .iter()
         .fold(0_i64, |total, row| total.saturating_add(row.cost_micros));
+    let candidate_corrected_cost_micros = candidates.iter().fold(0_i64, |total, row| {
+        total.saturating_add(row.corrected_cost_micros)
+    });
+    let usage_daily_keys = candidates
+        .iter()
+        .map(UsageDailyKey::from)
+        .collect::<HashSet<_>>();
+    let request_daily_keys = candidates
+        .iter()
+        .map(RequestDailyKey::from)
+        .collect::<HashSet<_>>();
+    let hourly_keys = candidates
+        .iter()
+        .map(|candidate| AnalysisKey::from_candidate(candidate, 3_600_000))
+        .collect::<HashSet<_>>();
+    let daily_keys = candidates
+        .iter()
+        .map(|candidate| AnalysisKey::from_candidate(candidate, 86_400_000))
+        .collect::<HashSet<_>>();
+    let session_keys = candidates
+        .iter()
+        .map(SessionKey::from)
+        .collect::<HashSet<_>>();
+    let previews = candidates
+        .iter()
+        .map(|candidate| FailedRequestCostCorrectionPreview {
+            request_id: candidate.request_id.clone(),
+            created_at: candidate.created_at,
+            status_code: candidate.status_code,
+            error_code: candidate.error_code.clone(),
+            usage_basis: candidate.usage_basis.clone(),
+            evidence_kind: candidate.evidence_kind.clone(),
+            original_cost_micros: candidate.cost_micros,
+            corrected_cost_micros: candidate.corrected_cost_micros,
+        })
+        .collect();
     let report = FailedRequestCostBackfillReport {
+        correction_version: FAILED_REQUEST_COST_CORRECTION_VERSION,
         applied,
         candidate_rows: candidates.len() as u64,
         changed_rows: 0,
         candidate_cost_micros,
         changed_cost_micros: 0,
+        candidate_corrected_cost_micros,
+        candidate_cost_delta_micros: candidate_corrected_cost_micros
+            .saturating_sub(candidate_cost_micros),
+        changed_cost_delta_micros: 0,
+        candidate_cost_reduction_micros: candidate_cost_micros
+            .saturating_sub(candidate_corrected_cost_micros),
+        affected_request_daily_dimensions: request_daily_keys.len() as u64,
+        affected_usage_daily_dimensions: usage_daily_keys.len() as u64,
+        affected_usage_analysis_hourly_dimensions: hourly_keys.len() as u64,
+        affected_usage_analysis_daily_dimensions: daily_keys.len() as u64,
+        affected_session_projections: session_keys.len() as u64,
         request_daily_dimensions_rebuilt: 0,
         usage_daily_dimensions_rebuilt: 0,
         usage_analysis_hourly_dimensions_rebuilt: 0,
@@ -265,6 +406,7 @@ fn prepare_batch(
         session_projections_rebuilt: 0,
         has_more,
         next_cursor,
+        candidates: previews,
     };
     (candidates, report)
 }
@@ -273,32 +415,67 @@ fn candidate_statement(lock: &str) -> String {
     format!(
         r#"SELECT f.request_id, f.tenant_id, f.key_id, f.created_at, f.model, f.protocol,
                   f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
-                  f.service_tier, f.currency, f.session_id, f.cost_micros
+                  f.service_tier, f.currency, f.session_id, f.cost_micros,
+                  r.cost_micros AS request_cost_micros, r.status_code, r.usage_basis,
+                  r.reservation_id, u.reserved_micros AS reservation_reserved_micros,
+                  u.actual_micros AS reservation_actual_micros,
+                  CASE WHEN r.usage_basis = 'provider_reported'
+                       THEN 'provider_reported'
+                       ELSE 'reservation_ceiling_without_usage' END AS evidence_kind,
+                  CASE WHEN r.usage_basis = 'provider_reported'
+                       THEN r.cost_micros ELSE 0 END AS corrected_cost_micros
              FROM request_stats_facts f
              JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at
-            WHERE f.cost_micros <> 0
+             JOIN usage_reservations u ON u.id = r.reservation_id
+             LEFT JOIN request_cost_projection_corrections correction
+               ON correction.correction_version = $5
+              AND correction.request_id = f.request_id
+            WHERE f.created_at >= $1 AND f.created_at < $2
               AND r.completed_at IS NOT NULL AND r.status_code IS NOT NULL
               AND ((r.status_code < 200 OR r.status_code >= 400)
                    OR COALESCE(r.error_code, '') <> '')
-              AND COALESCE(r.usage_basis, '') <> 'provider_reported'
-              AND (f.created_at > $1 OR (f.created_at = $1 AND f.request_id > $2))
+              AND correction.request_id IS NULL
+              AND (
+                    (r.usage_basis = 'provider_reported'
+                     AND f.cost_micros <> r.cost_micros
+                     AND u.status = 'settled'
+                     AND u.actual_micros = r.cost_micros)
+                    OR
+                    (COALESCE(r.usage_basis, '') IN ('', 'not_observed', 'contract_ceiling')
+                     AND f.cost_micros <> 0
+                     AND f.cost_micros = r.cost_micros
+                     AND u.status = 'settled'
+                     AND u.actual_micros = r.cost_micros
+                     AND u.reserved_micros = r.cost_micros
+                     AND u.reserved_tokens = r.input_tokens + r.output_tokens)
+                  )
+              AND (f.created_at > $3 OR (f.created_at = $3 AND f.request_id > $4))
             ORDER BY f.created_at ASC, f.request_id ASC
-            LIMIT $3{lock}"#
+            LIMIT $6{lock}"#
     )
 }
 
 async fn select_candidates_from_pool(
     pool: &AnyPool,
+    from_created_at: i64,
+    to_created_at: i64,
     after: Option<&FailedRequestCostBackfillCursor>,
     limit: i64,
 ) -> Result<Vec<Candidate>, AppError> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement("")))
-        .bind(after.map(|cursor| cursor.created_at).unwrap_or(i64::MIN))
+        .bind(from_created_at)
+        .bind(to_created_at)
+        .bind(
+            after
+                .map(|cursor| cursor.created_at)
+                .unwrap_or(from_created_at.saturating_sub(1)),
+        )
         .bind(
             after
                 .map(|cursor| cursor.request_id.as_str())
                 .unwrap_or_default(),
         )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
         .bind(limit)
         .fetch_all(pool)
         .await?;
@@ -308,6 +485,8 @@ async fn select_candidates_from_pool(
 async fn select_candidates(
     tx: &mut Transaction<'_, Any>,
     backend: DatabaseBackend,
+    from_created_at: i64,
+    to_created_at: i64,
     after: Option<&FailedRequestCostBackfillCursor>,
     limit: i64,
 ) -> Result<Vec<Candidate>, AppError> {
@@ -316,12 +495,19 @@ async fn select_candidates(
         DatabaseBackend::Sqlite => "",
     };
     let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement(lock)))
-        .bind(after.map(|cursor| cursor.created_at).unwrap_or(i64::MIN))
+        .bind(from_created_at)
+        .bind(to_created_at)
+        .bind(
+            after
+                .map(|cursor| cursor.created_at)
+                .unwrap_or(from_created_at.saturating_sub(1)),
+        )
         .bind(
             after
                 .map(|cursor| cursor.request_id.as_str())
                 .unwrap_or_default(),
         )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
         .bind(limit)
         .fetch_all(&mut **tx)
         .await?;
@@ -346,6 +532,14 @@ fn candidates_from_rows(rows: Vec<sqlx::any::AnyRow>) -> Result<Vec<Candidate>, 
                 currency: row.try_get("currency")?,
                 session_id: row.try_get("session_id")?,
                 cost_micros: row.try_get("cost_micros")?,
+                request_cost_micros: row.try_get("request_cost_micros")?,
+                corrected_cost_micros: row.try_get("corrected_cost_micros")?,
+                status_code: row.try_get("status_code")?,
+                usage_basis: row.try_get("usage_basis")?,
+                evidence_kind: row.try_get("evidence_kind")?,
+                reservation_id: row.try_get("reservation_id")?,
+                reservation_reserved_micros: row.try_get("reservation_reserved_micros")?,
+                reservation_actual_micros: row.try_get("reservation_actual_micros")?,
             })
         })
         .collect()
@@ -710,8 +904,8 @@ mod tests {
                 status_code,
                 duration_ms: 25,
                 usage: TokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 3,
+                    input_tokens: 10,
+                    output_tokens: 10,
                     ..TokenUsage::default()
                 },
                 error_code,
@@ -814,12 +1008,18 @@ mod tests {
         let mut corrected = Vec::new();
         for (status, error, usage_basis) in [
             (499, None, Some(RequestUsageBasis::NotObserved)),
-            (502, None, Some(RequestUsageBasis::ProviderEstimated)),
             (503, None, Some(RequestUsageBasis::ContractCeiling)),
             (200, Some("upstream_incomplete_response"), None),
         ] {
             corrected.push(seed_historical_case(fixture, status, error, usage_basis).await);
         }
+        let provider_estimated = seed_historical_case(
+            fixture,
+            502,
+            None,
+            Some(RequestUsageBasis::ProviderEstimated),
+        )
+        .await;
         let provider_reported = seed_historical_case(
             fixture,
             503,
@@ -837,13 +1037,25 @@ mod tests {
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: false,
                 batch_size: 100,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
                 after: None,
             })
             .await
             .unwrap();
-        assert_eq!(dry_run.candidate_rows, 4);
+        assert_eq!(dry_run.candidate_rows, 3);
         assert_eq!(dry_run.changed_rows, 0);
         assert!(!dry_run.applied);
+        assert_eq!(dry_run.candidate_corrected_cost_micros, 0);
+        assert_eq!(
+            dry_run.candidate_cost_delta_micros,
+            -dry_run.candidate_cost_micros
+        );
+        assert_eq!(
+            dry_run.candidate_cost_reduction_micros,
+            dry_run.candidate_cost_micros
+        );
+        assert_eq!(dry_run.candidates.len(), 3);
         assert_eq!(immutable_snapshot(fixture).await, immutable_before);
         assert_eq!(aggregate_costs(fixture).await, aggregates_before);
 
@@ -852,6 +1064,8 @@ mod tests {
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: true,
                 batch_size: 2,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
                 after: None,
             })
             .await
@@ -864,12 +1078,14 @@ mod tests {
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: true,
                 batch_size: 2,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
                 after: first.next_cursor.clone(),
             })
             .await
             .unwrap();
-        assert_eq!(second.candidate_rows, 2);
-        assert_eq!(second.changed_rows, 2);
+        assert_eq!(second.candidate_rows, 1);
+        assert_eq!(second.changed_rows, 1);
         assert!(!second.has_more);
 
         let replay = fixture
@@ -877,6 +1093,8 @@ mod tests {
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: true,
                 batch_size: 100,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
                 after: None,
             })
             .await
@@ -884,6 +1102,22 @@ mod tests {
         assert_eq!(replay.candidate_rows, 0);
         assert_eq!(replay.changed_rows, 0);
         assert_eq!(immutable_snapshot(fixture).await, immutable_before);
+        let correction_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_cost_projection_corrections WHERE correction_version = $1",
+        )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(correction_rows, 3);
+        let zeroed_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_cost_projection_corrections WHERE correction_version = $1 AND evidence_kind = 'reservation_ceiling_without_usage' AND corrected_fact_cost_micros = 0 AND original_fact_cost_micros = original_request_cost_micros",
+        )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(zeroed_rows, 3);
 
         for (request_id, _) in &corrected {
             let cost: i64 = sqlx::query_scalar(
@@ -895,7 +1129,7 @@ mod tests {
             .unwrap();
             assert_eq!(cost, 0);
         }
-        for (request_id, expected) in [provider_reported, success] {
+        for (request_id, expected) in [provider_reported, provider_estimated, success] {
             let cost: i64 = sqlx::query_scalar(
                 "SELECT cost_micros FROM request_stats_facts WHERE request_id = $1",
             )
@@ -905,13 +1139,68 @@ mod tests {
             .unwrap();
             assert_eq!(cost, expected);
         }
-        let retained_cost = provider_reported.1.saturating_add(success.1);
+        let retained_cost = provider_reported
+            .1
+            .saturating_add(provider_estimated.1)
+            .saturating_add(success.1);
         assert!(
             aggregate_costs(fixture)
                 .await
                 .into_iter()
                 .all(|cost| cost == retained_cost)
         );
+    }
+
+    async fn exercise_provider_reported_fact_repair(fixture: &Fixture) {
+        let (request_id, actual_cost) = seed_historical_case(
+            fixture,
+            502,
+            None,
+            Some(RequestUsageBasis::ProviderReported),
+        )
+        .await;
+        let incorrect_cost = actual_cost.saturating_add(7);
+        sqlx::query("UPDATE request_stats_facts SET cost_micros = $1 WHERE request_id = $2")
+            .bind(incorrect_cost)
+            .bind(request_id.to_string())
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+
+        let preview = fixture
+            .database
+            .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                apply: false,
+                batch_size: 1,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview.candidate_rows, 1);
+        assert_eq!(preview.candidates[0].evidence_kind, "provider_reported");
+        assert_eq!(preview.candidates[0].corrected_cost_micros, actual_cost);
+
+        let applied = fixture
+            .database
+            .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                apply: true,
+                batch_size: 1,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(applied.changed_rows, 1);
+        let corrected: i64 =
+            sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        assert_eq!(corrected, actual_cost);
     }
 
     async fn wait_for_postgres_blocker(observer: &AnyPool, waiter_pid: i32, blocker_pid: i32) {
@@ -940,13 +1229,7 @@ mod tests {
         database_url: &str,
         observer: &AnyPool,
     ) {
-        seed_historical_case(
-            fixture,
-            503,
-            None,
-            Some(RequestUsageBasis::ProviderEstimated),
-        )
-        .await;
+        seed_historical_case(fixture, 503, None, Some(RequestUsageBasis::ContractCeiling)).await;
         let writer_request_id = Uuid::now_v7();
         let writer = Database::connect_with_max(database_url, 1).await.unwrap();
         let reservation = writer
@@ -1039,6 +1322,8 @@ mod tests {
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply: true,
                     batch_size: 1,
+                    from_created_at: 0,
+                    to_created_at: i64::MAX,
                     after: None,
                 })
                 .await
@@ -1067,20 +1352,8 @@ mod tests {
             .await
             .unwrap();
 
-        seed_historical_case(
-            fixture,
-            503,
-            None,
-            Some(RequestUsageBasis::ProviderEstimated),
-        )
-        .await;
-        seed_historical_case(
-            fixture,
-            503,
-            None,
-            Some(RequestUsageBasis::ProviderEstimated),
-        )
-        .await;
+        seed_historical_case(fixture, 503, None, Some(RequestUsageBasis::ContractCeiling)).await;
+        seed_historical_case(fixture, 503, None, Some(RequestUsageBasis::ContractCeiling)).await;
         let gate = Database::connect_with_max(database_url, 1).await.unwrap();
         let mut gate_tx = gate.begin_write_transaction().await.unwrap();
         let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -1108,6 +1381,8 @@ mod tests {
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply: true,
                     batch_size: 1,
+                    from_created_at: 0,
+                    to_created_at: i64::MAX,
                     after: None,
                 })
                 .await
@@ -1119,6 +1394,8 @@ mod tests {
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply: true,
                     batch_size: 1,
+                    from_created_at: 0,
+                    to_created_at: i64::MAX,
                     after: None,
                 })
                 .await
@@ -1200,6 +1477,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_backfill_uses_only_provider_reported_usage_for_nonzero_repairs() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("failed-cost-provider-evidence.db")
+                .display()
+        );
+        let fixture = fixture(&database_url, Some(directory)).await;
+        exercise_provider_reported_fact_repair(&fixture).await;
+    }
+
+    #[tokio::test]
     async fn sqlite_backfill_rolls_back_the_fact_and_retries_after_projection_failure() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
@@ -1214,7 +1505,7 @@ mod tests {
             &fixture,
             503,
             None,
-            Some(RequestUsageBasis::ProviderEstimated),
+            Some(RequestUsageBasis::ContractCeiling),
         )
         .await;
         let immutable_before = immutable_snapshot(&fixture).await;
@@ -1232,6 +1523,8 @@ mod tests {
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply: true,
                     batch_size: 1,
+                    from_created_at: 0,
+                    to_created_at: i64::MAX,
                     after: None,
                 })
                 .await
@@ -1256,6 +1549,8 @@ mod tests {
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: true,
                 batch_size: 1,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
                 after: None,
             })
             .await
