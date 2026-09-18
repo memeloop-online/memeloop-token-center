@@ -195,11 +195,11 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     service_id: 'service-existing',
     name: 'Existing service credential',
     credential_generation: 1,
-    credential_copy_available: scenario === 'service-copy',
+    credential_copy_available: scenario === 'service-copy' && !parameters.has('missing-original'),
     fingerprint: 'fixture-fingerprint',
     scopes: ['keys:read'],
     tenant_external_id: initialTenant || 'tenant-a',
-    status: 'active',
+    status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
     created_at: 1_700_000_000_000,
   }]);
   if (url.pathname === '/internal/v1/keys/key-copy/copy' && method === 'POST') {
@@ -229,7 +229,6 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
     ]);
     if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
-    if (url.pathname === '/internal/v1/keys/key-created/credential' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys') return json([
       // Match the API's descending (created_at, key_id) keyset order.
@@ -237,6 +236,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
       credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
     ]);
+    if (url.pathname === '/internal/v1/keys/key-form/rotate' && method === 'POST') return json({ key: 'mtc_fixture_rotated' });
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -263,8 +263,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const tenant = url.searchParams.get('tenant_external_id');
     if (scenario === 'client-copy') return json([{
       ...credential('Copyable client', 'tenant-a', 'key-copy'),
+      status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
       policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
-      credential_copy_available: true,
+      credential_copy_available: !parameters.has('missing-original'),
     }]);
     if (scenario === 'all-tenants') return json([{
       ...credential('All tenant client', 'tenant-visible', 'key-all'),

@@ -64,7 +64,7 @@ import { useInlineEditorFocus } from '../hooks/useInlineEditorFocus';
 import { loadModelPricePages } from '../pricingLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
 import { PricingTable } from '../PricingTable';
-import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
+import { enumLabel, IssuedCredential, messageOf, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
 export function OperatorSchemaForm(props: FormProps) {
   const prepared = useMemo(() => prepareSecretForm(props.schema, props.validator, props.formData), [props.schema, props.validator, props.formData]);
@@ -115,14 +115,15 @@ function CredentialCopyAction({ value, canCopy, busy, secretVisible, t, onCopy }
   </DetailTooltip>;
 }
 
-function RevealedCredential({ value, message, onCopied, onDismiss }: {
+function RevealedCredential({ value, message, copyFailedInitially = false, onCopied, onDismiss }: {
   value: string;
   message: string;
+  copyFailedInitially?: boolean;
   onCopied: () => void;
   onDismiss: () => void;
 }) {
   const { t } = useI18n();
-  const [copyFailed, setCopyFailed] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(copyFailedInitially);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(value);
@@ -1330,10 +1331,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       showSecret({ value: result.key, kind: 'issued', alias: value.alias, displayId: crypto.randomUUID() });
-      await api<void>(`/internal/v1/keys/${value.key_id}/credential`, operationToken, {
-        ...secretResponseRequestPolicy, method: 'PUT', body: JSON.stringify({ key: result.key }), signal: controller.signal,
-      });
-      if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
@@ -1437,7 +1434,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</Button></div>}
     {workspace?.kind === 'routing' && !routingDraft && <p role="status">{t('common.loading')}</p>}
   </div>;
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <div ref={secretPriority} tabIndex={-1} className="credential-secret-priority">{visibleSecret.kind === 'issued' ? <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="client-credential.txt" onDismiss={dismissSecret} message={t('credentials.oneTimeSecret')} /> : <RevealedCredential key={visibleSecret.displayId} value={visibleSecret.value} message={t('credentials.copyReady', { alias: visibleSecret.alias ?? '' })} onDismiss={dismissSecret} onCopied={() => setMessage(t('credentials.copySuccess', { alias: visibleSecret.alias ?? '' }))} />}</div>}<section className="management-layout">
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{visibleSecret && <div ref={secretPriority} tabIndex={-1} className="credential-secret-priority">{visibleSecret.kind === 'issued' ? <IssuedCredential key={visibleSecret.displayId} value={visibleSecret.value} filename="client-credential.txt" onDismiss={dismissSecret} message={t('credentials.issued')} /> : <RevealedCredential key={visibleSecret.displayId} value={visibleSecret.value} message={t('credentials.copyReady', { alias: visibleSecret.alias ?? '' })} onDismiss={dismissSecret} onCopied={() => setMessage(t('credentials.copySuccess', { alias: visibleSecret.alias ?? '' }))} />}</div>}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><label>{t('request.status')}<Select aria-label={t('request.status')} value={serverStatus} onChange={event => setServerStatus(event.target.value)}><option value="active">{enumLabel(t, 'status', 'active')}</option><option value="all">{t('common.all')}</option><option value="suspended">{enumLabel(t, 'status', 'suspended')}</option><option value="revoked">{enumLabel(t, 'status', 'revoked')}</option></Select></label></div>
       <div className="credential-list-controls"><label>{t('credentials.search')}<Input type="search" maxLength={200} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<Select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</Select></label>}<label>{t('credentials.source')}<Select value={creationSource} onChange={event => setCreationSource(event.target.value)}><option value="manual_or_unknown">{t('credentials.sourceWorkspace')}</option><option value="manual">{t('credentials.sourceManual')}</option><option value="api">{t('credentials.sourceApi')}</option><option value="unknown">{t('credentials.sourceUnknown')}</option><option value="all">{t('common.all')}</option></Select></label></div>
       {canWrite && <div className="row-actions"><Button appearance="subtle" disabled={Boolean(busy) || Boolean(visibleSecret) || !filteredValues.length} onClick={() => setSelectedKeys(filteredValues.filter(canManage).slice(-100).map(value => value.key_id))}>{t('credentials.selectPage')}</Button><Button appearance="subtle" disabled={Boolean(busy) || !selectedKeys.length} onClick={() => setSelectedKeys([])}>{t('credentials.clearSelection')}</Button><Button appearance="secondary" disabled={Boolean(busy) || Boolean(visibleSecret) || !selectedKeys.length} onClick={() => void deleteKeys(selectedKeys)}>{t(busy === 'delete-credentials' ? 'credentials.deleting' : 'credentials.deleteSelected', { count: formatNumber(selectedKeys.length, locale) })}</Button><span className="muted">{t('credentials.selectionHint')}</span></div>}
@@ -1491,8 +1488,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, creation_source: 'manual', route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
           if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
           setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, kind: 'issued', displayId: crypto.randomUUID() });
-          await api<void>(`/internal/v1/keys/${created.key_id}/credential`, operationToken, { ...secretResponseRequestPolicy, method: 'PUT', body: JSON.stringify({ key: created.key }), signal: controller.signal });
-          if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
           setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
@@ -1514,7 +1509,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     renderScope.current = { token, tenant, writeTenant, generation: renderScope.current.generation + 1 };
   }
   const [values, setValues] = useState<ServiceTokenView[]>([]);
-  const [secret, setSecret] = useState<{ value: string; displayId: string; scopeGeneration: number; copied: boolean }>();
+  const [secret, setSecret] = useState<{ value: string; kind: 'issued' | 'revealed'; name?: string; copyFailedInitially?: boolean; displayId: string; scopeGeneration: number }>();
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -1559,8 +1554,8 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     secretOperation.current = undefined;
     setBusy('');
   };
-  const showSecret = (value: string, copied = false) => {
-    const next = { value, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation, copied };
+  const showSecret = (value: string, kind: 'issued' | 'revealed', name?: string, copyFailedInitially = false) => {
+    const next = { value, kind, name, copyFailedInitially, displayId: crypto.randomUUID(), scopeGeneration: renderScope.current.generation };
     secretRef.current = next;
     setSecret(next);
   };
@@ -1586,7 +1581,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
         if (current()) setMessage(t('services.copySuccess', { name: value.name }));
       } catch {
         if (!current()) return;
-        showSecret(result.token, true); setMessage(t('credentials.copyManual'));
+        showSecret(result.token, 'revealed', value.name, true); setMessage(t('services.copyReady', { name: value.name }));
       }
     } catch (reason) {
       if (!controller.signal.aborted && current()) setError(reason instanceof ApiError && reason.status === 403 ? t('services.copyPermission') : reason instanceof ApiError && reason.status === 404 ? t('services.copyNeedsOriginal') : messageOf(reason, t('common.requestFailed')));
@@ -1607,7 +1602,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
       if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return;
       const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, operationToken, { ...secretResponseRequestPolicy, method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, signal: controller.signal });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
-      showSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load();
+      showSecret(result.token, 'issued', value.name); setMessage(t('services.rotated', { name: value.name })); await load();
     } catch (reason) {
       if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -1627,7 +1622,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     try {
       const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...fields, tenant_external_id: operationWriteTenant }), signal: controller.signal });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
-      showSecret(created.token); setMessage(t('services.created')); await load();
+      showSecret(created.token, 'issued'); setMessage(t('services.created')); await load();
     } catch (reason) {
       if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -1635,7 +1630,9 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
-  return <>{confirmationDialog}{visibleSecret && <OneTimeSecret key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t(visibleSecret.copied ? 'credentials.copyManual' : 'services.oneTimeSecret')} />}<section className="management-layout">
+  return <>{confirmationDialog}{visibleSecret && (visibleSecret.kind === 'issued'
+    ? <IssuedCredential key={visibleSecret.displayId} value={visibleSecret.value} filename="service-credential.txt" onDismiss={dismissSecret} message={t('services.issued')} />
+    : <RevealedCredential key={visibleSecret.displayId} value={visibleSecret.value} message={t('services.copyReady', { name: visibleSecret.name ?? '' })} copyFailedInitially={visibleSecret.copyFailedInitially} onDismiss={dismissSecret} onCopied={() => setMessage(t('services.copySuccess', { name: visibleSecret.name ?? '' }))} />)}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list credential-compact-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => {
       const technicalDetails = [
         t('services.identifierHint', { id: value.service_id }),

@@ -14,9 +14,11 @@ test('generic credential copying exposes accessible failure feedback', () => {
 });
 
 test('operator credential panels bind only secret response fields to plaintext', () => {
-  assert.match(managementPages, /<OneTimeSecret key=\{visibleSecret\.displayId\} value=\{visibleSecret\.value\}/);
+  assert.match(managementPages, /<IssuedCredential key=\{visibleSecret\.displayId\} value=\{visibleSecret\.value\}/);
   assert.match(managementPages, /api<\{ key: string; key_id: string \}>\('\/internal\/v1\/keys'/);
   assert.match(managementPages, /api<\{ token: string \}>\('\/internal\/v1\/service-tokens'/);
-  assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.key_id\}/);
-  assert.doesNotMatch(managementPages, /<OneTimeSecret value=\{value\.service_id\}/);
+  assert.doesNotMatch(managementPages, /<IssuedCredential value=\{value\.key_id\}/);
+  assert.doesNotMatch(managementPages, /<IssuedCredential value=\{value\.service_id\}/);
+  assert.doesNotMatch(managementPages, /keys\/\$\{created\.key_id\}\/credential/);
+  assert.doesNotMatch(managementPages, /keys\/\$\{value\.key_id\}\/credential[\s\S]*result\.key/);
 });

@@ -26,7 +26,7 @@ export function WriteScopeNotice({ tenant }: { tenant: string }) {
   return <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
 }
 
-export function OneTimeSecret({ value, message, filename = 'token-center-credential.txt', onDismiss }: {
+export function IssuedCredential({ value, message, filename = 'token-center-credential.txt', onDismiss }: {
   value: string;
   message: string;
   filename?: string;
@@ -93,17 +93,17 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
   }
 
   function dismiss() {
-    if (onDismiss && window.confirm(t('common.confirmDismissSecret'))) onDismiss();
+    if (onDismiss && window.confirm(t('common.confirmDismissCredential'))) onDismiss();
   }
 
   // Do not make this container a live region: assistive technology must not
   // announce a credential merely because it was rendered.
   return <aside className="one-time">
     <div className="one-time-heading">
-      <div><b>{message}</b><p>{t('common.secretShownOnce')}</p></div>
+      <div><b>{message}</b><p>{t('common.credentialSavedHint')}</p></div>
       {onDismiss && <button type="button" className="secondary one-time-close" aria-label={t('common.close')} onClick={dismiss}>×</button>}
     </div>
-    <code aria-label={t('common.secretValue')}>{value}</code>
+    <code aria-label={t('common.credentialValue')}>{value}</code>
     <div className="button-row">
       <button type="button" onClick={() => void copySecret()}>
         {copyState === 'copied' ? t('common.copied') : t('common.copySecret')}
@@ -112,6 +112,6 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
     </div>
     {copyState === 'failed' && <small className="one-time-error" role="alert">{t('common.copySecretFailed')}</small>}
     {saved && <small className="one-time-saved" role="status">{t('common.secretSaved')}</small>}
-    <small className="one-time-hint">{t('common.secretCloseHint')}</small>
+    <small className="one-time-hint">{t('common.credentialCloseHint')}</small>
   </aside>;
 }

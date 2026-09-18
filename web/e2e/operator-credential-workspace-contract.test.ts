@@ -54,7 +54,7 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('credential workspaces isolate loads and preserve one-time service plaintext', { timeout: 60_000 }, async () => {
+test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 60_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
@@ -134,6 +134,23 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     assert.equal(await manualCopy.locator('.credential-revealed-value').evaluate((element) => getComputedStyle(element).userSelect), 'all', 'the revealed original remains selectable when clipboard access is unavailable');
     assert.equal(await manualCopy.getByRole('dialog').count(), 0);
     await manualCopy.close();
+
+    for (const [mode, expected] of [
+      ['missing-original', 'Submit the current credential value before copying.'],
+      ['suspended', 'This credential is suspended. Enable it to copy.'],
+      ['revoked', 'This credential has been revoked.'],
+    ] as const) {
+      const unavailableCopy = await browser.newPage();
+      await unavailableCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+      await unavailableCopy.goto(`${fixture('client-copy')}&${mode}`);
+      const disabledCopy = unavailableCopy.getByRole('button', { name: 'Copy credential', exact: true });
+      await disabledCopy.waitFor();
+      assert.equal(await disabledCopy.isDisabled(), true);
+      await disabledCopy.locator('..').focus();
+      await unavailableCopy.getByRole('tooltip').filter({ hasText: expected }).waitFor();
+      assert.equal(await unavailableCopy.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/keys/key-copy/copy'))), false, `${mode} never submits a copy request`);
+      await unavailableCopy.close();
+    }
 
     const race = await browser.newPage();
     await race.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -371,8 +388,10 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       }
       await create.locator('button[type="submit"]').click();
       await client.getByText('mtc_fixture_created', { exact: true }).waitFor();
+      await client.getByText(english ? 'Saved and available to copy again from the list.' : '凭据已保存，可从列表再次复制。', { exact: true }).waitFor();
       const createRequests = await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
       assert.equal(createRequests.length, 1);
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-created/credential').length), 0, 'creation persists the original in its own transaction without a second credential write');
       const body = JSON.parse(createRequests[0].body!);
       assert.equal(body.tenant_external_id, 'tenant-a');
       assert.equal(body.principal_external_id, 'fixture-principal');
@@ -381,6 +400,15 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.deepEqual(body.route_ids, ['00000000-0000-4000-8000-000000000001']);
       assert.deepEqual(body.route_group_ids, ['00000000-0000-4000-8000-000000000002']);
       assert.equal('route_ids' in body.policy || 'route_group_ids' in body.policy, false);
+      client.once('dialog', dialog => dialog.accept());
+      await client.getByRole('button', { name: english ? 'Close' : '关闭', exact: true }).click();
+      const existingRow = client.getByRole('group', { name: english ? 'Research workspace' : '研发工作区', exact: true });
+      await existingRow.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Rotate credential' : '轮换凭据', exact: true }).click();
+      await client.getByRole('dialog').getByRole('button', { name: english ? 'Confirm and continue' : '确认并继续', exact: true }).click();
+      await client.getByText('mtc_fixture_rotated', { exact: true }).waitFor();
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys/key-form/rotate').length), 1, 'rotation is one business write');
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-form/credential').length), 0, 'rotation persists the original in its own transaction without a second credential write');
       await client.close();
     }
     const policies = await browser.newPage();
