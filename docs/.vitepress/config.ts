@@ -110,15 +110,45 @@ function navFor(locale: Locale): DefaultTheme.NavItem[] {
 
 const base = process.env.DOCS_BASE || '/'
 
+const localeBootstrap = `(() => {
+  try {
+    const base = ${JSON.stringify(base)};
+    const localeKey = 'mtc-docs-locale';
+    const relativePath = location.pathname.startsWith(base)
+      ? location.pathname.slice(base.length)
+      : null;
+
+    if (relativePath === '' || relativePath === 'index.html') {
+      const savedLocale = localStorage.getItem(localeKey);
+      const locale = savedLocale === 'zh' || savedLocale === 'en'
+        ? savedLocale
+        : navigator.languages.some((language) => language.toLowerCase().startsWith('zh'))
+          ? 'zh'
+          : 'en';
+      location.replace(base + locale + '/' + location.search + location.hash);
+      return;
+    }
+
+    const locale = relativePath?.match(/^(zh|en)(?:\\/|$)/)?.[1];
+    if (locale) localStorage.setItem(localeKey, locale);
+  } catch {
+    // The site remains usable when browser storage is unavailable.
+  }
+})();`
+
 export default defineConfig({
   base,
   title: 'Memeloop Token Center',
   description: 'Memeloop Token Center product documentation',
   cleanUrls: true,
   lastUpdated: true,
+  appearance: true,
   srcExclude: computeSrcExclude(),
 
-  head: [['meta', { name: 'theme-color', content: '#0e7490' }]],
+  head: [
+    ['meta', { name: 'theme-color', content: '#0e7490' }],
+    ['script', {}, localeBootstrap]
+  ],
 
   locales: {
     zh: {

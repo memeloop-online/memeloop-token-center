@@ -4,8 +4,8 @@ title: One Model Gateway
 titleTemplate: false
 hero:
   name: Memeloop Token Center
-  text: One entry point for your model services
-  tagline: Manage upstream accounts, model routes, and access permissions in one place, with requests and usage visible in the same interface.
+  text: One gateway for your team's AI models
+  tagline: Connect upstream accounts, shape model routes, issue client credentials, and track usage from one operational workspace.
   actions:
     - theme: brand
       text: Get started
@@ -14,19 +14,25 @@ hero:
       text: Develop a plugin
       link: /en/plugins/
 features:
-  - title: Connect what you need
-    details: Connect different upstreams, organize models with route groups, and grant applications the access they need.
+  - title: Connect every upstream
+    details: Bring OAuth and API key accounts into one catalog, then organize models with reusable route groups.
     link: /en/guide/routing
-  - title: See every request clearly
-    details: Compare models, credentials, token usage, costs, and response behavior in the request list.
+  - title: Follow every request
+    details: Compare models, credentials, token usage, local settlement, and response behavior in one timeline.
     link: /en/guide/requests
-  - title: Extend as you go
-    details: Extend routing and administration with plugins, combining capabilities for your needs.
+  - title: Extend the gateway
+    details: Add routing policies, OAuth adapters, protocol support, and operator views through versioned Wasm plugins.
     link: /en/plugins/
 ---
 
-## See how your services are running
+## Explore the product
 
-![MTC overview with request trends, usage, and remaining upstream quotas](/images/overview.png)
+Three live product views show how MTC connects configuration with day-to-day operations.
 
-Captured from the live Chinese-language interface. Identity details are replaced; statistics are unchanged.
+<ProductGallery locale="en" />
+
+## Start with the workflow that fits your role
+
+- **Operators:** [connect upstream accounts](/en/guide/upstreams), [build model routes](/en/guide/routing), and [issue client credentials](/en/guide/credentials).
+- **Application teams:** use the [API guide](/en/guide/api) and inspect activity in [Requests](/en/guide/requests).
+- **Plugin developers:** browse the [extension model](/en/plugins/) and follow the [development guide](/en/plugins/development).
