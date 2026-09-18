@@ -947,6 +947,177 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
     .unwrap();
     assert_eq!(ordered_state.0, ordered_state.1);
     assert_eq!(ordered_state.2, 0);
+
+    // A response-only observation can later attach that response and reconcile descendants. It
+    // must take the statistics advisory lock before its response-reference lock, just like a turn
+    // observation, or the two paths can each hold one advisory lock while waiting for the other.
+    let response_only_request_id = Uuid::now_v7();
+    let response_child_request_id = Uuid::now_v7();
+    for (request_id, object) in [
+        (response_only_request_id, "objects/response-only-parent"),
+        (response_child_request_id, "objects/response-only-child"),
+    ] {
+        database
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: object,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    let response_only_id = format!("response-only-{unique}");
+    let response_turn_id = format!("response-child-turn-{unique}");
+    let mut stats_gate = database.begin_write_transaction().await.unwrap();
+    let stats_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *stats_gate)
+        .await
+        .unwrap();
+    lock_request_stats_projection_in_transaction(&mut stats_gate)
+        .await
+        .unwrap();
+
+    let response_database = database.clone();
+    let response_key = key.clone();
+    let response_id_for_writer = response_only_id.clone();
+    let (response_pid_sender, response_pid_receiver) = tokio::sync::oneshot::channel();
+    let (response_recorded_sender, response_recorded_receiver) = tokio::sync::oneshot::channel();
+    let (attach_sender, attach_receiver) = tokio::sync::oneshot::channel();
+    let response_writer = tokio::spawn(async move {
+        let mut transaction = response_database.begin_write_transaction().await.unwrap();
+        let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        response_pid_sender.send(backend_pid).unwrap();
+        let response_json = serde_json::json!({"input": "response-only parent"});
+        let response_hints = ConversationHints::default();
+        let cluster = response_database
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                ConversationObservationInput {
+                    key: &response_key,
+                    request_id: response_only_request_id,
+                    request_json: &response_json,
+                    hints: &response_hints,
+                    client_name: Some("Codex"),
+                    upstream_response_id: Some(&response_id_for_writer),
+                    observed_at: unix_millis(),
+                    attach_request_record: true,
+                    content_materialized: false,
+                },
+            )
+            .await
+            .unwrap();
+        response_recorded_sender.send(()).unwrap();
+        attach_receiver.await.unwrap();
+        attach_conversation_upstream_response_in_transaction(
+            &mut transaction,
+            response_database.backend,
+            response_only_request_id,
+            &response_id_for_writer,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        cluster
+    });
+    let response_pid = response_pid_receiver.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waits_for_stats_gate: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity activity WHERE activity.pid = $1 AND activity.state = 'active' AND activity.wait_event_type = 'Lock' AND activity.wait_event = 'advisory' AND $2 = ANY(pg_blocking_pids(activity.pid)))",
+            )
+            .bind(response_pid)
+            .bind(stats_gate_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if waits_for_stats_gate {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("response-only observation did not acquire statistics advisory before conversation references");
+    stats_gate.commit().await.unwrap();
+    response_recorded_receiver.await.unwrap();
+
+    let child_database = database.clone();
+    let child_key = key.clone();
+    let response_id_for_child = response_only_id.clone();
+    let (child_pid_sender, child_pid_receiver) = tokio::sync::oneshot::channel();
+    let child_writer = tokio::spawn(async move {
+        let mut transaction = child_database.begin_write_transaction().await.unwrap();
+        let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        child_pid_sender.send(backend_pid).unwrap();
+        let child_json = serde_json::json!({"input": "response-only child"});
+        let child_hints = ConversationHints {
+            parent_turn_id: Some(response_id_for_child),
+            turn_id: Some(response_turn_id),
+            ..ConversationHints::default()
+        };
+        let cluster = child_database
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                ConversationObservationInput {
+                    key: &child_key,
+                    request_id: response_child_request_id,
+                    request_json: &child_json,
+                    hints: &child_hints,
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: unix_millis(),
+                    attach_request_record: true,
+                    content_materialized: false,
+                },
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        cluster
+    });
+    let child_pid = child_pid_receiver.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waits_for_response_writer: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity activity WHERE activity.pid = $1 AND activity.state = 'active' AND activity.wait_event_type = 'Lock' AND activity.wait_event = 'advisory' AND $2 = ANY(pg_blocking_pids(activity.pid)))",
+            )
+            .bind(child_pid)
+            .bind(response_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if waits_for_response_writer {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn observation did not serialize behind response-only statistics ownership");
+    attach_sender.send(()).unwrap();
+    let response_cluster =
+        tokio::time::timeout(std::time::Duration::from_secs(10), response_writer)
+            .await
+            .expect("response-only attach deadlocked after taking statistics advisory first")
+            .unwrap();
+    let child_cluster = tokio::time::timeout(std::time::Duration::from_secs(10), child_writer)
+        .await
+        .expect("turn observation did not resume after response-only attach committed")
+        .unwrap();
+    assert_eq!(response_cluster, child_cluster);
 }
 
 #[tokio::test]

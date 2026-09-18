@@ -419,10 +419,11 @@ impl Database {
         } else {
             false
         };
-        // A completed request can reclassify its session projection, while a newly arrived turn id
-        // can reconcile already-completed descendants. Pending observations with neither condition
-        // must remain independently committable while another pending observation is uncommitted.
-        if request_fact_exists || hints.turn_id.is_some() {
+        // A completed request can reclassify its session projection, while a newly arrived turn or
+        // upstream response id can reconcile already-completed descendants. Pending observations
+        // with none of those conditions must remain independently committable while another pending
+        // observation is uncommitted.
+        if request_fact_exists || hints.turn_id.is_some() || upstream_response_id.is_some() {
             lock_request_stats_projection_in_transaction(transaction).await?;
         }
 

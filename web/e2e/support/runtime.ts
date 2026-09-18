@@ -76,7 +76,7 @@ export function observeSessionReadyRequests({
   const deadline = AbortSignal.timeout(30_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
-  let sessionId: string | undefined;
+  let ready: SessionReadyRequests | undefined;
   let eventAt: number | undefined;
   let eventId: string | undefined;
   let openedResolve!: () => void;
@@ -130,27 +130,50 @@ export function observeSessionReadyRequests({
             }
             const eventSessionId = event.session_context?.session_id;
             assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-            if (sessionId !== undefined) assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
             assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
             eventAt = event.event_at;
             eventId = id;
-            sessionId ??= eventSessionId;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
-            settled = true;
-            completedResolve({ requestIds: new Set(requestIds), sessionId: eventSessionId });
+            // A child can commit to an isolated cluster before its declared parent, then be merged
+            // by a later terminal transaction. The final event's session is the reconciliation
+            // candidate; do not publish readiness until its detail has converged to the exact set.
+            ready = { requestIds: new Set(requestIds), sessionId: eventSessionId };
             controller.abort();
           },
           openedResolve,
         );
       } catch (reason) {
+        if (ready) break;
         if (settled || signal.aborted) return;
         if (!(reason instanceof ApiError) || reason.code !== 'sse_response_interrupted') throw reason;
       }
+      if (ready) break;
       if (!settled && !signal.aborted) {
         await delay(100);
       }
     }
+    if (!ready || settled) return;
+    const converged = ready;
+    const detailParams = new URLSearchParams({
+      tenant_external_id: tenant,
+      key_id: keyId,
+      limit: '100',
+    });
+    await eventually(async () => {
+      const detail = await requestJson<{ requests: Array<{ request_id: string }> }>(
+        `/internal/v1/sessions/${encodeURIComponent(converged.sessionId)}?${detailParams}`,
+        { credential },
+      );
+      assert.deepEqual(
+        new Set(detail.requests.map((request) => request.request_id)),
+        converged.requestIds,
+        'the final logical session must converge to the exact observed request set',
+      );
+    }, 10_000, 'the final logical session did not converge after parent reconciliation');
+    if (settled) return;
+    settled = true;
+    completedResolve(converged);
   })().catch(fail);
   return { opened, completed };
 }
