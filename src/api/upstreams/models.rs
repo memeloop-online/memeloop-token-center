@@ -389,8 +389,9 @@ async fn sync_account_models(
                             error_code: None,
                         };
                     }
-                    Err(_) => {
-                        tracing::warn!(%account_id, "catalog committed but model price synchronization failed");
+                    Err(error) => {
+                        tracing::warn!(%account_id, error_category = error.diagnostic_category(),
+                            "catalog committed but model price synchronization failed");
                         price_sync.status = "error";
                         price_sync.error_code = Some("price_sync_failed");
                     }
@@ -917,6 +918,9 @@ mod tests {
         let mut models = (0..500)
             .map(|index| json!({"id": format!("unpriced-{index:03}")}))
             .collect::<Vec<_>>();
+        // Discovery accepts 500-byte IDs; pricing must report a long unmatched
+        // identity rather than silently dropping it during normalization.
+        models[0] = json!({"id": "long-unpriced-".repeat(30)});
         models.extend([json!({"id": "manual"}), json!({"id": "zz-priced-tail"})]);
         Mock::given(path("/v1/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": models})))

@@ -61,7 +61,7 @@ pub(super) fn normalized_models(models: Vec<String>) -> Vec<String> {
     let mut models = models
         .into_iter()
         .map(|model| model.trim().to_owned())
-        .filter(|model| !model.is_empty() && model.len() <= 300)
+        .filter(|model| !model.is_empty() && model.len() <= 500)
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
