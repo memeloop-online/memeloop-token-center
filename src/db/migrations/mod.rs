@@ -570,6 +570,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0107_request_cost_projection_corrections.sql"
         ),
     },
+    Migration {
+        version: 108,
+        name: "gateway failure-domain connection health",
+        sql: include_str!("../../../migrations/common/0108_gateway_failure_domain_health.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1125,6 +1130,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0107_request_cost_projection_corrections.sql"
         ),
+    },
+    Migration {
+        version: 108,
+        name: "gateway failure-domain connection health",
+        sql: include_str!("../../../migrations/common/0108_gateway_failure_domain_health.sql"),
     },
 ];
 

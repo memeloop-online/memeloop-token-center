@@ -86,6 +86,7 @@ pub(super) async fn request_detail(
             },
         },
         provenance: refs.provenance,
+        transport_diagnostics: Vec::new(),
     }
 }
 

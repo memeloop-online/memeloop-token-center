@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::{
     RequestsQuery, StatsQuery, generation_asset_response, management_tenant,
-    request_archive_content_response, request_detail_response, require_global_service,
-    require_service,
+    request_archive_content_response, request_detail_response_with_transport_diagnostics,
+    require_global_service, require_service,
 };
 use crate::{
     AppState,
@@ -636,7 +636,11 @@ pub(super) async fn internal_request_detail(
         }
         None => state.db.request_archive_refs_global(request_id).await?,
     };
-    request_detail_response(&state, refs).await
+    let diagnostics = state
+        .db
+        .request_upstream_transport_diagnostics(request_id)
+        .await?;
+    request_detail_response_with_transport_diagnostics(&state, refs, diagnostics).await
 }
 
 pub(super) async fn internal_request_archive_content(

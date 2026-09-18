@@ -990,6 +990,23 @@ pub struct RequestDetail {
     pub archive: RequestArchiveCompletenessView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<RequestProvenanceView>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transport_diagnostics: Vec<RequestTransportDiagnosticView>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestTransportDiagnosticView {
+    pub upstream_account_id: Uuid,
+    pub route_id: Uuid,
+    pub credential_generation: i64,
+    pub transport_revision: i64,
+    pub failure_kind: String,
+    pub failure_stage: String,
+    pub gateway_pod: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_node: Option<String>,
+    pub failure_domain: String,
+    pub observed_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

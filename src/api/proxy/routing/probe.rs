@@ -73,6 +73,43 @@ struct SharedProbeLimiter {
 static SHARED_PROBE_LIMITERS: OnceLock<Mutex<HashMap<ProbeKey, Weak<SharedProbeLimiter>>>> =
     OnceLock::new();
 
+#[derive(Clone, Debug)]
+struct GatewayFailureDomainIdentity {
+    pod: String,
+    node: Option<String>,
+    failure_domain: String,
+}
+
+fn bounded_identity_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && value.len() <= 253)
+}
+
+fn gateway_failure_domain_identity() -> GatewayFailureDomainIdentity {
+    static IDENTITY: OnceLock<GatewayFailureDomainIdentity> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let pod = bounded_identity_value("MTC_GATEWAY_POD_NAME")
+                .or_else(|| bounded_identity_value("HOSTNAME"))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let node = bounded_identity_value("MTC_GATEWAY_NODE_NAME");
+            let failure_domain = bounded_identity_value("MTC_GATEWAY_FAILURE_DOMAIN")
+                .or_else(|| node.clone())
+                // An unconfigured runtime intentionally forms one shared
+                // domain: it cannot manufacture cross-domain evidence from
+                // multiple processes on an unknown node.
+                .unwrap_or_else(|| "unassigned".to_owned());
+            GatewayFailureDomainIdentity {
+                pod,
+                node,
+                failure_domain,
+            }
+        })
+        .clone()
+}
+
 pub(crate) struct SharedProbePermit {
     limiter: Arc<SharedProbeLimiter>,
 }
@@ -484,6 +521,7 @@ pub(crate) enum UpstreamAttemptTerminal {
     Failed {
         kind: UpstreamFailureKind,
         reason: UpstreamHealthReason,
+        failure_stage: &'static str,
     },
 }
 
@@ -492,6 +530,7 @@ impl UpstreamAttemptTerminal {
         Self::Failed {
             kind: UpstreamFailureKind::InvalidResponse,
             reason: UpstreamHealthReason::InvalidResponse,
+            failure_stage: "response_validation",
         }
     }
 }
@@ -508,6 +547,8 @@ pub(crate) struct UpstreamAttemptGuard {
     route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
+    transport_revision: i64,
+    gateway_identity: GatewayFailureDomainIdentity,
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
@@ -524,6 +565,8 @@ struct UpstreamAttemptRecord {
     route_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
+    transport_revision: i64,
+    gateway_identity: GatewayFailureDomainIdentity,
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
@@ -538,6 +581,7 @@ impl UpstreamAttemptGuard {
         route_id: Uuid,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         admission: UpstreamAttemptAdmission,
         shared_probe_permit: Option<SharedProbePermit>,
     ) -> Self {
@@ -601,6 +645,8 @@ impl UpstreamAttemptGuard {
             route_id,
             upstream_account_id,
             credential_generation,
+            transport_revision,
+            gateway_identity: gateway_failure_domain_identity(),
             failure_epoch,
             lease_token,
             owns_probe_lease,
@@ -694,6 +740,8 @@ impl UpstreamAttemptGuard {
                 route_id: self.route_id,
                 upstream_account_id: self.upstream_account_id,
                 credential_generation: self.credential_generation,
+                transport_revision: self.transport_revision,
+                gateway_identity: self.gateway_identity.clone(),
                 failure_epoch: self.failure_epoch,
                 lease_token: self.lease_token,
                 owns_probe_lease: self.owns_probe_lease,
@@ -758,6 +806,8 @@ impl Drop for UpstreamAttemptGuard {
         let route_id = self.route_id;
         let upstream_account_id = self.upstream_account_id;
         let credential_generation = self.credential_generation;
+        let transport_revision = self.transport_revision;
+        let gateway_identity = self.gateway_identity.clone();
         let failure_epoch = self.failure_epoch;
         let lease_token = self.lease_token;
         let owns_probe_lease = self.owns_probe_lease;
@@ -774,6 +824,8 @@ impl Drop for UpstreamAttemptGuard {
                     route_id,
                     upstream_account_id,
                     credential_generation,
+                    transport_revision,
+                    gateway_identity,
                     failure_epoch,
                     lease_token,
                     owns_probe_lease,
@@ -793,6 +845,8 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         route_id,
         upstream_account_id,
         credential_generation,
+        transport_revision,
+        gateway_identity,
         failure_epoch,
         lease_token,
         owns_probe_lease,
@@ -855,6 +909,18 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
+            if let Err(error) = state
+                .db
+                .clear_upstream_connection_failure_domain(
+                    upstream_account_id,
+                    credential_generation,
+                    transport_revision,
+                    &gateway_identity.failure_domain,
+                )
+                .await
+            {
+                tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="connection_failure_domain_recovery", "failed to clear recovered gateway failure domain");
+            }
             if let (Some(policy), Some(signal), Some(lease_token)) = (
                 directive
                     .as_ref()
@@ -957,7 +1023,29 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 );
             }
         }
-        UpstreamAttemptTerminal::Failed { kind, reason } => {
+        UpstreamAttemptTerminal::Failed {
+            kind,
+            reason,
+            failure_stage,
+        } => {
+            if let Err(error) = state
+                .db
+                .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
+                    request_id,
+                    route_id,
+                    upstream_account_id,
+                    credential_generation,
+                    transport_revision,
+                    failure_kind: kind.as_str(),
+                    failure_stage,
+                    gateway_pod: &gateway_identity.pod,
+                    gateway_node: gateway_identity.node.as_deref(),
+                    failure_domain: &gateway_identity.failure_domain,
+                })
+                .await
+            {
+                tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transport_diagnostic_persist", "failed to persist upstream transport diagnostic");
+            }
             // A shared recovery request never owns the heartbeat lease. Its
             // connection/stream failure must not cancel the primary probe or
             // overwrite a concurrent success. A complete 429 is different:
@@ -1008,12 +1096,39 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         .await
                 }
                 None => match failure_epoch {
+                    Some(failure_epoch) if kind == UpstreamFailureKind::Connection => state
+                        .db
+                        .record_admitted_connection_failure_by_domain(
+                            crate::db::AdmittedConnectionFailure {
+                                request_id,
+                                upstream_account_id,
+                                credential_generation,
+                                transport_revision,
+                                failure_epoch,
+                                failure_stage,
+                                gateway_pod: &gateway_identity.pod,
+                                gateway_node: gateway_identity.node.as_deref(),
+                                failure_domain: &gateway_identity.failure_domain,
+                            },
+                            health,
+                        )
+                        .await
+                        .map(|result| {
+                            tracing::warn!(
+                                %request_id,
+                                %upstream_account_id,
+                                failure_domain = %gateway_identity.failure_domain,
+                                distinct_failure_domains = result.distinct_failure_domains,
+                                global_breaker_opened = result.global_breaker_opened,
+                                stage = "connection_failure_domain_health",
+                                "recorded failure-domain connection evidence"
+                            );
+                            result.global_breaker_opened
+                        }),
                     Some(failure_epoch)
                         if matches!(
                             kind,
-                            UpstreamFailureKind::Connection
-                                | UpstreamFailureKind::Unavailable
-                                | UpstreamFailureKind::InvalidResponse
+                            UpstreamFailureKind::Unavailable | UpstreamFailureKind::InvalidResponse
                         ) =>
                     {
                         state

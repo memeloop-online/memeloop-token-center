@@ -783,6 +783,7 @@ async fn execute_component_primary(
             primary.route.route_id,
             primary.route.account_id,
             primary.route.credential_generation,
+            primary.route.transport_revision,
             admission,
             None,
         )),
@@ -1430,7 +1431,11 @@ async fn proxy_with_identity_and_conversation_spool(
                 "proxy upstream attempt failed"
             );
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Failed { kind, reason })
+                .complete(UpstreamAttemptTerminal::Failed {
+                    kind,
+                    reason,
+                    failure_stage: routing::attempt_failure_stage(&result),
+                })
                 .await;
         }
         let disposition = routing::failover_disposition(
@@ -2115,6 +2120,13 @@ async fn execute_component_provider(
                     .complete(UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Connection,
                         reason: UpstreamHealthReason::Connection,
+                        failure_stage: if error.is_connect() {
+                            "connect"
+                        } else if error.is_timeout() {
+                            "request_timeout"
+                        } else {
+                            "request"
+                        },
                     })
                     .await;
             }
@@ -2130,6 +2142,7 @@ async fn execute_component_provider(
                 UpstreamAttemptTerminal::Failed {
                     kind,
                     reason: UpstreamHealthReason::RateLimited,
+                    failure_stage: "upstream_response",
                 }
             } else {
                 drop(upstream);
@@ -2140,11 +2153,13 @@ async fn execute_component_provider(
                     UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Authentication,
                         reason: UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else if upstream_status.is_server_error() {
                     UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Unavailable,
                         reason: UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else {
                     UpstreamAttemptTerminal::Inconclusive

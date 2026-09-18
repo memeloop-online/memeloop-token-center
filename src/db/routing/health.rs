@@ -7,6 +7,40 @@ use crate::config::UpstreamHealthConfig;
 mod delivery;
 mod strategy;
 
+const CONNECTION_FAILURE_DOMAIN_WINDOW_MILLIS: i64 = 60_000;
+const CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD: i64 = 2;
+
+pub(crate) struct UpstreamTransportDiagnostic<'a> {
+    pub request_id: Uuid,
+    pub route_id: Uuid,
+    pub upstream_account_id: Uuid,
+    pub credential_generation: i64,
+    pub transport_revision: i64,
+    pub failure_kind: &'a str,
+    pub failure_stage: &'a str,
+    pub gateway_pod: &'a str,
+    pub gateway_node: Option<&'a str>,
+    pub failure_domain: &'a str,
+}
+
+pub(crate) struct AdmittedConnectionFailure<'a> {
+    pub request_id: Uuid,
+    pub upstream_account_id: Uuid,
+    pub credential_generation: i64,
+    pub transport_revision: i64,
+    pub failure_epoch: Uuid,
+    pub failure_stage: &'a str,
+    pub gateway_pod: &'a str,
+    pub gateway_node: Option<&'a str>,
+    pub failure_domain: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnectionFailureDomainResult {
+    pub distinct_failure_domains: i64,
+    pub global_breaker_opened: bool,
+}
+
 pub(crate) use strategy::TransientHealthSignal;
 
 #[cfg(test)]
@@ -110,6 +144,264 @@ impl UpstreamFailureKind {
 }
 
 impl Database {
+    pub(crate) async fn record_upstream_transport_diagnostic(
+        &self,
+        diagnostic: UpstreamTransportDiagnostic<'_>,
+    ) -> Result<(), AppError> {
+        let now = unix_millis();
+        sqlx::query(
+            "INSERT INTO request_upstream_transport_diagnostics (
+                 request_id, route_id, upstream_account_id,
+                 credential_generation, transport_revision, failure_kind,
+                 failure_stage, gateway_pod, gateway_node, failure_domain,
+                 observed_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (request_id, route_id, upstream_account_id) DO UPDATE SET
+                 credential_generation = excluded.credential_generation,
+                 transport_revision = excluded.transport_revision,
+                 failure_kind = excluded.failure_kind,
+                 failure_stage = excluded.failure_stage,
+                 gateway_pod = excluded.gateway_pod,
+                 gateway_node = excluded.gateway_node,
+                 failure_domain = excluded.failure_domain,
+                 observed_at = excluded.observed_at",
+        )
+        .bind(diagnostic.request_id.to_string())
+        .bind(diagnostic.route_id.to_string())
+        .bind(diagnostic.upstream_account_id.to_string())
+        .bind(diagnostic.credential_generation)
+        .bind(diagnostic.transport_revision)
+        .bind(diagnostic.failure_kind)
+        .bind(diagnostic.failure_stage)
+        .bind(diagnostic.gateway_pod)
+        .bind(diagnostic.gateway_node)
+        .bind(diagnostic.failure_domain)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Connection failures are local transport evidence until two independent
+    /// gateway failure domains observe the same account transport revision in
+    /// a bounded window. The existing healthy-admission epoch remains the
+    /// global cohort fence, so concurrent failures can open the breaker only
+    /// once after the cross-domain threshold is met.
+    pub(crate) async fn record_admitted_connection_failure_by_domain(
+        &self,
+        failure: AdmittedConnectionFailure<'_>,
+        health: UpstreamHealthConfig,
+    ) -> Result<ConnectionFailureDomainResult, AppError> {
+        let now = unix_millis();
+        let window_start = now.saturating_sub(CONNECTION_FAILURE_DOMAIN_WINDOW_MILLIS);
+        let mut transaction = self.pool.begin().await?;
+        // Serialize failure-domain observations through the existing healthy
+        // cohort row. Without this lock, two domains inserting different keys
+        // concurrently could each observe only itself and both miss the
+        // threshold. The no-op update also fences stale route revisions and
+        // attempts admitted before another transaction opened the breaker.
+        let cohort = sqlx::query(
+            "UPDATE upstream_account_health
+                SET updated_at = updated_at
+              WHERE upstream_account_id = $1
+                AND credential_generation = $2
+                AND consecutive_failures = 0
+                AND probe_lease_token = $3
+                AND EXISTS (
+                    SELECT 1 FROM upstream_accounts account
+                     WHERE account.id = upstream_account_health.upstream_account_id
+                       AND account.status = 'active'
+                       AND account.credential_generation = $2
+                       AND account.updated_at = $4
+                )",
+        )
+        .bind(failure.upstream_account_id.to_string())
+        .bind(failure.credential_generation)
+        .bind(failure.failure_epoch.to_string())
+        .bind(failure.transport_revision)
+        .execute(&mut *transaction)
+        .await?;
+        if cohort.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(ConnectionFailureDomainResult::default());
+        }
+        let observed = sqlx::query(
+            "INSERT INTO upstream_connection_failure_domains (
+                 upstream_account_id, credential_generation, transport_revision,
+                 failure_domain, last_failure_epoch, last_request_id,
+                 failure_stage, gateway_pod, gateway_node, first_failure_at,
+                 last_failure_at
+             ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10
+               FROM upstream_accounts account
+              WHERE account.id = $1 AND account.status = 'active'
+                AND account.credential_generation = $2
+                AND account.updated_at = $3
+             ON CONFLICT (
+                 upstream_account_id, credential_generation,
+                 transport_revision, failure_domain
+             ) DO UPDATE SET
+                 last_failure_epoch = excluded.last_failure_epoch,
+                 last_request_id = excluded.last_request_id,
+                 failure_stage = excluded.failure_stage,
+                 gateway_pod = excluded.gateway_pod,
+                 gateway_node = excluded.gateway_node,
+                 first_failure_at = CASE
+                     WHEN upstream_connection_failure_domains.last_failure_at < $11
+                         THEN excluded.first_failure_at
+                     ELSE upstream_connection_failure_domains.first_failure_at
+                 END,
+                 last_failure_at = excluded.last_failure_at
+             WHERE EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                  WHERE account.id = upstream_connection_failure_domains.upstream_account_id
+                    AND account.status = 'active'
+                    AND account.credential_generation = excluded.credential_generation
+                    AND account.updated_at = excluded.transport_revision
+             )",
+        )
+        .bind(failure.upstream_account_id.to_string())
+        .bind(failure.credential_generation)
+        .bind(failure.transport_revision)
+        .bind(failure.failure_domain)
+        .bind(failure.failure_epoch.to_string())
+        .bind(failure.request_id.to_string())
+        .bind(failure.failure_stage)
+        .bind(failure.gateway_pod)
+        .bind(failure.gateway_node)
+        .bind(now)
+        .bind(window_start)
+        .execute(&mut *transaction)
+        .await?;
+        if observed.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(ConnectionFailureDomainResult::default());
+        }
+        let distinct_failure_domains: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM upstream_connection_failure_domains domains
+               JOIN upstream_accounts account ON account.id = domains.upstream_account_id
+              WHERE domains.upstream_account_id = $1
+                AND domains.credential_generation = $2
+                AND domains.transport_revision = $3
+                AND domains.last_failure_at >= $4
+                AND domains.last_failure_epoch = $5
+                AND account.status = 'active'
+                AND account.credential_generation = $2
+                AND account.updated_at = $3",
+        )
+        .bind(failure.upstream_account_id.to_string())
+        .bind(failure.credential_generation)
+        .bind(failure.transport_revision)
+        .bind(window_start)
+        .bind(failure.failure_epoch.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let global_breaker_opened =
+            if distinct_failure_domains >= CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD {
+                let cooldown_until = now
+                    .saturating_add(UpstreamFailureKind::Connection.base_cooldown_millis(health));
+                sqlx::query(
+                    "UPDATE upstream_account_health SET
+                     consecutive_failures = 1,
+                     cooldown_until = $1,
+                     probe_lease_until = 0,
+                     last_failure_kind = 'connection',
+                     updated_at = $2
+                 WHERE upstream_account_id = $3
+                   AND credential_generation = $4
+                   AND consecutive_failures = 0
+                   AND probe_lease_token = $5
+                   AND EXISTS (
+                     SELECT 1 FROM upstream_accounts account
+                      WHERE account.id = upstream_account_health.upstream_account_id
+                        AND account.status = 'active'
+                        AND account.credential_generation = $4
+                        AND account.updated_at = $6
+                   )",
+                )
+                .bind(cooldown_until)
+                .bind(now)
+                .bind(failure.upstream_account_id.to_string())
+                .bind(failure.credential_generation)
+                .bind(failure.failure_epoch.to_string())
+                .bind(failure.transport_revision)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    == 1
+            } else {
+                false
+            };
+        transaction.commit().await?;
+        Ok(ConnectionFailureDomainResult {
+            distinct_failure_domains,
+            global_breaker_opened,
+        })
+    }
+
+    pub(crate) async fn clear_upstream_connection_failure_domain(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+        failure_domain: &str,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "DELETE FROM upstream_connection_failure_domains
+              WHERE upstream_account_id = $1
+                AND credential_generation = $2
+                AND transport_revision = $3
+                AND failure_domain = $4",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .bind(failure_domain)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub(crate) async fn request_upstream_transport_diagnostics(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT route_id, upstream_account_id, credential_generation,
+                    transport_revision, failure_kind, failure_stage,
+                    gateway_pod, gateway_node, failure_domain, observed_at
+               FROM request_upstream_transport_diagnostics
+              WHERE request_id = $1
+              ORDER BY observed_at, route_id, upstream_account_id",
+        )
+        .bind(request_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::model::RequestTransportDiagnosticView {
+                    route_id: Uuid::parse_str(&row.try_get::<String, _>("route_id")?).map_err(
+                        |_| AppError::Storage("transport diagnostic route is malformed".into()),
+                    )?,
+                    upstream_account_id: Uuid::parse_str(
+                        &row.try_get::<String, _>("upstream_account_id")?,
+                    )
+                    .map_err(|_| {
+                        AppError::Storage("transport diagnostic account is malformed".into())
+                    })?,
+                    credential_generation: row.try_get("credential_generation")?,
+                    transport_revision: row.try_get("transport_revision")?,
+                    failure_kind: row.try_get("failure_kind")?,
+                    failure_stage: row.try_get("failure_stage")?,
+                    gateway_pod: row.try_get("gateway_pod")?,
+                    gateway_node: row.try_get("gateway_node")?,
+                    failure_domain: row.try_get("failure_domain")?,
+                    observed_at: row.try_get("observed_at")?,
+                })
+            })
+            .collect()
+    }
+
     /// Ensures healthy state has a cross-process epoch without adding schema.
     /// The existing probe token column is otherwise unused while failures are
     /// zero. Concurrent replicas either install one epoch or observe the same
@@ -897,6 +1189,212 @@ mod tests {
         .await
         .unwrap();
         (directory, database, account_id)
+    }
+
+    async fn transport_revision(database: &Database, account_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+            .bind(account_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap()
+    }
+
+    fn connection_failure<'a>(
+        account_id: Uuid,
+        transport_revision: i64,
+        failure_epoch: Uuid,
+        request_id: Uuid,
+        failure_domain: &'a str,
+        gateway_pod: &'a str,
+    ) -> AdmittedConnectionFailure<'a> {
+        AdmittedConnectionFailure {
+            request_id,
+            upstream_account_id: account_id,
+            credential_generation: 1,
+            transport_revision,
+            failure_epoch,
+            failure_stage: "proxy_connect",
+            gateway_pod,
+            gateway_node: Some(failure_domain),
+            failure_domain,
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_health_requires_two_failure_domains_and_deduplicates_one_cohort() {
+        let (_directory, database, account_id) = fixture().await;
+        let revision = transport_revision(&database, account_id).await;
+        let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("healthy admission");
+        };
+        let first = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-a",
+                    "gateway-a",
+                ),
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.distinct_failure_domains, 1);
+        assert!(!first.global_breaker_opened);
+        let duplicate = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-a",
+                    "gateway-a-peer",
+                ),
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.distinct_failure_domains, 1);
+        assert!(!duplicate.global_breaker_opened);
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            failures, 0,
+            "one failure domain cannot suppress the account"
+        );
+
+        let second_domain = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-b",
+                    "gateway-b",
+                ),
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_domain.distinct_failure_domains, 2);
+        assert!(second_domain.global_breaker_opened);
+        assert!(
+            database
+                .claim_upstream_account_attempt(account_id, 1)
+                .await
+                .unwrap()
+                .is_unavailable()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_domains_are_transport_revision_fenced_and_recover_locally() {
+        let (_directory, database, account_id) = fixture().await;
+        let first_revision = transport_revision(&database, account_id).await;
+        let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("healthy admission");
+        };
+        database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    first_revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-a",
+                    "gateway-a",
+                ),
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        let next_revision = first_revision + 1;
+        sqlx::query("UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2")
+            .bind(next_revision)
+            .bind(account_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let next = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    next_revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-b",
+                    "gateway-b",
+                ),
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.distinct_failure_domains, 1);
+        assert!(!next.global_breaker_opened);
+        assert!(
+            database
+                .clear_upstream_connection_failure_domain(account_id, 1, next_revision, "node-b")
+                .await
+                .unwrap()
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_connection_failure_domains WHERE upstream_account_id = $1 AND transport_revision = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(next_revision)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_diagnostics_preserve_failure_stage_and_gateway_identity() {
+        let (_directory, database, account_id) = fixture().await;
+        let request_id = Uuid::now_v7();
+        let route_id = Uuid::now_v7();
+        database
+            .record_upstream_transport_diagnostic(UpstreamTransportDiagnostic {
+                request_id,
+                route_id,
+                upstream_account_id: account_id,
+                credential_generation: 1,
+                transport_revision: transport_revision(&database, account_id).await,
+                failure_kind: "connection",
+                failure_stage: "proxy_connect",
+                gateway_pod: "gateway-a",
+                gateway_node: Some("node-a"),
+                failure_domain: "node-a",
+            })
+            .await
+            .unwrap();
+        let diagnostics = database
+            .request_upstream_transport_diagnostics(request_id)
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].route_id, route_id);
+        assert_eq!(diagnostics[0].failure_stage, "proxy_connect");
+        assert_eq!(diagnostics[0].gateway_pod, "gateway-a");
+        assert_eq!(diagnostics[0].gateway_node.as_deref(), Some("node-a"));
+        assert_eq!(diagnostics[0].failure_domain, "node-a");
     }
 
     #[tokio::test]
