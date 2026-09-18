@@ -426,3 +426,48 @@ fn chat_sse_requires_complete_canonical_usage_and_one_consistent_chat_id() {
         assert!(capture.finish_summary().usage_invalid);
     }
 }
+
+#[test]
+fn chat_sse_accepts_a_fragmented_event_above_the_legacy_limit_without_accounting_pollution() {
+    const OBSERVED_LARGE_EVENT_BYTES: usize = 346_759;
+    const FRAGMENT_BYTES: usize = 64 * 1024;
+
+    let large = chat_chunk(
+        "chatcmpl-large",
+        json!([{
+            "index": 0,
+            "delta": {"content": "x".repeat(OBSERVED_LARGE_EVENT_BYTES)},
+            "finish_reason": null,
+        }]),
+        None,
+    );
+    assert!(large.len() > 256 * 1024);
+    assert!(large.len() < MAX_RESPONSES_SSE_EVENT_BYTES);
+
+    let terminal = [
+        chat_finish("chatcmpl-large"),
+        chat_usage_only("chatcmpl-large", usage(9, 3, 12)),
+        done().to_owned(),
+    ]
+    .concat();
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let mut archived = Vec::new();
+    for fragment in large.as_bytes().chunks(FRAGMENT_BYTES) {
+        for frame in capture.push_delivery_frames(fragment).unwrap() {
+            archived.extend_from_slice(&frame.bytes);
+        }
+    }
+    for frame in capture.push_delivery_frames(terminal.as_bytes()).unwrap() {
+        archived.extend_from_slice(&frame.bytes);
+    }
+    let summary = capture.finish_summary();
+    assert!(matches!(
+        summary.outcome,
+        ResponsesSseOutcome::Completed { .. }
+    ));
+    assert!(!summary.usage_invalid);
+    assert!(!summary.observed_protocol_invalid);
+    assert!(!summary.protocol_invalid);
+    assert!(archived.starts_with(large.as_bytes()));
+    assert!(archived.ends_with(done().as_bytes()));
+}

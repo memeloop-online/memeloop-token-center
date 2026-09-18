@@ -234,9 +234,10 @@ fn sanitizer_bounds_each_event_not_the_network_chunk() {
             .to_vec();
     event.extend_from_slice(&[b'x'; 512]);
     event.extend_from_slice(b"\"}\n\n");
-    let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 1;
+    const LEGACY_EVENT_LIMIT: usize = 256 * 1024;
+    let repeats = LEGACY_EVENT_LIMIT / event.len() + 1;
     let network_chunk = event.repeat(repeats);
-    assert!(network_chunk.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
+    assert!(network_chunk.len() > LEGACY_EVENT_LIMIT);
     assert!(network_chunk.len() <= MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK);
     assert!(repeats <= MAX_SSE_FRAMES_PER_NETWORK_CHUNK);
     let mut sanitizer = ResponsesStreamingSanitizer::default();
@@ -252,6 +253,47 @@ fn sanitizer_bounds_each_event_not_the_network_chunk() {
         oversized.push(&second),
         Err("upstream_response_event_too_large")
     );
+}
+
+#[test]
+fn sanitizer_accepts_a_fragmented_real_responses_terminal_above_the_legacy_limit() {
+    const OBSERVED_LARGE_EVENT_BYTES: usize = 346_759;
+    const FRAGMENT_BYTES: usize = 64 * 1024;
+
+    let created =
+        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-large\"}}\n\n";
+    let completed_value = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp-large",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "x".repeat(OBSERVED_LARGE_EVENT_BYTES),
+                }],
+            }],
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+            },
+        },
+    });
+    let completed = format!("event: response.completed\ndata: {completed_value}\n\n").into_bytes();
+    assert!(completed.len() > 256 * 1024);
+    assert!(completed.len() < MAX_RESPONSES_SSE_EVENT_BYTES);
+
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    assert_eq!(sanitizer.push(created).unwrap().as_ref(), created);
+    for fragment in completed.chunks(FRAGMENT_BYTES) {
+        assert!(sanitizer.push(fragment).unwrap().is_empty());
+    }
+    let released = sanitizer.finish().unwrap();
+    assert_eq!(released.as_ref(), completed.as_slice());
+    assert!(sanitizer.is_complete());
 }
 
 #[test]

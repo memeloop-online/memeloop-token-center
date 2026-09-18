@@ -2784,10 +2784,11 @@ mod tests {
 
     #[tokio::test]
     async fn missing_content_type_admission_preserves_a_large_network_chunk() {
+        const LEGACY_EVENT_LIMIT: usize = 256 * 1024;
         let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
-        let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
+        let repeats = LEGACY_EVENT_LIMIT / event.len() + 2;
         let body = Bytes::from(event.repeat(repeats));
-        assert!(body.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
+        assert!(body.len() > LEGACY_EVENT_LIMIT);
         let response = UpstreamResponse::for_test(
             http::HeaderMap::new(),
             http::Version::HTTP_2,
