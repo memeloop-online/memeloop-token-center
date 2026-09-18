@@ -58,6 +58,18 @@ export class RequestOverflowReconciliation {
   }
 
   /**
+   * The page claimed a ticket, then became ineligible before it could issue
+   * the authoritative query (for example while a foreground load, pause, or
+   * filter change committed). Keep the edge and wait for the page to reopen
+   * the lane; treating this as a successful pass would lose live events.
+   */
+  defer(ticket: number) {
+    if (this.disposed || this.activeTicket !== ticket) return;
+    this.setBlocked(true);
+    this.finish(ticket, false);
+  }
+
+  /**
    * Cancel this scope's work. When preserveDirty is true an interrupted pass
    * remains sticky, while the existing cooldown boundary is retained.
    */

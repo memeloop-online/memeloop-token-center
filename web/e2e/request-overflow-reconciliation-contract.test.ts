@@ -76,6 +76,30 @@ test('failure stays sticky but retries only after the hard cooldown', () => {
   assert.deepEqual(started, [1, 2]);
 });
 
+test('a claimed ticket deferred by a page eligibility race remains dirty until its lane reopens', () => {
+  const time = clock();
+  const started: number[] = [];
+  const reconciliation = new RequestOverflowReconciliation(time, ticket => started.push(ticket));
+
+  reconciliation.signal();
+  time.advance(requestOverflowReconcileDelayMs);
+  assert.deepEqual(started, [1]);
+
+  // This models the timer claiming the ticket immediately before React commits
+  // a foreground load, pause, or filter. It must not be recorded as success.
+  reconciliation.defer(1);
+  for (let index = 0; index < 1_000; index++) reconciliation.signal();
+  time.advance(10_000);
+  assert.deepEqual(started, [1], 'a blocked page schedules no background queries');
+  assert.equal(time.size, 0, 'the dirty burst remains one sticky edge while blocked');
+
+  reconciliation.setBlocked(false);
+  time.advance(requestOverflowReconcileCooldownMs - 10_000 - 1);
+  assert.deepEqual(started, [1], 'reopen still honors the completed-pass cooldown');
+  time.advance(1);
+  assert.deepEqual(started, [1, 2], 'the retained edge receives one authoritative retry');
+});
+
 test('blocking and interrupted pagination preserve one dirty edge without wall-clock races', () => {
   const time = clock();
   const started: number[] = [];

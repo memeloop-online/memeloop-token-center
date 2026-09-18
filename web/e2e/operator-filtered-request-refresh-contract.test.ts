@@ -81,7 +81,10 @@ test('filtered views stay stable: published batches only mark them stale for a m
 
   const refreshStart = source.indexOf('async function refreshOverflowFirstPage(ticket: number)');
   const refreshEnd = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false)', refreshStart);
-  assert.doesNotMatch(source.slice(refreshStart, refreshEnd), /\|\| loadedHistoryIds\.current\.size/,
+  const refresh = source.slice(refreshStart, refreshEnd);
+  assert.doesNotMatch(refresh, /\|\| loadedHistoryIds\.current\.size/,
     'the explicit post-pagination compensation may reconcile the first page without dropping history');
+  assert.match(refresh, /overflowRefresh\.current\?\.defer\(ticket\)/,
+    'a timer that loses eligibility keeps its overflow edge rather than completing successfully');
   assert.match(source, /RequestOverflowReconciliation/);
 });

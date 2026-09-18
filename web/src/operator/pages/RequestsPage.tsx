@@ -104,11 +104,19 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     overflowRefresh.current?.reset(preserveDirty, resetCooldown);
   }
 
+  function syncOverflowRefreshBlocked() {
+    const currentScope = scope.current;
+    overflowRefresh.current?.setBlocked(
+      !currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters)
+      || loadingRef.current || paused.current,
+    );
+  }
+
   async function refreshOverflowFirstPage(ticket: number) {
     const currentScope = scope.current;
     if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters)
       || loadingRef.current || paused.current) {
-      overflowRefresh.current?.finish(ticket, true);
+      overflowRefresh.current?.defer(ticket);
       return;
     }
     const controller = new AbortController();
@@ -120,7 +128,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       });
       const latest = scope.current;
       if (controller.signal.aborted || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant
-        || latest.filters !== currentScope.filters || typedFiltersActive(latest.filters)) return;
+        || latest.filters !== currentScope.filters || typedFiltersActive(latest.filters)) {
+        syncOverflowRefreshBlocked();
+        return;
+      }
       // Replace the live window with the authoritative server first page, then
       // re-apply the bounded live buffer. Never runs for filtered views.
       const current = requestsRef.current;
@@ -154,7 +165,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const refreshWasActive = older && (overflowRefresh.current?.needsReconcile ?? false);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
-    cancelOverflowRefresh();
+    // Its dirty edge remains sticky: a just-claimed timer must not be mistaken
+    // for a completed authoritative refresh while the foreground lane owns it.
+    overflowRefresh.current?.setBlocked(true);
+    cancelOverflowRefresh(true);
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -195,6 +209,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         loadAbort.current = null;
         loadingRef.current = false;
         setLoading(false);
+        syncOverflowRefreshBlocked();
         // Pagination owns the network lane while it is active, but it cannot
         // consume an already-dirty first-page overflow. Re-arm exactly one
         // reconciliation after the older page settles.
@@ -245,10 +260,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     if (streamPaused) {
-      overflowRefresh.current?.setBlocked(true);
+      syncOverflowRefreshBlocked();
       cancelOverflowRefresh(true);
     } else {
-      overflowRefresh.current?.setBlocked(loadingRef.current);
+      syncOverflowRefreshBlocked();
     }
   }, [streamPaused]);
 
@@ -277,8 +292,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }, [streamRevision, streamPaused]);
 
   useEffect(() => {
-    overflowRefresh.current?.setBlocked(loading || streamPaused);
-  }, [loading]);
+    syncOverflowRefreshBlocked();
+  }, [filters, loading, streamPaused]);
 
   async function openRequestDetail(requestId: string) {
     if (selectedRequestId.current !== requestId) setDetail(undefined);
