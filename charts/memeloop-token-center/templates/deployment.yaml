@@ -43,8 +43,9 @@ kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   annotations:
-    # Argo waits for the reservation reclaimer before applying new producers.
-    argocd.argoproj.io/sync-wave: {{ ternary "-1" "0" (eq $role "worker") | quote }}
+    # Worker joins ServiceAccount/PVC creation in wave 0. Argo waits for it
+    # before applying split-role producers, including on a fresh installation.
+    argocd.argoproj.io/sync-wave: {{ ternary "1" "0" (or (eq $role "gateway") (eq $role "control")) | quote }}
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}

@@ -124,7 +124,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     for (const deployment of deployments) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
-      assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'worker' ? '-1' : '0');
+      assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'gateway' || role === 'control' ? '1' : '0');
       const pod = deployment.spec.template.spec;
       const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool');
       const spoolVolume = pod.volumes?.find(item => item.name === 'responses-request-spool');
