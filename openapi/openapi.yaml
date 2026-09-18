@@ -2085,10 +2085,10 @@ paths:
         - $ref: '#/components/parameters/TenantFilter'
       responses:
         '200':
-          description: Refreshed, stale, unsupported, or already-syncing catalog state.
+          description: Refreshed, stale, unsupported, or already-syncing catalog state, returning up to 10000 active and 10000 disabled entries without a follow-up GET.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/UpstreamModelCatalog' }
+              schema: { $ref: '#/components/schemas/UpstreamModelCatalogSyncResponse' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -7894,22 +7894,38 @@ components:
               status: { const: disabled }
               disabled_at: { type: integer, format: int64 }
               reason: { const: removed_from_upstream }
-        price_sync:
-          type: object
-          additionalProperties: false
-          description: Present on sync responses only. Directory availability is committed before pricing. Skipped means discovery failed, a directory lease was already held, or the successful directory was empty. Partial includes unavailable sources, unmatched models, or ambiguous matches. No automatic sync overwrites manual prices.
-          required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
-          properties:
-            status: { type: string, enum: [ready, partial, error, skipped] }
-            currency: { const: USD }
-            imported: { type: integer, minimum: 0 }
-            preserved: { type: integer, minimum: 0 }
-            unmatched: { type: integer, minimum: 0 }
-            ambiguous: { type: integer, minimum: 0 }
-            failed_sources:
-              type: array
-              items: { type: string }
-            error_code: { type: [string, 'null'], enum: [price_sync_failed, null] }
+    UpstreamModelCatalogSyncResponse:
+      type: object
+      additionalProperties: false
+      description: POST-only catalog synchronization result. Returns the complete bounded active catalog and up to 10000 disabled entries; unlike paginated GET, no additional listing request is needed. The price_sync outcome is always present and is independent of directory status.
+      required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models, disabled_models, price_sync]
+      properties:
+        account_id: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/account_id' }
+        status: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/status' }
+        credential_generation: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/credential_generation' }
+        last_attempt_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/last_attempt_at' }
+        last_success_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/last_success_at' }
+        expires_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/expires_at' }
+        error_code: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/error_code' }
+        models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/models' }
+        disabled_models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/disabled_models' }
+        price_sync: { $ref: '#/components/schemas/UpstreamModelPriceSyncResult' }
+    UpstreamModelPriceSyncResult:
+      type: object
+      additionalProperties: false
+      description: Directory availability is committed before pricing. Skipped means discovery failed, a directory lease was already held, or the successful directory was empty. Partial includes unavailable sources, unmatched models, or ambiguous matches. No automatic sync overwrites manual prices.
+      required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
+      properties:
+        status: { type: string, enum: [ready, partial, error, skipped] }
+        currency: { const: USD }
+        imported: { type: integer, minimum: 0 }
+        preserved: { type: integer, minimum: 0 }
+        unmatched: { type: integer, minimum: 0 }
+        ambiguous: { type: integer, minimum: 0 }
+        failed_sources:
+          type: array
+          items: { type: string }
+        error_code: { type: [string, 'null'], enum: [price_sync_failed, null] }
     AggregatedUpstreamModel:
       type: object
       additionalProperties: false

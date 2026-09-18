@@ -319,7 +319,12 @@ async fn sync_account_models(
         return Ok(CatalogSyncResult {
             catalog: state
                 .db
-                .upstream_model_catalog(account_id, tenant_external_id, None, 100)
+                .upstream_model_catalog(
+                    account_id,
+                    tenant_external_id,
+                    None,
+                    MAX_MODEL_COUNT as i64,
+                )
                 .await?,
             price_sync: CatalogPriceSyncResult::skipped(),
         });
@@ -419,7 +424,7 @@ async fn sync_account_models(
     Ok(CatalogSyncResult {
         catalog: state
             .db
-            .upstream_model_catalog(account_id, tenant_external_id, None, 100)
+            .upstream_model_catalog(account_id, tenant_external_id, None, MAX_MODEL_COUNT as i64)
             .await?,
         price_sync,
     })
@@ -913,7 +918,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Cross both the 100-item response page and the 500-item public pricing
+        // Cross both the old 100-item response page and the 500-item public pricing
         // limit. Only two models need prices, keeping the regression inexpensive.
         let mut models = (0..500)
             .map(|index| json!({"id": format!("unpriced-{index:03}")}))
@@ -941,7 +946,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.catalog.status, "ready");
-        assert_eq!(result.catalog.models.len(), 100);
+        assert_eq!(result.catalog.models.len(), 502);
         assert_eq!(result.price_sync.status, "partial");
         assert_eq!(result.price_sync.imported, 1);
         assert_eq!(result.price_sync.preserved, 1);
@@ -1013,6 +1018,7 @@ mod tests {
             .unwrap();
         assert_eq!(failed.catalog.status, "stale");
         assert_eq!(failed.price_sync.status, "skipped");
+        assert_eq!(failed.catalog.disabled_models.len(), 501);
         let catalog = state
             .db
             .upstream_model_catalog(account.id, tenant, None, 10_000)

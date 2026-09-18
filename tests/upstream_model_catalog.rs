@@ -441,14 +441,16 @@ async fn aggregate_distinguishes_terminal_unsupported_from_unknown_network_and_a
 #[tokio::test]
 async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snapshot() {
     let server = MockServer::start().await;
+    let mut model_data = vec![
+        json!({"id": "gpt-alpha"}),
+        json!({"id": "gpt-beta", "protocol": "openai"}),
+    ];
+    model_data.extend((0..249).map(|index| json!({"id": format!("catalog-{index:03}")})));
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .and(matches_header("authorization", "Bearer catalog-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                {"id": "gpt-alpha"},
-                {"id": "gpt-beta", "protocol": "openai"}
-            ]
+            "data": model_data
         })))
         .expect(1)
         .mount(&server)
@@ -486,9 +488,28 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
     .await;
     assert_eq!(status, StatusCode::OK, "{synced}");
     assert_eq!(synced["status"], "ready");
-    assert_eq!(synced["models"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        synced["models"].as_array().unwrap().len(),
+        251,
+        "POST must return the full active catalog without a follow-up GET"
+    );
     assert_eq!(synced["price_sync"]["status"], "error");
     assert_eq!(synced["disabled_models"], json!([]));
+    let (status, page) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstreams/{}/models?tenant_external_id=catalog-tenant&limit=1",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["models"].as_array().unwrap().len(), 1);
+    assert!(
+        page.get("price_sync").is_none(),
+        "GET remains a catalog read, not a synchronization result"
+    );
 
     // The one expected mock has been consumed. A 404 is reduced to a static
     // code while the previous complete snapshot remains searchable.
@@ -505,9 +526,33 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
     assert_eq!(status, StatusCode::OK, "{failed}");
     assert_eq!(failed["status"], "stale");
     assert_eq!(failed["error_code"], "upstream_unavailable");
-    assert_eq!(failed["models"].as_array().unwrap().len(), 2);
+    assert_eq!(failed["models"].as_array().unwrap().len(), 251);
     assert_eq!(failed["price_sync"]["status"], "skipped");
     assert_eq!(failed["disabled_models"], json!([]));
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (status, removed) = request(
+        &state,
+        "POST",
+        &format!(
+            "/internal/v1/upstreams/{}/models/sync?tenant_external_id=catalog-tenant",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["models"], json!([]));
+    assert_eq!(
+        removed["disabled_models"].as_array().unwrap().len(),
+        251,
+        "POST must also return disabled evidence beyond the GET default page"
+    );
+    assert_eq!(removed["price_sync"]["status"], "skipped");
 
     let (status, cross_tenant) = request(
         &state,
