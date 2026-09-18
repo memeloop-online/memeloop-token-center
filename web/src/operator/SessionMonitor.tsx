@@ -396,7 +396,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       };
       let retryDelay = 0;
       const refresh = async () => {
-        const targets = sessionSummaryTargets(batchEventIdentities);
+        const targets = sessionSummaryTargets(batchEventIdentities, filtersRef.current.state);
         let listLoaded = false;
         if (forceFullList || targets.requiresFullReload) {
           listLoaded = await loadSessions(false, filtersRef.current, true);

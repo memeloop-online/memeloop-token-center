@@ -71,11 +71,22 @@ export function drainSessionEventIdentities(queue: Set<string>) {
   return drained;
 }
 
-export function sessionSummaryTargets(eventIdentities: ReadonlySet<string>) {
+export function sessionSummaryTargets(
+  eventIdentities: ReadonlySet<string>,
+  state: '' | 'active' | 'has_errors' = '',
+) {
   const targets = new Map<string, SessionIdentity>();
   let unknown = false;
+  let activeMembershipChanged = false;
   for (const value of eventIdentities) {
     const event = JSON.parse(value) as SessionEventIdentity;
+    // A terminal request can make an otherwise visible active session vanish.
+    // The exact-summary endpoint correctly omits it, but cannot supply the
+    // row that replaces it in the filtered first page. Refresh that one
+    // coalesced terminal batch authoritatively instead of retaining a ghost.
+    if (state === 'active' && (event.event_kind === 'finished' || event.event_kind === 'projected')) {
+      activeMembershipChanged = true;
+    }
     if (!event.session_id) {
       unknown = true;
       continue;
@@ -89,7 +100,7 @@ export function sessionSummaryTargets(eventIdentities: ReadonlySet<string>) {
   }
   return {
     identities: [...targets.values()],
-    requiresFullReload: unknown || targets.size > maxSessionSummaryIdentities,
+    requiresFullReload: unknown || activeMembershipChanged || targets.size > maxSessionSummaryIdentities,
   };
 }
 

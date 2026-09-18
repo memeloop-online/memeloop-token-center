@@ -167,6 +167,17 @@ test('event batches resolve exact summary identities and fail closed for unknown
   assert.equal(sessionSummaryTargets(drainSessionEventIdentities(queued)).requiresFullReload, true,
     'an event without a tenant-owned session identity cannot be patched safely');
 
+  enqueueSessionEventIdentity(queued, {
+    key_id: 'key-active',
+    request_id: 'request-active',
+    event_kind: 'finished',
+    status_code: 200,
+    archive_state: 'bound',
+    session_context: { association: 'confirmed', session_id: 'session-active' },
+  });
+  assert.equal(sessionSummaryTargets(drainSessionEventIdentities(queued), 'active').requiresFullReload, true,
+    'one coalesced terminal batch must rebuild an active-filter page after its row can disappear');
+
   for (let index = 0; index < 101; index += 1) {
     enqueueSessionEventIdentity(queued, {
       key_id: 'key-a', request_id: `request-${index}`, event_kind: 'finished', status_code: 200, archive_state: 'bound',
