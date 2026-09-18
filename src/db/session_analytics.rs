@@ -86,14 +86,16 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                      request.key_id DESC
             LIMIT $3
        ), projected_candidates AS MATERIALIZED (
-           SELECT cluster.tenant_id, projection.key_id,
+           SELECT COALESCE(projected_key.tenant_id, cluster.tenant_id) AS tenant_id,
+                  projection.key_id,
                   projection.cluster_id AS session_id,
                   projection.updated_at AS last_activity_at
              FROM conversation_key_clusters projection
-             JOIN conversation_clusters cluster ON cluster.id = projection.cluster_id
              LEFT JOIN key_records projected_key ON projected_key.id = projection.key_id
-            WHERE cluster.tenant_id = $1
-              AND (projected_key.id IS NULL OR projected_key.tenant_id = cluster.tenant_id)
+             LEFT JOIN conversation_clusters cluster ON cluster.id = projection.cluster_id
+            WHERE COALESCE(projected_key.tenant_id, cluster.tenant_id) = $1
+              AND (projected_key.id IS NULL OR cluster.id IS NULL
+                   OR projected_key.tenant_id = cluster.tenant_id)
               AND ($2 = '' OR projection.key_id = $2)
             ORDER BY projection.updated_at DESC, projection.cluster_id DESC,
                      projection.key_id DESC
@@ -148,7 +150,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
        ), projected AS (
-           SELECT cluster.tenant_id, projection.key_id,
+           SELECT recent.tenant_id, projection.key_id,
                   projection.cluster_id AS session_id,
                   projection.updated_at AS last_activity_at,
                   projection.request_count
@@ -156,13 +158,6 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              JOIN conversation_key_clusters projection
                ON projection.key_id = recent.key_id
               AND projection.cluster_id = recent.session_id
-             JOIN conversation_clusters cluster
-               ON cluster.id = projection.cluster_id
-              AND cluster.tenant_id = recent.tenant_id
-             LEFT JOIN key_records projected_key
-               ON projected_key.id = projection.key_id
-            WHERE projected_key.id IS NULL
-               OR projected_key.tenant_id = cluster.tenant_id
        ), archived AS (
            SELECT archive.tenant_id, archive.key_id, archive.session_id,
                   archive.last_activity_at, archive.requests, archive.errors,
@@ -497,17 +492,18 @@ impl Database {
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
                ), projected AS (
-                   SELECT cluster.tenant_id, projection.key_id,
+                   SELECT COALESCE(projected_key.tenant_id, cluster.tenant_id) AS tenant_id,
+                          projection.key_id,
                           projection.cluster_id AS session_id,
                           projection.updated_at AS last_activity_at,
                           projection.request_count
                      FROM conversation_key_clusters projection
-                     JOIN conversation_clusters cluster
-                       ON cluster.id = projection.cluster_id
                      LEFT JOIN key_records projected_key
                        ON projected_key.id = projection.key_id
-                    WHERE cluster.tenant_id = $1
-                      AND (projected_key.id IS NULL
+                     LEFT JOIN conversation_clusters cluster
+                       ON cluster.id = projection.cluster_id
+                    WHERE COALESCE(projected_key.tenant_id, cluster.tenant_id) = $1
+                      AND (projected_key.id IS NULL OR cluster.id IS NULL
                            OR projected_key.tenant_id = cluster.tenant_id)
                       AND ($2 = '' OR projection.key_id = $2)
                ), archived AS (
