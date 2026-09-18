@@ -415,12 +415,15 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
   const listCount = observation.sessionListRequests.length;
+  const summaryCount = observation.sessionSummaryRequests.length;
   const detailCount = observation.detailRequests.length;
   releaseOtherEvent();
   await eventually(
-    () => assert.ok(observation.sessionListRequests.length > listCount),
+    () => assert.ok(
+      observation.sessionListRequests.length > listCount || observation.sessionSummaryRequests.length > summaryCount,
+    ),
     defaultRequestRefreshInterval + 3_000,
-    'another credential event did not refresh the session list',
+    'another credential event did not refresh the bounded session projection',
   );
   await page.locator('.session-live-state.reconnecting').waitFor();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
