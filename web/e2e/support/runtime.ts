@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser } from 'playwright';
 import { streamSse } from '../../src/api.js';
@@ -142,7 +141,7 @@ export function observeSessionReadyRequests({
         if (settled || signal.aborted) return;
       }
       if (!settled && !signal.aborted) {
-        await delay(100, undefined, { signal }).catch(() => undefined);
+        await delay(100);
       }
     }
   })().catch(fail);
