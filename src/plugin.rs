@@ -2375,7 +2375,7 @@ fn load_operator_ui_modules(
     Ok(modules)
 }
 
-fn safe_operator_ui_module_entry(value: &str) -> bool {
+pub(crate) fn safe_operator_ui_module_entry(value: &str) -> bool {
     let path = Path::new(value);
     if value.is_empty()
         || value.len() > 240
@@ -2396,7 +2396,7 @@ fn safe_operator_ui_module_entry(value: &str) -> bool {
         .all(|component| matches!(component, PathComponent::Normal(_)))
 }
 
-fn safe_plugin_token(value: &str, maximum: usize) -> bool {
+pub(crate) fn safe_plugin_token(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
         && value

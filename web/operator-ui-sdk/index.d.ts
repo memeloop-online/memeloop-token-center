@@ -17,7 +17,7 @@ export interface OperatorUiContributionV1 {
   module_sha256: `sha256:${string}`;
   component_id: string;
   component_props?: Record<string, unknown> | null;
-  data_endpoint?: string | null;
+  data_endpoint?: string;
 }
 
 export interface OperatorUiServiceDataResponseV1 {

@@ -436,9 +436,9 @@ export function PluginPageExtensions({ extensions, token, tenant, locale, onNavi
   if (extensions.length === 0) return null;
   return <section className="operator-page-plugin-extensions" aria-label="Plugin extensions">
     {extensions.map((registered) => registered.contribution.renderer === 'component_v1'
-      ? <div className="operator-page-plugin-extension" aria-label={registered.contribution.label} key={`${registered.pluginId}:${registered.contribution.id}`}>
+      ? <section className="operator-page-plugin-extension" aria-label={registered.contribution.label} key={`${registered.pluginId}:${registered.contribution.id}`}>
         <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
-      </div>
+      </section>
       : <article className="panel" key={`${registered.pluginId}:${registered.contribution.id}`}>
         <div className="panel-title"><h2>{registered.contribution.label}</h2></div>
         <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />

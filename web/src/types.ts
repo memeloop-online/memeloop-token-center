@@ -774,7 +774,7 @@ export interface PluginOperatorUiContribution {
   /** Optional core presentation used by typed_data_v1. */
   presentation?: PluginOperatorUiPresentation | null;
   /** Optional primary service-data endpoint. Components may load any endpoint declared by their manifest. */
-  data_endpoint?: string | null;
+  data_endpoint?: string;
 }
 
 export interface PluginServiceDataEndpoint {
