@@ -42,6 +42,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+  annotations:
+    # Argo waits for the reservation reclaimer before applying new producers.
+    argocd.argoproj.io/sync-wave: {{ ternary "-1" "0" (eq $role "worker") | quote }}
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
