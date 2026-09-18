@@ -1711,6 +1711,7 @@ mod tests {
     #[tokio::test]
     async fn observe_rollout_ignores_legacy_single_domain_connection_breaker() {
         let (_directory, database, account_id) = fixture().await;
+        let revision = transport_revision(&database, account_id).await;
         assert!(
             database
                 .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
@@ -1719,7 +1720,15 @@ mod tests {
         );
         assert!(
             database
-                .claim_upstream_account_attempt(account_id, 1)
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    UpstreamHealthConfig {
+                        failure_domain_enforcement_enabled: false,
+                        ..UpstreamHealthConfig::DEFAULT
+                    },
+                )
                 .await
                 .unwrap()
                 .is_healthy(),
