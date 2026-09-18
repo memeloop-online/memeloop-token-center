@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn quota_batch_deadline_fills_a_large_request_without_reordering_completed_items() {
         let account_ids = (1..=MAX_QUOTA_BATCH_ACCOUNTS)
-            .map(Uuid::from_u128)
+            .map(|index| Uuid::from_u128(index as u128))
             .collect::<Vec<_>>();
         let results = ordered_quota_batch_results(
             &account_ids,
