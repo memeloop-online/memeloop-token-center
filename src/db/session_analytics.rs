@@ -86,12 +86,14 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                      request.key_id DESC
             LIMIT $3
        ), projected_candidates AS MATERIALIZED (
-           SELECT key_record.tenant_id, projection.key_id,
+           SELECT cluster.tenant_id, projection.key_id,
                   projection.cluster_id AS session_id,
                   projection.updated_at AS last_activity_at
              FROM conversation_key_clusters projection
-             JOIN key_records key_record ON key_record.id = projection.key_id
-            WHERE key_record.tenant_id = $1
+             JOIN conversation_clusters cluster ON cluster.id = projection.cluster_id
+             LEFT JOIN key_records projected_key ON projected_key.id = projection.key_id
+            WHERE cluster.tenant_id = $1
+              AND (projected_key.id IS NULL OR projected_key.tenant_id = cluster.tenant_id)
               AND ($2 = '' OR projection.key_id = $2)
             ORDER BY projection.updated_at DESC, projection.cluster_id DESC,
                      projection.key_id DESC
@@ -146,7 +148,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
        ), projected AS (
-           SELECT key_record.tenant_id, projection.key_id,
+           SELECT cluster.tenant_id, projection.key_id,
                   projection.cluster_id AS session_id,
                   projection.updated_at AS last_activity_at,
                   projection.request_count
@@ -154,9 +156,13 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              JOIN conversation_key_clusters projection
                ON projection.key_id = recent.key_id
               AND projection.cluster_id = recent.session_id
-             JOIN key_records key_record
-               ON key_record.id = projection.key_id
-              AND key_record.tenant_id = recent.tenant_id
+             JOIN conversation_clusters cluster
+               ON cluster.id = projection.cluster_id
+              AND cluster.tenant_id = recent.tenant_id
+             LEFT JOIN key_records projected_key
+               ON projected_key.id = projection.key_id
+            WHERE projected_key.id IS NULL
+               OR projected_key.tenant_id = cluster.tenant_id
        ), archived AS (
            SELECT archive.tenant_id, archive.key_id, archive.session_id,
                   archive.last_activity_at, archive.requests, archive.errors,
@@ -261,7 +267,9 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                   ) AS activity_rank
              FROM recent_activity
        )
-       SELECT recent.*, key_record.alias AS key_alias,
+       SELECT recent.*,
+              COALESCE(key_record.alias,
+                       'retired-credential-' || recent.key_id) AS key_alias,
               COALESCE(totals.currency, '') AS currency,
               COALESCE(totals.cost_micros, 0) AS cost_micros,
               COALESCE(completed.requests, 0) AS requests,
@@ -287,7 +295,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                    WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
                    ELSE 'error' END AS last_status
          FROM recent
-         JOIN key_records key_record
+         LEFT JOIN key_records key_record
            ON key_record.id = recent.key_id
           AND key_record.tenant_id = recent.tenant_id
          LEFT JOIN completed
@@ -489,13 +497,18 @@ impl Database {
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
                ), projected AS (
-                   SELECT key_record.tenant_id, projection.key_id,
+                   SELECT cluster.tenant_id, projection.key_id,
                           projection.cluster_id AS session_id,
                           projection.updated_at AS last_activity_at,
                           projection.request_count
                      FROM conversation_key_clusters projection
-                     JOIN key_records key_record ON key_record.id = projection.key_id
-                    WHERE key_record.tenant_id = $1
+                     JOIN conversation_clusters cluster
+                       ON cluster.id = projection.cluster_id
+                     LEFT JOIN key_records projected_key
+                       ON projected_key.id = projection.key_id
+                    WHERE cluster.tenant_id = $1
+                      AND (projected_key.id IS NULL
+                           OR projected_key.tenant_id = cluster.tenant_id)
                       AND ($2 = '' OR projection.key_id = $2)
                ), archived AS (
                    SELECT tenant_id, key_id, session_id, last_activity_at,
@@ -519,7 +532,7 @@ impl Database {
                ), filterable AS (
                    SELECT ranked.*
                      FROM ranked
-                     JOIN key_records filter_key
+                     LEFT JOIN key_records filter_key
                        ON filter_key.id = ranked.key_id
                       AND filter_key.tenant_id = ranked.tenant_id
                      LEFT JOIN completed
@@ -538,7 +551,8 @@ impl Database {
                            OR ($6 = 'has_errors' AND
                                COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0))
                       AND ($8 = '' OR LOWER(ranked.session_id) LIKE $8 ESCAPE '\'
-                           OR LOWER(filter_key.alias) LIKE $8 ESCAPE '\'
+                           OR LOWER(COALESCE(filter_key.alias,
+                               'retired-credential-' || ranked.key_id)) LIKE $8 ESCAPE '\'
                            OR EXISTS (
                               SELECT 1 FROM conversation_observations named_observation
                                WHERE named_observation.key_id = ranked.key_id
@@ -666,7 +680,9 @@ impl Database {
                           ) AS activity_rank
                      FROM recent_activity
                )
-               SELECT recent.*, key_record.alias AS key_alias,
+               SELECT recent.*,
+                      COALESCE(key_record.alias,
+                               'retired-credential-' || recent.key_id) AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
                       COALESCE(totals.cost_micros, 0) AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,
@@ -692,7 +708,7 @@ impl Database {
                            WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
                            ELSE 'error' END AS last_status
                  FROM recent
-                 JOIN key_records key_record
+                 LEFT JOIN key_records key_record
                    ON key_record.id = recent.key_id
                   AND key_record.tenant_id = recent.tenant_id
                  LEFT JOIN completed

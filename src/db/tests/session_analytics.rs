@@ -45,6 +45,92 @@ fn candidate_first_dispatch_is_only_the_unfiltered_first_page() {
 }
 
 #[tokio::test]
+async fn sqlite_operator_sessions_keep_a_stable_retired_credential_identity() {
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("retired-session-key.db").display()
+    );
+    let database = Database::connect(&database_url)
+        .await
+        .expect("connect SQLite database");
+    database.migrate().await.expect("migrate SQLite database");
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "retired-session-tenant".into(),
+                principal_external_id: "retired-session-principal".into(),
+                alias: "legacy API2 alias that must disappear".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .expect("create retired session key");
+    let key = database
+        .authenticate_key(&issued.key, PEPPER)
+        .await
+        .expect("authenticate retired session key");
+    let cluster_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO conversation_clusters (id, tenant_id, principal_id, created_at, updated_at) VALUES ($1, $2, $3, 10, 20)",
+    )
+    .bind(cluster_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.principal_id.to_string())
+    .execute(&database.pool)
+    .await
+    .expect("insert retained conversation cluster");
+    sqlx::query(
+        "INSERT INTO conversation_key_clusters (key_id, cluster_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, 20, 1, 0)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(cluster_id.to_string())
+    .execute(&database.pool)
+    .await
+    .expect("insert retained conversation projection");
+    sqlx::query(
+        "INSERT INTO session_usage_totals (tenant_id, key_id, session_id, currency, last_activity_at, requests, errors, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_count, duration_sum_ms, cost_micros) VALUES ($1, $2, $3, 'USD', 20, 1, 0, 3, 4, 0, 0, 0, 1, 5, 7)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(cluster_id.to_string())
+    .execute(&database.pool)
+    .await
+    .expect("insert retained session usage");
+    sqlx::query("DELETE FROM key_records WHERE id = $1")
+        .bind(key.key_id.to_string())
+        .execute(&database.pool)
+        .await
+        .expect("physically remove retired key");
+
+    let sessions = database
+        .operator_recent_sessions(
+            "retired-session-tenant",
+            LogicalSessionListFilter {
+                limit: 10,
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list retained operator sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].key_id, key.key_id);
+    assert_eq!(
+        sessions[0].key_alias,
+        format!("retired-credential-{}", key.key_id)
+    );
+    assert!(!sessions[0].key_alias.contains("API2"));
+}
+
+#[tokio::test]
 async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_history_growth() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL session plan contract");

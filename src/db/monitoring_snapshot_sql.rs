@@ -140,7 +140,8 @@ pub(super) fn monitoring_upstream_health_batch_sql(account_count: usize) -> Opti
     Some(format!(
         r#"WITH selected(upstream_account_id) AS (VALUES {selected})
 SELECT target.upstream_account_id,
-       COALESCE(account.name, deleted.name, target.upstream_account_id) AS name,
+       COALESCE(account.name, deleted.name,
+                'retired-upstream-' || target.upstream_account_id) AS name,
        account.status, account.credential_generation,
        health.credential_generation AS health_generation,
        health.consecutive_failures, health.cooldown_until, health.updated_at
