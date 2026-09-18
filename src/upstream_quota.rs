@@ -9,7 +9,7 @@ pub(crate) mod reset;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -30,6 +30,63 @@ const QUOTA_TIMEOUT: Duration = Duration::from_secs(8);
 const QUOTA_MAX_READ_BUDGET: Duration = Duration::from_secs(30);
 const QUOTA_PERMIT_WAIT: Duration = Duration::from_secs(35);
 const QUOTA_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(70);
+// Leaves ten seconds for authorization/account lookup, response serialization,
+// and browser scheduling before the operator client's 85-second deadline.
+const QUOTA_TOTAL_READ_BUDGET: Duration = Duration::from_secs(75);
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuotaRequestTrigger {
+    Manual,
+    Bulk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuotaReadTrigger {
+    Manual,
+    Bulk,
+    BackgroundRecovery,
+    ResetWorkflow,
+}
+
+impl QuotaReadTrigger {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Bulk => "bulk",
+            Self::BackgroundRecovery => "background_recovery",
+            Self::ResetWorkflow => "reset_workflow",
+        }
+    }
+}
+
+impl From<QuotaRequestTrigger> for QuotaReadTrigger {
+    fn from(value: QuotaRequestTrigger) -> Self {
+        match value {
+            QuotaRequestTrigger::Manual => Self::Manual,
+            QuotaRequestTrigger::Bulk => Self::Bulk,
+        }
+    }
+}
+
+pub(crate) fn log_quota_read_completed(
+    account: &UpstreamAccountView,
+    trigger: QuotaReadTrigger,
+    outcome: &'static str,
+    error_code: &'static str,
+    started: tokio::time::Instant,
+) {
+    tracing::info!(
+        operation = "quota_supplier_read",
+        upstream_account_id = %account.id,
+        credential_generation = account.credential_generation,
+        trigger = trigger.as_str(),
+        outcome,
+        error_code,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "quota supplier read completed"
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuotaBudget {
@@ -81,6 +138,7 @@ struct QuotaRequestContext {
     account_id: Uuid,
     credential_generation: i64,
     endpoint_kind: &'static str,
+    trigger: QuotaReadTrigger,
 }
 
 #[derive(Clone)]
@@ -92,11 +150,16 @@ struct CodexQuotaAuth<'a> {
 }
 
 impl QuotaRequestContext {
-    fn for_account(account: &UpstreamAccountView, endpoint_kind: &'static str) -> Self {
+    fn for_account(
+        account: &UpstreamAccountView,
+        endpoint_kind: &'static str,
+        trigger: QuotaReadTrigger,
+    ) -> Self {
         Self {
             account_id: account.id,
             credential_generation: account.credential_generation,
             endpoint_kind,
+            trigger,
         }
     }
 }
@@ -166,6 +229,7 @@ fn log_quota_request_error(
         upstream_account_id = %context.account_id,
         credential_generation = context.credential_generation,
         endpoint_kind = context.endpoint_kind,
+        trigger = context.trigger.as_str(),
         phase,
         error_kind = quota_reqwest_error_kind(
             error.is_timeout(),
@@ -193,6 +257,7 @@ fn log_codex_quota_request_error(
         upstream_account_id = %context.account_id,
         credential_generation = context.credential_generation,
         endpoint_kind = context.endpoint_kind,
+        trigger = context.trigger.as_str(),
         phase,
         error_kind = quota_transport_error_kind(phase, is_timeout, is_connect),
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -426,8 +491,9 @@ impl QuotaCache {
         account: &UpstreamAccountView,
         credential: &UpstreamCredential,
         tenant: &str,
+        trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(state, account, credential, tenant, false)
+        self.read_inner(state, account, credential, tenant, false, trigger)
             .await
     }
 
@@ -442,8 +508,9 @@ impl QuotaCache {
         account: &UpstreamAccountView,
         credential: &UpstreamCredential,
         tenant: &str,
+        trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(state, account, credential, tenant, true)
+        self.read_inner(state, account, credential, tenant, true, trigger)
             .await
     }
 
@@ -454,6 +521,7 @@ impl QuotaCache {
         credential: &UpstreamCredential,
         tenant: &str,
         force_refresh: bool,
+        trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
         let empty = |error| QuotaSnapshot::empty(account, tenant, error);
         if !QuotaCapabilities::for_provider(&account.driver).read {
@@ -489,8 +557,20 @@ impl QuotaCache {
             (cached.value.clone(), cached.refresh_generation)
         };
         let fallback = |error| stale_or_error(previous.clone(), empty(Some(error)), now);
-        let Ok(_flight) = tokio::time::timeout(QUOTA_SINGLEFLIGHT_WAIT, entry.flight.lock()).await
+        let total_deadline = tokio::time::Instant::now() + QUOTA_TOTAL_READ_BUDGET;
+        let flight_deadline =
+            total_deadline.min(tokio::time::Instant::now() + QUOTA_SINGLEFLIGHT_WAIT);
+        let Ok(_flight) = tokio::time::timeout_at(flight_deadline, entry.flight.lock()).await
         else {
+            tracing::warn!(
+                operation = "quota_supplier_read",
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                trigger = trigger.as_str(),
+                phase = "singleflight",
+                error_kind = "timeout",
+                "quota supplier read timed out while waiting for the account owner"
+            );
             return fallback("quota_refresh_in_progress");
         };
         // A task can finish while we await the singleflight owner. Its result
@@ -505,8 +585,18 @@ impl QuotaCache {
                 return value.clone();
             }
         }
-        let Ok(permit) = tokio::time::timeout(QUOTA_PERMIT_WAIT, self.permits.acquire()).await
+        let permit_deadline = total_deadline.min(tokio::time::Instant::now() + QUOTA_PERMIT_WAIT);
+        let Ok(permit) = tokio::time::timeout_at(permit_deadline, self.permits.acquire()).await
         else {
+            tracing::warn!(
+                operation = "quota_supplier_read",
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                trigger = trigger.as_str(),
+                phase = "permit",
+                error_kind = "timeout",
+                "quota supplier read timed out while waiting for global admission"
+            );
             return fallback("quota_busy");
         };
         let Ok(_permit) = permit else {
@@ -521,14 +611,15 @@ impl QuotaCache {
         } else {
             QUOTA_TIMEOUT
         };
-        let result = match tokio::time::timeout(overall_timeout, async {
+        let supplier_deadline = total_deadline.min(tokio::time::Instant::now() + overall_timeout);
+        let result = match tokio::time::timeout_at(supplier_deadline, async {
             match account.driver.as_str() {
                 "google-antigravity" => {
-                    antigravity::read(state, account, credential, empty(None)).await
+                    antigravity::read(state, account, credential, empty(None), trigger).await
                 }
-                "kimi-oauth" => kimi::read(state, account, credential, empty(None)).await,
+                "kimi-oauth" => kimi::read(state, account, credential, empty(None), trigger).await,
                 "cursor" => cursor::read(state, credential, empty(None)).await,
-                _ => read_codex(state, account, credential, empty(None)).await,
+                _ => read_codex(state, account, credential, empty(None), trigger).await,
             }
         })
         .await
@@ -540,6 +631,7 @@ impl QuotaCache {
                     upstream_account_id = %account.id,
                     credential_generation = account.credential_generation,
                     endpoint_kind = "read",
+                    trigger = trigger.as_str(),
                     phase = "overall",
                     error_kind = "timeout",
                     elapsed_ms = refresh_started.elapsed().as_millis() as u64,
@@ -593,6 +685,17 @@ impl QuotaCache {
             };
         cached.refresh_generation = cached.refresh_generation.saturating_add(1);
         cached.value = Some(value.clone());
+        log_quota_read_completed(
+            account,
+            trigger,
+            if value.error_code.is_some() {
+                "error"
+            } else {
+                "success"
+            },
+            value.error_code.unwrap_or("none"),
+            refresh_started,
+        );
         value
     }
 }
@@ -628,6 +731,7 @@ async fn read_codex(
     account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
+    trigger: QuotaReadTrigger,
 ) -> Result<QuotaSnapshot, &'static str> {
     let observation_started_at = unix_millis();
     let recovery_fence = match state
@@ -644,6 +748,7 @@ async fn read_codex(
             tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
+                trigger = trigger.as_str(),
                 "failed to capture quota recovery fence; quota read remains read-only"
             );
             None
@@ -670,6 +775,7 @@ async fn read_codex(
             upstream_account_id = %account.id,
             credential_generation = account.credential_generation,
             endpoint_kind = "quota_client",
+            trigger = trigger.as_str(),
             phase = "client",
             error_kind = "destination_invalid",
             "quota supplier client setup failed"
@@ -685,6 +791,7 @@ async fn read_codex(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 endpoint_kind = "quota_client",
+                trigger = trigger.as_str(),
                 phase = "client",
                 error_kind = "transport_client_unavailable",
                 "quota supplier client setup failed"
@@ -707,14 +814,14 @@ async fn read_codex(
             &http,
             auth.clone(),
             USAGE_URL,
-            QuotaRequestContext::for_account(account, "usage"),
+            QuotaRequestContext::for_account(account, "usage", trigger),
             budget,
         ),
         get_codex_json(
             &http,
             auth,
             CREDITS_URL,
-            QuotaRequestContext::for_account(account, "credits"),
+            QuotaRequestContext::for_account(account, "credits", trigger),
             budget,
         ),
     );
@@ -749,6 +856,7 @@ async fn read_codex(
             Ok(true) => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
+                trigger = trigger.as_str(),
                 observation_started_at,
                 observed_at,
                 "fresh quota evidence cleared an exhausted upstream cooldown"
@@ -757,6 +865,7 @@ async fn read_codex(
             Err(_) => tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
+                trigger = trigger.as_str(),
                 error_code = "quota_health_recovery_failed",
                 "failed to apply fresh quota recovery evidence"
             ),
@@ -917,6 +1026,7 @@ async fn get_codex_json(
                     upstream_account_id = %context.account_id,
                     credential_generation = context.credential_generation,
                     endpoint_kind = context.endpoint_kind,
+                    trigger = context.trigger.as_str(),
                     attempt,
                     attempt_limit = budget.connect_attempts,
                     error_code = error,
@@ -1139,6 +1249,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_read_budget_finishes_before_the_operator_deadline() {
+        let operator_deadline = Duration::from_secs(85);
+        let response_slack = Duration::from_secs(10);
+        assert_eq!(QUOTA_TOTAL_READ_BUDGET + response_slack, operator_deadline);
+        assert!(
+            QUOTA_SINGLEFLIGHT_WAIT + QUOTA_PERMIT_WAIT + QUOTA_MAX_READ_BUDGET > operator_deadline
+        );
+    }
+
+    #[test]
+    fn quota_read_trigger_log_values_are_stable() {
+        assert_eq!(
+            QuotaReadTrigger::from(QuotaRequestTrigger::Manual),
+            QuotaReadTrigger::Manual
+        );
+        assert_eq!(
+            QuotaReadTrigger::from(QuotaRequestTrigger::Bulk),
+            QuotaReadTrigger::Bulk
+        );
+        assert_eq!(QuotaReadTrigger::Manual.as_str(), "manual");
+        assert_eq!(QuotaReadTrigger::Bulk.as_str(), "bulk");
+        assert_eq!(
+            QuotaReadTrigger::BackgroundRecovery.as_str(),
+            "background_recovery"
+        );
+        assert_eq!(QuotaReadTrigger::ResetWorkflow.as_str(), "reset_workflow");
+    }
+
     #[tokio::test]
     async fn explicit_quota_budget_is_not_cut_off_by_the_legacy_six_seconds() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1150,6 +1289,7 @@ mod tests {
             account_id: Uuid::from_u128(1),
             credential_generation: 2,
             endpoint_kind: "usage",
+            trigger: QuotaReadTrigger::Manual,
         };
         let url = format!("http://{}/usage", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -1250,6 +1390,7 @@ mod tests {
             account_id: Uuid::from_u128(1),
             credential_generation: 2,
             endpoint_kind: "usage",
+            trigger: QuotaReadTrigger::Manual,
         };
         let credits_context = QuotaRequestContext {
             endpoint_kind: "credits",

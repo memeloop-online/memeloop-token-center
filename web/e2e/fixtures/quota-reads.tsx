@@ -6,15 +6,16 @@ import { useUpstreamQuotaReads } from '../../src/operator/useUpstreamQuotaReads'
 import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';
 import '../../src/theme.css';
-declare global { interface Window { quotaReadCalls: string[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
+declare global { interface Window { quotaReadCalls: string[]; quotaReadTriggers: string[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
 window.quotaReadCalls = []; window.quotaActive = 0; window.quotaPeak = 0; window.quotaUnexpectedWrites = 0;
+window.quotaReadTriggers = [];
 const pending: ((status: number) => void)[] = [];
 window.releaseQuota = (index, status = 200) => pending[index](status);
 window.fetch = async (input, init) => {
   const url = new URL(String(input), location.origin);
-  if ((init?.method ?? 'GET') !== 'GET' || !/^\/internal\/v1\/upstreams\/account-\d\/quota$/.test(url.pathname)) { window.quotaUnexpectedWrites++; throw new Error('Only mock quota GET is allowed'); }
+  if ((init?.method ?? 'GET') !== 'GET' || !/^\/internal\/v1\/upstreams\/account-\d\/quota$/.test(url.pathname) || url.searchParams.get('fresh') !== 'true' || !['manual', 'bulk'].includes(url.searchParams.get('trigger') ?? '')) { window.quotaUnexpectedWrites++; throw new Error('Only explicit fresh mock quota GET is allowed'); }
   const id = url.pathname.split('/')[4];
-  window.quotaReadCalls.push(id); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
+  window.quotaReadCalls.push(id); window.quotaReadTriggers.push(url.searchParams.get('trigger')!); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
   const status = await new Promise<number>(resolve => pending.push(resolve));
   window.quotaActive--;
   const now = Date.now();

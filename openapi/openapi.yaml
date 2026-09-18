@@ -1542,6 +1542,9 @@ paths:
         Never consumes a reset credit or exposes supplier bodies or secrets.
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
+        Operator refresh actions set `fresh=true` to bypass a still-current cache
+        entry (while retaining request coalescing) and identify the initiating
+        action with `trigger=manual|bulk` for structured diagnostics.
         Unsupported means no quota adapter, not zero quota or unlimited usage.
         A fresh observation may clear a quota-exhausted routing row only when the
         main code limit reports allowed=true and does not report limit_reached=true.
@@ -1551,6 +1554,16 @@ paths:
           in: query
           required: true
           schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: fresh
+          in: query
+          required: false
+          description: Bypass a current cached snapshot; a newer concurrent supplier read may still satisfy this request.
+          schema: { type: boolean, default: false }
+        - name: trigger
+          in: query
+          required: false
+          description: Operator action used for structured quota-read diagnostics. Defaults to manual for compatibility.
+          schema: { type: string, enum: [manual, bulk], default: manual }
       responses:
         '200':
           description: Sanitized quota; provider-supported reset is distinct from implemented reset.

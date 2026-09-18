@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
-import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, upstreamQuotaPath, type UpstreamQuotaReadTrigger, type UpstreamQuotaSnapshot } from './upstreamQuota';
 
 export interface QuotaReadAccount { id: string; credential_generation: number; tenant_external_id?: string | null; status: string }
 export interface QuotaReadState { generation: number; snapshot?: UpstreamQuotaSnapshot; busy: boolean; queued?: boolean; refreshFailed: boolean; error?: 'quota.readFailed' | 'quota.errorPermission' }
@@ -24,7 +24,7 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     return () => { for (const request of requests.current.values()) request.controller.abort(); requests.current.clear(); };
   }, [scope]);
 
-  function read(account: QuotaReadAccount): Promise<void> {
+  function read(account: QuotaReadAccount, trigger: UpstreamQuotaReadTrigger): Promise<void> {
     const accountTenant = account.tenant_external_id ?? tenant;
     const generation = account.credential_generation;
     const ownsIdentity = () => current.current.scope === scope && current.current.accounts.some(value => value.id === account.id && value.credential_generation === generation && (value.tenant_external_id ?? tenant) === accountTenant);
@@ -40,7 +40,7 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     setEntries(previous => ({ ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, busy: true, refreshFailed: false } }));
     const promise = (async () => {
       try {
-        const snapshot = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(account.id, accountTenant), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS)]) });
+        const snapshot = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(account.id, accountTenant, { fresh: true, trigger }), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS)]) });
         if (!ownsIdentity() || controller.signal.aborted) return;
         if (!isEligible()) { clearPending(); return; }
         if (snapshot.contract_version !== 'upstream_quota_v1' || snapshot.upstream_account_id !== account.id || snapshot.tenant_external_id !== accountTenant) throw new Error('Quota scope mismatch');
@@ -72,7 +72,7 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     await Promise.all(Array.from({ length: Math.min(BULK_QUOTA_READ_CONCURRENCY, selected.length) }, async () => {
       while (owns() && next < selected.length) {
         const account = selected[next++];
-        await read(account); done++;
+        await read(account, 'bulk'); done++;
         if (owns()) setProgress({ done, total: selected.length, busy: true });
       }
     }));
@@ -90,5 +90,5 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     }
   }
   const visibleEntries: Record<string, QuotaReadState> = entryScope === scope ? entries : {};
-  return { entries: visibleEntries, read: (account: QuotaReadAccount) => batch.current ? Promise.resolve() : read(account), readAll, progress: entryScope === scope ? progress : undefined };
+  return { entries: visibleEntries, read: (account: QuotaReadAccount) => batch.current ? Promise.resolve() : read(account, 'manual'), readAll, progress: entryScope === scope ? progress : undefined };
 }

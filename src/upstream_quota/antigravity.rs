@@ -13,6 +13,7 @@ pub(super) async fn read(
     account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
+    trigger: QuotaReadTrigger,
 ) -> Result<QuotaSnapshot, &'static str> {
     if !matches!(credential, UpstreamCredential::OAuth { .. }) {
         return Err("credential_invalid");
@@ -41,7 +42,7 @@ pub(super) async fn read(
         credential,
         &config,
         &endpoint,
-        QuotaRequestContext::for_account(account, "antigravity_quota_summary"),
+        QuotaRequestContext::for_account(account, "antigravity_quota_summary", trigger),
     )
     .await?;
     snapshot.windows = windows(&payload)?;
@@ -382,6 +383,7 @@ mod tests {
                     account_id: Uuid::from_u128(1),
                     credential_generation: 2,
                     endpoint_kind: "antigravity_quota_summary",
+                    trigger: QuotaReadTrigger::Manual,
                 },
             )
             .await;

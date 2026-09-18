@@ -59,6 +59,8 @@ export interface UpstreamQuotaSnapshot {
 /** Covers the server's bounded queue plus one bounded supplier read. */
 export const UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS = 85_000;
 
+export type UpstreamQuotaReadTrigger = 'manual' | 'bulk';
+
 /** The next expiration belongs to reset opportunities, not a usage window. */
 export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Date.now()): { state: 'known' | 'unknown' | 'none'; at?: number } {
   if (snapshot.reset_capability.credit_error_code) return { state: 'unknown' };
@@ -85,9 +87,12 @@ export function quotaAvailableResetCredits(snapshot: UpstreamQuotaSnapshot, now 
   return available;
 }
 
-export function upstreamQuotaPath(accountId: string, tenant: string) {
+export function upstreamQuotaPath(accountId: string, tenant: string, options?: { fresh?: boolean; trigger?: UpstreamQuotaReadTrigger }) {
   if (!accountId || !tenant.trim()) throw new Error('Quota requires an account and tenant');
-  return `/internal/v1/upstreams/${encodeURIComponent(accountId)}/quota?${new URLSearchParams({ tenant_external_id: tenant })}`;
+  const query = new URLSearchParams({ tenant_external_id: tenant });
+  if (options?.fresh) query.set('fresh', 'true');
+  if (options?.trigger) query.set('trigger', options.trigger);
+  return `/internal/v1/upstreams/${encodeURIComponent(accountId)}/quota?${query}`;
 }
 
 export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number]): number | null {

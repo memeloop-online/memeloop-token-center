@@ -46,6 +46,7 @@ This GET returns the full proxy URL, network scope, and version fields required 
 `GET /internal/v1/upstreams/{account_id}/quota` (requires `providers:read`) reads a provider-side quota snapshot for an account, for operator observation and optional plugin input:
 
 - The snapshot is cached for 30 seconds with concurrent request coalescing. After a read failure, a bounded stale value is kept for at most five minutes; failure never presents old evidence as fresh.
+- Operator refresh controls request `fresh=true` and label the action as `trigger=manual` or `trigger=bulk`. This bypasses a still-current cache entry while preserving safe coalescing with a newer in-flight read.
 - The response is organized by **window**. Each window includes an identifier, period (such as five hours or weekly), reset time, used/remaining ratio, and exhausted state. Window information comes from explicit provider response fields—unknown quantities remain unknown and are never shown as zero or full.
 - `unsupported` means this account type has no quota adapter; it does not mean “unlimited quota.”
 - Reading quota does not refresh tokens, make model requests, or consume reset quota.

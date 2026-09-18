@@ -57,28 +57,65 @@ async fn fresh_snapshot(
         account: account_header,
         proxy_url: credential.proxy().map(|(url, _)| url),
     };
-    let reset = tokio::time::timeout(
+    let refresh_started = tokio::time::Instant::now();
+    let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
             &http,
             auth,
             CREDITS_URL,
-            QuotaRequestContext::for_account(account, "credits"),
+            QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
         ),
     )
     .await
-    .map_err(|_| temporarily_unavailable())?
-    .map_err(|_| temporarily_unavailable())?;
+    {
+        Ok(Ok(reset)) => reset,
+        Ok(Err(error)) => {
+            log_quota_read_completed(
+                account,
+                QuotaReadTrigger::ResetWorkflow,
+                "error",
+                error,
+                refresh_started,
+            );
+            return Err(temporarily_unavailable());
+        }
+        Err(_) => {
+            log_quota_read_completed(
+                account,
+                QuotaReadTrigger::ResetWorkflow,
+                "error",
+                "quota_timeout",
+                refresh_started,
+            );
+            return Err(temporarily_unavailable());
+        }
+    };
     let observed_at = unix_millis();
     let mut snapshot = QuotaSnapshot::empty(account, tenant, None);
-    normalize::reset_credits(&mut snapshot, &reset, observed_at)
-        .map_err(|_| temporarily_unavailable())?;
+    if let Err(error) = normalize::reset_credits(&mut snapshot, &reset, observed_at) {
+        log_quota_read_completed(
+            account,
+            QuotaReadTrigger::ResetWorkflow,
+            "error",
+            error,
+            refresh_started,
+        );
+        return Err(temporarily_unavailable());
+    }
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
     snapshot.finalize_reset_capability();
+    log_quota_read_completed(
+        account,
+        QuotaReadTrigger::ResetWorkflow,
+        "success",
+        "none",
+        refresh_started,
+    );
     Ok(snapshot)
 }
 
@@ -331,11 +368,13 @@ pub(crate) async fn confirm(
             Ok(_) => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
+                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 "refreshed quota evidence after an accepted reset"
             ),
             Err(error) => tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
+                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 error = %error,
                 error_code = "quota_reset_recovery_pending",
                 "accepted quota reset could not refresh supplier evidence"
