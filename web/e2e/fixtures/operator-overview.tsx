@@ -47,11 +47,13 @@ function usageTrends(tenant: FixtureTenant): OperatorUsageAnalysisTrends {
   const points = tenant === alpha
     ? [metrics(8, 7, 1), metrics(11, 10, 1), metrics(13, 11, 2)]
     : [metrics(3, 3, 0), metrics(5, 4, 1), metrics(9, 8, 1)];
+  const withoutCostSeries = new URLSearchParams(location.search).has('without-cost-series');
+  const summary = metrics(points.reduce((total, point) => total + point.requests, 0), points.reduce((total, point) => total + point.success, 0), points.reduce((total, point) => total + point.failed, 0));
   return {
     from_created_at: now - 86_400_000, to_created_at: now, granularity: 'hour', time_zone: 'UTC',
     p95_is_approximate: true, p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
-    summary: metrics(points.reduce((total, point) => total + point.requests, 0), points.reduce((total, point) => total + point.success, 0), points.reduce((total, point) => total + point.failed, 0)),
-    time_series: points.map((point, index) => ({ ...point, bucket_start: start + index * 3_600_000 })),
+    summary: { ...summary, costs: withoutCostSeries ? [] : summary.costs },
+    time_series: points.map((point, index) => ({ ...point, costs: withoutCostSeries ? [] : point.costs, bucket_start: start + index * 3_600_000 })),
   };
 }
 
@@ -124,7 +126,7 @@ function Fixture() {
       <button type="button" className="secondary" data-fixture-tenant-switch onClick={() => setTenant((current) => current === alpha ? beta : alpha)}>Switch tenant</button>
     </div>
     <output data-fixture-tenant={tenant}>{tenant}</output>
-    <OverviewPage token="mts_overview_fixture" tenant={tenant} onNavigate={() => undefined} onRequestDrilldown={(ast) => window.overviewFixture.drilldowns.push(ast)} onOpenUsageSession={() => undefined} onOpenSession={() => undefined} />
+    <OverviewPage token="mts_overview_fixture" tenant={tenant} onNavigate={() => undefined} onRequestDrilldown={(ast) => window.overviewFixture.drilldowns.push(ast)} onOpenUsageSession={() => undefined} onOpenRequest={() => undefined} onOpenSession={() => undefined} />
   </Shell>;
 }
 

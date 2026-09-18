@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { Operator } from '../../src/operator/Operator';
-import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, OperatorUsageAnalysisTrends, RequestView, UsageAnalysisMetrics } from '../../src/types';
+import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, OperatorUsageAnalysisTrends, RequestDetail, RequestView, UsageAnalysisMetrics } from '../../src/types';
 import type { OperatorRouteKey } from '../../src/operator/scope/operatorRoutes';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -17,6 +17,7 @@ declare global {
       calls: string[];
       requestQueryBodies: unknown[];
       route: OperatorRouteKey;
+      openOverview: () => void;
     };
   }
 }
@@ -26,7 +27,7 @@ const tenant = 'drilldown-tenant';
 const now = Date.UTC(2026, 8, 8, 12, 0, 0);
 const bucketStart = now - 3_600_000;
 
-window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview' };
+window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -74,6 +75,7 @@ const drilledRequest: RequestView = {
   input_tokens: 12, cached_input_tokens: 2, cache_write_tokens: 1, output_tokens: 4,
   cost: '0.001', currency: 'USD', error_code: null,
 };
+const drilledRequestDetail: RequestDetail = { ...drilledRequest, request_body: { model: drilledRequest.model }, response_body: { id: 'fixture-response' }, archive_complete: true };
 
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const source = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -85,7 +87,8 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends);
   if (url.pathname === '/internal/v1/usage-analysis') return json(usageAnalysis);
   if (url.pathname === '/internal/v1/monitoring-snapshot') return json(monitoring);
-  if (url.pathname === '/internal/v1/requests' && method === 'GET') return json([]);
+  if (url.pathname === '/internal/v1/requests' && method === 'GET') return json([drilledRequest]);
+  if (url.pathname === `/internal/v1/requests/${drilledRequest.request_id}` && method === 'GET') return json(drilledRequestDetail);
   if (url.pathname === '/internal/v1/upstreams') return json([]);
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
@@ -99,6 +102,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const [route, setRoute] = useState<OperatorRouteKey>('overview');
+  window.overviewDrilldownFixture.openOverview = () => setRoute('overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>
     <output data-fixture-route={route}>{route}</output>

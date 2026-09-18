@@ -2,7 +2,7 @@ import { ChartDataView } from '../charts/ChartDataView';
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useMemo } from 'react';
 import { api } from '../api';
-import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
+import { costCurrencies, costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel } from '../LocalSettlementNotice';
 import { useI18n } from '../i18n';
@@ -62,6 +62,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
   const latency = useMemo(() => latencyOption(finiteP95Points(stats?.time_series ?? []), copy, format), [stats, copy, format]);
   const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
+  const hasCostSeries = Boolean(stats && costCurrencies(stats.time_series).length);
   const trendCards = [
     { id: 'throughput', title: t('usage.throughput'), option: throughput },
     { id: 'latency', title: t('usage.latencyTrend'), option: latency },
@@ -95,6 +96,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
         {trendCards.map(({ id, title, option }) => <article className={`panel overview-trend-card${id === 'throughput' ? ' overview-trend-primary' : ''}`} key={id}>
           <ChartDataView title={title} metadata={<span>{displayTimeZone()}</span>} data={table}>
           {stats.time_series.length === 0 ? <div className="empty">{t('usage.noData')}</div>
+            : id === 'cost' && !hasCostSeries ? <div className="empty">{t('usage.noSettledCostTrend')}</div>
             : <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
               <EChart ariaLabel={title} locale={locale} option={option} timeZone={displayTimeZone()} onClick={({ dataIndex }) => {
                 const point = stats.time_series[dataIndex];

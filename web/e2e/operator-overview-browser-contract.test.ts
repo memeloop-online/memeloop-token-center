@@ -186,6 +186,18 @@ test('Overview keeps current sections visible through independent endpoint failu
       await page.screenshot({ path: join(artifactRoot, `overview-canvas-${theme}.png`), fullPage: true });
       await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();
     }
+
+    const noCostPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    await noCostPage.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await noCostPage.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview.html?without-cost-series=1`);
+    await noCostPage.locator('.overview-trend-card .usage-echart canvas').nth(1).waitFor();
+    const costCard = noCostPage.locator('.overview-trend-card').nth(2);
+    assert.equal(await noCostPage.locator('.overview-trend-card .usage-echart').count(), 2, 'request and latency trends remain charted when only settled-cost series are absent');
+    assert.equal(await costCard.getByText('暂无已结算费用 / 无可绘制数据', { exact: true }).count(), 1, 'time buckets without any settlement currency render the shared cost empty state');
+    assert.equal(await costCard.locator('.usage-echart').count(), 0, 'an empty cost series does not mount a blank chart');
+    await costCard.getByRole('tab', { name: '数据', exact: true }).click();
+    assert.equal(await costCard.locator('.overview-trend-data tbody tr').count(), 3, 'the empty chart state does not discard returned time buckets from the data view');
+    await noCostPage.close();
   } finally {
     await browser.close();
     await server.close();

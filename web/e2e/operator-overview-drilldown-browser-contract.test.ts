@@ -14,6 +14,7 @@ declare global {
       calls: string[];
       requestQueryBodies: unknown[];
       route: string;
+      openOverview: () => void;
     };
   }
 }
@@ -35,7 +36,7 @@ async function localChromiumExecutable() {
   return undefined;
 }
 
-test('Overview bucket drilldown navigates to Requests with the exact tenant-scoped filter', { timeout: 30_000 }, async () => {
+test('Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the Overview drilldown browser gate');
@@ -50,6 +51,12 @@ test('Overview bucket drilldown navigates to Requests with the exact tenant-scop
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html`);
+    await page.getByRole('button', { name: 'Open details for drilled-model', exact: true }).click();
+    await page.getByRole('dialog', { name: 'drilled-model', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'requests', 'the Overview row action uses the operator request route');
+    assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some((call) => call.includes(`/internal/v1/requests/dddddddd-dddd-4ddd-8ddd-dddddddddddd?tenant_external_id=drilldown-tenant`)), true, 'requestFocus opens the selected tenant-scoped request drawer');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.evaluate(() => window.overviewDrilldownFixture.openOverview());
     const firstChart = page.locator('.overview-trend-card').first();
     const trendData = firstChart.locator('.overview-trend-data');
     await firstChart.getByRole('tab', { name: 'Data', exact: true }).click();

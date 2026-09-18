@@ -26,6 +26,7 @@ test('each Overview section reports its own state while a ready value remains vi
   }
   assert.match(monitoringSection, /<MonitoringSnapshot snapshot=\{state\.value\}/);
   assert.match(requestsSection, /<RequestTable requests=\{state\.value\}/);
+  assert.match(requestsSection, /onSelect=\{\(request\) => onOpenRequest\(request\.request_id\)\}/);
 });
 
 test('Usage statistics stay mounted when upstream filter metadata is loading or fails', () => {
