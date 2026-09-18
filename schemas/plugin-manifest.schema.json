@@ -328,7 +328,7 @@
               "label": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^<>\\u0000-\\u001F\\u007F]+$" },
               "icon": { "enum": ["activity", "chart", "database", "heart", "plug", "shield"] },
               "renderer": { "enum": ["typed_data_v1", "component_v1"] },
-              "module_entry": { "type": "string", "minLength": 4, "maxLength": 240, "pattern": "^(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\\.m?js$" },
+              "module_entry": { "type": "string", "minLength": 4, "maxLength": 240, "pattern": "^[A-Za-z0-9._/-]+\\.m?js$" },
               "component_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
               "component_props": { "type": "object" },
               "presentation": {
