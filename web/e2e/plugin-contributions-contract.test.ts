@@ -67,6 +67,26 @@ test('component contributions register from immutable runtime module identities'
   assert.deepEqual(registry.pageExtensions.get('providers')?.after.map((value) => value.contribution.id), ['provider-extension']);
 });
 
+test('browser registry rejects malformed renderer contracts and module paths', () => {
+  const installed = structuredClone(fixture.installed);
+  installed[0].contributions.operator_ui = [
+    {
+      id: 'typed-with-component-state', slot: 'operator.overview.card', label: 'Invalid typed data', icon: 'plug',
+      renderer: 'typed_data_v1', data_endpoint: 'health', component_props: { unexpected: true },
+    },
+    {
+      id: 'component-with-empty-endpoint', slot: 'operator.overview.card', label: 'Invalid endpoint', icon: 'plug',
+      renderer: 'component_v1', module_entry: 'assets/operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace', data_endpoint: '',
+    },
+    {
+      id: 'component-with-normalized-path', slot: 'operator.overview.card', label: 'Invalid path', icon: 'plug',
+      renderer: 'component_v1', module_entry: 'assets//operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace',
+    },
+  ];
+  const registry = registerOperatorPluginContributions(installed);
+  assert.deepEqual(registry.overviewCards, []);
+});
+
 test('render boundary loads only digest-addressed same-origin modules and exposes no generic request API', async () => {
   const source = await readFile(new URL('../src/operator/pluginContributions.tsx', import.meta.url), 'utf8');
   const host = await readFile(new URL('../src/plugins/OperatorPluginComponentHost.tsx', import.meta.url), 'utf8');

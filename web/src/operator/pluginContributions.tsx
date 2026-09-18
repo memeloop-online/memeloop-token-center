@@ -55,14 +55,28 @@ function safeLabel(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 120 && !/[\u0000-\u001f\u007f<>]/u.test(value);
 }
 
+function safeModuleEntry(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 4 || value.length > 240 || !/\.m?js$/u.test(value)) return false;
+  return value.split('/').every((segment) => segment.length > 0
+    && segment !== '.'
+    && segment !== '..'
+    && /^[A-Za-z0-9._-]+$/u.test(segment));
+}
+
 function validContribution(value: PluginOperatorUiContribution): boolean {
   const rendererContract = value.renderer === 'typed_data_v1'
-    ? token.test(value.data_endpoint ?? '') && value.component_id == null && value.module_entry == null
+    ? token.test(value.data_endpoint ?? '')
+      && value.component_id == null
+      && value.component_props == null
+      && value.module_entry == null
+      && value.module_sha256 == null
     : value.renderer === 'component_v1'
       && token.test(value.component_id ?? '')
-      && typeof value.module_entry === 'string'
+      && safeModuleEntry(value.module_entry)
       && /^sha256:[0-9a-f]{64}$/u.test(value.module_sha256 ?? '')
-      && value.presentation == null;
+      && value.presentation == null
+      && (value.component_props == null || (typeof value.component_props === 'object' && !Array.isArray(value.component_props)))
+      && (value.data_endpoint == null || token.test(value.data_endpoint));
   return token.test(value.id)
     && safeLabel(value.label)
     && rendererContract

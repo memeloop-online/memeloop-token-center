@@ -2377,13 +2377,23 @@ fn load_operator_ui_modules(
 
 fn safe_operator_ui_module_entry(value: &str) -> bool {
     let path = Path::new(value);
-    !value.is_empty()
-        && value.len() <= 240
-        && (value.ends_with(".js") || value.ends_with(".mjs"))
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, PathComponent::Normal(_)))
+    if value.is_empty()
+        || value.len() > 240
+        || (!value.ends_with(".js") && !value.ends_with(".mjs"))
+        || path.is_absolute()
+    {
+        return false;
+    }
+    value.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }) && path
+        .components()
+        .all(|component| matches!(component, PathComponent::Normal(_)))
 }
 
 fn safe_plugin_token(value: &str, maximum: usize) -> bool {
@@ -2756,6 +2766,21 @@ fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_ui_module_entries_preserve_exact_safe_segments() {
+        assert!(safe_operator_ui_module_entry("assets/operator-ui.mjs"));
+        for entry in [
+            "assets//operator-ui.mjs",
+            "./operator-ui.mjs",
+            "assets/../operator-ui.mjs",
+            "/assets/operator-ui.mjs",
+            "assets/operator ui.mjs",
+            "assets/operator-ui.css",
+        ] {
+            assert!(!safe_operator_ui_module_entry(entry), "accepted {entry}");
+        }
+    }
 
     fn configurable_manifest(schema: Value, default: Value) -> PluginManifest {
         PluginManifest {

@@ -108,10 +108,17 @@ function componentLoad(
     if (!operatorUiPackageSupportsManifest(packageValue, pluginId, pluginVersion)) {
       throw new Error('Plugin UI package identity is incompatible with its manifest');
     }
+    if (!packageValue.components || typeof packageValue.components !== 'object' || Array.isArray(packageValue.components)) {
+      throw new Error('Plugin UI package has an invalid component registry');
+    }
     if (!Object.hasOwn(packageValue.components, componentId)) {
       throw new Error('Plugin UI package does not export the requested component');
     }
-    return { default: packageValue.components[componentId]! };
+    const component = packageValue.components[componentId];
+    if (typeof component !== 'function' && (typeof component !== 'object' || component === null)) {
+      throw new Error('Plugin UI package exported an invalid component');
+    }
+    return { default: component };
   });
 }
 
