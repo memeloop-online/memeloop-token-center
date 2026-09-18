@@ -211,7 +211,7 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
     .await;
     std::sync::Arc::make_mut(&mut fixture.state.config)
         .upstream_health
-        .connection_cooldown_millis = 10;
+        .connection_cooldown_millis = 60_000;
     let session_id = "same-session-local-domain-skip";
     let first = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(first.status(), StatusCode::OK);
@@ -279,19 +279,19 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
         .await
         .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let observed_at: i64 = sqlx::query_scalar(
-        "SELECT last_failure_at FROM upstream_connection_failure_domains
-         WHERE upstream_account_id = $1 AND failure_domain = $2",
+    let expired_at = crate::db::unix_millis().saturating_sub(60_001);
+    let expired = sqlx::query(
+        "UPDATE upstream_connection_failure_domains SET last_failure_at = $1
+         WHERE upstream_account_id = $2 AND failure_domain = $3",
     )
+    .bind(expired_at)
     .bind(preferred_account.to_string())
     .bind(routing::current_gateway_failure_domain())
-    .fetch_one(&pool)
+    .execute(&pool)
     .await
     .unwrap();
+    assert_eq!(expired.rows_affected(), 1);
     pool.close().await;
-    while crate::db::unix_millis() <= observed_at + 10 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
     let third = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(third.status(), StatusCode::OK);
     let _ = to_bytes(third.into_body(), MAX_PROXY_RESPONSE_BODY)
