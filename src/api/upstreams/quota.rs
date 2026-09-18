@@ -31,7 +31,7 @@ struct QuotaBatchResponse {
 enum QuotaBatchResult {
     Success {
         upstream_account_id: Uuid,
-        snapshot: crate::upstream_quota::QuotaSnapshot,
+        snapshot: Box<crate::upstream_quota::QuotaSnapshot>,
     },
     Error {
         upstream_account_id: Uuid,
@@ -130,7 +130,7 @@ async fn quota_batch_result(
     let snapshot = read_quota_snapshot(&state, &account, &credential, tenant, fresh, trigger).await;
     QuotaBatchResult::Success {
         upstream_account_id: account_id,
-        snapshot,
+        snapshot: Box::new(snapshot),
     }
 }
 
