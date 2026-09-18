@@ -167,7 +167,7 @@ jobs:
       PLUGIN_ID: mtc-health-intelligence
       PLUGIN_SOURCE: ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-plugin
       ENDORSED_PLUGIN_SOURCE: ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-endorsed
-      ENDORSED_PACKAGE_NAME: memeloop-token-center-health-intelligence-endorsed
+      ENDORSED_PLUGIN_REPOSITORY: memeloop-online/memeloop-token-center-health-intelligence-endorsed
       PLUGIN_DIGEST: sha256:d9d558a6a6118dadfd2693cfd7f479109dbca53ef8ddae201d8ea70fb93922c3
       UPSTREAM_SIGNING_IDENTITY: https://github.com/memeloop-online/memeloop-token-center-health-intelligence-plugin/.github/workflows/publish.yml@refs/heads/master
       SIGNING_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-first-party-plugin.yml@refs/heads/master
@@ -202,8 +202,6 @@ jobs:
           "$RUNNER_TEMP/plugin-tools/cosign" version --json | node scripts/ci/first-party-plugin-command-output.ts cosign-version
           echo "$RUNNER_TEMP/plugin-tools" >> "$GITHUB_PATH"
       - name: Verify the upstream release and add the MTC endorsement
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cosign verify \
             --certificate-identity "$UPSTREAM_SIGNING_IDENTITY" \
@@ -212,10 +210,16 @@ jobs:
           oras copy "$PLUGIN_SOURCE@$PLUGIN_DIGEST" "$ENDORSED_PLUGIN_SOURCE:sha-$GITHUB_SHA"
           endorsed_digest=$(oras resolve "$ENDORSED_PLUGIN_SOURCE:sha-$GITHUB_SHA")
           [[ "$endorsed_digest" == "$PLUGIN_DIGEST" ]]
+          anonymous_token=$(curl --fail --silent --show-error --get \
+            --data-urlencode service=ghcr.io \
+            --data-urlencode "scope=repository:$ENDORSED_PLUGIN_REPOSITORY:pull" \
+            https://ghcr.io/token | jq -r .token)
+          [[ -n "$anonymous_token" && "$anonymous_token" != null ]]
+          curl --fail --silent --show-error --output /dev/null \
+            --header "Authorization: Bearer $anonymous_token" \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/$ENDORSED_PLUGIN_REPOSITORY/manifests/$PLUGIN_DIGEST"
           cosign sign --yes "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST"
-          gh api --method PATCH \
-            "orgs/memeloop-online/packages/container/$ENDORSED_PACKAGE_NAME" \
-            -f visibility=public > /dev/null
           cosign verify \
             --certificate-identity "$SIGNING_IDENTITY" \
             --certificate-oidc-issuer "$SIGNING_ISSUER" \

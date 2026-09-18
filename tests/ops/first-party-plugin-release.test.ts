@@ -64,11 +64,15 @@ test('dispatch selects only a closed first-party package, never execution-sensit
   assert.match(workflow, /PLUGIN_DIGEST: sha256:d9d558a6a6118dadfd2693cfd7f479109dbca53ef8ddae201d8ea70fb93922c3/);
   assert.match(workflow, /UPSTREAM_SIGNING_IDENTITY: https:\/\/github\.com\/memeloop-online\/memeloop-token-center-health-intelligence-plugin\/\.github\/workflows\/publish\.yml@refs\/heads\/master/);
   assert.match(workflow, /ENDORSED_PLUGIN_SOURCE: ghcr\.io\/memeloop-online\/memeloop-token-center-health-intelligence-endorsed/);
-  assert.match(workflow, /ENDORSED_PACKAGE_NAME: memeloop-token-center-health-intelligence-endorsed/);
+  assert.match(workflow, /ENDORSED_PLUGIN_REPOSITORY: memeloop-online\/memeloop-token-center-health-intelligence-endorsed/);
   assert.match(workflow, /inputs\.package == 'health-intelligence'/);
   assert.match(workflow, /cosign verify[\s\S]*"\$UPSTREAM_SIGNING_IDENTITY"[\s\S]*oras copy "\$PLUGIN_SOURCE@\$PLUGIN_DIGEST" "\$ENDORSED_PLUGIN_SOURCE:sha-\$GITHUB_SHA"/);
-  assert.match(workflow, /\[\[ "\$endorsed_digest" == "\$PLUGIN_DIGEST" \]\][\s\S]*cosign sign --yes "\$ENDORSED_PLUGIN_SOURCE@\$PLUGIN_DIGEST"/);
-  assert.match(workflow, /gh api --method PATCH[\s\S]*-f visibility=public/);
+  assert.match(workflow, /scope=repository:\$ENDORSED_PLUGIN_REPOSITORY:pull[\s\S]*https:\/\/ghcr\.io\/v2\/\$ENDORSED_PLUGIN_REPOSITORY\/manifests\/\$PLUGIN_DIGEST/);
+  const digestCheck = workflow.indexOf('[[ "$endorsed_digest" == "$PLUGIN_DIGEST" ]]');
+  const anonymousPull = workflow.indexOf('"https://ghcr.io/v2/$ENDORSED_PLUGIN_REPOSITORY/manifests/$PLUGIN_DIGEST"');
+  const endorsement = workflow.indexOf('cosign sign --yes "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST"');
+  assert(digestCheck >= 0 && digestCheck < anonymousPull);
+  assert(anonymousPull < endorsement);
 });
 
 test('Model Guard default has no rewrite, provider, or host capability', () => {
