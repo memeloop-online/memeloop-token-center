@@ -74,6 +74,7 @@ const CORE_OPERATOR_ROUTES: &[&str] = &[
     "providers",
     "routes",
     "pricing",
+    "tenants",
     "credentials",
     "service-credentials",
     "plugins",
@@ -135,9 +136,9 @@ pub struct PluginContributions {
     pub configuration: Option<PluginConfigurationContribution>,
     #[serde(default)]
     pub providers: Vec<ProviderType>,
-    /// Declarative operator contributions.  These are deliberately data-only:
-    /// the browser maps them to core-owned renderers and never loads a plugin
-    /// script, document, stylesheet, or iframe.
+    /// Operator tabs and cards. `typed_data_v1` uses a core projection;
+    /// `component_v1` joins the manifest to a trusted UI package compiled into
+    /// the Operator build through the versioned UI SDK.
     #[serde(default)]
     pub operator_ui: Vec<PluginOperatorUiContribution>,
     /// Named, server-side JSON feeds used by `operator_ui`. The browser can
@@ -153,6 +154,10 @@ pub enum PluginOperatorUiSlot {
     SidebarTab,
     #[serde(rename = "operator.overview.card")]
     OverviewCard,
+    #[serde(rename = "operator.page.before")]
+    PageBefore,
+    #[serde(rename = "operator.page.after")]
+    PageAfter,
 }
 
 /// Closed, core-owned visual presentation choices for declarative operator
@@ -184,16 +189,23 @@ pub struct PluginOperatorUiContribution {
     pub category: Option<PluginOperatorUiCategory>,
     #[serde(default)]
     pub route: Option<String>,
+    #[serde(default)]
+    pub target_route: Option<String>,
     pub label: String,
     pub icon: String,
-    /// Only `typed_data_v1` is accepted. It selects a core-owned React
-    /// renderer; it is not a filename, URL, HTML fragment, or JavaScript ABI.
+    /// `typed_data_v1` selects a core projection. `component_v1` selects a
+    /// component exported by a trusted package in the Operator build.
     pub renderer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_props: Option<Value>,
     /// An optional closed presentation selected by the core. Omitting this
     /// keeps the generic typed-data presentation for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<PluginOperatorUiPresentation>,
-    pub data_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2045,11 +2057,47 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 manifest.id
             )));
         }
-        if !safe_plugin_label(&contribution.label) || contribution.renderer != "typed_data_v1" {
+        if !safe_plugin_label(&contribution.label) {
             return Err(AppError::BadRequest(format!(
-                "plugin {} operator UI contribution is not a supported typed-data renderer",
+                "plugin {} operator UI contribution has an invalid label",
                 manifest.id
             )));
+        }
+        match contribution.renderer.as_str() {
+            "typed_data_v1" => {
+                if contribution.component_id.is_some()
+                    || contribution.component_props.is_some()
+                    || contribution.data_endpoint.is_none()
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} typed-data contribution has an invalid renderer contract",
+                        manifest.id
+                    )));
+                }
+            }
+            "component_v1" => {
+                if !contribution
+                    .component_id
+                    .as_deref()
+                    .is_some_and(|value| safe_plugin_token(value, 64))
+                    || contribution.presentation.is_some()
+                    || contribution
+                        .component_props
+                        .as_ref()
+                        .is_some_and(|value| !value.is_object())
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} component contribution has an invalid component contract",
+                        manifest.id
+                    )));
+                }
+            }
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "plugin {} operator UI contribution has an unsupported renderer",
+                    manifest.id
+                )));
+            }
         }
         if !matches!(
             contribution.icon.as_str(),
@@ -2060,17 +2108,25 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 manifest.id
             )));
         }
-        if !endpoints
-            .iter()
-            .any(|endpoint| endpoint.id == contribution.data_endpoint)
-        {
-            return Err(AppError::BadRequest(format!(
-                "plugin {} operator UI contribution references an unknown data endpoint",
-                manifest.id
-            )));
+        if let Some(data_endpoint) = contribution.data_endpoint.as_deref() {
+            if !endpoints
+                .iter()
+                .any(|endpoint| endpoint.id == data_endpoint)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "plugin {} operator UI contribution references an unknown data endpoint",
+                    manifest.id
+                )));
+            }
         }
         match contribution.slot {
             PluginOperatorUiSlot::SidebarTab => {
+                if contribution.target_route.is_some() {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} sidebar contribution cannot declare a target route",
+                        manifest.id
+                    )));
+                }
                 let route = contribution.route.as_deref().ok_or_else(|| {
                     AppError::BadRequest(format!(
                         "plugin {} sidebar contribution needs a route",
@@ -2089,9 +2145,26 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 validate_operator_category(&manifest.id, contribution.category.as_ref())?;
             }
             PluginOperatorUiSlot::OverviewCard => {
-                if contribution.route.is_some() || contribution.category.is_some() {
+                if contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || contribution.target_route.is_some()
+                {
                     return Err(AppError::BadRequest(format!(
                         "plugin {} overview-card contribution cannot declare a route or category",
+                        manifest.id
+                    )));
+                }
+            }
+            PluginOperatorUiSlot::PageBefore | PluginOperatorUiSlot::PageAfter => {
+                if contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || !contribution
+                        .target_route
+                        .as_deref()
+                        .is_some_and(|route| CORE_OPERATOR_ROUTES.contains(&route))
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} page contribution needs a core target route",
                         manifest.id
                     )));
                 }

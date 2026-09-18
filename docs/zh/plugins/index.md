@@ -65,4 +65,4 @@ curl "https://mtc.example.com/internal/v1/plugins/example-policy/configuration" 
 | 流量策略 / 请求改写（`traffic-policy.post-auth`） | [插件开发](development.md) |
 | 上游 Provider 与 OAuth（`upstream-provider`） | [插件开发](development.md) |
 | 组路由 plan/observe（`group-routing-v1`） | [组路由](routing.md) |
-| Operator 侧栏页签 / 概览卡片（`typed_data_v1`） | [Operator UI](operator-ui.md) |
+| Operator 页签、现有页面插槽与概览卡片（`typed_data_v1` / `component_v1`） | [Operator UI](operator-ui.md) |

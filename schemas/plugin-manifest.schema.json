@@ -306,14 +306,14 @@
         },
         "operator_ui": {
           "type": "array",
-          "description": "Declarative operator navigation and fixed-slot cards. Core renders typed_data_v1 locally; plugin JavaScript, remote HTML, stylesheets, and iframes are not supported.",
+          "description": "Operator navigation and fixed-slot cards. typed_data_v1 uses core projections; component_v1 joins a manifest to a trusted UI package compiled into the Operator build.",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "slot", "label", "icon", "renderer", "data_endpoint"],
+            "required": ["id", "slot", "label", "icon", "renderer"],
             "properties": {
               "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
-              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card"] },
+              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after"] },
               "category": {
                 "type": "object",
                 "additionalProperties": false,
@@ -324,15 +324,40 @@
                 }
               },
               "route": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "target_route": { "enum": ["overview", "requests", "sessions", "usage", "generations", "providers", "routes", "pricing", "tenants", "credentials", "service-credentials", "plugins", "settings"] },
               "label": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^<>\\u0000-\\u001F\\u007F]+$" },
               "icon": { "enum": ["activity", "chart", "database", "heart", "plug", "shield"] },
-              "renderer": { "const": "typed_data_v1" },
+              "renderer": { "enum": ["typed_data_v1", "component_v1"] },
+              "component_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "component_props": { "type": "object" },
               "presentation": {
                 "enum": ["health_intelligence_v1", "projection_v1"],
-                "description": "Optional closed, core-owned typed-data presentation. This never names plugin browser code."
+                "description": "Optional core-owned typed-data presentation."
               },
               "data_endpoint": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" }
-            }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "renderer": { "const": "typed_data_v1" } }, "required": ["renderer"] },
+                "then": { "required": ["data_endpoint"], "not": { "anyOf": [{ "required": ["component_id"] }, { "required": ["component_props"] }] } }
+              },
+              {
+                "if": { "properties": { "renderer": { "const": "component_v1" } }, "required": ["renderer"] },
+                "then": { "required": ["component_id"], "not": { "required": ["presentation"] } }
+              },
+              {
+                "if": { "properties": { "slot": { "const": "operator.sidebar.tab" } }, "required": ["slot"] },
+                "then": { "required": ["route", "category"], "not": { "required": ["target_route"] } }
+              },
+              {
+                "if": { "properties": { "slot": { "const": "operator.overview.card" } }, "required": ["slot"] },
+                "then": { "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] } }
+              },
+              {
+                "if": { "properties": { "slot": { "enum": ["operator.page.before", "operator.page.after"] } }, "required": ["slot"] },
+                "then": { "required": ["target_route"], "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }] } }
+              }
+            ]
           }
         },
         "service_data": {

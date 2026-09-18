@@ -1,6 +1,11 @@
 # Operator UI extensions
 
-A plugin can contribute a sidebar tab or overview card to the Operator console with **no browser code**: the manifest declares the data source and fixed slot, and the core trusted `typed_data_v1` renderer turns JSON into a native component. The contract is defined by `contributions.service_data` and `contributions.operator_ui` in the [manifest schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json), together with the [UI projection schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-ui-projection.schema.json).
+Plugins can add sidebar tabs and overview cards to the Operator console. MTC supports two integration paths:
+
+- `typed_data_v1` renders structured data with the MTC design system.
+- `component_v1` connects a trusted React package through the versioned Operator UI SDK for interactive workspaces, visualizations, and complete workflows.
+
+The manifest contract lives in [plugin-manifest.schema.json](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json). The publishable React contract lives in `web/operator-ui-sdk`.
 
 ## Manifest example
 
@@ -17,14 +22,10 @@ A plugin can contribute a sidebar tab or overview card to the Operator console w
         "required_scope": "metrics:read",
         "response_schema": {
           "type": "object",
-          "additionalProperties": false,
           "required": ["status"],
           "properties": { "status": { "type": "string" } }
         },
-        "fallback": { "status": "offline" },
-        "cache_ttl_seconds": 30,
-        "timeout_millis": 2000,
-        "max_body_bytes": 65536
+        "fallback": { "status": "offline" }
       }
     ],
     "operator_ui": [
@@ -33,9 +34,11 @@ A plugin can contribute a sidebar tab or overview card to the Operator console w
         "slot": "operator.sidebar.tab",
         "category": { "id": "monitoring" },
         "route": "plugin-health",
-        "label": "Plugin health",
+        "label": "Service health",
         "icon": "heart",
-        "renderer": "typed_data_v1",
+        "renderer": "component_v1",
+        "component_id": "health-workspace",
+        "component_props": { "defaultRange": "24h" },
         "data_endpoint": "health"
       }
     ]
@@ -43,21 +46,45 @@ A plugin can contribute a sidebar tab or overview card to the Operator console w
 }
 ```
 
-Key points:
+`operator.sidebar.tab` uses a `route` and `category`; `operator.overview.card` appears on the overview; `operator.page.before` and `operator.page.after` use `target_route` to mount a component inside an existing Operator page. Core categories are `monitoring`, `traffic`, `identity`, and `system`. A plugin may also declare a named category. Available icons are `activity`, `chart`, `database`, `heart`, `plug`, and `shield`.
 
-- `service_data.url` must be a complete HTTPS GET URL, and its origin must exactly match the `allowed_origins` of an `http` capability. `fallback` must validate against `response_schema` so the UI remains usable when the upstream fails.
-- Choose one slot: `operator.sidebar.tab` (a sidebar tab, requiring `route` and a category—`monitoring`, `traffic`, `identity`, and `system` append to core categories; a new category needs a bounded `category.label`) or `operator.overview.card` (an overview card).
-- `icon` can only be `activity`, `chart`, `database`, `heart`, `plug`, or `shield`; `data_endpoint` must point to a `service_data` ID from the same plugin.
-- `presentation` can be omitted (generic key-value view), set to `"health_intelligence_v1"` (compact core three-source health view), or `"projection_v1"` (structured projection, below).
-- Loading rejects core route names, duplicate routes, category conflicts, arbitrary icon names, and unknown data endpoints immediately; `settings` and `system-settings` are reserved by the core.
+## React package
 
-## Data flow
+The package exports `operatorUiPackage`:
 
-The browser never accesses a plugin URL directly; it calls a core proxy endpoint:
+```tsx
+import { defineOperatorUiPackage } from '@memeloop/token-center-operator-ui-sdk';
+import { HealthWorkspace } from './HealthWorkspace';
 
-![The browser reads plugin data from the MTC control plane; the control plane checks permission and tenant, makes a restricted GET to a fixed plugin endpoint, validates JSON, and returns a core-owned envelope.](/diagrams/plugin-ui.svg)
+export const operatorUiPackage = defineOperatorUiPackage({
+  apiVersion: 'operator-ui-package-v1',
+  pluginId: 'example-observability',
+  compatiblePluginVersions: ['1.0.0'],
+  components: { 'health-workspace': HealthWorkspace },
+});
+```
 
-MTC never forwards service credentials, browser tokens, or tenant values to plugin endpoints. The response is always a core-owned envelope:
+Each component receives plugin, tenant, locale, slot, and host API context. The host API exposes:
+
+- `loadServiceData(endpointId)` for manifest service-data feeds.
+- `request(path, options)` for MTC APIs available to the current Operator credential.
+- `navigate(route)` for core and installed-plugin routes.
+
+Components can use React, Fluent UI, charting packages, and their own state management. MTC theme variables and the Fluent Provider cover the mounted component tree.
+
+Register packages at build time with a comma-separated `MTC_OPERATOR_UI_PACKAGES` value:
+
+```bash
+MTC_OPERATOR_UI_PACKAGES=@memeloop/health-plugin-ui,@memeloop/routing-plugin-ui npm run build
+```
+
+The installed manifest activates a contribution and the compiled package supplies its component. Manifest removal and version changes update the corresponding tabs, cards, and routes on the next catalog refresh.
+
+## Structured-data path
+
+Compact surfaces can use `typed_data_v1`. `data_endpoint` names a `service_data` entry from the same manifest. `presentation` selects the generic key-value view, `health_intelligence_v1`, or `projection_v1`. The projection format supports text, metric, status, and link components; see the [UI projection schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-ui-projection.schema.json).
+
+The control plane reads and validates service data and returns a consistent envelope:
 
 ```json
 {
@@ -73,28 +100,4 @@ MTC never forwards service credentials, browser tokens, or tenant values to plug
 }
 ```
 
-When the upstream fails, `partial: true` and `source` is `stale_cache` or `fallback`; `data` remains schema-valid. Provide a meaningful, non-sensitive fallback.
-
-## `projection_v1` projection
-
-With `"presentation": "projection_v1"`, endpoint data must use the projection format, with `slot_id` set to the contribution's `id`:
-
-```json
-{
-  "schema_version": 1,
-  "plugin_id": "example-observability",
-  "slot_id": "health-tab",
-  "components": [
-    { "kind": "metric", "label": "Request count", "value": "42" },
-    { "kind": "status", "label": "Status", "state": "ok" },
-    { "kind": "text", "text": "Data from the example plugin" },
-    { "kind": "link", "label": "Details", "href": "https://plugin-api.example.com/dashboard" }
-  ]
-}
-```
-
-Component fields depend on `kind`: `text` uses `text`; `metric` uses `label` + `value`; `status` uses `label` + `state` (`ok`, `warning`, `error`, `unknown`); `link` uses `label` + `href` (HTTPS only). Each slot accepts at most 32 components. A link's origin must come from an `http` capability approved by the installed manifest; projection data cannot claim its own origin.
-
-## Security boundaries
-
-`typed_data_v1` has no iframe, remote HTML, remote stylesheet, arbitrary JavaScript, or credential forwarding: React uses core components to render JSON as plain text. Installation and removal only change the loaded manifest set. After removal, that plugin's tabs, cards, and `plugin--{plugin_id}--{route}` routes disappear at the next manifest refresh, with no navigation records left behind.
+Build-time module resolution keeps component packages inside the standard TypeScript, dependency-locking, review, and content-security-policy pipeline. Runtime manifests select compiled components with a stable, traceable loading path.

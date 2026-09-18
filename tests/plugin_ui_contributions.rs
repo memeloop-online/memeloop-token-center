@@ -124,3 +124,55 @@ async fn arbitrary_operator_presentation_is_rejected_before_plugin_load() {
         "operator presentations must remain a closed core-owned enum"
     );
 }
+
+#[tokio::test]
+async fn component_operator_contributions_support_tabs_and_existing_page_slots() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let values = fixture();
+    let mut manifest = values["installed"][0].clone();
+    manifest["contributions"]["operator_ui"] = serde_json::json!([
+        {
+            "id": "interactive-tab",
+            "slot": "operator.sidebar.tab",
+            "category": { "id": "monitoring" },
+            "route": "interactive-health",
+            "label": "Interactive health",
+            "icon": "heart",
+            "renderer": "component_v1",
+            "component_id": "health-workspace",
+            "component_props": { "defaultRange": "24h" }
+        },
+        {
+            "id": "provider-footer",
+            "slot": "operator.page.after",
+            "target_route": "providers",
+            "label": "Provider intelligence",
+            "icon": "chart",
+            "renderer": "component_v1",
+            "component_id": "provider-intelligence",
+            "data_endpoint": "health"
+        }
+    ]);
+    write_package(&plugins, "component-ui", &manifest);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("component-ui.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.plugin_dir = Some(plugins.display().to_string());
+    let state = AppState::initialize(config)
+        .await
+        .expect("load component UI plugin fixture");
+    let manifest = state.plugins.manifests().pop().expect("component manifest");
+    assert_eq!(
+        manifest.contributions.operator_ui[0].renderer,
+        "component_v1"
+    );
+    assert_eq!(
+        manifest.contributions.operator_ui[1]
+            .target_route
+            .as_deref(),
+        Some("providers")
+    );
+}

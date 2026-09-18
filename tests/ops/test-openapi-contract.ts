@@ -68,7 +68,7 @@ test("model picker projection fails closed on network side effects", () => {
   operation["x-projection-contract"]["provider-network-io"] = "allowed";
   assert.throws(() => validateProductContracts(document), /model picker projection gained side effects/u);
 });
-test("plugin operator data is a scoped typed-JSON proxy contract", () => {
+test("plugin operator host exposes typed data and versioned component slots", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/plugins/{plugin_id}/data/{endpoint_id}"].get;
   assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
   assert.equal(operation["x-required-scope"], "plugins:read");
@@ -77,8 +77,10 @@ test("plugin operator data is a scoped typed-JSON proxy contract", () => {
   assert.equal(operation["x-outbound-contract"].transport, "HTTPS-only-DNS-pinned-no-redirect");
   assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/PluginServiceDataResponse");
   const contribution = document.components.schemas.PluginOperatorUiContribution;
-  assert.deepEqual(contribution.properties.slot.enum, ["operator.sidebar.tab", "operator.overview.card"]);
-  assert.equal(contribution.properties.renderer.const, "typed_data_v1");
+  assert.deepEqual(contribution.properties.slot.enum, ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after"]);
+  assert.deepEqual(contribution.properties.renderer.enum, ["typed_data_v1", "component_v1"]);
+  assert.ok(contribution.properties.component_id);
+  assert.ok(contribution.properties.target_route.enum.includes("providers"));
   assert.ok(document.components.schemas.PluginServiceDataEndpoint.properties.required_scope.enum.includes("metrics:read"));
 });
 test("Responses WebSocket negotiation remains an authenticated temporary fallback", () => {

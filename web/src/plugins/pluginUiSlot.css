@@ -8,3 +8,5 @@
 .plugin-ui-components a { color: inherit; text-decoration: underline; }
 .plugin-ui-state { color: inherit; border: 1px solid currentColor; padding: .1em .35em; }
 .plugin-ui-components a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.plugin-component-page, .operator-page-plugin-extension { min-inline-size: 0; }
+.operator-page-plugin-extensions { display: grid; gap: 16px; }
