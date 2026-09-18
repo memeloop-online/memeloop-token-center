@@ -37,21 +37,22 @@ function OverviewMonitoringSection({ state, points, token, tenant }: { state: Re
   return <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} quotaSummary={<OverviewUpstreamQuota token={token} tenant={tenant} snapshot={state.value} />} /></>;
 }
 
-function OverviewRecentRequestsSection({ state, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenSession: (sessionId: string) => void }) {
+function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string) => void }) {
   const { t } = useI18n();
   return <article className="panel operator-overview-recent"><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div>
     {state.kind === 'idle' || state.kind === 'loading'
       ? <div className="empty">{t('common.loading')}</div>
       : state.kind === 'failed'
         ? <div className="notice error" role="alert">{state.message}</div>
-        : <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<RequestTable requests={state.value} onOpenSession={onOpenSession} /></>}
+        : <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<RequestTable requests={state.value} onSelect={(request) => onOpenRequest(request.request_id)} onOpenSession={onOpenSession} /></>}
   </article>;
 }
 
-export function OverviewPage({ token, tenant, onNavigate, onOpenSession, onRequestDrilldown }: OperatorPageProps & {
+export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenSession, onRequestDrilldown }: OperatorPageProps & {
   onNavigate: (route: OperatorRouteKey) => void;
   onRequestDrilldown: (ast: TypedFilterAst) => void;
   onOpenUsageSession: (session: UsageAnalysisSessionBucket) => void;
+  onOpenRequest: (requestId: string) => void;
   onOpenSession: (sessionId: string) => void;
 }) {
   const { t } = useI18n();
@@ -69,7 +70,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenSession, onReque
   return <div className="operator-overview-dashboard">
     <OverviewMonitoringSection state={monitoringResource.state} token={token} tenant={tenant} points={trends.state.kind === 'ready' ? trends.state.value.time_series : undefined} />
     <OverviewTrends state={trends.state} onDrilldown={(ast) => { onRequestDrilldown(ast); onNavigate('requests'); }} />
-    <OverviewRecentRequestsSection state={requestResource.state} onOpenSession={onOpenSession} />
+    <OverviewRecentRequestsSection state={requestResource.state} onOpenRequest={onOpenRequest} onOpenSession={onOpenSession} />
   </div>;
 }
 
