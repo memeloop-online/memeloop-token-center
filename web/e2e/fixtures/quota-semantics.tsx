@@ -31,13 +31,17 @@ const unobserved: UpstreamQuotaSnapshot = {
 };
 
 function Preview() {
+  const now = Date.now();
+  const summarySnapshot: UpstreamQuotaSnapshot = { ...retained, status: 'ready', stale: false, stale_after: null, error_code: null, reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: now + 3_600_000, source: 'codex_reset_credits' }], windows: [
+    { ...retained.windows[0], used_percent: 51, reset_at: Date.UTC(2030, 0, 2, 10) },
+    { ...retained.windows[0], id: 'code:secondary_window', period_seconds: 604_800, used_percent: 20, reset_at: Date.UTC(2030, 0, 3, 11), reset_is_estimated: true },
+    { ...retained.windows[0], id: 'code_review:primary_window', used_percent: null, reset_at: null },
+  ] };
   return <main className="main"><article className="panel">
     <h1>Quota semantics · no network</h1>
-    <section data-case="summary"><QuotaSummary snapshot={{ ...retained, status: 'ready', stale: false, stale_after: null, error_code: null, windows: [
-      { ...retained.windows[0], used_percent: 51 },
-      { ...retained.windows[0], id: 'code:secondary_window', period_seconds: 604_800, used_percent: 20 },
-      { ...retained.windows[0], id: 'code_review:primary_window', used_percent: null },
-    ] }} /></section>
+    <section data-case="summary"><QuotaSummary snapshot={summarySnapshot} showResetCreditExpiryInTooltip /></section>
+    <section data-case="summary-credit-unknown"><QuotaSummary snapshot={{ ...summarySnapshot, reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: null, source: 'codex_reset_credits' }] }} showResetCreditExpiryInTooltip /></section>
+    <section data-case="summary-credit-none"><QuotaSummary snapshot={{ ...summarySnapshot, reset_capability: { ...summarySnapshot.reset_capability, available_credits: 0 }, reset_credits: [] }} showResetCreditExpiryInTooltip /></section>
     <section data-case="summary-retained"><QuotaSummary snapshot={retained} refreshFailed /></section>
     <section data-case="summary-expiring"><QuotaSummary snapshot={{ ...retained, error_code: null, stale: false, stale_after: Date.now() + 5_000 }} /></section>
     <section data-case="summary-unobserved"><QuotaSummary snapshot={unobserved} /></section>

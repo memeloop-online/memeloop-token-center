@@ -22,7 +22,7 @@ const snapshot: UpstreamQuotaSnapshot = {
     { id: 'code:primary_window', label: 'code:primary_window', used_percent: 75, used: null, remaining: 25, limit: 100, unit: null, reset_at: now + 3600_000, period_seconds: 18000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
     { id: 'code:secondary_window', label: 'code:secondary_window', used_percent: null, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 604800, source: 'codex_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
   ],
-  reset_capability: { provider_supported: mode === 'unsupported' ? null : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: mode === 'unsupported' ? null : 2, applicable_credits: mode === 'unsupported' ? null : 1, reason: mode === 'unsupported' ? 'quota_reset_not_supported' : 'explicit_confirmation_required', credit_error_code: null, evidence: mode === 'unsupported' ? 'unknown_provider' : 'server_driver_contract' },
+  reset_capability: { provider_supported: mode === 'unsupported' ? null : true, implementation_available: mode === 'reset' || mode === 'unknown' || mode === 'prepared-current', prepare_available: mode === 'reset' || mode === 'unknown' || mode === 'prepared-current', confirmation_required: mode === 'reset' || mode === 'unknown' || mode === 'prepared-current', retryable: false, available_credits: mode === 'unsupported' ? null : 2, applicable_credits: mode === 'unsupported' ? null : 1, reason: mode === 'unsupported' ? 'quota_reset_not_supported' : 'explicit_confirmation_required', credit_error_code: null, evidence: mode === 'unsupported' ? 'unknown_provider' : 'server_driver_contract' },
   reset_credits: [],
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
@@ -57,7 +57,7 @@ window.fetch = async (_input, init) => {
   const path = String(_input);
   if (url.pathname === `${reset}current`) {
     window.quotaCurrents += 1;
-    return new Response('null');
+    return new Response(mode === 'prepared-current' ? JSON.stringify(operation) : 'null');
   }
   if (path.includes('/quota-reset/')) {
     if (path.includes('/prepare')) {

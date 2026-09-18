@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
+import { formatCountdown } from '../format';
 import { useI18n } from '../i18n';
 import { useConfirmDialog } from '../useConfirmDialog';
 import type { UpstreamQuotaSnapshot } from './upstreamQuota';
+import { useQuotaClock } from './useQuotaClock';
 
 export interface QuotaResetOperation {
   id: string;
@@ -21,6 +23,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   accountId: string; accountName: string; tenant: string; token: string; snapshot: UpstreamQuotaSnapshot;
 }) {
   const { locale, t } = useI18n();
+  const now = useQuotaClock();
   const scope = `${token}\0${tenant}\0${accountId}`;
   const identity = useRef(scope);
   const secret = useRef<string | null>(null);
@@ -138,6 +141,9 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     {operation && <div role="status">
       <p>{t(dispatchState ? operation.state === 'accepted' ? 'quota.resetAccepted' : 'quota.resetUncertain' : 'quota.resetPrepared')}</p>
       <code>{operation.id}</code>
+      {operation.state === 'prepared' && <p data-reset-operation-expiry={operation.expires_at}>{t('quota.resetPreparedExpiresAt', { time: new Date(operation.expires_at).toLocaleString(locale) })} · {operation.expires_at <= now
+        ? t('quota.resetPreparedExpired')
+        : t('quota.resetPreparedExpiresIn', { time: formatCountdown(operation.expires_at - now, locale) })}</p>}
       <p>{t('quota.resetLocked')}</p>
       <div className="button-row">
         <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</button>
