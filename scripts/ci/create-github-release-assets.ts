@@ -143,7 +143,10 @@ try {
       '--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
       '-czf', archive, '-C', staging, basename(directory),
     ], { encoding: 'utf8', shell: false });
-    if (result.status !== 0) fail(SCOPE, `unable to package ${basename(directory)}`);
+    if (result.status !== 0) {
+      const detail = result.error?.message ?? (result.stderr.trim() || `tar exited with status ${String(result.status)}`);
+      fail(SCOPE, `unable to package ${basename(directory)}: ${detail}`);
+    }
   }
 } finally {
   rmSync(staging, { recursive: true, force: true });
@@ -164,4 +167,4 @@ writeFileSync(join(output, 'RELEASE.md'), [
   '',
   'This release is licensed under Apache License 2.0. Third-party notices and licenses are preserved in the complete archives and represented in the attached SPDX/SLSA evidence.',
 ].join('\n'), { encoding: 'utf8', flag: 'wx', mode: 0o644 });
-console.log(`Created ${assets.length + 1} checksummed release assets for ${revision}`);
+console.log(`Created ${assets.length} checksummed release assets plus SHA256SUMS for ${revision}`);
