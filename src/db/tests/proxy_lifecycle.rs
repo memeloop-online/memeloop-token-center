@@ -293,7 +293,9 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
                 alias: "late-streaming-parent".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    max_concurrency: 8,
+                    // This fixture deliberately keeps several reservations in flight while it
+                    // exercises independent reconciliation and lock-order scenarios below.
+                    max_concurrency: 16,
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
