@@ -23,3 +23,7 @@ Memeloop Token Center（MTC）是面向团队的多模型 AI 网关。它把上�
 [![实时请求流中的模型、凭据、词元用量、费用与状态](docs/public/images/requests.png)](https://memeloop-online.github.io/memeloop-token-center/zh/guide/requests)
 
 [![上游服务目录中的账号连接、模型与路由关系](docs/public/images/providers.png)](https://memeloop-online.github.io/memeloop-token-center/zh/guide/routing)
+
+## 许可证
+
+MemeLoop Token Center 0.1.0 及后续版本采用 [Apache License 2.0](LICENSE)。发布归档会保留各第三方组件各自适用的声明与许可证文本。

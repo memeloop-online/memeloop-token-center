@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 use crate::plugin::{PluginManifest, validate_plugin_package};
 
+pub use crate::plugin_runtime_companions::{COSIGN_VERIFIER_FILENAME, COSIGN_VERIFIER_VERSION};
+
 pub const PLUGIN_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.memeloop.token-center.plugin.v1";
 pub const PLUGIN_CONFIG_MEDIA_TYPE: &str =
     "application/vnd.memeloop.token-center.plugin.config.v1+json";
@@ -46,8 +48,6 @@ const MAX_COSIGN_OUTPUT_BYTES: u64 = 64 * 1024;
 const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
 // A whole-operation bound prevents drip-fed bodies holding an install lease.
 const OCI_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-pub const COSIGN_VERIFIER_PATH: &str = "/usr/local/bin/cosign";
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3";
 
 #[derive(Clone, Default)]
 pub enum RegistryCredentials {
@@ -388,11 +388,54 @@ trait CosignRunner: Send + Sync {
 
 struct SystemCosignRunner;
 
+/// Prove that this service executable can launch its co-located installer and
+/// that the installer can launch and validate its co-located Cosign verifier.
+#[cfg(feature = "experimental-plugin-revisions")]
+pub async fn verify_plugin_runtime() -> io::Result<()> {
+    crate::plugin_runtime_companions::verify_plugin_runtime().await
+}
+
 #[async_trait]
 impl CosignRunner for SystemCosignRunner {
     async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput> {
-        run_cosign_process(Path::new(COSIGN_VERIFIER_PATH), command, COSIGN_TIMEOUT).await
+        run_cosign_process(
+            &crate::plugin_runtime_companions::cosign_verifier_path()?,
+            command,
+            COSIGN_TIMEOUT,
+        )
+        .await
     }
+}
+
+/// Validate the exact co-located Cosign executable used by signature
+/// verification without contacting a registry. Release-package smoke tests use
+/// this boundary to prove that an extracted installer resolves its companion.
+pub async fn verify_cosign_runtime() -> Result<(), PluginDistributionError> {
+    let workspace = CosignWorkspace::new(
+        "runtime-check.invalid",
+        &RegistryCredentials::Anonymous,
+        &[],
+    )
+    .map_err(|_| PluginDistributionError::SignatureVerification)?;
+    let runner = SystemCosignRunner;
+    let version = runner
+        .run(&cosign_version_command(&workspace))
+        .await
+        .map_err(|_| PluginDistributionError::SignatureVerification)?;
+    if !version.success || !cosign_version_matches(&version.stdout) {
+        return Err(PluginDistributionError::SignatureVerification);
+    }
+    let mut verify_help = cosign_base_command(&workspace);
+    verify_help.arguments = vec!["verify".into(), "--help".into()];
+    if !runner
+        .run(&verify_help)
+        .await
+        .map_err(|_| PluginDistributionError::SignatureVerification)?
+        .success
+    {
+        return Err(PluginDistributionError::SignatureVerification);
+    }
+    Ok(())
 }
 
 async fn run_cosign_process(

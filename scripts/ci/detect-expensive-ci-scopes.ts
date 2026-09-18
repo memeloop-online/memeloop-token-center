@@ -99,7 +99,7 @@ const staticContractsOnly = changes.length > 0 && changes.every(({ paths }) => p
 const rust = fullCoverage || !(presentationOnly || staticContractsOnly);
 const web = fullCoverage || !staticContractsOnly;
 const migration = fullCoverage || !(presentationOnly || staticContractsOnly);
-const pluginInstaller = fullCoverage || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
+const pluginInstaller = fullCoverage || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer(?:\.release)?$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
 appendFileSync(
   outputValue,

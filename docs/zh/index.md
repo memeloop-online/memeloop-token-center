@@ -36,3 +36,7 @@ features:
 - **运营人员：** [连接上游账号](/zh/guide/upstreams)、[编排模型路由](/zh/guide/routing)、[签发客户端凭据](/zh/guide/credentials)。
 - **应用团队：** 通过 [API 指南](/zh/guide/api)接入服务，在[请求视图](/zh/guide/requests)中查看运行情况。
 - **插件开发者：** 了解[扩展模型](/zh/plugins/)，跟随[开发指南](/zh/plugins/development)构建插件。
+
+## 许可证
+
+MTC 0.1.0 及后续版本采用 [Apache License 2.0](https://github.com/memeloop-online/memeloop-token-center/blob/master/LICENSE)。发布归档会保留各第三方组件各自适用的声明与许可证文本。

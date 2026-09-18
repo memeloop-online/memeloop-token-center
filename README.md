@@ -23,3 +23,7 @@ These screenshots come from the running product. Identity details use example va
 [![Live request stream with model, credential, token usage, cost, and status](docs/public/images/requests.png)](https://memeloop-online.github.io/memeloop-token-center/en/guide/requests)
 
 [![Upstream service catalog with account connections, models, and route relationships](docs/public/images/providers.png)](https://memeloop-online.github.io/memeloop-token-center/en/guide/routing)
+
+## License
+
+MemeLoop Token Center 0.1.0 and later are licensed under the [Apache License 2.0](LICENSE). Distributed release archives retain separately applicable third-party notices and license texts.

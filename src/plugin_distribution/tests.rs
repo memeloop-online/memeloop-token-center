@@ -655,7 +655,7 @@ async fn system_executor_kills_on_timeout_and_rejects_oversized_output() {
 
 #[test]
 fn cosign_binary_and_version_are_fixed_security_constants() {
-    assert_eq!(COSIGN_VERIFIER_PATH, "/usr/local/bin/cosign");
+    assert_eq!(COSIGN_VERIFIER_FILENAME, "cosign");
     assert_eq!(COSIGN_VERIFIER_VERSION, "v3.1.3-mtc.3");
     assert!(cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.3"}"#));
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.1"}"#));

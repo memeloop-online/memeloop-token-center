@@ -17,9 +17,12 @@ test('release contains only runtime images and no retired migration delivery sur
   const minioImage = 'quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e';
   const minioClientImage = 'quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3';
   assert.ok(!dockerfile.includes('memeloop-token-center-importer'));
-  contains('Dockerfile.plugin-installer', 'FROM ${RUNTIME_IMAGE}');
+  contains('Dockerfile.plugin-installer.release', 'FROM ${RUNTIME_IMAGE}');
+  assert.ok(!read('Dockerfile.plugin-installer.release').includes('cargo build'));
+  assert.ok(!read('Dockerfile.plugin-installer.release').includes('go build'));
 
   const workflow = read('.github/workflows/ci.yml');
+  const manualRelease = parse(read('.github/workflows/manual-release.yml')) as Workflow;
   const browserSteps = (parse(workflow) as Workflow).jobs?.web?.steps ?? [];
   const cucumber = browserSteps.find((step) => step.run === 'npm run test:e2e');
   assert.equal(cucumber?.env?.MTC_E2E_BINARY, '${{ github.workspace }}/target/debug/memeloop-token-center');
@@ -30,6 +33,16 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.ok(!workflow.includes('test-cpa-upstream-import'));
   assert.ok(!workflow.includes('legacy_credentials_bulk_postgres'));
   assert.ok(!workflow.includes('test-session-archive-delta-export'));
+  const manualBuilder = manualRelease.jobs?.['build-release-input'];
+  const manualBuild = manualBuilder?.steps?.find((step) => step.uses?.startsWith('docker/build-push-action@'));
+  assert.equal(manualBuild?.with?.target, 'release-input-export');
+  assert.equal(manualBuild?.with?.outputs, 'type=local,dest=${{ runner.temp }}/release-service-input');
+  const manualPublisher = manualRelease.jobs?.['publish-ghcr'];
+  assert.deepEqual(manualPublisher?.needs, ['build-release-input']);
+  const manualMatrix = JSON.stringify((manualPublisher as unknown as { strategy?: unknown })?.strategy);
+  assert.match(manualMatrix, /Dockerfile\.release/);
+  assert.match(manualMatrix, /Dockerfile\.plugin-installer\.release/);
+  assert.doesNotMatch(manualMatrix, /"Dockerfile"|"Dockerfile\.plugin-installer"/);
   assert.equal(occurrences(workflow, minioImage), 1);
   assert.equal(occurrences(compose, minioImage), 1);
   assert.equal(occurrences(workflow, minioClientImage), 1);
@@ -85,7 +98,17 @@ test('release contains only runtime images and no retired migration delivery sur
   contains('Dockerfile', 'FROM scratch AS release-input-export');
   contains('Dockerfile', 'FROM ${RUNTIME_IMAGE} AS release-input-smoke');
   contains('Dockerfile.release', 'COPY --chmod=0555 --from=release-input /memeloop-token-center /usr/local/bin/memeloop-token-center');
-  contains('Dockerfile.release', 'COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web');
+  contains('Dockerfile', 'COPY --from=web-builder /build/web/dist /release-input/web');
+  contains('Dockerfile.release', 'COPY --from=release-input /web /usr/share/memeloop-token-center/web');
+  contains('Dockerfile.release', '["/usr/local/bin/memeloop-token-center", "verify-plugin-runtime"]');
+  contains('Dockerfile.release', '["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]');
+  contains('Dockerfile.plugin-installer.release', '["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]');
+  contains('src/plugin_runtime_companions.rs', 'std::env::current_exe()?');
+  contains('src/plugin_runtime_companions.rs', 'PLUGIN_INSTALLER_FILENAME');
+  assert.ok(!read('src/plugin/application/installation.rs').includes('/usr/local/bin/install-plugin-oci'));
+  assert.ok(!read('src/plugin/application/installation.rs').includes('LD_LIBRARY_PATH", "/usr/local/lib'));
+  assert.ok(!read('src/plugin_runtime_companions.rs').includes('/usr/local/bin/cosign'));
+  assert.ok(!read('Dockerfile.release').includes('npm run build'));
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory_acceptance == 'true'");
   assert.equal(rust?.if, "needs.changes.outputs.rust == 'true'");
@@ -111,9 +134,10 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.equal(assemblyDownload?.with?.name, 'memory-binary-${{ github.sha }}');
   assert.equal(assemblyDownload?.with?.path, '${{ runner.temp }}/release-service-input');
   const assemblyBuild = releaseInputAssembly?.steps?.find((step) => step.uses?.startsWith('docker/build-push-action@'));
-  assert.equal(assemblyBuild?.with?.file, 'Dockerfile.release');
+  assert.equal(assemblyBuild?.with?.file, '${{ matrix.dockerfile }}');
   assert.equal(assemblyBuild?.with?.outputs, 'type=cacheonly');
   assert.match(String(assemblyBuild?.with?.['build-contexts']), /^release-input=\$\{\{ runner\.temp \}\}\/release-service-input\s*$/);
+  assert.match(JSON.stringify((releaseInputAssembly as unknown as { strategy?: unknown })?.strategy), /Dockerfile\.plugin-installer\.release/);
   for (const jobName of ['repository-security', 'dependency-security', 'api-contract', 'packaging']) {
     assert.equal(parsed.jobs?.[jobName]?.if, undefined, `${jobName} must remain unconditional`);
   }
@@ -127,7 +151,7 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.deepEqual(verifier?.needs, ['publish-ghcr']);
   assert.match(
     String(verifier?.if).replace(/\s+/g, ' ').trim(),
-    /^always\(\) && github\.event_name == 'push' && github\.ref == 'refs\/heads\/master' && needs\.publish-ghcr\.result == 'success'$/,
+    /^always\(\) && github\.event_name == 'push' && \(github\.ref == 'refs\/heads\/master' \|\| startsWith\(github\.ref, 'refs\/tags\/v'\)\) && needs\.publish-ghcr\.result == 'success'$/,
     'verify-ghcr-release must not inherit skipped-ancestor propagation from publish prerequisites',
   );
   const publishSteps = publish.steps ?? [];
@@ -146,6 +170,12 @@ test('release contains only runtime images and no retired migration delivery sur
   const servicePublisher = publishSteps.find((step) => step.id === 'build');
   assert.match(String(servicePublisher?.with?.['build-contexts']), /^release-input=\$\{\{ runner\.temp \}\}\/release-service-input\s*$/);
   assert.match(serializedMatrix, /Dockerfile\.release/);
+  assert.match(serializedMatrix, /Dockerfile\.plugin-installer\.release/);
+  const githubRelease = parsed.jobs?.['publish-github-release'];
+  assert.deepEqual(new Set(Array.isArray(githubRelease?.needs) ? githubRelease.needs : []), new Set(['changes', 'memory-binary', 'verify-ghcr-release']));
+  assert.match(String(githubRelease?.if), /is_version_tag == 'true'/);
+  assert.ok(githubRelease?.steps?.some((step) => step.run?.includes('create-github-release-assets.ts')));
+  assert.ok(githubRelease?.steps?.some((step) => step.run?.includes('gh release create')));
   const packaging = parsed.jobs?.packaging;
   const cachedPluginBuild = packaging?.steps?.find((step) => step.name === 'Build the cached hardened plugin installer contract image');
   assert.equal(cachedPluginBuild?.with?.['cache-from'], 'type=gha,scope=plugin-installer');

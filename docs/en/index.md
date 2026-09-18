@@ -36,3 +36,7 @@ Three live product views show how MTC connects configuration with day-to-day ope
 - **Operators:** [connect upstream accounts](/en/guide/upstreams), [build model routes](/en/guide/routing), and [issue client credentials](/en/guide/credentials).
 - **Application teams:** use the [API guide](/en/guide/api) and inspect activity in [Requests](/en/guide/requests).
 - **Plugin developers:** browse the [extension model](/en/plugins/) and follow the [development guide](/en/plugins/development).
+
+## License
+
+MTC 0.1.0 and later are available under the [Apache License 2.0](https://github.com/memeloop-online/memeloop-token-center/blob/master/LICENSE). Release archives preserve separately applicable third-party notices and license texts.
