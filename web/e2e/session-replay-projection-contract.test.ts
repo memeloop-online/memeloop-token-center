@@ -77,17 +77,20 @@ test('projects Chat Completions messages and does not pair calls by tool name or
   ]);
 });
 
-test('reports unavailable, redacted, and out-of-session data as unknown rather than inventing it', () => {
+test('reports incomplete, unknown-format, redacted, and out-of-session archives as unknown rather than inventing them', () => {
   const unavailable = detail('missing', 1, null, null, { archive_complete: false });
   const redacted = detail('redacted', 2, { redacted: true }, { output: [{ type: 'message', role: 'assistant', content: { redacted: true } }] });
-  const otherSession = detail('other', 3, { input: 'must not be projected' }, { output: [] }, {
+  const unsupported = detail('unsupported', 3, { retained: 'unknown request body' }, { retained: 'unknown response body' });
+  const otherSession = detail('other', 4, { input: 'must not be projected' }, { output: [] }, {
     session_context: { session_id: 'session-b', association: 'confirmed', session_name: null, task_kind: null, agent_id: null, semantics_source: 'declared' },
   });
 
-  const replay = projectSessionReplay('session-a', [unavailable, redacted, otherSession]);
+  const replay = projectSessionReplay('session-a', [unavailable, redacted, unsupported, otherSession]);
   assert.deepEqual(replay.items.filter((item) => item.kind === 'unknown').map((item) => [item.requestId, item.body, item.reason]), [
     ['missing', 'request', 'archive_unavailable'], ['missing', 'response', 'archive_unavailable'],
-    ['redacted', 'request', 'redacted'], ['other', 'request', 'outside_session'], ['other', 'response', 'outside_session'],
+    ['redacted', 'request', 'redacted'],
+    ['unsupported', 'request', 'unsupported_body'], ['unsupported', 'response', 'unsupported_body'],
+    ['other', 'request', 'outside_session'], ['other', 'response', 'outside_session'],
   ]);
   const redactedMessage = replay.items.find((item) => item.kind === 'message' && item.requestId === 'redacted');
   assert.ok(redactedMessage?.kind === 'message');

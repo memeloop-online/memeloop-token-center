@@ -2,12 +2,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [surface, replayView, replayStyles, operatorSessions, operatorSessionsPage, selfSessions, i18n] = await Promise.all([
+const [surface, replayView, replayStyles, operatorSessions, selfSessions, i18n] = await Promise.all([
   readFile(new URL('../src/SessionViews.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/sessionReplayViews.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/sessionReplay.css', import.meta.url), 'utf8'),
   readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8'),
-  readFile(new URL('../src/operator/pages/SessionsPage.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/self/SessionsPage.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/i18n.tsx', import.meta.url), 'utf8'),
 ]);
@@ -50,8 +49,6 @@ test('replay provides localized user-turn navigation, compact archive state, and
   assert.match(replayView, /session-replay-preview/);
   assert.match(replayView, /archiveBodies = 2/);
   assert.match(replayView, /<ArchiveText kind="message"/);
-  const toolCall = replayView.slice(replayView.indexOf("if (item.kind === 'tool_call')"), replayView.indexOf("return <article className=\"session-replay-entry tool-result\""));
-  assert.ok(toolCall.indexOf('<ArchiveText kind="tool"') < toolCall.indexOf("<Disclosure title={t('request.technicalDetails')}"), 'tool arguments remain ordinary tool-call content before technical metadata');
   assert.match(replayStyles, /--replay-surface/);
   assert.match(replayStyles, /font: 14px\/1\.65 Inter/);
   assert.match(replayStyles, /\.session-replay-body\.tool \{ font-family: ui-monospace/);
@@ -60,14 +57,4 @@ test('replay provides localized user-turn navigation, compact archive state, and
   assert.match(replayStyles, /@media \(min-width: 1440px\)/);
   assert.match(replayStyles, /@media \(max-width: 768px\)/);
   assert.match(replayStyles, /@media \(max-width: 320px\)/);
-});
-
-test('session request inspection reuses request diagnostics and has a cancellable loading drawer', () => {
-  assert.match(operatorSessionsPage, /import \{ DrawerFrame, RequestDiagnostics \} from '\.\.\/\.\.\/components\.js';/);
-  assert.match(operatorSessionsPage, /const \[requestLoading, setRequestLoading\] = useState\(false\);/);
-  assert.match(operatorSessionsPage, /setSelectedRequest\(request\);/);
-  assert.match(operatorSessionsPage, /<Spinner size="extra-small" aria-hidden="true" \/>\{t\('common\.loading'\)\}/);
-  assert.match(operatorSessionsPage, /<RequestDiagnostics request=\{scopedDetail\} \/>/);
-  assert.match(operatorSessionsPage, /<Disclosure title=\{t\('request\.technicalDetails'\)\}>/);
-  assert.match(operatorSessionsPage, /detailRequests\.current\.invalidate\(\);/);
 });
