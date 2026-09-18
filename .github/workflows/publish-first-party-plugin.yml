@@ -232,46 +232,7 @@ jobs:
             --cosign-certificate-oidc-issuer "$SIGNING_ISSUER" \
             --registry-username-file /registry/username --registry-password-file /registry/password \
             > "$RUNNER_TEMP/plugin-installation.json"
-          node <<'NODE'
-          const assert = require('node:assert/strict');
-          const { createHash } = require('node:crypto');
-          const { readFileSync, writeFileSync } = require('node:fs');
-          const { join } = require('node:path');
-          const root = process.env.RUNNER_TEMP;
-          const json = (path) => JSON.parse(readFileSync(join(root, path), 'utf8'));
-          const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-          const manifestBytes = readFileSync(join(root, 'plugin-oci-manifest.json'));
-          assert.equal(digest(manifestBytes), process.env.PLUGIN_DIGEST);
-          const oci = JSON.parse(manifestBytes);
-          assert.equal(oci.artifactType, 'application/vnd.memeloop.token-center.plugin.v1');
-          assert.deepEqual(oci.layers.map((layer) => layer.annotations?.['org.opencontainers.image.title']).sort(),
-            ['README.md', 'plugin.json', 'schemas-health-intelligence.json']);
-          const installed = json('plugin-installation.json');
-          assert.equal(installed.id, process.env.PLUGIN_ID);
-          assert.equal(installed.digest, process.env.PLUGIN_DIGEST);
-          assert.equal(installed.source, process.env.PLUGIN_SOURCE);
-          const plugin = json(`plugin-install/${process.env.PLUGIN_ID}/plugin.json`);
-          assert.equal(plugin.id, process.env.PLUGIN_ID);
-          assert.equal(plugin.wasm, null);
-          assert.equal(plugin.contributions.operator_ui[0].presentation, 'health_intelligence_v1');
-          assert.equal(plugin.contributions.service_data[0].required_scope, 'metrics:read');
-          const receipt = json(`plugin-install/${process.env.PLUGIN_ID}/.mtc-oci-install.json`);
-          assert.equal(receipt.digest, process.env.PLUGIN_DIGEST);
-          assert.equal(receipt.source, process.env.PLUGIN_SOURCE);
-          assert.equal(receipt.signature_policy, 'cosign-keyless');
-          for (const path of ['upstream-signature-verification.json', 'mtc-endorsement-verification.json']) {
-            const signatures = json(path);
-            assert(signatures.some((entry) => entry.critical?.image?.['docker-manifest-digest'] === process.env.PLUGIN_DIGEST));
-          }
-          writeFileSync(join(root, 'plugin-endorsement.json'), `${JSON.stringify({
-            format_version: 1,
-            reference: `${process.env.PLUGIN_SOURCE}@${process.env.PLUGIN_DIGEST}`,
-            upstream_identity: process.env.UPSTREAM_SIGNING_IDENTITY,
-            endorsed_identity: process.env.SIGNING_IDENTITY,
-            installer_reference: `${process.env.INSTALLER_SOURCE}@${process.env.INSTALLER_DIGEST}`,
-            installation_verified: true,
-          }, null, 2)}\n`);
-          NODE
+          node scripts/ci/health-intelligence-endorsement.ts "$RUNNER_TEMP"
       - name: Preserve endorsement and clean-install evidence
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
