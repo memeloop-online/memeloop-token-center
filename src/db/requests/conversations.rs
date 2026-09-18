@@ -228,6 +228,7 @@ impl Database {
 
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
@@ -371,6 +372,9 @@ impl Database {
             attach_request_record,
             content_materialized,
         } = input;
+        // Join the live projection-writer cohort before request source, explicit-session, or
+        // conversation-reference locks. Full rebuilds take the exclusive form of this advisory.
+        lock_request_stats_projection_writer_in_transaction(transaction).await?;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
         let atom_hashes = bounded_atom_hashes(&atoms);
@@ -419,14 +423,6 @@ impl Database {
         } else {
             false
         };
-        // A completed request can reclassify its session projection, while a newly arrived turn or
-        // upstream response id can reconcile already-completed descendants. Pending observations
-        // with none of those conditions must remain independently committable while another pending
-        // observation is uncommitted.
-        if request_fact_exists || hints.turn_id.is_some() || upstream_response_id.is_some() {
-            lock_request_stats_projection_in_transaction(transaction).await?;
-        }
-
         if matches!(self.backend, DatabaseBackend::PostgreSql)
             && let Some(session_id) = hints.session_id.as_deref()
         {
@@ -1442,7 +1438,7 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
 ) -> Result<(), AppError> {
     // This path can reconcile clusters and merge their session projections. Acquire the shared
     // statistics lock before reading or locking conversation state to preserve the global order.
-    lock_request_stats_projection_in_transaction(transaction).await?;
+    lock_request_stats_projection_writer_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()
         || upstream_response_id.len() > 256

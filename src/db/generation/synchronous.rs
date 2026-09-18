@@ -643,6 +643,7 @@ impl Database {
         let request_id = input.request_id.to_string();
         let reservation_id = input.reservation.id.to_string();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         if let Some(idempotency_key) = input.idempotency_key {
             let owner = sqlx::query(
                 "UPDATE synchronous_image_idempotency SET lease_expires_at = lease_expires_at WHERE key_id = $1 AND idempotency_key = $2 AND request_id = $3 AND reservation_id = $4 AND status = 'pending'",

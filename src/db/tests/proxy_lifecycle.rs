@@ -982,7 +982,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
         .fetch_one(&mut *stats_gate)
         .await
         .unwrap();
-    lock_request_stats_projection_in_transaction(&mut stats_gate)
+    lock_request_stats_projection_rebuild_in_transaction(&mut stats_gate)
         .await
         .unwrap();
 
@@ -1108,7 +1108,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
         }
     })
     .await
-    .expect("turn observation did not serialize behind response-only statistics ownership");
+    .expect("turn observation did not serialize behind the response-only reference ownership");
     attach_sender.send(()).unwrap();
     let response_cluster =
         tokio::time::timeout(std::time::Duration::from_secs(10), response_writer)
@@ -1120,6 +1120,332 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
         .expect("turn observation did not resume after response-only attach committed")
         .unwrap();
     assert_eq!(response_cluster, child_cluster);
+}
+
+async fn wait_for_postgres_blocker(
+    database: &Database,
+    blocked_pid: i32,
+    blocking_pid: i32,
+    message: &'static str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity activity WHERE activity.pid = $1 AND activity.state = 'active' AND activity.wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(activity.pid)))",
+            )
+            .bind(blocked_pid)
+            .bind(blocking_pid)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(message);
+}
+
+#[tokio::test]
+async fn postgres_online_projection_writers_share_stats_lock_before_session_and_budget_locks() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper = b"online projection shared lock ordering pepper";
+    let model = format!("online-projection-lock-{unique}");
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("online-projection-lock-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "online-projection-lock".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    max_concurrency: 16,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+
+    for contender_kind in ["turn", "response", "completed-fact"] {
+        let session_id = format!("projection-lock-{contender_kind}-{unique}");
+        let pending_request_id = Uuid::now_v7();
+        let contender_request_id = Uuid::now_v7();
+        let pending_reservation = database
+            .start_proxy_request(StartProxyRequest {
+                request_id: pending_request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: "objects/pending-explicit-session",
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        let contender_reservation = database
+            .start_proxy_request(StartProxyRequest {
+                request_id: contender_request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai-responses",
+                model: &model,
+                request_object: "objects/projection-contender",
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        if contender_kind == "completed-fact" {
+            database
+                .finish_proxy_request(FinishProxyRequest {
+                    usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
+                    first_output_ms: None,
+                    generation_duration_ms: None,
+                    request_id: contender_request_id,
+                    tenant_id: key.tenant_id,
+                    reservation: &contender_reservation,
+                    input_token_ceiling: 10,
+                    output_token_ceiling: 10,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage::default(),
+                    error_code: None,
+                    response_object: "objects/completed-fact-response",
+                    routing_session_id: None,
+                    routing_terminal_observed_at: None,
+                    conversation: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let pause_lock = Uuid::now_v7().as_u128() as i64;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let function_name = format!("mtc_pause_pending_projection_{suffix}");
+        let trigger_name = format!("mtc_pause_pending_projection_trigger_{suffix}");
+        let function = format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.request_id = '{}' THEN PERFORM pg_advisory_xact_lock({pause_lock}); END IF; RETURN NEW; END $$",
+            pending_request_id
+        );
+        sqlx::query(sqlx::AssertSqlSafe(function))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let trigger = format!(
+            "CREATE TRIGGER {trigger_name} AFTER INSERT ON conversation_observations FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(trigger))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        let pause_gate = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pause_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pause_gate.pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(pause_lock)
+            .execute(&pause_gate.pool)
+            .await
+            .unwrap();
+
+        let pending_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pending_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pending_database.pool)
+            .await
+            .unwrap();
+        let pending_key = key.clone();
+        let pending_session_id = session_id.clone();
+        let pending_task = tokio::spawn(async move {
+            let request_json = serde_json::json!({"input": "pending explicit session"});
+            let hints = ConversationHints {
+                session_id: Some(pending_session_id),
+                ..ConversationHints::default()
+            };
+            pending_database
+                .finish_proxy_request(FinishProxyRequest {
+                    usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
+                    first_output_ms: None,
+                    generation_duration_ms: None,
+                    request_id: pending_request_id,
+                    tenant_id: pending_key.tenant_id,
+                    reservation: &pending_reservation,
+                    input_token_ceiling: 10,
+                    output_token_ceiling: 10,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage::default(),
+                    error_code: None,
+                    response_object: "objects/pending-explicit-session-response",
+                    routing_session_id: None,
+                    routing_terminal_observed_at: None,
+                    conversation: Some(ProxyConversationInput {
+                        key: &pending_key,
+                        request_json: &request_json,
+                        hints: &hints,
+                        client_name: Some("Codex"),
+                        upstream_response_id: None,
+                    }),
+                })
+                .await
+        });
+        wait_for_postgres_blocker(
+            &database,
+            pending_pid,
+            pause_gate_pid,
+            "pending terminal writer did not reach the post-session pause",
+        )
+        .await;
+
+        let contender_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let contender_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&contender_database.pool)
+            .await
+            .unwrap();
+        let contender_key = key.clone();
+        let contender_session_id = session_id.clone();
+        let contender_kind = contender_kind.to_owned();
+        let contender_task = tokio::spawn(async move {
+            let mut transaction = contender_database.begin_write_transaction().await?;
+            let request_json = serde_json::json!({"input": "projection contender"});
+            let hints = ConversationHints {
+                session_id: Some(contender_session_id),
+                turn_id: (contender_kind == "turn").then(|| "turn-contender".to_owned()),
+                ..ConversationHints::default()
+            };
+            let upstream_response_id =
+                (contender_kind == "response").then_some("response-contender");
+            contender_database
+                .record_conversation_observation_in_transaction(
+                    &mut transaction,
+                    ConversationObservationInput {
+                        key: &contender_key,
+                        request_id: contender_request_id,
+                        request_json: &request_json,
+                        hints: &hints,
+                        client_name: Some("Codex"),
+                        upstream_response_id,
+                        observed_at: unix_millis(),
+                        attach_request_record: true,
+                        content_materialized: false,
+                    },
+                )
+                .await?;
+            transaction.commit().await?;
+            Ok::<(), AppError>(())
+        });
+        wait_for_postgres_blocker(
+            &database,
+            contender_pid,
+            pending_pid,
+            "projection contender did not wait on the pending explicit session",
+        )
+        .await;
+
+        let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(pause_lock)
+            .fetch_one(&pause_gate.pool)
+            .await
+            .unwrap();
+        assert!(unlocked);
+        let (pending_result, contender_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(pending_task, contender_task)
+            })
+            .await
+            .expect("online projection writers exceeded the deadline or returned 55P03");
+        pending_result
+            .expect("pending terminal task panicked")
+            .expect("pending terminal writer returned 40P01 or 55P03");
+        contender_result
+            .expect("projection contender task panicked")
+            .expect("projection contender returned 40P01 or 55P03");
+
+        let drop_trigger = format!("DROP TRIGGER {trigger_name} ON conversation_observations");
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let drop_function = format!("DROP FUNCTION {function_name}()");
+        sqlx::query(sqlx::AssertSqlSafe(drop_function))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+
+    // Reproduce the key_budget_state -> stats / stats -> key_budget_state inversion directly.
+    // Shared online ownership lets the key holder re-enter the cohort and release the row; an
+    // exclusive online stats lock would deadlock these two transactions.
+    let mut key_first = database.begin_write_transaction().await.unwrap();
+    let key_first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *key_first)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE key_budget_state SET updated_at = updated_at WHERE key_id = $1")
+        .bind(key.key_id.to_string())
+        .execute(&mut *key_first)
+        .await
+        .unwrap();
+
+    let stats_first_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let stats_first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&stats_first_database.pool)
+        .await
+        .unwrap();
+    let key_id = key.key_id.to_string();
+    let stats_first = tokio::spawn(async move {
+        let mut transaction = stats_first_database.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        sqlx::query("UPDATE key_budget_state SET updated_at = updated_at WHERE key_id = $1")
+            .bind(key_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok::<(), AppError>(())
+    });
+    wait_for_postgres_blocker(
+        &database,
+        stats_first_pid,
+        key_first_pid,
+        "stats-first transaction did not wait on key_budget_state",
+    )
+    .await;
+    lock_request_stats_projection_writer_in_transaction(&mut key_first)
+        .await
+        .expect("key-first writer returned 40P01 or 55P03 while joining shared stats ownership");
+    key_first.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), stats_first)
+        .await
+        .expect("key-budget/stats writers exceeded the deadline or returned 55P03")
+        .expect("stats-first task panicked")
+        .expect("stats-first writer returned 40P01 or 55P03");
 }
 
 #[tokio::test]

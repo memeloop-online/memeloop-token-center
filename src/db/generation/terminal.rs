@@ -10,6 +10,7 @@ pub(super) async fn publish_generation_terminal_effects(
     job_id: &str,
     now: i64,
 ) -> Result<(), AppError> {
+    super::super::lock_request_stats_projection_writer_in_transaction(transaction).await?;
     super::super::billing::publish_generation_settlement_in_transaction(
         transaction,
         super::super::parse_uuid(job_id.to_owned())?,

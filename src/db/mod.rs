@@ -90,7 +90,8 @@ use constants::*;
 pub(crate) use projection_lock::{
     lock_generation_jobs_projection_source_in_transaction,
     lock_request_records_projection_source_in_transaction,
-    lock_request_stats_projection_in_transaction,
+    lock_request_stats_projection_rebuild_in_transaction,
+    lock_request_stats_projection_writer_in_transaction,
 };
 use rotation::*;
 use rows::generation_asset_download;

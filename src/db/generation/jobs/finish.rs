@@ -133,6 +133,7 @@ impl Database {
         }
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"

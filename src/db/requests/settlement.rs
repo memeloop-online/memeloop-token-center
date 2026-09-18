@@ -971,6 +971,7 @@ pub(crate) async fn settle_confirmed_image_charge_in_transaction(
             "confirmed cost must be a nonnegative JavaScript-safe integer".into(),
         ));
     }
+    lock_request_stats_projection_writer_in_transaction(tx).await?;
     // Only this evidence-confirmed entry point adds stricter arithmetic guards;
     // retain native charging policy and its existing reservation cap unchanged.
     let (lifetime, _) = lock_key_budget_state(tx, reservation.key_id, now).await?;
@@ -1040,6 +1041,7 @@ async fn settle_token_usage_with_explicit_charge(
         Some(_) => return Err(AppError::Internal),
         None => price_token_usage(reservation, usage)?,
     };
+    lock_request_stats_projection_writer_in_transaction(tx).await?;
     if !reservation.enforcement_mode.enforces_prepaid_limits() {
         let claimed = sqlx::query(
             "UPDATE usage_reservations SET actual_micros = $1, status = 'settled', settled_at = $2 WHERE id = $3 AND key_id = $4 AND account_id = $5 AND enforcement_mode = 'metered_unlimited' AND status = 'reserved'",
