@@ -351,7 +351,7 @@ impl Database {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
             let capture_started = std::time::Instant::now();
-            if !self
+            let captured = self
                 .capture_reserved_buffered_archive_body_in_transaction(
                     &mut transaction,
                     now,
@@ -359,15 +359,22 @@ impl Database {
                     Some(prepared_request_batch),
                     budget_reservation.as_ref(),
                 )
-                .await
-                .map_err(|_| AppError::Overloaded)?
-            {
+                .await;
+            if !matches!(captured, Ok(true)) {
                 tracing::warn!(
                     phase = "request_admission_capture",
-                    error_code = "capacity",
+                    error_code = if captured.is_err() {
+                        "capture_failed"
+                    } else {
+                        "capacity"
+                    },
                     elapsed_ms = capture_started.elapsed().as_millis() as u64,
-                    "durable request admission capacity exhausted"
+                    "durable request archive capture failed"
                 );
+                BudgetHold::rollback_optional(transaction, hold).await?;
+                if let Some(reservation) = budget_reservation.as_ref() {
+                    reservation.release().await;
+                }
                 return Err(AppError::Overloaded);
             }
         } else if prepared_request_batch.is_some() {

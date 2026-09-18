@@ -92,6 +92,9 @@ impl Database {
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
     ) -> Result<Option<ArchiveBudgetReservation>, AppError> {
+        if archive.body().len() > PLAIN_LIMIT as usize {
+            return Ok(None);
+        }
         let amount = archive
             .body()
             .chunks(crate::response_archive_spool::CHUNK_BYTES)
@@ -99,7 +102,7 @@ impl Database {
                 total.checked_add(archive.sealed_len(bytes.len())? as i64 + CHUNK_OVERHEAD)
             })
             .ok_or(AppError::Internal)?;
-        if amount > CIPHER_LIMIT || archive.body().len() > PLAIN_LIMIT as usize {
+        if amount > CIPHER_LIMIT {
             return Ok(None);
         }
         // Also recovers reservations during gateway-only rolling upgrades,
@@ -157,10 +160,13 @@ impl Database {
         let row = sqlx::query(statement)
             .bind(reservation.id.to_string())
             .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(AppError::Overloaded)?;
+            .await?;
         let now = archive_clock(&mut tx, self.backend).await?;
-        if row.try_get::<i64, _>("expires_at")? <= now {
+        let expires_at = row
+            .map(|row| row.try_get::<i64, _>("expires_at"))
+            .transpose()?;
+        if expires_at.is_none_or(|expires_at| expires_at <= now) {
+            tx.rollback().await?;
             return Err(AppError::Overloaded);
         }
         let mut hold = BudgetHold::late(operation, Some(reservation.identity.request_id));
