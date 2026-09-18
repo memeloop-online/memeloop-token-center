@@ -1834,12 +1834,26 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
+        let UpstreamAttemptAdmission::Healthy {
+            failure_epoch: next_failure_epoch,
+        } = database
+            .claim_upstream_account_attempt_at_revision_with_health_config(
+                account_id,
+                1,
+                next_revision,
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("new transport revision must establish a new healthy cohort");
+        };
         let next = database
             .record_admitted_connection_failure_by_domain(
                 connection_failure(
                     account_id,
                     next_revision,
-                    failure_epoch,
+                    next_failure_epoch,
                     Uuid::now_v7(),
                     "node-b",
                     "gateway-b",
