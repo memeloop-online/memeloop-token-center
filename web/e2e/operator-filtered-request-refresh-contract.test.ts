@@ -65,6 +65,8 @@ test('filtered views stay stable: published batches only mark them stale for a m
   assert.match(source, /t\('traffic\.filteredResultsStale'\)/);
   assert.match(source, /onRefreshFilteredResults/);
   assert.doesNotMatch(source, /scheduleFilteredRefresh/);
-  // The overflow reconcile is guarded away from filtered scopes.
-  assert.match(source, /typedFiltersActive\(currentScope\.filters\) \|\| !reconcileOverflow\.current/);
+  // The overflow reconcile is guarded away from filtered scopes and explicit
+  // history windows; those remain stable until the user refreshes them.
+  assert.match(source, /typedFiltersActive\(currentScope\.filters\)[\s\S]{0,120}loadedHistoryIds\.current\.size/);
+  assert.match(source, /RequestOverflowReconciliation/);
 });
