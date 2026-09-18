@@ -1,8 +1,8 @@
 use super::*;
 
+mod copy;
 mod keys;
 mod lifecycle;
-mod recovery;
 mod service_tokens;
 
 pub(crate) use keys::{

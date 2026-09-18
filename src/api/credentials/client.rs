@@ -234,18 +234,17 @@ pub(in crate::api) async fn rotate_key(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(in crate::api) struct StoreClientCredentialRecoveryRequest {
+pub(in crate::api) struct StoreClientCredentialRequest {
     key: String,
 }
 
-/// Stores an authorized caller's already-existing credential as a durable,
-/// key-bound encrypted recovery envelope. It never changes the credential
-/// generation or returns the supplied secret.
-pub(in crate::api) async fn store_key_credential_recovery(
+/// Stores an authorized caller's already-existing credential for direct copy.
+/// It never changes the credential generation or returns the supplied secret.
+pub(in crate::api) async fn store_key_credential(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
-    Json(body): Json<StoreClientCredentialRecoveryRequest>,
+    Json(body): Json<StoreClientCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
     if let Some(tenant) = service.tenant_external_id.as_deref() {
@@ -253,39 +252,31 @@ pub(in crate::api) async fn store_key_credential_recovery(
     }
     state
         .db
-        .store_key_credential_recovery_secret(
-            key_id,
-            &body.key,
-            state.config.key_pepper.as_bytes(),
-            service.service_id,
-        )
+        .store_key_credential_plaintext(key_id, &body.key, state.config.key_pepper.as_bytes())
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Explicitly returns a durable recovery envelope's plaintext for copying.
+/// Explicitly returns the active credential's stored plaintext for copying.
 /// Neither list nor self-service responses include this value.
 pub(in crate::api) async fn copy_key_credential(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
-    // Authenticate first, then let the database atomically rate-limit and
-    // audit authorized-service failures as well as successful retrievals.
-    // Invalid bearer tokens are rejected by the control middleware before
-    // this handler and never get to amplify durable audit writes.
+    // Authenticate before looking up a credential; scope and tenant checks
+    // remain atomic with the active-generation check in the database.
     let service = authenticated_service(&headers, &state).await?;
-    let recovered = state
+    let copied = state
         .db
         .copy_key_credential(
             key_id,
             state.config.key_pepper.as_bytes(),
-            service.service_id,
             service.tenant_external_id.as_deref(),
             service.allows("keys:write"),
         )
         .await?;
-    let mut response = Json(recovered).into_response();
+    let mut response = Json(copied).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

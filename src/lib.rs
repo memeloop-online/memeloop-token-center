@@ -132,7 +132,7 @@ impl AppState {
             .await
             .map_err(|_| InitializationError::Database)?;
             migration_db
-                .migrate()
+                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
                 .await
                 .map_err(|_| InitializationError::Database)?;
             migration_db.close().await;

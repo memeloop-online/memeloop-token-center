@@ -1413,10 +1413,7 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
         .unwrap();
     let service_token = state.config.service_token.clone();
     let control = router_for_role(state, RuntimeRole::Control);
-    let copy_path = format!(
-        "/internal/v1/keys/{}/credential-recovery/copy",
-        issued.key_id
-    );
+    let copy_path = format!("/internal/v1/keys/{}/copy", issued.key_id);
 
     let forbidden = control
         .clone()
@@ -1446,7 +1443,7 @@ async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list()
         .unwrap();
     assert!(!String::from_utf8_lossy(&listed).contains(&issued.key));
     let listed: Value = serde_json::from_slice(&listed).unwrap();
-    assert_eq!(listed[0]["credential_recovery_available"], true);
+    assert_eq!(listed[0]["credential_copy_available"], true);
 
     let copied = control
         .clone()
@@ -1561,10 +1558,7 @@ async fn credential_copy_hides_foreign_key_existence_and_allows_concurrent_repla
         .await
         .unwrap();
     let control = router_for_role(state, RuntimeRole::Control);
-    let copy_path = format!(
-        "/internal/v1/keys/{}/credential-recovery/copy",
-        target.key_id
-    );
+    let copy_path = format!("/internal/v1/keys/{}/copy", target.key_id);
     let foreign = control
         .clone()
         .oneshot(
@@ -1581,16 +1575,13 @@ async fn credential_copy_hides_foreign_key_existence_and_allows_concurrent_repla
     let unknown = control
         .clone()
         .oneshot(
-            Request::post(format!(
-                "/internal/v1/keys/{}/credential-recovery/copy",
-                Uuid::now_v7()
-            ))
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", foreign_actor.token),
-            )
-            .body(Body::empty())
-            .unwrap(),
+            Request::post(format!("/internal/v1/keys/{}/copy", Uuid::now_v7()))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", foreign_actor.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();

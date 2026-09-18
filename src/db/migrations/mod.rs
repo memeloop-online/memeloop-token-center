@@ -1,5 +1,7 @@
 use super::*;
 
+mod credential_plaintext;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionMaintenanceReport {
     pub ready_partitions: usize,
@@ -580,6 +582,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "explicit disabled upstream catalog models",
         sql: include_str!("../../../migrations/common/0109_upstream_model_catalog_disabled.sql"),
     },
+    Migration {
+        version: 110,
+        name: "direct credential copy",
+        sql: include_str!("../../../migrations/common/0110_direct_credential_copy.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1146,10 +1153,29 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "explicit disabled upstream catalog models",
         sql: include_str!("../../../migrations/common/0109_upstream_model_catalog_disabled.sql"),
     },
+    Migration {
+        version: 110,
+        name: "direct credential copy",
+        sql: include_str!("../../../migrations/common/0110_direct_credential_copy.sql"),
+    },
 ];
 
 impl Database {
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
+        self.migrate_with_optional_credential_pepper(None).await
+    }
+
+    /// Production upgrades must supply the existing authentication pepper so
+    /// all active originals can be verified before enabling direct copy.
+    pub async fn migrate_with_credential_pepper(&self, pepper: &[u8]) -> Result<(), sqlx::Error> {
+        self.migrate_with_optional_credential_pepper(Some(pepper))
+            .await
+    }
+
+    async fn migrate_with_optional_credential_pepper(
+        &self,
+        pepper: Option<&[u8]>,
+    ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(734627102948311)")
@@ -1235,7 +1261,17 @@ impl Database {
         if routing_groups_need_backfill {
             backfill_routing_grants_from_legacy_policy(&mut transaction).await?;
         }
-        apply_migration_range(&mut transaction, migrations, 44, i64::MAX).await?;
+        apply_migration_range(&mut transaction, migrations, 44, 109).await?;
+        let needs_plaintext_upgrade =
+            sqlx::query("SELECT version FROM schema_migrations WHERE version = 110")
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_none();
+        if needs_plaintext_upgrade {
+            credential_plaintext::promote_active_plaintext(&mut transaction, self.backend, pepper)
+                .await?;
+        }
+        apply_migration_range(&mut transaction, migrations, 110, i64::MAX).await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             maintain_postgres_partitions(&mut transaction).await?;
         }

@@ -6,13 +6,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/keys/delete", post(delete_client_credentials))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route(
-            "/internal/v1/keys/{key_id}/credential-recovery",
-            put(store_key_credential_recovery),
+            "/internal/v1/keys/{key_id}/credential",
+            put(store_key_credential),
         )
-        .route(
-            "/internal/v1/keys/{key_id}/credential-recovery/copy",
-            post(copy_key_credential),
-        )
+        .route("/internal/v1/keys/{key_id}/copy", post(copy_key_credential))
         .route("/internal/v1/keys/{key_id}/alias", patch(rename_key))
         .route("/internal/v1/keys/{key_id}/limits", get(key_limits))
         .route("/internal/v1/keys/{key_id}/policy", put(update_key_policy))

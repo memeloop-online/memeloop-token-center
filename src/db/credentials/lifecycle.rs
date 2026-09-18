@@ -1,5 +1,4 @@
 use super::super::*;
-use super::recovery::remove_key_credential_recovery_secrets_in_transaction;
 
 impl Database {
     /// Removes identities from the working directory without erasing request
@@ -29,7 +28,7 @@ impl Database {
         };
         let now = unix_millis();
         for key_id in &key_ids {
-            let row = sqlx::query(select)
+            sqlx::query(select)
                 .bind(key_id.to_string())
                 .bind(tenant)
                 .fetch_optional(&mut *tx)
@@ -41,13 +40,6 @@ impl Database {
                 .bind(now).bind(key_id.to_string()).execute(&mut *tx).await?;
             sqlx::query("UPDATE credential_rotation_replays SET response_ciphertext = NULL WHERE resource_kind = 'key' AND resource_id = $1")
                 .bind(key_id.to_string()).execute(&mut *tx).await?;
-            remove_key_credential_recovery_secrets_in_transaction(
-                &mut tx,
-                *key_id,
-                row.try_get("credential_generation")?,
-                now,
-            )
-            .await?;
         }
         tx.commit().await?;
         Ok(key_ids)
