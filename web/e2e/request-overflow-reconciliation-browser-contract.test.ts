@@ -89,7 +89,13 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     // isolation: pagination aborts the active first-page query, loads history,
     // then restores the one sticky reconciliation it interrupted.
     await page.evaluate(() => window.emitRequestOverflow(1_000));
-    await page.clock.fastForward(requestOverflowReconcileDelayMs);
+    // The successful resume reconciliation is a real authoritative read, so
+    // a new edge honors its hard cooldown. This is distinct from defer(),
+    // which issued no read and deliberately resumes immediately.
+    await page.clock.fastForward(requestOverflowReconcileCooldownMs - 1);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 4,
+      'a completed resume reconciliation retains the hard cooldown');
+    await page.clock.fastForward(1);
     assert.equal(await page.evaluate(() => window.requestQueryReads), 5);
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
     await model('older-page').waitFor();
