@@ -9,9 +9,8 @@ const EDGE_PREDICATE: &str = "  AND (f.created_at < $17 OR f.created_at >= $18)"
 
 // The pricing page normally asks for the global, unfiltered 30-day model
 // total. The facts and rollups already carry the immutable model and usage
-// fields. Durable facts remain visible after a product identity is retired;
-// the compact key set is derived from the facts themselves rather than the
-// mutable credential directory.
+// fields. Durable facts remain visible after a product identity is retired,
+// so this global path does not consult the mutable credential directory.
 // The four placeholders are deliberately consecutive so this statement has a
 // small bind set of its own; filtered and scoped requests retain the complete
 // operator-statistics source below.
@@ -21,7 +20,6 @@ SELECT a.model,
        a.output_tokens,
        a.requests
   FROM request_daily_aggregates a
-  JOIN pricing_visible_keys k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
  WHERE a.day_bucket >= $3 / 86400000
    AND a.day_bucket < $4 / 86400000
 UNION ALL
@@ -30,7 +28,6 @@ SELECT f.model,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
-  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at < $3
 UNION ALL
@@ -39,7 +36,6 @@ SELECT f.model,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM request_stats_facts f
-  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at >= $4 AND f.created_at >= $3
 UNION ALL
@@ -48,7 +44,6 @@ SELECT a.model,
        CAST(0 AS BIGINT) AS output_tokens,
        a.requests
   FROM generation_daily_aggregates a
-  JOIN pricing_visible_keys k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
  WHERE a.day_bucket >= $3 / 86400000
    AND a.day_bucket < $4 / 86400000
 UNION ALL
@@ -57,7 +52,6 @@ SELECT f.model,
        CAST(0 AS BIGINT) AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM generation_stats_facts f
-  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at < $3
 UNION ALL
@@ -66,7 +60,6 @@ SELECT f.model,
        CAST(0 AS BIGINT) AS output_tokens,
        CAST(1 AS BIGINT) AS requests
   FROM generation_stats_facts f
-  JOIN pricing_visible_keys k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
  WHERE f.created_at >= $1 AND f.created_at <= $2
    AND f.created_at >= $4 AND f.created_at >= $3
 "#;
@@ -132,19 +125,8 @@ fn pricing_stats_sql(tenant_external_id: Option<&str>, filter: &StatsFilter) -> 
     // No MATERIALIZED fence: PostgreSQL can prune unused cost/status columns
     // and plan the individual rollup/edge arms. Unlike the operator snapshot,
     // this endpoint needs neither four projections nor currency/window ranks.
-    let eligibility = if global_unfiltered {
-        r#"pricing_visible_keys AS MATERIALIZED (
-    SELECT key_id AS id, tenant_id FROM request_daily_aggregates
-    UNION SELECT key_id, tenant_id FROM request_stats_facts
-    UNION SELECT key_id, tenant_id FROM generation_daily_aggregates
-    UNION SELECT key_id, tenant_id FROM generation_stats_facts
-),
-"#
-    } else {
-        ""
-    };
     format!(
-        "WITH {eligibility}filtered_activity AS ({source})
+        "WITH filtered_activity AS ({source})
          SELECT model,
                 CAST(SUM(requests) AS BIGINT) AS calls,
                 CAST(SUM(input_tokens) AS BIGINT) AS input_tokens,
