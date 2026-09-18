@@ -1,8 +1,9 @@
 import { useEffect, useReducer, useRef } from 'react';
-import { apiDiagnosticMessage, streamSse } from '../../api';
+import { ApiError, apiDiagnosticMessage, streamSse } from '../../api';
 import { useI18n } from '../../i18n';
 import type { RequestEvent } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
+import { requestEventReconnectDelayMs } from './requestEventStreamBackoff';
 
 interface EventCursor {
   eventAt: number;
@@ -89,11 +90,18 @@ export function useRequestEventStream({
       dispatch({ type: 'idle' });
       return;
     }
-    let connectedOnce = false;
     let controller: AbortController | undefined;
     const connect = async (activeController: AbortController) => {
+      // The counter belongs to this identity/visibility lifetime. A new
+      // controller therefore starts fresh, while an opened stream clears the
+      // failures accumulated before recovery.
+      let connectedOnce = false;
+      let reconnectAttempt = 0;
+      let reconnectMessage = '';
       while (!activeController.signal.aborted) {
-        dispatch(connectedOnce ? { type: 'reconnecting' } : { type: 'connecting' });
+        dispatch(connectedOnce
+          ? { type: 'reconnecting', message: reconnectMessage }
+          : { type: 'connecting' });
         try {
           await streamSse<RequestEvent>(
             `/internal/v1/request-events${query(tenant, cursor.current)}`,
@@ -110,19 +118,39 @@ export function useRequestEventStream({
             () => {
               if (activeController.signal.aborted) return;
               connectedOnce = true;
+              reconnectAttempt = 0;
+              reconnectMessage = '';
               dispatch({ type: 'live' });
             },
           );
-          if (!activeController.signal.aborted) dispatch({ type: 'reconnecting' });
+          if (!activeController.signal.aborted) {
+            // A clean EOF is a reconnect boundary, not an operator-visible
+            // error. The status label still explains that the stream is
+            // reconnecting; failed attempts keep their diagnostic message.
+            reconnectMessage = '';
+            dispatch({ type: 'reconnecting' });
+          }
         } catch (reason) {
           if (!activeController.signal.aborted) {
-            dispatch({
-              type: 'reconnecting',
-              message: apiDiagnosticMessage(reason, disconnectedMessage, { requestId: requestIdLabel, streamInterrupted }),
-            });
+            if (reason instanceof ApiError && reason.code === 'sse_response_interrupted') {
+              // The API classifies a 200-body interruption as recoverable.
+              // Keep the reconnecting state visible without turning a normal
+              // stream boundary into a persistent page-level error.
+              reconnectMessage = '';
+              dispatch({ type: 'reconnecting' });
+            } else {
+              reconnectMessage = apiDiagnosticMessage(reason, disconnectedMessage, { requestId: requestIdLabel, streamInterrupted });
+              dispatch({
+                type: 'reconnecting',
+                message: reconnectMessage,
+              });
+            }
           }
         }
-        await waitForReconnect(activeController.signal, 1000);
+        if (activeController.signal.aborted) break;
+        const delay = requestEventReconnectDelayMs(reconnectAttempt, Math.random());
+        reconnectAttempt += 1;
+        await waitForReconnect(activeController.signal, delay);
       }
     };
     const start = () => {
@@ -135,6 +163,8 @@ export function useRequestEventStream({
     };
     const visibilityChanged = () => {
       if (document.hidden) {
+        // Do not leave a long-lived stream or backoff timer running while the
+        // operator is in a background tab.
         const activeController = controller;
         controller = undefined;
         activeController?.abort();
