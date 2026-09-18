@@ -22,6 +22,11 @@ pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
 pub const DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED: bool = false;
+/// Runtime rollout starts in observation mode until every gateway understands
+/// transport-scoped connection cohorts. Tests keep the historical breaker
+/// semantics through `UpstreamHealthConfig::DEFAULT`; production config must
+/// opt into enforcement explicitly after the mixed-version window closes.
+const DEFAULT_FAILURE_DOMAIN_ENFORCEMENT_ENABLED: bool = false;
 
 /// Global circuit-breaker safety defaults. Provider/account transport policy
 /// may narrow or tune supported recovery controls at runtime; these values
@@ -55,7 +60,7 @@ impl UpstreamHealthConfig {
         unavailable_cooldown_millis: 15_000,
         invalid_response_cooldown_millis: 15_000,
         connection_cooldown_millis: 5_000,
-        failure_domain_enforcement_enabled: false,
+        failure_domain_enforcement_enabled: true,
     };
 
     fn from_env() -> Result<Self, ConfigError> {
@@ -90,7 +95,7 @@ impl UpstreamHealthConfig {
             )?,
             failure_domain_enforcement_enabled: env_bool(
                 "MTC_UPSTREAM_HEALTH_FAILURE_DOMAIN_ENFORCEMENT_ENABLED",
-                Self::DEFAULT.failure_domain_enforcement_enabled,
+                DEFAULT_FAILURE_DOMAIN_ENFORCEMENT_ENABLED,
             ),
         };
         config.validate()?;

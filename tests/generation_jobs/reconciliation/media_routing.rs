@@ -18,7 +18,7 @@ async fn configure(f: &ReconcileFixture, base_url: &str, submitted: bool, cooldo
         .bind(locator).bind(if submitted { "running" } else { "queued" })
         .bind(if submitted { Some("media-provider-job") } else { None })
         .bind(f.job.to_string()).execute(&f.pool).await.unwrap();
-    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,consecutive_failures,cooldown_until,probe_lease_until,probe_lease_token,credential_generation,last_failure_kind,updated_at) SELECT upstream_account_id,1,$1,0,'',1,'connection',$2 FROM generation_jobs WHERE id = $3")
+    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id,consecutive_failures,cooldown_until,probe_lease_until,probe_lease_token,credential_generation,transport_revision,last_failure_kind,updated_at) SELECT job.upstream_account_id,1,$1,0,'',1,account.updated_at,'connection',$2 FROM generation_jobs job JOIN upstream_accounts account ON account.id = job.upstream_account_id WHERE job.id = $3")
         .bind(cooldown).bind(unix_millis()).bind(f.job.to_string()).execute(&f.pool).await.unwrap();
 }
 

@@ -132,7 +132,7 @@ async fn codex_retries_one_pre_delivery_connection_failure_before_breaker_accoun
 }
 
 #[tokio::test]
-async fn codex_exhausted_pre_delivery_connection_retries_open_the_breaker_once() {
+async fn codex_exhausted_pre_delivery_connection_retries_record_one_local_domain() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("pre-delivery-connect-exhausted").await;
     let response = routing::with_test_pre_delivery_connect_failures(
@@ -153,7 +153,38 @@ async fn codex_exhausted_pre_delivery_connection_retries_open_the_breaker_once()
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_account_failure_count(&fixture, 1).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            let domains: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM upstream_connection_failure_domains
+                 WHERE upstream_account_id = $1",
+            )
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let global_failures: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(consecutive_failures), 0)
+                   FROM upstream_account_health WHERE upstream_account_id = $1",
+            )
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+            if domains == 1 {
+                assert_eq!(
+                    global_failures, 0,
+                    "one gateway failure domain cannot suppress the account globally"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal recording must retain the local failure-domain evidence");
     upstream.verify().await;
 }
 
