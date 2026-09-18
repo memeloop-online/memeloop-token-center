@@ -154,26 +154,32 @@ export function observeSessionReadyRequests({
       }
     }
     if (!ready || settled) return;
-    const converged = ready;
+    const candidate = ready;
     const detailParams = new URLSearchParams({
       tenant_external_id: tenant,
       key_id: keyId,
       limit: '100',
     });
-    await eventually(async () => {
-      const detail = await requestJson<{ requests: Array<{ request_id: string }> }>(
-        `/internal/v1/sessions/${encodeURIComponent(converged.sessionId)}?${detailParams}`,
-        { credential },
-      );
-      assert.deepEqual(
-        new Set(detail.requests.map((request) => request.request_id)),
-        converged.requestIds,
-        'the final logical session must converge to the exact observed request set',
-      );
-    }, 10_000, 'the final logical session did not converge after parent reconciliation');
-    if (settled) return;
+    while (!settled && !deadline.aborted) {
+      try {
+        const detail = await requestJson<{ requests: Array<{ request_id: string }> }>(
+          `/internal/v1/sessions/${encodeURIComponent(candidate.sessionId)}?${detailParams}`,
+          { credential, signal: deadline },
+        );
+        assert.deepEqual(
+          new Set(detail.requests.map((request) => request.request_id)),
+          candidate.requestIds,
+          'the final logical session must converge to the exact observed request set',
+        );
+        break;
+      } catch {
+        if (settled || deadline.aborted) return;
+        await delay(100, deadline);
+      }
+    }
+    if (settled || deadline.aborted) return;
     settled = true;
-    completedResolve(converged);
+    completedResolve(candidate);
   })().catch(fail);
   return { opened, completed };
 }
@@ -209,6 +215,7 @@ interface JsonRequest {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   headers?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 class E2ERuntime {
@@ -338,7 +345,7 @@ export async function requestJson<T>(path: string, options: JsonRequest = {}): P
     method: options.method ?? 'GET',
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    signal: AbortSignal.timeout(30_000),
+    signal: options.signal ?? AbortSignal.timeout(30_000),
   });
   const text = await response.text();
   assert.ok(response.ok, `${options.method ?? 'GET'} ${path}: ${response.status} ${text}`);
@@ -606,8 +613,20 @@ export async function eventually(
   throw new Error(`${message}: ${detail}`);
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolveDelay, rejectDelay) => {
+    const timeout = setTimeout(finish, milliseconds);
+    signal?.addEventListener('abort', abort, { once: true });
+    function finish() {
+      signal?.removeEventListener('abort', abort);
+      resolveDelay();
+    }
+    function abort() {
+      clearTimeout(timeout);
+      rejectDelay(signal?.reason);
+    }
+  });
 }
 
 async function endpointIsReachable(url: URL): Promise<boolean> {
