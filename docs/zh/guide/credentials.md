@@ -13,20 +13,31 @@ MTC 有两类完全隔离的凭证。
 
 - 每个客户端凭证有一个不可变的 UUIDv7 `key_id`，它是计费账户、策略、请求历史、统计和会话数据的稳定归属。
 - 轮换（`POST /internal/v1/keys/{key_id}/rotate`）作废旧凭证并签发新凭证，`key_id` 及其全部历史保持不变。
-- 轮换接口要求 `Idempotency-Key`，响应返回新凭证并携带 `Cache-Control: no-store`；之后仍可通过复制操作取回。
+- 轮换接口要求 `Idempotency-Key`，响应返回新凭证并携带 `Cache-Control: no-store`。
 
 ## 复制凭证
 
-在客户端凭证列表中点击「复制凭证」即可复制当前可用的值。集成管理界面时可调用：
+客户端凭证列表永远不携带明文。使用列表中的明确「复制凭证」操作，可在单独操作区直接查看当前原值并选择或复制。集成管理界面可调用：
 
 ```bash
-curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential-recovery/copy?tenant_external_id=default" \
+curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/copy" \
   -H "Authorization: Bearer mts_example_service_token"
 ```
 
-- 需要 `keys:write` scope；响应为 `no-store`，仅在凭证仍处于可用状态时返回明文。
+- 需要 `keys:write` scope；响应为 `no-store`，仅在凭证仍处于启用状态时返回明文。
 - 重复调用返回同一个当前凭证，不会触发轮换或任何变更。
-- 列表和自助接口永远不包含明文；无法复制的凭证只能通过轮换获得新凭证。
+- 列表和自助接口永远不包含明文；仅通过 `credential_copy_available` 启用或禁用这个明确操作。
+
+如果授权来源已知当前有效凭证原值，可以在不改变凭证的前提下登记这个准确值，供之后明确复制：
+
+```bash
+curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential" \
+  -H "Authorization: Bearer mts_example_service_token" \
+  -H "Content-Type: application/json" \
+  --data '{"key":"mtc_example_current_value"}'
+```
+
+服务端会校验该值是否匹配当前凭证；操作不会轮换或替换凭证。
 
 ## 创建客户端凭证
 

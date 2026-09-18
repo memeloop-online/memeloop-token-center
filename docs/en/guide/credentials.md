@@ -13,20 +13,31 @@ Client credentials can never call management interfaces; service credentials can
 
 - Each client credential has an immutable UUIDv7 `key_id`, the stable owner of its billing account, policies, request history, statistics, and session data.
 - Rotation (`POST /internal/v1/keys/{key_id}/rotate`) invalidates the old credential and issues a new one; the `key_id` and all history remain unchanged.
-- The rotation endpoint requires `Idempotency-Key`, returns the new credential with `Cache-Control: no-store`, and still allows it to be retrieved later through the copy operation.
+- The rotation endpoint requires `Idempotency-Key` and returns the new credential with `Cache-Control: no-store`.
 
 ## Copying a credential
 
-Click **Copy credential** in the client credential list to copy its currently usable value. An integrated management interface can call:
+The client credential list never carries plaintext. Use its explicit **Copy credential** action to reveal the active original in a dedicated action area, where it can be selected or copied. An integrated management interface can retrieve that same value with:
 
 ```bash
-curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential-recovery/copy?tenant_external_id=default" \
+curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/copy" \
   -H "Authorization: Bearer mts_example_service_token"
 ```
 
-- Requires the `keys:write` scope. The response is `no-store` and includes plaintext only while the credential remains usable.
+- Requires the `keys:write` scope. The response is `no-store` and includes plaintext only while the credential remains active.
 - Repeated calls return the same current credential and trigger no rotation or other change.
-- Lists and self-service interfaces never include plaintext; a credential that cannot be copied can only be replaced through rotation.
+- Lists and self-service interfaces never include plaintext. They expose `credential_copy_available` only to enable or disable this explicit action.
+
+If an authorized source already knows an active credential value, it may register that exact value for later explicit copying without changing the credential:
+
+```bash
+curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential" \
+  -H "Authorization: Bearer mts_example_service_token" \
+  -H "Content-Type: application/json" \
+  --data '{"key":"mtc_example_current_value"}'
+```
+
+The value is verified against the active credential. This operation does not rotate or replace it.
 
 ## Creating a client credential
 

@@ -458,7 +458,7 @@ export interface KeyView {
   updated_at?: number;
   fingerprint?: string | null;
   /** Plaintext is never listed; this only enables the explicit copy action. */
-  credential_recovery_available?: boolean;
+  credential_copy_available?: boolean;
   creation_source?: 'manual' | 'api' | 'unknown';
   archived_at?: number | null;
 }
