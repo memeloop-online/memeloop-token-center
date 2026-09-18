@@ -11,7 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(crate) const REQUEST_MEMORY_WEIGHT: usize = 3;
 pub(crate) const CAPTURE_MEMORY_WEIGHT: usize = 3;
 pub(crate) const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-const SSE_STREAMING_MEMORY_WEIGHT: usize = 3;
+const SSE_STREAMING_MEMORY_WEIGHT: usize = 2;
 const UNIT_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -173,8 +173,8 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
-    /// Reserve one request-local envelope for the simultaneous SSE input,
-    /// framing/sanitizer copy, and terminal delivery copy. This turns the
+    /// Reserve one request-local envelope for the two independently retained
+    /// SSE maxima: framing/sanitizer state and terminal delivery state. This turns the
     /// configured per-stream byte ceiling into process-wide concurrency
     /// admission instead of allowing every active stream to allocate its
     /// maximum independently of the global proxy memory budget.
@@ -733,7 +733,7 @@ mod tests {
         let first = budget.reservation();
         let first_permit = first
             .try_reserve_sse_streaming(framed_bytes)
-            .expect("one three-copy SSE envelope fits exactly");
+            .expect("one two-copy SSE envelope fits exactly");
         assert_eq!(
             budget.snapshot().0,
             framed_bytes * SSE_STREAMING_MEMORY_WEIGHT
