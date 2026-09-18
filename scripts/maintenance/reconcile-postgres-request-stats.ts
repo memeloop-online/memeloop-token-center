@@ -181,8 +181,8 @@ SELECT :'cutoff' AS prune_before_utc,
 function pruneApply(environment: NodeJS.ProcessEnv, cutoff: string): void {
   psql(environment, { args: variables({ cutoff }), input: `BEGIN;
 SET LOCAL lock_timeout = '5s';
-LOCK TABLE request_records, generation_jobs IN SHARE MODE;
 SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314));
+LOCK TABLE request_records, generation_jobs IN SHARE MODE;
 CREATE TEMP TABLE mtc_request_stats_prune_guard (
   invalid boolean NOT NULL CHECK (invalid = false)
 ) ON COMMIT DROP;

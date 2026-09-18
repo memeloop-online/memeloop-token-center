@@ -106,8 +106,9 @@ impl ResponseIdentityGate {
 }
 
 /// A successful terminal stays private until EOF validates all framing. This
-/// bound is intentionally tied to the per-network-chunk delivery ceiling so
-/// EOF validation cannot turn a completed response into an unbounded buffer.
+/// bound covers one maximum-sized event and its small terminal control tail,
+/// so EOF validation cannot turn a completed response into an unbounded
+/// buffer.
 #[derive(Default)]
 enum ResponseTerminalHold {
     #[default]

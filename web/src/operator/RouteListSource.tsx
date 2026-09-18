@@ -22,6 +22,7 @@ export function RouteListSource({ route, groups, accounts }: { route: ModelRoute
   ].filter(Boolean).join('\n');
   return <div className="route-list-source">
     <span className="route-list-source-name">{sources.length ? sources.join(' · ') : t('routes.listUnknownSource')}</span>
+    {route.enabled && candidates?.length === 0 && <DetailTooltip content={t('providerCatalog.routeUnavailableHint')}><span className="status pending" tabIndex={0}>{t('providerCatalog.routeUnavailable')}</span></DetailTooltip>}
     <DetailTooltip content={detail}><Button appearance="subtle" size="small" type="button" className="route-list-source-range">{range}</Button></DetailTooltip>
   </div>;
 }

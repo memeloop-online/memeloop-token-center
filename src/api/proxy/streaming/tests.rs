@@ -224,6 +224,62 @@ fn strict_chat_event_limit_does_not_turn_missing_terminal_usage_into_semantic_ev
 }
 
 #[test]
+fn codex_capture_accepts_a_fragmented_large_terminal_without_archive_or_billing_pollution() {
+    const OBSERVED_LARGE_EVENT_BYTES: usize = 346_759;
+    const FRAGMENT_BYTES: usize = 64 * 1024;
+
+    let created =
+        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-large-capture\"}}\n\n";
+    let completed_value = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp-large-capture",
+            "status": "completed",
+            "output": [{"type": "message", "text": "x".repeat(OBSERVED_LARGE_EVENT_BYTES)}],
+            "usage": {
+                "input_tokens": 9,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens": 3,
+                "total_tokens": 12,
+            },
+        },
+    });
+    let completed = format!("event: response.completed\ndata: {completed_value}\n\n").into_bytes();
+    assert!(completed.len() > 256 * 1024);
+    assert!(completed.len() < crate::api::limits::MAX_RESPONSES_SSE_EVENT_BYTES);
+
+    let mut capture = ResponsesSseCapture::for_codex_responses();
+    let mut archived = Vec::new();
+    let mut billable_frames = 0;
+    for fragment in created
+        .as_slice()
+        .chunks(FRAGMENT_BYTES)
+        .chain(completed.chunks(FRAGMENT_BYTES))
+    {
+        for frame in capture.push_delivery_frames(fragment).unwrap() {
+            billable_frames += usize::from(frame.billable);
+            archived.extend_from_slice(&frame.bytes);
+        }
+    }
+    let summary = capture.finish_summary();
+    assert_eq!(
+        summary.outcome,
+        ResponsesSseOutcome::Completed {
+            response_id: Some("resp-large-capture".to_owned()),
+        }
+    );
+    assert_eq!(summary.usage.unwrap().total_tokens(), 12);
+    assert!(!summary.usage_invalid);
+    assert!(!summary.observed_protocol_invalid);
+    assert!(!summary.protocol_invalid);
+    assert_eq!(billable_frames, 1);
+    assert_eq!(
+        archived,
+        [created.as_slice(), completed.as_slice()].concat()
+    );
+}
+
+#[test]
 fn strict_chat_total_size_boundary_does_not_turn_missing_terminal_usage_into_semantic_evidence() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
     capture
@@ -389,7 +445,7 @@ fn terminal_barrier_bounds_the_tail_and_preserves_terminal_billing_class() {
         held.hold(SseDeliveryFrame {
             bytes: Bytes::from(vec![
                 b'x';
-                crate::api::limits::MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK
+                crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES
                     + 1
             ]),
             billable: false,

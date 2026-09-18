@@ -21,6 +21,7 @@ import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
+import { ProviderModelCatalog } from '../ProviderModelCatalog';
 import { providerDisplayName } from '../providerDisplayName';
 import '../routeFormScope.css';
 import {
@@ -328,6 +329,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
           </div>
           {detailOpen && <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
             <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></div>
+            <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || Boolean(busy) || proxyEditorOpen} />
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
@@ -356,6 +358,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     </article>
     <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
       {error && <div className="notice error" role="alert">{error}</div>}
+      {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={Boolean(busy) || proxyEditorOpen} />}
       {editing || rotating ? providerEditors : reauthorizing ? <>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { await onChanged(); setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); }} />
     </> : <>

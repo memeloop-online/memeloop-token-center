@@ -22,7 +22,10 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
   const base = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   try {
+    const fixedNow = new Date('2026-09-15T00:00:00Z');
     const page = await browser.newPage();
+    await page.clock.install({ time: fixedNow });
+    await page.clock.pauseAt(fixedNow);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.route('**/*', (route) => {
@@ -102,6 +105,18 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await status.waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 1], 'cancel permits only non-consuming preparation');
     assert.equal(await reset.count(), 0, 'cancelled preparation remains locked');
+    // Re-entering the page recovers the durable prepared operation without its
+    // confirmation secret, while keeping the exact deadline and live countdown visible.
+    await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=prepared-current`);
+    await view.click();
+    const recoveredExpiry = page.locator('[data-reset-operation-expiry]');
+    await recoveredExpiry.waitFor();
+    const exactPreparedExpiry = await page.evaluate(() => new Date(Date.now() + 120_000).toLocaleString('en'));
+    assert.equal(await recoveredExpiry.innerText(), `Confirmation expires ${exactPreparedExpiry} · Expires in 2m`);
+    assert.deepEqual(await page.evaluate(() => [window.quotaCurrents, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0], 'page re-entry only recovers the prepared operation');
+    assert.equal(await page.getByRole('button', { name: 'Retry this confirmation', exact: true }).count(), 0, 'the confirmation secret is never recovered from durable state');
+    await page.clock.fastForward(61_000);
+    await page.getByText(/Expires in less than 1 min/, { exact: false }).waitFor();
     // Fresh mount starts an independent operation; only explicit confirmation consumes.
     await page.goto(quotaUrl);
     await view.click();

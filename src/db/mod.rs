@@ -90,7 +90,8 @@ use constants::*;
 pub(crate) use projection_lock::{
     lock_generation_jobs_projection_source_in_transaction,
     lock_request_records_projection_source_in_transaction,
-    lock_request_stats_projection_in_transaction,
+    lock_request_stats_projection_rebuild_in_transaction,
+    lock_request_stats_projection_writer_in_transaction,
 };
 use rotation::*;
 use rows::generation_asset_download;
@@ -132,8 +133,9 @@ pub(crate) use credentials::{
 };
 pub use credentials::{CreateKeyInput, CreateServiceTokenInput, ProvisionedCloudCredential};
 pub use failed_request_cost_backfill::{
-    FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
-    FailedRequestCostBackfillInput, FailedRequestCostBackfillReport,
+    FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FAILED_REQUEST_COST_CORRECTION_VERSION,
+    FailedRequestCostBackfillCursor, FailedRequestCostBackfillInput,
+    FailedRequestCostBackfillReport, FailedRequestCostCorrectionPreview,
 };
 pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,

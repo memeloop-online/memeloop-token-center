@@ -65,6 +65,26 @@ test('filtered views stay stable: published batches only mark them stale for a m
   assert.match(source, /t\('traffic\.filteredResultsStale'\)/);
   assert.match(source, /onRefreshFilteredResults/);
   assert.doesNotMatch(source, /scheduleFilteredRefresh/);
-  // The overflow reconcile is guarded away from filtered scopes.
-  assert.match(source, /typedFiltersActive\(currentScope\.filters\) \|\| !reconcileOverflow\.current/);
+
+  const overflowEffectStart = source.indexOf('if (streamOverflowRevision !== previousOverflowRevision.current)');
+  const overflowEffectEnd = source.indexOf('// SSE batches never auto-refresh a filtered view', overflowEffectStart);
+  const overflowEffect = source.slice(overflowEffectStart, overflowEffectEnd);
+  assert.match(overflowEffect, /if \(typedFiltersActive\(filters\) \|\| loadedHistoryIds\.current\.size\) return;/,
+    'new overflow revisions do not auto-queue reconciliation while explicit history is loaded');
+
+  const loadStart = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false)');
+  const loadEnd = source.indexOf('\n  useEffect(() => {', loadStart);
+  const load = source.slice(loadStart, loadEnd);
+  assert.match(load, /const refreshWasActive = older && \(overflowRefresh\.current\?\.needsReconcile \?\? false\)/);
+  assert.match(load, /if \(refreshWasActive\) overflowRefresh\.current\?\.signal\(\)/,
+    'pagination restores the sticky first-page reconciliation which it interrupted');
+
+  const refreshStart = source.indexOf('async function refreshOverflowFirstPage(ticket: number)');
+  const refreshEnd = source.indexOf('async function load(nextFilters: TypedFilterAst, older = false)', refreshStart);
+  const refresh = source.slice(refreshStart, refreshEnd);
+  assert.doesNotMatch(refresh, /\|\| loadedHistoryIds\.current\.size/,
+    'the explicit post-pagination compensation may reconcile the first page without dropping history');
+  assert.match(refresh, /overflowRefresh\.current\?\.defer\(ticket\)/,
+    'a timer that loses eligibility keeps its overflow edge rather than completing successfully');
+  assert.match(source, /RequestOverflowReconciliation/);
 });

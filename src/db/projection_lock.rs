@@ -32,24 +32,35 @@ pub(crate) async fn lock_generation_jobs_projection_source_in_transaction(
     .await
 }
 
-/// Serializes fact snapshots with every online observability projection writer on PostgreSQL.
+const REQUEST_STATS_PROJECTION_WRITER_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock_shared(hashtextextended('memeloop-token-center:request-stats', 734627102948314))";
+const REQUEST_STATS_PROJECTION_REBUILD_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314))";
+
+/// Joins the online observability-writer cohort on PostgreSQL.
 ///
-/// Online writers acquire this after source-table `ROW EXCLUSIVE`, settlement, or outbox ownership
-/// locks and before their first fact or aggregate mutation. Backfills acquire it before locking
-/// candidate facts, while source-pruning maintenance takes `SHARE` source-table locks before this
-/// lock. Since the backfill does not acquire source, settlement, account, outbox, or conversation
-/// locks, this one-way order cannot form a lock cycle. SQLite already serializes these writers with
-/// `BEGIN IMMEDIATE`.
-pub(crate) async fn lock_request_stats_projection_in_transaction(
+/// Every live writer takes this shared lock before session, conversation, key-budget, settlement,
+/// source-table, fact, or aggregate locks. Shared mode keeps independent requests concurrent while
+/// excluding fact backfills and full projection rebuilds for their complete source snapshot and
+/// replacement transaction. SQLite already serializes these writers with `BEGIN IMMEDIATE`.
+pub(crate) async fn lock_request_stats_projection_writer_in_transaction(
     transaction: &mut Transaction<'_, Any>,
 ) -> Result<(), AppError> {
     if transaction.as_mut().backend_name() == "PostgreSQL" {
         // Keep this identity aligned with scripts/maintenance/reconcile-observability-day.sql.
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314))",
-        )
-        .execute(&mut **transaction)
-        .await?;
+        sqlx::query(REQUEST_STATS_PROJECTION_WRITER_LOCK_SQL)
+            .execute(&mut **transaction)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Exclusively fences online projection writers for a fact backfill or full rebuild.
+pub(crate) async fn lock_request_stats_projection_rebuild_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+) -> Result<(), AppError> {
+    if transaction.as_mut().backend_name() == "PostgreSQL" {
+        sqlx::query(REQUEST_STATS_PROJECTION_REBUILD_LOCK_SQL)
+            .execute(&mut **transaction)
+            .await?;
     }
     Ok(())
 }
