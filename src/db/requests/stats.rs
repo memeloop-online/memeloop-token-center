@@ -16,8 +16,8 @@ SELECT a.day_bucket * 86400000 AS created_at,
        a.cost_micros,
        a.requests
 FROM request_daily_aggregates a
-JOIN key_records k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = a.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR a.key_id = $2)
@@ -32,8 +32,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR a.upstream_account_id = $9)
   AND ($10 = '' OR a.model_route_id = $10)
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || a.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || a.key_id)) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT f.created_at,
        f.model,
@@ -46,8 +46,8 @@ SELECT f.created_at,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
-JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR f.key_id = $2)
@@ -62,8 +62,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR f.upstream_account_id = $9)
   AND ($10 = '' OR f.model_route_id = $10)
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT a.day_bucket * 86400000 AS created_at,
        a.model,
@@ -76,8 +76,8 @@ SELECT a.day_bucket * 86400000 AS created_at,
        a.cost_micros,
        a.requests
 FROM generation_daily_aggregates a
-JOIN key_records k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = a.key_id AND k.tenant_id = a.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = a.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR a.key_id = $2)
@@ -92,8 +92,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR a.upstream_account_id = $9)
   AND $10 = ''
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || a.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || a.key_id)) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT f.created_at,
        f.model,
@@ -106,8 +106,8 @@ SELECT f.created_at,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM generation_stats_facts f
-JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR f.key_id = $2)
@@ -122,8 +122,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR f.upstream_account_id = $9)
   AND $10 = ''
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
 "#;
 
 pub(crate) const FILTERED_ACTIVITY_SOURCE_FACTS: &str = r#"
@@ -138,8 +138,8 @@ SELECT f.created_at,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_stats_facts f
-JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR f.key_id = $2)
@@ -156,8 +156,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR f.duration_ms <= $12)
   AND ($13 < 0 OR f.cost_micros >= $13)
   AND ($14 < 0 OR f.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 UNION ALL
 SELECT f.created_at,
@@ -171,8 +171,8 @@ SELECT f.created_at,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM generation_stats_facts f
-JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = f.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR f.key_id = $2)
@@ -189,8 +189,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR f.duration_ms <= $12)
   AND ($13 < 0 OR f.cost_micros >= $13)
   AND ($14 < 0 OR f.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 "#;
 
@@ -207,8 +207,8 @@ SELECT r.created_at,
        r.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_records r
-JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = r.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR r.key_id = $2)
@@ -224,8 +224,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR r.duration_ms <= $12)
   AND ($13 < 0 OR r.cost_micros >= $13)
   AND ($14 < 0 OR r.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || r.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || r.key_id)) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT g.created_at,
        g.public_model AS model,
@@ -234,12 +234,12 @@ SELECT g.created_at,
        COALESCE(g.error_code, '') AS error_code,
        0 AS input_tokens,
        0 AS output_tokens,
-       k.currency,
+       COALESCE(k.currency, '') AS currency,
        g.cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM generation_jobs g
-JOIN key_records k ON k.id = g.key_id AND k.tenant_id = g.tenant_id
-JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+LEFT JOIN key_records k ON k.id = g.key_id AND k.tenant_id = g.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = g.tenant_id
 WHERE ($1 = '' OR t.external_id = $1)
   AND ($2 = '' OR g.key_id = $2)
@@ -255,8 +255,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND $12 < 0
   AND ($13 < 0 OR g.cost_micros >= $13)
   AND ($14 < 0 OR g.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(k.alias) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(p.external_id) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || g.key_id)) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || g.key_id)) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 "#;
 

@@ -9,9 +9,9 @@ const EDGE_PREDICATE: &str = "  AND (f.created_at < $17 OR f.created_at >= $18)"
 
 // The pricing page normally asks for the global, unfiltered 30-day model
 // total. The facts and rollups already carry the immutable model and usage
-// fields. We still restrict them to an eligible key set so historic orphan
-// facts have the same visibility as the authoritative statistics query, but
-// compute that key/principal/tenant relation once instead of per UNION arm.
+// fields. Durable facts remain visible after a product identity is retired;
+// the compact key set is derived from the facts themselves rather than the
+// mutable credential directory.
 // The four placeholders are deliberately consecutive so this statement has a
 // small bind set of its own; filtered and scoped requests retain the complete
 // operator-statistics source below.
@@ -134,10 +134,10 @@ fn pricing_stats_sql(tenant_external_id: Option<&str>, filter: &StatsFilter) -> 
     // this endpoint needs neither four projections nor currency/window ranks.
     let eligibility = if global_unfiltered {
         r#"pricing_visible_keys AS MATERIALIZED (
-    SELECT k.id, k.tenant_id
-      FROM key_records k
-      JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
-      JOIN tenants t ON t.id = k.tenant_id
+    SELECT key_id AS id, tenant_id FROM request_daily_aggregates
+    UNION SELECT key_id, tenant_id FROM request_stats_facts
+    UNION SELECT key_id, tenant_id FROM generation_daily_aggregates
+    UNION SELECT key_id, tenant_id FROM generation_stats_facts
 ),
 "#
     } else {

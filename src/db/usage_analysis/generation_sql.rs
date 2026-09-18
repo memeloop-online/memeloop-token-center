@@ -77,17 +77,19 @@ pub(super) fn generation_usage_dimension_sql(
            filtered_generation AS (
                SELECT activity.*
                  FROM generation_activity activity
-                 JOIN key_records k
+                 LEFT JOIN key_records k
                    ON k.id = activity.key_id AND k.tenant_id = activity.tenant_id
-                 JOIN principals principal
+                 LEFT JOIN principals principal
                    ON principal.id = k.principal_id
                   AND principal.tenant_id = k.tenant_id
                 WHERE ($6 = '' OR activity.protocol = $6)
                   AND ($7 = ''
                        OR ($7 = 'success' AND activity.status_class = 'success')
                        OR ($7 = 'error' AND activity.status_class = 'failure'))
-                  AND ($11 = '' OR LOWER(k.alias) LIKE $11 ESCAPE '\')
-                  AND ($12 = '' OR LOWER(principal.external_id) LIKE $12 ESCAPE '\')
+                  AND ($11 = '' OR LOWER(COALESCE(k.alias,
+                          'retired-credential-' || activity.key_id)) LIKE $11 ESCAPE '\')
+                  AND ($12 = '' OR LOWER(COALESCE(principal.external_id,
+                          'retired-principal-' || activity.key_id)) LIKE $12 ESCAPE '\')
            )
            SELECT 'modality' AS dimension, modality AS dimension_id, currency,
                   CAST(COALESCE(SUM(units), 0) AS BIGINT) AS units

@@ -801,7 +801,8 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
         usage_analysis_generation_fact_sql("$15", "$16", bucket_millis, &generation_filters);
     format!(
         r#"SELECT activity.*,
-                  k.alias AS key_label,
+                  COALESCE(k.alias,
+                           'retired-credential-' || activity.key_id) AS key_label,
                   CASE WHEN activity.upstream_account_id = '' THEN 'unassigned'
                        ELSE activity.upstream_account_id END AS analysis_upstream_id,
                   CASE WHEN activity.upstream_account_id = '' THEN 'Unassigned'
@@ -817,9 +818,10 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
                   UNION ALL
                   {right_generations}
              ) activity
-             JOIN key_records k
+             LEFT JOIN key_records k
                ON k.id = activity.key_id AND k.tenant_id = activity.tenant_id
-             JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+             LEFT JOIN principals p
+               ON p.id = k.principal_id AND p.tenant_id = activity.tenant_id
              LEFT JOIN upstream_accounts u
                     ON u.id = activity.upstream_account_id
                    AND u.tenant_id = activity.tenant_id
@@ -834,8 +836,10 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
                    OR ($9 = 'unassigned' AND activity.upstream_account_id = '')
                    OR activity.upstream_account_id = $9)
               AND ($10 = '' OR activity.model_route_id = $10)
-              AND ($11 = '' OR LOWER(k.alias) LIKE $11 ESCAPE '\')
-              AND ($12 = '' OR LOWER(p.external_id) LIKE $12 ESCAPE '\')"#
+              AND ($11 = '' OR LOWER(COALESCE(k.alias,
+                      'retired-credential-' || activity.key_id)) LIKE $11 ESCAPE '\')
+              AND ($12 = '' OR LOWER(COALESCE(p.external_id,
+                      'retired-principal-' || activity.key_id)) LIKE $12 ESCAPE '\')"#
     )
 }
 

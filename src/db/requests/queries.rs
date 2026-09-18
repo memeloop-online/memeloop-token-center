@@ -289,6 +289,21 @@ impl Database {
             if let Some(row) = row {
                 return request_archive_refs_from_row(row);
             }
+            let identity = self
+                .historical_credential_identity(
+                    &locator.tenant_id,
+                    &locator.key_id,
+                    Some(tenant_external_id),
+                )
+                .await?;
+            let mut refs = self
+                .request_archive_refs(
+                    parse_uuid(locator.key_id.clone())?,
+                    parse_uuid(request_id_string.clone())?,
+                )
+                .await?;
+            refs.view.credential_identity = Some(identity);
+            return Ok(refs);
         }
         let row = sqlx::query(
             "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.upstream_account_id, g.model_route_id AS route_id, g.status, g.error_code, g.request_object, g.result_json, facts.billed_units AS facts_billed_units, NULLIF(facts.billing_unit, '') AS facts_billing_unit, facts.cost_micros AS facts_cost_micros, NULLIF(facts.currency, '') AS facts_currency, t.external_id AS tenant_external_id, g.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id JOIN key_records k ON k.id = g.key_id AND k.tenant_id = g.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id WHERE g.id = $1 AND t.external_id = $2",
@@ -300,6 +315,32 @@ impl Database {
         match row {
             Some(row) => generation_archive_refs_from_row(row),
             None => {
+                if let Some(locator) = sqlx::query(
+                    "SELECT g.tenant_id, g.key_id FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2",
+                )
+                .bind(&request_id_string)
+                .bind(tenant_external_id)
+                .fetch_optional(&self.pool)
+                .await?
+                {
+                    let tenant_id: String = locator.try_get("tenant_id")?;
+                    let key_id: String = locator.try_get("key_id")?;
+                    let identity = self
+                        .historical_credential_identity(
+                            &tenant_id,
+                            &key_id,
+                            Some(tenant_external_id),
+                        )
+                        .await?;
+                    let mut refs = self
+                        .generation_archive_refs(
+                            parse_uuid(key_id)?,
+                            parse_uuid(request_id_string.clone())?,
+                        )
+                        .await?;
+                    refs.view.credential_identity = Some(identity);
+                    return Ok(refs);
+                }
                 self.session_archive_unlinked_refs_for_tenant(
                     tenant_external_id,
                     &request_id_string,
@@ -321,9 +362,21 @@ impl Database {
             .bind(&request_id)
             .bind(locator.created_at)
             .fetch_optional(&self.pool)
-            .await?
-            .ok_or(AppError::Internal)?;
-            return request_archive_refs_from_row(row);
+            .await?;
+            if let Some(row) = row {
+                return request_archive_refs_from_row(row);
+            }
+            let identity = self
+                .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)
+                .await?;
+            let mut refs = self
+                .request_archive_refs(
+                    parse_uuid(locator.key_id.clone())?,
+                    parse_uuid(request_id.clone())?,
+                )
+                .await?;
+            refs.view.credential_identity = Some(identity);
+            return Ok(refs);
         }
         let row = sqlx::query(
             "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.upstream_account_id, g.model_route_id AS route_id, g.status, g.error_code, g.request_object, g.result_json, facts.billed_units AS facts_billed_units, NULLIF(facts.billing_unit, '') AS facts_billing_unit, facts.cost_micros AS facts_cost_micros, NULLIF(facts.currency, '') AS facts_currency, t.external_id AS tenant_external_id, g.key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id JOIN key_records k ON k.id = g.key_id AND k.tenant_id = g.tenant_id JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id WHERE g.id = $1",
@@ -333,7 +386,29 @@ impl Database {
         .await?;
         match row {
             Some(row) => generation_archive_refs_from_row(row),
-            None => self.session_archive_unlinked_refs_global(&request_id).await,
+            None => {
+                if let Some(locator) =
+                    sqlx::query("SELECT tenant_id, key_id FROM generation_jobs WHERE id = $1")
+                        .bind(&request_id)
+                        .fetch_optional(&self.pool)
+                        .await?
+                {
+                    let tenant_id: String = locator.try_get("tenant_id")?;
+                    let key_id: String = locator.try_get("key_id")?;
+                    let identity = self
+                        .historical_credential_identity(&tenant_id, &key_id, None)
+                        .await?;
+                    let mut refs = self
+                        .generation_archive_refs(
+                            parse_uuid(key_id)?,
+                            parse_uuid(request_id.clone())?,
+                        )
+                        .await?;
+                    refs.view.credential_identity = Some(identity);
+                    return Ok(refs);
+                }
+                self.session_archive_unlinked_refs_global(&request_id).await
+            }
         }
     }
 
@@ -364,9 +439,28 @@ impl Database {
         .bind(request_id)
         .bind(tenant_external_id)
         .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return session_archive_unlinked_refs_from_row(row);
+        }
+        let locator = sqlx::query(
+            "SELECT u.tenant_id, u.key_id FROM session_archive_unlinked_requests u JOIN tenants t ON t.id = u.tenant_id WHERE u.archive_request_id = $1 AND t.external_id = $2",
+        )
+        .bind(request_id)
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        session_archive_unlinked_refs_from_row(row)
+        let tenant_id: String = locator.try_get("tenant_id")?;
+        let key_id: String = locator.try_get("key_id")?;
+        let identity = self
+            .historical_credential_identity(&tenant_id, &key_id, Some(tenant_external_id))
+            .await?;
+        let mut refs = self
+            .session_archive_unlinked_refs_for_key(parse_uuid(key_id)?, request_id)
+            .await?;
+        refs.view.credential_identity = Some(identity);
+        Ok(refs)
     }
 
     async fn session_archive_unlinked_refs_global(
@@ -390,14 +484,16 @@ impl Database {
                       observation.metadata_source AS semantics_source,
                       t.external_id AS tenant_external_id,
                       u.key_id AS credential_key_id,
-                      k.alias AS key_alias,
-                      p.external_id AS principal_external_id
+                      COALESCE(k.alias,
+                               'retired-credential-' || u.key_id) AS key_alias,
+                      COALESCE(p.external_id,
+                               'retired-principal-' || u.key_id) AS principal_external_id
                  FROM session_archive_unlinked_requests u
                  JOIN tenants t ON t.id = u.tenant_id
-                 JOIN key_records k
+            LEFT JOIN key_records k
                    ON k.id = u.key_id AND k.tenant_id = u.tenant_id
-                 JOIN principals p
-                   ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+            LEFT JOIN principals p
+                   ON p.id = k.principal_id AND p.tenant_id = u.tenant_id
                  JOIN session_archive_correlations c
                    ON c.tenant_id = u.tenant_id AND c.source = u.source
                   AND c.external_request_id = u.external_request_id
@@ -433,6 +529,28 @@ impl Database {
             })
         })
         .transpose()
+    }
+
+    async fn historical_credential_identity(
+        &self,
+        tenant_id: &str,
+        key_id: &str,
+        expected_tenant_external_id: Option<&str>,
+    ) -> Result<RequestCredentialIdentityView, AppError> {
+        let tenant_external_id: String = sqlx::query_scalar(
+            "SELECT external_id FROM tenants WHERE id = $1 AND ($2 = '' OR external_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(expected_tenant_external_id.unwrap_or_default())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        Ok(RequestCredentialIdentityView {
+            tenant_external_id,
+            key_id: parse_uuid(key_id.to_owned())?,
+            key_alias: format!("retired-credential-{key_id}"),
+            principal_external_id: format!("retired-principal-{key_id}"),
+        })
     }
 
     async fn generation_archive_refs(
@@ -522,7 +640,11 @@ fn push_identity_projection(
     if scope.includes_operator_identity() {
         query.push(", t.external_id AS tenant_external_id, ");
         query.push(source_alias);
-        query.push(".key_id AS credential_key_id, k.alias AS key_alias, p.external_id AS principal_external_id");
+        query.push(".key_id AS credential_key_id, COALESCE(k.alias, 'retired-credential-' || ");
+        query.push(source_alias);
+        query.push(".key_id) AS key_alias, COALESCE(p.external_id, 'retired-principal-' || ");
+        query.push(source_alias);
+        query.push(".key_id) AS principal_external_id");
     } else {
         query.push(", CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id");
     }
@@ -543,14 +665,16 @@ fn push_operator_identity_joins(
         query.push(" JOIN tenants t ON t.id = ");
         query.push(source_alias);
         query.push(".tenant_id");
-        query.push(" JOIN key_records k ON k.id = ");
+        query.push(" LEFT JOIN key_records k ON k.id = ");
         query.push(source_alias);
         query.push(".key_id AND k.tenant_id = ");
         query.push(source_alias);
         query.push(".tenant_id");
     }
     if scope.includes_operator_identity() || filter_uses_principal(filter) {
-        query.push(" JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id");
+        query.push(" LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = ");
+        query.push(source_alias);
+        query.push(".tenant_id");
     }
 }
 
@@ -578,14 +702,12 @@ fn push_identity_eligibility(
     if !scope.includes_operator_identity() {
         return;
     }
-    // Historical imports need not have foreign keys. Preserve the previous inner-join
-    // eligibility before LIMIT, including for orphan rows. A scalar lookup cannot be
-    // flattened into the full-history join that caused the operator query timeout.
-    query.push(" AND (SELECT identity_key.id FROM key_records identity_key JOIN tenants identity_tenant ON identity_tenant.id = identity_key.tenant_id JOIN principals identity_principal ON identity_principal.id = identity_key.principal_id AND identity_principal.tenant_id = identity_key.tenant_id WHERE identity_key.id = ");
+    // Product identities may be physically retired after their durable facts have
+    // been retained. Tenant scope remains authoritative; missing key/principal rows
+    // are enriched with stable tombstone labels after the bounded source page.
+    query.push(" AND EXISTS (SELECT 1 FROM tenants identity_tenant WHERE identity_tenant.id = ");
     query.push(source_alias);
-    query.push(".key_id AND identity_key.tenant_id = ");
-    query.push(source_alias);
-    query.push(".tenant_id) IS NOT NULL");
+    query.push(".tenant_id)");
 }
 
 fn push_list_scope_filter(
@@ -672,7 +794,7 @@ fn push_request_record_filters(
         query.push(" AND r.cost_micros <= ");
         query.bind_i64(max_cost_micros);
     }
-    push_operator_identity_filters(query, filter);
+    push_operator_identity_filters(query, "r", filter);
     push_typed_filters(query, "r", RequestSourceKind::Native, filter);
 }
 
@@ -735,7 +857,7 @@ fn push_generation_job_filters(
         query.push(" AND facts.cost_micros <= ");
         query.bind_i64(max_cost_micros);
     }
-    push_operator_identity_filters(query, filter);
+    push_operator_identity_filters(query, "g", filter);
     push_typed_filters(query, "g", RequestSourceKind::Generation, filter);
 }
 
@@ -791,7 +913,7 @@ fn push_archive_request_filters(
         query.push(" AND u.duration_ms <= ");
         query.bind_i64(max_duration_ms);
     }
-    push_operator_identity_filters(query, filter);
+    push_operator_identity_filters(query, "u", filter);
     push_typed_filters(query, "u", RequestSourceKind::Archive, filter);
 }
 
@@ -864,8 +986,12 @@ fn push_typed_filters(
                 "facts.cost_micros".to_owned()
             }
             TypedFilterField::CostMicros => format!("{source_alias}.cost_micros"),
-            TypedFilterField::KeyAlias => "k.alias".to_owned(),
-            TypedFilterField::Principal => "p.external_id".to_owned(),
+            TypedFilterField::KeyAlias => {
+                format!("COALESCE(k.alias, 'retired-credential-' || {source_alias}.key_id)")
+            }
+            TypedFilterField::Principal => {
+                format!("COALESCE(p.external_id, 'retired-principal-' || {source_alias}.key_id)")
+            }
         };
         push_typed_predicate(
             query,
@@ -1048,15 +1174,20 @@ fn push_archive_keyset_cursor(query: &mut PortableRequestListQuery, filter: &Req
 
 fn push_operator_identity_filters(
     query: &mut PortableRequestListQuery,
+    source_alias: &str,
     filter: &RequestListFilter,
 ) {
     if filter.key_alias.is_some() {
-        query.push(" AND LOWER(k.alias) LIKE ");
+        query.push(" AND LOWER(COALESCE(k.alias, 'retired-credential-' || ");
+        query.push(source_alias);
+        query.push(".key_id)) LIKE ");
         query.bind_text(search_prefix(filter.key_alias.as_deref()));
         query.push(r" ESCAPE '\'");
     }
     if filter.principal.is_some() {
-        query.push(" AND LOWER(p.external_id) LIKE ");
+        query.push(" AND LOWER(COALESCE(p.external_id, 'retired-principal-' || ");
+        query.push(source_alias);
+        query.push(".key_id)) LIKE ");
         query.bind_text(search_prefix(filter.principal.as_deref()));
         query.push(r" ESCAPE '\'");
     }
@@ -1371,9 +1502,11 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
             ELSE 'confirmed' END AS session_association,
        observation.compaction, observation.session_name, observation.task_kind, observation.agent_id,
        observation.metadata_source AS semantics_source,
-       CASE WHEN key_record.id IS NULL OR principal.id IS NULL THEN NULL ELSE tenant.external_id END AS tenant_external_id,
+       tenant.external_id AS tenant_external_id,
        e.key_id AS credential_key_id,
-       key_record.alias AS key_alias, principal.external_id AS principal_external_id
+       COALESCE(key_record.alias, 'retired-credential-' || e.key_id) AS key_alias,
+       COALESCE(principal.external_id, 'retired-principal-' || e.key_id)
+           AS principal_external_id
   FROM events e
   LEFT JOIN request_record_locators locator
     ON locator.id = e.request_id AND locator.tenant_id = e.tenant_id AND locator.key_id = e.key_id

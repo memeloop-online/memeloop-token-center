@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn operator_history_uses_stable_identity_after_credential_purge() {
+    let query = build_request_list_query(
+        RequestListScope::Global,
+        &RequestListFilter {
+            limit: 25,
+            ..Default::default()
+        },
+    );
+    assert!(query.statement.contains("LEFT JOIN key_records k"));
+    assert!(query.statement.contains("LEFT JOIN principals p"));
+    assert!(query.statement.contains("retired-credential-"));
+    assert!(query.statement.contains("retired-principal-"));
+    assert!(
+        !query
+            .statement
+            .contains("SELECT identity_key.id FROM key_records")
+    );
+}
+
 #[tokio::test]
 async fn postgres_operator_page_bounds_history_before_display_joins() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
