@@ -23,6 +23,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    await page.clock.install();
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.route('**/*', (route) => {

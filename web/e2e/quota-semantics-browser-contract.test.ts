@@ -19,7 +19,7 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(5_000);
-    await page.clock.install();
+    await page.clock.install({ time: new Date('2026-09-14T12:30:00Z') });
     const forbiddenRequests: string[] = [];
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
