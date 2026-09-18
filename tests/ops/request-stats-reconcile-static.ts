@@ -83,9 +83,12 @@ test("driver and day rebuild SQL retain reconciliation safety markers", () => {
   ]) assert.ok(sqlSource.includes(marker), `missing observability rebuild marker: ${marker}`);
 
   const pruneSource = driverSource.slice(driverSource.indexOf("function pruneApply"));
+  const exclusiveProjectionLock = pruneSource.indexOf("SELECT pg_advisory_xact_lock");
+  const sourceTableLock = pruneSource.indexOf("LOCK TABLE request_records, generation_jobs IN SHARE MODE");
+  assert.notEqual(exclusiveProjectionLock, -1, "prune must acquire the exclusive projection lock");
+  assert.notEqual(sourceTableLock, -1, "prune must lock both source tables against terminal writers");
   assert.ok(
-    pruneSource.indexOf("LOCK TABLE request_records, generation_jobs IN SHARE MODE") <
-      pruneSource.indexOf("SELECT pg_advisory_xact_lock"),
-    "source-table locks must precede the projection lock to match terminal writer ordering",
+    exclusiveProjectionLock < sourceTableLock,
+    "the exclusive projection lock must precede source-table locks to match online writer ordering",
   );
 });
