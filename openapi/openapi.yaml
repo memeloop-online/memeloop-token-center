@@ -1539,6 +1539,7 @@ paths:
         max-accounts: 100
         account-credential-load-statements: 1
         handler-concurrency: 3
+        total-deadline-millis: 270000
         cache: shared
         singleflight: shared-per-account
         global-permits: shared
@@ -1550,9 +1551,10 @@ paths:
         one database statement, constrained by the authenticated service tenant when
         present. The body cannot select a tenant. At most three account reads run at
         once and they reuse the same per-account cache, singleflight and process-wide
-        quota permits as the single-account endpoint. Each account returns its own
-        success or sanitized error so partial progress is retained. This endpoint is
-        read-only: it never refreshes OAuth credentials or consumes a reset credit.
+        quota permits as the single-account endpoint. A shared 270-second handler
+        deadline cancels unfinished reads and returns a sanitized per-account timeout
+        while retaining completed results. This endpoint is read-only: it never
+        refreshes OAuth credentials or consumes a reset credit.
       requestBody:
         required: true
         content:
@@ -6520,7 +6522,7 @@ components:
               properties:
                 code:
                   type: string
-                  enum: [quota_account_not_found, quota_account_inactive, credential_invalid, quota_account_unavailable]
+                  enum: [quota_account_not_found, quota_account_inactive, credential_invalid, quota_account_unavailable, quota_batch_timeout]
     PluginInstallation:
       type: object
       additionalProperties: false
