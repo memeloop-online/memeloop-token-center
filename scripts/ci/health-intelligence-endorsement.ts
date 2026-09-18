@@ -8,6 +8,7 @@ assert(root, 'endorsement evidence directory is required');
 const pluginId = process.env.PLUGIN_ID;
 const pluginDigest = process.env.PLUGIN_DIGEST;
 const pluginSource = process.env.PLUGIN_SOURCE;
+const endorsedPluginSource = process.env.ENDORSED_PLUGIN_SOURCE;
 const upstreamIdentity = process.env.UPSTREAM_SIGNING_IDENTITY;
 const signingIdentity = process.env.SIGNING_IDENTITY;
 const json = (path: string) => JSON.parse(readFileSync(join(root, path), 'utf8'));
@@ -15,6 +16,7 @@ const digest = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).d
 
 assert.equal(pluginId, 'mtc-health-intelligence');
 assert.equal(pluginSource, 'ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-plugin');
+assert.equal(endorsedPluginSource, 'ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-endorsed');
 assert.equal(pluginDigest, 'sha256:d9d558a6a6118dadfd2693cfd7f479109dbca53ef8ddae201d8ea70fb93922c3');
 const manifestBytes = readFileSync(join(root, 'plugin-oci-manifest.json'));
 assert.equal(digest(manifestBytes), pluginDigest);
@@ -25,7 +27,7 @@ assert.deepEqual(oci.layers.map((layer: any) => layer.annotations?.['org.opencon
 const installed = json('plugin-installation.json');
 assert.equal(installed.id, pluginId);
 assert.equal(installed.digest, pluginDigest);
-assert.equal(installed.source, pluginSource);
+assert.equal(installed.source, endorsedPluginSource);
 const plugin = json(`plugin-install/${pluginId}/plugin.json`);
 assert.equal(plugin.id, pluginId);
 assert.equal(plugin.wasm, null);
@@ -33,7 +35,7 @@ assert.equal(plugin.contributions.operator_ui[0].presentation, 'health_intellige
 assert.equal(plugin.contributions.service_data[0].required_scope, 'metrics:read');
 const receipt = json(`plugin-install/${pluginId}/.mtc-oci-install.json`);
 assert.equal(receipt.digest, pluginDigest);
-assert.equal(receipt.source, pluginSource);
+assert.equal(receipt.source, endorsedPluginSource);
 assert.equal(receipt.signature_policy, 'cosign-keyless');
 for (const path of ['upstream-signature-verification.json', 'mtc-endorsement-verification.json']) {
   const signatures = json(path);
@@ -41,7 +43,8 @@ for (const path of ['upstream-signature-verification.json', 'mtc-endorsement-ver
 }
 writeFileSync(join(root, 'plugin-endorsement.json'), `${JSON.stringify({
   format_version: 1,
-  reference: `${pluginSource}@${pluginDigest}`,
+  upstream_reference: `${pluginSource}@${pluginDigest}`,
+  reference: `${endorsedPluginSource}@${pluginDigest}`,
   upstream_identity: upstreamIdentity,
   endorsed_identity: signingIdentity,
   installer_reference: `${process.env.INSTALLER_SOURCE}@${process.env.INSTALLER_DIGEST}`,
