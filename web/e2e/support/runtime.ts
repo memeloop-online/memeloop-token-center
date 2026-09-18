@@ -123,15 +123,17 @@ export function observeSessionReadyRequests({
             assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
             const isReady = event.key_id === keyId && event.model === requestModel
               && matchesReadySessionEvent(event, sessionName);
-            const eventSessionId = isReady ? event.session_context?.session_id : undefined;
-            if (isReady) {
-              assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-              if (sessionId !== undefined) assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
-              assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
+            if (!isReady) {
+              eventAt = event.event_at;
+              eventId = id;
+              return;
             }
+            const eventSessionId = event.session_context?.session_id;
+            assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
+            if (sessionId !== undefined) assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
+            assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
             eventAt = event.event_at;
             eventId = id;
-            if (!isReady || eventSessionId === undefined) return;
             sessionId ??= eventSessionId;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
