@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser } from 'playwright';
 import { streamSse } from '../../src/api.js';
@@ -77,6 +78,8 @@ export function observeSessionReadyRequests({
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
   let sessionId: string | undefined;
+  let eventAt: number | undefined;
+  let eventId: string | undefined;
   let openedResolve!: () => void;
   let openedReject!: (reason: unknown) => void;
   let completedResolve!: (requests: SessionReadyRequests) => void;
@@ -103,31 +106,46 @@ export function observeSessionReadyRequests({
   deadline.addEventListener('abort', () => {
     fail(new Error(`observed ${requestIds.size} of ${expected} session-ready requests before the deadline`));
   }, { once: true });
-  void streamSse<RequestEvent>(
-    new URL(`/internal/v1/request-events?tenant_external_id=${encodeURIComponent(tenant)}`, baseURL).toString(),
-    credential,
-    signal,
-    ({ id, event: eventName, data: event }) => {
-      assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
-      assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
-      if (event.key_id !== keyId || event.model !== requestModel
-        || !matchesReadySessionEvent(event, sessionName)) return;
-      const eventSessionId = event.session_context?.session_id;
-      assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-      if (sessionId === undefined) sessionId = eventSessionId;
-      else assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
-      requestIds.add(event.request_id);
-      if (requestIds.size !== expected || settled) return;
-      settled = true;
-      completedResolve({ requestIds: new Set(requestIds), sessionId: eventSessionId });
-      controller.abort();
-    },
-    openedResolve,
-  ).then(() => {
-    fail(new Error(`request-event stream ended after ${requestIds.size} of ${expected} session-ready requests`));
-  }).catch((reason: unknown) => {
-    if (!settled) fail(reason);
-  });
+  void (async () => {
+    while (!settled && !signal.aborted) {
+      const url = new URL('/internal/v1/request-events', baseURL);
+      url.searchParams.set('tenant_external_id', tenant);
+      if (eventAt !== undefined && eventId !== undefined) {
+        url.searchParams.set('after_event_at', String(eventAt));
+        url.searchParams.set('after_event_id', eventId);
+      }
+      try {
+        await streamSse<RequestEvent>(
+          url.toString(),
+          credential,
+          signal,
+          ({ id, event: eventName, data: event }) => {
+            assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
+            assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
+            eventAt = event.event_at;
+            eventId = id;
+            if (event.key_id !== keyId || event.model !== requestModel
+              || !matchesReadySessionEvent(event, sessionName)) return;
+            const eventSessionId = event.session_context?.session_id;
+            assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
+            if (sessionId === undefined) sessionId = eventSessionId;
+            else assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
+            requestIds.add(event.request_id);
+            if (requestIds.size !== expected || settled) return;
+            settled = true;
+            completedResolve({ requestIds: new Set(requestIds), sessionId: eventSessionId });
+            controller.abort();
+          },
+          openedResolve,
+        );
+      } catch {
+        if (settled || signal.aborted) return;
+      }
+      if (!settled && !signal.aborted) {
+        await delay(100, undefined, { signal }).catch(() => undefined);
+      }
+    }
+  })().catch(fail);
   return { opened, completed };
 }
 
