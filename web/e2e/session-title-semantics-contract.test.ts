@@ -10,7 +10,8 @@ test('request table and diagnostics reuse declared names and the shared contextu
   const diagnostics = components.slice(components.indexOf('export function RequestDiagnostics'), components.indexOf('export function RequestTable'));
   const table = components.slice(components.indexOf('export function RequestTable'));
   for (const surface of [diagnostics, table]) {
-    assert.match(surface, /session_name\?\.trim\(\) \|\| unnamedSessionName\(t, locale, request\.created_at, request\.credential_identity\?\.key_alias\?\.trim\(\) \|\| request\.credential_identity\?\.key_id\)/);
+    assert.match(surface, /credentialDisplayName\(request\.credential_identity\.key_alias, t\)/);
+    assert.match(surface, /session_name\?\.trim\(\) \|\| unnamedSessionName\(t, locale, request\.created_at, sessionCredential\)/);
     assert.doesNotMatch(surface, /sessions\.reportedNameMissing/);
     assert.match(surface, /context\.association === 'confirmed'/);
     assert.match(surface, /request-session-unlinked[^\n]*sessions\.unlinkedRequests/);
