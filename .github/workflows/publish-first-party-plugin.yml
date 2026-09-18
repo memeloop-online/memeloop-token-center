@@ -166,6 +166,8 @@ jobs:
     env:
       PLUGIN_ID: mtc-health-intelligence
       PLUGIN_SOURCE: ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-plugin
+      ENDORSED_PLUGIN_SOURCE: ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-endorsed
+      ENDORSED_PACKAGE_NAME: memeloop-token-center-health-intelligence-endorsed
       PLUGIN_DIGEST: sha256:d9d558a6a6118dadfd2693cfd7f479109dbca53ef8ddae201d8ea70fb93922c3
       UPSTREAM_SIGNING_IDENTITY: https://github.com/memeloop-online/memeloop-token-center-health-intelligence-plugin/.github/workflows/publish.yml@refs/heads/master
       SIGNING_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-first-party-plugin.yml@refs/heads/master
@@ -200,17 +202,25 @@ jobs:
           "$RUNNER_TEMP/plugin-tools/cosign" version --json | node scripts/ci/first-party-plugin-command-output.ts cosign-version
           echo "$RUNNER_TEMP/plugin-tools" >> "$GITHUB_PATH"
       - name: Verify the upstream release and add the MTC endorsement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cosign verify \
             --certificate-identity "$UPSTREAM_SIGNING_IDENTITY" \
             --certificate-oidc-issuer "$SIGNING_ISSUER" \
             "$PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/upstream-signature-verification.json"
-          cosign sign --yes "$PLUGIN_SOURCE@$PLUGIN_DIGEST"
+          oras copy "$PLUGIN_SOURCE@$PLUGIN_DIGEST" "$ENDORSED_PLUGIN_SOURCE:sha-$GITHUB_SHA"
+          endorsed_digest=$(oras resolve "$ENDORSED_PLUGIN_SOURCE:sha-$GITHUB_SHA")
+          [[ "$endorsed_digest" == "$PLUGIN_DIGEST" ]]
+          cosign sign --yes "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST"
+          gh api --method PATCH \
+            "orgs/memeloop-online/packages/container/$ENDORSED_PACKAGE_NAME" \
+            -f visibility=public > /dev/null
           cosign verify \
             --certificate-identity "$SIGNING_IDENTITY" \
             --certificate-oidc-issuer "$SIGNING_ISSUER" \
-            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/mtc-endorsement-verification.json"
-          oras manifest fetch "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --output "$RUNNER_TEMP/plugin-oci-manifest.json"
+            "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/mtc-endorsement-verification.json"
+          oras manifest fetch "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST" --output "$RUNNER_TEMP/plugin-oci-manifest.json"
       - name: Clean-install the endorsed manifest-only package
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
@@ -227,7 +237,7 @@ jobs:
             --mount "type=bind,src=$RUNNER_TEMP/plugin-install,dst=/plugins" \
             --mount "type=bind,src=$RUNNER_TEMP/plugin-registry,dst=/registry,readonly" \
             --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" \
-            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --plugin-dir /plugins --allowed-source "$PLUGIN_SOURCE" \
+            "$ENDORSED_PLUGIN_SOURCE@$PLUGIN_DIGEST" --plugin-dir /plugins --allowed-source "$ENDORSED_PLUGIN_SOURCE" \
             --cosign-certificate-identity "$SIGNING_IDENTITY" \
             --cosign-certificate-oidc-issuer "$SIGNING_ISSUER" \
             --registry-username-file /registry/username --registry-password-file /registry/password \
