@@ -477,6 +477,8 @@ mod tests {
 
     struct DropProbe(Arc<AtomicBool>);
 
+    type TestQuotaBatchJob = Pin<Box<dyn Future<Output = (usize, &'static str)>>>;
+
     impl Drop for DropProbe {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
@@ -560,7 +562,7 @@ mod tests {
             let _probe = DropProbe(slow_dropped);
             futures_util::future::pending::<(usize, &'static str)>().await
         };
-        let jobs: Vec<Pin<Box<dyn Future<Output = (usize, &'static str)>>>> =
+        let jobs: Vec<TestQuotaBatchJob> =
             vec![Box::pin(async { (0, "completed") }), Box::pin(slow)];
 
         let completed = collect_quota_batch_until(
