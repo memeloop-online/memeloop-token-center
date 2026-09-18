@@ -17,6 +17,7 @@ pub struct FailedRequestCostBackfillInput {
     pub batch_size: i64,
     pub from_created_at: i64,
     pub to_created_at: i64,
+    pub confirmed_legacy_null_request_ids: Vec<String>,
     pub after: Option<FailedRequestCostBackfillCursor>,
 }
 
@@ -32,6 +33,7 @@ pub struct FailedRequestCostBackfillReport {
     pub candidate_cost_delta_micros: i64,
     pub changed_cost_delta_micros: i64,
     pub candidate_cost_reduction_micros: i64,
+    pub changed_cost_reduction_micros: i64,
     pub affected_request_daily_dimensions: u64,
     pub affected_usage_daily_dimensions: u64,
     pub affected_usage_analysis_hourly_dimensions: u64,
@@ -152,13 +154,22 @@ impl Database {
                 "backfill requires a non-negative, non-empty created_at interval".into(),
             ));
         }
-        if input
-            .after
-            .as_ref()
-            .is_some_and(|cursor| cursor.created_at < input.from_created_at)
+        if input.after.as_ref().is_some_and(|cursor| {
+            cursor.created_at < input.from_created_at || cursor.created_at >= input.to_created_at
+        }) {
+            return Err(AppError::BadRequest(
+                "backfill cursor falls outside the requested interval".into(),
+            ));
+        }
+        if input.confirmed_legacy_null_request_ids.len()
+            > FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE as usize
+            || input
+                .confirmed_legacy_null_request_ids
+                .iter()
+                .any(|request_id| Uuid::parse_str(request_id).is_err())
         {
             return Err(AppError::BadRequest(
-                "backfill cursor precedes the requested interval".into(),
+                "confirmed legacy NULL request ids must be valid UUIDs and batch bounded".into(),
             ));
         }
         if input
@@ -176,6 +187,7 @@ impl Database {
                 &self.pool,
                 input.from_created_at,
                 input.to_created_at,
+                &input.confirmed_legacy_null_request_ids,
                 input.after.as_ref(),
                 input.batch_size.saturating_add(1),
             )
@@ -191,6 +203,7 @@ impl Database {
             self.backend,
             input.from_created_at,
             input.to_created_at,
+            &input.confirmed_legacy_null_request_ids,
             input.after.as_ref(),
             input.batch_size.saturating_add(1),
         )
@@ -247,11 +260,15 @@ impl Database {
                 ));
             }
             report.changed_rows += 1;
-            report.changed_cost_micros = report.changed_cost_micros.saturating_add(
-                candidate
-                    .cost_micros
-                    .saturating_sub(candidate.corrected_cost_micros),
-            );
+            report.changed_cost_micros = report
+                .changed_cost_micros
+                .saturating_add(candidate.cost_micros);
+            report.changed_cost_reduction_micros =
+                report.changed_cost_reduction_micros.saturating_add(
+                    candidate
+                        .cost_micros
+                        .saturating_sub(candidate.corrected_cost_micros),
+                );
             report.changed_cost_delta_micros = report.changed_cost_delta_micros.saturating_add(
                 candidate
                     .corrected_cost_micros
@@ -394,6 +411,7 @@ fn prepare_batch(
         changed_cost_delta_micros: 0,
         candidate_cost_reduction_micros: candidate_cost_micros
             .saturating_sub(candidate_corrected_cost_micros),
+        changed_cost_reduction_micros: 0,
         affected_request_daily_dimensions: request_daily_keys.len() as u64,
         affected_usage_daily_dimensions: usage_daily_keys.len() as u64,
         affected_usage_analysis_hourly_dimensions: hourly_keys.len() as u64,
@@ -411,7 +429,12 @@ fn prepare_batch(
     (candidates, report)
 }
 
-fn candidate_statement(lock: &str) -> String {
+fn candidate_statement(lock: &str, confirmed_legacy_null: bool) -> String {
+    let absent_usage_evidence = if confirmed_legacy_null {
+        "r.usage_basis IS NULL AND f.request_id = $7"
+    } else {
+        "r.usage_basis IN ('not_observed', 'contract_ceiling')"
+    };
     format!(
         r#"SELECT f.request_id, f.tenant_id, f.key_id, f.created_at, f.model, f.protocol,
                   f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
@@ -441,7 +464,7 @@ fn candidate_statement(lock: &str) -> String {
                      AND u.status = 'settled'
                      AND u.actual_micros = r.cost_micros)
                     OR
-                    (COALESCE(r.usage_basis, '') IN ('', 'not_observed', 'contract_ceiling')
+                    ({absent_usage_evidence}
                      AND f.cost_micros <> 0
                      AND f.cost_micros = r.cost_micros
                      AND u.status = 'settled'
@@ -459,10 +482,11 @@ async fn select_candidates_from_pool(
     pool: &AnyPool,
     from_created_at: i64,
     to_created_at: i64,
+    confirmed_legacy_null_request_ids: &[String],
     after: Option<&FailedRequestCostBackfillCursor>,
     limit: i64,
 ) -> Result<Vec<Candidate>, AppError> {
-    let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement("")))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement("", false)))
         .bind(from_created_at)
         .bind(to_created_at)
         .bind(
@@ -479,7 +503,30 @@ async fn select_candidates_from_pool(
         .bind(limit)
         .fetch_all(pool)
         .await?;
-    candidates_from_rows(rows)
+    let mut candidates = candidates_from_rows(rows)?;
+    for request_id in confirmed_legacy_null_request_ids {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement("", true)))
+            .bind(from_created_at)
+            .bind(to_created_at)
+            .bind(
+                after
+                    .map(|cursor| cursor.created_at)
+                    .unwrap_or(from_created_at.saturating_sub(1)),
+            )
+            .bind(
+                after
+                    .map(|cursor| cursor.request_id.as_str())
+                    .unwrap_or_default(),
+            )
+            .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+            .bind(1_i64)
+            .bind(request_id)
+            .fetch_all(pool)
+            .await?;
+        candidates.extend(candidates_from_rows(rows)?);
+    }
+    sort_deduplicate_and_bound_candidates(&mut candidates, limit);
+    Ok(candidates)
 }
 
 async fn select_candidates(
@@ -487,6 +534,7 @@ async fn select_candidates(
     backend: DatabaseBackend,
     from_created_at: i64,
     to_created_at: i64,
+    confirmed_legacy_null_request_ids: &[String],
     after: Option<&FailedRequestCostBackfillCursor>,
     limit: i64,
 ) -> Result<Vec<Candidate>, AppError> {
@@ -494,7 +542,7 @@ async fn select_candidates(
         DatabaseBackend::PostgreSql => " FOR UPDATE OF f",
         DatabaseBackend::Sqlite => "",
     };
-    let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement(lock)))
+    let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement(lock, false)))
         .bind(from_created_at)
         .bind(to_created_at)
         .bind(
@@ -511,7 +559,40 @@ async fn select_candidates(
         .bind(limit)
         .fetch_all(&mut **tx)
         .await?;
-    candidates_from_rows(rows)
+    let mut candidates = candidates_from_rows(rows)?;
+    for request_id in confirmed_legacy_null_request_ids {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(candidate_statement(lock, true)))
+            .bind(from_created_at)
+            .bind(to_created_at)
+            .bind(
+                after
+                    .map(|cursor| cursor.created_at)
+                    .unwrap_or(from_created_at.saturating_sub(1)),
+            )
+            .bind(
+                after
+                    .map(|cursor| cursor.request_id.as_str())
+                    .unwrap_or_default(),
+            )
+            .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+            .bind(1_i64)
+            .bind(request_id)
+            .fetch_all(&mut **tx)
+            .await?;
+        candidates.extend(candidates_from_rows(rows)?);
+    }
+    sort_deduplicate_and_bound_candidates(&mut candidates, limit);
+    Ok(candidates)
+}
+
+fn sort_deduplicate_and_bound_candidates(candidates: &mut Vec<Candidate>, limit: i64) {
+    candidates.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    candidates.dedup_by(|left, right| left.request_id == right.request_id);
+    candidates.truncate(limit as usize);
 }
 
 fn candidates_from_rows(rows: Vec<sqlx::any::AnyRow>) -> Result<Vec<Candidate>, AppError> {
@@ -1009,10 +1090,13 @@ mod tests {
         for (status, error, usage_basis) in [
             (499, None, Some(RequestUsageBasis::NotObserved)),
             (503, None, Some(RequestUsageBasis::ContractCeiling)),
-            (200, Some("upstream_incomplete_response"), None),
         ] {
             corrected.push(seed_historical_case(fixture, status, error, usage_basis).await);
         }
+        let legacy_null =
+            seed_historical_case(fixture, 200, Some("upstream_incomplete_response"), None).await;
+        corrected.push(legacy_null);
+        let confirmed_legacy_null_request_ids = vec![legacy_null.0.to_string()];
         let provider_estimated = seed_historical_case(
             fixture,
             502,
@@ -1032,6 +1116,25 @@ mod tests {
 
         let immutable_before = immutable_snapshot(fixture).await;
         let aggregates_before = aggregate_costs(fixture).await;
+        let unconfirmed = fixture
+            .database
+            .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                apply: false,
+                batch_size: 100,
+                from_created_at: 0,
+                to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: Vec::new(),
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(unconfirmed.candidate_rows, 2);
+        assert!(
+            unconfirmed
+                .candidates
+                .iter()
+                .all(|candidate| candidate.usage_basis.is_some())
+        );
         let dry_run = fixture
             .database
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
@@ -1039,6 +1142,7 @@ mod tests {
                 batch_size: 100,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: confirmed_legacy_null_request_ids.clone(),
                 after: None,
             })
             .await
@@ -1066,6 +1170,7 @@ mod tests {
                 batch_size: 2,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: confirmed_legacy_null_request_ids.clone(),
                 after: None,
             })
             .await
@@ -1080,6 +1185,7 @@ mod tests {
                 batch_size: 2,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: confirmed_legacy_null_request_ids.clone(),
                 after: first.next_cursor.clone(),
             })
             .await
@@ -1095,6 +1201,7 @@ mod tests {
                 batch_size: 100,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids,
                 after: None,
             })
             .await
@@ -1174,6 +1281,7 @@ mod tests {
                 batch_size: 1,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: Vec::new(),
                 after: None,
             })
             .await
@@ -1189,6 +1297,7 @@ mod tests {
                 batch_size: 1,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: Vec::new(),
                 after: None,
             })
             .await
@@ -1201,6 +1310,49 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(corrected, actual_cost);
+        assert!(
+            aggregate_costs(fixture)
+                .await
+                .into_iter()
+                .all(|cost| cost == actual_cost)
+        );
+        let audit = sqlx::query(
+            "SELECT evidence_kind, observed_usage_basis, original_request_cost_micros, original_fact_cost_micros, corrected_fact_cost_micros FROM request_cost_projection_corrections WHERE correction_version = $1 AND request_id = $2",
+        )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+        .bind(request_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit.try_get::<String, _>("evidence_kind").unwrap(),
+            "provider_reported"
+        );
+        assert_eq!(
+            audit
+                .try_get::<Option<String>, _>("observed_usage_basis")
+                .unwrap()
+                .as_deref(),
+            Some("provider_reported")
+        );
+        assert_eq!(
+            audit
+                .try_get::<i64, _>("original_request_cost_micros")
+                .unwrap(),
+            actual_cost
+        );
+        assert_eq!(
+            audit
+                .try_get::<i64, _>("original_fact_cost_micros")
+                .unwrap(),
+            incorrect_cost
+        );
+        assert_eq!(
+            audit
+                .try_get::<i64, _>("corrected_fact_cost_micros")
+                .unwrap(),
+            actual_cost
+        );
     }
 
     async fn wait_for_postgres_blocker(observer: &AnyPool, waiter_pid: i32, blocker_pid: i32) {
@@ -1324,6 +1476,7 @@ mod tests {
                     batch_size: 1,
                     from_created_at: 0,
                     to_created_at: i64::MAX,
+                    confirmed_legacy_null_request_ids: Vec::new(),
                     after: None,
                 })
                 .await
@@ -1383,6 +1536,7 @@ mod tests {
                     batch_size: 1,
                     from_created_at: 0,
                     to_created_at: i64::MAX,
+                    confirmed_legacy_null_request_ids: Vec::new(),
                     after: None,
                 })
                 .await
@@ -1396,6 +1550,7 @@ mod tests {
                     batch_size: 1,
                     from_created_at: 0,
                     to_created_at: i64::MAX,
+                    confirmed_legacy_null_request_ids: Vec::new(),
                     after: None,
                 })
                 .await
@@ -1491,6 +1646,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_backfill_uses_half_open_ranges_and_rejects_out_of_range_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("failed-cost-range.db").display()
+        );
+        let fixture = fixture(&database_url, Some(directory)).await;
+        let (request_id, _) = seed_historical_case(
+            &fixture,
+            503,
+            None,
+            Some(RequestUsageBasis::ContractCeiling),
+        )
+        .await;
+        let created_at: i64 =
+            sqlx::query_scalar("SELECT created_at FROM request_records WHERE id = $1")
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        let included = fixture
+            .database
+            .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                apply: false,
+                batch_size: 1,
+                from_created_at: created_at,
+                to_created_at: created_at + 1,
+                confirmed_legacy_null_request_ids: Vec::new(),
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(included.candidate_rows, 1);
+        let excluded = fixture
+            .database
+            .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                apply: false,
+                batch_size: 1,
+                from_created_at: created_at + 1,
+                to_created_at: created_at + 2,
+                confirmed_legacy_null_request_ids: Vec::new(),
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(excluded.candidate_rows, 0);
+        assert!(
+            fixture
+                .database
+                .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                    apply: false,
+                    batch_size: 1,
+                    from_created_at: created_at,
+                    to_created_at: created_at + 1,
+                    confirmed_legacy_null_request_ids: Vec::new(),
+                    after: Some(FailedRequestCostBackfillCursor {
+                        created_at: created_at + 1,
+                        request_id: request_id.to_string(),
+                    }),
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_backfill_rolls_back_the_fact_and_retries_after_projection_failure() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
@@ -1525,6 +1746,7 @@ mod tests {
                     batch_size: 1,
                     from_created_at: 0,
                     to_created_at: i64::MAX,
+                    confirmed_legacy_null_request_ids: Vec::new(),
                     after: None,
                 })
                 .await
@@ -1537,6 +1759,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rolled_back_cost, original_cost);
+        let rolled_back_audit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_cost_projection_corrections WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(rolled_back_audit, 0);
         assert_eq!(immutable_snapshot(&fixture).await, immutable_before);
         assert_eq!(aggregate_costs(&fixture).await, aggregates_before);
 
@@ -1551,6 +1781,7 @@ mod tests {
                 batch_size: 1,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
+                confirmed_legacy_null_request_ids: Vec::new(),
                 after: None,
             })
             .await

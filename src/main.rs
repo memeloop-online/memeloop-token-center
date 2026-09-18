@@ -65,6 +65,9 @@ enum Command {
         /// Exclusive request creation timestamp in milliseconds.
         #[arg(long)]
         to_created_at: i64,
+        /// Audited request id whose legacy NULL usage basis is known to be a reservation ceiling.
+        #[arg(long = "confirmed-legacy-null-request-id")]
+        confirmed_legacy_null_request_ids: Vec<String>,
         /// Maximum eligible facts inspected in this transaction.
         #[arg(
             long,
@@ -161,6 +164,7 @@ async fn run() -> Result<(), &'static str> {
             batch_size,
             from_created_at,
             to_created_at,
+            confirmed_legacy_null_request_ids,
             after_created_at,
             after_request_id,
         } => {
@@ -179,6 +183,7 @@ async fn run() -> Result<(), &'static str> {
                     batch_size,
                     from_created_at,
                     to_created_at,
+                    confirmed_legacy_null_request_ids,
                     after,
                 })
                 .await
@@ -282,6 +287,7 @@ mod lifecycle_tests {
             batch_size,
             from_created_at,
             to_created_at,
+            confirmed_legacy_null_request_ids,
             after_created_at,
             after_request_id,
         } = parsed.command
@@ -292,6 +298,7 @@ mod lifecycle_tests {
         assert_eq!(batch_size, 100);
         assert_eq!(from_created_at, 1);
         assert_eq!(to_created_at, 2);
+        assert!(confirmed_legacy_null_request_ids.is_empty());
         assert_eq!(after_created_at, None);
         assert_eq!(after_request_id, None);
 
