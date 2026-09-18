@@ -31,6 +31,14 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled }: {
     const message = t(key);
     return message === key ? t('providerCatalog.error.unavailable') : message;
   };
+  const parseCatalog = (value: unknown): Catalog => {
+    if (!value || typeof value !== 'object' || !('status' in value) || typeof value.status !== 'string'
+      || !('models' in value) || !Array.isArray(value.models)
+      || !value.models.every(model => model && typeof model.id === 'string' && typeof model.protocol === 'string')) {
+      throw new Error(t('providerCatalog.error.invalid_response'));
+    }
+    return value as Catalog;
+  };
 
   useEffect(() => {
     controller.current?.abort();
@@ -38,7 +46,7 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled }: {
     setCatalog(undefined); setCatalogMessage(''); setCatalogError(''); setPriceMessage(''); setPriceError('');
     if (!token || !tenant) { setBusy(false); return () => read.abort(); }
     setBusy(true);
-    void api<Catalog>(`${path}?${query}`, token, { signal: read.signal })
+    void api<unknown>(`${path}?${query}`, token, { signal: read.signal }).then(parseCatalog)
       .then(value => { if (!read.signal.aborted) setCatalog(value); })
       .catch(reason => { if (!read.signal.aborted) setCatalogError(errorText(reason)); })
       .finally(() => { if (!read.signal.aborted) setBusy(false); });
@@ -53,7 +61,7 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled }: {
     setCatalogMessage(t('providerCatalog.syncingModels'));
     let current: Catalog;
     try {
-      const result = await api<Catalog>(`${path}/sync?${query}`, token, { method: 'POST', signal });
+      const result = parseCatalog(await api<unknown>(`${path}/sync?${query}`, token, { method: 'POST', signal }));
       if (signal.aborted) return;
       setCatalog(result);
       if (result.status !== 'ready' || result.error_code) {
@@ -62,7 +70,7 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled }: {
         else setCatalogError(catalogFailure(result));
         setBusy(false); return;
       }
-      current = await api<Catalog>(`${path}?${query}`, token, { signal });
+      current = parseCatalog(await api<unknown>(`${path}?${query}`, token, { signal }));
       if (signal.aborted) return;
       setCatalog(current);
       if (current.error_code || current.status !== 'ready') throw new Error(catalogFailure(current));
@@ -89,7 +97,7 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled }: {
         for (const source of result.sourceResults ?? []) if (source.error) failedSources.add(source.source);
       }
       setPriceMessage(t('providerCatalog.pricesDone', { imported: formatNumber(imported, locale), preserved: formatNumber(preserved, locale), pending: formatNumber(pending, locale) }));
-      if (failedSources.size) setPriceError(t('providerCatalog.sourcesFailed', { sources: [...failedSources].join('、') }));
+      if (failedSources.size) setPriceError(t('providerCatalog.sourcesFailed', { sources: new Intl.ListFormat(locale, { style: 'long', type: 'conjunction' }).format(failedSources) }));
     } catch (reason) {
       if (!signal.aborted) {
         setPriceMessage(t('providerCatalog.pricesDone', { imported: formatNumber(imported, locale), preserved: formatNumber(preserved, locale), pending: formatNumber(pending + models.length - processed, locale) }));
