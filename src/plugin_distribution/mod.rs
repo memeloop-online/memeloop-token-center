@@ -1063,7 +1063,24 @@ fn validate_manifest_layer_relationships(
         _ => Err(PluginDistributionError::InvalidArtifact(
             "manifest wasm path does not match the OCI wasm layer".to_owned(),
         )),
+    }?;
+    let asset_layers = files
+        .iter()
+        .filter(|file| file.descriptor.media_type == PLUGIN_ASSET_MEDIA_TYPE)
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    if manifest
+        .contributions
+        .operator_ui
+        .iter()
+        .filter_map(|contribution| contribution.module_entry.as_ref())
+        .any(|entry| !asset_layers.contains(entry))
+    {
+        return Err(PluginDistributionError::InvalidArtifact(
+            "manifest operator UI module must use a plugin asset layer".to_owned(),
+        ));
     }
+    Ok(())
 }
 
 async fn prepare_plugin_root(root: &Path) -> Result<(), PluginDistributionError> {

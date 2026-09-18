@@ -4,7 +4,7 @@
    an intentionally flat workspace. */
 :root[data-theme] .app-main-content[data-surface='operator']:is(
   [data-route='providers'], [data-route='routes'], [data-route='pricing'],
-  [data-route='credentials'], [data-route='plugins'], [data-route='settings']
+  [data-route='credentials'], [data-route='plugins'], [data-route='system-settings']
 ) :is(
   .provider-layout > .panel,
   .management-layout > .panel,

@@ -1,7 +1,7 @@
 use std::fs;
 
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
 use memeloop_token_center::{
@@ -28,6 +28,17 @@ fn write_package(root: &std::path::Path, name: &str, manifest: &Value) {
         serde_json::to_vec(manifest).expect("encode fixture plugin manifest"),
     )
     .expect("write fixture plugin manifest");
+    for entry in manifest["contributions"]["operator_ui"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|contribution| contribution["module_entry"].as_str())
+    {
+        let path = package.join(entry);
+        fs::create_dir_all(path.parent().unwrap()).expect("create fixture UI module directory");
+        fs::write(path, b"export function activateOperatorUi() {}\n")
+            .expect("write fixture UI module");
+    }
 }
 
 #[tokio::test]
@@ -140,6 +151,7 @@ async fn component_operator_contributions_support_tabs_and_existing_page_slots()
             "label": "Interactive health",
             "icon": "heart",
             "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs",
             "component_id": "health-workspace",
             "component_props": { "defaultRange": "24h" }
         },
@@ -150,6 +162,7 @@ async fn component_operator_contributions_support_tabs_and_existing_page_slots()
             "label": "Provider intelligence",
             "icon": "chart",
             "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs",
             "component_id": "provider-intelligence",
             "data_endpoint": "health"
         }
@@ -169,10 +182,31 @@ async fn component_operator_contributions_support_tabs_and_existing_page_slots()
         manifest.contributions.operator_ui[0].renderer,
         "component_v1"
     );
+    let digest = manifest.contributions.operator_ui[0]
+        .module_sha256
+        .as_deref()
+        .expect("runtime module digest");
+    assert!(digest.starts_with("sha256:"));
     assert_eq!(
         manifest.contributions.operator_ui[1]
             .target_route
             .as_deref(),
         Some("providers")
+    );
+    let response = api::router_for_role(state, RuntimeRole::Control)
+        .oneshot(
+            Request::get(format!(
+                "/ui-assets/plugins/{}/1.0.0/{digest}/assets/operator-ui.mjs",
+                manifest.id
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("serve runtime UI module");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+        b"export function activateOperatorUi() {}\n"
     );
 }

@@ -306,7 +306,7 @@
         },
         "operator_ui": {
           "type": "array",
-          "description": "Operator navigation and fixed-slot cards. typed_data_v1 uses core projections; component_v1 joins a manifest to a trusted UI package compiled into the Operator build.",
+          "description": "Operator navigation and fixed-slot cards. typed_data_v1 uses core projections; component_v1 loads a signed, digest-addressed module from the installed plugin package.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -324,10 +324,11 @@
                 }
               },
               "route": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
-              "target_route": { "enum": ["overview", "requests", "sessions", "usage", "generations", "providers", "routes", "pricing", "tenants", "credentials", "service-credentials", "plugins", "settings"] },
+              "target_route": { "enum": ["overview", "requests", "sessions", "usage", "generations", "providers", "routes", "pricing", "tenants", "credentials", "service-credentials", "plugins", "system-settings"] },
               "label": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^<>\\u0000-\\u001F\\u007F]+$" },
               "icon": { "enum": ["activity", "chart", "database", "heart", "plug", "shield"] },
               "renderer": { "enum": ["typed_data_v1", "component_v1"] },
+              "module_entry": { "type": "string", "minLength": 4, "maxLength": 240, "pattern": "^(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\\.m?js$" },
               "component_id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
               "component_props": { "type": "object" },
               "presentation": {
@@ -339,11 +340,11 @@
             "allOf": [
               {
                 "if": { "properties": { "renderer": { "const": "typed_data_v1" } }, "required": ["renderer"] },
-                "then": { "required": ["data_endpoint"], "not": { "anyOf": [{ "required": ["component_id"] }, { "required": ["component_props"] }] } }
+                "then": { "required": ["data_endpoint"], "not": { "anyOf": [{ "required": ["module_entry"] }, { "required": ["component_id"] }, { "required": ["component_props"] }] } }
               },
               {
                 "if": { "properties": { "renderer": { "const": "component_v1" } }, "required": ["renderer"] },
-                "then": { "required": ["component_id"], "not": { "required": ["presentation"] } }
+                "then": { "required": ["module_entry", "component_id"], "not": { "required": ["presentation"] } }
               },
               {
                 "if": { "properties": { "slot": { "const": "operator.sidebar.tab" } }, "required": ["slot"] },

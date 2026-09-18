@@ -761,8 +761,12 @@ export interface PluginOperatorUiContribution {
   target_route?: string | null;
   label: string;
   icon: PluginOperatorUiIcon;
-  /** Select a core projection or a component from a trusted build-time package. */
+  /** Select a core projection or a component from a signed runtime module. */
   renderer: PluginOperatorUiRenderer;
+  /** Signed package-relative ESM entry for component_v1. */
+  module_entry?: string | null;
+  /** Digest of the exact module bytes in the active runtime snapshot. */
+  module_sha256?: string | null;
   /** Component export key when renderer is component_v1. */
   component_id?: string | null;
   /** Plugin-defined JSON passed through as part of the contribution contract. */

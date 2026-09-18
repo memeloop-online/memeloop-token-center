@@ -7,5 +7,6 @@ export function defineOperatorUiPackage(value) {
 export function operatorUiPackageSupportsManifest(value, pluginId, pluginVersion) {
   return value.apiVersion === OPERATOR_UI_PACKAGE_API_V1
     && value.pluginId === pluginId
-    && (value.compatiblePluginVersions == null || value.compatiblePluginVersions.includes(pluginVersion));
+    && Array.isArray(value.compatiblePluginVersions)
+    && value.compatiblePluginVersions.includes(pluginVersion);
 }

@@ -79,8 +79,12 @@ test("plugin operator host exposes typed data and versioned component slots", ()
   const contribution = document.components.schemas.PluginOperatorUiContribution;
   assert.deepEqual(contribution.properties.slot.enum, ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after"]);
   assert.deepEqual(contribution.properties.renderer.enum, ["typed_data_v1", "component_v1"]);
+  assert.ok(contribution.properties.module_entry);
+  assert.equal(contribution.properties.module_sha256.readOnly, true);
   assert.ok(contribution.properties.component_id);
   assert.ok(contribution.properties.target_route.enum.includes("providers"));
+  assert.ok(contribution.properties.target_route.enum.includes("system-settings"));
+  assert.equal(contribution.properties.target_route.enum.includes("settings"), false);
   assert.ok(document.components.schemas.PluginServiceDataEndpoint.properties.required_scope.enum.includes("metrics:read"));
 });
 test("Responses WebSocket negotiation remains an authenticated temporary fallback", () => {

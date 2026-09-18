@@ -46,6 +46,7 @@ const PLUGIN_HTTP_HEADER_TOTAL_BYTES: usize = 16 * 1024;
 const PLUGIN_HTTP_HEADERS_JSON_BYTES: usize = 128 * 1024;
 const PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
 const PLUGIN_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+const PLUGIN_UI_MODULE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_COMPONENT_PROVIDER_BODY: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REASON_BYTES: usize = 256;
@@ -78,9 +79,6 @@ const CORE_OPERATOR_ROUTES: &[&str] = &[
     "credentials",
     "service-credentials",
     "plugins",
-    // Reserved for the core system-settings surface even when that page is
-    // not enabled in a particular deployment/build.
-    "settings",
     "system-settings",
 ];
 const CORE_OPERATOR_CATEGORIES: &[&str] = &["monitoring", "traffic", "identity", "system"];
@@ -137,8 +135,8 @@ pub struct PluginContributions {
     #[serde(default)]
     pub providers: Vec<ProviderType>,
     /// Operator tabs and cards. `typed_data_v1` uses a core projection;
-    /// `component_v1` joins the manifest to a trusted UI package compiled into
-    /// the Operator build through the versioned UI SDK.
+    /// `component_v1` loads a digest-addressed module captured from the active
+    /// installed plugin package through the versioned UI SDK.
     #[serde(default)]
     pub operator_ui: Vec<PluginOperatorUiContribution>,
     /// Named, server-side JSON feeds used by `operator_ui`. The browser can
@@ -194,8 +192,15 @@ pub struct PluginOperatorUiContribution {
     pub label: String,
     pub icon: String,
     /// `typed_data_v1` selects a core projection. `component_v1` selects a
-    /// component exported by a trusted package in the Operator build.
+    /// component exported by the signed package's runtime UI module.
     pub renderer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_entry: Option<String>,
+    /// Populated from the exact module bytes captured by the active runtime.
+    /// Source manifests cannot provide this field because the JSON schema
+    /// rejects it; clients use it to build an immutable same-origin URL.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub module_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,6 +323,7 @@ pub enum PluginCapability {
 struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
+    ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
     routing_validator: Option<crate::schema::CompiledSchema>,
     routing_fingerprint: String,
@@ -590,7 +596,7 @@ impl PluginRuntime {
         let mut plugins = Vec::new();
         let mut providers = Vec::new();
         for directory in directories {
-            let manifest = validate_plugin_package(&directory)?;
+            let mut manifest = validate_plugin_package(&directory)?;
             if plugins
                 .iter()
                 .any(|loaded: &LoadedPlugin| loaded.manifest.id == manifest.id)
@@ -614,6 +620,7 @@ impl PluginRuntime {
                 }
                 providers.push(provider);
             }
+            let ui_modules = load_operator_ui_modules(&directory, &mut manifest)?;
             let (component, component_sha256) = {
                 let component_bytes = manifest
                     .wasm
@@ -675,6 +682,7 @@ impl PluginRuntime {
             plugins.push(LoadedPlugin {
                 manifest,
                 component,
+                ui_modules,
                 configuration_validator,
                 routing_validator,
                 routing_fingerprint,
@@ -728,6 +736,31 @@ impl PluginRuntime {
             .iter()
             .map(|plugin| plugin.manifest.clone())
             .collect()
+    }
+
+    pub(crate) fn operator_ui_module(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        sha256: &str,
+        entry: &str,
+    ) -> Option<Arc<[u8]>> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id && plugin.manifest.version == version)?;
+        plugin
+            .manifest
+            .contributions
+            .operator_ui
+            .iter()
+            .any(|contribution| {
+                contribution.renderer == "component_v1"
+                    && contribution.module_entry.as_deref() == Some(entry)
+                    && contribution.module_sha256.as_deref() == Some(sha256)
+            })
+            .then_some(())?;
+        plugin.ui_modules.get(entry).cloned()
     }
 
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -1937,6 +1970,19 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
         let wasm_path = safe_child(directory, wasm)?;
         require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
     }
+    for entry in manifest
+        .contributions
+        .operator_ui
+        .iter()
+        .filter_map(|contribution| contribution.module_entry.as_deref())
+    {
+        let module_path = safe_child(directory, entry)?;
+        require_file_size(
+            &module_path,
+            PLUGIN_UI_MODULE_BYTES,
+            "plugin operator UI module",
+        )?;
+    }
     Ok(manifest)
 }
 
@@ -2067,6 +2113,7 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
             "typed_data_v1" => {
                 if contribution.component_id.is_some()
                     || contribution.component_props.is_some()
+                    || contribution.module_entry.is_some()
                     || contribution.data_endpoint.is_none()
                 {
                     return Err(AppError::BadRequest(format!(
@@ -2080,6 +2127,10 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                     .component_id
                     .as_deref()
                     .is_some_and(|value| safe_plugin_token(value, 64))
+                    || !contribution
+                        .module_entry
+                        .as_deref()
+                        .is_some_and(safe_operator_ui_module_entry)
                     || contribution.presentation.is_some()
                     || contribution
                         .component_props
@@ -2274,16 +2325,8 @@ fn validate_operator_category(
 
 fn validate_loaded_operator_ui_contributions(plugins: &[LoadedPlugin]) -> Result<(), AppError> {
     let mut categories: BTreeMap<&str, &str> = BTreeMap::new();
-    let mut routes = BTreeSet::new();
     for plugin in plugins {
         for contribution in &plugin.manifest.contributions.operator_ui {
-            if let Some(route) = contribution.route.as_deref()
-                && !routes.insert(route)
-            {
-                return Err(AppError::BadRequest(
-                    "duplicate plugin operator route across installed plugins".into(),
-                ));
-            }
             let Some(category) = contribution.category.as_ref() else {
                 continue;
             };
@@ -2305,6 +2348,42 @@ fn validate_loaded_operator_ui_contributions(plugins: &[LoadedPlugin]) -> Result
         }
     }
     Ok(())
+}
+
+fn load_operator_ui_modules(
+    directory: &Path,
+    manifest: &mut PluginManifest,
+) -> Result<BTreeMap<String, Arc<[u8]>>, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let mut modules = BTreeMap::new();
+    for contribution in &mut manifest.contributions.operator_ui {
+        let Some(entry) = contribution.module_entry.as_deref() else {
+            continue;
+        };
+        let bytes = if let Some(bytes) = modules.get(entry) {
+            bytes.clone()
+        } else {
+            let path = safe_child(directory, entry)?;
+            require_file_size(&path, PLUGIN_UI_MODULE_BYTES, "plugin operator UI module")?;
+            let bytes: Arc<[u8]> = read_identity_bytes(&path, PLUGIN_UI_MODULE_BYTES)?.into();
+            modules.insert(entry.to_owned(), bytes.clone());
+            bytes
+        };
+        contribution.module_sha256 = Some(format!("sha256:{:x}", Sha256::digest(bytes.as_ref())));
+    }
+    Ok(modules)
+}
+
+fn safe_operator_ui_module_entry(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 240
+        && (value.ends_with(".js") || value.ends_with(".mjs"))
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, PathComponent::Normal(_)))
 }
 
 fn safe_plugin_token(value: &str, maximum: usize) -> bool {

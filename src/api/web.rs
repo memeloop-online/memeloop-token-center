@@ -38,7 +38,27 @@ async fn web_index() -> Response {
     response
 }
 
-pub(super) async fn web_asset(Path(path): Path<String>) -> Response {
+pub(super) async fn web_asset(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    if let Some((plugin_id, version, sha256, entry)) = plugin_ui_asset_path(&path) {
+        let state = match state.pin_application_plugins().await {
+            Ok(state) => state,
+            Err(error) => return error.into_response(),
+        };
+        return match state
+            .plugins
+            .operator_ui_module(plugin_id, version, sha256, entry)
+        {
+            Some(body) => (
+                [
+                    (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                ],
+                Bytes::from_owner(body),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     let relative = std::path::Path::new(&path);
     if relative.is_absolute()
         || relative
@@ -60,4 +80,25 @@ pub(super) async fn web_asset(Path(path): Path<String>) -> Response {
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn plugin_ui_asset_path(path: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = path.splitn(5, '/');
+    if parts.next()? != "plugins" {
+        return None;
+    }
+    let plugin_id = parts.next()?;
+    let version = parts.next()?;
+    let sha256 = parts.next()?;
+    let entry = parts.next()?;
+    if plugin_id.is_empty()
+        || version.is_empty()
+        || !sha256.strip_prefix("sha256:").is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || entry.is_empty()
+    {
+        return None;
+    }
+    Some((plugin_id, version, sha256, entry))
 }

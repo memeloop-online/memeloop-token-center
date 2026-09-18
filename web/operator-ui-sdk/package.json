@@ -5,6 +5,6 @@
   "type": "module",
   "files": ["index.js", "index.d.ts", "README.md"],
   "exports": { ".": { "types": "./index.d.ts", "import": "./index.js" } },
-  "peerDependencies": { "react": ">=19" },
+  "peerDependencies": { "@fluentui/react-components": ">=9", "react": ">=19" },
   "license": "Apache-2.0"
 }

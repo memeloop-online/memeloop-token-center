@@ -126,7 +126,8 @@ oras push --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
   ghcr.io/example/token-center-plugins/example-policy:1.0.0 \
   plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
   plugin.wasm:application/vnd.wasm.content.layer.v1+wasm \
-  README.md:application/vnd.memeloop.token-center.plugin.asset.v1
+  README.md:application/vnd.memeloop.token-center.plugin.asset.v1 \
+  assets/operator-ui.mjs:application/vnd.memeloop.token-center.plugin.asset.v1
 digest="$(oras resolve ghcr.io/example/token-center-plugins/example-policy:1.0.0)"
 cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-policy@${digest}"
 ```
@@ -135,5 +136,5 @@ cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-polic
 
 ## 边界说明
 
-- 本文列出的扩展点是当前 ABI 的全部：流式请求钩子、任意 JavaScript UI、插件自创账户/路由等都不存在，请勿按「将来会有」设计。
+- 本文列出的扩展点构成当前 ABI。Operator React 模块使用经过签名、按摘要寻址的 `component_v1` 契约；流式请求钩子与插件自创账户/路由不在该 ABI 中。
 - 组路由使用独立的 `group-routing-plugin` world，见[组路由](routing.md)；Operator 界面扩展见[Operator UI](operator-ui.md)。

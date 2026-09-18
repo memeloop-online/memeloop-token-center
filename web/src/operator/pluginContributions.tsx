@@ -1,12 +1,7 @@
-import { useEffect, useState, type ComponentType } from 'react';
+import { useEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
 import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
 import { operatorRouteKeys, pluginRouteKey, type OperatorRouteKey, type PluginRouteKey } from '../app/routes.js';
-import {
-  operatorUiPackageSupportsManifest,
-  type OperatorUiComponentPropsV1,
-  type OperatorUiPackageV1,
-} from '../../operator-ui-sdk/index.js';
 import { OperatorPluginComponentHost } from '../plugins/OperatorPluginComponentHost.js';
 import type {
   PluginManifest,
@@ -17,10 +12,8 @@ import type {
 /**
  * Browser-side policy boundary for operator plugins.
  *
- * The registry accepts server-validated manifest data and joins component_v1
- * contributions to trusted packages already compiled into this Operator
- * build. Package loading is a build concern; this module never imports a URL,
- * evaluates source text, or inserts plugin HTML.
+ * The registry accepts server-validated manifest data. component_v1 entries
+ * point to digest-addressed modules from the active installed plugin snapshot.
  */
 export interface RegisteredPluginContribution {
   pluginId: string;
@@ -28,7 +21,6 @@ export interface RegisteredPluginContribution {
   manifestRevision?: string;
   allowedLinkOrigins?: readonly string[];
   contribution: PluginOperatorUiContribution;
-  component?: ComponentType<OperatorUiComponentPropsV1>;
   serviceEndpointIds: readonly string[];
   route: PluginRouteKey | null;
 }
@@ -65,8 +57,12 @@ function safeLabel(value: unknown): value is string {
 
 function validContribution(value: PluginOperatorUiContribution): boolean {
   const rendererContract = value.renderer === 'typed_data_v1'
-    ? token.test(value.data_endpoint ?? '') && value.component_id == null
-    : value.renderer === 'component_v1' && token.test(value.component_id ?? '') && value.presentation == null;
+    ? token.test(value.data_endpoint ?? '') && value.component_id == null && value.module_entry == null
+    : value.renderer === 'component_v1'
+      && token.test(value.component_id ?? '')
+      && typeof value.module_entry === 'string'
+      && /^sha256:[0-9a-f]{64}$/u.test(value.module_sha256 ?? '')
+      && value.presentation == null;
   return token.test(value.id)
     && safeLabel(value.label)
     && rendererContract
@@ -74,10 +70,7 @@ function validContribution(value: PluginOperatorUiContribution): boolean {
     && (value.presentation == null || supportedPresentations.has(value.presentation));
 }
 
-export function registerOperatorPluginContributions(
-  manifests: PluginManifest[],
-  packages: readonly OperatorUiPackageV1[] = [],
-): OperatorPluginRegistry {
+export function registerOperatorPluginContributions(manifests: PluginManifest[]): OperatorPluginRegistry {
   const navigation = new Map<string, PluginNavigationSection>();
   const pages = new Map<PluginRouteKey, RegisteredPluginContribution>();
   const overviewCards: RegisteredPluginContribution[] = [];
@@ -85,8 +78,6 @@ export function registerOperatorPluginContributions(
   const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
     if (!token.test(manifest.id)) continue;
-    const matchingPackages = packages.filter((candidate) => operatorUiPackageSupportsManifest(candidate, manifest.id, manifest.version));
-    const operatorPackage = matchingPackages.length === 1 ? matchingPackages[0] : undefined;
     const projectionPolicy = {
       pluginVersion: manifest.version,
       manifestRevision: JSON.stringify(manifest),
@@ -96,17 +87,10 @@ export function registerOperatorPluginContributions(
     for (const contribution of manifest.contributions.operator_ui ?? []) {
       if (!validContribution(contribution)) continue;
       if (contribution.data_endpoint && !endpoints.has(contribution.data_endpoint)) continue;
-      const component = contribution.renderer === 'component_v1'
-        && operatorPackage
-        && Object.hasOwn(operatorPackage.components, contribution.component_id!)
-        ? operatorPackage.components[contribution.component_id!]
-        : undefined;
-      if (contribution.renderer === 'component_v1' && !component) continue;
       const registration = {
         pluginId: manifest.id,
         ...projectionPolicy,
         contribution,
-        component,
         serviceEndpointIds: [...endpoints],
       };
       if (contribution.slot === 'operator.overview.card') {
@@ -135,12 +119,9 @@ export function registerOperatorPluginContributions(
   // Keep the first validated category declaration as the owner of its label.
   // A later conflicting declaration is rejected on its own; it must not erase
   // the already-valid navigation section or replace its label.
-  const routeCounts = new Map<string, number>();
   const categoryLabels = new Map<string, string>();
   const conflictingCategoryRoutes = new Set<PluginRouteKey>();
   for (const registered of sidebar) {
-    const rawRoute = registered.contribution.route!;
-    routeCounts.set(rawRoute, (routeCounts.get(rawRoute) ?? 0) + 1);
     if (coreCategories.has(registered.category.id)) continue;
     const label = registered.category.label!;
     const existing = categoryLabels.get(registered.category.id);
@@ -148,7 +129,7 @@ export function registerOperatorPluginContributions(
     else categoryLabels.set(registered.category.id, label);
   }
   for (const registered of sidebar) {
-    if (routeCounts.get(registered.contribution.route!) !== 1 || conflictingCategoryRoutes.has(registered.route) || pages.has(registered.route)) continue;
+    if (conflictingCategoryRoutes.has(registered.route) || pages.has(registered.route)) continue;
     pages.set(registered.route, registered);
     const existing = navigation.get(registered.category.id);
     if (existing) {
@@ -305,8 +286,8 @@ interface PluginContributionRenderProps {
 function PluginContributionData(props: PluginContributionRenderProps) {
   const { registered, token: credential, tenant } = props;
   const scopeKey = JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint]);
-  if (registered.contribution.renderer === 'component_v1' && registered.component) {
-    return <ComponentPluginData key={scopeKey} {...props} component={registered.component} />;
+  if (registered.contribution.renderer === 'component_v1') {
+    return <ComponentPluginData key={scopeKey} {...props} />;
   }
   if (registered.contribution.presentation === 'projection_v1') {
     return <ProjectionPluginData key={scopeKey} {...props} scopeKey={scopeKey} />;
@@ -321,13 +302,11 @@ function ComponentPluginData({
   locale,
   compact = false,
   onNavigate,
-  component: Component,
-}: PluginContributionRenderProps & { component: ComponentType<OperatorUiComponentPropsV1> }) {
+}: PluginContributionRenderProps) {
   return <OperatorPluginComponentHost
     pluginId={registered.pluginId}
     pluginVersion={registered.pluginVersion}
     contribution={registered.contribution}
-    component={Component}
     serviceEndpointIds={registered.serviceEndpointIds}
     credential={credential}
     tenantExternalId={tenant}

@@ -29,7 +29,7 @@ const labels = {
     monitoring: '监控', traffic: '流量配置', identity: '身份与权限', system: '系统', creation: '多模态',
     overview: '总览', requests: '请求', sessions: '会话', usage: '用量分析', generations: '生成任务', generate: '创建任务',
     providers: '上游服务', routes: '模型路由', pricing: '模型计费', tenants: '租户管理', credentials: '客户端凭据',
-    'service-credentials': '服务凭据', plugins: '插件', settings: '系统设置',
+    'service-credentials': '服务凭据', plugins: '插件', 'system-settings': '系统设置',
   },
   en: {
     portal: 'Portal', operator: 'Operator', skip: 'Skip to main content', menu: 'Open navigation', close: 'Close navigation',
@@ -38,7 +38,7 @@ const labels = {
     monitoring: 'Monitoring', traffic: 'Traffic configuration', identity: 'Identity and access', system: 'System', creation: 'Multimodal',
     overview: 'Overview', requests: 'Requests', sessions: 'Sessions', usage: 'Usage', generations: 'Generation jobs', generate: 'Create task',
     providers: 'Upstream services', routes: 'Model routes', pricing: 'Model pricing', tenants: 'Tenant management', credentials: 'Client credentials',
-    'service-credentials': 'Service credentials', plugins: 'Plugins', settings: 'System settings',
+    'service-credentials': 'Service credentials', plugins: 'Plugins', 'system-settings': 'System settings',
   },
 } as const;
 
@@ -61,7 +61,7 @@ function navigation(surface: AppSurface, locale: Locale, pluginNavigation: Plugi
     { id: 'monitoring', label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
     { id: 'traffic', label: label(locale, 'traffic'), items: [item('providers'), item('routes'), item('pricing')] },
     { id: 'identity', label: label(locale, 'identity'), items: [item('tenants'), item('credentials'), item('service-credentials')] },
-    { id: 'system', label: label(locale, 'system'), items: [item('plugins'), item('settings')] },
+    { id: 'system', label: label(locale, 'system'), items: [item('plugins'), item('system-settings', 'settings')] },
   ];
   for (const pluginSection of pluginNavigation) {
     const pluginItems = pluginSection.items.map((entry) => ({ route: entry.route as AppRouteKey, label: entry.label, icon: entry.icon as IconName }));

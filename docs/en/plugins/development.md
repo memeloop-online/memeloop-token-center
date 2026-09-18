@@ -126,7 +126,8 @@ oras push --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
   ghcr.io/example/token-center-plugins/example-policy:1.0.0 \
   plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
   plugin.wasm:application/vnd.wasm.content.layer.v1+wasm \
-  README.md:application/vnd.memeloop.token-center.plugin.asset.v1
+  README.md:application/vnd.memeloop.token-center.plugin.asset.v1 \
+  assets/operator-ui.mjs:application/vnd.memeloop.token-center.plugin.asset.v1
 digest="$(oras resolve ghcr.io/example/token-center-plugins/example-policy:1.0.0)"
 cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-policy@${digest}"
 ```
@@ -135,5 +136,5 @@ Installation references must pin a digest (never a tag). The operator installati
 
 ## Boundaries
 
-- The extension points listed here are the complete current ABI: streaming request hooks, arbitrary JavaScript UI, and plugin-created accounts/routes do not exist. Do not design around them as future features.
+- The extension points listed here are the complete current ABI. Operator React modules use the signed, digest-addressed `component_v1` contract; streaming request hooks and plugin-created accounts/routes are outside this ABI.
 - Group routing uses the separate `group-routing-plugin` world; see [Group routing](routing.md). Operator interface extensions are described in [Operator UI](operator-ui.md).

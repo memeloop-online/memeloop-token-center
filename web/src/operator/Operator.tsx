@@ -16,8 +16,6 @@ import { useRequestRefreshPreference } from './hooks/useRequestRefreshPreference
 import { OperatorAccessSettings } from './OperatorAccessSettings';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { isPluginRouteKey } from '../app/routes';
-import trustedOperatorUiPackages from '../plugins/trustedOperatorUiPackages.js';
-import type { OperatorUiPackageV1 } from '../../operator-ui-sdk/index.js';
 import {
   PluginContributionPage,
   PluginOverviewCards,
@@ -49,7 +47,6 @@ export interface OperatorProps {
   onPluginNavigation?: (navigation: PluginNavigationSection[]) => void;
   embedded?: boolean;
   showNavigation?: boolean;
-  operatorUiPackages?: readonly OperatorUiPackageV1[];
 }
 
 const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string }> = [
@@ -65,14 +62,14 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'credentials', label: 'nav.credentials', domId: 'credentials' },
   { route: 'service-credentials', label: 'nav.services', domId: 'services' },
   { route: 'plugins', label: 'nav.plugins', domId: 'plugins' },
-  { route: 'settings', label: 'nav.settings', domId: 'settings' },
+  { route: 'system-settings', label: 'nav.settings', domId: 'system-settings' },
 ];
 
 function pageId(route: OperatorApplicationRoute) {
   return navigation.find((item) => item.route === route)?.domId ?? route;
 }
 
-export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true, operatorUiPackages = trustedOperatorUiPackages }: OperatorProps = {}) {
+export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true }: OperatorProps = {}) {
   const { t, locale } = useI18n();
   const scope = useOperatorScope();
   const [internalRoute, setInternalRoute] = useState<OperatorApplicationRoute>('requests');
@@ -86,10 +83,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     t('common.requestFailed'),
   );
   const pluginManifests = pluginCatalog.state.kind === 'ready' ? pluginCatalog.state.value : undefined;
-  const pluginRegistry = useMemo(
-    () => registerOperatorPluginContributions(pluginManifests ?? [], operatorUiPackages),
-    [operatorUiPackages, pluginManifests],
-  );
+  const pluginRegistry = useMemo(() => registerOperatorPluginContributions(pluginManifests ?? []), [pluginManifests]);
   const credentialScope = useRef({ credential: '', generation: 0 });
   if (credentialScope.current.credential !== scope.activeCredential) {
     credentialScope.current = {
@@ -197,7 +191,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
         case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} reloadCatalog={pluginCatalog.reload} />; break;
-        case 'settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
+        case 'system-settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
       const extensions = pluginRegistry.pageExtensions.get(activeRoute);
       if (page && extensions) {
@@ -216,7 +210,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   // A settings user may explicitly replace a credential while tenant
   // discovery is still in flight. Keep only that access form mounted; all
   // tenant-scoped pages remain withheld until discovery resolves.
-  } else if (!scope.authenticating || activeRoute === 'settings') page = accessSettings;
+  } else if (!scope.authenticating || activeRoute === 'system-settings') page = accessSettings;
 
   const content = <>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
@@ -225,7 +219,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating && activeRoute !== 'settings'
+      {scope.authenticating && activeRoute !== 'system-settings'
         ? <div className="empty">{t('common.loading')}</div>
         : <Fragment key={pageScopeKey}><Suspense fallback={<div className="empty">{t('common.loading')}</div>}>{page}</Suspense></Fragment>}
     </section>

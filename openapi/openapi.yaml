@@ -7618,7 +7618,7 @@ components:
               items: { $ref: '#/components/schemas/ProviderType' }
             operator_ui:
               type: array
-              description: Operator tabs and cards rendered by a core projection or a trusted component package compiled into the Operator build.
+              description: Operator tabs and cards rendered by a core projection or a signed module from the active installed plugin snapshot.
               items: { $ref: '#/components/schemas/PluginOperatorUiContribution' }
             service_data:
               type: array
@@ -7641,13 +7641,21 @@ components:
         route: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         target_route:
           type: [string, 'null']
-          enum: [overview, requests, sessions, usage, generations, providers, routes, pricing, tenants, credentials, service-credentials, plugins, settings, null]
+          enum: [overview, requests, sessions, usage, generations, providers, routes, pricing, tenants, credentials, service-credentials, plugins, system-settings, null]
         label: { type: string, minLength: 1, maxLength: 120 }
         icon: { type: string, enum: [activity, chart, database, heart, plug, shield] }
         renderer:
           type: string
           enum: [typed_data_v1, component_v1]
-          description: Selects a core projection or a component from a trusted build-time package.
+          description: Selects a core projection or a component from a signed runtime module.
+        module_entry:
+          type: [string, 'null']
+          description: Package-relative signed JavaScript module used by component_v1.
+        module_sha256:
+          type: [string, 'null']
+          readOnly: true
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Digest of the exact module bytes captured by the active plugin runtime.
         component_id: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
         component_props: { type: [object, 'null'], additionalProperties: true }
         presentation:

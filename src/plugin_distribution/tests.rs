@@ -330,6 +330,45 @@ fn digest_and_paths_are_fail_closed() {
     );
 }
 
+#[test]
+fn operator_ui_module_entry_must_be_a_signed_asset_layer() {
+    let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+        "id": "ui-plugin", "version": "1.0.0", "wit_version": "0.2.0",
+        "wasm": null, "capabilities": [],
+        "contributions": {
+            "operator_ui": [{
+                "id": "dashboard", "slot": "operator.sidebar.tab",
+                "category": { "id": "monitoring" }, "route": "dashboard",
+                "label": "Dashboard", "icon": "chart", "renderer": "component_v1",
+                "module_entry": "assets/operator-ui.mjs", "component_id": "dashboard"
+            }]
+        }
+    }))
+    .unwrap();
+    let descriptor: OciDescriptor = serde_json::from_value(serde_json::json!({
+        "mediaType": PLUGIN_ASSET_MEDIA_TYPE,
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "size": 1,
+        "annotations": { OCI_TITLE_ANNOTATION: "assets/operator-ui.mjs" }
+    }))
+    .unwrap();
+    assert!(matches!(
+        validate_manifest_layer_relationships(&manifest, &[]),
+        Err(PluginDistributionError::InvalidArtifact(message)) if message.contains("operator UI module")
+    ));
+    assert!(
+        validate_manifest_layer_relationships(
+            &manifest,
+            &[PlannedFile {
+                path: PathBuf::from("assets/operator-ui.mjs"),
+                descriptor,
+                maximum: MAX_ASSET_BYTES,
+            }],
+        )
+        .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn pulls_from_mock_registry_and_atomically_installs() {
     let (_server, _temporary, artifact) = mock_artifact("plugin.json", &plugin_json()).await;

@@ -3,7 +3,7 @@
 Plugins can add sidebar tabs and overview cards to the Operator console. MTC supports two integration paths:
 
 - `typed_data_v1` renders structured data with the MTC design system.
-- `component_v1` connects a trusted React package through the versioned Operator UI SDK for interactive workspaces, visualizations, and complete workflows.
+- `component_v1` loads a signed, digest-addressed React module from the installed plugin package for interactive workspaces, visualizations, and complete workflows.
 
 The manifest contract lives in [plugin-manifest.schema.json](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json). The publishable React contract lives in `web/operator-ui-sdk`.
 
@@ -37,6 +37,7 @@ The manifest contract lives in [plugin-manifest.schema.json](https://github.com/
         "label": "Service health",
         "icon": "heart",
         "renderer": "component_v1",
+        "module_entry": "assets/operator-ui.mjs",
         "component_id": "health-workspace",
         "component_props": { "defaultRange": "24h" },
         "data_endpoint": "health"
@@ -48,37 +49,42 @@ The manifest contract lives in [plugin-manifest.schema.json](https://github.com/
 
 `operator.sidebar.tab` uses a `route` and `category`; `operator.overview.card` appears on the overview; `operator.page.before` and `operator.page.after` use `target_route` to mount a component inside an existing Operator page. Core categories are `monitoring`, `traffic`, `identity`, and `system`. A plugin may also declare a named category. Available icons are `activity`, `chart`, `database`, `heart`, `plug`, and `shield`.
 
-## React package
+## React module
 
-The package exports `operatorUiPackage`:
+The signed OCI artifact includes a self-contained ESM asset. Its activation export receives MTC's React and Fluent runtimes, preserving one React instance across the host and every plugin:
 
-```tsx
-import { defineOperatorUiPackage } from '@memeloop/token-center-operator-ui-sdk';
-import { HealthWorkspace } from './HealthWorkspace';
-
-export const operatorUiPackage = defineOperatorUiPackage({
-  apiVersion: 'operator-ui-package-v1',
-  pluginId: 'example-observability',
-  compatiblePluginVersions: ['1.0.0'],
-  components: { 'health-workspace': HealthWorkspace },
-});
+```js
+export function activateOperatorUi({ React, Fluent, defineOperatorUiPackage }) {
+  function HealthWorkspace({ api, contribution }) {
+    return React.createElement(Fluent.Text, null, contribution.label);
+  }
+  return defineOperatorUiPackage({
+    apiVersion: 'operator-ui-package-v1',
+    pluginId: 'example-observability',
+    compatiblePluginVersions: ['1.0.0'],
+    components: { 'health-workspace': HealthWorkspace },
+  });
+}
 ```
 
 Each component receives plugin, tenant, locale, slot, and host API context. The host API exposes:
 
 - `loadServiceData(endpointId)` for manifest service-data feeds.
-- `request(path, options)` for MTC APIs available to the current Operator credential.
 - `navigate(route)` for core and installed-plugin routes.
 
-Components can use React, Fluent UI, charting packages, and their own state management. MTC theme variables and the Fluent Provider cover the mounted component tree.
+Components use the host's React and Fluent UI objects and can bundle other browser-only libraries into the single ESM asset. MTC theme variables and the Fluent Provider cover the mounted component tree.
 
-Register packages at build time with a comma-separated `MTC_OPERATOR_UI_PACKAGES` value:
+Publish the module as a plugin asset layer alongside `plugin.json`:
 
 ```bash
-MTC_OPERATOR_UI_PACKAGES=@memeloop/health-plugin-ui,@memeloop/routing-plugin-ui npm run build
+oras push --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
+  --config artifact-config.json:application/vnd.memeloop.token-center.plugin.config.v1+json \
+  ghcr.io/example/example-observability:1.0.0 \
+  plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
+  assets/operator-ui.mjs:application/vnd.memeloop.token-center.plugin.asset.v1
 ```
 
-The installed manifest activates a contribution and the compiled package supplies its component. Manifest removal and version changes update the corresponding tabs, cards, and routes on the next catalog refresh.
+Installation verifies the pinned OCI digest and signature. The active runtime captures the exact module bytes, publishes their SHA-256 in the plugin catalog, and serves them from an immutable same-origin URL. Publishing, rolling back, or uninstalling a plugin updates its tabs and page slots on the next catalog refresh without rebuilding MTC. Each contribution has its own loading state and error boundary.
 
 ## Structured-data path
 
@@ -100,4 +106,4 @@ The control plane reads and validates service data and returns a consistent enve
 }
 ```
 
-Build-time module resolution keeps component packages inside the standard TypeScript, dependency-locking, review, and content-security-policy pipeline. Runtime manifests select compiled components with a stable, traceable loading path.
+`component_v1` modules stay inside the signed plugin artifact and MTC content-security policy. The first contract uses one ESM file per entry; a future SDK version can add chunk manifests while keeping the content-addressed loading model.

@@ -11,7 +11,7 @@ import {
 
 test('portal and operator expose the complete product route sets', () => {
   assert.deepEqual(portalRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'generate']);
-  assert.deepEqual(operatorRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes', 'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'settings']);
+  assert.deepEqual(operatorRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes', 'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'system-settings']);
 });
 
 test('legacy entry URLs resolve to stable defaults and query routes survive refresh', () => {

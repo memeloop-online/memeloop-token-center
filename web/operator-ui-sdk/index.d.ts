@@ -1,4 +1,6 @@
 import type { ComponentType } from 'react';
+import type * as ReactRuntime from 'react';
+import type * as FluentRuntime from '@fluentui/react-components';
 
 export declare const OPERATOR_UI_PACKAGE_API_V1: 'operator-ui-package-v1';
 
@@ -11,6 +13,8 @@ export interface OperatorUiContributionV1 {
   label: string;
   icon: string;
   renderer: 'component_v1';
+  module_entry: string;
+  module_sha256: `sha256:${string}`;
   component_id: string;
   component_props?: Record<string, unknown> | null;
   data_endpoint?: string | null;
@@ -28,15 +32,7 @@ export interface OperatorUiServiceDataResponseV1 {
   };
 }
 
-export interface OperatorUiRequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-  body?: unknown;
-  headers?: Readonly<Record<string, string>>;
-  signal?: AbortSignal;
-}
-
 export interface OperatorUiHostApiV1 {
-  request<T>(path: string, options?: OperatorUiRequestOptions): Promise<T>;
   loadServiceData(endpointId: string, signal?: AbortSignal): Promise<OperatorUiServiceDataResponseV1>;
   navigate(route: string): void;
 }
@@ -54,8 +50,19 @@ export interface OperatorUiComponentPropsV1 {
 export interface OperatorUiPackageV1 {
   apiVersion: typeof OPERATOR_UI_PACKAGE_API_V1;
   pluginId: string;
-  compatiblePluginVersions?: readonly string[];
+  compatiblePluginVersions: readonly string[];
   components: Readonly<Record<string, ComponentType<OperatorUiComponentPropsV1>>>;
+}
+
+export interface OperatorUiModuleHostV1 {
+  apiVersion: typeof OPERATOR_UI_PACKAGE_API_V1;
+  React: typeof ReactRuntime;
+  Fluent: typeof FluentRuntime;
+  defineOperatorUiPackage: typeof defineOperatorUiPackage;
+}
+
+export interface OperatorUiModuleV1 {
+  activateOperatorUi(host: OperatorUiModuleHostV1): OperatorUiPackageV1 | Promise<OperatorUiPackageV1>;
 }
 
 export declare function defineOperatorUiPackage(value: OperatorUiPackageV1): OperatorUiPackageV1;
