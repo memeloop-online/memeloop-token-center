@@ -254,9 +254,9 @@ mod tests {
                     .bind(invalid.key_id.to_string()).execute(&database.pool).await.unwrap();
             }
             if fault == "existing_plaintext_identity" {
-                let (hash, _) = crypto::hash_credential(&valid.key, PEPPER);
+                let foreign = crypto::issue_credential(Uuid::nil(), PEPPER);
                 sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
-                    .bind(&valid.key).bind(hash).bind(invalid.key_id.to_string())
+                    .bind(&foreign.secret).bind(&foreign.secret_hash).bind(invalid.key_id.to_string())
                     .execute(&database.pool).await.unwrap();
             }
             let result = match fault {
