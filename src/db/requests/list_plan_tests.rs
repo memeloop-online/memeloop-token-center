@@ -69,16 +69,16 @@ async fn postgres_operator_page_bounds_history_before_display_joins() {
             }
             if node.contains("Scan") && node.contains(" on request_records") {
                 native_scans += 1;
-                let nearest_join = ancestors.iter().rposition(|(_, ancestor)| {
-                    ancestor.contains("Join") || ancestor.starts_with("Nested Loop")
-                });
+                let bounded_source = ancestors
+                    .iter()
+                    .position(|(_, ancestor)| ancestor.starts_with("Subquery Scan on r"));
                 assert!(
                     ancestors
                         .iter()
                         .enumerate()
                         .any(|(position, (_, ancestor))| {
                             ancestor.starts_with("Limit")
-                                && nearest_join.is_none_or(|join| position > join)
+                                && bounded_source.is_some_and(|source| position > source)
                         }),
                     "historical scan must be bounded before display joins:\n{}",
                     lines.join("\n")

@@ -1090,7 +1090,7 @@ impl Database {
                     return Err(AppError::NotFound);
                 }
                 let owner = sqlx::query(
-                    "SELECT q.error_code, q.input_tokens, q.output_tokens, q.service_tier, reservation.account_id FROM request_records q JOIN usage_reservations reservation ON reservation.id = q.reservation_id AND reservation.key_id = q.key_id WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4",
+                    "SELECT q.error_code, q.input_tokens, q.output_tokens, q.service_tier, account.principal_id, account.id AS account_id FROM request_records q JOIN usage_reservations reservation ON reservation.id = q.reservation_id AND reservation.key_id = q.key_id JOIN credit_accounts account ON account.id = reservation.account_id WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4",
                 )
                 .bind(&request_id)
                 .bind(created_at)
@@ -1099,8 +1099,10 @@ impl Database {
                 .fetch_optional(&mut *transaction)
                 .await?
                 .ok_or(AppError::NotFound)?;
-                if owner.try_get::<String, _>("account_id")?
-                    != conversation.key.account_id.to_string()
+                if owner.try_get::<String, _>("principal_id")?
+                    != conversation.key.principal_id.to_string()
+                    || owner.try_get::<String, _>("account_id")?
+                        != conversation.key.account_id.to_string()
                     || conversation.key.account_id != trusted_reservation.account_id
                 {
                     return Err(AppError::NotFound);
