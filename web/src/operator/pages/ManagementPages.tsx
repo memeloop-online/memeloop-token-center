@@ -96,13 +96,17 @@ function CredentialCopyAction({ value, canCopy, busy, secretVisible, t, onCopy }
   t: (key: string) => string;
   onCopy: (value: KeyView) => void;
 }) {
-  const unavailable = value.status === 'revoked'
-    ? t('credentials.copyRevoked')
-    : value.status === 'suspended'
-      ? t('credentials.copySuspended')
-      : t('credentials.copyUnavailable');
-  const enabled = canCopy && value.status === 'active' && Boolean(value.credential_copy_available);
-  return <DetailTooltip content={enabled ? t('credentials.copyPermission') : unavailable}>
+  const reason = !canCopy
+    ? t('credentials.copyPermission')
+    : value.status === 'revoked'
+      ? t('credentials.copyRevoked')
+      : value.status === 'suspended'
+        ? t('credentials.copySuspended')
+        : !value.credential_copy_available
+          ? t('credentials.copyNeedsOriginal')
+          : undefined;
+  const enabled = !reason;
+  return <DetailTooltip content={reason ?? t('credentials.copy')}>
     <span tabIndex={enabled ? undefined : 0}>
       <Button appearance="secondary" type="button" disabled={!enabled || busy || secretVisible} onClick={() => onCopy(value)}>
         {busy ? t('common.loading') : t('credentials.copy')}
@@ -130,9 +134,9 @@ function RevealedCredential({ value, message, onCopied, onDismiss }: {
   };
   return <aside className="one-time">
     <div className="one-time-heading"><div><b>{message}</b><p>{t('credentials.revealedHint')}</p></div><button type="button" className="secondary one-time-close" aria-label={t('common.close')} onClick={onDismiss}>×</button></div>
-    <code aria-label={t('credentials.revealedValue')}>{value}</code>
+    <code className="credential-revealed-value" tabIndex={0} aria-label={t('credentials.revealedValue')}>{value}</code>
     <div className="button-row"><button type="button" onClick={() => void copy()}>{t('credentials.copy')}</button></div>
-    {copyFailed && <small className="one-time-error" role="alert">{t('common.copySecretFailed')}</small>}
+    {copyFailed && <small className="one-time-error" role="alert">{t('credentials.copyManual')}</small>}
   </aside>;
 }
 
@@ -1356,7 +1360,13 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       showSecret({ value: result.key, kind: 'revealed', alias: value.alias, displayId: crypto.randomUUID() });
       setMessage(t('credentials.copyReady', { alias: value.alias }));
     } catch (reason) {
-      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) {
+        setError(reason instanceof ApiError && reason.status === 403
+          ? t('credentials.copyPermission')
+          : reason instanceof ApiError && reason.status === 404
+            ? t('credentials.copyNeedsOriginal')
+            : messageOf(reason, t('common.requestFailed')));
+      }
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
@@ -1559,7 +1569,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
     setSecret(undefined);
   };
   const copyServiceCredential = async (value: ServiceTokenView) => {
-    if (!token || !value.credential_copy_available || value.status !== 'active') return;
+    if (!canManage(value) || !token || !value.credential_copy_available || value.status !== 'active') return;
     const operation = beginSecretOperation();
     if (!operation) return;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
@@ -1579,7 +1589,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
         showSecret(result.token, true); setMessage(t('credentials.copyManual'));
       }
     } catch (reason) {
-      if (!controller.signal.aborted && current()) setError(reason instanceof ApiError && reason.status === 403 ? t('services.copyPermission') : reason instanceof ApiError && reason.status === 404 ? t('services.secretUnavailable') : messageOf(reason, t('common.requestFailed')));
+      if (!controller.signal.aborted && current()) setError(reason instanceof ApiError && reason.status === 403 ? t('services.copyPermission') : reason instanceof ApiError && reason.status === 404 ? t('services.copyNeedsOriginal') : messageOf(reason, t('common.requestFailed')));
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
       if (current()) finishSecretOperation(operation);
@@ -1632,7 +1642,16 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
         t('services.scopesHint', { scopes: value.scopes.join(' · ') || '—' }),
         t('services.tenantHint', { tenant: tenantDisplayName(value.tenant_external_id ?? t('services.globalScope'), locale) }),
       ].join('\n');
-      return <div className="managed-resource credential-compact-row" key={value.service_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.name}</b><div className="credential-row-summary"><span className="credential-budget" title={t('services.notBilledHint')}>{t('services.notBilled')}</span><span className="credential-group-summary">{tenantDisplayName(value.tenant_external_id ?? t('services.globalScope'), locale)} · {value.scopes.join(' · ') || t('common.none')}</span></div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions credential-row-actions"><DetailTooltip content={value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.copySuspended') : !value.credential_copy_available ? t('services.secretUnavailable') : t('services.copyPermission')}><span tabIndex={!value.credential_copy_available || value.status !== 'active' ? 0 : undefined}><Button appearance="secondary" type="button" disabled={!token || !value.credential_copy_available || value.status !== 'active' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>;
+      const copyReason = !token || !canManage(value)
+        ? t('services.copyPermission')
+        : value.status === 'revoked'
+          ? t('credentials.copyRevoked')
+          : value.status === 'suspended'
+            ? t('credentials.copySuspended')
+            : !value.credential_copy_available
+              ? t('services.copyNeedsOriginal')
+              : undefined;
+      return <div className="managed-resource credential-compact-row" key={value.service_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.name}</b><div className="credential-row-summary"><span className="credential-budget" title={t('services.notBilledHint')}>{t('services.notBilled')}</span><span className="credential-group-summary">{tenantDisplayName(value.tenant_external_id ?? t('services.globalScope'), locale)} · {value.scopes.join(' · ') || t('common.none')}</span></div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions credential-row-actions"><DetailTooltip content={copyReason ?? t('credentials.copy')}><span tabIndex={copyReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(copyReason) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>;
     })}</div></article>
     <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;

@@ -17,18 +17,18 @@ MTC 有两类完全隔离的凭证。
 
 ## 复制凭证
 
-客户端凭证列表永远不携带明文。使用列表中的明确「复制凭证」操作，可在单独操作区直接查看当前原值并选择或复制。集成管理界面可调用：
+客户端凭证列表只显示身份和状态。点击「复制凭证」即可打开当前原值，再选中原值或点击复制。集成管理界面可调用：
 
 ```bash
 curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/copy" \
   -H "Authorization: Bearer mts_example_service_token"
 ```
 
-- 需要 `keys:write` scope；响应为 `no-store`，仅在凭证仍处于启用状态时返回明文。
-- 重复调用返回同一个当前凭证，不会触发轮换或任何变更。
-- 列表和自助接口永远不包含明文；仅通过 `credential_copy_available` 启用或禁用这个明确操作。
+- 需要 `keys:write` scope；响应为 `no-store`，凭证处于启用状态时返回明文。
+- 重复调用返回同一个当前凭证，并保持凭据代次不变。
+- 列表和自助接口不显示明文；`credential_copy_available` 表示复制凭证已就绪。
 
-如果授权来源已知当前有效凭证原值，可以在不改变凭证的前提下登记这个准确值，供之后明确复制：
+授权来源持有当前有效凭据原值时，可以提交这个准确值供复制凭证使用：
 
 ```bash
 curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential" \
@@ -37,7 +37,7 @@ curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-00
   --data '{"key":"mtc_example_current_value"}'
 ```
 
-服务端会校验该值是否匹配当前凭证；操作不会轮换或替换凭证。
+服务端会校验该值是否匹配当前凭证，并保持凭据代次不变。
 
 ## 创建客户端凭证
 

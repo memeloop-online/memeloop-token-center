@@ -17,18 +17,18 @@ Client credentials can never call management interfaces; service credentials can
 
 ## Copying a credential
 
-The client credential list never carries plaintext. Use its explicit **Copy credential** action to reveal the active original in a dedicated action area, where it can be selected or copied. An integrated management interface can retrieve that same value with:
+The client credential list keeps credential values out of its rows. Select **Copy credential** to open the active original value, then select it or use the copy button. An integrated management interface can retrieve that same value with:
 
 ```bash
 curl -X POST "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/copy" \
   -H "Authorization: Bearer mts_example_service_token"
 ```
 
-- Requires the `keys:write` scope. The response is `no-store` and includes plaintext only while the credential remains active.
-- Repeated calls return the same current credential and trigger no rotation or other change.
-- Lists and self-service interfaces never include plaintext. They expose `credential_copy_available` only to enable or disable this explicit action.
+- Requires the `keys:write` scope. The response is `no-store` and includes plaintext while the credential remains active.
+- Repeated calls return the same current credential and retain its generation.
+- Lists and self-service interfaces omit plaintext. `credential_copy_available` indicates when Copy credential is ready.
 
-If an authorized source already knows an active credential value, it may register that exact value for later explicit copying without changing the credential:
+An authorized source that holds an active credential value can save that value for Copy credential:
 
 ```bash
 curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-0000000000c3/credential" \
@@ -37,7 +37,7 @@ curl -X PUT "https://mtc.example.com/internal/v1/keys/0193f2ab-7c1e-7000-8000-00
   --data '{"key":"mtc_example_current_value"}'
 ```
 
-The value is verified against the active credential. This operation does not rotate or replace it.
+The service verifies the value against the active credential and retains its generation.
 
 ## Creating a client credential
 

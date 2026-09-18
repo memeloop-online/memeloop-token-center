@@ -195,7 +195,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     service_id: 'service-existing',
     name: 'Existing service credential',
     credential_generation: 1,
-    credential_copy_available: scenario === 'service-copy' && !parameters.has('unavailable'),
+    credential_copy_available: scenario === 'service-copy',
     fingerprint: 'fixture-fingerprint',
     scopes: ['keys:read'],
     tenant_external_id: initialTenant || 'tenant-a',

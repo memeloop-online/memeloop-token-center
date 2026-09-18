@@ -171,11 +171,11 @@ paths:
         A global credential may omit `tenant_external_id` to inspect all tenants.
         Records are ordered by `(created_at, key_id)` descending. Use the final row's
         `created_at` and `key_id` as the paired, exclusive `before_created_at` and
-        `before_id` cursor. The response never contains a credential secret, so a caller
+        `before_id` cursor. The response omits credential secrets, so a caller
         that lost a create response can reconcile the stable `key_id`, `account_id`,
-        fingerprint, generation, policy and balance, then use the explicit copy action
-        when `credential_copy_available` is true. Historical hash-only credentials
-        cannot be reconstructed.
+        fingerprint, generation, policy and balance, then use Copy when
+        `credential_copy_available` is true. An authorized source holding the current
+        value can submit it through the credential endpoint before copying.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:read
       parameters:
@@ -185,7 +185,7 @@ paths:
           schema: { type: string, maxLength: 200 }
         - name: key_id
           in: query
-          description: Return only the exact stable credential identity. This never searches secret values.
+          description: Return only the exact stable credential identity. Secret values are excluded from this search.
           schema: { type: string, format: uuid }
         - name: search
           in: query
@@ -204,7 +204,7 @@ paths:
         - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
-          description: Stable identities; never contains credential secrets.
+          description: Stable identities without credential secrets.
           content:
             application/json:
               schema:
@@ -324,8 +324,7 @@ paths:
       summary: Store an already-active client credential for direct authorized copying
       description: |
         Verifies the supplied credential against the active stable key and stores its original
-        value for direct copying. It does not rotate, replace, or otherwise change the
-        credential. Existing hash-only credentials cannot be reconstructed.
+        value for Copy. The credential keeps its current generation.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -347,12 +346,11 @@ paths:
       operationId: copyClientCredential
       summary: Copy a durable active client credential
       description: |
-        Returns plaintext only for an explicit, authorized copy action and only while the
-        matching key generation remains active. Credential lists and self-service APIs never
-        contain the secret. This operation never rotates or replaces the credential; repeated
-        authorized calls return the same current-generation credential. A hash-only historical
-        key returns 404 unless an authorized importer still has and stores its original value.
-        The stored original is verified against the active credential hash before copying.
+        Returns plaintext to an authorized Copy request while the matching key generation
+        remains active. Credential lists and self-service APIs omit the secret. Repeated
+        authorized calls return the same current-generation credential and retain its
+        generation. Submit a current value through the credential endpoint when Copy needs
+        an original value.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters: [{ $ref: '#/components/parameters/KeyId' }]
@@ -617,8 +615,7 @@ paths:
       summary: Copy a durable active service credential
       description: |
         Global service-token management only. Returns the current original credential through
-        an explicit no-store copy action without rotating it. Hash-only historical tokens
-        return 404 and are never replaced or fabricated.
+        a no-store Copy request and retains its generation.
       security: [{ serviceBearer: [] }]
       x-required-scope: service_tokens:write
       parameters: [{ $ref: '#/components/parameters/ServiceId' }]
@@ -6849,7 +6846,7 @@ components:
       properties:
         key_id: { type: string, format: uuid }
         credential_generation: { type: integer, format: int64, minimum: 1 }
-        key: { type: string, writeOnly: true, description: Active credential returned only by an explicit no-store copy action. }
+        key: { type: string, writeOnly: true, description: Active credential returned by a no-store Copy request. }
     ManagedClientCredential:
       type: object
       additionalProperties: false
@@ -6866,7 +6863,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: [string, 'null'] }
-        credential_copy_available: { type: boolean, description: Whether the active credential can be copied through the explicit management action. }
+        credential_copy_available: { type: boolean, description: Whether Copy credential can return the active credential. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
@@ -7024,7 +7021,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: string }
-        credential_copy_available: { type: boolean, description: Whether the current active credential has an original value available for copying. }
+        credential_copy_available: { type: boolean, description: Whether Copy credential can return the active service credential. }
         scopes:
           type: array
           items: { $ref: '#/components/schemas/ServiceScope' }
@@ -7038,7 +7035,7 @@ components:
       properties:
         service_id: { type: string, format: uuid }
         credential_generation: { type: integer, format: int64, minimum: 1 }
-        token: { type: string, writeOnly: true, description: Active service credential returned only by an explicit no-store copy action. }
+        token: { type: string, writeOnly: true, description: Active service credential returned by a no-store Copy request. }
     JsonSchema:
       oneOf:
         - type: object

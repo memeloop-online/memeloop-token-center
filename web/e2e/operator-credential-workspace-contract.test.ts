@@ -130,7 +130,8 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await manualCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
     await manualCopy.getByText('mtc_client_copied', { exact: true }).waitFor();
     await manualCopy.locator('.credential-secret-priority').getByRole('button', { name: 'Copy credential', exact: true }).click();
-    await manualCopy.getByRole('alert').filter({ hasText: 'Copy failed. Use download or select the credential above manually.' }).waitFor();
+    await manualCopy.getByRole('alert').filter({ hasText: 'Clipboard access is unavailable. Select the value above and copy it manually.' }).waitFor();
+    assert.equal(await manualCopy.locator('.credential-revealed-value').evaluate((element) => getComputedStyle(element).userSelect), 'all', 'the revealed original remains selectable when clipboard access is unavailable');
     assert.equal(await manualCopy.getByRole('dialog').count(), 0);
     await manualCopy.close();
 
