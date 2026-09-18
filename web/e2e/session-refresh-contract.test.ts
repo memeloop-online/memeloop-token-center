@@ -234,3 +234,26 @@ test('incremental summaries reload only when an affected identity can change fir
     hasMore: true,
   }).requiresFullReload, true, 'a visible row removed by state/model/search filters must be backfilled');
 });
+
+test('incremental summaries keep the loaded tail globally ordered without changing first-page membership', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 400 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 300 },
+    { key_id: 'key-a', session_id: 'session-c', last_activity_at: 200 },
+    { key_id: 'key-a', session_id: 'session-d', last_activity_at: 100 },
+  ];
+  const updatedTail = { ...current[3], last_activity_at: 250 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [updatedTail],
+    requested: [updatedTail],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    hasMore: true,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id),
+    ['session-a', 'session-b', 'session-d', 'session-c']);
+  assert.deepEqual(merged.sessions.slice(0, 2), current.slice(0, 2),
+    'tail-only movement must preserve the authoritative first-page membership');
+});

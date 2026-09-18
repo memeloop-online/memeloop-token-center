@@ -144,8 +144,8 @@ export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { l
     .filter((summary, index) => index < firstPageSize || !requestedKeys.has(sessionIdentityKey(summary))
       || updatesByKey.has(sessionIdentityKey(summary)))
     .map((summary) => updatesByKey.get(sessionIdentityKey(summary)) ?? summary);
-  const sortedFirstPage = replaced.slice(0, firstPageSize).sort(compareSessionOrder);
-  return { sessions: [...sortedFirstPage, ...replaced.slice(firstPageSize)], requiresFullReload: false };
+  replaced.sort(compareSessionOrder);
+  return { sessions: replaced, requiresFullReload: false };
 }
 
 export function sessionEventTargetsSelection(eventIdentities: ReadonlySet<string>, selected?: SessionIdentity) {

@@ -128,17 +128,14 @@ pub(super) struct SessionSummaryBatchRequest {
     q: Option<String>,
 }
 
+struct ValidatedSessionSummaryBatch {
+    tenant_external_id: Option<String>,
+    identities: Vec<(Uuid, String)>,
+    filter: LogicalSessionListFilter,
+}
+
 impl SessionSummaryBatchRequest {
-    fn validated(
-        self,
-    ) -> Result<
-        (
-            Option<String>,
-            Vec<(Uuid, String)>,
-            LogicalSessionListFilter,
-        ),
-        AppError,
-    > {
+    fn validated(self) -> Result<ValidatedSessionSummaryBatch, AppError> {
         let tenant_external_id = self.tenant_external_id;
         if self.identities.is_empty() || self.identities.len() > MAX_SESSION_SUMMARY_IDENTITIES {
             return Err(AppError::BadRequest(format!(
@@ -169,7 +166,11 @@ impl SessionSummaryBatchRequest {
                 identities.push((identity.key_id, identity.session_id));
             }
         }
-        Ok((tenant_external_id, identities, filter))
+        Ok(ValidatedSessionSummaryBatch {
+            tenant_external_id,
+            identities,
+            filter,
+        })
     }
 }
 
@@ -224,12 +225,12 @@ pub(super) async fn internal_session_summaries(
     Json(request): Json<SessionSummaryBatchRequest>,
 ) -> Result<Json<LogicalSessionSummaryBatchResponse>, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let (tenant_external_id, identities, filter) = request.validated()?;
-    let tenant = management_tenant(&service, tenant_external_id)?
+    let request = request.validated()?;
+    let tenant = management_tenant(&service, request.tenant_external_id)?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
     let sessions = state
         .db
-        .operator_session_summaries(&tenant, &identities, filter)
+        .operator_session_summaries(&tenant, &request.identities, request.filter)
         .await?;
     Ok(Json(LogicalSessionSummaryBatchResponse {
         generated_at: crate::db::unix_millis(),
