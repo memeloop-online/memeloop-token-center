@@ -624,7 +624,13 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         .unwrap();
         assert_eq!(count, 0);
     }
-    assert_eq!(budget(db).await, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget(db).await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed admission must return its independently reserved capacity");
     sqlx::query("DROP TRIGGER reject_admission_chunk ON request_archive_spool_chunks")
         .execute(&db.pool)
         .await

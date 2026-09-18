@@ -105,13 +105,7 @@ impl Database {
         // Also recovers reservations during gateway-only rolling upgrades,
         // when the currently running worker predates this table.
         self.cleanup_expired_archive_budget_reservation().await?;
-        let reservation = ArchiveBudgetReservation {
-            db: self.clone(),
-            id: Uuid::now_v7(),
-            identity: archive.identity(),
-            purpose: archive.purpose(),
-            released: std::sync::atomic::AtomicBool::new(false),
-        };
+        let id = Uuid::now_v7();
         let started = Instant::now();
         let mut tx = self.begin_write_transaction().await?;
         let now = archive_clock(&mut tx, self.backend).await?;
@@ -125,9 +119,18 @@ impl Database {
             return Ok(None);
         }
         sqlx::query("INSERT INTO archive_budget_reservations (id, request_id, purpose, cipher_bytes, expires_at) VALUES ($1, $2, $3, $4, $5)")
-            .bind(reservation.id.to_string()).bind(archive.identity().request_id.to_string())
-            .bind(if archive.purpose() == BufferedArchivePurpose::Request { "request" } else { "response" })
+            .bind(id.to_string()).bind(archive.identity().request_id.to_string())
+            .bind(archive.purpose().as_str())
             .bind(amount).bind(now + RESERVATION_TTL).execute(&mut *tx).await?;
+        // Arm cancellation recovery only once a reservation can commit. A
+        // capacity rejection must not launch extra refund work into a busy pool.
+        let reservation = ArchiveBudgetReservation {
+            db: self.clone(),
+            id,
+            identity: archive.identity(),
+            purpose: archive.purpose(),
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
         tx.commit().await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms >= 250 {

@@ -981,7 +981,7 @@ impl Database {
                     BufferedArchivePurpose::Response
                 };
                 match db.cleanup_archive_spool_batch(first).await? {
-                    Some(result) => Ok(Some(result)),
+                    Some(result) => Ok::<_, AppError>(Some(result)),
                     None => Ok(db
                         .cleanup_archive_spool_batch(second)
                         .await?
