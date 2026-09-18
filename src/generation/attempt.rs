@@ -56,6 +56,7 @@ impl<'a> Attempt<'a> {
             self.terminal = MediaAttemptTerminal::Failed {
                 kind: UpstreamFailureKind::Connection,
                 reason: UpstreamHealthReason::Connection,
+                failure_stage: "connect",
             };
         }
     }
@@ -144,6 +145,7 @@ async fn classified_json(response: Response) -> (Result<Value, AppError>, MediaA
         let terminal = MediaAttemptTerminal::Failed {
             kind,
             reason: UpstreamHealthReason::RateLimited,
+            failure_stage: "upstream_response",
         };
         return (Ok(serde_json::json!({})), terminal);
     }
@@ -151,10 +153,12 @@ async fn classified_json(response: Response) -> (Result<Value, AppError>, MediaA
         401 | 403 => MediaAttemptTerminal::Failed {
             kind: UpstreamFailureKind::Authentication,
             reason: UpstreamHealthReason::Unavailable,
+            failure_stage: "upstream_response",
         },
         500..=599 => MediaAttemptTerminal::Failed {
             kind: UpstreamFailureKind::Unavailable,
             reason: UpstreamHealthReason::Unavailable,
+            failure_stage: "upstream_response",
         },
         _ => MediaAttemptTerminal::Inconclusive,
     };

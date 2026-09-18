@@ -414,6 +414,7 @@ pub(super) async fn execute_synchronous_image_request(
                 crate::api::MediaAttemptTerminal::Failed {
                     kind: crate::db::UpstreamFailureKind::Connection,
                     reason: crate::metrics::UpstreamHealthReason::Connection,
+                    failure_stage: "connect",
                 }
             } else {
                 crate::api::MediaAttemptTerminal::Inconclusive
@@ -438,6 +439,7 @@ pub(super) async fn execute_synchronous_image_request(
             .complete(crate::api::MediaAttemptTerminal::Failed {
                 kind,
                 reason: crate::metrics::UpstreamHealthReason::RateLimited,
+                failure_stage: "upstream_response",
             })
             .await;
         return fail_image_request(context, "upstream_http_429").await;
@@ -460,7 +462,11 @@ pub(super) async fn execute_synchronous_image_request(
     };
     if let Some((kind, reason)) = failure {
         attempt
-            .complete(crate::api::MediaAttemptTerminal::Failed { kind, reason })
+            .complete(crate::api::MediaAttemptTerminal::Failed {
+                kind,
+                reason,
+                failure_stage: "upstream_response",
+            })
             .await;
     }
     if !upstream_status.is_success() {

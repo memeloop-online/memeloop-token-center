@@ -180,12 +180,13 @@ pub(crate) async fn admit(
         UpstreamAttemptAdmission::Unavailable { .. } => {
             Err(AppError::Upstream("generation upstream is isolated".into()))
         }
-        admission => Ok(MediaAttemptGuard::new(
+        admission => Ok(MediaAttemptGuard::new_media(
             state,
             request_id,
             route.route_id,
             route.account_id,
             route.credential_generation,
+            route.transport_revision,
             admission,
             None,
         )),
