@@ -181,7 +181,7 @@ table.request-table .request-model-cell code {
 
 @media (min-width: 1100px) {
   .metrics.request-traffic-metrics {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .request-table .request-time-cell {

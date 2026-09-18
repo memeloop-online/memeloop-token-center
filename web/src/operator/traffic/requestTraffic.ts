@@ -1,6 +1,6 @@
 import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
 import { requestOutcome } from '../../requestStatusPresentation.js';
-import { requestDisplayedCost, requestUsageIsActual } from '../../requestTablePresentation.js';
+import { nonCachedRequestInput, requestDisplayedCost, requestUsageIsActual } from '../../requestTablePresentation.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 
@@ -38,6 +38,7 @@ export interface VisibleRequestTrafficSummary {
   running: number;
   unknown: number;
   successRate: number | null;
+  cacheRate: number | null;
   averageDurationMs: number | null;
   totalTokens: number;
   /** Local settlement totals grouped by recorded currency; requests without a recorded currency never contribute and currencies are never combined. */
@@ -52,6 +53,8 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
   let durationTotal = 0;
   let durationCount = 0;
   let totalTokens = 0;
+  let cacheableTokens = 0;
+  let cachedTokens = 0;
   const localCosts = new Map<string, number>();
 
   for (const request of requests) {
@@ -63,6 +66,13 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
     if (requestUsageIsActual(request)) {
       if (Number.isFinite(request.input_tokens)) totalTokens += request.input_tokens;
       if (Number.isFinite(request.output_tokens)) totalTokens += request.output_tokens;
+      const uncachedInput = nonCachedRequestInput(request);
+      if (uncachedInput !== null) {
+        const cachedInput = request.cached_input_tokens ?? 0;
+        const cacheWrite = request.cache_write_tokens ?? 0;
+        cacheableTokens += uncachedInput + cachedInput + cacheWrite;
+        cachedTokens += cachedInput;
+      }
     }
     // Local settlement amounts follow the shared displayed-cost policy: failed
     // requests retain cost only when usage is provider-reported. The policy
@@ -98,6 +108,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
     running,
     unknown,
     successRate: terminal > 0 ? successful / terminal : null,
+    cacheRate: cacheableTokens > 0 ? cachedTokens / cacheableTokens : null,
     averageDurationMs: durationCount > 0 ? durationTotal / durationCount : null,
     totalTokens,
     localCosts: [...localCosts.entries()].map(([currency, cost]) => ({ currency, cost }))
