@@ -77,7 +77,11 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await openAppRoute(page, 'operator', 'requests');
   await assertVisible(page.getByRole('heading', { name: '实时请求', exact: true }));
   const requestPanel = operatorTrafficPanel(page);
-  await assertCount(requestPanel.locator('.request-traffic-metrics .metric'), 6);
+  const requestMetrics = requestPanel.locator('.request-traffic-metrics .metric');
+  await assertCount(requestMetrics, 4);
+  const requestMetricLabels = await requestMetrics.locator('.metric-label').allTextContents();
+  assert.deepEqual(requestMetricLabels, ['总词元', '本地结算 ⓘ', '缓存率', '平均延迟']);
+  assert.ok(!requestMetricLabels.includes('失败') && !requestMetricLabels.includes('请求数'), 'request metrics must not retain obsolete failure or request-count cards');
   const builder = requestPanel.locator('.typed-filter-builder');
   const dialog = await openTypedFilterDialog(builder);
 

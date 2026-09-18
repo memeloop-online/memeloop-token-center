@@ -32,7 +32,9 @@ test('live metrics retain only actionable aggregate cards across themes and widt
     assert.equal(await settlement.locator('.analytics-metric-trend, .analytics-metric-ratio').count(), 0, 'mixed currencies must not fabricate a settlement trend or ratio');
     const cacheRate = cards.filter({ hasText: 'Cache rate' });
     assert.equal(await cacheRate.locator('.analytics-metric-ratio').getAttribute('data-ratio'), '0.4');
-    assert.equal(await cards.locator('.analytics-metric-trend').count(), 2, 'only total tokens and average latency have enough adjacent loaded values for a real trend');
+    assert.equal(await cacheRate.locator('.analytics-metric-trend').count(), 0, 'cache rate must not fabricate a trend from incomplete cache telemetry');
+    const totalTokens = cards.filter({ hasText: 'Total tokens' });
+    assert.equal(await totalTokens.locator('.analytics-metric-trend').count(), 1, 'total tokens keeps its adjacent loaded-value trend');
     await cards.first().focus();
     await page.keyboard.press('End');
     assert.match(await cards.first().getAttribute('aria-valuetext') ?? '', /Total tokens: 0$/, 'the last bucket holds only the not-observed failure, which contributes no actual tokens');
@@ -40,6 +42,7 @@ test('live metrics retain only actionable aggregate cards across themes and widt
     assert.ok(descriptions.includes('300'), 'interactive bucket inspection must retain the aggregate in its accessible description');
     const average = cards.filter({ hasText: 'Average latency' });
     assert.equal(await average.count(), 1);
+    assert.equal(await average.locator('.analytics-metric-trend').count(), 0, 'non-contiguous latency samples must not fabricate a trend');
     const averageDescription = await average.evaluate(node => (node.getAttribute('aria-describedby') ?? '').split(/\s+/).map(id => document.getElementById(id)?.textContent ?? '').join(' '));
     assert.match(averageDescription, /25 s/);
     await page.keyboard.press('Escape');
