@@ -215,7 +215,12 @@ impl Database {
         if models.len() > 10_000
             || !matches!(
                 source_kind,
-                "openai_v1" | "component" | "codex_models" | "kimi_builtin" | "cursor_native"
+                "openai_v1"
+                    | "component"
+                    | "codex_models"
+                    | "kimi_builtin"
+                    | "cursor_native"
+                    | "antigravity_native"
             )
         {
             return Err(AppError::BadRequest(
@@ -319,6 +324,29 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
         }
+
+        // Once discovery has confirmed a custom association, its availability
+        // belongs to the catalog. Include the previous snapshot so the first
+        // sync after this change also reconciles models removed upstream.
+        // Genuinely custom models that were never advertised remain explicit.
+        // Never change the operator's enabled flag: a model returning in a
+        // later snapshot becomes eligible again without undoing manual choices.
+        sqlx::query(
+            "UPDATE model_route_upstream_accounts SET catalog_policy = 'required' \
+             WHERE tenant_id = $1 AND upstream_account_id = $2 \
+               AND catalog_policy = 'explicit_custom' AND EXISTS (\
+                 SELECT 1 FROM upstream_models model \
+                 JOIN model_routes route ON route.tenant_id = model_route_upstream_accounts.tenant_id \
+                   AND route.id = model_route_upstream_accounts.model_route_id \
+                 WHERE model.tenant_id = $1 AND model.upstream_account_id = $2 \
+                   AND model.model_id = model_route_upstream_accounts.upstream_model \
+                   AND (model.protocol = 'any' OR model.protocol = route.protocol)\
+               )",
+        )
+        .bind(&tenant_id)
+        .bind(account_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
 
         if driver == "openai-codex" {
             let mut config: Value =
@@ -498,7 +526,7 @@ impl Database {
             )
             .bind(snapshot_id)
             .bind(pattern)
-            .bind(limit.clamp(1, 200))
+            .bind(limit.clamp(1, 10_000))
             .fetch_all(&self.pool)
             .await?
         } else {

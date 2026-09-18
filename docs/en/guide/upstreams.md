@@ -11,6 +11,14 @@ An upstream account is the connection unit between MTC and an AI provider. It ha
 - Each account maintains a model catalog synchronized by credential generation (`POST /internal/v1/upstreams/{account_id}/models/sync`). Route creation uses the catalog to validate public/upstream model compatibility.
 - Common management interfaces: `GET/POST /internal/v1/upstreams`, `GET/PUT /internal/v1/upstreams/{account_id}`, `GET /internal/v1/upstreams/{account_id}/health`, and `GET /internal/v1/upstream-availability`.
 
+## Synchronizing models and prices
+
+Choose **Sync models and prices** in an upstream account's details or editor. MTC reads the directory using the account's connection settings, then matches models against configured price sources. Each step displays its own result. Models awaiting pricing can be completed in model pricing.
+
+Newly discovered models appear in the route model picker. When a previously discovered model disappears, its account stops participating in routes for that model; participation resumes when the model returns. Manual route enable/disable settings are preserved. Private models that have only been configured manually retain their custom selection.
+
+Public model names, account selections, and client access remain managed through routing configuration.
+
 ## OAuth login
 
 OAuth accounts are created through management-side login flows, with tokens stored encrypted:
