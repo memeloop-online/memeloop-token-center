@@ -39,7 +39,7 @@ fn validate_projection(
         .operator_ui
         .iter()
         .filter(|slot| {
-            slot.data_endpoint == endpoint_id
+            slot.data_endpoint.as_deref() == Some(endpoint_id)
                 && slot.presentation == Some(PluginOperatorUiPresentation::ProjectionV1)
         })
         .collect();

@@ -744,23 +744,37 @@ export interface PluginManifest {
   };
 }
 
-export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
+export type PluginOperatorUiSlot =
+  | 'operator.sidebar.tab'
+  | 'operator.overview.card'
+  | 'operator.page.before'
+  | 'operator.page.after';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
-/** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
 export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
+export type PluginOperatorUiRenderer = 'typed_data_v1' | 'component_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;
   slot: PluginOperatorUiSlot;
   category?: { id: string; label?: string | null } | null;
   route?: string | null;
+  target_route?: string | null;
   label: string;
   icon: PluginOperatorUiIcon;
-  /** Always selects a core-owned renderer; this is never executable plugin code. */
-  renderer: 'typed_data_v1';
-  /** Optional closed core presentation for a matching validated data shape. */
+  /** Select a core projection or a component from a signed runtime module. */
+  renderer: PluginOperatorUiRenderer;
+  /** Signed package-relative ESM entry for component_v1. */
+  module_entry?: string | null;
+  /** Digest of the exact module bytes in the active runtime snapshot. */
+  module_sha256?: string | null;
+  /** Component export key when renderer is component_v1. */
+  component_id?: string | null;
+  /** Plugin-defined JSON passed through as part of the contribution contract. */
+  component_props?: Record<string, unknown> | null;
+  /** Optional core presentation used by typed_data_v1. */
   presentation?: PluginOperatorUiPresentation | null;
-  data_endpoint: string;
+  /** Optional primary service-data endpoint. Components may load any endpoint declared by their manifest. */
+  data_endpoint?: string;
 }
 
 export interface PluginServiceDataEndpoint {

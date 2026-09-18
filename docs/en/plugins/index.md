@@ -65,4 +65,4 @@ curl "https://mtc.example.com/internal/v1/plugins/example-policy/configuration" 
 | Traffic policy / request rewrite (`traffic-policy.post-auth`) | [Plugin development](development.md) |
 | Upstream Provider and OAuth (`upstream-provider`) | [Plugin development](development.md) |
 | Group-routing plan/observe (`group-routing-v1`) | [Group routing](routing.md) |
-| Operator sidebar tab / overview card (`typed_data_v1`) | [Operator UI](operator-ui.md) |
+| Operator tabs, existing-page slots, and overview cards (`typed_data_v1` / `component_v1`) | [Operator UI](operator-ui.md) |

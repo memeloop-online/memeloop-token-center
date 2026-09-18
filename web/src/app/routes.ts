@@ -20,7 +20,7 @@ export const operatorRouteKeys = [
   'credentials',
   'service-credentials',
   'plugins',
-  'settings',
+  'system-settings',
 ] as const;
 
 export type PortalRouteKey = (typeof portalRouteKeys)[number];

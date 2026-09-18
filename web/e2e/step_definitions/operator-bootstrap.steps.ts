@@ -102,7 +102,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     await route.fulfill({ status: 200, contentType: 'application/json', body });
   });
 
-  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
+  await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
   const credentialInput = page.locator('.operator-credential input[type="password"]');
   // Connecting the first credential changes the localized submit label to
   // "replace credential". The form submit control is the stable user action
@@ -185,7 +185,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   await page.evaluate(() => localStorage.setItem('mtc.operator.service-credential.v1', 'multi-credential'));
   const restoring = page.waitForRequest(request => new URL(request.url()).pathname === '/internal/v1/tenants'
     && request.headers().authorization === 'Bearer multi-credential');
-  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
+  await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
   await restoring;
   await page.locator('form.operator-credential[aria-busy="true"] input[type="password"]').waitFor();
   const entryForm = operatorCredentialEntryForm(page);

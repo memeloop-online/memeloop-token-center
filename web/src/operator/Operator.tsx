@@ -15,9 +15,11 @@ import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
 import { useRequestRefreshPreference } from './hooks/useRequestRefreshPreference';
 import { OperatorAccessSettings } from './OperatorAccessSettings';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
+import { isPluginRouteKey } from '../app/routes';
 import {
   PluginContributionPage,
   PluginOverviewCards,
+  PluginPageExtensions,
   registerOperatorPluginContributions,
   type PluginNavigationSection,
 } from './pluginContributions';
@@ -60,7 +62,7 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'credentials', label: 'nav.credentials', domId: 'credentials' },
   { route: 'service-credentials', label: 'nav.services', domId: 'services' },
   { route: 'plugins', label: 'nav.plugins', domId: 'plugins' },
-  { route: 'settings', label: 'nav.settings', domId: 'settings' },
+  { route: 'system-settings', label: 'nav.settings', domId: 'system-settings' },
 ];
 
 function pageId(route: OperatorApplicationRoute) {
@@ -70,7 +72,7 @@ function pageId(route: OperatorApplicationRoute) {
 export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true }: OperatorProps = {}) {
   const { t, locale } = useI18n();
   const scope = useOperatorScope();
-  const [internalRoute, setInternalRoute] = useState<OperatorRouteKey>('requests');
+  const [internalRoute, setInternalRoute] = useState<OperatorApplicationRoute>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
   const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
   const [requestDrilldown, setRequestDrilldown] = useState<(RequestDrilldown & { token: string; tenant: string })>();
@@ -109,9 +111,13 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     onPluginNavigation?.(pluginRegistry.navigation);
   }, [onPluginNavigation, pluginRegistry]);
 
-  function navigate(next: OperatorRouteKey) {
+  function navigate(next: OperatorApplicationRoute) {
     if (route === undefined) setInternalRoute(next);
     onRouteChange?.(next);
+  }
+
+  function navigateFromPlugin(next: string) {
+    if (isOperatorRouteKey(next) || (isPluginRouteKey(next) && pluginRegistry.pages.has(next))) navigate(next);
   }
 
   function changeRouteByKeyboard(event: KeyboardEvent<HTMLButtonElement>, current: OperatorRouteKey) {
@@ -173,7 +179,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
-        case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
+        case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
         case 'requests': page = <RequestsPage {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
@@ -185,18 +191,26 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
         case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} reloadCatalog={pluginCatalog.reload} />; break;
-        case 'settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
+        case 'system-settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
+      }
+      const extensions = pluginRegistry.pageExtensions.get(activeRoute);
+      if (page && extensions) {
+        page = <>
+          <PluginPageExtensions extensions={extensions.before} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
+          {page}
+          <PluginPageExtensions extensions={extensions.after} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
+        </>;
       }
     } else {
       const registered = pluginRegistry.pages.get(activeRoute);
       page = registered
-        ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} />
+        ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
         : <div className="notice error" role="alert">This plugin page is no longer installed or available.</div>;
     }
   // A settings user may explicitly replace a credential while tenant
   // discovery is still in flight. Keep only that access form mounted; all
   // tenant-scoped pages remain withheld until discovery resolves.
-  } else if (!scope.authenticating || activeRoute === 'settings') page = accessSettings;
+  } else if (!scope.authenticating || activeRoute === 'system-settings') page = accessSettings;
 
   const content = <>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
@@ -205,7 +219,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating && activeRoute !== 'settings'
+      {scope.authenticating && activeRoute !== 'system-settings'
         ? <div className="empty">{t('common.loading')}</div>
         : <Fragment key={pageScopeKey}><Suspense fallback={<div className="empty">{t('common.loading')}</div>}>{page}</Suspense></Fragment>}
     </section>

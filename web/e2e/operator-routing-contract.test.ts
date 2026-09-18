@@ -25,7 +25,7 @@ test('operator exposes controlled built-in and plugin routing without coupling c
 test('sessions are a first-class operator route and all page keys are explicit', () => {
   assert.deepEqual(operatorRouteKeys, [
     'overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes',
-    'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'settings',
+    'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'system-settings',
   ]);
   assert.match(operator, /case 'sessions': page = <SessionsPage/);
   assert.match(operator, /case 'tenants': page = <TenantManager/);

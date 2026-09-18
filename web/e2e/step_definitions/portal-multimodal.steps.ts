@@ -765,7 +765,7 @@ Then('普通凭据在英文暗色主题下仍无法访问管理端', async funct
   const operatorPage = await this.context.newPage();
   operatorPage.on('console', (message) => { if (message.type() === 'error') this.consoleErrors.push(message.text()); });
   operatorPage.on('pageerror', (reason) => this.consoleErrors.push(reason.message));
-  await operatorPage.goto('/operator?view=settings');
+  await operatorPage.goto('/operator?view=system-settings');
   await page.close();
   this.page = operatorPage;
   await assertAttribute(operatorPage.locator('html'), 'lang', 'en');

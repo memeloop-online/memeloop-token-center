@@ -83,7 +83,7 @@ export async function connectOperator(
   const page = world.requirePage();
   const seed = runtime.requireSeed();
   const expectedCredential = credential ?? seed.serviceCredential;
-  await world.open('/operator?view=settings', { theme, locale: 'zh-CN' });
+  await world.open('/operator?view=system-settings', { theme, locale: 'zh-CN' });
   // A page reload can restore a remembered credential, so the shell first
   // performs tenant discovery and only then remounts this form as a
   // replacement-credential form. Target the form instead of its translated

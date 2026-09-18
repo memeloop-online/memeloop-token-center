@@ -13,7 +13,7 @@ test('management surfaces stay flat across themes without removing controls, foc
   try {
     const page = await browser.newPage();
     const artifacts = `${root}/e2e-artifacts/management-surfaces`; await mkdir(artifacts, { recursive: true });
-    for (const view of ['providers', 'routes', 'pricing', 'credentials', 'plugins', 'settings']) {
+    for (const view of ['providers', 'routes', 'pricing', 'credentials', 'plugins', 'system-settings']) {
       await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/management-surfaces.html?view=${view}`);
       for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 1000 });

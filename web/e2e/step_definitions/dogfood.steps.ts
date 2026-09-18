@@ -43,7 +43,7 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
   await assertNoCount(page.locator('.console-context'));
 
-  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
+  await this.open('/operator?view=system-settings', { theme: 'dark', locale: 'zh-CN' });
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
   await assertOperatorTenantScope(page, tenant, 'hidden');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();

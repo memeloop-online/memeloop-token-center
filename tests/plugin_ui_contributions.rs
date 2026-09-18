@@ -1,7 +1,7 @@
 use std::fs;
 
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
 use memeloop_token_center::{
@@ -28,6 +28,17 @@ fn write_package(root: &std::path::Path, name: &str, manifest: &Value) {
         serde_json::to_vec(manifest).expect("encode fixture plugin manifest"),
     )
     .expect("write fixture plugin manifest");
+    for entry in manifest["contributions"]["operator_ui"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|contribution| contribution["module_entry"].as_str())
+    {
+        let path = package.join(entry);
+        fs::create_dir_all(path.parent().unwrap()).expect("create fixture UI module directory");
+        fs::write(path, b"export function activateOperatorUi() {}\n")
+            .expect("write fixture UI module");
+    }
 }
 
 #[tokio::test]
@@ -122,5 +133,107 @@ async fn arbitrary_operator_presentation_is_rejected_before_plugin_load() {
     assert!(
         AppState::initialize(config).await.is_err(),
         "operator presentations must remain a closed core-owned enum"
+    );
+}
+
+#[tokio::test]
+async fn normalized_operator_module_paths_are_rejected_by_the_public_manifest_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let values = fixture();
+    let mut manifest = values["installed"][0].clone();
+    manifest["contributions"]["operator_ui"][0]["renderer"] = Value::String("component_v1".into());
+    manifest["contributions"]["operator_ui"][0]["module_entry"] =
+        Value::String("assets//operator-ui.mjs".into());
+    manifest["contributions"]["operator_ui"][0]["component_id"] = Value::String("workspace".into());
+    manifest["contributions"]["operator_ui"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    write_package(&plugins, "normalized-module-path", &manifest);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("normalized-module-path.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.plugin_dir = Some(plugins.display().to_string());
+    assert!(
+        AppState::initialize(config).await.is_err(),
+        "manifest validation must reject module paths that require normalization"
+    );
+}
+
+#[tokio::test]
+async fn component_operator_contributions_support_tabs_and_existing_page_slots() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let values = fixture();
+    let mut manifest = values["installed"][0].clone();
+    manifest["contributions"]["operator_ui"] = serde_json::json!([
+        {
+            "id": "interactive-tab",
+            "slot": "operator.sidebar.tab",
+            "category": { "id": "monitoring" },
+            "route": "interactive-health",
+            "label": "Interactive health",
+            "icon": "heart",
+            "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs",
+            "component_id": "health-workspace",
+            "component_props": { "defaultRange": "24h" }
+        },
+        {
+            "id": "provider-footer",
+            "slot": "operator.page.after",
+            "target_route": "providers",
+            "label": "Provider intelligence",
+            "icon": "chart",
+            "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs",
+            "component_id": "provider-intelligence",
+            "data_endpoint": "health"
+        }
+    ]);
+    write_package(&plugins, "component-ui", &manifest);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("component-ui.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.plugin_dir = Some(plugins.display().to_string());
+    let state = AppState::initialize(config)
+        .await
+        .expect("load component UI plugin fixture");
+    let manifest = state.plugins.manifests().pop().expect("component manifest");
+    assert_eq!(
+        manifest.contributions.operator_ui[0].renderer,
+        "component_v1"
+    );
+    let digest = manifest.contributions.operator_ui[0]
+        .module_sha256
+        .as_deref()
+        .expect("runtime module digest");
+    assert!(digest.starts_with("sha256:"));
+    assert_eq!(
+        manifest.contributions.operator_ui[1]
+            .target_route
+            .as_deref(),
+        Some("providers")
+    );
+    let response = api::router_for_role(state, RuntimeRole::Control)
+        .oneshot(
+            Request::get(format!(
+                "/ui-assets/plugins/{}/1.0.0/{digest}/assets/operator-ui.mjs",
+                manifest.id
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("serve runtime UI module");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+        b"export function activateOperatorUi() {}\n"
     );
 }

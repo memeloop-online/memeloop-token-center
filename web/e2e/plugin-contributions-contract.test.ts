@@ -50,13 +50,66 @@ test('projection presentation uses existing page/card registry with manifest rev
   assert.deepEqual(registered.allowedLinkOrigins, installed[0].capabilities.flatMap((capability) => capability.kind === 'http' ? capability.allowed_origins : []));
 });
 
-test('render boundary remains core-owned typed JSON with no remote executable surface', async () => {
+test('component contributions register from immutable runtime module identities', () => {
+  const installed = structuredClone(fixture.installed);
+  installed[0].contributions.operator_ui!.push(
+    {
+      id: 'component-tab', slot: 'operator.sidebar.tab', category: { id: 'monitoring' }, route: 'component-tab',
+      label: 'Component tab', icon: 'plug', renderer: 'component_v1', module_entry: 'assets/operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace', component_props: { density: 'compact' },
+    },
+    {
+      id: 'provider-extension', slot: 'operator.page.after', target_route: 'providers',
+      label: 'Provider extension', icon: 'plug', renderer: 'component_v1', module_entry: 'assets/operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace',
+    },
+  );
+  const registry = registerOperatorPluginContributions(installed);
+  assert.equal(registry.pages.get(pluginRouteKey('observability-suite', 'component-tab'))?.contribution.module_entry, 'assets/operator-ui.mjs');
+  assert.deepEqual(registry.pageExtensions.get('providers')?.after.map((value) => value.contribution.id), ['provider-extension']);
+});
+
+test('browser registry rejects malformed renderer contracts and module paths', () => {
+  const installed = structuredClone(fixture.installed);
+  installed[0].contributions.operator_ui = [
+    {
+      id: 'typed-with-component-state', slot: 'operator.overview.card', label: 'Invalid typed data', icon: 'plug',
+      renderer: 'typed_data_v1', data_endpoint: 'health', component_props: { unexpected: true },
+    },
+    {
+      id: 'component-with-empty-endpoint', slot: 'operator.overview.card', label: 'Invalid endpoint', icon: 'plug',
+      renderer: 'component_v1', module_entry: 'assets/operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace', data_endpoint: '',
+    },
+    {
+      id: 'component-with-normalized-path', slot: 'operator.overview.card', label: 'Invalid path', icon: 'plug',
+      renderer: 'component_v1', module_entry: 'assets//operator-ui.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'workspace',
+    },
+  ];
+  const registry = registerOperatorPluginContributions(installed);
+  assert.deepEqual(registry.overviewCards, []);
+});
+
+test('render boundary loads only digest-addressed same-origin modules and exposes no generic request API', async () => {
   const source = await readFile(new URL('../src/operator/pluginContributions.tsx', import.meta.url), 'utf8');
+  const host = await readFile(new URL('../src/plugins/OperatorPluginComponentHost.tsx', import.meta.url), 'utf8');
   assert.match(source, /renderer === 'typed_data_v1'/);
+  assert.match(source, /renderer === 'component_v1'/);
   assert.match(source, /health_intelligence_v1/);
   assert.match(source, /\/internal\/v1\/plugins\//);
-  assert.doesNotMatch(source, /dangerouslySetInnerHTML|<iframe|import\s*\(/u);
+  assert.doesNotMatch(source, /dangerouslySetInnerHTML|<iframe/u);
   assert.doesNotMatch(source, /contribution\.url|endpoint\.url/u);
+  assert.match(host, /new URL\(expectedPath, window\.location\.origin\)/);
+  assert.match(host, /import\(\/\* @vite-ignore \*\/ url\)/);
+  assert.match(host, /PluginContributionBoundary/);
+  assert.doesNotMatch(host, /async request|OperatorUiRequestOptions/u);
+});
+
+test('equal raw routes remain independent across plugin namespaces', () => {
+  const installed = structuredClone(fixture.installed);
+  const second = structuredClone(installed[0]);
+  second.id = 'another-observability-suite';
+  second.contributions.operator_ui = second.contributions.operator_ui?.filter((value) => value.slot === 'operator.sidebar.tab').map((value) => ({ ...value, route: 'health-intelligence' }));
+  const registry = registerOperatorPluginContributions([...installed, second]);
+  assert.ok(registry.pages.has(pluginRouteKey('observability-suite', 'health-intelligence')));
+  assert.ok(registry.pages.has(pluginRouteKey('another-observability-suite', 'health-intelligence')));
 });
 
 test('the closed health-intelligence presentation only accepts its bounded three-source snapshot', () => {

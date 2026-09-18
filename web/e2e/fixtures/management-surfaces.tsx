@@ -11,11 +11,11 @@ import '../../src/operator/managementSurfaces.css';
 import '../../src/theme.css';
 
 const route = new URLSearchParams(location.search).get('view') ?? 'routes';
-const wrapper = route === 'providers' ? 'provider-layout' : route === 'pricing' ? 'pricing-page' : route === 'settings' ? 'system-settings' : route === 'plugins' ? '' : 'management-layout';
+const wrapper = route === 'providers' ? 'provider-layout' : route === 'pricing' ? 'pricing-page' : route === 'system-settings' ? 'system-settings' : route === 'plugins' ? '' : 'management-layout';
 createRoot(document.getElementById('root')!).render(<MtcFluentProvider>
   <main className="app-main-content" data-surface="operator" data-route={route} style={{ padding: 20 }}>
     <div className={wrapper}>
-      <article className={`panel ${route === 'settings' ? 'settings-card settings-access-card' : ''}`} data-testid="outer-surface">
+      <article className={`panel ${route === 'system-settings' ? 'settings-card settings-access-card' : ''}`} data-testid="outer-surface">
         <h2>连接与管理</h2>
         <div className="managed-resource"><b>测试账号</b><p>状态与配置信息</p>
           <details className="inline-editor form-panel" open><summary>配置</summary><label>连接名称<Input value="测试连接" readOnly /></label><Button appearance="primary">保存配置</Button></details>

@@ -7618,7 +7618,7 @@ components:
               items: { $ref: '#/components/schemas/ProviderType' }
             operator_ui:
               type: array
-              description: Data-only contributions rendered by core-owned local components. Remote scripts, HTML, stylesheets, and iframes are unsupported.
+              description: Operator tabs and cards rendered by a core projection or a signed module from the active installed plugin snapshot.
               items: { $ref: '#/components/schemas/PluginOperatorUiContribution' }
             service_data:
               type: array
@@ -7627,10 +7627,10 @@ components:
     PluginOperatorUiContribution:
       type: object
       additionalProperties: false
-      required: [id, slot, label, icon, renderer, data_endpoint]
+      required: [id, slot, label, icon, renderer]
       properties:
         id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
-        slot: { type: string, enum: [operator.sidebar.tab, operator.overview.card] }
+        slot: { type: string, enum: [operator.sidebar.tab, operator.overview.card, operator.page.before, operator.page.after] }
         category:
           type: [object, 'null']
           additionalProperties: false
@@ -7639,12 +7639,34 @@ components:
             id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
             label: { type: [string, 'null'], minLength: 1, maxLength: 120 }
         route: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        target_route:
+          type: [string, 'null']
+          enum: [overview, requests, sessions, usage, generations, providers, routes, pricing, tenants, credentials, service-credentials, plugins, system-settings, null]
         label: { type: string, minLength: 1, maxLength: 120 }
         icon: { type: string, enum: [activity, chart, database, heart, plug, shield] }
         renderer:
           type: string
-          const: typed_data_v1
-          description: Selects a core-owned local React renderer; it is not a URL or executable asset.
+          enum: [typed_data_v1, component_v1]
+          description: Selects a core projection or a component from a signed runtime module.
+        module_entry:
+          type: [string, 'null']
+          minLength: 4
+          maxLength: 240
+          pattern: '^[A-Za-z0-9._/-]+\.m?js$'
+          allOf:
+            - not: { type: string, pattern: '(^/|//)' }
+            - not: { type: string, pattern: '(^|/)\.{1,2}(/|$)' }
+          description: Package-relative signed JavaScript module used by component_v1.
+        module_sha256:
+          type: [string, 'null']
+          readOnly: true
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Digest of the exact module bytes captured by the active plugin runtime.
+        component_id: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        component_props: { type: [object, 'null'], additionalProperties: true }
+        presentation:
+          type: [string, 'null']
+          enum: [health_intelligence_v1, projection_v1, null]
         data_endpoint: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
     PluginServiceDataEndpoint:
       type: object

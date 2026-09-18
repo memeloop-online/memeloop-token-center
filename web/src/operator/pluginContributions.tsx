@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
 import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
-import { pluginRouteKey, type PluginRouteKey } from '../app/routes.js';
+import { operatorRouteKeys, pluginRouteKey, type OperatorRouteKey, type PluginRouteKey } from '../app/routes.js';
+import { OperatorPluginComponentHost } from '../plugins/OperatorPluginComponentHost.js';
 import type {
   PluginManifest,
   PluginOperatorUiContribution,
@@ -11,15 +12,16 @@ import type {
 /**
  * Browser-side policy boundary for operator plugins.
  *
- * The registry accepts only server-validated manifest data and maps it onto a
- * small set of local typed-data components. It intentionally has no dynamic
- * import, URL renderer, iframe, HTML parser, or script/style injection API.
+ * The registry accepts server-validated manifest data. component_v1 entries
+ * point to digest-addressed modules from the active installed plugin snapshot.
  */
 export interface RegisteredPluginContribution {
   pluginId: string;
+  pluginVersion: string;
   manifestRevision?: string;
   allowedLinkOrigins?: readonly string[];
   contribution: PluginOperatorUiContribution;
+  serviceEndpointIds: readonly string[];
   route: PluginRouteKey | null;
 }
 
@@ -39,6 +41,7 @@ export interface OperatorPluginRegistry {
   navigation: PluginNavigationSection[];
   pages: Map<PluginRouteKey, RegisteredPluginContribution>;
   overviewCards: RegisteredPluginContribution[];
+  pageExtensions: Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>;
 }
 
 const token = /^[a-z0-9-]{1,64}$/;
@@ -52,11 +55,31 @@ function safeLabel(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 120 && !/[\u0000-\u001f\u007f<>]/u.test(value);
 }
 
+function safeModuleEntry(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 4 || value.length > 240 || !/\.m?js$/u.test(value)) return false;
+  return value.split('/').every((segment) => segment.length > 0
+    && segment !== '.'
+    && segment !== '..'
+    && /^[A-Za-z0-9._-]+$/u.test(segment));
+}
+
 function validContribution(value: PluginOperatorUiContribution): boolean {
+  const rendererContract = value.renderer === 'typed_data_v1'
+    ? token.test(value.data_endpoint ?? '')
+      && value.component_id == null
+      && value.component_props == null
+      && value.module_entry == null
+      && value.module_sha256 == null
+    : value.renderer === 'component_v1'
+      && token.test(value.component_id ?? '')
+      && safeModuleEntry(value.module_entry)
+      && /^sha256:[0-9a-f]{64}$/u.test(value.module_sha256 ?? '')
+      && value.presentation == null
+      && (value.component_props == null || (typeof value.component_props === 'object' && !Array.isArray(value.component_props)))
+      && (value.data_endpoint == null || token.test(value.data_endpoint));
   return token.test(value.id)
     && safeLabel(value.label)
-    && token.test(value.data_endpoint)
-    && value.renderer === 'typed_data_v1'
+    && rendererContract
     && supportedIcons.has(value.icon)
     && (value.presentation == null || supportedPresentations.has(value.presentation));
 }
@@ -65,39 +88,54 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
   const navigation = new Map<string, PluginNavigationSection>();
   const pages = new Map<PluginRouteKey, RegisteredPluginContribution>();
   const overviewCards: RegisteredPluginContribution[] = [];
+  const pageExtensions = new Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>();
   const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
     if (!token.test(manifest.id)) continue;
     const projectionPolicy = {
+      pluginVersion: manifest.version,
       manifestRevision: JSON.stringify(manifest),
       allowedLinkOrigins: (manifest.capabilities ?? []).flatMap((capability) => capability.kind === 'http' ? capability.allowed_origins : []),
     };
     const endpoints = new Set((manifest.contributions.service_data ?? []).map((endpoint) => endpoint.id).filter((id) => token.test(id)));
     for (const contribution of manifest.contributions.operator_ui ?? []) {
-      if (!validContribution(contribution) || !endpoints.has(contribution.data_endpoint)) continue;
+      if (!validContribution(contribution)) continue;
+      if (contribution.data_endpoint && !endpoints.has(contribution.data_endpoint)) continue;
+      const registration = {
+        pluginId: manifest.id,
+        ...projectionPolicy,
+        contribution,
+        serviceEndpointIds: [...endpoints],
+      };
       if (contribution.slot === 'operator.overview.card') {
-        if (contribution.route || contribution.category) continue;
-        overviewCards.push({ pluginId: manifest.id, ...projectionPolicy, contribution, route: null });
+        if (contribution.route || contribution.category || contribution.target_route) continue;
+        overviewCards.push({ ...registration, route: null });
+        continue;
+      }
+      if (contribution.slot === 'operator.page.before' || contribution.slot === 'operator.page.after') {
+        if (contribution.route || contribution.category || !operatorRouteKeys.includes(contribution.target_route as OperatorRouteKey)) continue;
+        const target = contribution.target_route as OperatorRouteKey;
+        const extensions = pageExtensions.get(target) ?? { before: [], after: [] };
+        extensions[contribution.slot === 'operator.page.before' ? 'before' : 'after'].push({ ...registration, route: null });
+        pageExtensions.set(target, extensions);
         continue;
       }
       if (contribution.slot !== 'operator.sidebar.tab' || !token.test(contribution.route ?? '')) continue;
+      if (contribution.target_route) continue;
       const category = contribution.category;
       if (!category || !token.test(category.id)) continue;
       if (!coreCategories.has(category.id) && !safeLabel(category.label)) continue;
       const route = pluginRouteKey(manifest.id, contribution.route!);
-      sidebar.push({ pluginId: manifest.id, ...projectionPolicy, contribution, route, category });
+      sidebar.push({ ...registration, route, category });
     }
   }
 
   // Keep the first validated category declaration as the owner of its label.
   // A later conflicting declaration is rejected on its own; it must not erase
   // the already-valid navigation section or replace its label.
-  const routeCounts = new Map<string, number>();
   const categoryLabels = new Map<string, string>();
   const conflictingCategoryRoutes = new Set<PluginRouteKey>();
   for (const registered of sidebar) {
-    const rawRoute = registered.contribution.route!;
-    routeCounts.set(rawRoute, (routeCounts.get(rawRoute) ?? 0) + 1);
     if (coreCategories.has(registered.category.id)) continue;
     const label = registered.category.label!;
     const existing = categoryLabels.get(registered.category.id);
@@ -105,7 +143,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
     else categoryLabels.set(registered.category.id, label);
   }
   for (const registered of sidebar) {
-    if (routeCounts.get(registered.contribution.route!) !== 1 || conflictingCategoryRoutes.has(registered.route) || pages.has(registered.route)) continue;
+    if (conflictingCategoryRoutes.has(registered.route) || pages.has(registered.route)) continue;
     pages.set(registered.route, registered);
     const existing = navigation.get(registered.category.id);
     if (existing) {
@@ -118,7 +156,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
       });
     }
   }
-  return { navigation: [...navigation.values()], pages, overviewCards };
+  return { navigation: [...navigation.values()], pages, overviewCards, pageExtensions };
 }
 
 function serviceDataPath(pluginId: string, endpointId: string, tenant: string) {
@@ -250,18 +288,46 @@ function HealthIntelligencePanel({ snapshot, compact }: { snapshot: HealthIntell
   </section>;
 }
 
-function TypedPluginData(props: {
+interface PluginContributionRenderProps {
   registered: RegisteredPluginContribution;
   token: string;
   tenant: string;
+  locale: string;
+  onNavigate: (route: string) => void;
   compact?: boolean;
-}) {
+}
+
+function PluginContributionData(props: PluginContributionRenderProps) {
   const { registered, token: credential, tenant } = props;
   const scopeKey = JSON.stringify([credential, tenant, registered.manifestRevision, registered.contribution.data_endpoint]);
+  if (registered.contribution.renderer === 'component_v1') {
+    return <ComponentPluginData key={scopeKey} {...props} />;
+  }
   if (registered.contribution.presentation === 'projection_v1') {
     return <ProjectionPluginData key={scopeKey} {...props} scopeKey={scopeKey} />;
   }
   return <LegacyTypedPluginData key={scopeKey} {...props} />;
+}
+
+function ComponentPluginData({
+  registered,
+  token: credential,
+  tenant,
+  locale,
+  compact = false,
+  onNavigate,
+}: PluginContributionRenderProps) {
+  return <OperatorPluginComponentHost
+    pluginId={registered.pluginId}
+    pluginVersion={registered.pluginVersion}
+    contribution={registered.contribution}
+    serviceEndpointIds={registered.serviceEndpointIds}
+    credential={credential}
+    tenantExternalId={tenant}
+    locale={locale}
+    compact={compact}
+    onNavigate={onNavigate}
+  />;
 }
 
 function ProjectionPluginData({ registered, token: credential, tenant, scopeKey }: {
@@ -280,7 +346,7 @@ function ProjectionPluginData({ registered, token: credential, tenant, scopeKey 
       allowedLinkOrigins={registered.allowedLinkOrigins ?? []}
       messages={{ loading: 'Loading plugin data…', unavailable: 'Plugin data is currently unavailable.', empty: 'No current signals.', states: { ok: 'Healthy', warning: 'Warning', error: 'Error', unknown: 'Unknown' } }}
       load={async (signal) => {
-        const response = await api<PluginServiceDataResponse>(serviceDataPath(registered.pluginId, registered.contribution.data_endpoint, tenant), credential, { signal });
+        const response = await api<PluginServiceDataResponse>(serviceDataPath(registered.pluginId, registered.contribution.data_endpoint!, tenant), credential, { signal });
         if (!signal.aborted) setPartial(response.partial);
         return response.data;
       }}
@@ -296,7 +362,7 @@ function LegacyTypedPluginData({ registered, token: credential, tenant, compact 
 }) {
   const [response, setResponse] = useState<PluginServiceDataResponse>();
   const [error, setError] = useState('');
-  const endpoint = registered.contribution.data_endpoint;
+  const endpoint = registered.contribution.data_endpoint!;
 
   useEffect(() => {
     let active = true;
@@ -326,27 +392,56 @@ function LegacyTypedPluginData({ registered, token: credential, tenant, compact 
   </>;
 }
 
-export function PluginContributionPage({ registered, token, tenant }: {
+export function PluginContributionPage({ registered, token, tenant, locale, onNavigate }: {
   registered: RegisteredPluginContribution;
   token: string;
   tenant: string;
+  locale: string;
+  onNavigate: (route: string) => void;
 }) {
+  if (registered.contribution.renderer === 'component_v1') {
+    return <article className="plugin-contribution-page plugin-component-page" aria-label={registered.contribution.label}>
+      <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+    </article>;
+  }
   return <article className="panel plugin-contribution-page">
     <div className="panel-title"><div><h2>{registered.contribution.label}</h2><p className="muted">Data from the installed extension.</p></div></div>
-    <TypedPluginData registered={registered} token={token} tenant={tenant} />
+    <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
   </article>;
 }
 
-export function PluginOverviewCards({ cards, token, tenant }: {
+export function PluginOverviewCards({ cards, token, tenant, locale, onNavigate }: {
   cards: RegisteredPluginContribution[];
   token: string;
   tenant: string;
+  locale: string;
+  onNavigate: (route: string) => void;
 }) {
   if (cards.length === 0) return null;
   return <section className="operator-overview-plugin-cards" aria-label="Plugin contributions">
     {cards.map((registered) => <article className="panel" key={`${registered.pluginId}:${registered.contribution.id}`}>
       <div className="panel-title"><h2>{registered.contribution.label}</h2></div>
-      <TypedPluginData registered={registered} token={token} tenant={tenant} compact />
+      <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} compact />
     </article>)}
+  </section>;
+}
+
+export function PluginPageExtensions({ extensions, token, tenant, locale, onNavigate }: {
+  extensions: RegisteredPluginContribution[];
+  token: string;
+  tenant: string;
+  locale: string;
+  onNavigate: (route: string) => void;
+}) {
+  if (extensions.length === 0) return null;
+  return <section className="operator-page-plugin-extensions" aria-label="Plugin extensions">
+    {extensions.map((registered) => registered.contribution.renderer === 'component_v1'
+      ? <section className="operator-page-plugin-extension" aria-label={registered.contribution.label} key={`${registered.pluginId}:${registered.contribution.id}`}>
+        <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+      </section>
+      : <article className="panel" key={`${registered.pluginId}:${registered.contribution.id}`}>
+        <div className="panel-title"><h2>{registered.contribution.label}</h2></div>
+        <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+      </article>)}
   </section>;
 }
