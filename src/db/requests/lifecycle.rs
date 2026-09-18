@@ -1490,7 +1490,7 @@ impl Database {
             return Ok(());
         }
         sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), ''), 0, 0, 0)",
+            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
         )
         .bind(&request_id)
         .bind(&tenant_id)
@@ -1751,7 +1751,7 @@ async fn insert_request_started_record_in_transaction(
         ));
     }
     sqlx::query(
-        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), ''), 0, 0, 0)",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
     )
     .bind(&request_id)
     .bind(&tenant_id)
