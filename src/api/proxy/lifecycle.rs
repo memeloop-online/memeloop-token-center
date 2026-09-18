@@ -6,7 +6,7 @@ pub(super) async fn finish_unavailable(
     error_code: &str,
     last_dispatched_upstream: Option<(Uuid, Uuid)>,
 ) -> Result<Response, AppError> {
-    let mut response = finish_buffered_request_with_upstream_attribution(
+    let mut response = finish_local_buffered_error_with_upstream_attribution(
         request,
         StatusCode::SERVICE_UNAVAILABLE,
         Bytes::from_static(

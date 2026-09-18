@@ -1768,7 +1768,20 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         rows[0].error_code.as_deref(),
         Some("upstream_transport_request")
     );
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(
+            "inline-json:{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}"
+        )
+    );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let selected_account: String = sqlx::query_scalar(
         "SELECT upstream_account_id FROM request_records WHERE id = $1 AND key_id = $2",
@@ -1778,9 +1791,16 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
     .fetch_one(&pool)
     .await
     .unwrap();
+    let response_spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     pool.close().await;
     assert_eq!(selected_account, fixture.upstream_account_id.to_string());
     assert_ne!(selected_account, standby.to_string());
+    assert_eq!(response_spools, 0);
 }
 
 #[tokio::test]
