@@ -72,8 +72,10 @@ test('fallback context is consistent with the list and never invents an epoch da
 });
 
 test('full session identifiers remain inside diagnostic disclosures', () => {
-  assert.match(sessions, /<details><summary>\{t\('sessions\.diagnostics'\)\}<\/summary><code>\{session\.session_id\}<\/code>/);
+  assert.match(sessions, /<Disclosure title=\{t\('sessions\.diagnostics'\)\}><code>\{session\.session_id\}<\/code>/);
   assert.match(sessions, /showDiagnosticIds && <div className="session-diagnostics"><Disclosure/);
+  assert.match(sessions, /<div className="session-relationships"><Disclosure title=\{t\('sessions\.relationships'\)\}>/);
+  assert.doesNotMatch(sessions, /<details|<summary/);
   assert.match(sessions, /reportedSessionId && <>/);
   assert.doesNotMatch(sessions, /reportedSession && <span>/);
   assert.doesNotMatch(sessions, /const title[^;]*session_id\s*;/);

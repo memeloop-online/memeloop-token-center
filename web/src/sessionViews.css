@@ -183,7 +183,6 @@
 .session-event footer .error-code { color: #ff9999; overflow-wrap: anywhere; }
 .session-event-open { margin-left: auto; padding: 4px 7px; font-size: 11px; }
 
-.session-analysis,
 .session-relationships {
   min-width: 0;
   padding: 0;
@@ -191,21 +190,6 @@
   border-radius: 14px;
   background: #0a171b;
 }
-.session-analysis > summary,
-.session-relationships > summary {
-  cursor: pointer;
-  padding: 13px 15px;
-  color: #b6d9d6;
-  font-weight: 600;
-}
-.session-analysis[open] > summary,
-.session-relationships[open] > summary { border-bottom: 1px solid #294148; }
-.session-analysis > .semantic-execution { margin: 0; border: 0; border-radius: 0 0 14px 14px; }
-.session-relationships > .edge-list,
-.session-relationships > .candidate-edges,
-.session-relationships > .notice { margin-right: 15px; margin-left: 15px; }
-.session-relationships > .edge-list { margin-bottom: 12px; }
-
 :root[data-theme='light'] .session-browser { border-color: #c8d6d3; background: #fff; }
 :root[data-theme='light'] .session-sidebar-item { border-color: #dce7e4; color: #17302d; }
 :root[data-theme='light'] .session-sidebar-item:hover { background: #edf7f4; }
@@ -213,7 +197,6 @@
 :root[data-theme='light'] .session-sidebar-context,
 :root[data-theme='light'] .session-sidebar-meta { color: #58716d; }
 :root[data-theme='light'] .session-actor-outline,
-:root[data-theme='light'] .session-analysis,
 :root[data-theme='light'] .session-relationships { border-color: #c8d6d3; background: #fff; }
 :root[data-theme='light'] .session-actor { background: #eef7f5; }
 :root[data-theme='light'] .session-labels { border-color: #dce7e4; }
@@ -233,8 +216,6 @@
 .session-detail-heading h2 { overflow-wrap: anywhere; font-size: 24px; }
 .session-detail .fui-AccordionHeader__button { justify-content: flex-start; min-height: 40px; }
 .session-detail .session-replay-feed { max-height: 65vh; overflow: auto; overscroll-behavior: contain; }
-:root[data-theme='light'] .session-analysis[open] > summary,
-:root[data-theme='light'] .session-relationships[open] > summary { border-color: #dce7e4; }
 
 @media (width <= 900px) {
   .session-workspace { grid-template-columns: minmax(0, 1fr); }
@@ -259,7 +240,6 @@
   .session-event header time { text-align: left; }
   .session-event footer { display: grid; }
   .session-event-open { width: 100%; margin-left: 0; }
-  .session-analysis > .semantic-execution { padding: 12px; }
 }
 
 /* Follow the same Fluent surface and text tokens as the surrounding console. */
@@ -272,4 +252,3 @@
 .mtc-fluent-root .session-sidebar-meta { color: var(--colorNeutralForeground2); font-size: var(--fontSizeBase200); }
 .mtc-fluent-root .session-sidebar-context span:last-child { color: var(--colorNeutralForeground2); }
 .mtc-fluent-root .session-relationships { background: transparent; border: 0; border-radius: 0; }
-.mtc-fluent-root .session-relationships > summary { color: var(--colorNeutralForeground1); padding: 12px 0; }

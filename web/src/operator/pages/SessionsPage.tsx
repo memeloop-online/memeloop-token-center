@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { api } from '../../api.js';
-import { DrawerFrame } from '../../components.js';
+import { DrawerFrame, RequestDiagnostics } from '../../components.js';
+import { Disclosure, Spinner } from '../../design-system/index.js';
 import { useI18n } from '../../i18n.js';
 import type { RequestDetail, RequestView } from '../../types.js';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
@@ -23,6 +24,9 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   const scopeKey = `${tenant}\0${token}`;
   const [detail, setDetail] = useState<RequestDetail>();
   const [detailScope, setDetailScope] = useState('');
+  const [selectedRequest, setSelectedRequest] = useState<RequestView>();
+  const [selectedRequestScope, setSelectedRequestScope] = useState('');
+  const [requestLoading, setRequestLoading] = useState(false);
   const [error, setError] = useState('');
   const [errorScope, setErrorScope] = useState('');
   const detailRequests = useRef(new LatestRequestGate());
@@ -31,6 +35,9 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
     detailRequests.current.invalidate();
     setDetail(undefined);
     setDetailScope('');
+    setSelectedRequest(undefined);
+    setSelectedRequestScope('');
+    setRequestLoading(false);
     setError('');
     setErrorScope('');
     return () => detailRequests.current.invalidate();
@@ -42,11 +49,19 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
       detailRequests.current.invalidate();
       setDetail(undefined);
       setDetailScope('');
+      setSelectedRequest(undefined);
+      setSelectedRequestScope('');
+      setRequestLoading(false);
       setError('');
       setErrorScope('');
       return;
     }
     const pending = detailRequests.current.begin();
+    setDetail(undefined);
+    setDetailScope('');
+    setSelectedRequest(request);
+    setSelectedRequestScope(scopeKey);
+    setRequestLoading(true);
     try {
       setError('');
       setErrorScope('');
@@ -64,11 +79,22 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         setError(messageOf(reason, t('traffic.detailFailed')));
         setErrorScope(scopeKey);
       }
+    } finally {
+      if (pending.isCurrent()) setRequestLoading(false);
     }
   }
 
   const scopedDetail = detailScope === scopeKey ? detail : undefined;
+  const scopedSelectedRequest = selectedRequestScope === scopeKey ? selectedRequest : undefined;
   const scopedError = errorScope === scopeKey ? error : '';
+  const closeRequestDetail = () => {
+    detailRequests.current.invalidate();
+    setDetail(undefined);
+    setDetailScope('');
+    setSelectedRequest(undefined);
+    setSelectedRequestScope('');
+    setRequestLoading(false);
+  };
 
   return <>
     {scopedError && <div className="notice error" role="alert">{scopedError}</div>}
@@ -87,6 +113,21 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         onSelectRequest={selectRequest}
       />
     </article>
-    {scopedDetail && <DrawerFrame title={scopedDetail.model} eyebrow={t('request.operatorDiagnosis')} onClose={() => { setDetail(undefined); setDetailScope(''); }}><p className="muted break-anywhere">{scopedDetail.request_id} · {scopedDetail.status_code ?? t('common.running')} · {scopedDetail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</p><h3>{t('request.error')}</h3><pre>{scopedDetail.error_code ?? t('common.none')}</pre><h3>{t('request.request')}</h3><pre>{JSON.stringify(scopedDetail.request_body, null, 2)}</pre><h3>{t('request.response')}</h3><pre>{JSON.stringify(scopedDetail.response_body, null, 2)}</pre></DrawerFrame>}
+    {(scopedDetail || (requestLoading && scopedSelectedRequest)) && <DrawerFrame title={scopedDetail?.model ?? scopedSelectedRequest!.model} eyebrow={t('request.operatorDiagnosis')} onClose={closeRequestDetail}>
+      {requestLoading && !scopedDetail
+        ? <div className="empty" role="status" aria-live="polite"><Spinner size="extra-small" aria-hidden="true" />{t('common.loading')}</div>
+        : scopedDetail && <>
+          <RequestDiagnostics request={scopedDetail} />
+          <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
+            <span><b>{t('self.archive')}</b>{scopedDetail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
+            {scopedDetail.provenance && <span><b>{t('request.provenance')}</b>{scopedDetail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {scopedDetail.provenance.source}</span>}
+          </div>
+          <Disclosure title={t('request.technicalDetails')}>
+            <h3>{t('request.request')}</h3><pre>{JSON.stringify(scopedDetail.request_body, null, 2)}</pre>
+            <h3>{t('request.response')}</h3><pre>{JSON.stringify(scopedDetail.response_body, null, 2)}</pre>
+            {scopedDetail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(scopedDetail.provenance, null, 2)}</pre></>}
+          </Disclosure>
+        </>}
+    </DrawerFrame>}
   </>;
 }

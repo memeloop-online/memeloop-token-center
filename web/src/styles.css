@@ -1015,18 +1015,15 @@ button.bucket-heading:hover b {
   margin-top: 14px;
 }
 
-.session-card-actions details,
+.session-card-actions .fui-Accordion,
 .session-diagnostics,
-.candidate-edges {
+.session-relationships .fui-Accordion {
   min-width: 0;
 }
 .session-card-heading > span { align-items: center; display: flex; flex-wrap: wrap; gap: 6px; }
 
-.session-card-actions summary,
-.session-diagnostics summary,
-.candidate-edges summary {
-  color: #8bd7cc;
-  cursor: pointer;
+.session-card-actions .fui-AccordionHeader__button,
+.session-diagnostics .fui-AccordionHeader__button {
   font-size: 12px;
 }
 
@@ -1076,9 +1073,6 @@ button.bucket-heading:hover b {
 :root[data-theme='light'] .session-live-state.reconnecting { color: #aa2828; }
 :root[data-theme='light'] .session-metric-negative b { color: #aa2828; }
 .session-result-count { font-size: 12px; }
-.candidate-edges { margin-top: 18px; }
-.candidate-edges > .muted { margin: 8px 0; }
-
 :root[data-theme='light'] .session-card {
   background: #fff;
   border-color: #c8d6d3;
@@ -1093,12 +1087,6 @@ button.bucket-heading:hover b {
 :root[data-theme='light'] .session-card-metrics small,
 :root[data-theme='light'] .session-card-context code {
   color: #58716d;
-}
-
-:root[data-theme='light'] .session-card-actions summary,
-:root[data-theme='light'] .session-diagnostics summary,
-:root[data-theme='light'] .candidate-edges summary {
-  color: #176f64;
 }
 
 :root[data-theme='light'] .session-archive-metrics {
