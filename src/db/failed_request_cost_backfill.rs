@@ -430,10 +430,27 @@ fn prepare_batch(
 }
 
 fn candidate_statement(lock: &str, confirmed_legacy_null: bool) -> String {
-    let absent_usage_evidence = if confirmed_legacy_null {
-        "r.usage_basis IS NULL AND f.request_id = $7"
+    let eligibility = if confirmed_legacy_null {
+        r#"r.usage_basis IS NULL AND f.request_id = $7
+            AND f.cost_micros <> 0
+            AND f.cost_micros = r.cost_micros
+            AND u.status = 'settled'
+            AND u.actual_micros = r.cost_micros
+            AND u.reserved_micros = r.cost_micros
+            AND u.reserved_tokens = r.input_tokens + r.output_tokens"#
     } else {
-        "r.usage_basis IN ('not_observed', 'contract_ceiling')"
+        r#"(r.usage_basis = 'provider_reported'
+             AND f.cost_micros <> r.cost_micros
+             AND u.status = 'settled'
+             AND u.actual_micros = r.cost_micros)
+            OR
+            (r.usage_basis IN ('not_observed', 'contract_ceiling')
+             AND f.cost_micros <> 0
+             AND f.cost_micros = r.cost_micros
+             AND u.status = 'settled'
+             AND u.actual_micros = r.cost_micros
+             AND u.reserved_micros = r.cost_micros
+             AND u.reserved_tokens = r.input_tokens + r.output_tokens)"#
     };
     format!(
         r#"SELECT f.request_id, f.tenant_id, f.key_id, f.created_at, f.model, f.protocol,
@@ -458,20 +475,7 @@ fn candidate_statement(lock: &str, confirmed_legacy_null: bool) -> String {
               AND ((r.status_code < 200 OR r.status_code >= 400)
                    OR COALESCE(r.error_code, '') <> '')
               AND correction.request_id IS NULL
-              AND (
-                    (r.usage_basis = 'provider_reported'
-                     AND f.cost_micros <> r.cost_micros
-                     AND u.status = 'settled'
-                     AND u.actual_micros = r.cost_micros)
-                    OR
-                    ({absent_usage_evidence}
-                     AND f.cost_micros <> 0
-                     AND f.cost_micros = r.cost_micros
-                     AND u.status = 'settled'
-                     AND u.actual_micros = r.cost_micros
-                     AND u.reserved_micros = r.cost_micros
-                     AND u.reserved_tokens = r.input_tokens + r.output_tokens)
-                  )
+              AND ({eligibility})
               AND (f.created_at > $3 OR (f.created_at = $3 AND f.request_id > $4))
             ORDER BY f.created_at ASC, f.request_id ASC
             LIMIT $6{lock}"#
@@ -1273,36 +1277,47 @@ mod tests {
             .execute(&fixture.database.pool)
             .await
             .unwrap();
+        let (legacy_null_id, _) =
+            seed_historical_case(fixture, 499, Some("client_disconnected"), None).await;
+        let confirmed_legacy_null_request_ids = vec![legacy_null_id.to_string()];
 
         let preview = fixture
             .database
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: false,
-                batch_size: 1,
+                batch_size: 2,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
-                confirmed_legacy_null_request_ids: Vec::new(),
+                confirmed_legacy_null_request_ids: confirmed_legacy_null_request_ids.clone(),
                 after: None,
             })
             .await
             .unwrap();
-        assert_eq!(preview.candidate_rows, 1);
-        assert_eq!(preview.candidates[0].evidence_kind, "provider_reported");
-        assert_eq!(preview.candidates[0].corrected_cost_micros, actual_cost);
+        assert_eq!(preview.candidate_rows, 2);
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.request_id == request_id.to_string()
+                && candidate.evidence_kind == "provider_reported"
+                && candidate.corrected_cost_micros == actual_cost
+        }));
+        assert!(preview.candidates.iter().any(|candidate| {
+            candidate.request_id == legacy_null_id.to_string()
+                && candidate.evidence_kind == "reservation_ceiling_without_usage"
+                && candidate.corrected_cost_micros == 0
+        }));
 
         let applied = fixture
             .database
             .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                 apply: true,
-                batch_size: 1,
+                batch_size: 2,
                 from_created_at: 0,
                 to_created_at: i64::MAX,
-                confirmed_legacy_null_request_ids: Vec::new(),
+                confirmed_legacy_null_request_ids,
                 after: None,
             })
             .await
             .unwrap();
-        assert_eq!(applied.changed_rows, 1);
+        assert_eq!(applied.changed_rows, 2);
         let corrected: i64 =
             sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
                 .bind(request_id.to_string())
@@ -1310,6 +1325,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(corrected, actual_cost);
+        let zeroed_legacy: i64 =
+            sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+                .bind(legacy_null_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        assert_eq!(zeroed_legacy, 0);
         assert!(
             aggregate_costs(fixture)
                 .await
@@ -1815,10 +1837,13 @@ mod tests {
             .append_pair("options", &format!("-c search_path={schema}"));
         let contract_fixture = fixture(isolated.as_str(), None).await;
         exercise_backfill(&contract_fixture).await;
+        let provider_fixture = fixture(isolated.as_str(), None).await;
+        exercise_provider_reported_fact_repair(&provider_fixture).await;
         let concurrency_fixture = fixture(isolated.as_str(), None).await;
         exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
             .await;
         contract_fixture.database.close().await;
+        provider_fixture.database.close().await;
         concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
