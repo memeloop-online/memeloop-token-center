@@ -5,6 +5,7 @@ import type {
   OperatorUiComponentPropsV1,
   OperatorUiContributionV1,
   OperatorUiHostApiV1,
+  OperatorUiRequestOptions,
 } from '../../operator-ui-sdk/index.js';
 
 export interface OperatorPluginComponentHostProps {
@@ -42,7 +43,7 @@ export function OperatorPluginComponentHost({
   onNavigate,
 }: OperatorPluginComponentHostProps) {
   const hostApi = useMemo<OperatorUiHostApiV1>(() => ({
-    async request<T>(path: string, options = {}) {
+    async request<T>(path: string, options: OperatorUiRequestOptions = {}) {
       if (!isSameOriginPath(path)) throw new Error('Operator API paths use a same-origin absolute path');
       const { body, method = 'GET', headers, signal } = options;
       return api<T>(path, credential, {
