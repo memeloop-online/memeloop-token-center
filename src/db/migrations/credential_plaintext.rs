@@ -29,8 +29,7 @@ fn verified_original_matches_key(
     // Imported and legacy credentials may be opaque. Their keyed hash is
     // the authenticity boundary. Native MTC credentials additionally carry a
     // key identity, which must agree with the row when it is present.
-    crypto::parse_credential(value)
-        .is_none_or(|parsed| parsed.key_id == expected_key_id)
+    crypto::parse_credential(value).is_none_or(|parsed| parsed.key_id == expected_key_id)
 }
 
 pub(super) async fn promote_active_plaintext(
@@ -335,7 +334,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("opaque-plaintext-upgrade.db").display()
+            directory
+                .path()
+                .join("opaque-plaintext-upgrade.db")
+                .display()
         ))
         .await
         .unwrap();
@@ -345,13 +347,15 @@ mod tests {
 
         let plaintext = "fixture-opaque-original-value";
         let (hash, _) = crypto::hash_credential(plaintext, PEPPER);
-        sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
-            .bind(plaintext)
-            .bind(hash)
-            .bind(issued.key_id.to_string())
-            .execute(&database.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3",
+        )
+        .bind(plaintext)
+        .bind(hash)
+        .bind(issued.key_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
 
         database
             .migrate_with_credential_pepper(PEPPER)
@@ -369,7 +373,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("opaque-envelope-upgrade.db").display()
+            directory
+                .path()
+                .join("opaque-envelope-upgrade.db")
+                .display()
         ))
         .await
         .unwrap();
