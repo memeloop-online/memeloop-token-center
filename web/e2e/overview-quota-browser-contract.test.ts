@@ -40,20 +40,25 @@ test('production overview reads each leading account once and preserves unknown 
     page.on('pageerror', error => errors.push(error.message));
     await page.route('**/*', route => {
       const request = route.request(), url = new URL(request.url());
-      if (url.origin !== origin || request.method() !== 'GET') { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
+      if (url.origin !== origin) { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
       if (!url.pathname.startsWith('/internal/')) return route.continue();
       const json = (value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) });
+      if (url.pathname === '/internal/v1/upstreams/quota/batch') {
+        if (request.method() !== 'POST') { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
+        const body = JSON.parse(request.postData() ?? '{}') as { account_ids?: string[]; fresh?: boolean; trigger?: string };
+        if (body.fresh !== true || body.trigger !== 'bulk' || !Array.isArray(body.account_ids)) { unexpected.push(`invalid quota batch ${url.pathname}`); return route.abort(); }
+        reads.push(...body.account_ids);
+        if (failRefresh) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic read unavailable' } }) });
+        return json({ contract_version: 'upstream_quota_batch_v1', results: body.account_ids.map(id => id === 'known'
+          ? { status: 'success', upstream_account_id: id, snapshot: quota }
+          : { status: 'success', upstream_account_id: id, snapshot: { ...quota, upstream_account_id: id, status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...quotaWindow, used_percent: 0 }] } })) });
+      }
+      if (request.method() !== 'GET') { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
       if (url.pathname === '/internal/v1/tenants') return json([{ id: 'synthetic', external_id: 'default', name: 'Design acceptance' }]);
       if (url.pathname === '/internal/v1/plugins' || url.pathname === '/internal/v1/requests') return json([]);
       if (url.pathname === '/internal/v1/monitoring-snapshot') return json(snapshot);
       if (url.pathname === '/internal/v1/usage-analysis/trends') return json({ from_created_at: now - 86_400_000, to_created_at: now, granularity: 'hour', time_zone: 'UTC', p95_is_approximate: true, p95_method: 'fixed_histogram_upper_bound_capped_60000ms', summary: { ...metrics, success: 28, failed: 4, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, generation_units: 0 }, time_series: [] });
       if (url.pathname === '/internal/v1/upstreams') return json(['known', 'unknown', 'not-in-overview'].map(id => ({ id, name: id, tenant_external_id: 'default', credential_generation: 1, status: 'active' })));
-      if (/^\/internal\/v1\/upstreams\/(known|unknown)\/quota$/.test(url.pathname)) {
-        assert.equal(url.searchParams.get('tenant_external_id'), 'default');
-        const id = url.pathname.split('/')[4]; reads.push(id);
-        if (id === 'known' && failRefresh) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic read unavailable' } }) });
-        return json(id === 'known' ? quota : { ...quota, upstream_account_id: 'unknown', status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...quotaWindow, used_percent: 0 }] });
-      }
       unexpected.push(url.pathname); return route.abort();
     });
     await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'en'); localStorage.setItem('mtc.operator.service-credential.v1', 'synthetic-browser-only'); });
