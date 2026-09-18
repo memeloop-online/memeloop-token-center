@@ -57,6 +57,7 @@ mod billing;
 mod constants;
 mod credentials;
 mod effective_cost;
+mod failed_request_cost_backfill;
 mod filter_assistant;
 mod generation;
 mod group_routing;
@@ -70,6 +71,7 @@ mod plugin_installations;
 mod plugin_kv;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;
+mod projection_lock;
 mod providers;
 mod requests;
 mod rotation;
@@ -85,12 +87,18 @@ mod usage_analysis;
 mod validation;
 
 use constants::*;
+pub(crate) use projection_lock::{
+    lock_generation_jobs_projection_source_in_transaction,
+    lock_request_records_projection_source_in_transaction,
+    lock_request_stats_projection_in_transaction,
+};
 use rotation::*;
 use rows::generation_asset_download;
 pub use session_analytics::LogicalSessionListFilter;
 pub(crate) use session_projection::{
     add_request_fact_to_session_projection_in_transaction,
-    merge_request_session_projection_in_transaction, reclassify_request_session_in_transaction,
+    merge_request_session_projection_in_transaction,
+    rebuild_request_session_projection_in_transaction, reclassify_request_session_in_transaction,
 };
 pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
@@ -123,6 +131,10 @@ pub(crate) use credentials::{
     validate_key_policy,
 };
 pub use credentials::{CreateKeyInput, CreateServiceTokenInput, ProvisionedCloudCredential};
+pub use failed_request_cost_backfill::{
+    FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
+    FailedRequestCostBackfillInput, FailedRequestCostBackfillReport,
+};
 pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
     CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,

@@ -397,6 +397,35 @@ impl Database {
         } else {
             None
         };
+        let request_fact_exists = if let Some(request_created_at) = request_created_at {
+            lock_request_records_projection_source_in_transaction(transaction).await?;
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                sqlx::query(
+                    "SELECT id FROM request_records WHERE id = $1 AND created_at = $2 FOR UPDATE",
+                )
+                .bind(&request_id)
+                .bind(request_created_at)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            }
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1",
+            )
+            .bind(&request_id)
+            .fetch_one(&mut **transaction)
+            .await?
+                != 0
+        } else {
+            false
+        };
+        // A completed request can reclassify its session projection, while a newly arrived turn or
+        // upstream response id can reconcile already-completed descendants. Pending observations
+        // with none of those conditions must remain independently committable while another pending
+        // observation is uncommitted.
+        if request_fact_exists || hints.turn_id.is_some() || upstream_response_id.is_some() {
+            lock_request_stats_projection_in_transaction(transaction).await?;
+        }
 
         if matches!(self.backend, DatabaseBackend::PostgreSql)
             && let Some(session_id) = hints.session_id.as_deref()
@@ -739,8 +768,13 @@ impl Database {
             if attached.rows_affected() != 1 {
                 return Err(AppError::Internal);
             }
-            reclassify_request_session_in_transaction(transaction, parse_uuid(request_id.clone())?)
+            if request_fact_exists {
+                reclassify_request_session_in_transaction(
+                    transaction,
+                    parse_uuid(request_id.clone())?,
+                )
                 .await?;
+            }
         }
         if let Some(turn_id) = hints.turn_id.as_deref() {
             reconcile_unresolved_explicit_parents_in_transaction(
@@ -1406,6 +1440,9 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     request_id: Uuid,
     upstream_response_id: &str,
 ) -> Result<(), AppError> {
+    // This path can reconcile clusters and merge their session projections. Acquire the shared
+    // statistics lock before reading or locking conversation state to preserve the global order.
+    lock_request_stats_projection_in_transaction(transaction).await?;
     let upstream_response_id = upstream_response_id.trim();
     if upstream_response_id.is_empty()
         || upstream_response_id.len() > 256

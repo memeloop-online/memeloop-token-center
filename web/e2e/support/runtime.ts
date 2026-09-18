@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser } from 'playwright';
-import { streamSse } from '../../src/api.js';
+import { ApiError, streamSse } from '../../src/api.js';
 import type { RequestEvent } from '../../src/types.js';
 
 const bootstrapToken = process.env.MTC_E2E_SERVICE_TOKEN
@@ -76,7 +76,9 @@ export function observeSessionReadyRequests({
   const deadline = AbortSignal.timeout(30_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
-  let sessionId: string | undefined;
+  let ready: SessionReadyRequests | undefined;
+  let eventAt: number | undefined;
+  let eventId: string | undefined;
   let openedResolve!: () => void;
   let openedReject!: (reason: unknown) => void;
   let completedResolve!: (requests: SessionReadyRequests) => void;
@@ -103,31 +105,82 @@ export function observeSessionReadyRequests({
   deadline.addEventListener('abort', () => {
     fail(new Error(`observed ${requestIds.size} of ${expected} session-ready requests before the deadline`));
   }, { once: true });
-  void streamSse<RequestEvent>(
-    new URL(`/internal/v1/request-events?tenant_external_id=${encodeURIComponent(tenant)}`, baseURL).toString(),
-    credential,
-    signal,
-    ({ id, event: eventName, data: event }) => {
-      assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
-      assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
-      if (event.key_id !== keyId || event.model !== requestModel
-        || !matchesReadySessionEvent(event, sessionName)) return;
-      const eventSessionId = event.session_context?.session_id;
-      assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-      if (sessionId === undefined) sessionId = eventSessionId;
-      else assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
-      requestIds.add(event.request_id);
-      if (requestIds.size !== expected || settled) return;
-      settled = true;
-      completedResolve({ requestIds: new Set(requestIds), sessionId: eventSessionId });
-      controller.abort();
-    },
-    openedResolve,
-  ).then(() => {
-    fail(new Error(`request-event stream ended after ${requestIds.size} of ${expected} session-ready requests`));
-  }).catch((reason: unknown) => {
-    if (!settled) fail(reason);
-  });
+  void (async () => {
+    while (!settled && !signal.aborted) {
+      const url = new URL('/internal/v1/request-events', baseURL);
+      url.searchParams.set('tenant_external_id', tenant);
+      if (eventAt !== undefined && eventId !== undefined) {
+        url.searchParams.set('after_event_at', String(eventAt));
+        url.searchParams.set('after_event_id', eventId);
+      }
+      try {
+        await streamSse<RequestEvent>(
+          url.toString(),
+          credential,
+          signal,
+          ({ id, event: eventName, data: event }) => {
+            assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
+            assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
+            const isReady = event.key_id === keyId && event.model === requestModel
+              && matchesReadySessionEvent(event, sessionName);
+            if (!isReady) {
+              eventAt = event.event_at;
+              eventId = id;
+              return;
+            }
+            const eventSessionId = event.session_context?.session_id;
+            assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
+            assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
+            eventAt = event.event_at;
+            eventId = id;
+            requestIds.add(event.request_id);
+            if (requestIds.size !== expected || settled) return;
+            // A child can commit to an isolated cluster before its declared parent, then be merged
+            // by a later terminal transaction. The final event's session is the reconciliation
+            // candidate; do not publish readiness until its detail has converged to the exact set.
+            ready = { requestIds: new Set(requestIds), sessionId: eventSessionId };
+            controller.abort();
+          },
+          openedResolve,
+        );
+      } catch (reason) {
+        if (ready) break;
+        if (settled || signal.aborted) return;
+        if (!(reason instanceof ApiError) || reason.code !== 'sse_response_interrupted') throw reason;
+      }
+      if (ready) break;
+      if (!settled && !signal.aborted) {
+        await delay(100);
+      }
+    }
+    if (!ready || settled) return;
+    const candidate = ready;
+    const detailParams = new URLSearchParams({
+      tenant_external_id: tenant,
+      key_id: keyId,
+      limit: '100',
+    });
+    while (!settled && !deadline.aborted) {
+      try {
+        const detail = await requestJson<{ requests: Array<{ request_id: string }> }>(
+          `/internal/v1/sessions/${encodeURIComponent(candidate.sessionId)}?${detailParams}`,
+          { credential, signal: deadline },
+        );
+        assert.deepEqual(
+          new Set(detail.requests.map((request) => request.request_id)),
+          candidate.requestIds,
+          'the final logical session must converge to the exact observed request set',
+        );
+        break;
+      } catch {
+        if (settled || deadline.aborted) return;
+        await delay(100, deadline);
+      }
+    }
+    if (settled || deadline.aborted) return;
+    settled = true;
+    completedResolve(candidate);
+  })().catch(fail);
   return { opened, completed };
 }
 
@@ -162,6 +215,7 @@ interface JsonRequest {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   headers?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 class E2ERuntime {
@@ -291,7 +345,7 @@ export async function requestJson<T>(path: string, options: JsonRequest = {}): P
     method: options.method ?? 'GET',
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    signal: AbortSignal.timeout(30_000),
+    signal: options.signal ?? AbortSignal.timeout(30_000),
   });
   const text = await response.text();
   assert.ok(response.ok, `${options.method ?? 'GET'} ${path}: ${response.status} ${text}`);
@@ -559,8 +613,20 @@ export async function eventually(
   throw new Error(`${message}: ${detail}`);
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolveDelay, rejectDelay) => {
+    const timeout = setTimeout(finish, milliseconds);
+    signal?.addEventListener('abort', abort, { once: true });
+    function finish() {
+      signal?.removeEventListener('abort', abort);
+      resolveDelay();
+    }
+    function abort() {
+      clearTimeout(timeout);
+      rejectDelay(signal?.reason);
+    }
+  });
 }
 
 async function endpointIsReachable(url: URL): Promise<boolean> {

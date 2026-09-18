@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
-    db::Database,
+    db::{
+        Database, FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
+        FailedRequestCostBackfillInput,
+    },
     worker::{self, wait_for_server_shutdown},
 };
 use tokio::{net::TcpListener, sync::watch};
@@ -50,6 +53,26 @@ enum Command {
         role: RuntimeRole,
     },
     Migrate,
+    /// Audit or correct one bounded batch of historical failed-request cost projections.
+    /// Without --apply this is a read-only dry run; resume from the returned JSON cursor.
+    BackfillFailedRequestCosts {
+        /// Persist fact corrections and rebuild affected aggregate dimensions.
+        #[arg(long)]
+        apply: bool,
+        /// Maximum eligible facts inspected in this transaction.
+        #[arg(
+            long,
+            default_value_t = 100,
+            value_parser = clap::value_parser!(i64).range(1..=FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE)
+        )]
+        batch_size: i64,
+        /// Resume strictly after this fact timestamp; must accompany --after-request-id.
+        #[arg(long, requires = "after_request_id")]
+        after_created_at: Option<i64>,
+        /// Resume strictly after this request id at --after-created-at.
+        #[arg(long, requires = "after_created_at")]
+        after_request_id: Option<String>,
+    },
     /// Initialize an empty shared inventory without replacing existing data.
     #[cfg(feature = "experimental-plugin-revisions")]
     PreparePluginInventory {
@@ -127,6 +150,33 @@ async fn run() -> Result<(), &'static str> {
                 .map_err(|_| "database_migration_failed")?;
             info!("database schema is current");
         }
+        Command::BackfillFailedRequestCosts {
+            apply,
+            batch_size,
+            after_created_at,
+            after_request_id,
+        } => {
+            let database = Database::connect_with_max(&config.database_url, 1)
+                .await
+                .map_err(|_| "database_connect_failed")?;
+            let after = after_created_at
+                .zip(after_request_id)
+                .map(|(created_at, request_id)| FailedRequestCostBackfillCursor {
+                    created_at,
+                    request_id,
+                });
+            let report = database
+                .backfill_failed_request_costs(FailedRequestCostBackfillInput {
+                    apply,
+                    batch_size,
+                    after,
+                })
+                .await
+                .map_err(|_| "failed_request_cost_backfill_failed")?;
+            let output = serde_json::to_string(&report)
+                .map_err(|_| "failed_request_cost_backfill_report_failed")?;
+            println!("{output}");
+        }
         Command::Serve { role } => {
             let state = AppState::initialize(config.clone())
                 .await
@@ -201,6 +251,45 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn failed_request_cost_backfill_is_explicit_bounded_and_dry_run_by_default() {
+        let parsed =
+            Cli::try_parse_from(["memeloop-token-center", "backfill-failed-request-costs"])
+                .unwrap();
+        let Command::BackfillFailedRequestCosts {
+            apply,
+            batch_size,
+            after_created_at,
+            after_request_id,
+        } = parsed.command
+        else {
+            panic!("expected failed request cost backfill command");
+        };
+        assert!(!apply);
+        assert_eq!(batch_size, 100);
+        assert_eq!(after_created_at, None);
+        assert_eq!(after_request_id, None);
+
+        assert!(
+            Cli::try_parse_from([
+                "memeloop-token-center",
+                "backfill-failed-request-costs",
+                "--after-created-at",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "memeloop-token-center",
+                "backfill-failed-request-costs",
+                "--batch-size",
+                "1001",
+            ])
+            .is_err()
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn worker_failure_stops_server_without_an_external_signal() {

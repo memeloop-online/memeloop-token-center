@@ -143,7 +143,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await recordedRow.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none');
     assert.match(await recordedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+—/, 'failed delivery is not compared with successful generation in the list');
     assert.match(await recordedDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/, 'failed delivery has no average throughput in details');
-    assert.match(await recordedDiagnostics.locator('[data-rate="generation"]').innerText(), /Gateway output rate\s+—/, 'failed delivery has no generation throughput in details');
+    assert.match(await recordedDiagnostics.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/, 'failed delivery has no generation throughput in details');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-tps-cell').innerText(), /Average TPS\s+—/, 'missing duration never becomes zero TPS');
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-primary').innerText(), /Uncached input\s*—[\s\S]*Output\s*—/);
     const runningRow = page.locator('tbody tr').nth(2);

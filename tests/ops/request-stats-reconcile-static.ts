@@ -81,4 +81,11 @@ test("driver and day rebuild SQL retain reconciliation safety markers", () => {
     "INSERT INTO usage_analysis_daily",
     "FROM usage_analysis_hourly h",
   ]) assert.ok(sqlSource.includes(marker), `missing observability rebuild marker: ${marker}`);
+
+  const pruneSource = driverSource.slice(driverSource.indexOf("function pruneApply"));
+  assert.ok(
+    pruneSource.indexOf("LOCK TABLE request_records, generation_jobs IN SHARE MODE") <
+      pruneSource.indexOf("SELECT pg_advisory_xact_lock"),
+    "source-table locks must precede the projection lock to match terminal writer ordering",
+  );
 });
