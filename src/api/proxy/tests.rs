@@ -538,7 +538,13 @@ async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &
         let archived = if let Some(inline) = response_object.strip_prefix("inline-json:") {
             inline.as_bytes().to_vec()
         } else {
-            fixture.state.archive.get(&response_object).await.unwrap()
+            fixture
+                .state
+                .archive
+                .get(&response_object)
+                .await
+                .unwrap()
+                .to_vec()
         };
         assert!(
             !String::from_utf8_lossy(&archived).contains(sensitive),
