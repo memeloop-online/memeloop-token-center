@@ -228,19 +228,23 @@ impl Database {
     ) -> Result<ConnectionFailureDomainResult, AppError> {
         let now = unix_millis();
         let window_start = now.saturating_sub(CONNECTION_FAILURE_DOMAIN_WINDOW_MILLIS);
-        let mut transaction = self.pool.begin().await?;
-        // Serialize failure-domain observations through the existing healthy
-        // cohort row. Without this lock, two domains inserting different keys
-        // concurrently could each observe only itself and both miss the
-        // threshold. The no-op update also fences stale route revisions and
-        // attempts admitted before another transaction opened the breaker.
+        let mut transaction = self.begin_write_transaction().await?;
+        // Serialize failure-domain observations through the admitted cohort
+        // row. A half-open connection failure converts its exact lease into a
+        // fresh healthy epoch, so one domain cannot extend the old global
+        // cooldown by itself. Without this lock, two domains inserting
+        // different keys could each observe only itself and miss the threshold.
+        // The token/revision fence also makes stale terminals harmless.
         let cohort = sqlx::query(
             "UPDATE upstream_account_health
-                SET updated_at = updated_at
+                SET consecutive_failures = 0,
+                    cooldown_until = CASE WHEN consecutive_failures > 0 THEN 0 ELSE cooldown_until END,
+                    probe_lease_until = CASE WHEN consecutive_failures > 0 THEN 0 ELSE probe_lease_until END,
+                    last_failure_kind = CASE WHEN consecutive_failures > 0 THEN '' ELSE last_failure_kind END,
+                    updated_at = CASE WHEN consecutive_failures > 0 THEN $5 ELSE updated_at END
               WHERE upstream_account_id = $1
                 AND credential_generation = $2
                 AND transport_revision = $4
-                AND consecutive_failures = 0
                 AND probe_lease_token = $3
                 AND EXISTS (
                     SELECT 1 FROM upstream_accounts account
@@ -254,12 +258,32 @@ impl Database {
         .bind(failure.credential_generation)
         .bind(failure.failure_epoch.to_string())
         .bind(failure.transport_revision)
+        .bind(now)
         .execute(&mut *transaction)
         .await?;
         if cohort.rows_affected() == 0 {
             transaction.commit().await?;
             return Ok(ConnectionFailureDomainResult::default());
         }
+        // Domain evidence is retained across successful requests and cleaned
+        // only on the next connection failure. This removes a write from the
+        // success hot path while keeping the bounded window/revision/epoch
+        // contract exact for both databases.
+        sqlx::query(
+            "DELETE FROM upstream_connection_failure_domains
+              WHERE upstream_account_id = $1
+                AND (
+                    credential_generation <> $2
+                    OR transport_revision <> $3
+                    OR last_failure_at < $4
+                )",
+        )
+        .bind(failure.upstream_account_id.to_string())
+        .bind(failure.credential_generation)
+        .bind(failure.transport_revision)
+        .bind(window_start)
+        .execute(&mut *transaction)
+        .await?;
         let observed = sqlx::query(
             "INSERT INTO upstream_connection_failure_domains (
                  upstream_account_id, credential_generation, transport_revision,
@@ -374,29 +398,6 @@ impl Database {
             distinct_failure_domains,
             global_breaker_opened,
         })
-    }
-
-    pub(crate) async fn clear_upstream_connection_failure_domain(
-        &self,
-        upstream_account_id: Uuid,
-        credential_generation: i64,
-        transport_revision: i64,
-        failure_domain: &str,
-    ) -> Result<bool, AppError> {
-        let result = sqlx::query(
-            "DELETE FROM upstream_connection_failure_domains
-              WHERE upstream_account_id = $1
-                AND credential_generation = $2
-                AND transport_revision = $3
-                AND failure_domain = $4",
-        )
-        .bind(upstream_account_id.to_string())
-        .bind(credential_generation)
-        .bind(transport_revision)
-        .bind(failure_domain)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     pub(crate) async fn request_upstream_transport_diagnostics(
@@ -661,6 +662,7 @@ impl Database {
             credential_generation,
             transport_revision,
             UpstreamHealthConfig::DEFAULT,
+            None,
         )
         .await
     }
@@ -671,6 +673,7 @@ impl Database {
         credential_generation: i64,
         transport_revision: i64,
         health: UpstreamHealthConfig,
+        failure_domain: Option<&str>,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         self.claim_upstream_attempt_inner(
             upstream_account_id,
@@ -678,6 +681,7 @@ impl Database {
             transport_revision,
             health,
             false,
+            failure_domain,
         )
         .await
     }
@@ -699,6 +703,7 @@ impl Database {
             credential_generation,
             transport_revision,
             health,
+            None,
         )
         .await
     }
@@ -709,6 +714,7 @@ impl Database {
         credential_generation: i64,
         transport_revision: i64,
         health: UpstreamHealthConfig,
+        failure_domain: Option<&str>,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         self.claim_upstream_attempt_inner(
             upstream_account_id,
@@ -716,6 +722,7 @@ impl Database {
             transport_revision,
             health,
             true,
+            failure_domain,
         )
         .await
     }
@@ -737,6 +744,7 @@ impl Database {
             credential_generation,
             transport_revision,
             health,
+            None,
         )
         .await
     }
@@ -748,6 +756,7 @@ impl Database {
         transport_revision: i64,
         health: UpstreamHealthConfig,
         transient_only: bool,
+        failure_domain: Option<&str>,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let mut initialized_epoch = false;
         loop {
@@ -760,12 +769,18 @@ impl Database {
             .await?;
             let row = sqlx::query(
             "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until,
-                    health.last_failure_kind, health.updated_at
+                    health.last_failure_kind, health.updated_at,
+                    domain_health.last_failure_at AS local_connection_failure_at
              FROM upstream_accounts account
              LEFT JOIN upstream_account_health health
               ON health.upstream_account_id = account.id
               AND health.credential_generation = $2
               AND health.transport_revision = $3
+             LEFT JOIN upstream_connection_failure_domains domain_health
+              ON domain_health.upstream_account_id = health.upstream_account_id
+              AND domain_health.credential_generation = health.credential_generation
+              AND domain_health.transport_revision = health.transport_revision
+              AND domain_health.failure_domain = $4
              WHERE account.id = $1 AND account.status = 'active'
                AND account.credential_generation = $2
                AND account.updated_at = $3",
@@ -773,6 +788,7 @@ impl Database {
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
         .bind(transport_revision)
+        .bind(failure_domain.unwrap_or(""))
             .fetch_optional(&self.pool)
             .await?;
             let Some(row) = row else {
@@ -787,6 +803,20 @@ impl Database {
                 .try_get::<Option<i64>, _>("consecutive_failures")?
                 .unwrap_or(0);
             if consecutive_failures == 0 {
+                let local_cooldown_until = row
+                    .try_get::<Option<i64>, _>("local_connection_failure_at")?
+                    .map(|observed_at| {
+                        observed_at.saturating_add(health.connection_cooldown_millis)
+                    })
+                    .unwrap_or(0);
+                if health.failure_domain_enforcement_enabled && local_cooldown_until > now {
+                    return Ok(UpstreamAttemptAdmission::Unavailable {
+                        cooldown_until: local_cooldown_until,
+                        probe_lease_until: 0,
+                        shared_probe_eligible: false,
+                        transient_wait_eligible: false,
+                    });
+                }
                 if let Some(failure_epoch) = self
                     .ensure_healthy_admission_epoch(
                         upstream_account_id,
@@ -1595,6 +1625,34 @@ mod tests {
             .unwrap();
         assert_eq!(first.distinct_failure_domains, 1);
         assert!(!first.global_breaker_opened);
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    enforced_failure_domains(),
+                    Some("node-a"),
+                )
+                .await
+                .unwrap()
+                .is_unavailable(),
+            "the observing failure domain must briefly skip the account"
+        );
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    enforced_failure_domains(),
+                    Some("node-b"),
+                )
+                .await
+                .unwrap()
+                .is_healthy(),
+            "another failure domain keeps the account available"
+        );
         let duplicate = database
             .record_admitted_connection_failure_by_domain(
                 connection_failure(
@@ -1646,6 +1704,7 @@ mod tests {
                     1,
                     revision,
                     enforced_failure_domains(),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -1709,6 +1768,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn half_open_connection_failure_starts_a_new_domain_arbitration_episode() {
+        let (_directory, database, account_id) = fixture().await;
+        let revision = transport_revision(&database, account_id).await;
+        let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("healthy admission");
+        };
+        for (domain, pod) in [("node-a", "gateway-a"), ("node-b", "gateway-b")] {
+            database
+                .record_admitted_connection_failure_by_domain(
+                    connection_failure(
+                        account_id,
+                        revision,
+                        failure_epoch,
+                        Uuid::now_v7(),
+                        domain,
+                        pod,
+                    ),
+                    enforced_failure_domains(),
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let UpstreamAttemptAdmission::Probe { lease_token } = database
+            .claim_upstream_account_attempt_at_revision_with_health_config(
+                account_id,
+                1,
+                revision,
+                enforced_failure_domains(),
+                Some("node-c"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("half-open probe admission");
+        };
+        let first = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    lease_token,
+                    Uuid::now_v7(),
+                    "node-c",
+                    "gateway-c",
+                ),
+                enforced_failure_domains(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.distinct_failure_domains, 1);
+        assert!(!first.global_breaker_opened);
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    enforced_failure_domains(),
+                    Some("node-c"),
+                )
+                .await
+                .unwrap()
+                .is_unavailable(),
+            "the failed probe domain cannot immediately extend the global cooldown"
+        );
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    enforced_failure_domains(),
+                    Some("node-d"),
+                )
+                .await
+                .unwrap()
+                .is_healthy(),
+            "a peer domain can continue the new arbitration episode"
+        );
+        let second = database
+            .record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    lease_token,
+                    Uuid::now_v7(),
+                    "node-d",
+                    "gateway-d",
+                ),
+                enforced_failure_domains(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.distinct_failure_domains, 2);
+        assert!(second.global_breaker_opened);
+    }
+
+    #[tokio::test]
     async fn observe_rollout_ignores_legacy_single_domain_connection_breaker() {
         let (_directory, database, account_id) = fixture().await;
         let revision = transport_revision(&database, account_id).await;
@@ -1728,6 +1897,7 @@ mod tests {
                         failure_domain_enforcement_enabled: false,
                         ..UpstreamHealthConfig::DEFAULT
                     },
+                    None,
                 )
                 .await
                 .unwrap()
@@ -1764,6 +1934,7 @@ mod tests {
                 1,
                 new_revision,
                 UpstreamHealthConfig::DEFAULT,
+                None,
             )
             .await
             .unwrap()
@@ -1812,7 +1983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_failure_domains_are_transport_revision_fenced_and_recover_locally() {
+    async fn connection_failure_domains_are_revision_fenced_and_lazily_cleaned() {
         let (_directory, database, account_id) = fixture().await;
         let first_revision = transport_revision(&database, account_id).await;
         let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
@@ -1851,6 +2022,7 @@ mod tests {
                 1,
                 next_revision,
                 UpstreamHealthConfig::DEFAULT,
+                None,
             )
             .await
             .unwrap()
@@ -1875,19 +2047,54 @@ mod tests {
         assert!(!next.global_breaker_opened);
         assert!(
             database
-                .clear_upstream_connection_failure_domain(account_id, 1, next_revision, "node-b")
+                .record_upstream_account_success_at_revision(
+                    account_id,
+                    1,
+                    next_revision,
+                    next_failure_epoch,
+                )
                 .await
                 .unwrap()
         );
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM upstream_connection_failure_domains WHERE upstream_account_id = $1 AND transport_revision = $2",
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_connection_failure_domains WHERE upstream_account_id = $1",
         )
         .bind(account_id.to_string())
-        .bind(next_revision)
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(
+            retained, 1,
+            "successful requests leave cleanup to the next connection failure"
+        );
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    next_revision,
+                    enforced_failure_domains(),
+                    Some("node-b"),
+                )
+                .await
+                .unwrap()
+                .is_unavailable(),
+            "success in another domain cannot erase this domain's short local cooldown"
+        );
+        assert!(
+            database
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    next_revision,
+                    enforced_failure_domains(),
+                    Some("node-c"),
+                )
+                .await
+                .unwrap()
+                .is_healthy(),
+            "retained local evidence cannot suppress peer domains"
+        );
     }
 
     #[tokio::test]

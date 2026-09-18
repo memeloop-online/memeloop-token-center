@@ -104,6 +104,7 @@ pub(crate) struct GroupRoutingHealth {
     pub(crate) cooldown_until: i64,
     pub(crate) probe_lease_until: i64,
     pub(crate) updated_at: i64,
+    pub(crate) local_connection_failure_at: Option<i64>,
 }
 
 impl GroupRoutingHealth {
@@ -270,15 +271,22 @@ impl Database {
         upstream_account_id: Uuid,
         credential_generation: i64,
         transport_revision: i64,
+        failure_domain: Option<&str>,
     ) -> Result<Option<GroupRoutingHealth>, AppError> {
         let row = sqlx::query(
             "SELECT health.consecutive_failures, health.last_failure_kind,
-                    health.cooldown_until, health.probe_lease_until, health.updated_at
+                    health.cooldown_until, health.probe_lease_until, health.updated_at,
+                    domain_health.last_failure_at AS local_connection_failure_at
              FROM upstream_accounts account
              LEFT JOIN upstream_account_health health
               ON health.upstream_account_id = account.id
               AND health.credential_generation = $3
               AND health.transport_revision = $4
+             LEFT JOIN upstream_connection_failure_domains domain_health
+              ON domain_health.upstream_account_id = health.upstream_account_id
+              AND domain_health.credential_generation = health.credential_generation
+              AND domain_health.transport_revision = health.transport_revision
+              AND domain_health.failure_domain = $5
              WHERE account.id = $1 AND account.tenant_id = $2
                AND account.status = 'active' AND account.credential_generation = $3
                AND account.updated_at = $4",
@@ -287,6 +295,7 @@ impl Database {
         .bind(tenant_id.to_string())
         .bind(credential_generation)
         .bind(transport_revision)
+        .bind(failure_domain.unwrap_or(""))
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
@@ -304,6 +313,7 @@ impl Database {
                     .try_get::<Option<i64>, _>("probe_lease_until")?
                     .unwrap_or(0),
                 updated_at: row.try_get::<Option<i64>, _>("updated_at")?.unwrap_or(0),
+                local_connection_failure_at: row.try_get("local_connection_failure_at")?,
             })
         })
         .transpose()
@@ -326,6 +336,7 @@ impl Database {
             upstream_account_id,
             credential_generation,
             transport_revision,
+            None,
         )
         .await
     }
@@ -343,6 +354,7 @@ impl Database {
         allow_transient_probe: bool,
         cooldown_override_ms: Option<u64>,
         transient_only: bool,
+        failure_domain: Option<&str>,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
         self.adopt_legacy_health_revision(
@@ -365,12 +377,23 @@ impl Database {
                 upstream_account_id,
                 credential_generation,
                 transport_revision,
+                failure_domain,
             )
             .await?
         else {
             return Ok(unavailable(0, 0, false));
         };
         if snapshot.consecutive_failures == 0 {
+            let local_cooldown_millis = cooldown_override_ms
+                .map(|duration| duration.min(60_000) as i64)
+                .unwrap_or(health.connection_cooldown_millis);
+            let local_cooldown_until = snapshot
+                .local_connection_failure_at
+                .map(|observed_at| observed_at.saturating_add(local_cooldown_millis))
+                .unwrap_or(0);
+            if health.failure_domain_enforcement_enabled && local_cooldown_until > now {
+                return Ok(unavailable(local_cooldown_until, 0, false));
+            }
             return Ok(
                 match self
                     .ensure_healthy_admission_epoch(
@@ -490,6 +513,7 @@ impl Database {
             allow_transient_probe,
             cooldown_override_ms,
             transient_only,
+            None,
         )
         .await
     }

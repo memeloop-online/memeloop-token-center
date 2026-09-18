@@ -143,6 +143,7 @@ pub(crate) async fn admit(
                 allow_probe,
                 Some(cooldown_ms),
                 false,
+                Some(crate::api::current_gateway_failure_domain()),
             )
             .await?
     } else {
@@ -153,6 +154,7 @@ pub(crate) async fn admit(
                 route.credential_generation,
                 route.transport_revision,
                 state.config.upstream_health,
+                Some(crate::api::current_gateway_failure_domain()),
             )
             .await?
     };

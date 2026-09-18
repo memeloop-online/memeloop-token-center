@@ -87,27 +87,29 @@ fn bounded_identity_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty() && value.len() <= 253)
 }
 
-fn gateway_failure_domain_identity() -> GatewayFailureDomainIdentity {
+fn gateway_failure_domain_identity() -> &'static GatewayFailureDomainIdentity {
     static IDENTITY: OnceLock<GatewayFailureDomainIdentity> = OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let pod = bounded_identity_value("MTC_GATEWAY_POD_NAME")
-                .or_else(|| bounded_identity_value("HOSTNAME"))
-                .unwrap_or_else(|| "unknown".to_owned());
-            let node = bounded_identity_value("MTC_GATEWAY_NODE_NAME");
-            let failure_domain = bounded_identity_value("MTC_GATEWAY_FAILURE_DOMAIN")
-                .or_else(|| node.clone())
-                // An unconfigured runtime intentionally forms one shared
-                // domain: it cannot manufacture cross-domain evidence from
-                // multiple processes on an unknown node.
-                .unwrap_or_else(|| "unassigned".to_owned());
-            GatewayFailureDomainIdentity {
-                pod,
-                node,
-                failure_domain,
-            }
-        })
-        .clone()
+    IDENTITY.get_or_init(|| {
+        let pod = bounded_identity_value("MTC_GATEWAY_POD_NAME")
+            .or_else(|| bounded_identity_value("HOSTNAME"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let node = bounded_identity_value("MTC_GATEWAY_NODE_NAME");
+        let failure_domain = bounded_identity_value("MTC_GATEWAY_FAILURE_DOMAIN")
+            .or_else(|| node.clone())
+            // An unconfigured runtime intentionally forms one shared
+            // domain: it cannot manufacture cross-domain evidence from
+            // multiple processes on an unknown node.
+            .unwrap_or_else(|| "unassigned".to_owned());
+        GatewayFailureDomainIdentity {
+            pod,
+            node,
+            failure_domain,
+        }
+    })
+}
+
+pub(crate) fn current_gateway_failure_domain() -> &'static str {
+    gateway_failure_domain_identity().failure_domain.as_str()
 }
 
 pub(crate) struct SharedProbePermit {
@@ -652,7 +654,7 @@ impl UpstreamAttemptGuard {
             upstream_account_id,
             credential_generation,
             transport_revision,
-            gateway_identity: gateway_failure_domain_identity(),
+            gateway_identity: gateway_failure_domain_identity().clone(),
             failure_epoch,
             lease_token,
             owns_probe_lease,
@@ -918,18 +920,6 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
-            if let Err(error) = state
-                .db
-                .clear_upstream_connection_failure_domain(
-                    upstream_account_id,
-                    credential_generation,
-                    transport_revision,
-                    &gateway_identity.failure_domain,
-                )
-                .await
-            {
-                tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="connection_failure_domain_recovery", "failed to clear recovered gateway failure domain");
-            }
             if let (Some(policy), Some(signal), Some(lease_token)) = (
                 directive
                     .as_ref()
@@ -1068,7 +1058,9 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 && !owns_probe_lease
                 && !matches!(
                     kind,
-                    UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. }
+                    UpstreamFailureKind::RateLimited
+                        | UpstreamFailureKind::RateLimitedUntil { .. }
+                        | UpstreamFailureKind::Authentication
                 )
             {
                 return;
@@ -1096,6 +1088,28 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 return;
             }
             let persisted = match lease_token {
+                Some(failure_epoch)
+                    if owns_probe_lease && kind == UpstreamFailureKind::Connection =>
+                {
+                    state
+                        .db
+                        .record_admitted_connection_failure_by_domain(
+                            crate::db::AdmittedConnectionFailure {
+                                request_id,
+                                upstream_account_id,
+                                credential_generation,
+                                transport_revision,
+                                failure_epoch,
+                                failure_stage,
+                                gateway_pod: &gateway_identity.pod,
+                                gateway_node: gateway_identity.node.as_deref(),
+                                failure_domain: &gateway_identity.failure_domain,
+                            },
+                            health,
+                        )
+                        .await
+                        .map(|result| result.global_breaker_opened)
+                }
                 Some(lease_token) => {
                     state
                         .db

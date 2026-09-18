@@ -2,6 +2,7 @@ use super::*;
 pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
+    current_gateway_failure_domain,
 };
 
 pub(crate) async fn classify_media_rate_limit(
@@ -313,6 +314,7 @@ async fn next_sendable_proxy_route(
                     allow_probe,
                     Some(cooldown_ms),
                     false,
+                    Some(routing::current_gateway_failure_domain()),
                 )
                 .await?
         } else {
@@ -323,6 +325,7 @@ async fn next_sendable_proxy_route(
                     planned.route.credential_generation,
                     planned.route.transport_revision,
                     state.config.upstream_health,
+                    Some(routing::current_gateway_failure_domain()),
                 )
                 .await?
         };
@@ -349,6 +352,7 @@ async fn next_sendable_proxy_route(
                 admission_reason,
                 cooldown_until,
                 probe_lease_until,
+                failure_domain = routing::current_gateway_failure_domain(),
                 stage = "upstream_admission_skip",
                 "proxy skipped an authorized upstream before sending"
             );
@@ -747,6 +751,7 @@ async fn execute_component_primary(
                 allow_probe,
                 Some(cooldown_ms),
                 false,
+                Some(routing::current_gateway_failure_domain()),
             )
             .await?
     } else {
@@ -758,6 +763,7 @@ async fn execute_component_primary(
                 primary.route.credential_generation,
                 primary.route.transport_revision,
                 request.state.config.upstream_health,
+                Some(routing::current_gateway_failure_domain()),
             )
             .await?
     };

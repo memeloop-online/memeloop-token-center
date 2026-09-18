@@ -34,7 +34,9 @@ pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_tran
 pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;
 pub(super) use probe::{SharedProbePermit, join_shared_probe};
-pub(crate) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
+pub(crate) use probe::{
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, current_gateway_failure_domain,
+};
 pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,

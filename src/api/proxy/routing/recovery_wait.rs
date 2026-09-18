@@ -236,6 +236,7 @@ pub(crate) async fn wait(
                             allow_probe,
                             Some(cooldown_ms),
                             true,
+                            Some(current_gateway_failure_domain()),
                         )
                         .await?
                 } else {
@@ -246,6 +247,7 @@ pub(crate) async fn wait(
                             route.credential_generation,
                             route.transport_revision,
                             state.config.upstream_health,
+                            Some(current_gateway_failure_domain()),
                         )
                         .await?
                 };

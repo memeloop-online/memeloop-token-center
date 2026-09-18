@@ -189,6 +189,104 @@ async fn codex_exhausted_pre_delivery_connection_retries_record_one_local_domain
 }
 
 #[tokio::test]
+async fn same_session_skips_only_the_current_failure_domain_without_replaying() {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(2)
+        .mount(&preferred)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&standby)
+        .await;
+    let mut fixture = resilient_route_fixture(
+        "same-session-local-domain-skip",
+        &[(preferred.uri(), 0), (standby.uri(), 10)],
+    )
+    .await;
+    std::sync::Arc::make_mut(&mut fixture.state.config)
+        .upstream_health
+        .connection_cooldown_millis = 10;
+    let session_id = "same-session-local-domain-skip";
+    let first = send_resilient_chat(&fixture, Some(session_id), false).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+
+    let preferred_account = fixture.accounts[0];
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let transport_revision: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+            .bind(preferred_account.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    let UpstreamAttemptAdmission::Healthy { failure_epoch } = fixture
+        .state
+        .db
+        .claim_upstream_account_attempt(preferred_account, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("preferred account must be healthy before local failure evidence");
+    };
+    fixture
+        .state
+        .db
+        .record_admitted_connection_failure_by_domain(
+            crate::db::AdmittedConnectionFailure {
+                request_id: Uuid::now_v7(),
+                upstream_account_id: preferred_account,
+                credential_generation: 1,
+                transport_revision,
+                failure_epoch,
+                failure_stage: "proxy_connect",
+                gateway_pod: "test-gateway",
+                gateway_node: None,
+                failure_domain: routing::current_gateway_failure_domain(),
+            },
+            fixture.state.config.upstream_health,
+        )
+        .await
+        .unwrap();
+
+    let second = send_resilient_chat(&fixture, Some(session_id), false).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let observed_at: i64 = sqlx::query_scalar(
+        "SELECT last_failure_at FROM upstream_connection_failure_domains
+         WHERE upstream_account_id = $1 AND failure_domain = $2",
+    )
+    .bind(preferred_account.to_string())
+    .bind(routing::current_gateway_failure_domain())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    while crate::db::unix_millis() <= observed_at + 10 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let third = send_resilient_chat(&fixture, Some(session_id), false).await;
+    assert_eq!(third.status(), StatusCode::OK);
+    let _ = to_bytes(third.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    preferred.verify().await;
+    standby.verify().await;
+}
+
+#[tokio::test]
 async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
     let (endpoint, upstream) = truncated_sse_upstream_endpoint(
         b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"private-secret\"}}",
