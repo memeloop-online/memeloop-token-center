@@ -2357,7 +2357,7 @@ async fn finish_component_provider_failure(
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
     }
-    finish_buffered_request(
+    finish_local_buffered_error(
         request,
         StatusCode::BAD_GATEWAY,
         Bytes::from_static(b"{\"error\":{\"message\":\"component provider request failed\"}}"),
@@ -2382,7 +2382,7 @@ async fn finish_proxy_failure(
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
     }
-    finish_buffered_request(
+    finish_local_buffered_error(
         request,
         StatusCode::BAD_GATEWAY,
         Bytes::from_static(
@@ -2396,6 +2396,67 @@ async fn finish_proxy_failure(
         Some(error_code.to_owned()),
     )
     .await
+}
+
+async fn finish_local_buffered_error(
+    request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
+    error_code: Option<String>,
+) -> Result<Response, AppError> {
+    finish_local_buffered_error_with_upstream_attribution(
+        request,
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        ProxyRequestUpstreamAttribution::KeepSelected,
+    )
+    .await
+}
+
+async fn finish_local_buffered_error_with_upstream_attribution(
+    request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
+    error_code: Option<String>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
+) -> Result<Response, AppError> {
+    const MAX_INLINE_LOCAL_ERROR_BYTES: usize = 4 * 1024;
+    if body.len() > MAX_INLINE_LOCAL_ERROR_BYTES || serde_json::from_slice::<Value>(&body).is_err()
+    {
+        return Err(AppError::Internal);
+    }
+    let body_text = std::str::from_utf8(&body).map_err(|_| AppError::Internal)?;
+    let stored_response = format!("inline-json:{body_text}");
+    finish_buffered_request_with_upstream_attribution_and_response_object(
+        request,
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        BufferedFinishPolicy {
+            upstream_attribution,
+            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+        },
+    )
+    .await
+}
+
+enum BufferedResponseStorage {
+    DurableArchive,
+    InlineLocalJson(String),
+}
+
+struct BufferedFinishPolicy {
+    upstream_attribution: ProxyRequestUpstreamAttribution,
+    response_storage: BufferedResponseStorage,
 }
 
 async fn finish_buffered_request(
@@ -2420,13 +2481,45 @@ async fn finish_buffered_request(
 
 async fn finish_buffered_request_with_upstream_attribution(
     request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
+    error_code: Option<String>,
+    upstream_attribution: ProxyRequestUpstreamAttribution,
+) -> Result<Response, AppError> {
+    finish_buffered_request_with_upstream_attribution_and_response_object(
+        request,
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        BufferedFinishPolicy {
+            upstream_attribution,
+            response_storage: BufferedResponseStorage::DurableArchive,
+        },
+    )
+    .await
+}
+
+async fn finish_buffered_request_with_upstream_attribution_and_response_object(
+    request: &BufferedRequest<'_>,
     mut status: StatusCode,
     mut body: Bytes,
     content_type: &str,
     usage: (TokenUsage, crate::model::RequestUsageBasis),
     mut error_code: Option<String>,
-    upstream_attribution: ProxyRequestUpstreamAttribution,
+    policy: BufferedFinishPolicy,
 ) -> Result<Response, AppError> {
+    let BufferedFinishPolicy {
+        upstream_attribution,
+        response_storage,
+    } = policy;
+    let inline_response_object = match response_storage {
+        BufferedResponseStorage::DurableArchive => None,
+        BufferedResponseStorage::InlineLocalJson(stored_response) => Some(stored_response),
+    };
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
     let usage = match crate::db::normalize_proxy_usage(
@@ -2461,11 +2554,12 @@ async fn finish_buffered_request_with_upstream_attribution(
     let capture_started = Instant::now();
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
     let base_capture_bytes = body.len().max(256);
-    let response_capture_admitted = request.memory.has_buffered_response()
-        || response_capture_permit.try_grow(
-            base_capture_bytes,
-            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        );
+    let response_capture_admitted = inline_response_object.is_none()
+        && (request.memory.has_buffered_response()
+            || response_capture_permit.try_grow(
+                base_capture_bytes,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            ));
     let response_capture_memory = response_capture_admitted.then(|| {
         request.state.metrics.memory_usage(
             crate::metrics::MemoryComponent::StreamCapture,
@@ -2489,23 +2583,26 @@ async fn finish_buffered_request_with_upstream_attribution(
     } else {
         None
     };
-    let response_archive = archive_body.as_ref().map_or_else(
-        || Err(AppError::Overloaded),
-        |archive_body| {
-            BufferedArchive::new(
-                crate::db::ArchiveSpoolIdentity {
-                    request_id,
-                    tenant_id: request.tenant_id,
-                    reservation_id: request.reservation.id,
-                },
-                crate::response_archive_spool::BufferedArchivePurpose::Response,
-                archive_body,
-                request.state.config.key_pepper.as_bytes(),
-                request.state.config.archive_spool_compression_enabled,
-            )
-        },
-    );
-    let stored_response = format!("gap://{request_id}/response");
+    let response_archive = inline_response_object.is_none().then(|| {
+        archive_body.as_ref().map_or_else(
+            || Err(AppError::Overloaded),
+            |archive_body| {
+                BufferedArchive::new(
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: request.tenant_id,
+                        reservation_id: request.reservation.id,
+                    },
+                    crate::response_archive_spool::BufferedArchivePurpose::Response,
+                    archive_body,
+                    request.state.config.key_pepper.as_bytes(),
+                    request.state.config.archive_spool_compression_enabled,
+                )
+            },
+        )
+    });
+    let stored_response =
+        inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
     let routing_session_id = request
         .conversation
         .as_ref()
@@ -2552,7 +2649,7 @@ async fn finish_buffered_request_with_upstream_attribution(
         "buffered_archive_settlement",
     );
     let result = match response_archive {
-        Ok(archive) => {
+        Some(Ok(archive)) => {
             lifecycle::finish_buffered_proxy_request_with_retry(
                 &request.state.db,
                 terminal,
@@ -2561,13 +2658,17 @@ async fn finish_buffered_request_with_upstream_attribution(
             )
             .await
         }
-        Err(_) => {
+        Some(Err(_)) => {
             tracing::warn!(
                 phase = "response_encrypt",
                 error_code = "capture_failed",
                 elapsed_ms = capture_started.elapsed().as_millis() as u64,
                 "proxy archive gap"
             );
+            finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
+                .await
+        }
+        None => {
             finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
                 .await
         }
