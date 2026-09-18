@@ -590,7 +590,6 @@ impl UpstreamAttemptGuard {
         admission: UpstreamAttemptAdmission,
         shared_probe_permit: Option<SharedProbePermit>,
     ) -> Self {
-        let state = state;
         let (lease_token, failure_epoch) = match admission {
             UpstreamAttemptAdmission::Probe { lease_token }
             | UpstreamAttemptAdmission::SharedProbe { lease_token } => (Some(lease_token), None),
