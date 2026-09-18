@@ -387,6 +387,46 @@ async fn sync_preserves_manual_and_last_known_preferred_prices() {
         .expect("preserved manual price");
     assert_eq!(manual.source, "manual");
     assert_eq!(manual.input_per_million, "100");
+    // Exercise the write boundary directly, bypassing the syncer's earlier
+    // source read: a manual write winning that interval must remain authoritative.
+    for tier in ["default", "priority"] {
+        database
+            .upsert_model_price_tier(
+                "openai/gpt-manual",
+                "USD",
+                tier,
+                Decimal::from(100),
+                Decimal::from(10),
+                Decimal::from(20),
+                Decimal::from(200),
+                false,
+            )
+            .await
+            .unwrap();
+        let preserved = database
+            .upsert_synced_model_price_tier(
+                "openai/gpt-manual",
+                "USD",
+                tier,
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::TWO,
+                "models.dev",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(preserved.source, "manual");
+        let saved = preserved
+            .tiers
+            .iter()
+            .find(|saved| saved.service_tier == tier)
+            .unwrap();
+        assert_eq!(saved.source, "manual");
+        assert_eq!(saved.input_per_million, "100");
+        assert_eq!(saved.cached_input_per_million, "10");
+    }
     let last_known = database
         .model_price_view("openai/gpt-priority", "USD")
         .await

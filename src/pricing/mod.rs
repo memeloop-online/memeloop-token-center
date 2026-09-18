@@ -215,18 +215,27 @@ async fn run_price_sync(
             .unwrap_or(price.input_per_million);
         let cache_estimated =
             price.cached_input_per_million.is_none() || price.cache_write_per_million.is_none();
-        db.upsert_synced_model_price_tier(
-            model,
-            currency,
-            &price.service_tier,
-            price.input_per_million,
-            cached,
-            cache_write,
-            price.output_per_million,
-            price.source,
-            cache_estimated,
-        )
-        .await?;
+        let written = db
+            .upsert_synced_model_price_tier(
+                model,
+                currency,
+                &price.service_tier,
+                price.input_per_million,
+                cached,
+                cache_write,
+                price.output_per_million,
+                price.source,
+                cache_estimated,
+            )
+            .await?;
+        if written
+            .tiers
+            .iter()
+            .any(|tier| tier.service_tier == price.service_tier && tier.source == "manual")
+        {
+            preserved.push(model.clone());
+            continue;
+        }
         imported += 1;
         matched.push(model.clone());
     }

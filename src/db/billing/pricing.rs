@@ -168,8 +168,11 @@ impl Database {
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         if service_tier == "default" {
-            sqlx::query(
-                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at",
+            // The caller's earlier source read is advisory: an operator may
+            // have committed a manual price since then. Decide under the write
+            // lock, preserving the base row and its default tier together.
+            let updated = sqlx::query(
+                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at WHERE model_prices.source <> 'manual'",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(model)
@@ -180,15 +183,13 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-        } else if sqlx::query("SELECT id FROM model_prices WHERE model = $1 AND currency = $2")
-            .bind(model)
-            .bind(&currency)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_none()
-        {
-            sqlx::query(
-                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            if updated.rows_affected() == 0 {
+                tx.commit().await?;
+                return self.model_price_view(model, &currency).await;
+            }
+        } else {
+            let inserted = sqlx::query(
+                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO NOTHING",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(model)
@@ -199,20 +200,22 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            upsert_price_tier(
-                &mut tx,
-                model,
-                &currency,
-                "default",
-                input_micros,
-                cached_input_micros,
-                cache_write_micros,
-                output_micros,
-                source,
-                now,
-                true,
-            )
-            .await?;
+            if inserted.rows_affected() == 1 {
+                upsert_price_tier(
+                    &mut tx,
+                    model,
+                    &currency,
+                    "default",
+                    input_micros,
+                    cached_input_micros,
+                    cache_write_micros,
+                    output_micros,
+                    source,
+                    now,
+                    true,
+                )
+                .await?;
+            }
         }
         upsert_price_tier(
             &mut tx,
@@ -598,7 +601,7 @@ async fn upsert_price_tier(
     // deferred transaction that first reads and then upgrades to a writer can fail immediately
     // with SQLITE_BUSY when a background worker owns the writer slot, bypassing busy_timeout.
     let result = sqlx::query(
-        "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 FROM model_prices WHERE model = $2 AND currency = $3 ON CONFLICT(model, currency, service_tier) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, cached_input_micros_per_million = excluded.cached_input_micros_per_million, cache_write_micros_per_million = excluded.cache_write_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at, cache_price_estimated = excluded.cache_price_estimated",
+        "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 FROM model_prices WHERE model = $2 AND currency = $3 ON CONFLICT(model, currency, service_tier) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, cached_input_micros_per_million = excluded.cached_input_micros_per_million, cache_write_micros_per_million = excluded.cache_write_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at, cache_price_estimated = excluded.cache_price_estimated WHERE excluded.source = 'manual' OR model_price_tiers.source <> 'manual'",
     )
     .bind(Uuid::now_v7().to_string())
     .bind(model)
