@@ -180,6 +180,11 @@ async fn sqlite_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
     assert_eq!(health.get::<i64, _>("credential_generation"), 7);
     assert_eq!(health.get::<String, _>("last_failure_kind"), "connection");
     assert_eq!(health.get::<i64, _>("updated_at"), now);
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 67, i64::MAX)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     sqlx::query(
         "UPDATE upstream_account_health SET cooldown_until = 0
          WHERE upstream_account_id = $1",

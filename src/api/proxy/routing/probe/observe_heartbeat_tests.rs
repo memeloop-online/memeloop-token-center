@@ -96,6 +96,7 @@ async fn terminal_observe_keeps_half_open_lease_alive_until_fenced_settlement() 
         Uuid::now_v7(),
         account,
         1,
+        0,
         admission,
         None,
     );

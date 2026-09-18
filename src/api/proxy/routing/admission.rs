@@ -76,6 +76,7 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
             planned.route.route_id,
             planned.route.account_id,
             planned.route.credential_generation,
+            planned.route.transport_revision,
             admission,
             shared_probe_permit,
         )

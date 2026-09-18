@@ -193,15 +193,15 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
+pub(crate) use routing::{
+    AdmittedConnectionFailure, GrantedModelCapabilitySource, UpstreamAttemptAdmission,
+    UpstreamFailureKind, UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
+};
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteCreateDisposition,
     RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
-};
-pub(crate) use routing::{
-    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
-    upstream_probe_heartbeat_interval,
 };
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,

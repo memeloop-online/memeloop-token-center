@@ -566,6 +566,7 @@ fn override_is_transient_only_and_bounded() {
         cooldown_until: 500,
         probe_lease_until: 0,
         updated_at: 100,
+        local_connection_failure_at: None,
     };
     assert_eq!(snapshot.effective_cooldown_until(Some(u64::MAX)), 60_100);
     assert_eq!(snapshot.effective_cooldown_until(None), 500);

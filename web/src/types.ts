@@ -100,6 +100,20 @@ export interface RequestDetail extends RequestView {
     external_request_id: string;
     proof_digest: string;
   };
+  transport_diagnostics?: RequestTransportDiagnostic[];
+}
+
+export interface RequestTransportDiagnostic {
+  upstream_account_id: string;
+  route_id: string;
+  credential_generation: number;
+  transport_revision: number;
+  failure_kind: string;
+  failure_stage: string;
+  gateway_pod: string;
+  gateway_node?: string;
+  failure_domain: string;
+  observed_at: number;
 }
 
 export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_bound' | 'archive_gap';

@@ -227,23 +227,27 @@ pub(crate) async fn wait(
                 {
                     state
                         .db
-                        .claim_upstream_account_attempt_with_strategy(
+                        .claim_upstream_account_attempt_at_revision_with_strategy(
                             snapshot.tenant_id,
                             route.account_id,
                             route.credential_generation,
+                            route.transport_revision,
                             state.config.upstream_health,
                             allow_probe,
                             Some(cooldown_ms),
                             true,
+                            Some(current_gateway_failure_domain()),
                         )
                         .await?
                 } else {
                     state
                         .db
-                        .claim_transient_recovery_attempt(
+                        .claim_transient_recovery_attempt_at_revision(
                             route.account_id,
                             route.credential_generation,
+                            route.transport_revision,
                             state.config.upstream_health,
+                            Some(current_gateway_failure_domain()),
                         )
                         .await?
                 };
@@ -265,6 +269,7 @@ pub(crate) async fn wait(
                             route.route_id,
                             route.account_id,
                             route.credential_generation,
+                            route.transport_revision,
                             admission,
                             None,
                         );

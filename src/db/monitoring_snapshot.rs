@@ -759,8 +759,8 @@ mod tests {
                 "INSERT INTO upstream_account_health (
                      upstream_account_id, consecutive_failures, cooldown_until,
                      probe_lease_until, last_failure_kind, updated_at,
-                     credential_generation
-                 ) VALUES ($1, $2, $3, 0, '', 700, $4)",
+                     credential_generation, transport_revision
+                 ) VALUES ($1, $2, $3, 0, '', 700, $4, 1)",
             )
             .bind(&upstream_account_id)
             .bind(consecutive_failures)

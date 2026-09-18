@@ -483,22 +483,24 @@ async fn put_accounts_in_cooldown(fixture: &HintRoutingFixture, account_ids: &[u
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let now = unix_millis();
     for account_id in account_ids {
-        let credential_generation: i64 =
-            sqlx::query_scalar("SELECT credential_generation FROM upstream_accounts WHERE id = $1")
-                .bind(account_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (credential_generation, transport_revision): (i64, i64) = sqlx::query_as(
+            "SELECT credential_generation, updated_at FROM upstream_accounts WHERE id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO upstream_account_health (
                  upstream_account_id, consecutive_failures, cooldown_until,
                  probe_lease_until, probe_lease_token, credential_generation,
-                 last_failure_kind, updated_at
-             ) VALUES ($1, 1, $2, 0, '', $3, 'rate_limited', $4)",
+                 transport_revision, last_failure_kind, updated_at
+             ) VALUES ($1, 1, $2, 0, '', $3, $4, 'rate_limited', $5)",
         )
         .bind(account_id.to_string())
         .bind(now.saturating_add(60_000))
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(now)
         .execute(&pool)
         .await

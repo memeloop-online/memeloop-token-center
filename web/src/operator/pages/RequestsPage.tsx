@@ -427,7 +427,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
 }
 
 function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
@@ -441,6 +441,7 @@ function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detai
       <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
       <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
       {detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}
+      {detail.transport_diagnostics?.length ? <><h3>{locale === 'zh-CN' ? '上游传输诊断' : 'Upstream transport diagnostics'}</h3><pre>{JSON.stringify(detail.transport_diagnostics, null, 2)}</pre></> : null}
     </section>}
   </DrawerFrame>;
 }

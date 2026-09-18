@@ -88,8 +88,16 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
     assert!(matches!(admission, UpstreamAttemptAdmission::Probe { .. }));
     let request = Uuid::now_v7();
     let gate = crate::group_routing::test_observe_gate::install(request);
-    let guard =
-        MediaAttemptGuard::new(&state, request, Uuid::now_v7(), account, 1, admission, None);
+    let guard = MediaAttemptGuard::new(
+        &state,
+        request,
+        Uuid::now_v7(),
+        account,
+        1,
+        0,
+        admission,
+        None,
+    );
     // This is the exact helper used only after a successful job CAS. Cancel
     // its caller while the actual observed completion is demonstrably live.
     let caller = tokio::spawn(complete_committed(guard, MediaAttemptTerminal::Succeeded));

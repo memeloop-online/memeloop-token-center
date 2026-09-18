@@ -79,6 +79,17 @@ pub(in crate::api::proxy) enum TransportFailureKind {
 }
 
 impl TransportFailureKind {
+    pub(in crate::api::proxy) const fn failure_stage(&self) -> &'static str {
+        match self {
+            Self::Timeout => "request_timeout",
+            Self::ConnectionReset => "response_connection_reset",
+            Self::Body => "response_body",
+            Self::Decode => "response_decode",
+            Self::Request => "request",
+            Self::Other => "transport",
+        }
+    }
+
     pub(in crate::api::proxy) const fn diagnostic_outcome(&self) -> &'static str {
         match self {
             Self::Timeout => "transport_timeout_delivery_unknown",

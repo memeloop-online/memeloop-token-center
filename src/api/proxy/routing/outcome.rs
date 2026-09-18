@@ -81,6 +81,27 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
     }
 }
 
+pub(in crate::api::proxy) fn attempt_failure_stage(
+    result: &Result<ProxyRouteResponse, ProxySendError>,
+) -> &'static str {
+    match result {
+        Err(ProxySendError::RetryableConnection(stage)) => stage,
+        Err(ProxySendError::NonRetryableTransport(kind)) => kind.failure_stage(),
+        Err(ProxySendError::OuterDeadline) => "request_deadline",
+        Err(
+            ProxySendError::RetryableCodexBadRequest
+            | ProxySendError::CodexBadRequest
+            | ProxySendError::AmbiguousResponse(_),
+        )
+        | Ok(_) => "upstream_response",
+        Err(
+            ProxySendError::CandidateUnavailable
+            | ProxySendError::CredentialUnavailable
+            | ProxySendError::Credential,
+        ) => "request_preparation",
+    }
+}
+
 fn classify_response_failure(
     status: StatusCode,
     rate_limit: Option<UpstreamFailureKind>,
@@ -168,24 +189,27 @@ mod tests {
 
     #[test]
     fn ambiguous_transport_failure_cools_account_without_permitting_replay() {
-        let result = Err(ProxySendError::NonRetryableTransport(
-            TransportFailureKind::ConnectionReset,
-        ));
-        assert_eq!(
-            classify_attempt_failure(&result, None),
-            Some((
-                UpstreamFailureKind::Connection,
-                UpstreamHealthReason::Connection
-            ))
-        );
-        assert_eq!(
-            failover_disposition(
-                None,
-                Some(&ProxySendError::NonRetryableTransport(
-                    TransportFailureKind::ConnectionReset,
-                )),
+        for (kind, stage) in [
+            (
+                TransportFailureKind::ConnectionReset,
+                "response_connection_reset",
             ),
-            FailoverDisposition::Stop
-        );
+            (TransportFailureKind::Request, "request"),
+            (TransportFailureKind::Timeout, "request_timeout"),
+        ] {
+            let result = Err(ProxySendError::NonRetryableTransport(kind));
+            assert_eq!(
+                classify_attempt_failure(&result, None),
+                Some((
+                    UpstreamFailureKind::Connection,
+                    UpstreamHealthReason::Connection
+                ))
+            );
+            assert_eq!(
+                failover_disposition(None, result.as_ref().err()),
+                FailoverDisposition::Stop
+            );
+            assert_eq!(attempt_failure_stage(&result), stage);
+        }
     }
 }

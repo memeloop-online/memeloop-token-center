@@ -2,6 +2,7 @@ use super::*;
 pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
+    current_gateway_failure_domain,
 };
 
 pub(crate) async fn classify_media_rate_limit(
@@ -304,23 +305,27 @@ async fn next_sendable_proxy_route(
         {
             state
                 .db
-                .claim_upstream_account_attempt_with_strategy(
+                .claim_upstream_account_attempt_at_revision_with_strategy(
                     snapshot.tenant_id,
                     planned.route.account_id,
                     planned.route.credential_generation,
+                    planned.route.transport_revision,
                     state.config.upstream_health,
                     allow_probe,
                     Some(cooldown_ms),
                     false,
+                    Some(routing::current_gateway_failure_domain()),
                 )
                 .await?
         } else {
             state
                 .db
-                .claim_upstream_account_attempt_with_health_config(
+                .claim_upstream_account_attempt_at_revision_with_health_config(
                     planned.route.account_id,
                     planned.route.credential_generation,
+                    planned.route.transport_revision,
                     state.config.upstream_health,
+                    Some(routing::current_gateway_failure_domain()),
                 )
                 .await?
         };
@@ -347,6 +352,7 @@ async fn next_sendable_proxy_route(
                 admission_reason,
                 cooldown_until,
                 probe_lease_until,
+                failure_domain = routing::current_gateway_failure_domain(),
                 stage = "upstream_admission_skip",
                 "proxy skipped an authorized upstream before sending"
             );
@@ -443,6 +449,7 @@ async fn next_sendable_proxy_route(
             state,
             planned.route.account_id,
             planned.route.credential_generation,
+            planned.route.transport_revision,
             transport_policy.shared_probe_attempts,
         )
         .await?
@@ -735,24 +742,28 @@ async fn execute_component_primary(
         request
             .state
             .db
-            .claim_upstream_account_attempt_with_strategy(
+            .claim_upstream_account_attempt_at_revision_with_strategy(
                 snapshot.tenant_id,
                 primary.route.account_id,
                 primary.route.credential_generation,
+                primary.route.transport_revision,
                 request.state.config.upstream_health,
                 allow_probe,
                 Some(cooldown_ms),
                 false,
+                Some(routing::current_gateway_failure_domain()),
             )
             .await?
     } else {
         request
             .state
             .db
-            .claim_upstream_account_attempt_with_health_config(
+            .claim_upstream_account_attempt_at_revision_with_health_config(
                 primary.route.account_id,
                 primary.route.credential_generation,
+                primary.route.transport_revision,
                 request.state.config.upstream_health,
+                Some(routing::current_gateway_failure_domain()),
             )
             .await?
     };
@@ -783,6 +794,7 @@ async fn execute_component_primary(
             primary.route.route_id,
             primary.route.account_id,
             primary.route.credential_generation,
+            primary.route.transport_revision,
             admission,
             None,
         )),
@@ -1437,7 +1449,11 @@ async fn proxy_with_identity_and_conversation_spool(
                 "proxy upstream attempt failed"
             );
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Failed { kind, reason })
+                .complete(UpstreamAttemptTerminal::Failed {
+                    kind,
+                    reason,
+                    failure_stage: routing::attempt_failure_stage(&result),
+                })
                 .await;
         }
         let disposition = routing::failover_disposition(
@@ -2125,6 +2141,13 @@ async fn execute_component_provider(
                     .complete(UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Connection,
                         reason: UpstreamHealthReason::Connection,
+                        failure_stage: if error.is_connect() {
+                            "connect"
+                        } else if error.is_timeout() {
+                            "request_timeout"
+                        } else {
+                            "request"
+                        },
                     })
                     .await;
             }
@@ -2140,6 +2163,7 @@ async fn execute_component_provider(
                 UpstreamAttemptTerminal::Failed {
                     kind,
                     reason: UpstreamHealthReason::RateLimited,
+                    failure_stage: "upstream_response",
                 }
             } else {
                 drop(upstream);
@@ -2150,11 +2174,13 @@ async fn execute_component_provider(
                     UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Authentication,
                         reason: UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else if upstream_status.is_server_error() {
                     UpstreamAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Unavailable,
                         reason: UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else {
                     UpstreamAttemptTerminal::Inconclusive

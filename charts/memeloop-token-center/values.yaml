@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 107
+  schemaVersion: 108
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -151,6 +151,11 @@ config:
     unavailableCooldownMillis: 15000
     invalidResponseCooldownMillis: 15000
     connectionCooldownMillis: 5000
+    # Two-phase rollout contract: deploy v108-capable binaries everywhere
+    # with this disabled first. Enable only in a later rollout after no legacy
+    # gateway/worker remains; observe mode cannot globally isolate an account
+    # from a single runtime failure domain.
+    failureDomainEnforcementEnabled: false
   # Register CPU/heap diagnostic handlers only on an internal control/all
   # deployment during an incident. They remain disabled by default and are
   # never rendered for gateway or worker roles.

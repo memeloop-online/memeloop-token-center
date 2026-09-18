@@ -134,23 +134,27 @@ pub(crate) async fn admit(
     {
         state
             .db
-            .claim_upstream_account_attempt_with_strategy(
+            .claim_upstream_account_attempt_at_revision_with_strategy(
                 tenant_id,
                 route.account_id,
                 route.credential_generation,
+                route.transport_revision,
                 state.config.upstream_health,
                 allow_probe,
                 Some(cooldown_ms),
                 false,
+                Some(crate::api::current_gateway_failure_domain()),
             )
             .await?
     } else {
         state
             .db
-            .claim_upstream_account_attempt_with_health_config(
+            .claim_upstream_account_attempt_at_revision_with_health_config(
                 route.account_id,
                 route.credential_generation,
+                route.transport_revision,
                 state.config.upstream_health,
+                Some(crate::api::current_gateway_failure_domain()),
             )
             .await?
     };
@@ -186,6 +190,7 @@ pub(crate) async fn admit(
             route.route_id,
             route.account_id,
             route.credential_generation,
+            route.transport_revision,
             admission,
             None,
         )),

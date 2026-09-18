@@ -89,7 +89,7 @@ impl Database {
             FROM input
             JOIN model_routes r ON r.id = input.route_id AND r.tenant_id = $1
             JOIN upstream_accounts a ON a.id = input.account_id AND a.tenant_id = $1
-            LEFT JOIN upstream_account_health h ON h.upstream_account_id = a.id AND h.credential_generation = input.generation
+            LEFT JOIN upstream_account_health h ON h.upstream_account_id = a.id AND h.credential_generation = input.generation AND h.transport_revision = a.updated_at
         ), bindings AS (
             SELECT c.route_id, c.account_id, g.id, g.routing_priority, g.strategy_version, g.routing_strategy, 'provider' AS kind, c.health, c.generation
             FROM candidate_scope c

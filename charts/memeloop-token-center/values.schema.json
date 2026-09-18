@@ -71,7 +71,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 107 },
+        "schemaVersion": { "type": "integer", "const": 108 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -172,6 +172,7 @@
             "unavailableCooldownMillis",
             "invalidResponseCooldownMillis",
             "connectionCooldownMillis"
+            ,"failureDomainEnforcementEnabled"
           ],
           "properties": {
             "probeLeaseMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
@@ -180,6 +181,7 @@
             "unavailableCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
             "invalidResponseCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
             "connectionCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 }
+            ,"failureDomainEnforcementEnabled": { "type": "boolean" }
           },
           "description": "Shared upstream account circuit-breaker cooldowns and exclusive half-open probe timing in milliseconds. The application rejects a heartbeat that is not shorter than the lease."
         },

@@ -152,6 +152,7 @@ SELECT target.upstream_account_id,
          ON deleted.upstream_account_id = target.upstream_account_id
   LEFT JOIN upstream_account_health health
          ON health.upstream_account_id = account.id
+        AND health.transport_revision = account.updated_at
  ORDER BY target.upstream_account_id ASC"#,
     ))
 }

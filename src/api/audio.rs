@@ -280,6 +280,7 @@ pub(super) async fn create_audio_transcription(
                     .complete(MediaAttemptTerminal::Failed {
                         kind,
                         reason: crate::metrics::UpstreamHealthReason::RateLimited,
+                        failure_stage: "upstream_response",
                     })
                     .await;
                 finish_audio_failure(
@@ -302,11 +303,13 @@ pub(super) async fn create_audio_transcription(
                     MediaAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Authentication,
                         reason: crate::metrics::UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else if upstream_status.is_server_error() {
                     MediaAttemptTerminal::Failed {
                         kind: crate::db::UpstreamFailureKind::Unavailable,
                         reason: crate::metrics::UpstreamHealthReason::Unavailable,
+                        failure_stage: "upstream_response",
                     }
                 } else {
                     MediaAttemptTerminal::Inconclusive
@@ -735,6 +738,7 @@ fn audio_transport_failure() -> MediaAttemptTerminal {
     MediaAttemptTerminal::Failed {
         kind: crate::db::UpstreamFailureKind::Connection,
         reason: crate::metrics::UpstreamHealthReason::Connection,
+        failure_stage: "transport",
     }
 }
 
@@ -1088,6 +1092,7 @@ mod tests {
             MediaAttemptTerminal::Failed {
                 kind: crate::db::UpstreamFailureKind::Connection,
                 reason: crate::metrics::UpstreamHealthReason::Connection,
+                ..
             }
         ));
     }

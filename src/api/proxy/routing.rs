@@ -31,10 +31,12 @@ pub(super) use codex::quota::classify_rate_limit;
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
-pub(super) use outcome::{classify_attempt_failure, failover_disposition};
+pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;
 pub(super) use probe::{SharedProbePermit, join_shared_probe};
-pub(crate) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
+pub(crate) use probe::{
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, current_gateway_failure_domain,
+};
 pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
