@@ -284,8 +284,8 @@ async fn hot_path_parity(database: &Database) {
 
     if matches!(database.backend, DatabaseBackend::Sqlite) {
         // The core history tables have no key/principal foreign keys. The
-        // authoritative joins hide such stale facts, and the specialized
-        // eligible-key CTE must do the same.
+        // authoritative statistics and specialized pricing projection must
+        // both retain their durable facts after a product identity is removed.
         let principal_id: String =
             sqlx::query_scalar("SELECT principal_id FROM key_records WHERE id = $1")
                 .bind(key.to_string())
