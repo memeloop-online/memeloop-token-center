@@ -936,6 +936,7 @@ impl Database {
             } else {
                 (self.begin_write_transaction().await?, None)
             };
+            lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
             BudgetHold::set_phase(&mut hold, "terminal_owner");
             // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
             // Capture the observation boundary only after that wait so live writes
@@ -1834,6 +1835,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     usage_basis: Option<crate::model::RequestUsageBasis>,
     metered_usage: Option<MeteredRequestUsage<'_>>,
 ) -> Result<bool, AppError> {
+    lock_request_stats_projection_writer_in_transaction(tx).await?;
     let request_id = request.request_id.to_string();
     let locator = sqlx::query(
         "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
@@ -1882,7 +1884,6 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Ok(false);
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
-    lock_request_stats_projection_in_transaction(tx).await?;
     if project_aggregates {
         sqlx::query(
             "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",

@@ -564,6 +564,7 @@ impl Database {
         validate_generation_preparation_error(error_code)?;
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let locked = sqlx::query(
             "UPDATE generation_jobs SET updated_at = updated_at WHERE id = $1 AND key_id = $2 AND status = 'preparing'",
         )
@@ -593,6 +594,7 @@ impl Database {
     pub async fn expire_preparing_generation_jobs(&self, limit: i64) -> Result<u64, AppError> {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT id FROM generation_jobs WHERE status = 'preparing' AND lease_expires_at <= $1 ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED LIMIT $2"
@@ -844,6 +846,7 @@ impl Database {
     ) -> Result<GenerationJobView, AppError> {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"

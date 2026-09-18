@@ -135,7 +135,7 @@ impl Database {
         }
 
         let mut transaction = self.begin_write_transaction().await?;
-        lock_request_stats_projection_in_transaction(&mut transaction).await?;
+        lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
         let candidates = select_candidates(
             &mut transaction,
             self.backend,
@@ -1087,7 +1087,7 @@ mod tests {
             .fetch_one(&mut *gate_tx)
             .await
             .unwrap();
-        lock_request_stats_projection_in_transaction(&mut gate_tx)
+        lock_request_stats_projection_rebuild_in_transaction(&mut gate_tx)
             .await
             .unwrap();
         let first = Database::connect_with_max(database_url, 1).await.unwrap();
@@ -1143,7 +1143,7 @@ mod tests {
             .fetch_one(&mut *stats_gate_tx)
             .await
             .unwrap();
-        lock_request_stats_projection_in_transaction(&mut stats_gate_tx)
+        lock_request_stats_projection_rebuild_in_transaction(&mut stats_gate_tx)
             .await
             .unwrap();
 
@@ -1154,9 +1154,9 @@ mod tests {
             .unwrap();
         let source_writer_task = tokio::spawn(async move {
             let mut transaction = source_writer.begin_write_transaction().await?;
+            lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
             lock_request_records_projection_source_in_transaction(&mut transaction).await?;
             lock_generation_jobs_projection_source_in_transaction(&mut transaction).await?;
-            lock_request_stats_projection_in_transaction(&mut transaction).await?;
             transaction.commit().await?;
             Ok::<(), AppError>(())
         });
@@ -1169,14 +1169,14 @@ mod tests {
             .unwrap();
         let prune_task = tokio::spawn(async move {
             let mut transaction = prune.begin_write_transaction().await?;
+            lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
             sqlx::query("LOCK TABLE request_records, generation_jobs IN SHARE MODE")
                 .execute(&mut *transaction)
                 .await?;
-            lock_request_stats_projection_in_transaction(&mut transaction).await?;
             transaction.commit().await?;
             Ok::<(), AppError>(())
         });
-        wait_for_postgres_blocker(observer, prune_pid, source_writer_pid).await;
+        wait_for_postgres_blocker(observer, prune_pid, stats_gate_pid).await;
         stats_gate_tx.commit().await.unwrap();
         let (source_writer_result, prune_result) =
             tokio::time::timeout(std::time::Duration::from_secs(10), async {

@@ -108,6 +108,7 @@ impl Database {
         .to_hex()
         .to_string();
         let mut tx = self.begin_write_transaction().await?;
+        lock_request_stats_projection_writer_in_transaction(&mut tx).await?;
         // Tenant lifecycle writers lock this row before touching scoped actor
         // credentials. Preserve that order and retain the lock through replay
         // or settlement, not merely through an earlier API authorization read.
