@@ -35,6 +35,44 @@ tokio::task_local! {
     static TEST_MAX_PROXY_RESPONSE_BODY: usize;
 }
 
+#[cfg(test)]
+pub(super) mod finalization_test_gate {
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    pub(crate) struct Gate {
+        pub(crate) entered: Notify,
+        pub(crate) release: Notify,
+    }
+
+    static GATES: LazyLock<Mutex<std::collections::HashMap<Uuid, Weak<Gate>>>> =
+        LazyLock::new(Default::default);
+
+    pub(crate) fn install(request_id: Uuid) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut gates = GATES.lock().unwrap();
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        gates.insert(request_id, Arc::downgrade(&gate));
+        gate
+    }
+
+    pub(super) async fn wait(request_id: Uuid) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .remove(&request_id)
+            .and_then(|gate| gate.upgrade());
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+}
+
 fn streaming_response_body_limit() -> usize {
     #[cfg(test)]
     if let Ok(limit) = TEST_MAX_PROXY_RESPONSE_BODY.try_with(|limit| *limit) {
@@ -899,6 +937,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             }
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            drop(terminal_delivery);
+            drop(responses_streaming_sanitizer);
             let classification = classify_streaming_terminal(
                 status_code,
                 protocol,
@@ -906,6 +946,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 transport_error,
                 sse_summary.as_ref(),
             );
+            // Framing and terminal-delivery buffers are gone once the stream
+            // has a final classification. Return their process-wide envelope
+            // before routing publication or request settlement can block on
+            // database work.
+            drop(_sse_streaming_memory.take());
             let routing_terminal_observed_at = conversation
                 .as_ref()
                 .and_then(|conversation| conversation.hints.session_id.as_ref())
@@ -960,6 +1005,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let response_archive_attempt = None;
             let terminal_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
+            #[cfg(test)]
+            finalization_test_gate::wait(request_id).await;
             finalize_streaming_lifecycle(StreamingFinalizationInput {
                 output_timing,
                 state: &background_state,
