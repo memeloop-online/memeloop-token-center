@@ -4,8 +4,8 @@ title: 统一模型入口
 titleTemplate: false
 hero:
   name: Memeloop Token Center
-  text: 一个入口，连接你的模型服务
-  tagline: 集中管理上游账号、模型路由与访问权限，在同一界面查看请求和用量。
+  text: 团队多模型 AI 网关
+  tagline: 集中连接上游账号、编排模型路由、签发客户端凭据，在同一工作台掌握请求、用量与费用。
   actions:
     - theme: brand
       text: 开始使用
@@ -14,19 +14,25 @@ hero:
       text: 开发插件
       link: /zh/plugins/
 features:
-  - title: 按需连接
-    details: 接入不同上游，用路由组组织模型，为应用分配合适的访问权限。
+  - title: 汇聚上游服务
+    details: 集中接入 OAuth 与 API Key 账号，用可复用的路由组组织模型。
     link: /zh/guide/routing
-  - title: 看清每次请求
-    details: 在请求列表中对照模型、凭据、词元用量、费用与响应表现。
+  - title: 跟踪每次请求
+    details: 在同一时间线对照模型、凭据、词元用量、本地结算与响应表现。
     link: /zh/guide/requests
-  - title: 持续扩展
-    details: 通过插件扩展路由与管理界面，按业务需要组合能力。
+  - title: 扩展网关能力
+    details: 通过版本化 Wasm 插件添加路由策略、OAuth 适配、协议支持与管理视图。
     link: /zh/plugins/
 ---
 
-## 一眼了解服务运行状态
+## 探索产品界面
 
-![MTC 总览中的请求趋势、用量与上游剩余额度](/images/overview.png)
+三个真实产品视图，呈现从配置到日常运营的完整动线。
 
-来自真实运行界面；身份信息已替换，统计数据保留。
+<ProductGallery locale="zh" />
+
+## 从你的工作入口开始
+
+- **运营人员：** [连接上游账号](/zh/guide/upstreams)、[编排模型路由](/zh/guide/routing)、[签发客户端凭据](/zh/guide/credentials)。
+- **应用团队：** 通过 [API 指南](/zh/guide/api)接入服务，在[请求视图](/zh/guide/requests)中查看运行情况。
+- **插件开发者：** 了解[扩展模型](/zh/plugins/)，跟随[开发指南](/zh/plugins/development)构建插件。
