@@ -45,7 +45,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
       assert.equal(await endpointLabel.count(), 1, 'endpoint help belongs to its field label, not a duplicate row');
       await endpointLabel.focus();
       await page.getByRole('tooltip').waitFor();
-      assert.match(await page.getByRole('tooltip').innerText(), /不是网络代理/);
+      assert.match(await page.getByRole('tooltip').innerText(), /网络出口在账号网络代理中配置/);
       await page.keyboard.press('Escape');
       assert.equal(await page.locator('.provider-directory details').count(), 0);
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);

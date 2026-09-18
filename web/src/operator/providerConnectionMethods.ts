@@ -8,13 +8,13 @@ export function isKimiDeviceProvider(provider?: Pick<ProviderType, 'id' | 'sourc
     && provider.oauth_adapter?.flow_kind === 'kimi_device';
 }
 
-/** Creation support follows the native OAuth start contracts, not all OAuth plugins. */
-export function oauthCreationProxyMode(provider?: ProviderType): 'required' | 'optional' | 'none' {
-  if (provider?.oauth_adapter?.flow_kind === 'openai_device') return 'required';
-  if (provider?.source === 'builtin' && ((provider.id === 'cursor' && provider.oauth_adapter?.flow_kind === 'cursor_pkce')
-    || (provider.id === 'github-copilot' && provider.oauth_adapter?.flow_kind === 'github_device_copilot')
-    || isKimiDeviceProvider(provider))) return 'optional';
-  return 'none';
+/**
+ * Every interactive provider uses the same optional account egress choice.
+ * Adapter implementations receive the selected proxy as transport metadata;
+ * users on a directly connected network simply leave it off.
+ */
+export function oauthCreationProxyMode(provider?: ProviderType): 'optional' | 'none' {
+  return provider?.oauth_adapter ? 'optional' : 'none';
 }
 
 function objectValue(value: unknown): JsonSchema | undefined {

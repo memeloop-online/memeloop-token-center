@@ -40,7 +40,7 @@ When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示�
     assert.equal(route.request().method(), 'POST');
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
       driver: 'openai-codex',
-      verification_url: 'https://auth.openai.com/device',
+      verification_url: new URL('/ui-assets/token-center-icon-32.png?oauth-login=1', baseURL).toString(),
       user_code: 'SAFE-CODE',
       session_token: 'browser-codex-session',
       expires_at: Date.now() + 600_000,
@@ -280,12 +280,27 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await page.keyboard.press('Escape');
   await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await onboarding.getByLabel('上游名称').fill('codex-primary');
-  assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true);
+  assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), true, 'Codex supports the server default egress');
+  await onboarding.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
+  assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true, 'the selected proxy waits for a valid address');
   await onboarding.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
   await onboarding.getByRole('button', { name: '开始登录', exact: true }).click();
-  await assertContains(onboarding.getByRole('status'), '仅当这次登录由你刚刚发起时');
-  await assertContains(onboarding.getByRole('status'), 'SAFE-CODE');
-  await assertAttribute(onboarding.getByRole('link', { name: '打开授权页', exact: true }), 'href', 'https://auth.openai.com/device');
+  const deviceAuthorization = onboarding.locator('.device-authorization');
+  await assertContains(deviceAuthorization, '在 OpenAI 页面确认本次登录');
+  await assertContains(deviceAuthorization, 'SAFE-CODE');
+  const loginUrl = new URL('/ui-assets/token-center-icon-32.png?oauth-login=1', baseURL).toString();
+  const copyLogin = onboarding.getByRole('button', { name: '复制登录地址', exact: true });
+  const openLogin = onboarding.getByRole('link', { name: '打开授权页', exact: true });
+  await assertAttribute(openLogin, 'href', loginUrl);
+  await assertAttribute(openLogin, 'target', '_blank');
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await copyLogin.click();
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), loginUrl);
+  const popupPromise = page.context().waitForEvent('page');
+  await openLogin.click();
+  const popup = await popupPromise;
+  await popup.waitForURL(/token-center-icon-32\.png\?oauth-login=1$/);
+  await popup.close();
   await assertVisible(onboarding.getByRole('button', { name: '检查授权结果', exact: true }));
   const polledCodex = page.waitForResponse((response) => response.url().endsWith('/internal/v1/oauth/codex/poll') && response.request().method() === 'POST');
   await onboarding.getByRole('button', { name: '检查授权结果', exact: true }).click();
@@ -304,7 +319,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(onboarding.getByLabel('Service provider'));
   await assertContains(onboarding.getByLabel('Service provider'), 'OpenAI Codex');
   assert.equal(await onboarding.getByLabel('Service provider').isDisabled(), true, 'an in-progress authorization keeps its selected provider locked');
-  await assertContains(onboarding.getByRole('status'), 'Continue on OpenAI only if you just started this login.');
+  await assertContains(deviceAuthorization, 'Confirm this login on OpenAI');
   await assertNotContains(page.locator('body'), 'CPA');
   await assertNotContains(page.locator('body'), 'Bridge');
   await assertNotContains(page.locator('body'), 'Subscription bridge');

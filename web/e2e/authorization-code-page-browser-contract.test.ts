@@ -40,7 +40,7 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     await page.getByRole('button', { name: '开始登录', exact: true }).click();
     await page.getByLabel('完整回调地址', { exact: true }).fill('http://localhost/cb?code=fixture&state=fixture');
     await page.getByRole('button', { name: '完成授权', exact: true }).click();
-    const readFailure = page.getByText('账号已保存，但暂时无法刷新账号列表。请重试读取列表，无需重新登录或再次提交授权码。', { exact: true });
+    const readFailure = page.getByText('账号已保存。重新读取账号列表即可查看。', { exact: true });
     await readFailure.waitFor();
     assert.equal(completeCalls, 1); assert.equal(failedReads, 1);
     assert.equal(await page.getByRole('button', { name: '完成授权', exact: true }).count(), 0);

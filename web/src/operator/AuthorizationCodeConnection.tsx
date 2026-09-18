@@ -12,6 +12,7 @@ import type { ProviderType, UpstreamAccount } from '../types';
 import { ProxyInput } from './UpstreamConnection';
 import { isGenericProxyUrlInput } from './upstreamConnectionPolicy';
 import { authorizationCodeCopy } from './authorizationCodeCopy';
+import { OAuthLoginLinkActions } from './OAuthLoginLinkActions';
 import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, type AuthorizationCodeSession } from './authorizationCode';
 import { fluentFormWidgets } from './FluentFormWidgets';
 
@@ -95,8 +96,8 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     <p>{copy.network}: {existing ? copy.retainedNetwork : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
     {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
     {!existing && !session && !submitted && <>
-      <Checkbox label={copy.proxy} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
-      {useProxy && <ProxyInput generic value={proxy} onChange={setProxy} disabled={busy} />}
+      <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
+      {useProxy && <ProxyInput generic required value={proxy} onChange={setProxy} disabled={busy} hint={t('connection.oauthProxyHint')} />}
       <h3>{copy.config}</h3>
       <RjsfForm schema={localizeSchema(provider.config_schema as RJSFSchema, locale)} formData={config} onChange={({ formData }) => setConfig(formData ?? {})} disabled={busy} validator={safeValidator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData ?? {})}>
         <Button appearance="primary" type="submit" disabled={!token || !tenant || !name.trim() || busy || (useProxy && !isGenericProxyUrlInput(proxy.trim()))}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>
@@ -104,7 +105,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     </>}
     {session && !submitted && <>
       <p role="status">{copy.waiting}</p><p>{copy.expires}: {new Date(session.expires_at).toLocaleString(locale)}</p>
-      <a className="button secondary" href={session.login_url} target="_blank" rel="noopener noreferrer">{t('common.openAuthorization')}</a>
+      <OAuthLoginLinkActions url={session.login_url} />
       <label>{copy.callback}<Input type="password" autoComplete="off" spellCheck={false} value={callback} disabled={busy} onChange={event => setCallback(event.target.value)} /></label>
       <p className="field-hint">{copy.callbackHelp}</p>
       <Button appearance="primary" type="button" disabled={busy || !validAuthorizationCallback(callback)} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button>
