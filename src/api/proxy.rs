@@ -2418,7 +2418,7 @@ async fn finish_local_buffered_error(
     .await
 }
 
-pub(super) async fn finish_local_buffered_error_with_upstream_attribution(
+async fn finish_local_buffered_error_with_upstream_attribution(
     request: &BufferedRequest<'_>,
     status: StatusCode,
     body: Bytes,
