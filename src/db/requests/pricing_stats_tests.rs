@@ -356,18 +356,18 @@ fn pricing_query_has_only_model_projection_and_disjoint_indexable_edges() {
     assert!(!query.contains("GROUPING SETS"));
     assert!(!query.contains("filtered_activity AS MATERIALIZED"));
     assert!(!query.contains("DENSE_RANK"));
-    // The visibility relation is built once; the six activity arms only join
-    // its compact `(key_id, tenant_id)` projection. Actual result equivalence
-    // (including orphaned principal/key cases) is exercised above.
+    // The durable identity relation is built once from retained facts; the six
+    // activity arms only join its compact `(key_id, tenant_id)` projection.
     assert_eq!(
         query
             .matches("pricing_visible_keys AS MATERIALIZED")
             .count(),
         1
     );
-    assert_eq!(query.matches("FROM key_records").count(), 1);
-    assert_eq!(query.matches("JOIN principals").count(), 1);
-    assert_eq!(query.matches("JOIN tenants").count(), 1);
+    assert_eq!(query.matches("FROM key_records").count(), 0);
+    assert_eq!(query.matches("JOIN principals").count(), 0);
+    assert_eq!(query.matches("JOIN tenants").count(), 0);
+    assert_eq!(query.matches("UNION SELECT key_id, tenant_id").count(), 3);
     assert_eq!(query.matches("JOIN pricing_visible_keys").count(), 6);
     assert_eq!(query.matches("AND f.created_at < $3").count(), 2);
     assert_eq!(
