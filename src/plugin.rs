@@ -2356,7 +2356,7 @@ fn load_operator_ui_modules(
 ) -> Result<BTreeMap<String, Arc<[u8]>>, AppError> {
     use sha2::{Digest, Sha256};
 
-    let mut modules = BTreeMap::new();
+    let mut modules: BTreeMap<String, Arc<[u8]>> = BTreeMap::new();
     for contribution in &mut manifest.contributions.operator_ui {
         let Some(entry) = contribution.module_entry.as_deref() else {
             continue;
