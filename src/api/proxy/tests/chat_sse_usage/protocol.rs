@@ -446,7 +446,15 @@ fn chat_sse_accepts_a_fragmented_event_above_the_legacy_limit_without_accounting
 
     let terminal = [
         chat_finish("chatcmpl-large"),
-        chat_usage_only("chatcmpl-large", usage(9, 3, 12)),
+        chat_usage_only(
+            "chatcmpl-large",
+            json!({
+                "prompt_tokens": 9,
+                "completion_tokens": 3,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 4},
+            }),
+        ),
         done().to_owned(),
     ]
     .concat();
