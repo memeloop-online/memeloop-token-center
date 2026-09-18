@@ -75,11 +75,30 @@ pub(super) fn normalize_codex_multi_agent_v2(
 
     prepare_codex_multi_agent_v2_tools(request, true)?;
     if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
-        for item in input {
+        let mut normalized = Vec::with_capacity(input.len());
+        let mut last_opaque_agent = None;
+        let mut last_readable_user_or_agent = None;
+        for (index, mut item) in input.clone().into_iter().enumerate() {
             if item.get("type").and_then(Value::as_str) == Some("agent_message") {
-                rewrite_agent_message(item)?;
+                if rewrite_agent_message(&mut item)? {
+                    last_readable_user_or_agent = Some(index);
+                    normalized.push(item);
+                } else {
+                    last_opaque_agent = Some(index);
+                }
+            } else {
+                if has_readable_user_message(&item) {
+                    last_readable_user_or_agent = Some(index);
+                }
+                normalized.push(item);
             }
         }
+        if last_opaque_agent.is_some_and(|opaque| {
+            last_readable_user_or_agent.is_none_or(|readable| readable < opaque)
+        }) {
+            return Err(malformed_agent_message());
+        }
+        *input = normalized;
     }
     Ok(())
 }
@@ -156,7 +175,43 @@ fn malformed_agent_message() -> AppError {
     )
 }
 
-fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
+fn has_readable_user_message(item: &Value) -> bool {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        None | Some("message")
+    ) || item.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return false;
+    }
+    match item.get("content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(parts)) => {
+            parts
+                .iter()
+                .any(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text" | "text") => part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    Some("input_image") => part
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| !url.trim().is_empty()),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+fn agent_envelope_has_empty_payload(text: &str) -> bool {
+    text.starts_with("Message Type:")
+        && text
+            .split_once("Payload:")
+            .is_some_and(|(_, payload)| payload.trim().is_empty())
+}
+
+fn rewrite_agent_message(item: &mut Value) -> Result<bool, AppError> {
     let content = item
         .get("content")
         .and_then(Value::as_array)
@@ -166,21 +221,13 @@ fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
         return Err(malformed_agent_message());
     }
 
+    let carries_encrypted_content = content
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("encrypted_content"));
     let mut sanitized_content = Vec::with_capacity(content.len());
-    for mut part in content {
+    for part in content {
         if part.get("type").and_then(Value::as_str) == Some("encrypted_content") {
-            let text = part
-                .get("encrypted_content")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(malformed_agent_message)?;
-            let Some(part) = part.as_object_mut() else {
-                return Err(malformed_agent_message());
-            };
-            part.insert("type".into(), Value::String("input_text".into()));
-            part.insert("text".into(), Value::String(text));
-            part.remove("encrypted_content");
+            continue;
         }
 
         let sanitized = match part.get("type").and_then(Value::as_str) {
@@ -188,15 +235,18 @@ fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
                 let text = part
                     .get("text")
                     .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
+                    .filter(|text| !text.trim().is_empty())
                     .ok_or_else(malformed_agent_message)?;
+                if carries_encrypted_content && agent_envelope_has_empty_payload(text) {
+                    continue;
+                }
                 serde_json::json!({"type":"input_text", "text":text})
             }
             Some("input_image") => {
                 let image_url = part
                     .get("image_url")
                     .and_then(Value::as_str)
-                    .filter(|image_url| !image_url.is_empty())
+                    .filter(|image_url| !image_url.trim().is_empty())
                     .ok_or_else(malformed_agent_message)?;
                 let mut sanitized = serde_json::json!({
                     "type": "input_image",
@@ -212,6 +262,14 @@ fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
         sanitized_content.push(sanitized);
     }
 
+    if sanitized_content.is_empty() {
+        return if carries_encrypted_content {
+            Ok(false)
+        } else {
+            Err(malformed_agent_message())
+        };
+    }
+
     // An agent envelope is an internal transport shape.  Once it becomes a
     // normal user message, retain only the standard message fields and the
     // allow-listed content fields above; author/recipient and passthrough
@@ -222,7 +280,7 @@ fn rewrite_agent_message(item: &mut Value) -> Result<(), AppError> {
         item.insert("role".into(), Value::String("user".into()));
         item.insert("content".into(), Value::Array(sanitized_content));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -372,7 +430,7 @@ mod tests {
             }}],
             "input": [{"type":"agent_message","role":"system",
                 "internal_chat_message_metadata_passthrough":{"turn_id":"keep-for-native"},
-                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
+                "content":[{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]
             }]
         });
 
@@ -401,8 +459,8 @@ mod tests {
             "input": [{"type":"agent_message","role":"system",
                 "internal_chat_message_metadata_passthrough":{"turn_id":"turn"},
                 "content":[
-                    {"type":"input_text","text":"prefix"},
-                    {"type":"encrypted_content","encrypted_content":"delegated task","trace":"keep"}
+                    {"type":"input_text","text":"delegated task"},
+                    {"type":"encrypted_content","encrypted_content":"opaque-ciphertext","trace":"keep"}
                 ]
             }]
         });
@@ -417,31 +475,32 @@ mod tests {
         );
         assert!(request["input"][0].get("author").is_none());
         assert!(request["input"][0].get("recipient").is_none());
-        assert_eq!(request["input"][0]["content"][1]["type"], "input_text");
-        assert_eq!(request["input"][0]["content"][1]["text"], "delegated task");
+        assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(request["input"][0]["content"][0]["text"], "delegated task");
         assert!(
-            request["input"][0]["content"][1]
+            request["input"][0]["content"][0]
                 .get("encrypted_content")
                 .is_none()
         );
-        assert!(request["input"][0]["content"][1].get("trace").is_none());
+        assert!(request["input"][0]["content"][0].get("trace").is_none());
+        assert!(!request.to_string().contains("opaque-ciphertext"));
     }
 
     #[test]
-    fn opaque_agent_message_is_rejected_without_mutating_native_shape() {
+    fn opaque_agent_part_is_omitted_when_readable_agent_content_remains() {
         let mut request = json!({
             "input": [{"type":"agent_message","role":"system", "content":[
                 {"type":"input_text","text":"prefix"},
                 {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
             ]}]
         });
-        assert!(normalize_codex_multi_agent_v2(&mut request, true).is_err());
+        normalize_codex_multi_agent_v2(&mut request, true).unwrap();
 
-        assert_eq!(request["input"][0]["type"], "agent_message");
-        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(request["input"][0]["type"], "message");
+        assert_eq!(request["input"][0]["role"], "user");
         assert_eq!(
-            request["input"][0]["content"][1]["encrypted_content"]["ciphertext"],
-            "opaque"
+            request["input"][0]["content"],
+            json!([{"type":"input_text","text":"prefix"}])
         );
     }
 
@@ -452,9 +511,54 @@ mod tests {
             json!({"type":"agent_message"}),
             json!({"type":"agent_message","content":[{"type":"future_content"}]}),
             json!({"type":"agent_message","content":[{"type":"input_text","text":""}]}),
+            json!({"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            ]}),
         ] {
             let mut request = json!({"input":[item]});
             assert!(normalize_codex_multi_agent_v2(&mut request, true).is_err());
         }
+    }
+
+    #[test]
+    fn opaque_agent_history_is_omitted_only_when_followed_by_readable_intent() {
+        let opaque = json!({"type":"agent_message","role":"system","content":[
+            {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+            {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
+        ]});
+
+        let mut historical = json!({"input":[
+            opaque.clone(),
+            {"type":"message","role":"user","content":"continue with the visible task"}
+        ]});
+        normalize_codex_multi_agent_v2(&mut historical, true).unwrap();
+        assert_eq!(historical["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            historical["input"][0]["content"],
+            "continue with the visible task"
+        );
+        assert!(!historical.to_string().contains("opaque-ciphertext"));
+
+        let mut current = json!({"input":[
+            {"type":"message","role":"user","content":"earlier visible request"},
+            opaque
+        ]});
+        assert!(normalize_codex_multi_agent_v2(&mut current, true).is_err());
+
+        let mut whitespace_history = json!({"input":[
+            {"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
+            ]},
+            {"type":"message","role":"user","content":"   \n"}
+        ]});
+        assert!(normalize_codex_multi_agent_v2(&mut whitespace_history, true).is_err());
+
+        let mut whitespace_agent = json!({"input":[
+            {"type":"agent_message","content":[
+                {"type":"input_text","text":"\n"},
+                {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
+            ]}
+        ]});
+        assert!(normalize_codex_multi_agent_v2(&mut whitespace_agent, true).is_err());
     }
 }

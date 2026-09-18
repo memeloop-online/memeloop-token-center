@@ -77,32 +77,115 @@ pub(in crate::api) fn tools(request: &Value) -> BTreeMap<String, (ToolIdentity, 
     result
 }
 
-fn content(value: &Value) -> Value {
+fn content(value: &Value) -> Result<Value, AppError> {
     let Some(parts) = value.as_array() else {
-        return value.clone();
+        return Ok(value.clone());
     };
-    Value::Array(
-        parts
-            .iter()
-            .map(|part| match part["type"].as_str().unwrap_or("input_text") {
-                "input_text" | "output_text" | "text" => json!({"type":"text","text":part["text"]}),
-                "input_image" => {
-                    let mut image =
-                        json!({"type":"image_url","image_url":{"url":part["image_url"]}});
-                    if let Some(detail) = part["detail"].as_str() {
-                        image["image_url"]["detail"] = Value::String(
-                            if detail == "original" { "high" } else { detail }.into(),
-                        );
-                    }
-                    image
+    let mut converted = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part["type"].as_str().unwrap_or("input_text") {
+            "input_text" | "output_text" | "text" => {
+                let text = part["text"].as_str().ok_or_else(|| {
+                    AppError::BadRequest("Responses-via-Chat text content must contain text".into())
+                })?;
+                converted.push(json!({"type":"text","text":text}));
+            }
+            "input_image" => {
+                let image_url = part["image_url"]
+                    .as_str()
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Responses-via-Chat image content must contain an image URL".into(),
+                        )
+                    })?;
+                let mut image = json!({"type":"image_url","image_url":{"url":image_url}});
+                if let Some(detail) = part["detail"].as_str() {
+                    image["image_url"]["detail"] =
+                        Value::String(if detail == "original" { "high" } else { detail }.into());
                 }
-                _ => part.clone(),
-            })
-            .collect(),
-    )
+                converted.push(image);
+            }
+            // Encrypted host state is carried by Responses between compatible
+            // clients and providers. A Chat upstream cannot consume it.
+            "encrypted_content" => {}
+            kind => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported Responses message content for Responses-via-Chat: {kind}"
+                )));
+            }
+        }
+    }
+    if converted.is_empty() {
+        return Err(AppError::BadRequest(
+            "Responses-via-Chat message has no readable content".into(),
+        ));
+    }
+    Ok(Value::Array(converted))
 }
 
-fn validate_tools(value: &Value) -> Result<(), AppError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolBridgeDisposition {
+    Translate,
+    OmitHostManaged,
+    Reject,
+}
+
+fn tool_bridge_disposition(kind: &str) -> ToolBridgeDisposition {
+    match kind {
+        "function" | "custom" | "namespace" => ToolBridgeDisposition::Translate,
+        // Codex may advertise this Responses host tool even when the current
+        // task does not use it. Chat transports have no equivalent contract,
+        // so an unused declaration is left with the Responses host instead of
+        // being represented as a function the upstream could falsely invoke.
+        "web_search" => ToolBridgeDisposition::OmitHostManaged,
+        _ => ToolBridgeDisposition::Reject,
+    }
+}
+
+fn tool_choice_references_kind(choice: &Value, kind: &str) -> bool {
+    match choice {
+        Value::String(value) => value == kind || value == "required",
+        Value::Array(values) => values.iter().any(|value| {
+            value.get("type").and_then(Value::as_str) == Some(kind)
+                || value
+                    .get("tools")
+                    .is_some_and(|nested| tool_choice_references_kind(nested, kind))
+        }),
+        Value::Object(object) => {
+            object.get("type").and_then(Value::as_str) == Some(kind)
+                || object
+                    .get("tools")
+                    .is_some_and(|tools| tool_choice_references_kind(tools, kind))
+        }
+        _ => false,
+    }
+}
+
+fn input_references_host_tool(request: &Value, kind: &str) -> bool {
+    let call = format!("{kind}_call");
+    let call_output = format!("{kind}_call_output");
+    request["input"].as_array().is_some_and(|input| {
+        input.iter().any(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_kind| {
+                    item_kind == kind
+                        || item_kind == call.as_str()
+                        || item_kind == call_output.as_str()
+                })
+        })
+    })
+}
+
+fn request_references_host_tool(request: &Value, kind: &str) -> bool {
+    request
+        .get("tool_choice")
+        .is_some_and(|choice| tool_choice_references_kind(choice, kind))
+        || input_references_host_tool(request, kind)
+}
+
+fn validate_tools(request: &Value, value: &Value) -> Result<(), AppError> {
     let Some(tools) = value.as_array() else {
         return Err(AppError::BadRequest(
             "Responses-via-Chat tools must be an array".into(),
@@ -110,10 +193,20 @@ fn validate_tools(value: &Value) -> Result<(), AppError> {
     };
     for tool in tools {
         let kind = tool["type"].as_str().unwrap_or("function");
-        match kind {
-            "function" | "custom" => {}
-            "namespace" => validate_tools(&tool["tools"])?,
-            _ => {
+        match tool_bridge_disposition(kind) {
+            ToolBridgeDisposition::Translate => {
+                if kind == "namespace" {
+                    validate_tools(request, &tool["tools"])?;
+                }
+            }
+            ToolBridgeDisposition::OmitHostManaged => {
+                if request_references_host_tool(request, kind) {
+                    return Err(AppError::BadRequest(format!(
+                        "Responses-via-Chat cannot preserve an active Responses host tool: {kind}"
+                    )));
+                }
+            }
+            ToolBridgeDisposition::Reject => {
                 return Err(AppError::BadRequest(format!(
                     "unsupported Responses tool type for Responses-via-Chat: {kind}"
                 )));
@@ -147,18 +240,18 @@ fn validate_image_details(value: &Value) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Reject request features that this bridge cannot preserve exactly. The
-/// gateway must not advertise a tool/image capability and then silently drop
-/// or downgrade it while converting Responses to Chat.
+/// Enforce the declared Responses-to-Chat capability boundary. Model-visible
+/// tools require an exact mapping. Reviewed host-managed declarations may be
+/// omitted while idle because Chat transports cannot execute them.
 pub(super) fn validate_bridge_features(request: &Value) -> Result<(), AppError> {
     validate_image_details(request)?;
     if request.get("tools").is_some() {
-        validate_tools(&request["tools"])?;
+        validate_tools(request, &request["tools"])?;
     }
     if let Some(input) = request["input"].as_array() {
         for item in input {
             if item["type"] == "additional_tools" {
-                validate_tools(&item["tools"])?;
+                validate_tools(request, &item["tools"])?;
             }
         }
     }
@@ -169,18 +262,18 @@ fn combine(existing: &mut String, incoming: &str) {
     if incoming.trim().is_empty() || existing == incoming {
         return;
     }
-    if existing.is_empty() || existing == "[reasoning unavailable]" {
+    if existing.is_empty() {
         *existing = incoming.into();
-    } else if incoming != "[reasoning unavailable]" {
+    } else {
         existing.push_str("\n\n");
         existing.push_str(incoming);
     }
 }
 
 /// Inter-agent messages are user-level input, never privileged instructions.
-/// The common request normalizer converts readable string encrypted payloads
-/// before this function runs. Any opaque/non-string payload still fails closed
-/// rather than being guessed at.
+/// The common request normalizer removes host-owned encrypted payloads before
+/// this function runs. Only independently readable content crosses the Chat
+/// boundary; opaque state is never guessed at or presented as task text.
 fn agent_message(item: &Value) -> Result<Value, AppError> {
     let parts = item["content"].as_array().ok_or_else(|| {
         AppError::BadRequest("Responses-via-Chat agent messages require readable content".into())
@@ -294,15 +387,16 @@ pub(in crate::api) fn convert_with_dialect(
                             .collect::<String>()
                     })
                     .unwrap_or_default();
-                combine(
-                    &mut reasoning,
-                    if summary.is_empty() {
-                        "[reasoning unavailable]"
-                    } else {
-                        &summary
-                    },
-                );
+                combine(&mut reasoning, &summary);
             }
+            // Encrypted compaction is opaque state owned by a Responses host.
+            // Visible messages and tool history remain authoritative for Chat
+            // routes; any future readable compaction shape needs an explicit
+            // mapping before it can cross this boundary.
+            "compaction"
+                if item.get("encrypted_content").is_some()
+                    && item.get("content").is_none()
+                    && item.get("summary").is_none() => {}
             "function_call" | "custom_tool_call" => {
                 if preserve_reasoning {
                     combine(
@@ -344,7 +438,7 @@ pub(in crate::api) fn convert_with_dialect(
             "function_call_output" | "custom_tool_call_output" => {
                 let id = item["call_id"].as_str().unwrap_or("");
                 let body = if item["output"].is_array() {
-                    content(&item["output"])
+                    content(&item["output"])?
                 } else if item["output"].is_string() {
                     item["output"].clone()
                 } else {
@@ -360,7 +454,7 @@ pub(in crate::api) fn convert_with_dialect(
             "message" => {
                 let role = item["role"].as_str().unwrap_or("user");
                 let mut message = json!({"role":if role == "developer" {"user"} else {role},
-                    "content":content(&item["content"])});
+                    "content":content(&item["content"])?});
                 if role == "assistant" {
                     if preserve_reasoning {
                         combine(
@@ -474,25 +568,23 @@ mod tests {
     }
 
     #[test]
-    fn normalized_encrypted_agent_payload_preserves_task_text_without_metadata() {
-        for content in [
-            json!([{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
-                {"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
-            json!([{"type":"encrypted_content","encrypted_content":"secret-ciphertext-fixture"}]),
-        ] {
-            let mut request = json!({"input":[{"type":"agent_message",
-                "author":"/root", "recipient":"/root/worker",
-                "internal_chat_message_metadata_passthrough":{"instruction":"never forward this"},
-                "content":content}]});
-            crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
-                .unwrap();
-            assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
-            let output = convert(&request).unwrap();
-            assert_eq!(output["messages"][0]["role"], "user");
-            assert!(output.to_string().contains("secret-ciphertext-fixture"));
-            assert!(!output.to_string().contains("encrypted_content"));
-            assert!(!output.to_string().contains("never forward this"));
-        }
+    fn normalized_encrypted_agent_payload_preserves_only_independent_task_text() {
+        let mut request = json!({"input":[{"type":"agent_message",
+        "author":"/root", "recipient":"/root/worker",
+        "internal_chat_message_metadata_passthrough":{"instruction":"never forward this"},
+        "content":[
+            {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\ndelegated task"},
+            {"type":"encrypted_content","encrypted_content":"opaque-ciphertext-fixture"}
+        ]}]});
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+            .unwrap();
+        assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
+        let output = convert(&request).unwrap();
+        assert_eq!(output["messages"][0]["role"], "user");
+        assert!(output.to_string().contains("delegated task"));
+        assert!(!output.to_string().contains("opaque-ciphertext-fixture"));
+        assert!(!output.to_string().contains("encrypted_content"));
+        assert!(!output.to_string().contains("never forward this"));
     }
 
     #[test]
@@ -538,11 +630,12 @@ mod tests {
                 .get("encrypted")
                 .is_none()
         );
-        assert_eq!(request["input"][1]["content"][1]["type"], "input_text");
+        assert_eq!(request["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(
-            request["input"][1]["content"][1]["text"],
-            "delegated task fixture"
+            request["input"][1]["content"][0]["text"],
+            "Message Type: NEW_TASK\nPayload:\ndelegated task fixture"
         );
+        assert!(!request.to_string().contains("opaque-ciphertext-fixture"));
 
         let output = convert(&request).expect("fixture converts to Responses-via-Chat");
         let spawn_agent = output["tools"]
@@ -662,6 +755,113 @@ mod tests {
             "tools":[{"type":"function","name":"same","parameters":{}}]});
         assert!(!tools(&request)["same"].0.custom);
         assert!(convert(&request).is_err());
+    }
+
+    #[test]
+    fn unused_host_web_search_is_omitted_while_model_visible_tools_survive() {
+        let request = json!({
+            "input": [
+                {"role":"user","content":"delegate this task"},
+                {"type":"additional_tools","tools":[
+                    {"type":"web_search"},
+                    {"type":"custom","name":"patch"}
+                ]}
+            ],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"function","name":"lookup","parameters":{"type":"object"}},
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+                ]}
+            ],
+            "tool_choice": "auto"
+        });
+
+        let converted = convert(&request).unwrap();
+        let names = converted["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["collaboration__spawn_agent", "lookup", "patch"])
+        );
+        assert!(!converted.to_string().contains("web_search"));
+        assert_eq!(converted["tool_choice"], "auto");
+
+        let named_required = convert(&json!({
+            "input":"hello",
+            "tools":[
+                {"type":"web_search"},
+                {"type":"function","name":"required","parameters":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"function","name":"required"}
+        }))
+        .unwrap();
+        assert_eq!(
+            named_required["tool_choice"]["function"]["name"],
+            "required"
+        );
+    }
+
+    #[test]
+    fn active_host_web_search_and_other_builtin_tools_fail_closed() {
+        for request in [
+            json!({"input":"hello","tools":[{"type":"web_search"}],
+                "tool_choice":{"type":"web_search"}}),
+            json!({"input":"hello","tools":[{"type":"web_search"}],
+                "tool_choice":"required"}),
+            json!({"input":[{"type":"web_search_call","id":"search"}],
+                "tools":[{"type":"web_search"}]}),
+            json!({"input":"hello","tools":[
+                {"type":"computer_use_preview","display_width":1024}
+            ]}),
+        ] {
+            assert!(convert(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn opaque_host_state_is_omitted_without_losing_visible_history() {
+        let request = json!({
+            "input": [
+                {"role":"user","content":[
+                    {"type":"input_text","text":"visible task"},
+                    {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+                ]},
+                {"type":"reasoning","encrypted_content":{"ciphertext":"opaque"},
+                    "summary":[{"type":"summary_text","text":"visible summary"}]},
+                {"type":"compaction","encrypted_content":{"ciphertext":"opaque"}},
+                {"role":"assistant","content":[
+                    {"type":"output_text","text":"visible answer"}
+                ]}
+            ]
+        });
+
+        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        let wire = converted.to_string();
+        assert!(wire.contains("visible task"));
+        assert!(wire.contains("visible summary"));
+        assert!(wire.contains("visible answer"));
+        assert!(!wire.contains("encrypted_content"));
+        assert!(!wire.contains("ciphertext"));
+        assert!(!wire.contains("compaction"));
+
+        assert!(
+            convert(&json!({"input":[{"role":"user","content":[
+                {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            ]}]}))
+            .is_err()
+        );
+        for content in [
+            json!([]),
+            json!([{"type":"input_text"}]),
+            json!([{"type":"input_image","image_url":""}]),
+        ] {
+            assert!(convert(&json!({"input":[{"role":"user","content":content}]})).is_err());
+        }
     }
 
     #[test]

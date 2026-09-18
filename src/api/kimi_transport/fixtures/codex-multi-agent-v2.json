@@ -91,8 +91,8 @@
         "instruction": "never forward this metadata as a prompt"
       },
       "content": [
-        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
-        {"type": "encrypted_content", "encrypted_content": "delegated task fixture"}
+        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\ndelegated task fixture"},
+        {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext-fixture"}
       ]
     },
     {

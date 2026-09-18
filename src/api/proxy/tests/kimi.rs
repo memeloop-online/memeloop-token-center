@@ -373,9 +373,12 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         &json!({
             "model": fixture.model,
             "input": "buffered delegated task",
-            "tools": [{"type":"namespace","name":"collaboration","tools":[
-                {"type":"function","name":"followup_task","parameters":{"type":"object"}}
-            ]}],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+                ]}
+            ],
             "stream": false
         }),
         "application/json",
@@ -439,11 +442,22 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         &fixture,
         &json!({
             "model": fixture.model,
-            "input": [{"type":"agent_message","author":"/root","recipient":"/worker",
-                "content":[{"type":"input_text","text":"readable delegated task"}]}],
-            "tools": [{"type":"namespace","name":"collaboration","tools":[
-                {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
-            ]}],
+            "input": [
+                {"type":"additional_tools","tools":[
+                    {"type":"web_search"},
+                    {"type":"namespace","name":"collaboration","tools":[
+                        {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+                    ]}
+                ]},
+                {"type":"compaction","encrypted_content":{"ciphertext":"host-state"}},
+                {"type":"reasoning","summary":[],
+                    "encrypted_content":{"ciphertext":"host-state"}},
+                {"type":"agent_message","author":"/root","recipient":"/worker",
+                    "content":[
+                        {"type":"input_text","text":"readable delegated task"},
+                        {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
+                    ]}
+            ],
             "stream": true
         }),
         "text/event-stream",
@@ -463,6 +477,19 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
     assert!(streamed_body.contains(r#""namespace":"collaboration""#));
     assert!(streamed_body.contains(r#""encrypted_function_args":[]"#));
     upstream.verify().await;
+    let forwarded = upstream.received_requests().await.unwrap();
+    assert_eq!(forwarded.len(), 2);
+    for request in forwarded {
+        let body: Value = request.body_json().unwrap();
+        assert!(!body.to_string().contains("web_search"));
+        assert!(body["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with("collaboration__"))
+            })
+        }));
+    }
 }
 
 #[test]

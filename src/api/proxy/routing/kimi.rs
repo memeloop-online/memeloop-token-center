@@ -530,7 +530,10 @@ mod tests {
             "model": "public-model",
             "input": [{"type":"agent_message","role":"system",
                 "author":"internal",
-                "content":[{"type":"encrypted_content","encrypted_content":"delegated task"}]
+                "content":[
+                    {"type":"input_text","text":"delegated task"},
+                    {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
+                ]
             }]
         });
         let (forwarded, _) = prepare_forwarded_request(
@@ -549,6 +552,7 @@ mod tests {
             forwarded["messages"][0]["content"][0]["text"],
             "delegated task"
         );
+        assert!(!forwarded.to_string().contains("opaque-ciphertext"));
     }
 
     #[test]
@@ -556,7 +560,7 @@ mod tests {
         let request = json!({
             "model": "public-model",
             "input": [{"type":"agent_message","content":[
-                {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+                {"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}
             ]}]
         });
         let error = match prepare_forwarded_request(
