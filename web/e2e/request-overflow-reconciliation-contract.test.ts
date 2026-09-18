@@ -94,10 +94,9 @@ test('a claimed ticket deferred by a page eligibility race remains dirty until i
   assert.equal(time.size, 0, 'the dirty burst remains one sticky edge while blocked');
 
   reconciliation.setBlocked(false);
-  time.advance(requestOverflowReconcileCooldownMs - 10_000 - 1);
-  assert.deepEqual(started, [1], 'reopen still honors the completed-pass cooldown');
-  time.advance(1);
-  assert.deepEqual(started, [1, 2], 'the retained edge receives one authoritative retry');
+  time.advance(0);
+  assert.deepEqual(started, [1, 2], 'an ineligible ticket did not consume the success cooldown');
+  assert.equal(time.size, 0, 'the immediate catch-up is still one query for the retained burst');
 });
 
 test('blocking and interrupted pagination preserve one dirty edge without wall-clock races', () => {

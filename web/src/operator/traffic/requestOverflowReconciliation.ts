@@ -21,6 +21,7 @@ export class RequestOverflowReconciliation {
   private disposed = false;
   private lastFinishedAt?: number;
   private nextTicket = 0;
+  private resumeImmediately = false;
   private timer?: number;
 
   constructor(
@@ -61,12 +62,15 @@ export class RequestOverflowReconciliation {
    * The page claimed a ticket, then became ineligible before it could issue
    * the authoritative query (for example while a foreground load, pause, or
    * filter change committed). Keep the edge and wait for the page to reopen
-   * the lane; treating this as a successful pass would lose live events.
+   * the lane. This did not make a query, so it must not consume the success
+   * cooldown; the reopened lane receives one immediate catch-up pass.
    */
   defer(ticket: number) {
     if (this.disposed || this.activeTicket !== ticket) return;
+    this.activeTicket = undefined;
+    this.dirty = true;
+    this.resumeImmediately = true;
     this.setBlocked(true);
-    this.finish(ticket, false);
   }
 
   /**
@@ -79,6 +83,7 @@ export class RequestOverflowReconciliation {
     this.cancelTimer();
     this.activeTicket = undefined;
     this.dirty = preserveDirty && interrupted;
+    if (!this.dirty || resetCooldown) this.resumeImmediately = false;
     if (resetCooldown) this.lastFinishedAt = undefined;
     this.arm();
   }
@@ -88,6 +93,7 @@ export class RequestOverflowReconciliation {
     this.cancelTimer();
     this.activeTicket = undefined;
     this.dirty = false;
+    this.resumeImmediately = false;
     this.disposed = true;
   }
 
@@ -95,7 +101,7 @@ export class RequestOverflowReconciliation {
     if (this.disposed || this.blocked || !this.dirty || this.timer !== undefined || this.activeTicket !== undefined) return;
     const now = this.clock.now();
     const cooldownDelay = this.lastFinishedAt === undefined ? 0 : this.lastFinishedAt + this.cooldownMs - now;
-    const delay = Math.max(this.delayMs, cooldownDelay, 0);
+    const delay = this.resumeImmediately ? 0 : Math.max(this.delayMs, cooldownDelay, 0);
     this.timer = this.clock.schedule(() => {
       this.timer = undefined;
       if (this.disposed || this.blocked || !this.dirty || this.activeTicket !== undefined) {
@@ -103,6 +109,7 @@ export class RequestOverflowReconciliation {
         return;
       }
       this.dirty = false;
+      this.resumeImmediately = false;
       const ticket = ++this.nextTicket;
       this.activeTicket = ticket;
       this.start(ticket);

@@ -88,6 +88,21 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     await page.evaluate(() => window.resolveNextRequestQuery('post-pagination-reconcile'));
     await model('post-pagination-reconcile').waitFor();
     await model('older-page').waitFor();
+
+    // Exercise the React pause lane: an overflow received while paused stays
+    // sticky, does not issue background queries, and resumes as exactly one
+    // authoritative first-page query rather than being dropped or fanning out.
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => window.emitRequestOverflow(1_000));
+    await page.clock.fastForward(requestOverflowReconcileCooldownMs * 2);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 6,
+      'pause blocks reconciliation without discarding the overflow edge');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await page.clock.fastForward(requestOverflowReconcileDelayMs);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 7,
+      'resume performs one bounded reconciliation for the retained overflow');
+    await page.evaluate(() => window.resolveNextRequestQuery('post-pause-reconcile'));
+    await model('post-pause-reconcile').waitFor();
   } finally {
     await browser.close();
     await server.close();

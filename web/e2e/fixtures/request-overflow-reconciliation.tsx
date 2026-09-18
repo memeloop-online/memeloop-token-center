@@ -96,7 +96,8 @@ function Fixture() {
     <output data-testid="overflow-revision" hidden>{overflowRevision}</output>
     <RequestsPage token="fixture-token" tenant="fixture-tenant" liveEvents={events}
       streamRevision={revision} streamOverflowRevision={overflowRevision} streamState="live" streamError=""
-      onOpenSessions={() => undefined} onOpenSession={() => undefined} onProtectRequests={() => undefined} />
+      onOpenSessions={() => undefined} onOpenSession={() => undefined} onProtectRequests={() => undefined}
+      requestRefresh={{ intervalMs: 5_000, paused: false, onIntervalChange: () => undefined }} />
   </>;
 }
 
