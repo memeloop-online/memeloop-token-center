@@ -42,6 +42,7 @@ test('visible traffic summary separates terminal health from live work', () => {
     running: 1,
     unknown: 0,
     successRate: 2 / 3,
+    cacheRate: null,
     averageDurationMs: 240,
     totalTokens: 0,
     localCosts: [],
@@ -56,6 +57,7 @@ test('visible traffic summary has no fabricated rate or latency without terminal
     running: 1,
     unknown: 0,
     successRate: null,
+    cacheRate: null,
     averageDurationMs: null,
     totalTokens: 0,
     localCosts: [],
@@ -102,6 +104,16 @@ test('totalTokens counts actual usage only: pending and non-actual history never
   assert.equal(summary.totalTokens, 35);
   // Failed provider-reported usage is actual and remains included.
   assert.equal(summarizeVisibleRequests([failedProviderReported]).totalTokens, 23);
+});
+
+test('cache rate uses only actual requests with complete cache telemetry', () => {
+  const summary = summarizeVisibleRequests([
+    { ...request(200, 100), input_tokens: 100, cached_input_tokens: 20, cache_write_tokens: 10 },
+    { ...request(200, 100), input_tokens: 50, cached_input_tokens: 0, cache_write_tokens: 0 },
+    { ...request(200, 100), input_tokens: 500 },
+    { ...request(null, null), input_tokens: 500, cached_input_tokens: 500, cache_write_tokens: 0 },
+  ]);
+  assert.equal(summary.cacheRate, 20 / 150);
 });
 
 test('local cost totals follow the shared displayed-cost policy per currency', () => {

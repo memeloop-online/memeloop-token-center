@@ -326,6 +326,8 @@ export function RequestTable({
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: '—' };
             const costCopy = requestCostCopy(request, locale);
             const duration = formatDurationDisplay(request.duration_ms, locale);
+            const durationDetails = [duration.title, durationSummary].filter(Boolean).join(' · ');
+            const durationValue = <span className="request-duration-info" aria-label={durationDetails ? [duration.text, durationDetails].join(' · ') : undefined} tabIndex={durationDetails ? 0 : undefined}>{duration.text}</span>;
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? [request.credential_identity.key_id, principalDisplayName(request.credential_identity.principal_external_id, t)].filter(Boolean).join(' · ') : credentialLabel;
@@ -347,7 +349,7 @@ export function RequestTable({
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
               <td className="request-status-cell" data-label={t('request.status')}><RequestStatus request={request} />{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
-              <td className="request-duration-cell" data-label={t('request.duration')}><span className="request-duration-info" title={[duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} aria-label={[duration.text, duration.title, durationSummary].filter(Boolean).join(' · ') || undefined} tabIndex={duration.title || durationSummary ? 0 : undefined}>{duration.text}</span></td>
+              <td className="request-duration-cell" data-label={t('request.duration')}>{durationDetails ? <DetailTooltip content={durationDetails}>{durationValue}</DetailTooltip> : durationValue}</td>
               <td className="request-tps-cell" data-label="TPS"><RequestOutputRate request={request} /></td>
               {onSelect && <td className="request-actions-cell"><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
