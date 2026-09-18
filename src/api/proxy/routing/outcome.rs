@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn ambiguous_transport_failure_cools_account_without_permitting_replay() {
         for (kind, stage) in [
-            (TransportFailureKind::ConnectionReset, "response_connection_reset"),
+            (
+                TransportFailureKind::ConnectionReset,
+                "response_connection_reset",
+            ),
             (TransportFailureKind::Request, "request"),
             (TransportFailureKind::Timeout, "request_timeout"),
         ] {
