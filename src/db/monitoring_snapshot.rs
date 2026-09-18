@@ -424,12 +424,7 @@ impl Database {
             let (upstream_name, health) = upstream_health
                 .get(&upstream_account_id)
                 .cloned()
-                .unwrap_or_else(|| {
-                    (
-                        format!("retired-upstream-{upstream_account_id}"),
-                        unknown_health(),
-                    )
-                });
+                .unwrap_or_else(|| ("__retired_upstream__".to_owned(), unknown_health()));
             let terminal_outcomes = outcomes
                 .remove(&(upstream_account_id.clone(), model.clone()))
                 .unwrap_or_default();
@@ -1295,7 +1290,7 @@ mod tests {
         .await
         .unwrap();
         let (name, health) = results.remove(&upstream_account_id).unwrap();
-        assert_eq!(name, format!("retired-upstream-{upstream_account_id}"));
+        assert_eq!(name, "__retired_upstream__");
         assert_eq!(health.status, "unknown");
         assert_eq!(health.observed_at, None);
         assert_eq!(statements.count, 1);

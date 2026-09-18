@@ -60,6 +60,7 @@ test('fallback context is consistent with the list and never invents an epoch da
   assert.deepEqual(sessionFallback(detail), { time: 20, credential: 'Retained alias' });
   assert.deepEqual(sessionFallback({ requests: [...detail.requests].reverse() }), sessionFallback(detail));
   assert.deepEqual(sessionFallback(detail, { last_activity_at: 30, key_alias: ' ', key_id: 'summary-key' }), { time: 30, credential: 'summary-key' });
+  assert.deepEqual(sessionFallback(detail, { last_activity_at: 30, key_alias: '__retired_credential__', key_id: 'internal-key' }), { time: 30, credential: undefined });
   assert.deepEqual(sessionFallback({ requests: [] }), { time: undefined, credential: undefined });
   const calls: Array<{ key: string; variables?: Record<string, string | number> }> = [];
   const translate = (key: string, variables?: Record<string, string | number>) => { calls.push({ key, variables }); return key; };

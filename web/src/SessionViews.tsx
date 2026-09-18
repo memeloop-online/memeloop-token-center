@@ -10,6 +10,7 @@ import { latestDeclaredSessionName, sessionFallback, unnamedSessionName } from '
 import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
 import type { ArchiveRangeLoader } from './archiveRange.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
+import { credentialDisplayName } from './identityPresentation.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
 
@@ -174,26 +175,28 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   if (!values.length) return <div className="empty">{t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {
-      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || undefined, true);
+      const credential = credentialDisplayName(session.key_alias, t);
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credential, true);
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
       return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
           <span className="session-sidebar-title"><b>{title}</b><span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span>
-          <span className="session-sidebar-context">{showCredential && <span>{session.key_alias || t('common.none')}</span>}<span>{session.model || t('common.none')}</span></span>
+          <span className="session-sidebar-context">{showCredential && <span title={session.key_id}>{credential}</span>}<span>{session.model || t('common.none')}</span></span>
           <span className="session-sidebar-meta"><span>{new Date(session.last_activity_at).toLocaleString(locale)}</span><span>{formatMetricNumber(session.requests, locale).text}</span></span>
         </button>
       </article>;
     })}
   </div>;
   return <div className="session-list">{values.map((session) => {
+    const credential = credentialDisplayName(session.key_alias, t);
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, session.key_alias.trim() || undefined);
+      : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credential);
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
       <span className="session-card-context">
-        {showCredential && <span><small>{t('sessions.credential')}</small><b>{session.key_alias || t('common.none')}</b></span>}
+        {showCredential && <span><small>{t('sessions.credential')}</small><b title={session.key_id}>{credential}</b></span>}
         <span><small>{t('request.model')}</small><b>{session.model || t('common.none')}</b><code>{session.protocol || t('common.none')}</code></span>
         <span><small>{t('sessions.lastActivity')}</small><b>{new Date(session.last_activity_at).toLocaleString(locale)}</b></span>
       </span>

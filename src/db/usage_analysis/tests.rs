@@ -50,8 +50,8 @@ fn historical_usage_survives_product_identity_purge() {
     for sql in [main, sessions, generation] {
         assert!(sql.contains("LEFT JOIN key_records"), "{sql}");
         assert!(sql.contains("LEFT JOIN principals"), "{sql}");
-        assert!(sql.contains("retired-credential-"), "{sql}");
-        assert!(sql.contains("retired-principal-"), "{sql}");
+        assert!(sql.contains("__retired_credential__"), "{sql}");
+        assert!(sql.contains("__retired_principal__"), "{sql}");
     }
 }
 

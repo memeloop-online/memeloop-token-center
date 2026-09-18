@@ -347,7 +347,7 @@ impl Database {
     ) -> Result<Vec<String>, AppError> {
         let rows = if let Some(tenant) = tenant_external_id {
             sqlx::query(
-                "SELECT model FROM (SELECT model FROM model_prices UNION SELECT a.model FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION SELECT g.public_model AS model FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 UNION SELECT r.public_model AS model FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $3) discovered_models ORDER BY model ASC LIMIT $4",
+                "SELECT model FROM (SELECT model FROM model_prices UNION SELECT a.model FROM request_daily_aggregates a JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = $1 UNION SELECT g.public_model AS model FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 UNION SELECT r.public_model AS model FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $3) discovered_models ORDER BY model ASC LIMIT $4",
             )
             .bind(tenant)
             .bind(tenant)

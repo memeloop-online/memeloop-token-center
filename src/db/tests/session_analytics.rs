@@ -123,11 +123,19 @@ async fn sqlite_operator_sessions_keep_a_stable_retired_credential_identity() {
         .expect("list retained operator sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].key_id, key.key_id);
-    assert_eq!(
-        sessions[0].key_alias,
-        format!("retired-credential-{}", key.key_id)
-    );
+    assert_eq!(sessions[0].key_alias, "__retired_credential__");
     assert!(!sessions[0].key_alias.contains("API2"));
+
+    let detail = database
+        .operator_logical_session_detail(
+            "retired-session-tenant",
+            key.key_id,
+            &cluster_id.to_string(),
+            ConversationDetailFilter::default(),
+        )
+        .await
+        .expect("read retained operator session detail after credential purge");
+    assert_eq!(detail.session_id, cluster_id.to_string());
 }
 
 #[tokio::test]

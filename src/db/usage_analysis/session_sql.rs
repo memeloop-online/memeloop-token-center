@@ -138,8 +138,7 @@ pub(super) fn session_usage_dimension_sql(
            ),
            filtered_sessions AS (
                SELECT activity.*,
-                      COALESCE(key_record.alias,
-                               'retired-credential-' || activity.key_id) AS key_alias
+                      COALESCE(key_record.alias, '__retired_credential__') AS key_alias
                  FROM session_activity activity
                  LEFT JOIN key_records key_record
                    ON key_record.id = activity.key_id
@@ -148,9 +147,9 @@ pub(super) fn session_usage_dimension_sql(
                    ON principal.id = key_record.principal_id
                   AND principal.tenant_id = key_record.tenant_id
                 WHERE ($11 = '' OR LOWER(COALESCE(key_record.alias,
-                          'retired-credential-' || activity.key_id)) LIKE $11 ESCAPE '\')
+                          '__retired_credential__')) LIKE $11 ESCAPE '\')
                   AND ($12 = '' OR LOWER(COALESCE(principal.external_id,
-                          'retired-principal-' || activity.key_id)) LIKE $12 ESCAPE '\')
+                          '__retired_principal__')) LIKE $12 ESCAPE '\')
            ),
            grouped_sessions AS (
                SELECT key_id, key_alias, session_id, currency,

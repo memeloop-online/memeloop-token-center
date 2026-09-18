@@ -11,8 +11,8 @@ fn operator_history_uses_stable_identity_after_credential_purge() {
     );
     assert!(query.statement.contains("LEFT JOIN key_records k"));
     assert!(query.statement.contains("LEFT JOIN principals p"));
-    assert!(query.statement.contains("retired-credential-"));
-    assert!(query.statement.contains("retired-principal-"));
+    assert!(query.statement.contains("__retired_credential__"));
+    assert!(query.statement.contains("__retired_principal__"));
     assert!(
         !query
             .statement

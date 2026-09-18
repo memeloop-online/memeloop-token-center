@@ -44,9 +44,9 @@ pub(super) async fn attach_output_rates(
            AND ($9 = '' OR ($9 = 'unassigned' AND f.upstream_account_id = '') OR f.upstream_account_id = $9)
            AND ($10 = '' OR f.model_route_id = $10)
            AND ($11 = '' OR LOWER(COALESCE(k.alias,
-                   'retired-credential-' || f.key_id)) LIKE $11 ESCAPE '\')
+                   '__retired_credential__')) LIKE $11 ESCAPE '\')
            AND ($12 = '' OR LOWER(COALESCE(p.external_id,
-                   'retired-principal-' || f.key_id)) LIKE $12 ESCAPE '\')
+                   '__retired_principal__')) LIKE $12 ESCAPE '\')
            AND r.completed_at IS NOT NULL AND r.status_code >= 200 AND r.status_code < 300
            AND (r.error_code IS NULL OR r.error_code = '')
            AND r.usage_basis = 'provider_reported' AND r.duration_ms > 0

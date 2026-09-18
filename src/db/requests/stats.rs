@@ -32,8 +32,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR a.upstream_account_id = $9)
   AND ($10 = '' OR a.model_route_id = $10)
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || a.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || a.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT f.created_at,
        f.model,
@@ -62,8 +62,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR f.upstream_account_id = $9)
   AND ($10 = '' OR f.model_route_id = $10)
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT a.day_bucket * 86400000 AS created_at,
        a.model,
@@ -92,8 +92,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR a.upstream_account_id = $9)
   AND $10 = ''
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || a.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || a.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT f.created_at,
        f.model,
@@ -122,8 +122,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($9 = '' OR f.upstream_account_id = $9)
   AND $10 = ''
   AND $11 < 0 AND $12 < 0 AND $13 < 0 AND $14 < 0
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 "#;
 
 pub(crate) const FILTERED_ACTIVITY_SOURCE_FACTS: &str = r#"
@@ -156,8 +156,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR f.duration_ms <= $12)
   AND ($13 < 0 OR f.cost_micros >= $13)
   AND ($14 < 0 OR f.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 UNION ALL
 SELECT f.created_at,
@@ -189,8 +189,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR f.duration_ms <= $12)
   AND ($13 < 0 OR f.cost_micros >= $13)
   AND ($14 < 0 OR f.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || f.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || f.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 "#;
 
@@ -224,8 +224,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR r.duration_ms <= $12)
   AND ($13 < 0 OR r.cost_micros >= $13)
   AND ($14 < 0 OR r.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || r.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || r.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 UNION ALL
 SELECT g.created_at,
        g.public_model AS model,
@@ -255,8 +255,8 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND $12 < 0
   AND ($13 < 0 OR g.cost_micros >= $13)
   AND ($14 < 0 OR g.cost_micros <= $14)
-  AND ($15 = '' OR LOWER(COALESCE(k.alias, 'retired-credential-' || g.key_id)) LIKE $15 ESCAPE '\')
-  AND ($16 = '' OR LOWER(COALESCE(p.external_id, 'retired-principal-' || g.key_id)) LIKE $16 ESCAPE '\')
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
 "#;
 

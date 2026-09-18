@@ -2,12 +2,13 @@ import { useConfirmDialog } from '../useConfirmDialog';
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
-import { Button } from '../design-system';
+import { Button, DetailTooltip } from '../design-system';
 import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
 import type { GenerationAsset, OperatorGenerationJob } from '../types';
 import './generationWorkspace.css';
+import { credentialDisplayName } from '../identityPresentation.js';
 
 function tenantQuery(tenant: string) {
   const query = new URLSearchParams();
@@ -121,7 +122,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
         <tbody>{jobs.map((job) => <tr key={job.job_id}>
           <td className="generation-time-cell" data-label={t('request.time')}>{new Date(job.created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}</td>
-          <td className="generation-tenant-cell" data-label={t('operator.tenant')}>{tenantDisplayName(job.tenant_external_id, locale)}</td><td className="generation-credential-cell" data-label={t('generations.credential')}><button type="button" className="table-link" onClick={() => void select(job)}>{job.key_alias}</button><small className="break-anywhere">{job.key_id}</small></td>
+          <td className="generation-tenant-cell" data-label={t('operator.tenant')}>{tenantDisplayName(job.tenant_external_id, locale)}</td><td className="generation-credential-cell" data-label={t('generations.credential')}><DetailTooltip content={job.key_id}><button type="button" className="table-link" onClick={() => void select(job)}>{credentialDisplayName(job.key_alias, t)}</button></DetailTooltip></td>
           <td className="generation-model-cell"><code>{job.model}</code></td><td className="generation-driver-cell" data-label={t('generations.driver')}>{job.driver}</td><td className="generation-status-cell" data-label={t('request.status')}><span className={'status ' + statusTone(job.status)}>{t('generations.status.' + job.status)}</span></td>
           <td className="generation-units-cell" data-label={t('generations.units')}>{formatNumber(job.billed_units ?? job.estimated_units, locale)} · {t('billingUnit.' + job.billing_unit)}</td>
           <td className="generation-cost-cell" data-label={t('request.cost')}>{formatCurrency(job.cost, job.currency, locale)}</td>
@@ -132,7 +133,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
     {detail && <DrawerFrame title={detail.model} eyebrow={t('generations.detailTitle')} onClose={() => setDetail(undefined)}>
       {error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
-      <p className="muted break-anywhere">{detail.job_id} · {tenantDisplayName(detail.tenant_external_id, locale)} · {detail.key_alias}</p>
+      <p className="muted break-anywhere">{detail.job_id} · {tenantDisplayName(detail.tenant_external_id, locale)} · <DetailTooltip content={detail.key_id}><span tabIndex={0}>{credentialDisplayName(detail.key_alias, t)}</span></DetailTooltip></p>
       <h3>{t('request.status')}</h3><p><span className={'status ' + statusTone(detail.status)}>{t('generations.status.' + detail.status)}</span> <code>{detail.status}</code></p>
       <h3>{t('generations.units')}</h3><pre>{JSON.stringify({ estimated: detail.estimated_units, billed: detail.billed_units, billing_unit: detail.billing_unit, cost: detail.cost, currency: detail.currency }, null, 2)}</pre>
       <h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre>

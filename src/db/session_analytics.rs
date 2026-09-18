@@ -263,8 +263,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              FROM recent_activity
        )
        SELECT recent.*,
-              COALESCE(key_record.alias,
-                       'retired-credential-' || recent.key_id) AS key_alias,
+              COALESCE(key_record.alias, '__retired_credential__') AS key_alias,
               COALESCE(totals.currency, '') AS currency,
               COALESCE(totals.cost_micros, 0) AS cost_micros,
               COALESCE(completed.requests, 0) AS requests,
@@ -361,7 +360,11 @@ impl Database {
         session_id: &str,
         filter: ConversationDetailFilter,
     ) -> Result<LogicalSessionDetail, AppError> {
-        let owned = sqlx::query("SELECT id FROM key_records WHERE id = $1 AND tenant_id = $2")
+        // Durable session facts outlive a physically retired credential. Authorize
+        // details from those tenant-scoped facts instead of the mutable key row.
+        let owned = sqlx::query(
+            "SELECT 1 FROM (SELECT tenant_id FROM request_records WHERE key_id = $1 UNION ALL SELECT tenant_id FROM session_usage_totals WHERE key_id = $1 UNION ALL SELECT tenant_id FROM session_archive_totals WHERE key_id = $1 UNION ALL SELECT cluster.tenant_id FROM conversation_key_clusters projection JOIN conversation_clusters cluster ON cluster.id = projection.cluster_id WHERE projection.key_id = $1) retained WHERE tenant_id = $2 LIMIT 1",
+        )
             .bind(key_id.to_string())
             .bind(tenant_id.to_string())
             .fetch_optional(&self.pool)
@@ -548,7 +551,7 @@ impl Database {
                                COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0))
                       AND ($8 = '' OR LOWER(ranked.session_id) LIKE $8 ESCAPE '\'
                            OR LOWER(COALESCE(filter_key.alias,
-                               'retired-credential-' || ranked.key_id)) LIKE $8 ESCAPE '\'
+                               '__retired_credential__')) LIKE $8 ESCAPE '\'
                            OR EXISTS (
                               SELECT 1 FROM conversation_observations named_observation
                                WHERE named_observation.key_id = ranked.key_id
@@ -677,8 +680,7 @@ impl Database {
                      FROM recent_activity
                )
                SELECT recent.*,
-                      COALESCE(key_record.alias,
-                               'retired-credential-' || recent.key_id) AS key_alias,
+                      COALESCE(key_record.alias, '__retired_credential__') AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
                       COALESCE(totals.cost_micros, 0) AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,

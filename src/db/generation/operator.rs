@@ -15,7 +15,7 @@ impl Database {
                               j.upstream_job_id, j.estimated_units, j.billed_units,
                               j.cost_micros, j.error_code, j.result_json, j.key_id,
                               t.external_id AS tenant_external_id,
-                              COALESCE(k.alias, 'retired-credential-' || j.key_id) AS key_alias,
+                              COALESCE(k.alias, '__retired_credential__') AS key_alias,
                               COALESCE(k.currency, facts.currency, '') AS currency
                          FROM generation_jobs j
                          JOIN tenants t ON t.id = j.tenant_id
@@ -39,7 +39,7 @@ impl Database {
                               j.upstream_job_id, j.estimated_units, j.billed_units,
                               j.cost_micros, j.error_code, j.result_json, j.key_id,
                               t.external_id AS tenant_external_id,
-                              COALESCE(k.alias, 'retired-credential-' || j.key_id) AS key_alias,
+                              COALESCE(k.alias, '__retired_credential__') AS key_alias,
                               COALESCE(k.currency, facts.currency, '') AS currency
                          FROM generation_jobs j
                          JOIN tenants t ON t.id = j.tenant_id
@@ -71,7 +71,7 @@ impl Database {
                               j.upstream_job_id, j.estimated_units, j.billed_units,
                               j.cost_micros, j.error_code, j.result_json, j.key_id,
                               t.external_id AS tenant_external_id,
-                              COALESCE(k.alias, 'retired-credential-' || j.key_id) AS key_alias,
+                              COALESCE(k.alias, '__retired_credential__') AS key_alias,
                               COALESCE(k.currency, facts.currency, '') AS currency
                          FROM generation_jobs j
                          JOIN tenants t ON t.id = j.tenant_id
@@ -94,7 +94,7 @@ impl Database {
                               j.upstream_job_id, j.estimated_units, j.billed_units,
                               j.cost_micros, j.error_code, j.result_json, j.key_id,
                               t.external_id AS tenant_external_id,
-                              COALESCE(k.alias, 'retired-credential-' || j.key_id) AS key_alias,
+                              COALESCE(k.alias, '__retired_credential__') AS key_alias,
                               COALESCE(k.currency, facts.currency, '') AS currency
                          FROM generation_jobs j
                          JOIN tenants t ON t.id = j.tenant_id

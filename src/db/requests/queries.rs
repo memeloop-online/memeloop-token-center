@@ -485,9 +485,9 @@ impl Database {
                       t.external_id AS tenant_external_id,
                       u.key_id AS credential_key_id,
                       COALESCE(k.alias,
-                               'retired-credential-' || u.key_id) AS key_alias,
+                               '__retired_credential__') AS key_alias,
                       COALESCE(p.external_id,
-                               'retired-principal-' || u.key_id) AS principal_external_id
+                               '__retired_principal__') AS principal_external_id
                  FROM session_archive_unlinked_requests u
                  JOIN tenants t ON t.id = u.tenant_id
             LEFT JOIN key_records k
@@ -548,8 +548,8 @@ impl Database {
         Ok(RequestCredentialIdentityView {
             tenant_external_id,
             key_id: parse_uuid(key_id.to_owned())?,
-            key_alias: format!("retired-credential-{key_id}"),
-            principal_external_id: format!("retired-principal-{key_id}"),
+            key_alias: "__retired_credential__".into(),
+            principal_external_id: "__retired_principal__".into(),
         })
     }
 
@@ -591,7 +591,7 @@ fn build_request_list_query(
     push_request_record_filters(&mut query, scope, filter);
     query.push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ");
     query.bind_i64(page_limit);
-    query.push(") r");
+    query.push(" OFFSET 0) r");
     push_operator_identity_joins(&mut query, scope, "r", &RequestListFilter::default());
     query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
     query.push(" LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
@@ -607,7 +607,7 @@ fn build_request_list_query(
         push_generation_job_filters(&mut query, scope, filter);
         query.push(" ORDER BY g.created_at DESC, g.id DESC LIMIT ");
         query.bind_i64(page_limit);
-        query.push(") g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
+        query.push(" OFFSET 0) g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
         push_operator_identity_joins(&mut query, scope, "g", &RequestListFilter::default());
         query.push(") AS generation_page");
     }
@@ -622,7 +622,7 @@ fn build_request_list_query(
         push_archive_request_filters(&mut query, scope, filter);
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
-        query.push(") u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
+        query.push(" OFFSET 0) u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
         push_operator_identity_joins(&mut query, scope, "u", &RequestListFilter::default());
         query.push(") AS archive_page");
     }
@@ -640,11 +640,7 @@ fn push_identity_projection(
     if scope.includes_operator_identity() {
         query.push(", t.external_id AS tenant_external_id, ");
         query.push(source_alias);
-        query.push(".key_id AS credential_key_id, COALESCE(k.alias, 'retired-credential-' || ");
-        query.push(source_alias);
-        query.push(".key_id) AS key_alias, COALESCE(p.external_id, 'retired-principal-' || ");
-        query.push(source_alias);
-        query.push(".key_id) AS principal_external_id");
+        query.push(".key_id AS credential_key_id, COALESCE(k.alias, '__retired_credential__') AS key_alias, COALESCE(p.external_id, '__retired_principal__') AS principal_external_id");
     } else {
         query.push(", CAST(NULL AS TEXT) AS tenant_external_id, CAST(NULL AS TEXT) AS credential_key_id, CAST(NULL AS TEXT) AS key_alias, CAST(NULL AS TEXT) AS principal_external_id");
     }
@@ -986,11 +982,9 @@ fn push_typed_filters(
                 "facts.cost_micros".to_owned()
             }
             TypedFilterField::CostMicros => format!("{source_alias}.cost_micros"),
-            TypedFilterField::KeyAlias => {
-                format!("COALESCE(k.alias, 'retired-credential-' || {source_alias}.key_id)")
-            }
+            TypedFilterField::KeyAlias => "COALESCE(k.alias, '__retired_credential__')".into(),
             TypedFilterField::Principal => {
-                format!("COALESCE(p.external_id, 'retired-principal-' || {source_alias}.key_id)")
+                "COALESCE(p.external_id, '__retired_principal__')".into()
             }
         };
         push_typed_predicate(
@@ -1178,16 +1172,12 @@ fn push_operator_identity_filters(
     filter: &RequestListFilter,
 ) {
     if filter.key_alias.is_some() {
-        query.push(" AND LOWER(COALESCE(k.alias, 'retired-credential-' || ");
-        query.push(source_alias);
-        query.push(".key_id)) LIKE ");
+        query.push(" AND LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE ");
         query.bind_text(search_prefix(filter.key_alias.as_deref()));
         query.push(r" ESCAPE '\'");
     }
     if filter.principal.is_some() {
-        query.push(" AND LOWER(COALESCE(p.external_id, 'retired-principal-' || ");
-        query.push(source_alias);
-        query.push(".key_id)) LIKE ");
+        query.push(" AND LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE ");
         query.bind_text(search_prefix(filter.principal.as_deref()));
         query.push(r" ESCAPE '\'");
     }
@@ -1504,8 +1494,8 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
        observation.metadata_source AS semantics_source,
        tenant.external_id AS tenant_external_id,
        e.key_id AS credential_key_id,
-       COALESCE(key_record.alias, 'retired-credential-' || e.key_id) AS key_alias,
-       COALESCE(principal.external_id, 'retired-principal-' || e.key_id)
+       COALESCE(key_record.alias, '__retired_credential__') AS key_alias,
+       COALESCE(principal.external_id, '__retired_principal__')
            AS principal_external_id
   FROM events e
   LEFT JOIN request_record_locators locator

@@ -87,9 +87,9 @@ pub(super) fn generation_usage_dimension_sql(
                        OR ($7 = 'success' AND activity.status_class = 'success')
                        OR ($7 = 'error' AND activity.status_class = 'failure'))
                   AND ($11 = '' OR LOWER(COALESCE(k.alias,
-                          'retired-credential-' || activity.key_id)) LIKE $11 ESCAPE '\')
+                          '__retired_credential__')) LIKE $11 ESCAPE '\')
                   AND ($12 = '' OR LOWER(COALESCE(principal.external_id,
-                          'retired-principal-' || activity.key_id)) LIKE $12 ESCAPE '\')
+                          '__retired_principal__')) LIKE $12 ESCAPE '\')
            )
            SELECT 'modality' AS dimension, modality AS dimension_id, currency,
                   CAST(COALESCE(SUM(units), 0) AS BIGINT) AS units

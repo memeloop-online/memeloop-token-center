@@ -107,6 +107,7 @@ test('credential identity remains meaningful without inventing an alias for expl
   assert.deepEqual(requestCredentialLabel(request, 'Portal key'), { label: 'Portal key' });
   assert.deepEqual(requestCredentialLabel({ ...request, credential_identity: null }, 'Portal key'), { key: 'request.missingCredential' });
   assert.deepEqual(requestCredentialLabel({ ...request, credential_identity: { tenant_external_id: 'fixture', key_id: 'key', key_alias: '', principal_external_id: 'user' } }, 'Portal key'), { key: 'request.unnamedCredential' });
+  assert.deepEqual(requestCredentialLabel({ ...request, credential_identity: { tenant_external_id: 'fixture', key_id: 'internal-key', key_alias: '__retired_credential__', principal_external_id: '__retired_principal__' } }, 'Portal key'), { key: 'request.retiredCredential' });
 });
 
 test('terminal imported history need not have completion timestamps; live started events remain pending', () => {

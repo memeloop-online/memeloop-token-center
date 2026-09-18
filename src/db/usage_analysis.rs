@@ -801,8 +801,7 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
         usage_analysis_generation_fact_sql("$15", "$16", bucket_millis, &generation_filters);
     format!(
         r#"SELECT activity.*,
-                  COALESCE(k.alias,
-                           'retired-credential-' || activity.key_id) AS key_label,
+                  COALESCE(k.alias, '__retired_credential__') AS key_label,
                   CASE WHEN activity.upstream_account_id = '' THEN 'unassigned'
                        ELSE activity.upstream_account_id END AS analysis_upstream_id,
                   CASE WHEN activity.upstream_account_id = '' THEN 'Unassigned'
@@ -837,9 +836,9 @@ fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scope
                    OR activity.upstream_account_id = $9)
               AND ($10 = '' OR activity.model_route_id = $10)
               AND ($11 = '' OR LOWER(COALESCE(k.alias,
-                      'retired-credential-' || activity.key_id)) LIKE $11 ESCAPE '\')
+                      '__retired_credential__')) LIKE $11 ESCAPE '\')
               AND ($12 = '' OR LOWER(COALESCE(p.external_id,
-                      'retired-principal-' || activity.key_id)) LIKE $12 ESCAPE '\')"#
+                      '__retired_principal__')) LIKE $12 ESCAPE '\')"#
     )
 }
 
