@@ -16,6 +16,23 @@ fn invalid_upgrade() -> sqlx::Error {
     sqlx::Error::Protocol("credential plaintext upgrade validation failed".into())
 }
 
+fn verified_original_matches_key(
+    value: &str,
+    pepper: &[u8],
+    expected_hash: &[u8],
+    expected_key_id: Uuid,
+) -> bool {
+    if !crypto::verify_credential(value, pepper, expected_hash) {
+        return false;
+    }
+
+    // Imported and legacy credentials may be opaque. Their keyed hash is
+    // the authenticity boundary. Native MTC credentials additionally carry a
+    // key identity, which must agree with the row when it is present.
+    crypto::parse_credential(value)
+        .is_none_or(|parsed| parsed.key_id == expected_key_id)
+}
+
 pub(super) async fn promote_active_plaintext(
     tx: &mut Transaction<'_, Any>,
     backend: DatabaseBackend,
@@ -53,10 +70,7 @@ pub(super) async fn promote_active_plaintext(
             }
             let expected: Vec<u8> = row.try_get("secret_hash")?;
             if let Some(plaintext) = row.try_get::<Option<String>, _>("secret_plaintext")? {
-                if !crypto::verify_credential(&plaintext, pepper, &expected)
-                    || crypto::parse_credential(&plaintext)
-                        .is_none_or(|parsed| parsed.key_id != key_uuid)
-                {
+                if !verified_original_matches_key(&plaintext, pepper, &expected, key_uuid) {
                     return Err(invalid_upgrade());
                 }
                 cursor = id;
@@ -76,9 +90,7 @@ pub(super) async fn promote_active_plaintext(
                 .map_err(|_| invalid_upgrade())?;
             if envelope.key_id != key_uuid
                 || envelope.credential_generation != generation
-                || !crypto::verify_credential(&envelope.key, pepper, &expected)
-                || crypto::parse_credential(&envelope.key)
-                    .is_none_or(|parsed| parsed.key_id != key_uuid)
+                || !verified_original_matches_key(&envelope.key, pepper, &expected, key_uuid)
             {
                 return Err(invalid_upgrade());
             }
@@ -138,8 +150,10 @@ mod tests {
             issued.key_id
         };
         let generation = if fault == "payload_generation" { 2 } else { 1 };
-        let key = if fault == "hash" || fault == "unparseable" {
+        let key = if fault == "hash" {
             "incorrect-original-value"
+        } else if fault == "opaque" {
+            "fixture-opaque-original-value"
         } else {
             issued.key.as_str()
         };
@@ -162,7 +176,7 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
-        if fault == "unparseable" {
+        if fault == "opaque" {
             let (hash, _) = crypto::hash_credential(key, PEPPER);
             sqlx::query("UPDATE key_credentials SET secret_hash = $1 WHERE key_id = $2")
                 .bind(hash)
@@ -224,8 +238,6 @@ mod tests {
             "active_generation",
             "existing_plaintext_hash",
             "existing_plaintext_identity",
-            "existing_plaintext_unparseable",
-            "unparseable",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let database = Database::connect(&format!(
@@ -278,13 +290,6 @@ mod tests {
                     .bind(&foreign.secret).bind(&foreign.secret_hash).bind(invalid.key_id.to_string())
                     .execute(&database.pool).await.unwrap();
             }
-            if fault == "existing_plaintext_unparseable" {
-                let plaintext = "fixture-opaque-original-value";
-                let (hash, _) = crypto::hash_credential(plaintext, PEPPER);
-                sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
-                    .bind(plaintext).bind(hash).bind(invalid.key_id.to_string())
-                    .execute(&database.pool).await.unwrap();
-            }
             let result = match fault {
                 "missing_pepper" => database.migrate().await,
                 "wrong_pepper" => {
@@ -323,6 +328,65 @@ mod tests {
                 "{fault}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upgrade_preserves_hash_verified_opaque_plaintext() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("opaque-plaintext-upgrade.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let issued = issue(&database, "opaque-plaintext").await;
+        mark_upgrade_pending(&database).await;
+
+        let plaintext = "fixture-opaque-original-value";
+        let (hash, _) = crypto::hash_credential(plaintext, PEPPER);
+        sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
+            .bind(plaintext)
+            .bind(hash)
+            .bind(issued.key_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        database
+            .migrate_with_credential_pepper(PEPPER)
+            .await
+            .unwrap();
+        let copied = database
+            .copy_key_credential(issued.key_id, PEPPER, None, true)
+            .await
+            .unwrap();
+        assert_eq!(copied.key, plaintext);
+    }
+
+    #[tokio::test]
+    async fn upgrade_promotes_hash_verified_opaque_envelope_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("opaque-envelope-upgrade.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let issued = issue(&database, "opaque-envelope").await;
+        mark_upgrade_pending(&database).await;
+        envelope(&database, &issued, "opaque").await;
+
+        database
+            .migrate_with_credential_pepper(PEPPER)
+            .await
+            .unwrap();
+        let copied = database
+            .copy_key_credential(issued.key_id, PEPPER, None, true)
+            .await
+            .unwrap();
+        assert_eq!(copied.key, "fixture-opaque-original-value");
     }
 
     #[tokio::test]
