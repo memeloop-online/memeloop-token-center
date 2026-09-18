@@ -1,16 +1,16 @@
 use axum::body::Bytes;
 
 use super::super::limits::{
-    MAX_RESPONSES_SSE_EVENT_BYTES, MAX_SSE_FIELDS_PER_EVENT,
-    MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK, MAX_SSE_FRAMES_PER_NETWORK_CHUNK,
+    MAX_SSE_FIELDS_PER_EVENT, MAX_SSE_FRAMES_PER_NETWORK_CHUNK,
     MAX_SSE_METADATA_ITEMS_PER_NETWORK_CHUNK,
 };
+use crate::provider::SseFramingLimits;
 
 /// A bounded, stateful SSE framer. It preserves original wire bytes while
 /// treating CR, LF, and CRLF as line endings. EOF never turns an unterminated
 /// field block into an event.
-#[derive(Default)]
 pub(in crate::api) struct BoundedSseFramer {
+    limits: SseFramingLimits,
     event: Vec<u8>,
     line: Vec<u8>,
     lines: Vec<BoundedSseLine>,
@@ -21,6 +21,12 @@ pub(in crate::api) struct BoundedSseFramer {
     emitted_cr_event_bytes: usize,
     completed_event: Option<PendingSseEvent>,
     batch_rejected: bool,
+}
+
+impl Default for BoundedSseFramer {
+    fn default() -> Self {
+        Self::with_limits(SseFramingLimits::default())
+    }
 }
 
 pub(in crate::api) struct BoundedSseFrameBatch {
@@ -113,6 +119,22 @@ pub(in crate::api) enum SseIdleControl {
 }
 
 impl BoundedSseFramer {
+    pub(in crate::api) fn with_limits(limits: SseFramingLimits) -> Self {
+        Self {
+            limits,
+            event: Vec::new(),
+            line: Vec::new(),
+            lines: Vec::new(),
+            discarding_event: false,
+            discarding_line_has_data: false,
+            skip_lf_after_cr: false,
+            emit_lf_continuation: false,
+            emitted_cr_event_bytes: 0,
+            completed_event: None,
+            batch_rejected: false,
+        }
+    }
+
     pub(in crate::api) fn push(&mut self, chunk: &[u8]) -> BoundedSseFrameBatch {
         let mut batch = BoundedSseFrameBatch {
             events: Vec::new(),
@@ -134,7 +156,7 @@ impl BoundedSseFramer {
             }
             if let Some(mut completed) = self.completed_event.take() {
                 if self.skip_lf_after_cr && byte == b'\n' {
-                    if completed.bytes.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
+                    if completed.bytes.len() >= self.limits.event_bytes {
                         self.skip_lf_after_cr = false;
                         self.emit_lf_continuation = false;
                         self.emitted_cr_event_bytes = 0;
@@ -153,13 +175,13 @@ impl BoundedSseFramer {
                     self.skip_lf_after_cr = false;
                     self.emit_lf_continuation = false;
                     self.emitted_cr_event_bytes = 0;
-                    Self::emit(&mut batch, completed);
+                    Self::emit(&mut batch, completed, self.limits);
                     continue;
                 }
                 self.skip_lf_after_cr = false;
                 self.emit_lf_continuation = false;
                 self.emitted_cr_event_bytes = 0;
-                Self::emit(&mut batch, completed);
+                Self::emit(&mut batch, completed, self.limits);
             }
             if self.skip_lf_after_cr {
                 self.skip_lf_after_cr = false;
@@ -168,7 +190,7 @@ impl BoundedSseFramer {
                         continue;
                     }
                     if let Some(line) = self.lines.last_mut() {
-                        if self.event.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
+                        if self.event.len() >= self.limits.event_bytes {
                             self.discarding_event = true;
                             self.discarding_line_has_data = false;
                             self.event.clear();
@@ -180,7 +202,7 @@ impl BoundedSseFramer {
                         line.ending.push(byte);
                         self.event.push(byte);
                     } else if self.emit_lf_continuation {
-                        if self.emitted_cr_event_bytes >= MAX_RESPONSES_SSE_EVENT_BYTES {
+                        if self.emitted_cr_event_bytes >= self.limits.event_bytes {
                             batch.reject(SseFramerRejection::EventLimit);
                         } else {
                             Self::emit(
@@ -193,6 +215,7 @@ impl BoundedSseFramer {
                                     is_line_ending_continuation: true,
                                     idle_control: None,
                                 },
+                                self.limits,
                             );
                         }
                     }
@@ -213,7 +236,7 @@ impl BoundedSseFramer {
         }
         if let Some(completed) = self.completed_event.take() {
             self.emitted_cr_event_bytes = completed.bytes.len();
-            Self::emit(&mut batch, completed);
+            Self::emit(&mut batch, completed, self.limits);
             self.emit_lf_continuation = true;
         }
         if matches!(batch.rejection, Some(SseFramerRejection::BatchLimit)) {
@@ -235,7 +258,7 @@ impl BoundedSseFramer {
             self.discarding_line_has_data = true;
             return;
         }
-        if self.event.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
+        if self.event.len() >= self.limits.event_bytes {
             self.discarding_event = true;
             self.discarding_line_has_data = true;
             self.event.clear();
@@ -256,7 +279,7 @@ impl BoundedSseFramer {
             self.discarding_line_has_data = false;
             return;
         }
-        if self.event.len().saturating_add(ending.len()) > MAX_RESPONSES_SSE_EVENT_BYTES {
+        if self.event.len().saturating_add(ending.len()) > self.limits.event_bytes {
             self.discarding_event = !self.line.is_empty();
             self.discarding_line_has_data = false;
             self.event.clear();
@@ -278,7 +301,7 @@ impl BoundedSseFramer {
             if completed.terminator.first() == Some(&b'\r') {
                 self.completed_event = Some(completed);
             } else {
-                Self::emit(batch, completed);
+                Self::emit(batch, completed, self.limits);
             }
             return;
         }
@@ -315,7 +338,7 @@ impl BoundedSseFramer {
             if completed.lines[0].ending.first() == Some(&b'\r') {
                 self.completed_event = Some(completed);
             } else {
-                Self::emit(batch, completed);
+                Self::emit(batch, completed, self.limits);
             }
             return;
         }
@@ -331,10 +354,9 @@ impl BoundedSseFramer {
         });
     }
 
-    fn emit(batch: &mut BoundedSseFrameBatch, pending: PendingSseEvent) {
+    fn emit(batch: &mut BoundedSseFrameBatch, pending: PendingSseEvent, limits: SseFramingLimits) {
         if batch.events.len() >= MAX_SSE_FRAMES_PER_NETWORK_CHUNK
-            || batch.framed_bytes.saturating_add(pending.bytes.len())
-                > MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK
+            || batch.framed_bytes.saturating_add(pending.bytes.len()) > limits.framed_bytes
         {
             batch.reject(SseFramerRejection::BatchLimit);
             return;

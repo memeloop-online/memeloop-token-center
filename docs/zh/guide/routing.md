@@ -42,7 +42,7 @@
 
 ## Codex 传输策略 `transport_policy`
 
-原生 Codex 账户可以在 `config.transport_policy` 中调整连接与故障转移预算（版本 1，缺失 `version` 按 1 处理；未知字段与越界值会被拒绝）：
+原生 Codex 账户可以在 `config.transport_policy` 中调整连接、故障转移与 SSE framing 预算（版本 1，缺失 `version` 按 1 处理；未知字段与越界值会被拒绝）：
 
 | 字段 | 默认 | 允许范围 |
 | --- | --- | --- |
@@ -51,8 +51,13 @@
 | `shared_probe_attempts` | 跟随服务健康设置 | 0–4 |
 | `candidate_attempts` | 3 | 1–8 |
 | `failover_deadline_millis` | 300000 | 1000–300000 |
+| `max_sse_event_bytes` | 8388608 | 262144–16777216 |
+| `max_sse_framed_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
+| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–`max_sse_framed_bytes` |
 
-通过既有的 `PUT /internal/v1/upstreams/{account_id}` 账户更新（CAS）修改。候选数与 Deadline 在请求入场时快照一次：备用配置和运行中的修改不会为已在执行的请求补充预算，Deadline 到期后不再发起新的发送，但成功准入的响应流不会被截断。
+通过既有的 `PUT /internal/v1/upstreams/{account_id}` 账户更新（CAS）修改。候选数与 Deadline 在请求入场时快照一次；SSE 限制在选定出站尝试时快照一次，并由响应头准入、sanitizer、投递 capture、归档投影和 terminal hold 共同使用。运行时修改只影响后续请求，不会改变正在执行的流。Deadline 到期后不再发起新的发送，但成功准入的响应流不会被截断。
+
+每个获准投递的 SSE 流会先从进程级代理内存预算中预留 framing 与 terminal 两份缓冲 envelope。提高账号上限会相应降低可准入的并发流数量，而不会让 framing 与终止缓冲区的聚合内存越过全局预算；归档 JSON 转换仍使用独立的加权准入。
 
 ## 自定义模型的预留上限 `reservation_token_bounds`
 

@@ -42,8 +42,16 @@ fn json_body_if_valid(original: &Bytes) -> Bytes {
     )
 }
 
+#[cfg(test)]
 pub(super) fn sse_frame(original: &Bytes) -> Bytes {
-    let mut framer = crate::api::sse::BoundedSseFramer::default();
+    sse_frame_with_limits(original, crate::provider::SseFramingLimits::default())
+}
+
+pub(super) fn sse_frame_with_limits(
+    original: &Bytes,
+    limits: crate::provider::SseFramingLimits,
+) -> Bytes {
+    let mut framer = crate::api::sse::BoundedSseFramer::with_limits(limits);
     let batch = framer.push(original);
     if batch.rejection.is_some() || batch.events.len() != 1 || !framer.is_complete() {
         return original.clone();

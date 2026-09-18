@@ -2,6 +2,32 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SseFramingLimits {
+    pub event_bytes: usize,
+    pub framed_bytes: usize,
+    pub terminal_hold_bytes: usize,
+}
+
+impl SseFramingLimits {
+    pub const DEFAULT_EVENT_BYTES: usize = 8 * 1024 * 1024;
+    pub const DEFAULT_FRAMED_BYTES: usize = Self::DEFAULT_EVENT_BYTES + 64 * 1024;
+    pub const DEFAULT_TERMINAL_HOLD_BYTES: usize = Self::DEFAULT_FRAMED_BYTES;
+    pub const MIN_EVENT_BYTES: usize = 256 * 1024;
+    pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+    pub const MAX_BUFFER_BYTES: usize = Self::MAX_EVENT_BYTES + 64 * 1024;
+}
+
+impl Default for SseFramingLimits {
+    fn default() -> Self {
+        Self {
+            event_bytes: Self::DEFAULT_EVENT_BYTES,
+            framed_bytes: Self::DEFAULT_FRAMED_BYTES,
+            terminal_hold_bytes: Self::DEFAULT_TERMINAL_HOLD_BYTES,
+        }
+    }
+}
+
 /// How the native Codex adapter handles OpenAI Chat controls which the
 /// upstream Responses transport cannot represent exactly.
 ///
@@ -34,6 +60,9 @@ pub(crate) struct CodexTransportPolicy {
     pub request_timeout_millis: u64,
     /// Maximum local memory queue time; does not extend the request deadline.
     pub memory_admission_wait_millis: u64,
+    pub max_sse_event_bytes: usize,
+    pub max_sse_framed_bytes: usize,
+    pub max_sse_terminal_hold_bytes: usize,
     pub chat_controls: CodexChatControlPolicy,
 }
 
@@ -50,6 +79,9 @@ impl Default for CodexTransportPolicy {
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
+            max_sse_event_bytes: SseFramingLimits::DEFAULT_EVENT_BYTES,
+            max_sse_framed_bytes: SseFramingLimits::DEFAULT_FRAMED_BYTES,
+            max_sse_terminal_hold_bytes: SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES,
             chat_controls: CodexChatControlPolicy::Strict,
         }
     }
@@ -75,6 +107,13 @@ impl CodexTransportPolicy {
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
+            || !(SseFramingLimits::MIN_EVENT_BYTES..=SseFramingLimits::MAX_EVENT_BYTES)
+                .contains(&policy.max_sse_event_bytes)
+            || !(policy.max_sse_event_bytes..=SseFramingLimits::MAX_BUFFER_BYTES)
+                .contains(&policy.max_sse_framed_bytes)
+            || !(policy.max_sse_event_bytes..=SseFramingLimits::MAX_BUFFER_BYTES)
+                .contains(&policy.max_sse_terminal_hold_bytes)
+            || policy.max_sse_terminal_hold_bytes > policy.max_sse_framed_bytes
             || policy.connect_timeout_millis >= policy.request_timeout_millis
             || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
@@ -82,6 +121,14 @@ impl CodexTransportPolicy {
             return Err("invalid_transport_policy");
         }
         Ok(policy)
+    }
+
+    pub(crate) const fn sse_framing_limits(self) -> SseFramingLimits {
+        SseFramingLimits {
+            event_bytes: self.max_sse_event_bytes,
+            framed_bytes: self.max_sse_framed_bytes,
+            terminal_hold_bytes: self.max_sse_terminal_hold_bytes,
+        }
     }
 }
 
@@ -110,6 +157,7 @@ mod tests {
         assert_eq!(policy.read_timeout_millis, 600_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
+        assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
         assert_eq!(policy.chat_controls, CodexChatControlPolicy::Strict);
         let provider_default = CodexTransportPolicy::parse(Some(&json!({
             "chat_controls": "provider_default"
@@ -127,6 +175,20 @@ mod tests {
         .unwrap();
         assert_eq!(independent_phases.connect_timeout_millis, 5_000);
         assert_eq!(independent_phases.read_timeout_millis, 1_000);
+        let framing = CodexTransportPolicy::parse(Some(&json!({
+            "max_sse_event_bytes": 1_048_576,
+            "max_sse_framed_bytes": 1_114_112,
+            "max_sse_terminal_hold_bytes": 1_114_112,
+        })))
+        .unwrap();
+        assert_eq!(
+            framing.sse_framing_limits(),
+            SseFramingLimits {
+                event_bytes: 1_048_576,
+                framed_bytes: 1_114_112,
+                terminal_hold_bytes: 1_114_112,
+            }
+        );
     }
 
     #[test]
@@ -154,6 +216,13 @@ mod tests {
             json!({"request_timeout_millis": 1260001}),
             json!({"memory_admission_wait_millis": 99}),
             json!({"memory_admission_wait_millis": 300001}),
+            json!({"max_sse_event_bytes": 262143}),
+            json!({"max_sse_event_bytes": 16777217}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
+            json!({"max_sse_framed_bytes": 16842753}),
+            json!({"max_sse_terminal_hold_bytes": 16842753}),
             json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
             json!({"connect_timeout_millis": 2000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),
             json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000, "request_timeout_millis": 1000}),

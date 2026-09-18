@@ -15,7 +15,9 @@ pub(super) const MAX_AUDIO_RESPONSE_BODY: usize = 4 * 1024 * 1024;
 // Codex responses already exceed the former 256 KiB ceiling, so keep a
 // dedicated, bounded allowance that can carry those valid events without
 // weakening the independent 64 MiB response-body admission limit.
-pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
+pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize =
+    crate::provider::SseFramingLimits::DEFAULT_EVENT_BYTES;
 // Bound decoder products independently of the 64 MiB response budget. This
 // prevents tiny legal events or fields from multiplying frame metadata,
 // archive batching, and JSON classification work before downstream
@@ -25,8 +27,9 @@ pub(super) const MAX_SSE_FRAMES_PER_NETWORK_CHUNK: usize = 4_096;
 // ceiling when the HTTP client delivers it without fragmentation. The small
 // tail allowance carries DONE and other bounded control framing in that same
 // network chunk.
+#[cfg(test)]
 pub(super) const MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK: usize =
-    MAX_RESPONSES_SSE_EVENT_BYTES + 64 * 1024;
+    crate::provider::SseFramingLimits::DEFAULT_FRAMED_BYTES;
 pub(super) const MAX_SSE_FIELDS_PER_EVENT: usize = 4_096;
 // Each emitted event and retained field line owns vector metadata. Keep their
 // combined count below a process-safe ceiling even when a bounded network
@@ -36,8 +39,9 @@ pub(super) const MAX_SSE_METADATA_ITEMS_PER_NETWORK_CHUNK: usize = 16 * 1024;
 // framing is complete. Leave bounded room for a maximum-sized terminal plus
 // its tiny DONE/control tail while remaining far below the 64 MiB response
 // admission ceiling.
+#[cfg(test)]
 pub(super) const MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES: usize =
-    MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
+    crate::provider::SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES;
 pub(super) const SYNCHRONOUS_IMAGE_DEADLINE: Duration = Duration::from_secs(12 * 60);
 pub(super) const SYNCHRONOUS_AUDIO_DEADLINE: Duration = Duration::from_secs(10 * 60);
 pub(super) const CLOUD_WEBHOOK_BODY_READ_DEADLINE: Duration = Duration::from_secs(10);

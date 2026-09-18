@@ -1,6 +1,8 @@
 use super::*;
 
 mod delivery;
+#[cfg(test)]
+pub(super) mod finalization_test_gate;
 mod lifecycle;
 mod terminal_delivery;
 #[cfg(test)]
@@ -155,6 +157,7 @@ pub(super) struct StreamingResponse<'a> {
     /// content.
     pub(super) upstream_account_id: Uuid,
     pub(super) credential_generation: i64,
+    pub(super) sse_framing_limits: crate::provider::SseFramingLimits,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -182,6 +185,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         public_model,
         upstream_account_id,
         credential_generation,
+        sse_framing_limits,
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
@@ -203,6 +207,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         ..
     } = buffered_request;
     tokio::spawn(async move {
+        let mut _sse_streaming_memory = None;
         let stream_owner = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "stream_owner",
@@ -272,20 +277,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             });
             let mut sse_capture = is_sse.then(|| match protocol {
                 Protocol::OpenAiChat if is_codex_route => {
-                    ResponsesSseCapture::for_codex_responses()
+                    ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
                 Protocol::OpenAiChat if strict_openai_chat_usage => {
-                    chat_usage_capture(is_kimi_route)
+                    chat_usage_capture_with_limits(is_kimi_route, sse_framing_limits)
                 }
                 Protocol::OpenAiResponses if is_codex_route => {
-                    ResponsesSseCapture::for_codex_responses()
+                    ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
-                Protocol::OpenAiResponses => ResponsesSseCapture::for_responses(),
-                _ => ResponsesSseCapture::for_delivery(),
+                Protocol::OpenAiResponses => {
+                    ResponsesSseCapture::for_responses_with_limits(sse_framing_limits)
+                }
+                _ => ResponsesSseCapture::for_delivery_with_limits(sse_framing_limits),
             });
             let mut responses_streaming_sanitizer = (is_sse
                 && (is_codex_route || matches!(protocol, Protocol::OpenAiResponses)))
-            .then(crate::api::sse::ResponsesStreamingSanitizer::default);
+            .then(|| crate::api::sse::ResponsesStreamingSanitizer::with_limits(sse_framing_limits));
             let codex_responses_progress_heartbeat =
                 is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);
             let mut transport_error: Option<&'static str> = None;
@@ -293,7 +300,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
-            let mut terminal_frames = delivery::TerminalFrames::default();
+            let mut terminal_frames =
+                delivery::TerminalFrames::with_limit(sse_framing_limits.terminal_hold_bytes);
             let mut output_timing = timing::OutputTiming::default();
             let mut terminal_memory = background_state
                 .metrics
@@ -425,13 +433,38 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        if is_sse
+                            && !flushing_terminal
+                            && !raw_chunk.is_empty()
+                            && _sse_streaming_memory.is_none()
+                        {
+                            let Some(memory) = request_memory
+                                .try_reserve_sse_streaming(sse_framing_limits.framed_bytes)
+                            else {
+                                transport_error = Some(transport_error_with_downstream_precedence(
+                                    downstream_closed_observed || body_sender.is_closed(),
+                                    "upstream_response_memory_capacity",
+                                ));
+                                drop(archive_sender.take());
+                                let _ = tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        responses_streaming_sanitizer.as_ref(),
+                                        "upstream response exceeded memory capacity",
+                                    )),
+                                )
+                                .await;
+                                break;
+                            };
+                            _sse_streaming_memory = Some(memory);
+                        }
                         let raw_chunk_len = raw_chunk.len();
                         if downstream_closed_observed && !flushing_terminal {
                             downstream_ready_bytes =
                                 downstream_ready_bytes.saturating_add(raw_chunk_len);
-                            if downstream_ready_bytes
-                                > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES
-                            {
+                            if downstream_ready_bytes > sse_framing_limits.terminal_hold_bytes {
                                 transport_error = Some("downstream_disconnected");
                                 drop(archive_sender.take());
                                 break;
@@ -626,9 +659,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     archive_failed = true;
                                     break;
                                 };
-                                if !spool
-                                    .append(vec![super::archive_retention::sse_frame(&frame.bytes)])
-                                {
+                                if !spool.append(vec![
+                                    super::archive_retention::sse_frame_with_limits(
+                                        &frame.bytes,
+                                        sse_framing_limits,
+                                    ),
+                                ]) {
                                     archive_failed = true;
                                     break;
                                 }
@@ -865,6 +901,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             }
             drop(terminal_frames);
             terminal_memory.set_bytes(0);
+            drop(terminal_delivery);
+            drop(responses_streaming_sanitizer);
             let classification = classify_streaming_terminal(
                 status_code,
                 protocol,
@@ -872,6 +910,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 transport_error,
                 sse_summary.as_ref(),
             );
+            // Framing and terminal-delivery buffers are gone once the stream
+            // has a final classification. Return their process-wide envelope
+            // before routing publication or request settlement can block on
+            // database work.
+            drop(_sse_streaming_memory.take());
             let routing_terminal_observed_at = conversation
                 .as_ref()
                 .and_then(|conversation| conversation.hints.session_id.as_ref())
@@ -926,6 +969,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let response_archive_attempt = None;
             let terminal_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
+            #[cfg(test)]
+            finalization_test_gate::wait(request_id).await;
             finalize_streaming_lifecycle(StreamingFinalizationInput {
                 output_timing,
                 state: &background_state,
@@ -1026,11 +1071,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .map_err(|_| AppError::Internal)
 }
 
+#[cfg(test)]
 fn chat_usage_capture(is_kimi_route: bool) -> ResponsesSseCapture {
+    chat_usage_capture_with_limits(is_kimi_route, crate::provider::SseFramingLimits::default())
+}
+
+fn chat_usage_capture_with_limits(
+    is_kimi_route: bool,
+    limits: crate::provider::SseFramingLimits,
+) -> ResponsesSseCapture {
     if is_kimi_route {
-        ResponsesSseCapture::for_kimi_chat_usage()
+        ResponsesSseCapture::for_kimi_chat_usage_with_limits(limits)
     } else {
-        ResponsesSseCapture::for_openai_chat_usage()
+        ResponsesSseCapture::for_openai_chat_usage_with_limits(limits)
     }
 }
 

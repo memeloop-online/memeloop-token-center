@@ -85,6 +85,11 @@ async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
         json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000,
             "request_timeout_millis": 1000}),
+        json!({"max_sse_event_bytes": 262143}),
+        json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
+        json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+        json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112,
+            "max_sse_terminal_hold_bytes": 1179648}),
     ] {
         let mut rejected = update.clone();
         rejected["expected_updated_at"] = saved["updated_at"].clone();
@@ -115,7 +120,9 @@ async fn versioned_policy_roundtrips_through_authorized_cas_api() {
         &fixture,
         json!({"version": 1, "candidate_attempts": 8,
         "failover_deadline_millis": 1234, "connect_timeout_millis": 1000,
-        "read_timeout_millis": 2000, "request_timeout_millis": 3000}),
+        "read_timeout_millis": 2000, "request_timeout_millis": 3000,
+        "max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112,
+        "max_sse_terminal_hold_bytes": 1114112}),
     )
     .await;
 }

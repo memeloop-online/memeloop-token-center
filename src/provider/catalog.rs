@@ -521,7 +521,7 @@ impl ProviderCatalog {
             "type": "object",
             "additionalProperties": false,
             "default": {},
-            "description": "Runtime-adjustable recovery policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
+            "description": "Runtime-adjustable transport policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
             "properties": {
                 "version": {
                     "type": "integer",
@@ -544,6 +544,21 @@ impl ProviderCatalog {
                     "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000,
                     "title": "Memory queue timeout (ms)",
                     "description": "Maximum wait for gateway memory capacity within the request deadline."
+                },
+                "max_sse_event_bytes": {
+                    "type": "integer", "minimum": 262144, "maximum": 16777216, "default": 8388608,
+                    "title": "Maximum SSE event bytes",
+                    "description": "Maximum bytes retained for one upstream SSE event. Responses terminal events may contain the complete response object."
+                },
+                "max_sse_framed_bytes": {
+                    "type": "integer", "minimum": 262144, "maximum": 16842752, "default": 8454144,
+                    "title": "Maximum framed bytes per network chunk",
+                    "description": "Maximum completed SSE bytes materialized from one upstream network chunk. Must be at least max_sse_event_bytes."
+                },
+                "max_sse_terminal_hold_bytes": {
+                    "type": "integer", "minimum": 262144, "maximum": 16842752, "default": 8454144,
+                    "title": "Maximum terminal hold bytes",
+                    "description": "Maximum validated Responses terminal bytes held until EOF. Must be between max_sse_event_bytes and max_sse_framed_bytes."
                 },
                 "candidate_attempts": {
                     "type": "integer",

@@ -28,6 +28,18 @@ pub(super) async fn send_reqwest_proxy_route(
     // local to this attempt; the caller's frozen outer attempt budget remains
     // authoritative when it selects a standby candidate.
     let timeout = configured_timeout(&route.route.config);
+    let sse_framing_limits = crate::provider::SseFramingLimits::default();
+    tracing::info!(
+        %request_id,
+        upstream_account_id = %route.route.account_id,
+        transport_policy_source = "global_default",
+        transport_policy_version = 1,
+        max_sse_event_bytes = sse_framing_limits.event_bytes,
+        max_sse_framed_bytes = sse_framing_limits.framed_bytes,
+        max_sse_terminal_hold_bytes = sse_framing_limits.terminal_hold_bytes,
+        stage = "sse_framing_policy_snapshot",
+        "upstream SSE framing policy frozen"
+    );
     let request_deadline = tokio::time::Instant::now() + timeout;
     let outbound_base_url = route.route.base_url.clone();
     let outbound_http = match tokio::time::timeout_at(
@@ -128,7 +140,12 @@ pub(super) async fn send_reqwest_proxy_route(
     match upstream_result {
         Ok(response) => {
             let response = if let Some(context) = route.responses_chat.clone() {
-                super::kimi::translate(response, context, route.upstream_stream)?
+                super::kimi::translate(
+                    response,
+                    context,
+                    route.upstream_stream,
+                    sse_framing_limits,
+                )?
             } else {
                 UpstreamResponse::Reqwest(response)
             };
@@ -140,6 +157,7 @@ pub(super) async fn send_reqwest_proxy_route(
                 response: response.with_body_timeouts(request_deadline, timeout),
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
+                sse_framing_limits,
             })
         }
         Err(error) => Err(error),

@@ -45,6 +45,7 @@ async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
             raw,
             crate::api::responses_via_chat::Context::for_kimi(&json!({"model":fixture.model})),
             true,
+            crate::provider::SseFramingLimits::default(),
         )
         .unwrap();
         let chunks = translated.bytes_stream().collect::<Vec<_>>().await;
@@ -149,7 +150,13 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         .unwrap();
     assert!(response.content_length().is_some());
     let context = crate::api::responses_via_chat::Context::for_kimi(&json!({"model":"kimi"}));
-    let translated = routing::kimi::translate(response, context, false).unwrap();
+    let translated = routing::kimi::translate(
+        response,
+        context,
+        false,
+        crate::provider::SseFramingLimits::default(),
+    )
+    .unwrap();
     assert!(translated.content_length().is_none());
     let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
         crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,

@@ -102,6 +102,43 @@ fn rejects_crlf_that_crosses_the_exact_event_byte_limit() {
 }
 
 #[test]
+fn request_snapshot_controls_event_and_batch_limits() {
+    let limits = crate::provider::SseFramingLimits {
+        event_bytes: 300 * 1024,
+        framed_bytes: 320 * 1024,
+        terminal_hold_bytes: 320 * 1024,
+    };
+    let mut accepted = b"data: ".to_vec();
+    accepted.extend(vec![b'x'; limits.event_bytes - b"data: ".len() - 2]);
+    accepted.extend_from_slice(b"\n\n");
+    let mut framer = BoundedSseFramer::with_limits(limits);
+    let split = 257 * 1024;
+    assert!(framer.push(&accepted[..split]).events.is_empty());
+    let completed = framer.push(&accepted[split..]);
+    assert!(completed.rejection.is_none());
+    assert_eq!(completed.events.len(), 1);
+
+    let mut oversized = BoundedSseFramer::with_limits(limits);
+    assert_eq!(
+        oversized
+            .push(&vec![b'x'; limits.event_bytes + 1])
+            .rejection,
+        Some(SseFramerRejection::EventLimit)
+    );
+
+    let mut small = b"data: ".to_vec();
+    small.extend(vec![b'x'; 1024]);
+    small.extend_from_slice(b"\n\n");
+    let mut batch = BoundedSseFramer::with_limits(limits);
+    assert_eq!(
+        batch
+            .push(&small.repeat(limits.framed_bytes / small.len() + 1))
+            .rejection,
+        Some(SseFramerRejection::BatchLimit)
+    );
+}
+
+#[test]
 fn accepts_exact_metadata_budget_and_rejects_million_short_fields_within_2mib() {
     // Four events with 4,095 fields use exactly 16,384 retained field/event
     // metadata entries: 4 * (4,095 field lines + 1 event frame).

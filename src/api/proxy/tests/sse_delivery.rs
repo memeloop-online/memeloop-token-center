@@ -111,6 +111,9 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap())
+        .expect("gateway request id");
+    let finalization_gate = streaming::finalization_test_gate::install(request_id);
 
     let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(
@@ -118,10 +121,22 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         "source-backed raw conversation bytes are released while the SSE remains open"
     );
 
+    let delivered = tokio::spawn(async move {
+        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap()
+    });
     release_body.send(()).unwrap();
-    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+    tokio::time::timeout(Duration::from_secs(5), finalization_gate.entered.notified())
         .await
-        .unwrap();
+        .expect("stream must reach the deterministic finalization gate");
+    let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
+    assert!(
+        held < RETAINED_BYTES,
+        "SSE framing capacity is returned before database finalization"
+    );
+    finalization_gate.release.notify_one();
+    let delivered = delivered.await.unwrap();
     assert!(String::from_utf8_lossy(&delivered).contains("projected after EOF"));
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;

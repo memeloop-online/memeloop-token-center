@@ -15,6 +15,7 @@ pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) shared_probe_attempts: u32,
     pub(in crate::api::proxy) source: &'static str,
     pub(in crate::api::proxy) version: u32,
+    pub(in crate::api::proxy) sse_framing_limits: crate::provider::SseFramingLimits,
     connect_timeout: std::time::Duration,
     read_timeout: std::time::Duration,
     request_timeout: std::time::Duration,
@@ -51,8 +52,9 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
         source: if config.get("transport_policy").is_some() {
             "account_config"
         } else {
-            "default"
+            "global_default"
         },
+        sse_framing_limits: policy.sse_framing_limits(),
         connect_timeout: std::time::Duration::from_millis(policy.connect_timeout_millis),
         read_timeout: std::time::Duration::from_millis(policy.read_timeout_millis),
         request_timeout: std::time::Duration::from_millis(policy.request_timeout_millis),
@@ -124,6 +126,17 @@ pub(super) async fn send_proxy_route(
         state.config.upstream_health.shared_probe_attempts,
     )
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    tracing::info!(
+        %request_id,
+        upstream_account_id = %route.route.account_id,
+        transport_policy_source = transport_policy.source,
+        transport_policy_version = transport_policy.version,
+        max_sse_event_bytes = transport_policy.sse_framing_limits.event_bytes,
+        max_sse_framed_bytes = transport_policy.sse_framing_limits.framed_bytes,
+        max_sse_terminal_hold_bytes = transport_policy.sse_framing_limits.terminal_hold_bytes,
+        stage = "sse_framing_policy_snapshot",
+        "upstream SSE framing policy frozen"
+    );
     // One logical Codex send may include the sole, explicitly permitted 400
     // replay. Keep one deadline across both sends so replay cannot refresh an
     // operator-configured total request budget.
@@ -184,11 +197,17 @@ pub(super) async fn send_proxy_route(
                 response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::new(state.metrics.clone(), retry.outcome()),
+                sse_framing_limits: transport_policy.sse_framing_limits,
             });
         }
         let content_type_class = codex_transport::content_type_class(&response);
         let http_version = codex_transport::http_version_class(&response);
-        match codex_transport::admit_event_stream_response(response).await {
+        match codex_transport::admit_event_stream_response(
+            response,
+            transport_policy.sse_framing_limits,
+        )
+        .await
+        {
             Ok(response) => {
                 return Ok(ProxyRouteResponse {
                     response,
@@ -197,6 +216,7 @@ pub(super) async fn send_proxy_route(
                         state.metrics.clone(),
                         retry.outcome(),
                     ),
+                    sse_framing_limits: transport_policy.sse_framing_limits,
                 });
             }
             Err(codex_transport::ResponseAdmissionError::Invalid(error_code)) => {
@@ -447,6 +467,39 @@ where
 mod timeout_tests {
     use super::super::outcome::FailoverDisposition;
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_policy_snapshots_current_sse_limits_per_request() {
+        let defaults = runtime_transport_policy(&json!({}), 1).unwrap();
+        assert_eq!(defaults.source, "global_default");
+        assert_eq!(
+            defaults.sse_framing_limits,
+            crate::provider::SseFramingLimits::default()
+        );
+        let first = runtime_transport_policy(
+            &json!({"transport_policy": {
+                "max_sse_event_bytes": 1048576,
+                "max_sse_framed_bytes": 1114112,
+                "max_sse_terminal_hold_bytes": 1114112
+            }}),
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.source, "account_config");
+        let reloaded = runtime_transport_policy(
+            &json!({"transport_policy": {
+                "max_sse_event_bytes": 2097152,
+                "max_sse_framed_bytes": 2162688,
+                "max_sse_terminal_hold_bytes": 2162688
+            }}),
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.sse_framing_limits.event_bytes, 1_048_576);
+        assert_eq!(reloaded.sse_framing_limits.event_bytes, 2_097_152);
+        assert_ne!(first.sse_framing_limits, reloaded.sse_framing_limits);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn request_deadline_wins_at_the_typed_connect_boundary() {

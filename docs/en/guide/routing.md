@@ -42,7 +42,7 @@ When all candidates are unavailable and the failure is temporary (`unavailable`)
 
 ## Codex transport policy `transport_policy`
 
-Native Codex accounts can adjust connection and failover budgets in `config.transport_policy` (version 1; a missing `version` is treated as 1; unknown fields and out-of-range values are rejected):
+Native Codex accounts can adjust connection, failover, and SSE framing budgets in `config.transport_policy` (version 1; a missing `version` is treated as 1; unknown fields and out-of-range values are rejected):
 
 | Field | Default | Allowed range |
 | --- | --- | --- |
@@ -51,8 +51,13 @@ Native Codex accounts can adjust connection and failover budgets in `config.tran
 | `shared_probe_attempts` | Follows service health setting | 0–4 |
 | `candidate_attempts` | 3 | 1–8 |
 | `failover_deadline_millis` | 300000 | 1000–300000 |
+| `max_sse_event_bytes` | 8388608 | 262144–16777216 |
+| `max_sse_framed_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
+| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–`max_sse_framed_bytes` |
 
-Change this with the existing account update `PUT /internal/v1/upstreams/{account_id}` (CAS). Candidate count and Deadline are snapshotted once on request entry: fallback configuration and runtime changes do not add budget to an executing request. After the Deadline, no new send starts, but a response stream that has been admitted successfully is not truncated.
+Change this with the existing account update `PUT /internal/v1/upstreams/{account_id}` (CAS). Candidate count and Deadline are snapshotted once on request entry. SSE limits are snapshotted once for the selected outbound attempt and shared by header admission, sanitizer, delivery capture, archive projection, and terminal hold. Runtime changes apply to later requests and never change an executing stream. After the Deadline, no new send starts, but a response stream that has been admitted successfully is not truncated.
+
+Each admitted SSE stream reserves a two-buffer framing and terminal envelope from the process-wide proxy memory budget before delivery starts. Larger account limits therefore reduce admitted stream concurrency instead of allowing aggregate framing and terminal buffers to exceed the global budget. Archive JSON transformations retain their separate weighted admission.
 
 ## Reservation bounds for custom models `reservation_token_bounds`
 

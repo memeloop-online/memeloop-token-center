@@ -14,9 +14,11 @@ use super::super::sse::{
     SAFE_SSE_HEARTBEAT_COMMENT, SseFramerRejection, is_response_metadata_event, is_sse_field_line,
     parse_sse_event, parse_unique_json, trim_ascii,
 };
+#[cfg(test)]
+use super::MAX_RESPONSES_SSE_EVENT_BYTES;
 use super::{
-    MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
-    MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage, upstream_response::UpstreamResponse,
+    MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS, Protocol, TokenUsage,
+    upstream_response::UpstreamResponse,
 };
 use crate::provider::CodexChatControlPolicy;
 use crate::{
@@ -1126,6 +1128,7 @@ pub(super) enum ResponseAdmissionError {
 
 pub(super) async fn admit_event_stream_response(
     response: UpstreamResponse,
+    sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<UpstreamResponse, ResponseAdmissionError> {
     if is_event_stream(&response) {
         return Ok(response);
@@ -1148,7 +1151,7 @@ pub(super) async fn admit_event_stream_response(
     let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
-    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut sanitizer = ResponsesStreamingSanitizer::with_limits(sse_framing_limits);
     loop {
         let next = tokio::time::timeout_at(deadline, parts.stream.next())
             .await
@@ -1161,7 +1164,7 @@ pub(super) async fn admit_event_stream_response(
         let chunk = next.map_err(ResponseAdmissionError::Ambiguous)?;
         let mut accepted_at = None;
         for (index, byte) in chunk.iter().enumerate() {
-            if inspected.len() == MAX_RESPONSES_SSE_EVENT_BYTES {
+            if inspected.len() == sse_framing_limits.event_bytes {
                 return Err(ResponseAdmissionError::Invalid(
                     "upstream_response_event_too_large",
                 ));
@@ -1176,7 +1179,7 @@ pub(super) async fn admit_event_stream_response(
             }
         }
         if let Some(accepted_at) = accepted_at {
-            validate_missing_content_type_prefix(&inspected)
+            validate_missing_content_type_prefix(&inspected, sse_framing_limits)
                 .map_err(ResponseAdmissionError::Invalid)?;
             prefetched.push(chunk.slice(..accepted_at));
             if accepted_at < chunk.len() {
@@ -1194,11 +1197,14 @@ pub(super) async fn admit_event_stream_response(
     }
 }
 
-fn validate_missing_content_type_prefix(prefix: &[u8]) -> Result<(), &'static str> {
+fn validate_missing_content_type_prefix(
+    prefix: &[u8],
+    sse_framing_limits: crate::provider::SseFramingLimits,
+) -> Result<(), &'static str> {
     // Headerless admission uses the same CR/LF/CRLF bounded scanner as
     // delivery; it must not grow a fourth LF-only parser with divergent EOF
     // and line-ending semantics.
-    let mut framer = BoundedSseFramer::default();
+    let mut framer = BoundedSseFramer::with_limits(sse_framing_limits);
     let batch = framer.push(prefix);
     if batch.rejection.is_some() || !framer.is_complete() {
         return Err("upstream_invalid_content_type");
@@ -1714,6 +1720,7 @@ pub(super) async fn buffer_response(
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     started: std::time::Instant,
     conversation: Option<&super::ProxyConversation>,
+    sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<BufferedCodexResponse, &'static str> {
     if response
         .headers()
@@ -1757,7 +1764,7 @@ pub(super) async fn buffer_response(
         diagnostic_context,
         "buffered_first_byte",
     ));
-    let mut parser = BufferedResponsesParser::default();
+    let mut parser = BufferedResponsesParser::with_limits(sse_framing_limits);
     let mut total = 0_usize;
     let mut memory_scanner = crate::gateway_body::memory::JsonMemoryScanner::default();
     let mut stream = response.bytes_stream();
@@ -1799,6 +1806,13 @@ struct BufferedResponsesParser {
 }
 
 impl BufferedResponsesParser {
+    fn with_limits(limits: crate::provider::SseFramingLimits) -> Self {
+        Self {
+            framer: BoundedSseFramer::with_limits(limits),
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) -> Result<(), &'static str> {
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
@@ -2364,7 +2378,10 @@ mod tests {
             json!({
                 "connect_attempts": 4,
                 "connect_retry_delay_millis": 2000,
-                "shared_probe_attempts": 4
+                "shared_probe_attempts": 4,
+                "max_sse_event_bytes": 1048576,
+                "max_sse_framed_bytes": 1114112,
+                "max_sse_terminal_hold_bytes": 1114112
             }),
         );
         assert!(validate_route_config(&valid).is_ok());
@@ -2374,6 +2391,10 @@ mod tests {
             json!({"connect_attempts": 5}),
             json!({"connect_retry_delay_millis": 2001}),
             json!({"shared_probe_attempts": 5}),
+            json!({"max_sse_event_bytes": 262143}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
             json!({"unexpected": true}),
             json!("invalid"),
         ] {
@@ -2667,6 +2688,18 @@ mod tests {
         let mut parser = BufferedResponsesParser::default();
         let oversized = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES + 1];
         assert!(parser.push(&oversized).is_err());
+
+        let limits = crate::provider::SseFramingLimits {
+            event_bytes: 300 * 1024,
+            framed_bytes: 320 * 1024,
+            terminal_hold_bytes: 320 * 1024,
+        };
+        let mut configured = BufferedResponsesParser::with_limits(limits);
+        assert!(
+            configured
+                .push(&vec![b'x'; limits.event_bytes + 1])
+                .is_err()
+        );
     }
 
     #[test]
@@ -2794,7 +2827,10 @@ mod tests {
             http::Version::HTTP_2,
             vec![Ok(body.clone())],
         );
-        let response = admit_event_stream_response(response).await.unwrap();
+        let response =
+            admit_event_stream_response(response, crate::provider::SseFramingLimits::default())
+                .await
+                .unwrap();
         assert!(is_event_stream(&response));
         assert_eq!(response.version(), http::Version::HTTP_2);
         let mut stream = response.bytes_stream();
@@ -2814,7 +2850,8 @@ mod tests {
             vec![Ok(body.clone())],
         );
         assert!(matches!(
-            admit_event_stream_response(missing).await,
+            admit_event_stream_response(missing, crate::provider::SseFramingLimits::default())
+                .await,
             Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type"
             ))
@@ -2829,7 +2866,11 @@ mod tests {
             let response =
                 UpstreamResponse::for_test(headers, http::Version::HTTP_2, vec![Ok(body.clone())]);
             assert!(matches!(
-                admit_event_stream_response(response).await,
+                admit_event_stream_response(
+                    response,
+                    crate::provider::SseFramingLimits::default(),
+                )
+                .await,
                 Err(ResponseAdmissionError::Invalid(
                     "upstream_invalid_content_type"
                 ))
@@ -2847,9 +2888,38 @@ mod tests {
         );
         let response = UpstreamResponse::for_test(duplicate, http::Version::HTTP_2, vec![Ok(body)]);
         assert!(matches!(
-            admit_event_stream_response(response).await,
+            admit_event_stream_response(response, crate::provider::SseFramingLimits::default())
+                .await,
             Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_admission_uses_the_request_framing_snapshot() {
+        let limits = crate::provider::SseFramingLimits {
+            event_bytes: 300 * 1024,
+            framed_bytes: 320 * 1024,
+            terminal_hold_bytes: 320 * 1024,
+        };
+        let body = Bytes::from(format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp-policy", "padding": "x".repeat(limits.event_bytes)},
+            })
+        ));
+        let split = 257 * 1024;
+        let response = UpstreamResponse::for_test(
+            http::HeaderMap::new(),
+            http::Version::HTTP_2,
+            vec![Ok(body.slice(..split)), Ok(body.slice(split..))],
+        );
+        assert!(matches!(
+            admit_event_stream_response(response, limits).await,
+            Err(ResponseAdmissionError::Invalid(
+                "upstream_response_event_too_large"
             ))
         ));
     }

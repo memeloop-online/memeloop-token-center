@@ -35,8 +35,8 @@ export function connectionSchema(schema: RJSFSchema, endpointHint: string): RJSF
   }
   const policy = result.properties?.transport_policy;
   if (policy && typeof policy === 'object') {
-    policy.title = 'Runtime retry policy';
-    for (const [name, title] of Object.entries({ connect_timeout_millis: 'Connect timeout (ms)', read_timeout_millis: 'Read inactivity timeout (ms)', request_timeout_millis: 'Total request timeout (ms)' })) {
+    policy.title = 'Runtime transport policy';
+    for (const [name, title] of Object.entries({ connect_timeout_millis: 'Connect timeout (ms)', read_timeout_millis: 'Read inactivity timeout (ms)', request_timeout_millis: 'Total request timeout (ms)', max_sse_event_bytes: 'Maximum SSE event (bytes)', max_sse_framed_bytes: 'Maximum framed chunk (bytes)', max_sse_terminal_hold_bytes: 'Maximum terminal hold (bytes)' })) {
       const field = policy.properties?.[name];
       if (field && typeof field === 'object') field.title = title;
     }
