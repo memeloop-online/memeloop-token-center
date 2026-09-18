@@ -6,16 +6,36 @@ import test from 'node:test';
 import { rejected, repository, run } from './contract-helpers.ts';
 
 const revision = 'a'.repeat(40);
+const cargoManifest = readFileSync(join(repository, 'Cargo.toml'), 'utf8');
+const releaseVersion = /^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"$/mu.exec(cargoManifest)?.[1];
+if (releaseVersion === undefined) throw new Error('Cargo release version is missing');
+
+test('release version stays synchronized across product metadata', () => {
+  assert.match(readFileSync(join(repository, 'Cargo.lock'), 'utf8'), new RegExp(`\\[\\[package\\]\\]\\nname = "memeloop-token-center"\\nversion = "${releaseVersion.replaceAll('.', '\\.')}"`));
+  for (const file of ['package.json', 'web/package.json', 'web/operator-ui-sdk/package.json']) {
+    assert.equal((JSON.parse(readFileSync(join(repository, file), 'utf8')) as { version?: string }).version, releaseVersion, file);
+  }
+  for (const file of ['package-lock.json', 'web/package-lock.json']) {
+    const lock = JSON.parse(readFileSync(join(repository, file), 'utf8')) as { version?: string; packages?: Record<string, { version?: string }> };
+    assert.equal(lock.version, releaseVersion, file);
+    assert.equal(lock.packages?.['']?.version, releaseVersion, `${file} root package`);
+  }
+  const chart = readFileSync(join(repository, 'charts/memeloop-token-center/Chart.yaml'), 'utf8');
+  assert.ok(chart.includes(`\nversion: ${releaseVersion}\n`));
+  assert.ok(chart.includes(`\nappVersion: "${releaseVersion}"\n`));
+  assert.ok(readFileSync(join(repository, 'charts/memeloop-token-center/values.yaml'), 'utf8').includes(`\n  tag: "v${releaseVersion}"\n`));
+  assert.ok(readFileSync(join(repository, 'openapi/openapi.yaml'), 'utf8').includes(`\n  version: ${releaseVersion}\n`));
+});
 
 test('version metadata accepts only the Cargo version tag', () => {
   const temporary = mkdtempSync(join(tmpdir(), 'mtc-release-version-'));
   try {
     const output = join(temporary, 'output');
     writeFileSync(output, '');
-    run(process.execPath, ['scripts/ci/resolve-release-metadata.ts', 'refs/tags/v0.1.0', output], { cwd: repository });
+    run(process.execPath, ['scripts/ci/resolve-release-metadata.ts', `refs/tags/v${releaseVersion}`, output], { cwd: repository });
     const values = Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map((line) => line.split('=', 2)));
-    assert.deepEqual(values, { version: '0.1.0', version_tag: 'v0.1.0', is_version_tag: 'true' });
-    rejected(process.execPath, ['scripts/ci/resolve-release-metadata.ts', 'refs/tags/v0.2.0', output], { cwd: repository });
+    assert.deepEqual(values, { version: releaseVersion, version_tag: `v${releaseVersion}`, is_version_tag: 'true' });
+    rejected(process.execPath, ['scripts/ci/resolve-release-metadata.ts', `refs/tags/v${releaseVersion}-mismatch`, output], { cwd: repository });
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 });
 
@@ -48,14 +68,14 @@ test('GitHub release assets contain raw binaries, runnable archives, checksums, 
       { revision, reference: 'ghcr.io/memeloop-online/memeloop-token-center@sha256:' + '1'.repeat(64) },
       { revision, reference: 'ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@sha256:' + '2'.repeat(64) },
     ]));
-    run(process.execPath, ['scripts/ci/create-github-release-assets.ts', input, evidence, manifest, output, revision, '0.1.0'], { cwd: repository });
+    run(process.execPath, ['scripts/ci/create-github-release-assets.ts', input, evidence, manifest, output, revision, releaseVersion], { cwd: repository });
     const names = readdirSync(output).sort();
     for (const required of [
       'SHA256SUMS', 'memeloop-token-center-linux-amd64', 'install-plugin-oci-linux-amd64',
-      'memeloop-token-center-0.1.0-linux-amd64.tar.gz', 'install-plugin-oci-0.1.0-linux-amd64.tar.gz',
+      `memeloop-token-center-${releaseVersion}-linux-amd64.tar.gz`, `install-plugin-oci-${releaseVersion}-linux-amd64.tar.gz`,
       'memeloop-token-center-image-linux-amd64.spdx.json', 'memeloop-token-center-image-linux-amd64.provenance.json',
     ]) assert.ok(names.includes(required), required);
-    const serviceListing = run('tar', ['-tzf', join(output, 'memeloop-token-center-0.1.0-linux-amd64.tar.gz')]);
+    const serviceListing = run('tar', ['-tzf', join(output, `memeloop-token-center-${releaseVersion}-linux-amd64.tar.gz`)]);
     assert.match(serviceListing, /bin\/memeloop-token-center$/m);
     assert.match(serviceListing, /share\/web\/index\.html$/m);
     assert.match(serviceListing, /third-party-licenses\/cosign-LICENSE$/m);
