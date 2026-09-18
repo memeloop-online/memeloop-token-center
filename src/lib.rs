@@ -29,6 +29,11 @@ pub mod plugin_distribution;
     feature = "plugin-distribution"
 ))]
 mod plugin_publication;
+#[cfg(any(
+    feature = "experimental-plugin-revisions",
+    feature = "plugin-distribution"
+))]
+mod plugin_runtime_companions;
 pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;

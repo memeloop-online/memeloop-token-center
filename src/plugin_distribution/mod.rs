@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 use crate::plugin::{PluginManifest, validate_plugin_package};
 
+pub use crate::plugin_runtime_companions::{COSIGN_VERIFIER_FILENAME, COSIGN_VERIFIER_VERSION};
+
 pub const PLUGIN_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.memeloop.token-center.plugin.v1";
 pub const PLUGIN_CONFIG_MEDIA_TYPE: &str =
     "application/vnd.memeloop.token-center.plugin.config.v1+json";
@@ -46,9 +48,6 @@ const MAX_COSIGN_OUTPUT_BYTES: u64 = 64 * 1024;
 const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
 // A whole-operation bound prevents drip-fed bodies holding an install lease.
 const OCI_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-pub const COSIGN_VERIFIER_FILENAME: &str = "cosign";
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3";
-const PLUGIN_INSTALLER_FILENAME: &str = "install-plugin-oci";
 
 #[derive(Clone, Default)]
 pub enum RegistryCredentials {
@@ -389,124 +388,22 @@ trait CosignRunner: Send + Sync {
 
 struct SystemCosignRunner;
 
-struct PluginRuntimeLayout {
-    binary_directory: PathBuf,
-    library_directory: PathBuf,
-    installer: PathBuf,
-}
-
-fn plugin_runtime_layout_from(executable: &Path) -> io::Result<PluginRuntimeLayout> {
-    let binary_directory = executable
-        .parent()
-        .ok_or_else(|| io::Error::other("runtime executable directory unavailable"))?
-        .canonicalize()?;
-    let root = binary_directory
-        .parent()
-        .ok_or_else(|| io::Error::other("runtime root unavailable"))?;
-    let installer = executable_regular_sibling(
-        &binary_directory,
-        PLUGIN_INSTALLER_FILENAME,
-        "co-located plugin installer",
-    )?;
-    let library_candidate = root.join("lib");
-    let library_metadata = std::fs::symlink_metadata(&library_candidate)?;
-    if !library_metadata.is_dir() || library_metadata.file_type().is_symlink() {
-        return Err(io::Error::other(
-            "co-located runtime library path must be a regular directory",
-        ));
-    }
-    let library_directory = library_candidate.canonicalize()?;
-    if library_directory.parent() != Some(root) {
-        return Err(io::Error::other(
-            "co-located runtime library path escaped the package root",
-        ));
-    }
-    Ok(PluginRuntimeLayout {
-        installer,
-        library_directory,
-        binary_directory,
-    })
-}
-
-fn plugin_runtime_layout() -> io::Result<PluginRuntimeLayout> {
-    plugin_runtime_layout_from(&std::env::current_exe()?)
-}
-
-pub(crate) fn plugin_installer_command() -> io::Result<tokio::process::Command> {
-    let runtime = plugin_runtime_layout()?;
-    let search_path = std::env::join_paths([
-        runtime.binary_directory.as_path(),
-        Path::new("/usr/bin"),
-        Path::new("/bin"),
-    ])
-    .map_err(|_| io::Error::other("plugin runtime search path is invalid"))?;
-    let mut command = tokio::process::Command::new(runtime.installer);
-    command
-        .env_clear()
-        .env("LD_LIBRARY_PATH", runtime.library_directory)
-        .env("PATH", search_path);
-    Ok(command)
-}
-
 /// Prove that this service executable can launch its co-located installer and
 /// that the installer can launch and validate its co-located Cosign verifier.
+#[cfg(feature = "experimental-plugin-revisions")]
 pub async fn verify_plugin_runtime() -> io::Result<()> {
-    let mut command = plugin_installer_command()?;
-    command
-        .arg("--mtc-cosign-runtime-check")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(Duration::from_secs(15), command.status())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "plugin runtime check timed out"))??;
-    if !status.success() {
-        return Err(io::Error::other("plugin runtime check failed"));
-    }
-    Ok(())
-}
-
-fn cosign_verifier_path_from(executable: &Path) -> io::Result<PathBuf> {
-    let directory = executable
-        .parent()
-        .ok_or_else(|| io::Error::other("installer executable directory unavailable"))?
-        .canonicalize()?;
-    executable_regular_sibling(&directory, COSIGN_VERIFIER_FILENAME, "co-located cosign")
-}
-
-fn executable_regular_sibling(
-    directory: &Path,
-    filename: &str,
-    description: &str,
-) -> io::Result<PathBuf> {
-    let candidate = directory.join(filename);
-    let metadata = std::fs::symlink_metadata(&candidate)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o111 == 0
-    {
-        return Err(io::Error::other(format!(
-            "{description} must be an executable regular file"
-        )));
-    }
-    let canonical = candidate.canonicalize()?;
-    if canonical.parent() != Some(directory) {
-        return Err(io::Error::other(format!(
-            "{description} escaped the executable directory"
-        )));
-    }
-    Ok(canonical)
-}
-
-fn cosign_verifier_path() -> io::Result<PathBuf> {
-    cosign_verifier_path_from(&std::env::current_exe()?)
+    crate::plugin_runtime_companions::verify_plugin_runtime().await
 }
 
 #[async_trait]
 impl CosignRunner for SystemCosignRunner {
     async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput> {
-        run_cosign_process(&cosign_verifier_path()?, command, COSIGN_TIMEOUT).await
+        run_cosign_process(
+            &crate::plugin_runtime_companions::cosign_verifier_path()?,
+            command,
+            COSIGN_TIMEOUT,
+        )
+        .await
     }
 }
 

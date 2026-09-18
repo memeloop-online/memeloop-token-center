@@ -93,7 +93,10 @@ enum Command {
     },
     /// Internal release-package check for the installer, runtime library path,
     /// and Cosign companion. It performs no registry or database access.
-    #[cfg(feature = "experimental-plugin-revisions")]
+    #[cfg(all(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ))]
     #[command(hide = true)]
     VerifyPluginRuntime,
 }
@@ -144,7 +147,10 @@ async fn run() -> Result<(), &'static str> {
         }
         .map_err(|_| "plugin_inventory_preparation_failed");
     }
-    #[cfg(feature = "experimental-plugin-revisions")]
+    #[cfg(all(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ))]
     if matches!(&cli.command, Command::VerifyPluginRuntime) {
         return memeloop_token_center::plugin_distribution::verify_plugin_runtime()
             .await
@@ -157,7 +163,10 @@ async fn run() -> Result<(), &'static str> {
         Command::PreparePluginInventory { .. } => {
             unreachable!("handled before configuration loading")
         }
-        #[cfg(feature = "experimental-plugin-revisions")]
+        #[cfg(all(
+            feature = "experimental-plugin-revisions",
+            feature = "plugin-distribution"
+        ))]
         Command::VerifyPluginRuntime => {
             unreachable!("handled before configuration loading")
         }

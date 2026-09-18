@@ -360,7 +360,7 @@ impl ApplicationPlugins {
                 {
                     return Ok(());
                 }
-                let mut command = crate::plugin_distribution::plugin_installer_command()
+                let mut command = crate::plugin_runtime_companions::plugin_installer_command()
                     .map_err(|_| AppError::Internal)?;
                 command
                     .arg(reference)

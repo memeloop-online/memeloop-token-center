@@ -103,11 +103,11 @@ test('release contains only runtime images and no retired migration delivery sur
   contains('Dockerfile.release', '["/usr/local/bin/memeloop-token-center", "verify-plugin-runtime"]');
   contains('Dockerfile.release', '["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]');
   contains('Dockerfile.plugin-installer.release', '["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]');
-  contains('src/plugin_distribution/mod.rs', 'std::env::current_exe()?');
-  contains('src/plugin_distribution/mod.rs', 'PLUGIN_INSTALLER_FILENAME');
+  contains('src/plugin_runtime_companions.rs', 'std::env::current_exe()?');
+  contains('src/plugin_runtime_companions.rs', 'PLUGIN_INSTALLER_FILENAME');
   assert.ok(!read('src/plugin/application/installation.rs').includes('/usr/local/bin/install-plugin-oci'));
   assert.ok(!read('src/plugin/application/installation.rs').includes('LD_LIBRARY_PATH", "/usr/local/lib'));
-  assert.ok(!read('src/plugin_distribution/mod.rs').includes('/usr/local/bin/cosign'));
+  assert.ok(!read('src/plugin_runtime_companions.rs').includes('/usr/local/bin/cosign'));
   assert.ok(!read('Dockerfile.release').includes('npm run build'));
   assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
   assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory_acceptance == 'true'");
