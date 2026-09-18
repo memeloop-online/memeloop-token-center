@@ -55,7 +55,7 @@ pub(super) async fn promote_active_plaintext(
             if let Some(plaintext) = row.try_get::<Option<String>, _>("secret_plaintext")? {
                 if !crypto::verify_credential(&plaintext, pepper, &expected)
                     || crypto::parse_credential(&plaintext)
-                        .is_some_and(|parsed| parsed.key_id != key_uuid)
+                        .is_none_or(|parsed| parsed.key_id != key_uuid)
                 {
                     return Err(invalid_upgrade());
                 }
@@ -78,7 +78,7 @@ pub(super) async fn promote_active_plaintext(
                 || envelope.credential_generation != generation
                 || !crypto::verify_credential(&envelope.key, pepper, &expected)
                 || crypto::parse_credential(&envelope.key)
-                    .is_some_and(|parsed| parsed.key_id != key_uuid)
+                    .is_none_or(|parsed| parsed.key_id != key_uuid)
             {
                 return Err(invalid_upgrade());
             }
@@ -138,7 +138,7 @@ mod tests {
             issued.key_id
         };
         let generation = if fault == "payload_generation" { 2 } else { 1 };
-        let key = if fault == "hash" {
+        let key = if fault == "hash" || fault == "unparseable" {
             "incorrect-original-value"
         } else {
             issued.key.as_str()
@@ -162,6 +162,15 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
+        if fault == "unparseable" {
+            let (hash, _) = crypto::hash_credential(key, PEPPER);
+            sqlx::query("UPDATE key_credentials SET secret_hash = $1 WHERE key_id = $2")
+                .bind(hash)
+                .bind(issued.key_id.to_string())
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -215,6 +224,8 @@ mod tests {
             "active_generation",
             "existing_plaintext_hash",
             "existing_plaintext_identity",
+            "existing_plaintext_unparseable",
+            "unparseable",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let database = Database::connect(&format!(
@@ -255,8 +266,23 @@ mod tests {
             }
             if fault == "existing_plaintext_identity" {
                 let foreign = crypto::issue_credential(Uuid::nil(), PEPPER);
+                let duplicate_hashes: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM key_credentials WHERE secret_hash = $1",
+                )
+                .bind(&foreign.secret_hash)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+                assert_eq!(duplicate_hashes, 0);
                 sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
                     .bind(&foreign.secret).bind(&foreign.secret_hash).bind(invalid.key_id.to_string())
+                    .execute(&database.pool).await.unwrap();
+            }
+            if fault == "existing_plaintext_unparseable" {
+                let plaintext = "fixture-opaque-original-value";
+                let (hash, _) = crypto::hash_credential(plaintext, PEPPER);
+                sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
+                    .bind(plaintext).bind(hash).bind(invalid.key_id.to_string())
                     .execute(&database.pool).await.unwrap();
             }
             let result = match fault {
