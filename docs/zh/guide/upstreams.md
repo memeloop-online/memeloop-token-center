@@ -11,6 +11,14 @@
 - 每个账户维护一份按凭证代同步的模型目录（`POST /internal/v1/upstreams/{account_id}/models/sync`），路由创建时用目录校验公开/上游模型兼容性。
 - 常用管理接口：`GET/POST /internal/v1/upstreams`、`GET/PUT /internal/v1/upstreams/{account_id}`、`GET /internal/v1/upstreams/{account_id}/health`、`GET /internal/v1/upstream-availability`。
 
+## 同步模型与价格
+
+在上游账户详情或编辑页选择「同步模型及价格」。MTC 使用该账户的连接配置读取模型目录，再从已配置的价格源匹配价格，分别展示两个步骤的结果。价格源暂未收录的模型会列为待补充，可在模型计费中填写。
+
+目录新增的模型会进入路由模型选择器。已被目录确认的模型随后移除时，对应账户暂停参与该模型的路由；模型重新出现后恢复参与。手动设置的路由启停状态保持原样。仅人工配置、从未出现在目录中的私有模型继续采用自定义选择。
+
+新模型的公开名称、账户选择和客户端授权由路由配置管理。
+
 ## OAuth 登录
 
 OAuth 账户通过管理端登录流程创建，令牌加密存储：

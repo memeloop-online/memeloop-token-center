@@ -70,6 +70,158 @@ async fn request_as(
 }
 
 #[tokio::test]
+async fn discovered_custom_routes_follow_catalog_churn_without_changing_enabled() {
+    let (state, _directory) = state("catalog-custom-churn").await;
+    let tenant = "catalog-custom-churn";
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "catalog-account".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://example.com"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut routes = Vec::new();
+    for model in ["advertised", "manual-disabled", "private-custom"] {
+        routes.push(
+            state
+                .db
+                .create_model_route(CreateModelRouteInput {
+                    tenant_external_id: tenant.into(),
+                    public_model: model.into(),
+                    upstream_account_id: account.id,
+                    upstream_model: model.into(),
+                    protocol: "openai".into(),
+                    priority: 0,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    state
+        .db
+        .set_model_route_enabled(routes[1].id, tenant, false, routes[1].updated_at)
+        .await
+        .unwrap();
+    let mut observer = sqlx::AnyConnection::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    for (index, (names, expected)) in [
+        (vec!["advertised", "manual-disabled"], 1_i64),
+        (vec!["new-model"], 0),
+        (vec!["advertised", "manual-disabled"], 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lease = Uuid::now_v7();
+        assert!(
+            state
+                .db
+                .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+                .await
+                .unwrap()
+        );
+        let models = names
+            .iter()
+            .map(|name| DiscoveredUpstreamModel {
+                model_id: (*name).into(),
+                protocol: "any".into(),
+                context_window: None,
+                reservation_token_bound: None,
+                reservation_bound_source: None,
+            })
+            .collect::<Vec<_>>();
+        state
+            .db
+            .replace_upstream_model_catalog(account.id, tenant, 1, lease, "openai_v1", &models)
+            .await
+            .unwrap();
+        for route in &routes[..2] {
+            let eligible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_route_eligible_upstream_accounts WHERE model_route_id = $1")
+                .bind(route.id.to_string()).fetch_one(&mut observer).await.unwrap();
+            assert_eq!(eligible, expected);
+        }
+        let custom: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_route_eligible_upstream_accounts WHERE model_route_id = $1",
+        )
+        .bind(routes[2].id.to_string())
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+        assert_eq!(
+            custom, 1,
+            "unadvertised private models keep their explicit selection"
+        );
+        let enabled: i64 = sqlx::query_scalar("SELECT enabled FROM model_routes WHERE id = $1")
+            .bind(routes[1].id.to_string())
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+        assert_eq!(enabled, 0, "sync must preserve operator intent");
+        let catalog = state
+            .db
+            .upstream_model_catalog(account.id, tenant, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(catalog.models.len(), names.len());
+        if index == 0 {
+            // Simulate an association persisted by the older implementation.
+            // The next sync must notice it in the previous snapshot even when
+            // the upstream has just removed the model from the new snapshot.
+            sqlx::query("UPDATE model_route_upstream_accounts SET catalog_policy = 'explicit_custom' WHERE model_route_id = $1")
+                .bind(routes[0].id.to_string()).execute(&mut observer).await.unwrap();
+        }
+    }
+    let models = (0..251)
+        .map(|index| DiscoveredUpstreamModel {
+            model_id: format!("catalog-{index}"),
+            protocol: "any".into(),
+            context_window: None,
+            reservation_token_bound: None,
+            reservation_bound_source: None,
+        })
+        .collect::<Vec<_>>();
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+            .await
+            .unwrap()
+    );
+    state
+        .db
+        .replace_upstream_model_catalog(account.id, tenant, 1, lease, "openai_v1", &models)
+        .await
+        .unwrap();
+    let (status, catalog) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstreams/{}/models?tenant_external_id={tenant}&limit=10000",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog["models"].as_array().unwrap().len(),
+        251,
+        "provider sync must not silently price only the first 200 models"
+    );
+}
+
+#[tokio::test]
 async fn cursor_native_snapshot_preserves_unknown_limits_and_generation_fence() {
     let (state, _directory) = state("cursor-native-catalog").await;
     let tenant = "cursor-native-catalog";
@@ -137,6 +289,31 @@ async fn cursor_native_snapshot_preserves_unknown_limits_and_generation_fence() 
             "id":"fixture-model", "protocol":"cursor_agent", "context_window":null,
             "reservation_token_bound":null, "reservation_bound_source":null,
         }])
+    );
+    // The Antigravity adapter emits this source kind; persistence must accept
+    // it just as it accepts the other native directory adapters.
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(
+                account.id,
+                tenant,
+                1,
+                lease,
+                "antigravity_native",
+                &models
+            )
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
     );
 }
 
