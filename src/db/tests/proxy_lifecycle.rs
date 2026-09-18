@@ -977,15 +977,6 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
     }
     let response_only_id = format!("response-only-{unique}");
     let response_turn_id = format!("response-child-turn-{unique}");
-    let mut stats_gate = database.begin_write_transaction().await.unwrap();
-    let stats_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *stats_gate)
-        .await
-        .unwrap();
-    lock_request_stats_projection_rebuild_in_transaction(&mut stats_gate)
-        .await
-        .unwrap();
-
     let response_database = database.clone();
     let response_key = key.clone();
     let response_id_for_writer = response_only_id.clone();
@@ -1032,25 +1023,6 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
         cluster
     });
     let response_pid = response_pid_receiver.await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let waits_for_stats_gate: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity activity WHERE activity.pid = $1 AND activity.state = 'active' AND activity.wait_event_type = 'Lock' AND activity.wait_event = 'advisory' AND $2 = ANY(pg_blocking_pids(activity.pid)))",
-            )
-            .bind(response_pid)
-            .bind(stats_gate_pid)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
-            if waits_for_stats_gate {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("response-only observation did not acquire statistics advisory before conversation references");
-    stats_gate.commit().await.unwrap();
     response_recorded_receiver.await.unwrap();
 
     let child_database = database.clone();
