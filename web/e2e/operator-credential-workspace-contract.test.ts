@@ -54,7 +54,7 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('credential workspaces isolate loads and preserve one-time service plaintext', { timeout: 60_000 }, async () => {
+test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 60_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
@@ -92,35 +92,65 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await routeFailure.getByRole('alert').getByText('route catalog unavailable', { exact: true }).waitFor();
     assert.equal(await routeFailure.getByText('Route failure client', { exact: true }).count(), 1, 'a route error cannot hide a successfully loaded key page');
 
-    const recovery = await browser.newPage();
-    await recovery.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await recovery.goto(fixture('client-recovery'));
-    await recovery.getByText('Recoverable client', { exact: true }).waitFor();
-    await recovery.getByText('Unlimited (metered)', { exact: true }).waitFor();
-    await recovery.getByRole('button', { name: 'Copy credential', exact: true }).click();
-    await recovery.getByRole('status').filter({ hasText: 'Copied Recoverable client credential.' }).waitFor();
-    assert.equal(await recovery.getByRole('dialog').count(), 0, 'copy does not add a recovery confirmation');
-    assert.equal(await recovery.locator('html').getAttribute('data-copied-fixture-credential'), 'true', 'copy uses the original value, not the credential ID');
-    assert.equal(await recovery.getByText('mts_client_recovered', { exact: true }).count(), 0, 'successful clipboard copying does not expose a secret panel');
-    const recoveryRequest = await recovery.evaluate(() => window.credentialFixture.requests.find((request) => request.path.endsWith('/credential-recovery/copy')));
-    assert.deepEqual(recoveryRequest, {
+    const clientCopy = await browser.newPage();
+    await clientCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await clientCopy.goto(fixture('client-copy'));
+    await clientCopy.getByText('Copyable client', { exact: true }).waitFor();
+    await clientCopy.getByText('Unlimited (metered)', { exact: true }).waitFor();
+    await clientCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    const copyPanel = clientCopy.locator('.credential-secret-priority');
+    await copyPanel.getByText('mtc_client_copied', { exact: true }).waitFor();
+    await clientCopy.getByRole('status').filter({ hasText: 'Copyable client credential is ready. Select the value or use Copy credential.' }).waitFor();
+    assert.equal(await clientCopy.getByRole('dialog').count(), 0, 'copy is a direct, confirmation-free action');
+    assert.equal(await clientCopy.locator('html').getAttribute('data-copied-fixture-credential'), null, 'fetching a credential never writes it to the clipboard implicitly');
+    await copyPanel.getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await clientCopy.getByRole('status').filter({ hasText: 'Copied Copyable client credential.' }).waitFor();
+    assert.equal(await clientCopy.locator('html').getAttribute('data-copied-fixture-credential'), 'true', 'the explicit panel copy uses the original value, not the credential ID');
+    const copyRequest = await clientCopy.evaluate(() => window.credentialFixture.requests.find((request) => request.path.endsWith('/keys/key-copy/copy')));
+    assert.deepEqual(copyRequest, {
       method: 'POST',
-      path: '/internal/v1/keys/key-recovery/credential-recovery/copy',
+      path: '/internal/v1/keys/key-copy/copy',
       cache: 'no-store',
       credentials: 'omit',
       referrerPolicy: 'no-referrer',
       hasSignal: true,
     });
-    assert.equal(await recovery.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/rotate'))), false, 'copy never rotates the credential');
+    assert.equal(await clientCopy.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/rotate'))), false, 'copy never rotates the credential');
+    await copyPanel.getByRole('button', { name: 'Close', exact: true }).click();
+    await clientCopy.getByRole('button', { name: 'More actions', exact: true }).click();
+    await clientCopy.getByRole('menuitem', { name: 'Store original value', exact: true }).click();
+    await clientCopy.getByLabel('Original credential value', { exact: true }).fill('mtc_client_known_original');
+    await clientCopy.getByRole('button', { name: 'Save', exact: true }).click();
+    await clientCopy.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-copy/credential'));
+    assert.equal(await clientCopy.getByText('mtc_client_known_original', { exact: true }).count(), 0, 'a submitted original never enters the credential list');
     const manualCopy = await browser.newPage();
     await manualCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await manualCopy.goto(`${fixture('client-recovery')}&clipboard-failure`);
-    await manualCopy.getByText('Recoverable client', { exact: true }).waitFor();
+    await manualCopy.goto(`${fixture('client-copy')}&clipboard-failure`);
+    await manualCopy.getByText('Copyable client', { exact: true }).waitFor();
     await manualCopy.getByRole('button', { name: 'Copy credential', exact: true }).click();
-    await manualCopy.getByText('mts_client_recovered', { exact: true }).waitFor();
-    await manualCopy.getByRole('status').filter({ hasText: 'Copy this credential manually' }).waitFor();
+    await manualCopy.getByText('mtc_client_copied', { exact: true }).waitFor();
+    await manualCopy.locator('.credential-secret-priority').getByRole('button', { name: 'Copy credential', exact: true }).click();
+    await manualCopy.getByRole('alert').filter({ hasText: 'Clipboard access is unavailable. Select the value above and copy it manually.' }).waitFor();
+    assert.equal(await manualCopy.locator('.credential-revealed-value').evaluate((element) => getComputedStyle(element).userSelect), 'all', 'the revealed original remains selectable when clipboard access is unavailable');
     assert.equal(await manualCopy.getByRole('dialog').count(), 0);
     await manualCopy.close();
+
+    for (const [mode, expected] of [
+      ['missing-original', 'Submit the current credential value before copying.'],
+      ['suspended', 'This credential is suspended. Enable it to copy.'],
+      ['revoked', 'This credential has been revoked.'],
+    ] as const) {
+      const unavailableCopy = await browser.newPage();
+      await unavailableCopy.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+      await unavailableCopy.goto(`${fixture('client-copy')}&${mode}`);
+      const disabledCopy = unavailableCopy.getByRole('button', { name: 'Copy credential', exact: true });
+      await disabledCopy.waitFor();
+      assert.equal(await disabledCopy.isDisabled(), true);
+      await disabledCopy.locator('..').focus();
+      await unavailableCopy.getByRole('tooltip').filter({ hasText: expected }).waitFor();
+      assert.equal(await unavailableCopy.evaluate(() => window.credentialFixture.requests.some(request => request.path.endsWith('/keys/key-copy/copy'))), false, `${mode} never submits a copy request`);
+      await unavailableCopy.close();
+    }
 
     const race = await browser.newPage();
     await race.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -149,7 +179,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await lock.getByText('Scope B older client', { exact: true }).waitFor();
     const cursorCalls = (await calls(lock)).filter((call) => call.startsWith('/internal/v1/keys?') && call.includes('before_id='));
     assert.equal(cursorCalls.length, 1, 'the stale scope cannot release the active cursor request for a second load');
-    await Promise.all([allTenants.close(), routeFailure.close(), recovery.close(), race.close(), lock.close()]);
+    await Promise.all([allTenants.close(), routeFailure.close(), clientCopy.close(), race.close(), lock.close()]);
 
     const filters = await browser.newPage();
     await filters.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -357,9 +387,11 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
         await create.screenshot({ path: `${artifacts}/credential-route-scope-${locale}-${theme}-wide.png` });
       }
       await create.locator('button[type="submit"]').click();
-      await client.getByText('mts_fixture_created', { exact: true }).waitFor();
+      await client.getByText('mtc_fixture_created', { exact: true }).waitFor();
+      await client.getByText(english ? 'Saved and available to copy again from the list.' : '凭据已保存，可从列表再次复制。', { exact: true }).waitFor();
       const createRequests = await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
       assert.equal(createRequests.length, 1);
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-created/credential').length), 0, 'creation persists the original in its own transaction without a second credential write');
       const body = JSON.parse(createRequests[0].body!);
       assert.equal(body.tenant_external_id, 'tenant-a');
       assert.equal(body.principal_external_id, 'fixture-principal');
@@ -368,6 +400,15 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
       assert.deepEqual(body.route_ids, ['00000000-0000-4000-8000-000000000001']);
       assert.deepEqual(body.route_group_ids, ['00000000-0000-4000-8000-000000000002']);
       assert.equal('route_ids' in body.policy || 'route_group_ids' in body.policy, false);
+      client.once('dialog', dialog => dialog.accept());
+      await client.getByRole('button', { name: english ? 'Close' : '关闭', exact: true }).click();
+      const existingRow = client.getByRole('group', { name: english ? 'Research workspace' : '研发工作区', exact: true });
+      await existingRow.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Rotate credential' : '轮换凭据', exact: true }).click();
+      await client.getByRole('dialog').getByRole('button', { name: english ? 'Confirm and continue' : '确认继续', exact: true }).click();
+      await client.getByText('mtc_fixture_rotated', { exact: true }).waitFor();
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys/key-form/rotate').length), 1, 'rotation is one business write');
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-form/credential').length), 0, 'rotation persists the original in its own transaction without a second credential write');
       await client.close();
     }
     const policies = await browser.newPage();

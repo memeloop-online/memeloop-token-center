@@ -38,7 +38,6 @@
 .journey-actions button { flex: 0 0 auto; }
 .credential-secondary-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .management-layout:has(> .create-journey) .managed-resource { border: 0; background: color-mix(in srgb, var(--picker-inset) 65%, transparent); padding: 20px; }
-.management-layout:has(> .create-journey) .managed-resource .credential-recovery-unavailable,
 .management-layout:has(> .create-journey) .managed-resource .account-meta .pill { border: 0; background: transparent; padding: 0; color: var(--picker-muted); font-size: 14px; }
 .credential-group-workspace .fui-AccordionHeader__button { justify-content: flex-start; }
 /* Keep identity, authorization and budget in reading order at every width. */

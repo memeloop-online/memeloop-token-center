@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-recovery' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter' | 'client-lifecycle';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-copy' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter' | 'client-lifecycle';
 
 interface RecordedRequest {
   method: string;
@@ -74,11 +74,11 @@ window.credentialFixture = {
   },
 };
 
-if (scenario === 'client-recovery') {
+if (scenario === 'client-copy') {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
     writeText: async (value: string) => {
       if (parameters.has('clipboard-failure')) throw new Error('fixture clipboard denied');
-      document.documentElement.dataset.copiedFixtureCredential = String(value === 'mts_client_recovered');
+      document.documentElement.dataset.copiedFixtureCredential = String(value === 'mtc_client_copied');
     },
   } });
 }
@@ -195,15 +195,19 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     service_id: 'service-existing',
     name: 'Existing service credential',
     credential_generation: 1,
-    credential_copy_available: scenario === 'service-copy' && !parameters.has('unavailable'),
+    credential_copy_available: scenario === 'service-copy' && !parameters.has('missing-original'),
     fingerprint: 'fixture-fingerprint',
     scopes: ['keys:read'],
     tenant_external_id: initialTenant || 'tenant-a',
-    status: 'active',
+    status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
     created_at: 1_700_000_000_000,
   }]);
-  if (url.pathname === '/internal/v1/keys/key-recovery/credential-recovery/copy' && method === 'POST') {
-    return json({ key_id: 'key-recovery', credential_generation: 1, key: 'mts_client_recovered' });
+  if (url.pathname === '/internal/v1/keys/key-copy/copy' && method === 'POST') {
+    return json({ key_id: 'key-copy', credential_generation: 1, key: 'mtc_client_copied' });
+  }
+  if (url.pathname === '/internal/v1/keys/key-copy/credential' && method === 'PUT') {
+    const body = JSON.parse(String(init?.body));
+    return body.key === 'mtc_client_known_original' ? json({}) : json({ error: { message: 'fixture original did not match' } }, 400);
   }
   if (scenario === 'client-lifecycle' && url.pathname === '/internal/v1/keys/delete') {
     const body = JSON.parse(String(init?.body));
@@ -224,7 +228,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
       ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
     ]);
-    if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mts_fixture_created' });
+    if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys') return json([
       // Match the API's descending (created_at, key_id) keyset order.
@@ -232,6 +236,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
       credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
     ]);
+    if (url.pathname === '/internal/v1/keys/key-form/rotate' && method === 'POST') return json({ key: 'mtc_fixture_rotated' });
   }
   if (url.pathname.endsWith('credential-groups') || url.pathname.endsWith('route-groups')) return json([]);
   if (url.pathname === '/internal/v1/model-routes') {
@@ -256,10 +261,11 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       }]);
     }
     const tenant = url.searchParams.get('tenant_external_id');
-    if (scenario === 'client-recovery') return json([{
-      ...credential('Recoverable client', 'tenant-a', 'key-recovery'),
+    if (scenario === 'client-copy') return json([{
+      ...credential('Copyable client', 'tenant-a', 'key-copy'),
+      status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
       policy: { ...credential('unused', 'tenant-a', 'unused').policy, enforcement_mode: 'metered_unlimited' },
-      credential_recovery_available: true,
+      credential_copy_available: !parameters.has('missing-original'),
     }]);
     if (scenario === 'all-tenants') return json([{
       ...credential('All tenant client', 'tenant-visible', 'key-all'),
