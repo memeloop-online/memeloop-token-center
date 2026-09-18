@@ -13,7 +13,7 @@ import {
 declare global {
   interface Window {
     requestQueryReads: number;
-    emitRequestOverflow: (count?: number) => void;
+    emitRequestOverflow: (count?: number) => Promise<void>;
     emitLiveRequest: (id: string, createdAt: number) => void;
     resolveNextRequestQuery: (id: string) => void;
     requestQueryKinds: string[];
@@ -38,17 +38,20 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-overflow-reconciliation.html`);
     await page.waitForFunction(() => window.requestQueryReads === 1);
     await model('initial-authoritative').waitFor();
+    // install() virtualizes timers but intentionally lets time keep flowing.
+    // Freeze only after boot so CI render time can never consume a contract
+    // interval before an assertion explicitly advances it.
+    await page.clock.pauseAt(new Date('2026-01-01T01:00:00Z'));
 
     await page.evaluate(() => window.emitRequestOverflow(1_000));
-    await page.getByTestId('overflow-revision').filter({ hasText: '1000' }).waitFor({ state: 'attached' });
     await page.clock.fastForward(requestOverflowReconcileDelayMs - 1);
     assert.equal(await page.evaluate(() => window.requestQueryReads), 1);
     await page.clock.fastForward(1);
-    await page.waitForFunction(() => window.requestQueryReads === 2);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 2);
 
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
       window.emitLiveRequest('live-during-reconcile', 2_000);
-      window.emitRequestOverflow(1_000);
+      await window.emitRequestOverflow(1_000);
     });
     await model('live-during-reconcile').waitFor();
     assert.equal(await page.evaluate(() => window.requestQueryReads), 2, 'in-flight overflow cannot fan out query POSTs');
@@ -59,7 +62,7 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     await page.clock.fastForward(requestOverflowReconcileCooldownMs - 1);
     assert.equal(await page.evaluate(() => window.requestQueryReads), 2);
     await page.clock.fastForward(1);
-    await page.waitForFunction(() => window.requestQueryReads === 3);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 3);
 
     await page.evaluate(() => window.resolveNextRequestQuery('final-reconcile'));
     await model('final-reconcile').waitFor();
@@ -71,16 +74,15 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     // isolation: pagination aborts the active first-page query, loads history,
     // then restores the one sticky reconciliation it interrupted.
     await page.evaluate(() => window.emitRequestOverflow(1_000));
-    await page.getByTestId('overflow-revision').filter({ hasText: '3000' }).waitFor({ state: 'attached' });
     await page.clock.fastForward(requestOverflowReconcileDelayMs);
-    await page.waitForFunction(() => window.requestQueryReads === 4);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 4);
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
     await model('older-page').waitFor();
-    await page.waitForFunction(() => window.requestQueryReads === 5);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 5);
     assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older']);
 
     await page.clock.fastForward(requestOverflowReconcileDelayMs);
-    await page.waitForFunction(() => window.requestQueryReads === 6);
+    assert.equal(await page.evaluate(() => window.requestQueryReads), 6);
     assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older', 'first'],
       'the interrupted sticky overflow is restored as a first-page query after pagination');
     await page.evaluate(() => window.resolveNextRequestQuery('post-pagination-reconcile'));

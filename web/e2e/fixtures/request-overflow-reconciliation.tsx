@@ -1,5 +1,5 @@
 import { createRoot } from 'react-dom/client';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { MtcFluentProvider } from '../../src/design-system';
 import { I18nProvider } from '../../src/i18n';
 import { RequestsPage } from '../../src/operator/pages/RequestsPage';
@@ -14,7 +14,7 @@ import '../../src/operator/operator.css';
 declare global {
   interface Window {
     requestQueryReads: number;
-    emitRequestOverflow: (count?: number) => void;
+    emitRequestOverflow: (count?: number) => Promise<void>;
     emitLiveRequest: (id: string, createdAt: number) => void;
     resolveNextRequestQuery: (id: string) => void;
     requestQueryKinds: string[];
@@ -35,7 +35,7 @@ const response = (id: string): RequestListResponse => {
 const heldQueries: Array<{ active: boolean; resolve: (value: Response) => void }> = [];
 window.requestQueryReads = 0;
 window.requestQueryKinds = [];
-window.emitRequestOverflow = () => undefined;
+window.emitRequestOverflow = async () => undefined;
 window.emitLiveRequest = () => undefined;
 window.resolveNextRequestQuery = id => {
   let held = heldQueries.shift();
@@ -69,7 +69,19 @@ function Fixture() {
   const [overflowRevision, setOverflowRevision] = useState(0);
   const [revision, setRevision] = useState(0);
   const [events, setEvents] = useState(new Map<string, RequestEvent>());
-  window.emitRequestOverflow = (count = 1) => setOverflowRevision(value => value + count);
+  const resolveOverflowCommit = useRef<(() => void) | undefined>(undefined);
+  window.emitRequestOverflow = (count = 1) => new Promise(resolve => {
+    resolveOverflowCommit.current = resolve;
+    setOverflowRevision(value => value + count);
+  });
+  useEffect(() => {
+    const resolve = resolveOverflowCommit.current;
+    resolveOverflowCommit.current = undefined;
+    // Resolve after the complete passive-effect flush: RequestsPage has
+    // observed the new revision and armed its coordinator before the test
+    // advances the paused clock.
+    if (resolve) queueMicrotask(resolve);
+  }, [overflowRevision]);
   window.emitLiveRequest = (id, createdAt) => {
     const event: RequestEvent = {
       event_id: `event-${id}`, event_at: createdAt, event_kind: 'finished', request_id: id,
