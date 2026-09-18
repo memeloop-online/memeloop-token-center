@@ -286,24 +286,34 @@ impl Database {
                 .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
-        // Prepare the existing bounded first insert batch before opening the
-        // budget-first transaction. Cancellation here leaves no admission
+        // Prepare the existing bounded first insert batch before reserving
+        // capacity. Cancellation here leaves no admission
         // facts, and the ciphertext is dropped with this future.
         let prepared_request_batch = match buffered_archive.as_ref() {
             Some(archive) => Some(archive.prepare_first_batch().await?),
             None => None,
         };
-        // Always acquire the spool budget before request/account locks, matching
-        // the archive worker's budget -> request lock order.
-        let (mut transaction, now, mut hold) = if archive.is_some() {
-            let (tx, now, hold) = self
-                .tracked_spool_transaction("request_admission", Some(input.request_id))
-                .await
-                .map_err(|_| AppError::Overloaded)?;
-            (tx, now, Some(hold))
-        } else {
-            (self.begin_write_transaction().await?, unix_millis(), None)
+        // Reserve capacity in a short, independently committed transaction.
+        // Request/account/session locks and compression only hold the private
+        // reservation row, never the shared counter used by every stream.
+        let budget_reservation = match buffered_archive.as_ref() {
+            Some(archive) => Some(
+                self.reserve_buffered_archive_capacity(archive)
+                    .await?
+                    .ok_or(AppError::Overloaded)?,
+            ),
+            None => None,
         };
+        let (mut transaction, now, mut hold) =
+            if let Some(reservation) = budget_reservation.as_ref() {
+                let (tx, now, hold) = self
+                    .reserved_spool_transaction(reservation, "request_admission")
+                    .await
+                    .map_err(|_| AppError::Overloaded)?;
+                (tx, now, Some(hold))
+            } else {
+                (self.begin_write_transaction().await?, unix_millis(), None)
+            };
         BudgetHold::set_phase(&mut hold, "key_account_reservation");
         let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
             backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
@@ -342,11 +352,12 @@ impl Database {
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_body_in_transaction(
+                .capture_reserved_buffered_archive_body_in_transaction(
                     &mut transaction,
                     now,
                     &archive,
                     Some(prepared_request_batch),
+                    budget_reservation.as_ref(),
                 )
                 .await
                 .map_err(|_| AppError::Overloaded)?
@@ -380,6 +391,9 @@ impl Database {
                     error.into()
                 }
             })?;
+        if let Some(reservation) = budget_reservation.as_ref() {
+            reservation.release().await;
+        }
         Ok(reservation)
     }
 
@@ -923,14 +937,25 @@ impl Database {
             Some(archive) => Some(archive.prepare_first_batch().await?),
             None => None,
         };
+        let budget_reservation = match buffered_archive {
+            Some(archive) => self.reserve_buffered_archive_capacity(archive).await?,
+            None => None,
+        };
+        if buffered_archive.is_some() && budget_reservation.is_none() {
+            tracing::warn!(
+                phase = "response_terminal_capture",
+                error_code = "capacity",
+                "buffered response archive gap"
+            );
+        }
         let (mut transaction, now, created_at, reservation_row, trusted_reservation, mut hold) = loop {
-            // Preparing immutable content must not hold either shared lock:
-            // spool_transaction takes the global archive budget row, and the
-            // final observation takes the explicit-session advisory lock.
-            let (mut transaction, mut hold) = if buffered_archive.is_some() && preparation_complete
+            // Content preparation runs before taking the private reservation
+            // row and the final observation's explicit-session advisory lock.
+            let (mut transaction, mut hold) = if let Some(reservation) =
+                budget_reservation.as_ref().filter(|_| preparation_complete)
             {
                 let (tx, _, hold) = self
-                    .tracked_spool_transaction("buffered_terminal", Some(input.request_id))
+                    .reserved_spool_transaction(reservation, "buffered_terminal")
                     .await?;
                 (tx, Some(hold))
             } else {
@@ -1016,6 +1041,9 @@ impl Database {
                 )
                 .await?;
                 BudgetHold::commit_optional(transaction, hold).await?;
+                if let Some(reservation) = budget_reservation.as_ref() {
+                    reservation.release().await;
+                }
                 return Ok(result);
             }
 
@@ -1154,9 +1182,8 @@ impl Database {
                     // Reclaim and revalidate the owner in the final transaction.
                     // A concurrent winner leaves only deduplicated, invisible
                     // content, never an observation or a second ledger charge.
-                    // Buffered metered-unlimited finishes do not materialize
-                    // content, but must still restart to acquire the budget
-                    // before the request row, preserving the old lock order.
+                    // Buffered metered-unlimited finishes also restart to take
+                    // the private reservation before the request owner row.
                     if content_materialized || buffered_archive.is_some() {
                         BudgetHold::commit_optional(transaction, hold).await?;
                         continue;
@@ -1228,15 +1255,16 @@ impl Database {
             }
         }
 
-        if let Some(archive) = buffered_archive {
+        if let Some(archive) = buffered_archive.filter(|_| budget_reservation.is_some()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let capture_started = std::time::Instant::now();
             if !self
-                .capture_buffered_archive_body_in_transaction(
+                .capture_reserved_buffered_archive_body_in_transaction(
                     &mut transaction,
                     now,
                     archive,
                     prepared_response_batch,
+                    budget_reservation.as_ref(),
                 )
                 .await?
             {
@@ -1441,6 +1469,9 @@ impl Database {
             ));
         }
         BudgetHold::commit_optional(transaction, hold).await?;
+        if let Some(reservation) = budget_reservation.as_ref() {
+            reservation.release().await;
+        }
         Ok(FinishProxyRequestResult::Finished {
             cost_micros,
             usage_invalid,

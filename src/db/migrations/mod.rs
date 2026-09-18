@@ -558,6 +558,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "OpenAI Audio metered request accounting",
         sql: include_str!("../../../migrations/common/0105_openai_audio_metered_requests.sql"),
     },
+    Migration {
+        version: 106,
+        name: "durable archive capacity reservations",
+        sql: include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1101,6 +1106,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 105,
         name: "OpenAI Audio metered request accounting",
         sql: include_str!("../../../migrations/common/0105_openai_audio_metered_requests.sql"),
+    },
+    Migration {
+        version: 106,
+        name: "durable archive capacity reservations",
+        sql: include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
     },
 ];
 

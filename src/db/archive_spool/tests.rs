@@ -454,6 +454,8 @@ async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
 mod gc_tests;
 #[path = "postgres_tests.rs"]
 mod postgres_tests;
+#[path = "reservation_tests.rs"]
+mod reservation_tests;
 
 #[tokio::test]
 async fn buffered_atomic_capture_shares_budget_and_rolls_back_all_chunks() {

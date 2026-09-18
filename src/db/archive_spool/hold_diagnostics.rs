@@ -143,7 +143,7 @@ impl Drop for BudgetHold {
                     request_id = ?self.request_id, outcome = self.outcome,
                     last_phase = self.phase, elapsed_ms = hold_ms,
                     slowest_phase, slowest_phase_ms,
-                    "slow archive transaction with final budget update");
+                    "slow archive transaction");
             } else {
                 tracing::warn!(phase = "archive_budget_hold", operation = self.operation,
                     request_id = ?self.request_id, backend_pid = ?self.backend_pid,
