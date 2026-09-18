@@ -210,7 +210,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
         <span><small>{t('sessions.cost')}</small><b><SessionCosts values={session.costs} /></b></span>
       </span>
       {session.archived_only_requests > 0 && <div className="session-archive-metrics"><b>{t('sessions.archiveOnlyTitle')}</b><span>{t('sessions.archiveOnlySummary', { requests: formatMetricNumber(session.archived_only_requests, locale).text, errors: formatMetricNumber(session.archived_only_errors, locale).text, tokens: formatMetricNumber(session.archived_only_input_tokens + session.archived_only_output_tokens, locale).text, latency: formatMilliseconds(session.archived_only_avg_duration_ms, locale) })}</span></div>}
-      <div className="session-card-actions"><button type="button" disabled={loading} onClick={() => onSelect(session)} aria-label={t('sessions.open', { name: title })}>{t('sessions.openTimeline')}</button>{(showCredential || !session.unlinked) && <details><summary>{t('sessions.diagnostics')}</summary><code>{session.session_id}</code><CopyDiagnostic value={session.session_id} kind="session" />{showCredential && <><code>{session.key_id}</code><CopyDiagnostic value={session.key_id} kind="credential" /></>}</details>}</div>
+      <div className="session-card-actions"><button type="button" disabled={loading} onClick={() => onSelect(session)} aria-label={t('sessions.open', { name: title })}>{t('sessions.openTimeline')}</button>{(showCredential || !session.unlinked) && <Disclosure title={t('sessions.diagnostics')}><code>{session.session_id}</code><CopyDiagnostic value={session.session_id} kind="session" />{showCredential && <><code>{session.key_id}</code><CopyDiagnostic value={session.key_id} kind="credential" /></>}</Disclosure>}</div>
     </article>;
   })}</div>;
 }
@@ -319,13 +319,13 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     <Disclosure title={t('sessions.executionTimeline')} defaultOpen={detail.unlinked}><SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} /></Disclosure>
     {detail.has_more && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</Button></div>}
     {!detail.unlinked && <Disclosure title={t('sessions.semantic')}><SemanticExecutionPanel detail={detail} /></Disclosure>}
-    <details className="session-relationships"><summary>{t('sessions.relationships')}</summary>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
+    <div className="session-relationships"><Disclosure title={t('sessions.relationships')}>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
       <span className="status ok">{t(`conversationRelation.${edge.relation}`)}</span>
       <span>{t(`sessions.relationship.${edge.relation}`, { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span>
       <small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small>
     </div>)}{confirmedEdges.length === 0 && <div className="empty">{detail.unlinked ? t('sessions.noGuessedEdges') : t('sessions.singleObservation')}</div>}</div>
-    {candidateEdges.length > 0 && <details className="candidate-edges"><summary>{t('sessions.candidateRelationships', { count: candidateEdges.length })}</summary><p className="muted">{t('sessions.candidateHint')}</p><div className="edge-list">{candidateEdges.map((edge) => <div className="edge" key={`candidate-${edge.from_request_id ?? 'root'}-${edge.to_request_id}`}><span className="status pending">{t('conversationRelation.candidate')}</span><span>{t('sessions.relationshipSentence', { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span><small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small></div>)}</div></details>}
-    </details>
+    {candidateEdges.length > 0 && <div className="candidate-edges"><Disclosure title={t('sessions.candidateRelationships', { count: candidateEdges.length })}><p className="muted">{t('sessions.candidateHint')}</p><div className="edge-list">{candidateEdges.map((edge) => <div className="edge" key={`candidate-${edge.from_request_id ?? 'root'}-${edge.to_request_id}`}><span className="status pending">{t('conversationRelation.candidate')}</span><span>{t('sessions.relationshipSentence', { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span><small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small></div>)}</div></Disclosure></div>}
+    </Disclosure></div>
   </section>;
 }
 

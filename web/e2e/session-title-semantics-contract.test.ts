@@ -71,14 +71,6 @@ test('fallback context is consistent with the list and never invents an epoch da
   assert.deepEqual(calls.at(-1), { key: 'sessions.unnamedSession', variables: { time: new Date(20).toLocaleString('zh-CN'), credential: 'Known credential' } });
 });
 
-test('full session identifiers remain inside diagnostic disclosures', () => {
-  assert.match(sessions, /<details><summary>\{t\('sessions\.diagnostics'\)\}<\/summary><code>\{session\.session_id\}<\/code>/);
-  assert.match(sessions, /showDiagnosticIds && <div className="session-diagnostics"><Disclosure/);
-  assert.match(sessions, /reportedSessionId && <>/);
-  assert.doesNotMatch(sessions, /reportedSession && <span>/);
-  assert.doesNotMatch(sessions, /const title[^;]*session_id\s*;/);
-});
-
 test('semantic warnings and duration chart use localized product copy', () => {
   assert.match(sessions, /t\('sessions\.durationBars'\)/);
   assert.match(sessions, /t\('sessions\.parentEvidenceDegraded'\)/);

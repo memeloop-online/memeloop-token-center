@@ -110,12 +110,12 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
     <header><b>{t('sessionReplay.toolCall')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
     <p className="session-replay-tool-name">{item.name ?? t('sessionReplay.unknown')}</p>
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
+    <ArchiveText kind="tool" t={t} value={item.arguments ?? unknownLabel(t, item.unknownFields.includes('arguments') ? 'missing_text' : null)} />
     <Disclosure title={t('request.technicalDetails')}>
       <dl>
         <div><dt>{t('sessionReplay.callId')}</dt><dd><code>{item.callId ?? t('sessionReplay.unknown')}</code></dd></div>
         <div><dt>{t('sessionReplay.pairing')}</dt><dd>{t(`sessionReplay.pairing.${item.pairing}`)}</dd></div>
       </dl>
-      <ArchiveText kind="tool" t={t} value={item.arguments ?? unknownLabel(t, item.unknownFields.includes('arguments') ? 'missing_text' : null)} />
     </Disclosure>
     {item.truncated && <small className="session-replay-flag">{t('sessionReplay.truncated')}</small>}
   </article>;
