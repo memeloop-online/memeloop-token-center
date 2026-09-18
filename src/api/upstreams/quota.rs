@@ -90,9 +90,8 @@ where
     if tokio::time::Instant::now() >= deadline {
         return Vec::new();
     }
-    let mut jobs = Box::pin(
-        futures_util::stream::iter(jobs).buffer_unordered(QUOTA_BATCH_CONCURRENCY),
-    );
+    let mut jobs =
+        Box::pin(futures_util::stream::iter(jobs).buffer_unordered(QUOTA_BATCH_CONCURRENCY));
     let timer = tokio::time::sleep_until(deadline);
     tokio::pin!(timer);
     let mut completed = Vec::new();
@@ -537,7 +536,10 @@ mod tests {
             &account_ids,
             vec![
                 (99, quota_batch_error(account_ids[99], "credential_invalid")),
-                (0, quota_batch_error(account_ids[0], "quota_account_unavailable")),
+                (
+                    0,
+                    quota_batch_error(account_ids[0], "quota_account_unavailable"),
+                ),
             ],
         );
 
@@ -555,10 +557,8 @@ mod tests {
             let _probe = DropProbe(slow_dropped);
             futures_util::future::pending::<(usize, &'static str)>().await
         };
-        let jobs: Vec<Pin<Box<dyn Future<Output = (usize, &'static str)>>>> = vec![
-            Box::pin(async { (0, "completed") }),
-            Box::pin(slow),
-        ];
+        let jobs: Vec<Pin<Box<dyn Future<Output = (usize, &'static str)>>>> =
+            vec![Box::pin(async { (0, "completed") }), Box::pin(slow)];
 
         let completed = collect_quota_batch_until(
             jobs,
