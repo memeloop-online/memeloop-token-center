@@ -375,10 +375,11 @@ fn codex_model_info(
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": capabilities.and_then(|capabilities| capabilities.apply_patch_tool_type.as_deref()),
-        // The bridge only preserves function/custom/namespace tools. Do not
-        // advertise a built-in web-search tool that would be rejected or
-        // silently dropped during Responses-to-Chat conversion.
-        "web_search_tool_type": "disabled",
+        // Omit web_search_tool_type: Codex 0.154 accepts only `text` and
+        // `text_and_image`, not `disabled`. It selects the hosted search
+        // output format, not whether the tool is enabled. Hosted search is
+        // controlled by client/provider configuration; the bridge handles
+        // idle declarations and rejects active unsupported host-tool use.
         "truncation_policy": {"mode": "bytes", "limit": 10000},
         "supports_image_detail_original": capabilities
             .is_some_and(|capabilities| capabilities.supports_image_detail_original),
@@ -397,6 +398,8 @@ fn codex_model_info(
         }),
         "default_reasoning_level": capabilities
             .and_then(|capabilities| capabilities.default_reasoning_level.clone()),
+        // This controls deferred tool discovery, not hosted web search.
+        // Responses-via-Chat translates declared tools eagerly.
         "supports_search_tool": false,
         "supports_experimental_context": false,
         "use_responses_lite": false,
@@ -488,7 +491,7 @@ mod tests {
             5
         );
         assert_eq!(compatible["supports_image_detail_original"], false);
-        assert_eq!(compatible["web_search_tool_type"], "disabled");
+        assert!(compatible.get("web_search_tool_type").is_none());
         assert!(
             compatible["base_instructions"]
                 .as_str()
@@ -565,6 +568,67 @@ mod tests {
         let ordinary = codex_model_info("ordinary", false, Some(kimi_capabilities));
         assert_eq!(ordinary["multi_agent_version"], "disabled");
         assert_eq!(ordinary["shell_type"], "disabled");
+    }
+
+    #[test]
+    fn granted_kimi_catalog_uses_client_compatible_search_metadata() {
+        // Narrow projection of Codex 0.154's openai_models.rs contract
+        // (6b9826e3aa83b1a5947db50f4332cb9c65f1b340). A made-up `disabled`
+        // enum value rejects the entire remote catalog, losing collaboration
+        // and context metadata even though supports_search_tool is false.
+        #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum WebSearchToolType {
+            #[default]
+            Text,
+            TextAndImage,
+        }
+
+        #[derive(Deserialize)]
+        struct ClientModel {
+            slug: String,
+            #[serde(default)]
+            web_search_tool_type: WebSearchToolType,
+            #[serde(default)]
+            supports_search_tool: bool,
+            multi_agent_version: String,
+            context_window: u64,
+        }
+
+        #[derive(Deserialize)]
+        struct ClientCatalog {
+            models: Vec<ClientModel>,
+        }
+
+        let providers = crate::provider::ProviderCatalog::builtins();
+        let sources =
+            ["kimi-k3", "kimi-k3-256k"].map(|model| crate::db::GrantedModelCapabilitySource {
+                public_model: model.into(),
+                upstream_model: model.into(),
+                protocol: "openai".into(),
+                driver: "kimi-oauth".into(),
+                config_json: "{}".into(),
+            });
+        let response = codex_models_response(&providers, &sources);
+        let parsed: ClientCatalog = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(parsed.models.len(), 2);
+        for (model, source) in parsed.models.iter().zip(&sources) {
+            assert_eq!(model.slug, source.public_model);
+            assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
+            assert!(!model.supports_search_tool);
+            assert_eq!(model.multi_agent_version, "v2");
+            assert_eq!(model.context_window, 262_144);
+        }
+
+        let mut invalid = response;
+        invalid["models"][0]["web_search_tool_type"] = json!("disabled");
+        assert!(serde_json::from_value::<ClientCatalog>(invalid).is_err());
+
+        // Discovery is not an entitlement: never synthesize the 256k alias
+        // merely because another Kimi model is granted.
+        let single = codex_models_response(&providers, &sources[..1]);
+        assert_eq!(single["models"].as_array().unwrap().len(), 1);
+        assert_eq!(single["models"][0]["slug"], "kimi-k3");
     }
 
     #[test]
