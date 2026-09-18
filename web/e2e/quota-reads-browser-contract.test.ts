@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { quotaReadCalls: string[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
+declare global { interface Window { quotaReadCalls: string[]; quotaReadTriggers: string[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
 
 test('quota reads share ownership, bounded batches, partial failures and credit expiry', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -39,6 +39,7 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     await page.evaluate(() => window.releaseQuota(4));
     await page.getByText('5/5', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.quotaPeak), 1);
+    assert.deepEqual(await page.evaluate(() => window.quotaReadTriggers), ['bulk', 'bulk', 'bulk', 'bulk', 'bulk']);
     await page.locator('[data-account="account-0"] [data-reset-credit-expiry="known"]').first().waitFor();
     await page.locator('[data-account="account-1"] [data-reset-credit-expiry="unknown"]').first().waitFor();
     assert.match(await page.locator('[data-account="account-2"] [data-summary]').innerText(), /failed/i);
@@ -46,6 +47,7 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     await page.waitForFunction(() => window.quotaReadCalls.length === 6);
     await page.evaluate(() => window.releaseQuota(5));
     await page.locator('[data-account="account-2"] [data-reset-credit-expiry="known"]').first().waitFor();
+    assert.equal(await page.evaluate(() => window.quotaReadTriggers[5]), 'manual');
     assert.equal(await page.evaluate(() => window.quotaUnexpectedWrites), 0);
 
     await page.goto(url);

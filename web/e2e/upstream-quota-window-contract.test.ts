@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { formatCountdown } from '../src/format.js';
-import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
+  assert.equal(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, 85_000, 'operator deadline preserves ten seconds beyond the server read budget');
   const url = new URL(upstreamQuotaPath('account/one', 'tenant & one'), 'https://example.test');
   assert.equal(url.pathname, '/internal/v1/upstreams/account%2Fone/quota');
   assert.equal(url.searchParams.get('tenant_external_id'), 'tenant & one');
+  assert.equal(url.searchParams.has('fresh'), false);
+  assert.equal(url.searchParams.has('trigger'), false);
+  const manual = new URL(upstreamQuotaPath('account/one', 'tenant & one', { fresh: true, trigger: 'manual' }), 'https://example.test');
+  assert.equal(manual.searchParams.get('fresh'), 'true');
+  assert.equal(manual.searchParams.get('trigger'), 'manual');
+  const bulk = new URL(upstreamQuotaPath('account/one', 'tenant & one', { fresh: true, trigger: 'bulk' }), 'https://example.test');
+  assert.equal(bulk.searchParams.get('fresh'), 'true');
+  assert.equal(bulk.searchParams.get('trigger'), 'bulk');
   assert.throws(() => upstreamQuotaPath('account', ''));
 });
 

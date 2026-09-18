@@ -8,6 +8,7 @@ pub(super) async fn read(
     account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
+    trigger: QuotaReadTrigger,
 ) -> Result<QuotaSnapshot, &'static str> {
     credential
         .validate(unix_millis())
@@ -27,7 +28,7 @@ pub(super) async fn read(
         &http,
         credential,
         USAGE_URL,
-        QuotaRequestContext::for_account(account, "usage"),
+        QuotaRequestContext::for_account(account, "usage", trigger),
     )
     .await?;
     let now = unix_millis();
@@ -235,6 +236,7 @@ mod tests {
                     account_id: Uuid::from_u128(1),
                     credential_generation: 2,
                     endpoint_kind: "usage",
+                    trigger: QuotaReadTrigger::Manual,
                 },
             )
             .await

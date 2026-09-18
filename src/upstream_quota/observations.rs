@@ -241,12 +241,24 @@ async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
                     let snapshot = if target.recovering_quota {
                         state
                             .upstream_quota
-                            .read_fresh(state, &account, &credential, &target.tenant_external_id)
+                            .read_fresh(
+                                state,
+                                &account,
+                                &credential,
+                                &target.tenant_external_id,
+                                super::QuotaReadTrigger::BackgroundRecovery,
+                            )
                             .await
                     } else {
                         state
                             .upstream_quota
-                            .read(state, &account, &credential, &target.tenant_external_id)
+                            .read(
+                                state,
+                                &account,
+                                &credential,
+                                &target.tenant_external_id,
+                                super::QuotaReadTrigger::BackgroundRecovery,
+                            )
                             .await
                     };
                     project(&account, &snapshot, crate::db::unix_millis())

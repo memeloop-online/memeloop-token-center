@@ -9,6 +9,16 @@ pub(in crate::api) struct QuotaQuery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(in crate::api) struct QuotaReadQuery {
+    tenant_external_id: String,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    trigger: Option<crate::upstream_quota::QuotaRequestTrigger>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api) struct ResetConfirmation {
     confirmation_token: String,
     confirmation: String,
@@ -181,7 +191,7 @@ pub(in crate::api) async fn upstream_quota(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
-    Query(query): Query<QuotaQuery>,
+    Query(query): Query<QuotaReadQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
     let tenant = query.tenant_external_id.trim();
@@ -196,9 +206,20 @@ pub(in crate::api) async fn upstream_quota(
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
-    let snapshot = state
-        .upstream_quota
-        .read(&state, &account, &credential, tenant)
-        .await;
+    let trigger = query
+        .trigger
+        .unwrap_or(crate::upstream_quota::QuotaRequestTrigger::Manual)
+        .into();
+    let snapshot = if query.fresh {
+        state
+            .upstream_quota
+            .read_fresh(&state, &account, &credential, tenant, trigger)
+            .await
+    } else {
+        state
+            .upstream_quota
+            .read(&state, &account, &credential, tenant, trigger)
+            .await
+    };
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(snapshot)))
 }

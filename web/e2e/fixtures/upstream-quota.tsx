@@ -44,6 +44,7 @@ window.fetch = async (_input, init) => {
   const quota = '/internal/v1/upstreams/quota-account/quota';
   const reset = '/internal/v1/upstreams/quota-account/quota-reset/';
   if (url.origin !== location.origin || url.searchParams.get('tenant_external_id') !== 'default'
+    || (url.pathname === quota && (url.searchParams.get('fresh') !== 'true' || url.searchParams.get('trigger') !== 'manual'))
     || !((url.pathname === quota && method === 'GET')
       || (url.pathname === `${reset}prepare` && method === 'POST')
       || (url.pathname === `${reset}current` && method === 'GET')
