@@ -3,6 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import {
   eventually,
+  baseURL,
   model,
   observeSessionReadyRequests,
   releaseSessionFixture,
@@ -433,7 +434,9 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
     credential: seed.serviceCredential,
     headers: { 'Idempotency-Key': crypto.randomUUID() },
   });
-  const rejected = await fetch(new URL('/self/v1/sessions', page.url()), {
+  // This deliberately exercises an expected 401. Keep it outside the page so
+  // the browser-error contract only reports errors caused by the UI itself.
+  const rejected = await fetch(new URL('/self/v1/sessions', baseURL), {
     headers: { Authorization: `Bearer ${oldCredential}` },
   });
   assert.equal(rejected.status, 401);
@@ -449,7 +452,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.ok(other.sessions.every((session) => session.key_id !== seed.clientKeyId));
   const forbiddenDetail = await fetch(new URL(
     `/self/v1/sessions/${encodeURIComponent(before.sessions[0].session_id)}`,
-    page.url(),
+    baseURL,
   ), { headers: { Authorization: `Bearer ${seed.otherClientCredential}` } });
   assert.equal(forbiddenDetail.status, 404);
 
