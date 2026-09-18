@@ -147,6 +147,18 @@ async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
             tokio::task::yield_now().await;
         }
     }).await.expect("admission must reach the real chunk insert barrier");
+    let mut available_budget = fixture.db.pool.begin().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query(
+            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
+        )
+        .execute(&mut *available_budget),
+    )
+    .await
+    .expect("real buffered admission must release the shared budget before chunk insertion")
+    .unwrap();
+    available_budget.rollback().await.unwrap();
     let mut other_tenant = fixture.db.pool.begin().await.unwrap();
     let other_request = Uuid::new_v4().to_string();
     let other_tenant_id = Uuid::new_v4().to_string();
