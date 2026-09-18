@@ -57,6 +57,8 @@
 
 通过既有的 `PUT /internal/v1/upstreams/{account_id}` 账户更新（CAS）修改。候选数与 Deadline 在请求入场时快照一次；SSE 限制在选定出站尝试时快照一次，并由响应头准入、sanitizer、投递 capture、归档投影和 terminal hold 共同使用。运行时修改只影响后续请求，不会改变正在执行的流。Deadline 到期后不再发起新的发送，但成功准入的响应流不会被截断。
 
+每个获准投递的 SSE 流会先从进程级代理内存预算中预留三份 framing envelope。提高账号上限会相应降低可准入的并发流数量，而不会让 framing 与终止缓冲区的聚合内存越过全局预算。
+
 ## 自定义模型的预留上限 `reservation_token_bounds`
 
 请求执行前，网关会按价格与词元上限预留一笔余额；取得供应商完整用量后按实结算，预留金额不等于最终费用。

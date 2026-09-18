@@ -57,6 +57,8 @@ Native Codex accounts can adjust connection, failover, and SSE framing budgets i
 
 Change this with the existing account update `PUT /internal/v1/upstreams/{account_id}` (CAS). Candidate count and Deadline are snapshotted once on request entry. SSE limits are snapshotted once for the selected outbound attempt and shared by header admission, sanitizer, delivery capture, archive projection, and terminal hold. Runtime changes apply to later requests and never change an executing stream. After the Deadline, no new send starts, but a response stream that has been admitted successfully is not truncated.
 
+Each admitted SSE stream reserves a three-copy framing envelope from the process-wide proxy memory budget before delivery starts. Larger account limits therefore reduce admitted stream concurrency instead of allowing aggregate framing and terminal buffers to exceed the global budget.
+
 ## Reservation bounds for custom models `reservation_token_bounds`
 
 Before execution, the gateway reserves balance based on price and token limits; after complete provider usage is available, it settles at actual usage. The reserved amount is not the final cost.

@@ -11,6 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub(crate) const REQUEST_MEMORY_WEIGHT: usize = 3;
 pub(crate) const CAPTURE_MEMORY_WEIGHT: usize = 3;
 pub(crate) const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const SSE_STREAMING_MEMORY_WEIGHT: usize = 3;
 const UNIT_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -154,13 +155,40 @@ pub(crate) struct ArchiveOutputMemory {
     bytes: usize,
 }
 
+pub(crate) struct SseStreamingMemory {
+    reservation: Arc<ProxyMemoryReservation>,
+    bytes: usize,
+}
+
 impl Drop for ArchiveOutputMemory {
     fn drop(&mut self) {
         self.reservation.release(self.bytes, 1);
     }
 }
 
+impl Drop for SseStreamingMemory {
+    fn drop(&mut self) {
+        self.reservation.release(self.bytes, 1);
+    }
+}
+
 impl ProxyMemoryReservation {
+    /// Reserve one request-local envelope for the simultaneous SSE input,
+    /// framing/sanitizer copy, and terminal delivery copy. This turns the
+    /// configured per-stream byte ceiling into process-wide concurrency
+    /// admission instead of allowing every active stream to allocate its
+    /// maximum independently of the global proxy memory budget.
+    pub(crate) fn try_reserve_sse_streaming(
+        self: &Arc<Self>,
+        framed_bytes: usize,
+    ) -> Option<SseStreamingMemory> {
+        let bytes = framed_bytes.checked_mul(SSE_STREAMING_MEMORY_WEIGHT)?;
+        self.try_grow(bytes, 1).then(|| SseStreamingMemory {
+            reservation: self.clone(),
+            bytes,
+        })
+    }
+
     pub(crate) fn try_reserve_archive_output(
         self: &Arc<Self>,
         bytes: usize,
@@ -696,6 +724,28 @@ mod tests {
                 .try_reserve_archive_json_transform(&large_frame)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn sse_streaming_envelope_limits_concurrency_and_releases_capacity() {
+        let framed_bytes = 8 * UNIT_BYTES;
+        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u32);
+        let first = budget.reservation();
+        let first_permit = first
+            .try_reserve_sse_streaming(framed_bytes)
+            .expect("one three-copy SSE envelope fits exactly");
+        assert_eq!(
+            budget.snapshot().0,
+            framed_bytes * SSE_STREAMING_MEMORY_WEIGHT
+        );
+
+        let second = budget.reservation();
+        assert!(second.try_reserve_sse_streaming(framed_bytes).is_none());
+        assert!(second.try_reserve_sse_streaming(usize::MAX).is_none());
+
+        drop(first_permit);
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(second.try_reserve_sse_streaming(framed_bytes).is_some());
     }
 
     #[test]

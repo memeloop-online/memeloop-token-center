@@ -163,6 +163,17 @@ pub(super) struct StreamingResponse<'a> {
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::Context::for_request(input.request_id);
     let response_body_limit = streaming_response_body_limit();
+    let sse_streaming_memory = if input.is_sse {
+        Some(
+            input
+                .buffered_request
+                .memory
+                .try_reserve_sse_streaming(input.sse_framing_limits.framed_bytes)
+                .ok_or(AppError::Overloaded)?,
+        )
+    } else {
+        None
+    };
     let StreamingResponse {
         state,
         upstream,
@@ -205,6 +216,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         ..
     } = buffered_request;
     tokio::spawn(async move {
+        let _sse_streaming_memory = sse_streaming_memory;
         let stream_owner = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "stream_owner",
