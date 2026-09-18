@@ -16,6 +16,7 @@ declare global {
     emitRequestOverflow: (count?: number) => void;
     emitLiveRequest: (id: string, createdAt: number) => void;
     resolveNextRequestQuery: (id: string) => void;
+    requestQueryKinds: string[];
   }
 }
 
@@ -65,6 +66,26 @@ test('Requests keeps realtime events flowing while overflow reconciliation coale
     await page.clock.fastForward(requestOverflowReconcileCooldownMs * 2);
     assert.equal(await page.evaluate(() => window.requestQueryReads), 3, 'one clean trailing pass ends the catch-up episode');
     await model('live-during-reconcile').waitFor();
+
+    // Exercise RequestsPage.load(filters, true), not just the coordinator in
+    // isolation: pagination aborts the active first-page query, loads history,
+    // then restores the one sticky reconciliation it interrupted.
+    await page.evaluate(() => window.emitRequestOverflow(1_000));
+    await page.getByTestId('overflow-revision').filter({ hasText: '3000' }).waitFor({ state: 'attached' });
+    await page.clock.fastForward(requestOverflowReconcileDelayMs);
+    await page.waitForFunction(() => window.requestQueryReads === 4);
+    await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
+    await model('older-page').waitFor();
+    await page.waitForFunction(() => window.requestQueryReads === 5);
+    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older']);
+
+    await page.clock.fastForward(requestOverflowReconcileDelayMs);
+    await page.waitForFunction(() => window.requestQueryReads === 6);
+    assert.deepEqual(await page.evaluate(() => window.requestQueryKinds), ['first', 'first', 'first', 'first', 'older', 'first'],
+      'the interrupted sticky overflow is restored as a first-page query after pagination');
+    await page.evaluate(() => window.resolveNextRequestQuery('post-pagination-reconcile'));
+    await model('post-pagination-reconcile').waitFor();
+    await model('older-page').waitFor();
   } finally {
     await browser.close();
     await server.close();

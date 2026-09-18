@@ -27,10 +27,11 @@ function clock() {
   };
 }
 
-test('overflow edges collapse into one authoritative query and one cooldown-bounded trailing query', () => {
+test('overflow edges collapse into cooldown-bounded authoritative trailing queries', () => {
   const time = clock();
   const started: number[] = [];
   const reconciliation = new RequestOverflowReconciliation(time, ticket => started.push(ticket));
+  assert.equal(requestOverflowReconcileCooldownMs, 30_000, 'the reconciliation rate limit is an explicit contract');
 
   for (let index = 0; index < 1_000; index++) reconciliation.signal();
   assert.equal(time.size, 1, 'a burst owns one fixed edge timer');
@@ -50,9 +51,15 @@ test('overflow edges collapse into one authoritative query and one cooldown-boun
   assert.deepEqual(started, [1]);
   time.advance(1);
   assert.deepEqual(started, [1, 2]);
+  for (let index = 0; index < 1_000; index++) reconciliation.signal();
   reconciliation.finish(2, true);
+  time.advance(requestOverflowReconcileCooldownMs - 1);
+  assert.deepEqual(started, [1, 2], 'overflow sustained through the second query still observes the cooldown');
+  time.advance(1);
+  assert.deepEqual(started, [1, 2, 3], 'the second query retains only one final necessary reconciliation');
+  reconciliation.finish(3, true);
   time.advance(requestOverflowReconcileCooldownMs * 2);
-  assert.deepEqual(started, [1, 2], 'a clean trailing pass ends the catch-up episode');
+  assert.deepEqual(started, [1, 2, 3], 'a clean final pass ends the catch-up episode');
 });
 
 test('failure stays sticky but retries only after the hard cooldown', () => {

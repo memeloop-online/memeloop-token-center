@@ -17,6 +17,7 @@ declare global {
     emitRequestOverflow: (count?: number) => void;
     emitLiveRequest: (id: string, createdAt: number) => void;
     resolveNextRequestQuery: (id: string) => void;
+    requestQueryKinds: string[];
   }
 }
 
@@ -26,20 +27,40 @@ const request = (request_id: string, created_at: number): RequestView => ({
   error_code: null, currency: 'USD', archive_state: 'bound', usage_basis: 'provider_reported',
 });
 
-const response = (id: string): RequestListResponse => ({ requests: [request(id, 1_000)], next_cursor: null });
-const heldQueries: Array<(value: Response) => void> = [];
+const response = (id: string): RequestListResponse => {
+  const requests = [request(id, 1_000), ...Array.from({ length: 99 }, (_, index) => request(`${id}-${index + 1}`, 999 - index))];
+  const tail = requests.at(-1)!;
+  return { requests, next_cursor: { before_created_at: tail.created_at, before_id: tail.request_id } };
+};
+const heldQueries: Array<{ active: boolean; resolve: (value: Response) => void }> = [];
 window.requestQueryReads = 0;
+window.requestQueryKinds = [];
 window.emitRequestOverflow = () => undefined;
 window.emitLiveRequest = () => undefined;
-window.resolveNextRequestQuery = id => heldQueries.shift()?.(Response.json(response(id)));
+window.resolveNextRequestQuery = id => {
+  let held = heldQueries.shift();
+  while (held && !held.active) held = heldQueries.shift();
+  held?.resolve(Response.json(response(id)));
+};
 
-window.fetch = async input => {
+window.fetch = async (input, init) => {
   const url = new URL(String(input), location.origin);
   if (url.pathname === '/internal/v1/upstreams') return Response.json([]);
   if (url.pathname === '/internal/v1/requests/query') {
     window.requestQueryReads += 1;
+    const body = JSON.parse(String(init?.body)) as { before_id?: string };
+    const older = body.before_id !== undefined;
+    window.requestQueryKinds.push(older ? 'older' : 'first');
     if (window.requestQueryReads === 1) return Response.json(response('initial-authoritative'));
-    return new Promise<Response>(resolve => heldQueries.push(resolve));
+    if (older) return Response.json({ requests: [request('older-page', 100)], next_cursor: null } satisfies RequestListResponse);
+    return new Promise<Response>((resolve, reject) => {
+      const held = { active: true, resolve };
+      heldQueries.push(held);
+      init?.signal?.addEventListener('abort', () => {
+        held.active = false;
+        reject(new DOMException('The operation was aborted', 'AbortError'));
+      }, { once: true });
+    });
   }
   return Response.json({ error: { message: `Unexpected fixture request: ${url.pathname}` } }, { status: 500 });
 };

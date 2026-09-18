@@ -107,7 +107,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   async function refreshOverflowFirstPage(ticket: number) {
     const currentScope = scope.current;
     if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters)
-      || loadedHistoryIds.current.size || loadingRef.current || paused.current) {
+      || loadingRef.current || paused.current) {
       overflowRefresh.current?.finish(ticket, true);
       return;
     }
@@ -120,7 +120,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       });
       const latest = scope.current;
       if (controller.signal.aborted || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant
-        || latest.filters !== currentScope.filters || typedFiltersActive(latest.filters) || loadedHistoryIds.current.size) return;
+        || latest.filters !== currentScope.filters || typedFiltersActive(latest.filters)) return;
       // Replace the live window with the authoritative server first page, then
       // re-apply the bounded live buffer. Never runs for filtered views.
       const current = requestsRef.current;
@@ -151,6 +151,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // Freeze insertion before the page fetch, not after it resolves: otherwise
     // a live batch could move the visible tail while this cursor is in flight.
     if (older) for (const request of requestsRef.current) loadedHistoryIds.current.add(request.request_id);
+    const refreshWasActive = older && (overflowRefresh.current?.needsReconcile ?? false);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
     cancelOverflowRefresh();
@@ -194,6 +195,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         loadAbort.current = null;
         loadingRef.current = false;
         setLoading(false);
+        // Pagination owns the network lane while it is active, but it cannot
+        // consume an already-dirty first-page overflow. Re-arm exactly one
+        // reconciliation after the older page settles.
+        if (refreshWasActive) overflowRefresh.current?.signal();
       }
     }
   }
