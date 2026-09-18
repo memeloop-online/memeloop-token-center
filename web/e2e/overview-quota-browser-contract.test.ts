@@ -49,9 +49,10 @@ test('production overview reads each leading account once and preserves unknown 
         if (body.fresh !== true || body.trigger !== 'bulk' || !Array.isArray(body.account_ids)) { unexpected.push(`invalid quota batch ${url.pathname}`); return route.abort(); }
         reads.push(...body.account_ids);
         if (failRefresh) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic read unavailable' } }) });
-        return json({ contract_version: 'upstream_quota_batch_v1', results: body.account_ids.map(id => id === 'known'
+        const results = body.account_ids.map(id => id === 'known'
           ? { status: 'success', upstream_account_id: id, snapshot: quota }
-          : { status: 'success', upstream_account_id: id, snapshot: { ...quota, upstream_account_id: id, status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...quotaWindow, used_percent: 0 }] } })) });
+          : { status: 'success', upstream_account_id: id, snapshot: { ...quota, upstream_account_id: id, status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_transport_failed', windows: [{ ...quotaWindow, used_percent: 0 }] } });
+        return json({ contract_version: 'upstream_quota_batch_v1', results });
       }
       if (request.method() !== 'GET') { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
       if (url.pathname === '/internal/v1/tenants') return json([{ id: 'synthetic', external_id: 'default', name: 'Design acceptance' }]);
