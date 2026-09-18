@@ -56,10 +56,22 @@ export interface UpstreamQuotaSnapshot {
   reset_credits: { status: string | null; granted_at: number | null; expires_at: number | null; source: 'codex_reset_credits' }[];
 }
 
+export type UpstreamQuotaBatchResult =
+  | { status: 'success'; upstream_account_id: string; snapshot: UpstreamQuotaSnapshot }
+  | { status: 'error'; upstream_account_id: string; error: { code: string } };
+
+export interface UpstreamQuotaBatchResponse {
+  contract_version: 'upstream_quota_batch_v1';
+  results: UpstreamQuotaBatchResult[];
+}
+
 /** Covers the server's bounded queue plus one bounded supplier read. */
 export const UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS = 85_000;
 
 export type UpstreamQuotaReadTrigger = 'manual' | 'bulk';
+
+/** Covers 100 accounts in server waves of three, including each read's queue slack. */
+export const UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS = Math.ceil(100 / 3) * UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS;
 
 /** The next expiration belongs to reset opportunities, not a usage window. */
 export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Date.now()): { state: 'known' | 'unknown' | 'none'; at?: number } {
@@ -93,6 +105,10 @@ export function upstreamQuotaPath(accountId: string, tenant: string, options?: {
   if (options?.fresh) query.set('fresh', 'true');
   if (options?.trigger) query.set('trigger', options.trigger);
   return `/internal/v1/upstreams/${encodeURIComponent(accountId)}/quota?${query}`;
+}
+
+export function upstreamQuotaBatchPath() {
+  return '/internal/v1/upstreams/quota/batch';
 }
 
 export function quotaUsedPercent(window: UpstreamQuotaSnapshot['windows'][number]): number | null {

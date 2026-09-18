@@ -15,6 +15,11 @@ pub struct CreateUpstreamAccountInput {
     pub oauth_refresh_url: Option<String>,
 }
 
+pub struct BatchUpstreamAccountCredential {
+    pub account_id: Uuid,
+    pub result: Result<(UpstreamAccountView, UpstreamCredential), AppError>,
+}
+
 #[derive(Clone, Debug)]
 pub struct UpdateUpstreamAccountInput {
     pub name: String,
@@ -175,6 +180,51 @@ impl Database {
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         Ok((upstream_account_view(row)?, credential))
+    }
+
+    /// Loads one bounded operator page of accounts and current credentials in
+    /// one statement. The optional tenant is taken from the authenticated
+    /// service scope; callers never supply a second tenant selector in the
+    /// batch body.
+    pub async fn upstream_accounts_with_credentials_batch(
+        &self,
+        account_ids: &[Uuid],
+        tenant_external_id: Option<&str>,
+        key_material: &[u8],
+    ) -> Result<Vec<BatchUpstreamAccountCredential>, AppError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account_ids =
+            serde_json::to_string(&account_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+                .map_err(|_| AppError::Internal)?;
+        let selected_accounts = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT selected.item FROM jsonb_array_elements_text(CAST($2 AS jsonb)) AS selected(item)"
+            }
+            DatabaseBackend::Sqlite => "SELECT value FROM json_each($2)",
+        };
+        let statement = format!(
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND a.id IN ({selected_accounts}) ORDER BY a.id"
+        );
+        let rows = sqlx::query(&statement)
+            .bind(tenant_external_id.unwrap_or_default())
+            .bind(account_ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let account_id = parse_uuid(row.try_get("id")?)?;
+                let ciphertext: Option<String> = row.try_get("credential_ciphertext")?;
+                let result = upstream_account_view(row).and_then(|account| {
+                    ciphertext.ok_or(AppError::NotFound).and_then(|ciphertext| {
+                        open_credential(&ciphertext, key_material)
+                            .map(|credential| (account, credential))
+                    })
+                });
+                Ok(BatchUpstreamAccountCredential { account_id, result })
+            })
+            .collect()
     }
 
     /// Control-plane read of the current generation, including a locally

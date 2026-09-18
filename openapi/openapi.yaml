@@ -1528,6 +1528,49 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/upstreams/quota/batch:
+    post:
+      tags: [Upstream providers]
+      operationId: batchReadUpstreamQuota
+      summary: Refresh one bounded page of upstream quota snapshots
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      x-quota-batch-contract:
+        max-accounts: 100
+        account-credential-load-statements: 1
+        handler-concurrency: 3
+        cache: shared
+        singleflight: shared-per-account
+        global-permits: shared
+        partial-results: true
+        supplier-reset: forbidden
+        tenant-source: authenticated-service-scope-and-account-ownership
+      description: |
+        Loads the requested account identities and current encrypted credentials in
+        one database statement, constrained by the authenticated service tenant when
+        present. The body cannot select a tenant. At most three account reads run at
+        once and they reuse the same per-account cache, singleflight and process-wide
+        quota permits as the single-account endpoint. Each account returns its own
+        success or sanitized error so partial progress is retained. This endpoint is
+        read-only: it never refreshes OAuth credentials or consumes a reset credit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpstreamQuotaBatchRequest' }
+      responses:
+        '200':
+          description: Ordered per-account quota results; one item may fail without failing its peers.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaBatchResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/upstreams/{account_id}/quota:
     get:
       tags: [Upstream providers]
@@ -6427,6 +6470,57 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    UpstreamQuotaBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [account_ids, fresh, trigger]
+      properties:
+        account_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        fresh:
+          type: boolean
+          description: Bypass a still-fresh cached snapshot while retaining shared singleflight and permits.
+        trigger:
+          type: string
+          enum: [bulk, manual]
+          description: Auditable operator intent; refresh-all uses bulk and an individual manual refresh uses manual.
+    UpstreamQuotaBatchResponse:
+      type: object
+      additionalProperties: false
+      required: [contract_version, results]
+      properties:
+        contract_version: { const: upstream_quota_batch_v1 }
+        results:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UpstreamQuotaBatchResult' }
+    UpstreamQuotaBatchResult:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [status, upstream_account_id, snapshot]
+          properties:
+            status: { const: success, description: A quota snapshot projection was produced; inspect its status and error_code for supplier-read failures. }
+            upstream_account_id: { type: string, format: uuid }
+            snapshot: { $ref: '#/paths/~1internal~1v1~1upstreams~1{account_id}~1quota/get/responses/200/content/application~1json/schema' }
+        - type: object
+          additionalProperties: false
+          required: [status, upstream_account_id, error]
+          properties:
+            status: { const: error, description: The account could not produce a scoped quota projection. }
+            upstream_account_id: { type: string, format: uuid }
+            error:
+              type: object
+              additionalProperties: false
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  enum: [quota_account_not_found, quota_account_inactive, credential_invalid, quota_account_unavailable]
     PluginInstallation:
       type: object
       additionalProperties: false

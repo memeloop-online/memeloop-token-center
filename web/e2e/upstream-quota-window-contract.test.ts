@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { formatCountdown } from '../src/format.js';
-import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   assert.equal(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, 85_000, 'operator deadline preserves ten seconds beyond the server read budget');
@@ -17,6 +17,12 @@ test('quota URL requires and preserves explicit account and tenant identity', ()
   assert.equal(bulk.searchParams.get('fresh'), 'true');
   assert.equal(bulk.searchParams.get('trigger'), 'bulk');
   assert.throws(() => upstreamQuotaPath('account', ''));
+});
+
+test('quota batch URL carries no caller-selected tenant', () => {
+  const url = new URL(upstreamQuotaBatchPath(), 'https://example.test');
+  assert.equal(url.pathname, '/internal/v1/upstreams/quota/batch');
+  assert.equal(url.search, '');
 });
 
 test('unknown windows stay unknown and exact usage is not rounded or capped by the projection', () => {

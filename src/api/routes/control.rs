@@ -135,6 +135,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(upstream_account_availability),
         )
         .route(
+            "/internal/v1/upstreams/quota/batch",
+            post(upstream_quota_batch),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/quota",
             get(upstream_quota),
         )

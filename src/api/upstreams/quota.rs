@@ -1,10 +1,137 @@
 use super::super::*;
 use crate::provider::UpstreamAccountView;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+
+const MAX_QUOTA_BATCH_ACCOUNTS: usize = 100;
+const QUOTA_BATCH_CONCURRENCY: usize = 3;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct QuotaQuery {
     tenant_external_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct QuotaBatchRequest {
+    account_ids: Vec<Uuid>,
+    fresh: bool,
+    trigger: crate::upstream_quota::QuotaRequestTrigger,
+}
+
+#[derive(Serialize)]
+struct QuotaBatchResponse {
+    contract_version: &'static str,
+    results: Vec<QuotaBatchResult>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum QuotaBatchResult {
+    Success {
+        upstream_account_id: Uuid,
+        snapshot: crate::upstream_quota::QuotaSnapshot,
+    },
+    Error {
+        upstream_account_id: Uuid,
+        error: QuotaBatchError,
+    },
+}
+
+#[derive(Serialize)]
+struct QuotaBatchError {
+    code: &'static str,
+}
+
+fn validate_quota_batch_request(body: &QuotaBatchRequest) -> Result<(), AppError> {
+    if body.account_ids.is_empty() || body.account_ids.len() > MAX_QUOTA_BATCH_ACCOUNTS {
+        return Err(AppError::BadRequest(
+            "quota batch must contain 1 to 100 account_ids".into(),
+        ));
+    }
+    let mut unique = HashSet::with_capacity(body.account_ids.len());
+    if !body.account_ids.iter().copied().all(|id| unique.insert(id)) {
+        return Err(AppError::BadRequest(
+            "quota batch account_ids must be unique".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_quota_snapshot(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    fresh: bool,
+    trigger: crate::upstream_quota::QuotaReadTrigger,
+) -> crate::upstream_quota::QuotaSnapshot {
+    if fresh {
+        state
+            .upstream_quota
+            .read_fresh(state, account, credential, tenant, trigger)
+            .await
+    } else {
+        state
+            .upstream_quota
+            .read(state, account, credential, tenant, trigger)
+            .await
+    }
+}
+
+async fn quota_batch_result(
+    state: AppState,
+    account_id: Uuid,
+    loaded: Option<Result<(UpstreamAccountView, UpstreamCredential), AppError>>,
+    fresh: bool,
+    trigger: crate::upstream_quota::QuotaReadTrigger,
+) -> QuotaBatchResult {
+    let Some(loaded) = loaded else {
+        return QuotaBatchResult::Error {
+            upstream_account_id: account_id,
+            error: QuotaBatchError {
+                code: "quota_account_not_found",
+            },
+        };
+    };
+    let (account, credential) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::warn!(
+                upstream_account_id = %account_id,
+                error_category = error.diagnostic_category(),
+                "batch quota account credential could not be loaded"
+            );
+            return QuotaBatchResult::Error {
+                upstream_account_id: account_id,
+                error: QuotaBatchError {
+                    code: "credential_invalid",
+                },
+            };
+        }
+    };
+    if account.status != "active" {
+        return QuotaBatchResult::Error {
+            upstream_account_id: account_id,
+            error: QuotaBatchError {
+                code: "quota_account_inactive",
+            },
+        };
+    }
+    let Some(tenant) = account.tenant_external_id.as_deref() else {
+        return QuotaBatchResult::Error {
+            upstream_account_id: account_id,
+            error: QuotaBatchError {
+                code: "quota_account_unavailable",
+            },
+        };
+    };
+    let snapshot = read_quota_snapshot(&state, &account, &credential, tenant, fresh, trigger).await;
+    QuotaBatchResult::Success {
+        upstream_account_id: account_id,
+        snapshot,
+    }
 }
 
 #[derive(Deserialize)]
@@ -210,16 +337,102 @@ pub(in crate::api) async fn upstream_quota(
         .trigger
         .unwrap_or(crate::upstream_quota::QuotaRequestTrigger::Manual)
         .into();
-    let snapshot = if query.fresh {
-        state
-            .upstream_quota
-            .read_fresh(&state, &account, &credential, tenant, trigger)
-            .await
-    } else {
-        state
-            .upstream_quota
-            .read(&state, &account, &credential, tenant, trigger)
-            .await
-    };
+    let snapshot =
+        read_quota_snapshot(&state, &account, &credential, tenant, query.fresh, trigger).await;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(snapshot)))
+}
+
+pub(in crate::api) async fn upstream_quota_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<QuotaBatchRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    validate_quota_batch_request(&body)?;
+    let loaded = state
+        .db
+        .upstream_accounts_with_credentials_batch(
+            &body.account_ids,
+            service.tenant_external_id.as_deref(),
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    let mut loaded = loaded
+        .into_iter()
+        .map(|item| (item.account_id, item.result))
+        .collect::<HashMap<_, _>>();
+    let fresh = body.fresh;
+    let trigger = body.trigger.into();
+    let jobs = body.account_ids.into_iter().map(|account_id| {
+        quota_batch_result(
+            state.clone(),
+            account_id,
+            loaded.remove(&account_id),
+            fresh,
+            trigger,
+        )
+    });
+    let results = futures_util::stream::iter(jobs)
+        .buffered(QUOTA_BATCH_CONCURRENCY)
+        .collect()
+        .await;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(QuotaBatchResponse {
+            contract_version: "upstream_quota_batch_v1",
+            results,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_batch_wire_contract_is_closed_bounded_and_tenant_free() {
+        let first = Uuid::from_u128(1);
+        let request: QuotaBatchRequest = serde_json::from_value(json!({
+            "account_ids": [first],
+            "fresh": true,
+            "trigger": "bulk"
+        }))
+        .expect("valid batch request");
+        validate_quota_batch_request(&request).expect("bounded unique batch");
+
+        assert!(
+            serde_json::from_value::<QuotaBatchRequest>(json!({
+                "account_ids": [first],
+                "fresh": true,
+                "trigger": "bulk",
+                "tenant_external_id": "caller-selected"
+            }))
+            .is_err()
+        );
+        let duplicate: QuotaBatchRequest = serde_json::from_value(json!({
+            "account_ids": [first, first],
+            "fresh": true,
+            "trigger": "manual"
+        }))
+        .expect("wire shape is valid before semantic uniqueness validation");
+        assert!(validate_quota_batch_request(&duplicate).is_err());
+    }
+
+    #[test]
+    fn quota_batch_error_is_per_account_and_sanitized() {
+        assert_eq!(
+            serde_json::to_value(QuotaBatchResult::Error {
+                upstream_account_id: Uuid::from_u128(2),
+                error: QuotaBatchError {
+                    code: "quota_account_unavailable"
+                }
+            })
+            .expect("serialize batch result"),
+            json!({
+                "status": "error",
+                "upstream_account_id": Uuid::from_u128(2),
+                "error": { "code": "quota_account_unavailable" }
+            })
+        );
+    }
 }

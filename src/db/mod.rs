@@ -158,16 +158,16 @@ pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView,
-    ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh, CreateModelRouteInput,
-    CreateUpstreamAccountInput, DiscoveredUpstreamModel, MODEL_PICKER_GROUP_LIMIT,
-    MODEL_PICKER_ITEM_LIMIT, MODEL_PICKER_SOURCE_LIMIT, ModelPickerCatalogEvidence,
-    ModelPickerConfigurationAvailability, ModelPickerHealthEvidence, ModelPickerItem,
-    ModelPickerNamedIdentity, ModelPickerProjectionFilter, ModelPickerProviderIdentity,
-    ModelPickerSelectionIdentity, ModelPickerSelectionKind, ModelPickerSource,
-    ModelPickerSourceCapabilities, NativeCursorImportInput, NativeCursorImportResult,
-    NativeOAuthImportAccountInput, NativeOAuthImportApproval, NativeOAuthImportCohortResult,
-    ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult, UpdateModelRouteInput,
-    UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
+    BatchUpstreamAccountCredential, ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh,
+    CreateModelRouteInput, CreateUpstreamAccountInput, DiscoveredUpstreamModel,
+    MODEL_PICKER_GROUP_LIMIT, MODEL_PICKER_ITEM_LIMIT, MODEL_PICKER_SOURCE_LIMIT,
+    ModelPickerCatalogEvidence, ModelPickerConfigurationAvailability, ModelPickerHealthEvidence,
+    ModelPickerItem, ModelPickerNamedIdentity, ModelPickerProjectionFilter,
+    ModelPickerProviderIdentity, ModelPickerSelectionIdentity, ModelPickerSelectionKind,
+    ModelPickerSource, ModelPickerSourceCapabilities, NativeCursorImportInput,
+    NativeCursorImportResult, NativeOAuthImportAccountInput, NativeOAuthImportApproval,
+    NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
+    UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
