@@ -15,8 +15,9 @@ import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
 import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
+import { RequestOverflowReconciliation } from '../traffic/requestOverflowReconciliation';
 import {
-  emptyTypedFilterAst, filteredRequestRefreshDelay, mergeRefreshedRequestPage,
+  emptyTypedFilterAst, mergeRefreshedRequestPage,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
@@ -61,17 +62,17 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [userPaused, setUserPaused] = useState(false);
   const streamPaused = userPaused || (requestRefresh?.paused ?? false);
   paused.current = streamPaused;
-  const reconcileOverflow = useRef(false);
   const previousOverflowRevision = useRef(streamOverflowRevision);
-  const overflowRefresh = useRef<{
-    controller?: AbortController;
-    firstPendingAt?: number;
-    inFlight: boolean;
-    pending: boolean;
-    requestSequence: number;
-    scopeSequence: number;
-    timer?: number;
-  }>({ inFlight: false, pending: false, requestSequence: 0, scopeSequence: 0 });
+  const overflowController = useRef<AbortController | null>(null);
+  const startOverflowRefresh = useRef<(ticket: number) => void>(() => undefined);
+  const overflowRefresh = useRef<RequestOverflowReconciliation | undefined>(undefined);
+  if (!overflowRefresh.current) {
+    overflowRefresh.current = new RequestOverflowReconciliation({
+      now: () => Date.now(),
+      schedule: (callback, delay) => window.setTimeout(callback, delay),
+      cancel: timer => window.clearTimeout(timer),
+    }, ticket => startOverflowRefresh.current(ticket));
+  }
   const loadAbort = useRef<AbortController | null>(null);
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
@@ -97,80 +98,61 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   requestsRef.current = requests;
   scope.current = { token, tenant, filters };
 
-  function cancelOverflowRefresh() {
-    const state = overflowRefresh.current;
-    state.scopeSequence += 1;
-    state.requestSequence += 1;
-    if (state.timer !== undefined) window.clearTimeout(state.timer);
-    state.timer = undefined;
-    state.controller?.abort();
-    state.controller = undefined;
-    state.firstPendingAt = undefined;
-    state.inFlight = false;
-    state.pending = false;
+  function cancelOverflowRefresh(preserveDirty = false, resetCooldown = false) {
+    overflowController.current?.abort();
+    overflowController.current = null;
+    overflowRefresh.current?.reset(preserveDirty, resetCooldown);
   }
 
-  // Overflow reconciliation serves only the unfiltered live first page.
-  // Filtered and history views stay stable until an explicit manual refresh.
-  function scheduleOverflowRefresh() {
-    const state = overflowRefresh.current;
+  function syncOverflowRefreshBlocked() {
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters) || !reconcileOverflow.current) return;
-    state.pending = true;
-    if (state.inFlight || loadingRef.current || paused.current) return;
-
-    const now = Date.now();
-    state.firstPendingAt ??= now;
-    if (state.timer !== undefined) window.clearTimeout(state.timer);
-    const scopeSequence = state.scopeSequence;
-    state.timer = window.setTimeout(() => {
-      state.timer = undefined;
-      if (overflowRefresh.current.scopeSequence === scopeSequence) void refreshOverflowFirstPage();
-    }, filteredRequestRefreshDelay(now, state.firstPendingAt));
+    overflowRefresh.current?.setBlocked(
+      !currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters)
+      || loadingRef.current || paused.current,
+    );
   }
 
-  async function refreshOverflowFirstPage() {
-    const state = overflowRefresh.current;
-    if (state.inFlight || loadingRef.current || !state.pending || paused.current) return;
+  async function refreshOverflowFirstPage(ticket: number) {
     const currentScope = scope.current;
-    if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters) || !reconcileOverflow.current) return;
-    state.inFlight = true;
-    state.pending = false;
-    state.firstPendingAt = undefined;
-    const requestSequence = ++state.requestSequence;
-    const scopeSequence = state.scopeSequence;
-    const overflowAtStart = previousOverflowRevision.current;
+    if (!currentScope.token || !currentScope.tenant || typedFiltersActive(currentScope.filters)
+      || loadingRef.current || paused.current) {
+      overflowRefresh.current?.defer(ticket);
+      return;
+    }
     const controller = new AbortController();
-    state.controller = controller;
+    overflowController.current = controller;
+    let succeeded = false;
     try {
       const next = await api<RequestListResponse>('/internal/v1/requests/query', currentScope.token, {
         method: 'POST', body: JSON.stringify(typedRequestQueryBody(currentScope.tenant, currentScope.filters)), signal: controller.signal,
       });
       const latest = scope.current;
-      if (controller.signal.aborted || state.requestSequence !== requestSequence || state.scopeSequence !== scopeSequence
-        || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
+      if (controller.signal.aborted || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant
+        || latest.filters !== currentScope.filters || typedFiltersActive(latest.filters)) {
+        syncOverflowRefreshBlocked();
+        return;
+      }
       // Replace the live window with the authoritative server first page, then
       // re-apply the bounded live buffer. Never runs for filtered views.
       const current = requestsRef.current;
       const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
       setRequests(page.requests); setHasOlder(page.hasOlder);
-      if (previousOverflowRevision.current === overflowAtStart) reconcileOverflow.current = false;
+      succeeded = true;
       if (errorSource.current === 'refresh') {
         errorSource.current = undefined;
         setError('');
       }
     } catch (reason) {
-      if (!controller.signal.aborted && state.requestSequence === requestSequence && state.scopeSequence === scopeSequence) {
+      if (!controller.signal.aborted) {
         errorSource.current = 'refresh';
         setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
       }
     } finally {
-      if (state.requestSequence !== requestSequence || state.scopeSequence !== scopeSequence) return;
-      state.controller = undefined;
-      state.inFlight = false;
-      if (state.pending) scheduleOverflowRefresh();
+      if (overflowController.current === controller) overflowController.current = null;
+      overflowRefresh.current?.finish(ticket, succeeded);
     }
   }
+  startOverflowRefresh.current = ticket => { void refreshOverflowFirstPage(ticket); };
 
   async function load(nextFilters: TypedFilterAst, older = false) {
     if (!token || !tenant) return;
@@ -180,10 +162,13 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // Freeze insertion before the page fetch, not after it resolves: otherwise
     // a live batch could move the visible tail while this cursor is in flight.
     if (older) for (const request of requestsRef.current) loadedHistoryIds.current.add(request.request_id);
-    const refreshWasActive = older && (overflowRefresh.current.pending || overflowRefresh.current.inFlight);
+    const refreshWasActive = older && (overflowRefresh.current?.needsReconcile ?? false);
     // A foreground page request owns the request list until it settles. Abort
     // any background first-page refresh rather than running two query POSTs.
-    cancelOverflowRefresh();
+    // Its dirty edge remains sticky: a just-claimed timer must not be mistaken
+    // for a completed authoritative refresh while the foreground lane owns it.
+    overflowRefresh.current?.setBlocked(true);
+    cancelOverflowRefresh(true);
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -224,8 +209,11 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
         loadAbort.current = null;
         loadingRef.current = false;
         setLoading(false);
-        if (refreshWasActive) overflowRefresh.current.pending = true;
-        if (overflowRefresh.current.pending) scheduleOverflowRefresh();
+        syncOverflowRefreshBlocked();
+        // Pagination owns the network lane while it is active, but it cannot
+        // consume an already-dirty first-page overflow. Re-arm exactly one
+        // reconciliation after the older page settles.
+        if (refreshWasActive) overflowRefresh.current?.signal();
       }
     }
   }
@@ -237,10 +225,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // new scope's batch is recreated empty after this commit, so any future
     // overflow still arrives as a strictly larger revision.
     loadedHistoryIds.current.clear();
-    reconcileOverflow.current = false;
     previousOverflowRevision.current = streamOverflowRevision;
     onProtectRequests?.([]);
-    cancelOverflowRefresh();
+    cancelOverflowRefresh(false, true);
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
@@ -273,11 +260,11 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     if (streamPaused) {
-      const state = overflowRefresh.current;
-      const pending = state.pending || state.inFlight;
-      cancelOverflowRefresh();
-      state.pending = pending;
-    } else if (overflowRefresh.current.pending) scheduleOverflowRefresh();
+      syncOverflowRefreshBlocked();
+      cancelOverflowRefresh(true);
+    } else {
+      syncOverflowRefreshBlocked();
+    }
   }, [streamPaused]);
 
   useEffect(() => {
@@ -286,8 +273,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       // Overflow reconciliation serves only the unfiltered live first page.
       // Filtered and history views stay stable until an explicit refresh.
       if (typedFiltersActive(filters) || loadedHistoryIds.current.size) return;
-      reconcileOverflow.current = true;
-      scheduleOverflowRefresh();
+      overflowRefresh.current?.signal();
     }
   }, [streamOverflowRevision]);
 
@@ -306,8 +292,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   }, [streamRevision, streamPaused]);
 
   useEffect(() => {
-    if (!loading && overflowRefresh.current.pending) scheduleOverflowRefresh();
-  }, [loading]);
+    syncOverflowRefreshBlocked();
+  }, [filters, loading, streamPaused]);
 
   async function openRequestDetail(requestId: string) {
     if (selectedRequestId.current !== requestId) setDetail(undefined);
