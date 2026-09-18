@@ -306,7 +306,7 @@ impl TerminalFrames {
             return Ok(Some(frame));
         }
         self.bytes = self.bytes.checked_add(frame.bytes.len()).ok_or(())?;
-        if self.bytes > crate::api::limits::MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK {
+        if self.bytes > crate::api::limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES {
             return Err(());
         }
         self.frames.push(frame);
