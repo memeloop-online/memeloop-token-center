@@ -573,9 +573,11 @@ impl Config {
             upstream_openai_key: None,
             upstream_anthropic_url: None,
             upstream_anthropic_key: None,
-            pricing_models_dev_url: DEFAULT_PRICING_MODELS_DEV_URL.to_owned(),
-            pricing_litellm_url: DEFAULT_PRICING_LITELLM_URL.to_owned(),
-            pricing_openrouter_url: DEFAULT_PRICING_OPENROUTER_URL.to_owned(),
+            // Automatic account/catalog refresh must never send test traffic to
+            // public price services. Pricing tests supply explicit mock URLs.
+            pricing_models_dev_url: String::new(),
+            pricing_litellm_url: String::new(),
+            pricing_openrouter_url: String::new(),
             plugin_dir: None,
             plugin_inventory_file: None,
             plugin_install_policy_file: None,
@@ -759,6 +761,14 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_price_sources_require_explicit_mock_urls() {
+        let config = Config::for_test("sqlite::memory:".to_owned());
+        for (_, url) in crate::pricing::model_price_sources(&config) {
+            assert!(reqwest::Url::parse(url).is_err());
+        }
+    }
 
     #[test]
     fn proxy_memory_budget_reserves_progress_headroom_and_request_capture() {

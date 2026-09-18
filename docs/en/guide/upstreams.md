@@ -15,6 +15,8 @@ An upstream account is the connection unit between MTC and an AI provider. It ha
 
 Choose **Sync models and prices** in an upstream account's details or editor. MTC reads the directory using the account's connection settings, then matches models against configured price sources. Each step displays its own result. Models awaiting pricing can be completed in model pricing.
 
+Manual and background account refreshes share the server-side coordinator. A successful directory update commits before USD price synchronization; unavailable price sources never roll back model availability or overwrite manual prices. The sync response reports pricing separately in `price_sync` (`ready`, `partial`, `error`, or `skipped`). Directory reads expose removed models in `disabled_models`, including their disappearance time, while `models` remains the active selection list. Temporary discovery failures retain both lists unchanged.
+
 Newly discovered models appear in the route model picker. When a previously discovered model disappears, its account stops participating in routes for that model; participation resumes when the model returns. Manual route enable/disable settings are preserved. Private models that have only been configured manually retain their custom selection.
 
 Public model names, account selections, and client access remain managed through routing configuration.

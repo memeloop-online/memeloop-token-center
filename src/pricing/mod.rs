@@ -15,6 +15,8 @@ use types::RemotePrice;
 pub use types::{ModelPriceSyncResult, SyncCandidate, SyncCandidateSet, SyncSourceResult};
 
 pub const MAX_SYNC_MODELS: usize = 500;
+pub(crate) static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(2);
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_PRICES: usize = 20_000;
 const MAX_CANDIDATES_PER_MODEL: usize = 8;
@@ -49,14 +51,60 @@ pub async fn sync_model_prices(
 async fn sync_model_prices_with_sources(
     db: &Database,
     http: &reqwest::Client,
-    mut models: Vec<String>,
+    models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
     allow_test_loopback: bool,
 ) -> Result<ModelPriceSyncResult, AppError> {
-    if models.len() > MAX_SYNC_MODELS {
+    run_price_sync(
+        db,
+        http,
+        models,
+        currency,
+        source_specs,
+        allow_test_loopback,
+        MAX_SYNC_MODELS,
+    )
+    .await
+}
+
+/// Server-owned catalog synchronization accepts the full bounded catalog,
+/// fetching each source once and chunking database reads, not network requests.
+pub(crate) async fn sync_catalog_model_prices(
+    db: &Database,
+    http: &reqwest::Client,
+    models: Vec<String>,
+    source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
+) -> Result<ModelPriceSyncResult, AppError> {
+    let _permit = MODEL_PRICE_SYNC_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| AppError::Internal)?;
+    run_price_sync(
+        db,
+        http,
+        models,
+        "USD",
+        source_specs,
+        allow_test_loopback,
+        10_000,
+    )
+    .await
+}
+
+async fn run_price_sync(
+    db: &Database,
+    http: &reqwest::Client,
+    mut models: Vec<String>,
+    currency: &str,
+    source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
+    max_models: usize,
+) -> Result<ModelPriceSyncResult, AppError> {
+    if models.len() > max_models {
         return Err(AppError::BadRequest(format!(
-            "model price sync accepts at most {MAX_SYNC_MODELS} models"
+            "model price sync accepts at most {max_models} models"
         )));
     }
     models = normalized_models(models);
@@ -105,12 +153,15 @@ async fn sync_model_prices_with_sources(
         ));
     }
 
-    let existing = db
-        .model_price_views_for_models(currency, &models)
-        .await?
-        .into_iter()
-        .map(|price| (price.model.clone(), price))
-        .collect::<HashMap<_, _>>();
+    let mut existing = HashMap::new();
+    for batch in models.chunks(MAX_SYNC_MODELS) {
+        existing.extend(
+            db.model_price_views_for_models(currency, batch)
+                .await?
+                .into_iter()
+                .map(|price| (price.model.clone(), price)),
+        );
+    }
     let mut selected = HashMap::<String, RemotePrice>::new();
     let mut candidate_sets = HashMap::<String, Vec<SyncCandidate>>::new();
 

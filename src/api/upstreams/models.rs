@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use futures_util::StreamExt;
+use serde::Serialize;
 
 use super::super::*;
 use crate::db::{DiscoveredUpstreamModel, ReplaceModelCatalogResult, UpstreamModelCatalogView};
@@ -9,6 +10,40 @@ const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_MODEL_CATALOG_BODY: usize = 2 * 1024 * 1024;
 const MAX_MODEL_COUNT: usize = 10_000;
 const MAX_MODEL_ID_BYTES: usize = 500;
+
+#[derive(Debug, Serialize)]
+struct CatalogSyncResult {
+    #[serde(flatten)]
+    catalog: UpstreamModelCatalogView,
+    price_sync: CatalogPriceSyncResult,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogPriceSyncResult {
+    status: &'static str,
+    currency: &'static str,
+    imported: usize,
+    preserved: usize,
+    unmatched: usize,
+    ambiguous: usize,
+    failed_sources: Vec<String>,
+    error_code: Option<&'static str>,
+}
+
+impl CatalogPriceSyncResult {
+    fn skipped() -> Self {
+        Self {
+            status: "skipped",
+            currency: "USD",
+            imported: 0,
+            preserved: 0,
+            unmatched: 0,
+            ambiguous: 0,
+            failed_sources: Vec::new(),
+            error_code: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CatalogBudget {
@@ -251,7 +286,7 @@ async fn sync_account_models(
     account_id: Uuid,
     tenant_external_id: &str,
     blocking: Option<&crate::worker::BlockingTasks>,
-) -> Result<UpstreamModelCatalogView, AppError> {
+) -> Result<CatalogSyncResult, AppError> {
     let pinned = state.clone().pin_application_plugins().await?;
     let state = &pinned;
     let (account, credential) = state
@@ -281,12 +316,16 @@ async fn sync_account_models(
         )
         .await?
     {
-        return state
-            .db
-            .upstream_model_catalog(account_id, tenant_external_id, None, 100)
-            .await;
+        return Ok(CatalogSyncResult {
+            catalog: state
+                .db
+                .upstream_model_catalog(account_id, tenant_external_id, None, 100)
+                .await?,
+            price_sync: CatalogPriceSyncResult::skipped(),
+        });
     }
     let discovery = discover_models(state, &account, &credential, blocking).await;
+    let mut price_sync = CatalogPriceSyncResult::skipped();
     match discovery {
         Ok((source_kind, models)) => {
             let replaced = state
@@ -304,6 +343,58 @@ async fn sync_account_models(
                 return Err(AppError::Conflict(
                     "upstream credential changed while models were synchronizing".into(),
                 ));
+            }
+            // Routing availability commits first. Price-source outages must not
+            // undo a confirmed disappearance or turn discovery into a failure.
+            // Both the explicit endpoint and every background refresh enter here.
+            let price_models = models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !price_models.is_empty() {
+                let sources = crate::pricing::model_price_sources(&state.config);
+                match crate::pricing::sync_catalog_model_prices(
+                    &state.db,
+                    &state.http,
+                    price_models,
+                    &sources,
+                    state.config.allow_oauth_loopback,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let failed_sources = result
+                            .source_results
+                            .into_iter()
+                            .filter(|source| source.error.is_some())
+                            .map(|source| source.source)
+                            .collect::<Vec<_>>();
+                        price_sync = CatalogPriceSyncResult {
+                            status: if failed_sources.is_empty()
+                                && result.unmatched.is_empty()
+                                && result.candidates.is_empty()
+                            {
+                                "ready"
+                            } else {
+                                "partial"
+                            },
+                            currency: "USD",
+                            imported: result.imported,
+                            preserved: result.preserved.len(),
+                            unmatched: result.unmatched.len(),
+                            ambiguous: result.candidates.len(),
+                            failed_sources,
+                            error_code: None,
+                        };
+                    }
+                    Err(_) => {
+                        tracing::warn!(%account_id, "catalog committed but model price synchronization failed");
+                        price_sync.status = "error";
+                        price_sync.error_code = Some("price_sync_failed");
+                    }
+                }
             }
         }
         Err(code) => {
@@ -324,10 +415,13 @@ async fn sync_account_models(
             }
         }
     }
-    state
-        .db
-        .upstream_model_catalog(account_id, tenant_external_id, None, 100)
-        .await
+    Ok(CatalogSyncResult {
+        catalog: state
+            .db
+            .upstream_model_catalog(account_id, tenant_external_id, None, 100)
+            .await?,
+        price_sync,
+    })
 }
 
 async fn discover_models(
@@ -779,6 +873,156 @@ fn validate_model_id(id: &str) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn manual_and_background_catalog_sync_share_full_catalog_pricing_and_failure_isolation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("catalog-pricing.db").display()
+        ));
+        config.pricing_models_dev_url = format!("{}/models-dev", server.uri());
+        config.pricing_litellm_url = format!("{}/litellm", server.uri());
+        config.pricing_openrouter_url = format!("{}/openrouter", server.uri());
+        let state = AppState::initialize(config).await.unwrap();
+        let tenant = "catalog-pricing";
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "catalog-pricing".into(),
+                    driver: "http-json".into(),
+                    config: json!({"base_url": server.uri()}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_model_price("manual", "USD", Decimal::ONE, Decimal::TWO)
+            .await
+            .unwrap();
+
+        // Cross both the 100-item response page and the 500-item public pricing
+        // limit. Only two models need prices, keeping the regression inexpensive.
+        let mut models = (0..500)
+            .map(|index| json!({"id": format!("unpriced-{index:03}")}))
+            .collect::<Vec<_>>();
+        models.extend([json!({"id": "manual"}), json!({"id": "zz-priced-tail"})]);
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": models})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/models-dev"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"provider": {"models": {
+                    "manual": {"cost": {"input": 9, "output": 9}},
+                    "zz-priced-tail": {"cost": {"input": 2, "output": 4}}
+                }}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = sync_account_models(&state, account.id, tenant, None)
+            .await
+            .unwrap();
+        assert_eq!(result.catalog.status, "ready");
+        assert_eq!(result.catalog.models.len(), 100);
+        assert_eq!(result.price_sync.status, "partial");
+        assert_eq!(result.price_sync.imported, 1);
+        assert_eq!(result.price_sync.preserved, 1);
+        assert_eq!(result.price_sync.unmatched, 500);
+        assert_eq!(result.price_sync.failed_sources, ["litellm", "openrouter"]);
+        assert_eq!(
+            state
+                .db
+                .model_price_view("manual", "USD")
+                .await
+                .unwrap()
+                .input_per_million,
+            "1"
+        );
+        assert_eq!(
+            state
+                .db
+                .model_price_view("zz-priced-tail", "USD")
+                .await
+                .unwrap()
+                .input_per_million,
+            "2"
+        );
+        server.verify().await;
+        server.reset().await;
+
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+                {"id": "zz-priced-tail"}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/models-dev"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"provider": {"models": {
+                    "zz-priced-tail": {"cost": {"input": 3, "output": 6}}
+                }}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        sync_upstream_models_after_refresh(&state, account.id, None).await;
+        assert_eq!(
+            state
+                .db
+                .model_price_view("zz-priced-tail", "USD")
+                .await
+                .unwrap()
+                .input_per_million,
+            "3",
+            "background refresh must perform the same price synchronization"
+        );
+        let catalog = state
+            .db
+            .upstream_model_catalog(account.id, tenant, None, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.disabled_models.len(), 501);
+        let disabled_before = serde_json::to_value(&catalog.disabled_models).unwrap();
+        server.verify().await;
+        server.reset().await;
+
+        // A failed catalog fetch must not trigger price traffic or turn the
+        // last successful directory into an empty/disabled snapshot.
+        let failed = sync_account_models(&state, account.id, tenant, None)
+            .await
+            .unwrap();
+        assert_eq!(failed.catalog.status, "stale");
+        assert_eq!(failed.price_sync.status, "skipped");
+        let catalog = state
+            .db
+            .upstream_model_catalog(account.id, tenant, None, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&catalog.disabled_models).unwrap(),
+            disabled_before
+        );
+        assert_eq!(catalog.models[0].id, "zz-priced-tail");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v1/models");
+    }
 
     #[test]
     fn directory_budget_uses_only_explicit_account_timeouts() {
