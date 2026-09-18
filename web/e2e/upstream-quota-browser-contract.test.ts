@@ -22,8 +22,10 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
   const base = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   try {
+    const fixedNow = new Date('2026-09-15T00:00:00Z');
     const page = await browser.newPage();
-    await page.clock.install({ time: new Date('2026-09-15T00:00:00Z') });
+    await page.clock.install({ time: fixedNow });
+    await page.clock.pauseAt(fixedNow);
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.route('**/*', (route) => {
