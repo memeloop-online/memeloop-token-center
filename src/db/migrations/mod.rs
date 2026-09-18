@@ -563,6 +563,13 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable archive capacity reservations",
         sql: include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
     },
+    Migration {
+        version: 107,
+        name: "audited historical request cost projection corrections",
+        sql: include_str!(
+            "../../../migrations/common/0107_request_cost_projection_corrections.sql"
+        ),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1111,6 +1118,13 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 106,
         name: "durable archive capacity reservations",
         sql: include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
+    },
+    Migration {
+        version: 107,
+        name: "audited historical request cost projection corrections",
+        sql: include_str!(
+            "../../../migrations/common/0107_request_cost_projection_corrections.sql"
+        ),
     },
 ];
 

@@ -59,6 +59,15 @@ enum Command {
         /// Persist fact corrections and rebuild affected aggregate dimensions.
         #[arg(long)]
         apply: bool,
+        /// Inclusive request creation timestamp in milliseconds.
+        #[arg(long)]
+        from_created_at: i64,
+        /// Exclusive request creation timestamp in milliseconds.
+        #[arg(long)]
+        to_created_at: i64,
+        /// Audited request id whose legacy NULL usage basis is known to be a reservation ceiling.
+        #[arg(long = "confirmed-legacy-null-request-id")]
+        confirmed_legacy_null_request_ids: Vec<String>,
         /// Maximum eligible facts inspected in this transaction.
         #[arg(
             long,
@@ -153,6 +162,9 @@ async fn run() -> Result<(), &'static str> {
         Command::BackfillFailedRequestCosts {
             apply,
             batch_size,
+            from_created_at,
+            to_created_at,
+            confirmed_legacy_null_request_ids,
             after_created_at,
             after_request_id,
         } => {
@@ -169,6 +181,9 @@ async fn run() -> Result<(), &'static str> {
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply,
                     batch_size,
+                    from_created_at,
+                    to_created_at,
+                    confirmed_legacy_null_request_ids,
                     after,
                 })
                 .await
@@ -254,12 +269,25 @@ mod lifecycle_tests {
 
     #[test]
     fn failed_request_cost_backfill_is_explicit_bounded_and_dry_run_by_default() {
-        let parsed =
+        assert!(
             Cli::try_parse_from(["memeloop-token-center", "backfill-failed-request-costs"])
-                .unwrap();
+                .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "memeloop-token-center",
+            "backfill-failed-request-costs",
+            "--from-created-at",
+            "1",
+            "--to-created-at",
+            "2",
+        ])
+        .unwrap();
         let Command::BackfillFailedRequestCosts {
             apply,
             batch_size,
+            from_created_at,
+            to_created_at,
+            confirmed_legacy_null_request_ids,
             after_created_at,
             after_request_id,
         } = parsed.command
@@ -268,6 +296,9 @@ mod lifecycle_tests {
         };
         assert!(!apply);
         assert_eq!(batch_size, 100);
+        assert_eq!(from_created_at, 1);
+        assert_eq!(to_created_at, 2);
+        assert!(confirmed_legacy_null_request_ids.is_empty());
         assert_eq!(after_created_at, None);
         assert_eq!(after_request_id, None);
 
@@ -275,6 +306,10 @@ mod lifecycle_tests {
             Cli::try_parse_from([
                 "memeloop-token-center",
                 "backfill-failed-request-costs",
+                "--from-created-at",
+                "1",
+                "--to-created-at",
+                "2",
                 "--after-created-at",
                 "1",
             ])
@@ -284,6 +319,10 @@ mod lifecycle_tests {
             Cli::try_parse_from([
                 "memeloop-token-center",
                 "backfill-failed-request-costs",
+                "--from-created-at",
+                "1",
+                "--to-created-at",
+                "2",
                 "--batch-size",
                 "1001",
             ])

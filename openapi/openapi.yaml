@@ -2015,7 +2015,7 @@ paths:
           schema: { type: string, maxLength: 500 }
         - name: limit
           in: query
-          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+          schema: { type: integer, minimum: 1, maximum: 10000, default: 100 }
       responses:
         '200':
           description: Current account-scoped catalog snapshot.

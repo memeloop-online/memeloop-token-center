@@ -6,16 +6,18 @@ export const ARCHIVE_RESERVATION_TTL_MS = 10 * 60 * 1000;
 const OBSERVATION_MAX_AGE_MS = 30_000;
 const roles = ['worker', 'gateway', 'control', 'all'] as const;
 type Role = typeof roles[number];
-type Version = { schemaVersion: number; replicas: number };
+// Capabilities are bound to the actual immutable image: a parallel release may
+// contain migration 107 without implementing the reservation protocol from 106.
+type Version = { schemaVersion: number; archiveReservations: boolean; replicas: number };
 // Live replicas include terminating Pods; readyReplicas counts only Pods whose
-// actual image supports schemaVersion, not old replicas during a rolling update.
+// actual image has the observed capability, not old replicas during a rollout.
 type LiveVersion = Version & { readyReplicas: number };
 export type ArchiveRolloutObservation = {
   observedAtMillis: number;
   roles: Record<Role, LiveVersion>;
   /** Live database COUNT(*), not a cached operator quota/metrics response. */
   reservationCount: number | null;
-  /** Last v106+ producer stopped; supplied by the deployment controller. */
+  /** Last reservation-capable producer stopped; supplied by the controller. */
   lastReservationProducerStoppedAtMillis: number | null;
 };
 export type ArchiveRolloutTarget = Partial<Record<Role, Version>>;
@@ -32,11 +34,13 @@ function integer(value: unknown, label: string): asserts value is number {
 function validateVersion(value: Version, label: string): void {
   if (!value || typeof value !== 'object') throw new Error(`${label} is required`);
   integer(value.schemaVersion, `${label}.schemaVersion`);
+  if (typeof value.archiveReservations !== 'boolean') throw new Error(`${label}.archiveReservations requires image capability evidence`);
+  if (value.archiveReservations && value.schemaVersion < ARCHIVE_RESERVATION_SCHEMA) throw new Error(`${label} lacks the reservation schema`);
   integer(value.replicas, `${label}.replicas`);
 }
 
 function reclaims(version: Version): boolean {
-  return version.schemaVersion >= ARCHIVE_RESERVATION_SCHEMA && version.replicas >= 1;
+  return version.archiveReservations && version.replicas >= 1;
 }
 
 /**

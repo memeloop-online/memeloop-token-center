@@ -8,11 +8,11 @@ import {
 import { read } from './contract-helpers.ts';
 
 const now = 2_000_000;
-const version = (schemaVersion: number) => ({ schemaVersion, replicas: 1, readyReplicas: 1 });
+const version = (schemaVersion: number, archiveReservations = schemaVersion === 106) => ({ schemaVersion, archiveReservations, replicas: 1, readyReplicas: 1 });
 function snapshot(schema = 105): ArchiveRolloutObservation {
   return {
     observedAtMillis: now,
-    roles: { worker: version(schema), gateway: version(schema), control: version(schema), all: { schemaVersion: schema, replicas: 0, readyReplicas: 0 } },
+    roles: { worker: version(schema), gateway: version(schema), control: version(schema), all: { ...version(schema), replicas: 0, readyReplicas: 0 } },
     reservationCount: 0,
     lastReservationProducerStoppedAtMillis: null,
   };
@@ -74,4 +74,13 @@ test('combined role cannot bypass the retained-reclaimer boundary', () => {
   assert.throws(() => validateArchiveBudgetRollout('rollback', live, { all: version(105) }, now), /split roles/);
   assert.throws(() => validateArchiveBudgetRollout('upgrade', snapshot(), { all: version(106) }, now), /split roles/);
   assert.throws(() => validateArchiveBudgetRollout('retire-reclaimer', live, { worker: version(105) }, now), /split roles/);
+});
+
+test('a larger schema from a parallel release does not prove reclaimer support', () => {
+  const live = snapshot(107);
+  assert.throws(() => validateArchiveBudgetRollout('upgrade', live, { gateway: version(107, true) }, now), /reclaimer/);
+  live.roles.worker = version(107, true);
+  assert.deepEqual(validateArchiveBudgetRollout('upgrade', live, { gateway: version(107, true) }, now).stages, [
+    { roles: ['gateway'], waitForReady: true },
+  ]);
 });

@@ -133,8 +133,9 @@ pub(crate) use credentials::{
 };
 pub use credentials::{CreateKeyInput, CreateServiceTokenInput, ProvisionedCloudCredential};
 pub use failed_request_cost_backfill::{
-    FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
-    FailedRequestCostBackfillInput, FailedRequestCostBackfillReport,
+    FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FAILED_REQUEST_COST_CORRECTION_VERSION,
+    FailedRequestCostBackfillCursor, FailedRequestCostBackfillInput,
+    FailedRequestCostBackfillReport, FailedRequestCostCorrectionPreview,
 };
 pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
