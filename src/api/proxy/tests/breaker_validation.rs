@@ -218,7 +218,22 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
     let _ = to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 1 && rows.iter().all(|row| row.status_code.is_some()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 
     let preferred_account = fixture.accounts[0];
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
