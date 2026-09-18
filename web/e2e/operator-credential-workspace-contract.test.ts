@@ -405,7 +405,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       const existingRow = client.getByRole('group', { name: english ? 'Research workspace' : '研发工作区', exact: true });
       await existingRow.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
       await client.getByRole('menuitem', { name: english ? 'Rotate credential' : '轮换凭据', exact: true }).click();
-      await client.getByRole('dialog').getByRole('button', { name: english ? 'Confirm and continue' : '确认并继续', exact: true }).click();
+      await client.getByRole('dialog').getByRole('button', { name: english ? 'Confirm and continue' : '确认继续', exact: true }).click();
       await client.getByText('mtc_fixture_rotated', { exact: true }).waitFor();
       assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys/key-form/rotate').length), 1, 'rotation is one business write');
       assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path === '/internal/v1/keys/key-form/credential').length), 0, 'rotation persists the original in its own transaction without a second credential write');
