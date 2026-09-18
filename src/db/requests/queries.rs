@@ -1168,7 +1168,7 @@ fn push_archive_keyset_cursor(query: &mut PortableRequestListQuery, filter: &Req
 
 fn push_operator_identity_filters(
     query: &mut PortableRequestListQuery,
-    source_alias: &str,
+    _source_alias: &str,
     filter: &RequestListFilter,
 ) {
     if filter.key_alias.is_some() {

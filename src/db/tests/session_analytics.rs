@@ -131,7 +131,11 @@ async fn sqlite_operator_sessions_keep_a_stable_retired_credential_identity() {
             "retired-session-tenant",
             key.key_id,
             &cluster_id.to_string(),
-            ConversationDetailFilter::default(),
+            ConversationDetailFilter {
+                limit: 100,
+                before_created_at: None,
+                before_request_id: None,
+            },
         )
         .await
         .expect("read retained operator session detail after credential purge");
