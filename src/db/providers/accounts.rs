@@ -209,7 +209,7 @@ impl Database {
         );
         // `selected_accounts` is chosen solely from these two audited static
         // fragments above; every caller-controlled value remains a bind.
-        let rows = sqlx::query(&*statement)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(tenant_external_id.unwrap_or_default())
             .bind(account_ids)
             .fetch_all(&self.pool)

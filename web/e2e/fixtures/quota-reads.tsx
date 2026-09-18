@@ -20,6 +20,9 @@ function snapshot(id: string, tenant: string): UpstreamQuotaSnapshot {
     reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
   };
 }
+function unobservedFailure(id: string, tenant: string): UpstreamQuotaSnapshot {
+  return { ...snapshot(id, tenant), status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', windows: [], reset_credits: [], error_code: 'quota_timeout' };
+}
 window.fetch = async (input, init) => {
   const url = new URL(String(input), location.origin);
   const method = init?.method ?? 'GET';
@@ -28,7 +31,7 @@ window.fetch = async (input, init) => {
     if (body.fresh !== true || body.trigger !== 'bulk') { window.quotaUnexpectedWrites++; throw new Error('Refresh all must request a fresh bulk read'); }
     window.quotaBatchBodies.push(body); window.quotaReadCalls.push('batch'); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
     const status = await new Promise<number>(resolve => pending.push(resolve)); window.quotaActive--;
-    const response = status === 200 ? { contract_version: 'upstream_quota_batch_v1', results: body.account_ids.map(id => id === 'account-2' ? { status: 'error', upstream_account_id: id, error: { code: 'quota_account_unavailable' } } : { status: 'success', upstream_account_id: id, snapshot: snapshot(id, 'default') }) } : { error: { code: 'test_unavailable', message: 'fixture failure' } };
+    const response = status === 200 ? { contract_version: 'upstream_quota_batch_v1', results: body.account_ids.map(id => id === 'account-2' ? { status: 'error', upstream_account_id: id, error: { code: 'quota_account_unavailable' } } : { status: 'success', upstream_account_id: id, snapshot: id === 'account-3' && window.quotaBatchBodies.length > 1 ? unobservedFailure(id, 'default') : snapshot(id, 'default') }) } : { error: { code: 'test_unavailable', message: 'fixture failure' } };
     return new Response(JSON.stringify(response), { status });
   }
   if (method !== 'GET' || !/^\/internal\/v1\/upstreams\/account-\d\/quota$/.test(url.pathname) || url.searchParams.get('fresh') !== 'true' || !['manual', 'bulk'].includes(url.searchParams.get('trigger') ?? '')) { window.quotaUnexpectedWrites++; throw new Error('Only explicit fresh mock quota GETs and batch POSTs are allowed'); }

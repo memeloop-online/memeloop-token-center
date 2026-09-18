@@ -70,8 +70,8 @@ export const UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS = 85_000;
 
 export type UpstreamQuotaReadTrigger = 'manual' | 'bulk';
 
-/** Covers 100 accounts in server waves of three, including each read's queue slack. */
-export const UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS = Math.ceil(100 / 3) * UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS;
+/** A list refresh remains responsive even if several suppliers/proxies are unavailable. */
+export const UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS = 5 * 60_000;
 
 /** The next expiration belongs to reset opportunities, not a usage window. */
 export function quotaResetCreditExpiry(snapshot: UpstreamQuotaSnapshot, now = Date.now()): { state: 'known' | 'unknown' | 'none'; at?: number } {

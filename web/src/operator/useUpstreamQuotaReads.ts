@@ -5,6 +5,17 @@ import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS
 export interface QuotaReadAccount { id: string; credential_generation: number; tenant_external_id?: string | null; status: string }
 export interface QuotaReadState { generation: number; snapshot?: UpstreamQuotaSnapshot; busy: boolean; queued?: boolean; refreshFailed: boolean; error?: 'quota.readFailed' | 'quota.errorPermission' }
 
+function refreshFailed(snapshot: UpstreamQuotaSnapshot) {
+  return snapshot.status === 'error' || Boolean(snapshot.error_code);
+}
+
+/** An unobserved error has no newer quota evidence than the retained row. */
+function visibleSnapshot(previous: QuotaReadState | undefined, generation: number, snapshot: UpstreamQuotaSnapshot) {
+  return refreshFailed(snapshot) && snapshot.observed_at === null && previous?.generation === generation && previous.snapshot
+    ? previous.snapshot
+    : snapshot;
+}
+
 /** One shared read owner for list, detail and batch actions; never calls reset or OAuth. */
 export function useUpstreamQuotaReads(token: string, tenant: string, accounts: QuotaReadAccount[]) {
   const scope = `${token}\0${tenant}`;
@@ -39,7 +50,18 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
         if (!ownsIdentity() || controller.signal.aborted) return;
         if (!isEligible()) { clearPending(); return; }
         if (snapshot.contract_version !== 'upstream_quota_v1' || snapshot.upstream_account_id !== account.id || snapshot.tenant_external_id !== accountTenant) throw new Error('Quota scope mismatch');
-        setEntries(previous => ownsIdentity() && isEligible() ? { ...previous, [account.id]: { generation, snapshot, busy: false, refreshFailed: snapshot.status === 'error' || Boolean(snapshot.error_code) } } : previous);
+        setEntries(previous => {
+          if (!ownsIdentity() || !isEligible()) return previous;
+          return {
+            ...previous,
+            [account.id]: {
+              generation,
+              snapshot: visibleSnapshot(previous[account.id], generation, snapshot),
+              busy: false,
+              refreshFailed: refreshFailed(snapshot),
+            },
+          };
+        });
       } catch (reason) {
         if (!ownsIdentity() || controller.signal.aborted) return;
         if (!isEligible()) { clearPending(); return; }
@@ -88,7 +110,13 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
           }
           const result = results.get(account.id);
           if (result?.status === 'success' && result.snapshot.contract_version === 'upstream_quota_v1' && result.snapshot.upstream_account_id === account.id && result.snapshot.tenant_external_id === accountTenant) {
-            settled[account.id] = { generation: account.credential_generation, snapshot: result.snapshot, busy: false, queued: false, refreshFailed: result.snapshot.status === 'error' || Boolean(result.snapshot.error_code) };
+            settled[account.id] = {
+              generation: account.credential_generation,
+              snapshot: visibleSnapshot(previous[account.id], account.credential_generation, result.snapshot),
+              busy: false,
+              queued: false,
+              refreshFailed: refreshFailed(result.snapshot),
+            };
           } else {
             settled[account.id] = { generation: account.credential_generation, snapshot: previous[account.id]?.generation === account.credential_generation ? previous[account.id].snapshot : undefined, busy: false, queued: false, refreshFailed: true, error: 'quota.readFailed' };
           }
