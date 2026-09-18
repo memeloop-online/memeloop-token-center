@@ -70,6 +70,15 @@ test('Docker-native service release inputs bind binary, runtime libraries, featu
     copyFileSync(join(exported, 'libstdc++.so.6'), join(artifact, 'libstdc++.so.6'));
     writeFileSync(join(artifact, 'install-plugin-oci'), 'verified installer');
     writeFileSync(join(artifact, 'cosign'), 'verified signature checker');
+    writeFileSync(join(artifact, 'LICENSE'), 'Apache License 2.0');
+    writeFileSync(join(artifact, 'THIRD_PARTY_NOTICES.md'), 'Third-party notices');
+    mkdirSync(join(artifact, 'web'));
+    writeFileSync(join(artifact, 'web/index.html'), '<!doctype html>');
+    mkdirSync(join(artifact, 'third-party-licenses'));
+    writeFileSync(join(artifact, 'third-party-licenses/cosign-LICENSE'), 'Apache License 2.0');
+    writeFileSync(join(artifact, 'third-party-licenses/rust_decimal-LICENSE'), 'MIT License');
+    chmodSync(join(artifact, 'install-plugin-oci'), 0o555);
+    chmodSync(join(artifact, 'cosign'), 0o555);
     run(process.execPath, ['scripts/ci/create-release-service-input-manifest.ts', artifact, revision]);
     // GitHub artifact download normalizes file modes. The final Dockerfile
     // restores the executable bit while digest verification remains valid.

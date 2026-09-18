@@ -18,8 +18,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build-release-input:
+    if: github.ref == 'refs/heads/master' && inputs.accept_archive_risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Resolve release version metadata from Cargo
+        id: release
+        run: node scripts/ci/resolve-release-metadata.ts "$GITHUB_REF" "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build, runtime-smoke, and export the one manual-release input
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          target: release-input-export
+          platforms: linux/amd64
+          outputs: type=local,dest=${{ runner.temp }}/release-service-input
+          build-args: |
+            MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
+            MTC_BUILD_TIMESTAMP_INPUT=manual-archive-waiver
+            MTC_BUILD_TARGET_INPUT=linux/amd64
+          cache-from: type=gha,scope=service-release-input
+          cache-to: type=gha,mode=max,scope=service-release-input
+      - name: Seal the manual release artifact
+        run: |
+          node scripts/ci/create-memory-binary-manifest.ts \
+            "$RUNNER_TEMP/release-service-input/memeloop-token-center" \
+            "$GITHUB_SHA" \
+            "$RUNNER_TEMP/release-artifact"
+          for file in libgcc_s.so.1 libstdc++.so.6 install-plugin-oci cosign LICENSE THIRD_PARTY_NOTICES.md; do
+            cp "$RUNNER_TEMP/release-service-input/$file" "$RUNNER_TEMP/release-artifact/$file"
+          done
+          cp -R "$RUNNER_TEMP/release-service-input/web" "$RUNNER_TEMP/release-artifact/web"
+          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" "$RUNNER_TEMP/release-artifact/third-party-licenses"
+          chmod 0555 "$RUNNER_TEMP/release-artifact/install-plugin-oci" "$RUNNER_TEMP/release-artifact/cosign"
+          node scripts/ci/create-release-service-input-manifest.ts "$RUNNER_TEMP/release-artifact" "$GITHUB_SHA"
+          chmod 0644 "$RUNNER_TEMP/release-artifact/memeloop-token-center"
+      - name: Upload the one exact-revision manual release artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: manual-release-input-${{ github.sha }}
+          path: ${{ runner.temp }}/release-artifact/
+          if-no-files-found: error
+          retention-days: 1
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
   publish-ghcr:
     if: github.ref == 'refs/heads/master' && inputs.accept_archive_risk
+    needs: [build-release-input]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -30,10 +86,10 @@ jobs:
       matrix:
         include:
           - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center
-            dockerfile: Dockerfile
+            dockerfile: Dockerfile.release
             cache_scope: service
           - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer
-            dockerfile: Dockerfile.plugin-installer
+            dockerfile: Dockerfile.plugin-installer.release
             cache_scope: plugin-installer
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -42,6 +98,13 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
+      - name: Download the one same-run manual release input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: manual-release-input-${{ github.sha }}
+          path: ${{ runner.temp }}/release-service-input
+      - name: Verify the exact manual release input
+        run: node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/release-service-input" "$GITHUB_SHA"
       - name: Validate shared immutable release inputs
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
@@ -75,10 +138,10 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          build-args: |
-            MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
-            MTC_BUILD_TIMESTAMP_INPUT=manual-archive-waiver
-            MTC_BUILD_TARGET_INPUT=linux/amd64
+            org.opencontainers.image.version=${{ needs.build-release-input.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          build-contexts: |
+            release-input=${{ runner.temp }}/release-service-input
           cache-from: type=gha,scope=${{ matrix.cache_scope }}
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max

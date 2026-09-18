@@ -27,6 +27,12 @@ const tag = `sha-${revision}`;
 const taggedReference = `${image}:${tag}`;
 const resolved = run('crane', ['digest', taggedReference], SCOPE, 'immutable tag resolution').trim();
 if (resolved !== digest) fail(SCOPE, 'immutable tag does not resolve to the build digest');
+const versionTag = process.env.VERSION_TAG ?? '';
+if (versionTag !== '') {
+  if (!/^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(versionTag)) fail(SCOPE, 'version tag is invalid');
+  const versionResolved = run('crane', ['digest', `${image}:${versionTag}`], SCOPE, 'version tag resolution').trim();
+  if (versionResolved !== digest) fail(SCOPE, 'version tag does not resolve to the build digest');
+}
 
 const indexPath = join(runner, `${cacheScope}-index.json`);
 const attestations = join(runner, `${cacheScope}-attestations`);

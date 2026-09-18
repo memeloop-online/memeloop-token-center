@@ -69,6 +69,10 @@ RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 COPY --from=cosign-builder /tmp/cosign /release-input/cosign
+COPY --from=cosign-builder /build/cosign/LICENSE /release-input/third-party-licenses/cosign-LICENSE
+COPY --from=web-builder /build/web/dist /release-input/web
+COPY LICENSE THIRD_PARTY_NOTICES.md /release-input/
+COPY vendor/rust_decimal/LICENSE /release-input/third-party-licenses/rust_decimal-LICENSE
 
 FROM ${RUNTIME_IMAGE} AS release-input-smoke
 # SQLite copies every bound archive ciphertext through libc. Keep those
@@ -84,6 +88,9 @@ COPY --from=release-input /release-input/libstdc++.so.6 /usr/local/lib/libstdc++
 COPY --from=release-input /release-input/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=release-input /release-input/install-plugin-oci /usr/local/bin/install-plugin-oci
 COPY --from=release-input /release-input/cosign /usr/local/bin/cosign
+COPY --from=release-input /release-input/LICENSE /usr/share/licenses/memeloop-token-center/LICENSE
+COPY --from=release-input /release-input/THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
+COPY --from=release-input /release-input/third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
 # A release-input artifact is only valid when the Docker-native binary starts
 # against the exact distroless runtime that will publish it.
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
@@ -94,6 +101,7 @@ FROM scratch AS release-input-export
 COPY --from=release-input-smoke /release-input /
 
 FROM ${RUNTIME_IMAGE}
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 ENV LD_LIBRARY_PATH=/usr/local/lib \
     GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
 COPY --from=release-input /release-input/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
@@ -101,7 +109,10 @@ COPY --from=release-input /release-input/libstdc++.so.6 /usr/local/lib/libstdc++
 COPY --from=release-input /release-input/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=release-input /release-input/install-plugin-oci /usr/local/bin/install-plugin-oci
 COPY --from=release-input /release-input/cosign /usr/local/bin/cosign
-COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
+COPY --from=release-input /release-input/web /usr/share/memeloop-token-center/web
+COPY --from=release-input /release-input/LICENSE /usr/share/licenses/memeloop-token-center/LICENSE
+COPY --from=release-input /release-input/THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
+COPY --from=release-input /release-input/third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
 USER 10001:10001
 EXPOSE 8080

@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
+
+# The installer, its patched Cosign companion, runtime library, and license
+# material all come from the verified same-run release artifact. This image is
+# assembly-only: it never invokes Cargo, Go, or npm.
+FROM ${RUNTIME_IMAGE}
+LABEL org.opencontainers.image.title="MemeLoop Token Center OCI plugin installer" \
+      org.opencontainers.image.description="Digest-pinned OCI plugin installer with Cosign v3.1.3 security backports" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      io.memeloop.cosign.version="v3.1.3-mtc.3" \
+      io.memeloop.cosign.upstream-commit="11926fa5bbbbde47e88fc006b625a17769b743b2"
+ENV LD_LIBRARY_PATH=/usr/local/lib
+COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign
+COPY --chmod=0555 --from=release-input /install-plugin-oci /usr/local/bin/install-plugin-oci
+COPY --from=release-input /libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
+COPY --from=release-input /LICENSE /usr/share/licenses/memeloop-token-center/LICENSE
+COPY --from=release-input /THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
+COPY --from=release-input /third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
+RUN ["/usr/local/bin/install-plugin-oci", "--help"]
+RUN ["/usr/local/bin/cosign", "version", "--json"]
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]

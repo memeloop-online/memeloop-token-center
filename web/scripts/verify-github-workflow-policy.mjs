@@ -127,7 +127,7 @@ function verifyReleaseVerifier(job) {
     fail('verify-ghcr-release must depend only on publish-ghcr');
   }
   const gate = typeof job.if === 'string' ? job.if.replace(/\s+/gu, ' ').trim() : '';
-  const expectedGate = "always() && github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.publish-ghcr.result == 'success'";
+  const expectedGate = "always() && github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.publish-ghcr.result == 'success'";
   if (gate !== expectedGate) {
     fail('verify-ghcr-release must run after skipped ancestors only when publish-ghcr succeeded');
   }
@@ -152,9 +152,14 @@ function verifyWorkflow(workflow) {
     { contents: 'read', packages: 'read' },
     'verify-ghcr-release',
   );
+  assertExactPermissions(
+    workflow.jobs['publish-github-release']?.permissions,
+    { contents: 'write' },
+    'publish-github-release',
+  );
 
   for (const [name, job] of Object.entries(workflow.jobs)) {
-    if (name === 'publish-ghcr' || name === 'verify-ghcr-release') continue;
+    if (name === 'publish-ghcr' || name === 'verify-ghcr-release' || name === 'publish-github-release') continue;
     if (!isRecord(job)) {
       fail(`${name} job must be a mapping`);
     }

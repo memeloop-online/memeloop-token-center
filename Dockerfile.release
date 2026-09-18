@@ -1,19 +1,8 @@
 # syntax=docker/dockerfile:1.7
-ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
-# The service executable and its C++ runtime libraries arrive through the
-# verified same-run release-input context. The web bundle remains source-built
-# here so the published image retains its established frontend build contract.
-FROM ${NODE_IMAGE} AS web-builder
-ARG NPM_REGISTRY=https://registry.npmjs.org
-WORKDIR /build/web
-COPY web/package.json web/package-lock.json ./
-RUN npm config set registry "${NPM_REGISTRY}" && npm ci
-COPY web ./
-RUN npm run build
-
 FROM ${RUNTIME_IMAGE}
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 ENV LD_LIBRARY_PATH=/usr/local/lib \
     GLIBC_TUNABLES=glibc.malloc.mmap_threshold=65536
 COPY --chmod=0555 --from=release-input /memeloop-token-center /usr/local/bin/memeloop-token-center
@@ -21,7 +10,10 @@ COPY --chmod=0555 --from=release-input /install-plugin-oci /usr/local/bin/instal
 COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign
 COPY --from=release-input /libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
 COPY --from=release-input /libstdc++.so.6 /usr/local/lib/libstdc++.so.6
-COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
+COPY --from=release-input /web /usr/share/memeloop-token-center/web
+COPY --from=release-input /LICENSE /usr/share/licenses/memeloop-token-center/LICENSE
+COPY --from=release-input /THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
+COPY --from=release-input /third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
 RUN ["/usr/local/bin/install-plugin-oci", "--help"]
 RUN ["/usr/local/bin/cosign", "version", "--json"]

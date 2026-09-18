@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -25,6 +26,9 @@ jobs:
       memory: ${{ steps.scope.outputs.memory }}
       memory_acceptance: ${{ steps.scope.outputs.memory_acceptance }}
       plugin_installer: ${{ steps.scope.outputs.plugin_installer }}
+      version: ${{ steps.release.outputs.version }}
+      version_tag: ${{ steps.release.outputs.version_tag }}
+      is_version_tag: ${{ steps.release.outputs.is_version_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -42,6 +46,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           node scripts/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" --verified-merge "$GITHUB_OUTPUT"
+      - name: Resolve and validate release version metadata
+        id: release
+        run: node scripts/ci/resolve-release-metadata.ts "$GITHUB_REF" "$GITHUB_OUTPUT"
 
   repository-security:
     runs-on: ubuntu-latest
@@ -508,6 +515,14 @@ jobs:
             "$RUNNER_TEMP/memory-binary/install-plugin-oci"
           install -m 0555 "$RUNNER_TEMP/release-service-input/cosign" \
             "$RUNNER_TEMP/memory-binary/cosign"
+          install -m 0644 "$RUNNER_TEMP/release-service-input/LICENSE" \
+            "$RUNNER_TEMP/memory-binary/LICENSE"
+          install -m 0644 "$RUNNER_TEMP/release-service-input/THIRD_PARTY_NOTICES.md" \
+            "$RUNNER_TEMP/memory-binary/THIRD_PARTY_NOTICES.md"
+          cp -R "$RUNNER_TEMP/release-service-input/web" \
+            "$RUNNER_TEMP/memory-binary/web"
+          cp -R "$RUNNER_TEMP/release-service-input/third-party-licenses" \
+            "$RUNNER_TEMP/memory-binary/third-party-licenses"
       - name: Seal the complete Docker-native service release input
         run: >-
           node scripts/ci/create-release-service-input-manifest.ts
@@ -541,6 +556,14 @@ jobs:
     needs: [changes, memory-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile.release
+            cache_scope: service
+          - dockerfile: Dockerfile.plugin-installer.release
+            cache_scope: plugin-installer
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -563,16 +586,17 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: Dockerfile.release
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           outputs: type=cacheonly
           build-contexts: |
             release-input=${{ runner.temp }}/release-service-input
-          cache-from: type=gha,scope=service
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
 
   publish-ghcr:
     if: >-
-      always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+      always() && github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true') &&
       needs.changes.result == 'success' && needs.repository-security.result == 'success' &&
       needs.dependency-security.result == 'success' && needs.api-contract.result == 'success' &&
       needs.packaging.result == 'success' && needs.memory-binary.result == 'success' &&
@@ -604,7 +628,7 @@ jobs:
             dockerfile: Dockerfile.release
             cache_scope: service
           - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer
-            dockerfile: Dockerfile.plugin-installer
+            dockerfile: Dockerfile.plugin-installer.release
             cache_scope: plugin-installer
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -627,6 +651,18 @@ jobs:
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: node scripts/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
+      - name: Resolve immutable image tags
+        id: image-tags
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION_TAG: ${{ needs.changes.outputs.version_tag }}
+        run: |
+          {
+            echo 'tags<<TAGS'
+            echo "$IMAGE:sha-$GITHUB_SHA"
+            if [ -n "$VERSION_TAG" ]; then echo "$IMAGE:$VERSION_TAG"; fi
+            echo TAGS
+          } >> "$GITHUB_OUTPUT"
       - name: Install checksum-pinned crane registry client
         run: |
           archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
@@ -652,14 +688,12 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           outputs: type=image,push=true,oci-mediatypes=true,oci-artifact=true
-          tags: ${{ matrix.image }}:sha-${{ github.sha }}
+          tags: ${{ steps.image-tags.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          build-args: |
-            MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
-            MTC_BUILD_TIMESTAMP_INPUT=${{ github.event.head_commit.timestamp }}
-            MTC_BUILD_TARGET_INPUT=linux/amd64
+            org.opencontainers.image.version=${{ needs.changes.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
           build-contexts: |
             release-input=${{ runner.temp }}/release-service-input
           cache-from: type=gha,scope=${{ matrix.cache_scope }}
@@ -692,6 +726,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
           CACHE_SCOPE: ${{ matrix.cache_scope }}
+          VERSION_TAG: ${{ needs.changes.outputs.version_tag }}
         run: node scripts/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
       - name: Upload immutable image digest manifest
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
@@ -707,7 +742,8 @@ jobs:
 
   verify-ghcr-release:
     if: >-
-      always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+      always() && github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
       needs.publish-ghcr.result == 'success'
     needs: [publish-ghcr]
     runs-on: ubuntu-latest
@@ -742,6 +778,73 @@ jobs:
           path: ${{ runner.temp }}/release-manifest.json
           if-no-files-found: error
           retention-days: 90
+
+  publish-github-release:
+    if: >-
+      always() && needs.changes.outputs.is_version_tag == 'true' &&
+      needs.verify-ghcr-release.result == 'success' && needs.memory-binary.result == 'success'
+    needs: [changes, memory-binary, verify-ghcr-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Download the exact same-run release input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: memory-binary-${{ github.sha }}
+          path: ${{ runner.temp }}/release-input
+      - name: Verify the exact same-run release input
+        run: node scripts/ci/verify-release-service-input.ts "$RUNNER_TEMP/release-input" "$GITHUB_SHA"
+      - name: Download verified image evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-digest-*-${{ github.sha }}
+          path: ${{ runner.temp }}/release-evidence
+          merge-multiple: true
+      - name: Download the verified GHCR release manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ghcr-release-${{ github.sha }}
+          path: ${{ runner.temp }}/ghcr-release
+      - name: Create binaries, complete runtime archives, checksums, SBOM, and provenance assets
+        run: >-
+          node scripts/ci/create-github-release-assets.ts
+          "$RUNNER_TEMP/release-input"
+          "$RUNNER_TEMP/release-evidence"
+          "$RUNNER_TEMP/ghcr-release/release-manifest.json"
+          "$RUNNER_TEMP/github-release-assets"
+          "$GITHUB_SHA"
+          "${{ needs.changes.outputs.version }}"
+      - name: Smoke-test both extracted complete runtime archives
+        env:
+          VERSION: ${{ needs.changes.outputs.version }}
+        run: |
+          mkdir "$RUNNER_TEMP/service-package" "$RUNNER_TEMP/installer-package"
+          tar -xzf "$RUNNER_TEMP/github-release-assets/memeloop-token-center-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/service-package"
+          tar -xzf "$RUNNER_TEMP/github-release-assets/install-plugin-oci-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/installer-package"
+          "$RUNNER_TEMP/service-package/memeloop-token-center-$VERSION-linux-amd64/bin/memeloop-token-center" --help
+          "$RUNNER_TEMP/installer-package/install-plugin-oci-$VERSION-linux-amd64/bin/install-plugin-oci" --help
+      - name: Create the immutable version-tagged GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_TAG: ${{ needs.changes.outputs.version_tag }}
+        run: |
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            echo "Release $VERSION_TAG already exists; refusing to overwrite immutable assets" >&2
+            exit 1
+          fi
+          mapfile -d '' assets < <(find "$RUNNER_TEMP/github-release-assets" -maxdepth 1 -type f ! -name RELEASE.md -print0 | sort -z)
+          gh release create "$VERSION_TAG" "${assets[@]}" \
+            --verify-tag \
+            --title "MemeLoop Token Center $VERSION_TAG" \
+            --notes-file "$RUNNER_TEMP/github-release-assets/RELEASE.md"
 
   packaging:
     needs: changes
@@ -789,9 +892,9 @@ jobs:
       - name: Validate fail-closed expensive CI scope detection
         run: node --test tests/ops/ci-scope-contract.test.ts
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: needs.changes.outputs.plugin_installer == 'true'
+        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
       - name: Build the cached hardened plugin installer contract image
-        if: needs.changes.outputs.plugin_installer == 'true'
+        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -802,12 +905,12 @@ jobs:
           cache-from: type=gha,scope=plugin-installer
           cache-to: type=gha,mode=max,scope=plugin-installer
       - name: Build and exercise the hardened plugin installer image
-        if: needs.changes.outputs.plugin_installer == 'true'
+        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
         env:
           MTC_PLUGIN_INSTALLER_IMAGE: mtc-plugin-installer-contract:${{ github.run_id }}
         run: node --test tests/ops/plugin-installer-image-contract.test.ts
       - name: Validate the unchanged plugin installer contract statically
-        if: needs.changes.outputs.plugin_installer != 'true'
+        if: needs.changes.outputs.plugin_installer != 'true' || github.event_name != 'pull_request'
         env:
           MTC_SKIP_DOCKER_BUILD: "1"
         run: node --test tests/ops/plugin-installer-image-contract.test.ts
