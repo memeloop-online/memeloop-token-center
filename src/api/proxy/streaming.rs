@@ -163,17 +163,6 @@ pub(super) struct StreamingResponse<'a> {
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::Context::for_request(input.request_id);
     let response_body_limit = streaming_response_body_limit();
-    let sse_streaming_memory = if input.is_sse {
-        Some(
-            input
-                .buffered_request
-                .memory
-                .try_reserve_sse_streaming(input.sse_framing_limits.framed_bytes)
-                .ok_or(AppError::Overloaded)?,
-        )
-    } else {
-        None
-    };
     let StreamingResponse {
         state,
         upstream,
@@ -216,7 +205,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         ..
     } = buffered_request;
     tokio::spawn(async move {
-        let _sse_streaming_memory = sse_streaming_memory;
+        let mut _sse_streaming_memory = None;
         let stream_owner = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "stream_owner",
@@ -442,6 +431,33 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        if is_sse
+                            && !flushing_terminal
+                            && !raw_chunk.is_empty()
+                            && _sse_streaming_memory.is_none()
+                        {
+                            let Some(memory) = request_memory
+                                .try_reserve_sse_streaming(sse_framing_limits.framed_bytes)
+                            else {
+                                transport_error = Some(transport_error_with_downstream_precedence(
+                                    downstream_closed_observed || body_sender.is_closed(),
+                                    "upstream_response_memory_capacity",
+                                ));
+                                drop(archive_sender.take());
+                                let _ = tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        responses_streaming_sanitizer.as_ref(),
+                                        "upstream response exceeded memory capacity",
+                                    )),
+                                )
+                                .await;
+                                break;
+                            };
+                            _sse_streaming_memory = Some(memory);
+                        }
                         let raw_chunk_len = raw_chunk.len();
                         if downstream_closed_observed && !flushing_terminal {
                             downstream_ready_bytes =
