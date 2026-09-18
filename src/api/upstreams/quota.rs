@@ -363,16 +363,20 @@ pub(in crate::api) async fn upstream_quota_batch(
         .collect::<HashMap<_, _>>();
     let fresh = body.fresh;
     let trigger = body.trigger.into();
-    let jobs = body.account_ids.into_iter().enumerate().map(|(index, account_id)| {
-        let state = state.clone();
-        let loaded = loaded.remove(&account_id);
-        async move {
-            (
-                index,
-                quota_batch_result(state, account_id, loaded, fresh, trigger).await,
-            )
-        }
-    });
+    let jobs = body
+        .account_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, account_id)| {
+            let state = state.clone();
+            let loaded = loaded.remove(&account_id);
+            async move {
+                (
+                    index,
+                    quota_batch_result(state, account_id, loaded, fresh, trigger).await,
+                )
+            }
+        });
     // Do not let the first slow supplier hold the queue head hostage. Results
     // still return in request order so callers can match them deterministically.
     let mut indexed_results = futures_util::stream::iter(jobs)
