@@ -207,7 +207,9 @@ impl Database {
         let statement = format!(
             "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND a.id IN ({selected_accounts}) ORDER BY a.id"
         );
-        let rows = sqlx::query(&statement)
+        // `selected_accounts` is chosen solely from these two audited static
+        // fragments above; every caller-controlled value remains a bind.
+        let rows = sqlx::query(&*statement)
             .bind(tenant_external_id.unwrap_or_default())
             .bind(account_ids)
             .fetch_all(&self.pool)
