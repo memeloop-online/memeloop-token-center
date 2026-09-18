@@ -4,6 +4,18 @@ use serde::Serialize;
 use crate::model::ModelPriceView;
 
 #[derive(Clone, Debug)]
+pub(crate) struct SyncedModelPriceInput {
+    pub model: String,
+    pub service_tier: String,
+    pub input_per_million: Decimal,
+    pub cached_input_per_million: Decimal,
+    pub cache_write_per_million: Decimal,
+    pub output_per_million: Decimal,
+    pub source: String,
+    pub cache_price_estimated: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct RemotePrice {
     pub(super) source: &'static str,
     pub(super) source_model_id: String,

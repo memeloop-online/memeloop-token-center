@@ -575,6 +575,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "gateway failure-domain connection health",
         sql: include_str!("../../../migrations/common/0108_gateway_failure_domain_health.sql"),
     },
+    Migration {
+        version: 109,
+        name: "explicit disabled upstream catalog models",
+        sql: include_str!("../../../migrations/common/0109_upstream_model_catalog_disabled.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1135,6 +1140,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 108,
         name: "gateway failure-domain connection health",
         sql: include_str!("../../../migrations/common/0108_gateway_failure_domain_health.sql"),
+    },
+    Migration {
+        version: 109,
+        name: "explicit disabled upstream catalog models",
+        sql: include_str!("../../../migrations/common/0109_upstream_model_catalog_disabled.sql"),
     },
 ];
 

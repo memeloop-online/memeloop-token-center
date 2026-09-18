@@ -1,8 +1,6 @@
 use super::super::*;
 use super::money::parse_decimal;
 
-static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct PriceRequest {
     input_per_million: String,
@@ -91,7 +89,7 @@ pub(in crate::api) async fn sync_model_prices(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "prices:write").await?;
     require_global_service(&service)?;
-    let _permit = MODEL_PRICE_SYNC_PERMITS
+    let _permit = crate::pricing::MODEL_PRICE_SYNC_PERMITS
         .try_acquire()
         .map_err(|_| AppError::LimitExceeded {
             reason: crate::error::LimitReason::ConcurrencyExhausted,

@@ -15,6 +15,18 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+test("catalog sync has a complete POST-only response with required pricing outcome", () => {
+  const document = cloneDocument();
+  const catalog = document.components.schemas.UpstreamModelCatalog;
+  const sync = document.components.schemas.UpstreamModelCatalogSyncResponse;
+  assert.equal(document.paths["/internal/v1/upstreams/{account_id}/models"].get.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamModelCatalog");
+  assert.equal(document.paths["/internal/v1/upstreams/{account_id}/models/sync"].post.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamModelCatalogSyncResponse");
+  assert.ok(sync.required.includes("price_sync"));
+  assert.ok(!("price_sync" in catalog.properties));
+  assert.equal(catalog.properties.models.maxItems, 10000);
+  assert.equal(catalog.properties.disabled_models.maxItems, 10000);
+});
+
 function sourceWith(controlExtra = "", gatewayExtra = "", commonExtra = ""): string {
   return `
 fn router_for_role(state: AppState, role: RuntimeRole) -> Router {

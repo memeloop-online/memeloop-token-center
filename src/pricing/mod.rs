@@ -2,19 +2,24 @@ mod matching;
 mod sources;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{config::Config, db::Database, error::AppError};
 
 use self::{
-    matching::{match_price, normalized_models, source_priority},
+    matching::{IndexedPrices, normalized_models, source_priority},
     sources::fetch_source,
 };
 
+#[cfg(test)]
+use matching::match_price;
 use types::RemotePrice;
+pub(crate) use types::SyncedModelPriceInput;
 pub use types::{ModelPriceSyncResult, SyncCandidate, SyncCandidateSet, SyncSourceResult};
 
 pub const MAX_SYNC_MODELS: usize = 500;
+pub(crate) static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(2);
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_PRICES: usize = 20_000;
 const MAX_CANDIDATES_PER_MODEL: usize = 8;
@@ -49,14 +54,60 @@ pub async fn sync_model_prices(
 async fn sync_model_prices_with_sources(
     db: &Database,
     http: &reqwest::Client,
-    mut models: Vec<String>,
+    models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
     allow_test_loopback: bool,
 ) -> Result<ModelPriceSyncResult, AppError> {
-    if models.len() > MAX_SYNC_MODELS {
+    run_price_sync(
+        db,
+        http,
+        models,
+        currency,
+        source_specs,
+        allow_test_loopback,
+        MAX_SYNC_MODELS,
+    )
+    .await
+}
+
+/// Server-owned catalog synchronization accepts the full bounded catalog,
+/// fetching each source once and chunking database reads, not network requests.
+pub(crate) async fn sync_catalog_model_prices(
+    db: &Database,
+    http: &reqwest::Client,
+    models: Vec<String>,
+    source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
+) -> Result<ModelPriceSyncResult, AppError> {
+    let _permit = MODEL_PRICE_SYNC_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| AppError::Internal)?;
+    run_price_sync(
+        db,
+        http,
+        models,
+        "USD",
+        source_specs,
+        allow_test_loopback,
+        10_000,
+    )
+    .await
+}
+
+async fn run_price_sync(
+    db: &Database,
+    http: &reqwest::Client,
+    mut models: Vec<String>,
+    currency: &str,
+    source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
+    max_models: usize,
+) -> Result<ModelPriceSyncResult, AppError> {
+    if models.len() > max_models {
         return Err(AppError::BadRequest(format!(
-            "model price sync accepts at most {MAX_SYNC_MODELS} models"
+            "model price sync accepts at most {max_models} models"
         )));
     }
     models = normalized_models(models);
@@ -85,7 +136,7 @@ async fn sync_model_prices_with_sources(
                     error: None,
                 });
                 successful_sources.push(source.to_owned());
-                fetched.push((source, prices));
+                fetched.push(IndexedPrices::new(prices));
             }
             Err(error) => {
                 tracing::warn!(source, %error, "model price source synchronization failed");
@@ -105,18 +156,12 @@ async fn sync_model_prices_with_sources(
         ));
     }
 
-    let existing = db
-        .model_price_views_for_models(currency, &models)
-        .await?
-        .into_iter()
-        .map(|price| (price.model.clone(), price))
-        .collect::<HashMap<_, _>>();
     let mut selected = HashMap::<String, RemotePrice>::new();
     let mut candidate_sets = HashMap::<String, Vec<SyncCandidate>>::new();
 
     for model in &models {
-        for (_source, prices) in &fetched {
-            let (matched, candidates) = match_price(model, prices);
+        for prices in &fetched {
+            let (matched, candidates) = prices.match_price(model);
             if let Some(price) = matched {
                 selected.insert(model.clone(), price);
                 break;
@@ -130,9 +175,23 @@ async fn sync_model_prices_with_sources(
         }
     }
 
-    let mut imported = 0;
-    let mut matched = Vec::new();
-    let mut preserved = Vec::new();
+    let selected_models = models
+        .iter()
+        .filter(|model| selected.contains_key(*model))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut existing = HashMap::new();
+    for batch in selected_models.chunks(MAX_SYNC_MODELS) {
+        existing.extend(
+            db.model_price_views_for_models(currency, batch)
+                .await?
+                .into_iter()
+                .map(|price| (price.model.clone(), price)),
+        );
+    }
+    let mut matched = HashSet::new();
+    let mut preserved = HashSet::new();
+    let mut writes = Vec::with_capacity(selected.len());
     for model in &models {
         let Some(price) = selected.get(model) else {
             continue;
@@ -152,7 +211,7 @@ async fn sync_model_prices_with_sources(
                 })
             });
             if preserve_manual || preserve_failed_preferred {
-                preserved.push(model.clone());
+                preserved.insert(model.clone());
                 continue;
             }
         }
@@ -164,20 +223,30 @@ async fn sync_model_prices_with_sources(
             .unwrap_or(price.input_per_million);
         let cache_estimated =
             price.cached_input_per_million.is_none() || price.cache_write_per_million.is_none();
-        db.upsert_synced_model_price_tier(
-            model,
-            currency,
-            &price.service_tier,
-            price.input_per_million,
-            cached,
-            cache_write,
-            price.output_per_million,
-            price.source,
-            cache_estimated,
-        )
-        .await?;
-        imported += 1;
-        matched.push(model.clone());
+        writes.push(SyncedModelPriceInput {
+            model: model.clone(),
+            service_tier: price.service_tier.clone(),
+            input_per_million: price.input_per_million,
+            cached_input_per_million: cached,
+            cache_write_per_million: cache_write,
+            output_per_million: price.output_per_million,
+            source: price.source.to_owned(),
+            cache_price_estimated: cache_estimated,
+        });
+    }
+    for batch in writes.chunks(MAX_SYNC_MODELS) {
+        for written in db.upsert_synced_model_price_tiers(currency, batch).await? {
+            let price = &selected[&written.model];
+            if written
+                .tiers
+                .iter()
+                .any(|tier| tier.service_tier == price.service_tier && tier.source == "manual")
+            {
+                preserved.insert(written.model);
+            } else {
+                matched.insert(written.model);
+            }
+        }
     }
 
     let mut candidates = candidate_sets
@@ -189,12 +258,16 @@ async fn sync_model_prices_with_sources(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.model.cmp(&right.model));
+    let ambiguous = candidates
+        .iter()
+        .map(|set| set.model.as_str())
+        .collect::<HashSet<_>>();
     let unmatched = models
         .iter()
         .filter(|model| {
-            !matched.contains(model)
-                && !preserved.contains(model)
-                && !candidates.iter().any(|set| &set.model == *model)
+            !matched.contains(*model)
+                && !preserved.contains(*model)
+                && !ambiguous.contains(model.as_str())
         })
         .cloned()
         .collect();
@@ -203,10 +276,14 @@ async fn sync_model_prices_with_sources(
     } else {
         "multi".to_owned()
     };
+    let mut matched = matched.into_iter().collect::<Vec<_>>();
+    let mut preserved = preserved.into_iter().collect::<Vec<_>>();
+    matched.sort();
+    preserved.sort();
     Ok(ModelPriceSyncResult {
         source,
         sources: successful_sources,
-        imported,
+        imported: matched.len(),
         matched,
         candidates,
         unmatched,

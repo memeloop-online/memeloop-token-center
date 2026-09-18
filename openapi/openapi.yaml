@@ -2077,7 +2077,7 @@ paths:
       tags: [Upstream providers]
       operationId: syncUpstreamModels
       summary: Refresh one upstream model catalog using its stored destination and credential
-      description: Concurrent refreshes are collapsed by a database lease. The client cannot supply a discovery URL. Failure returns a static error code while preserving the prior snapshot.
+      description: Concurrent directory refreshes are collapsed by a database lease. The client cannot supply a discovery URL. Successful discovery atomically publishes new and retained models and records removed models as disabled, immediately excluding them from catalog-managed routing without changing manual route settings. The server then synchronizes USD prices for the full discovered catalog, using the same coordinator as background account refreshes. Price-source failures are reported separately in price_sync and never undo directory changes or manual prices. Discovery failure preserves the prior snapshot and disabled state and skips price synchronization.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters:
@@ -2085,10 +2085,10 @@ paths:
         - $ref: '#/components/parameters/TenantFilter'
       responses:
         '200':
-          description: Refreshed, stale, unsupported, or already-syncing catalog state.
+          description: Refreshed, stale, unsupported, or already-syncing catalog state, returning up to 10000 active and 10000 disabled entries without a follow-up GET.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/UpstreamModelCatalog' }
+              schema: { $ref: '#/components/schemas/UpstreamModelCatalogSyncResponse' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -7863,8 +7863,9 @@ components:
         passive_health: { $ref: '#/components/schemas/ModelPickerHealthEvidence' }
     UpstreamModelCatalog:
       type: object
+      description: Internal v1 additive response update. Clients with strict unknown-field validators must update their schema before adopting the server release that adds disabled_models and the sync-only price_sync field; legacy clients that ignore unknown response properties retain their active-model semantics.
       additionalProperties: false
-      required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models]
+      required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models, disabled_models]
       properties:
         account_id: { type: string, format: uuid }
         status: { type: string, enum: [unknown, syncing, ready, stale, error] }
@@ -7877,8 +7878,54 @@ components:
           enum: [unsupported, destination_invalid, credential_invalid, connection_failed, authentication_failed, rate_limited, upstream_unavailable, redirect_rejected, response_too_large, invalid_response, codex_no_trusted_models, null]
         models:
           type: array
-          maxItems: 200
+          maxItems: 10000
           items: { $ref: '#/components/schemas/UpstreamModel' }
+        disabled_models:
+          type: array
+          maxItems: 10000
+          description: Previously advertised model/protocol pairs missing from a successful directory response. Filtered by the same search and limit as models; never included in selectable active models. A returning pair clears its disabled entry. Transport/authentication/parse failures do not change these entries.
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, protocol, status, disabled_at, reason]
+            properties:
+              id: { type: string, minLength: 1, maxLength: 500 }
+              protocol: { type: string, minLength: 1, maxLength: 64 }
+              status: { const: disabled }
+              disabled_at: { type: integer, format: int64 }
+              reason: { const: removed_from_upstream }
+    UpstreamModelCatalogSyncResponse:
+      type: object
+      additionalProperties: false
+      description: POST-only catalog synchronization result. Returns the complete bounded active catalog and up to 10000 disabled entries; unlike paginated GET, no additional listing request is needed. The price_sync outcome is always present and is independent of directory status.
+      required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models, disabled_models, price_sync]
+      properties:
+        account_id: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/account_id' }
+        status: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/status' }
+        credential_generation: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/credential_generation' }
+        last_attempt_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/last_attempt_at' }
+        last_success_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/last_success_at' }
+        expires_at: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/expires_at' }
+        error_code: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/error_code' }
+        models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/models' }
+        disabled_models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/disabled_models' }
+        price_sync: { $ref: '#/components/schemas/UpstreamModelPriceSyncResult' }
+    UpstreamModelPriceSyncResult:
+      type: object
+      additionalProperties: false
+      description: Directory availability is committed before pricing. Skipped means discovery failed, a directory lease was already held, or the successful directory was empty. Partial includes unavailable sources, unmatched models, or ambiguous matches. No automatic sync overwrites manual prices.
+      required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
+      properties:
+        status: { type: string, enum: [ready, partial, error, skipped] }
+        currency: { const: USD }
+        imported: { type: integer, minimum: 0 }
+        preserved: { type: integer, minimum: 0 }
+        unmatched: { type: integer, minimum: 0 }
+        ambiguous: { type: integer, minimum: 0 }
+        failed_sources:
+          type: array
+          items: { type: string }
+        error_code: { type: [string, 'null'], enum: [price_sync_failed, null] }
     AggregatedUpstreamModel:
       type: object
       additionalProperties: false

@@ -174,6 +174,24 @@ async fn discovered_custom_routes_follow_catalog_churn_without_changing_enabled(
             .await
             .unwrap();
         assert_eq!(catalog.models.len(), names.len());
+        let disabled = catalog
+            .disabled_models
+            .iter()
+            .map(|model| {
+                assert_eq!(model.status, "disabled");
+                assert_eq!(model.reason, "removed_from_upstream");
+                assert!(model.disabled_at > 0);
+                model.id.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disabled,
+            match index {
+                0 => vec![],
+                1 => vec!["advertised", "manual-disabled"],
+                _ => vec!["new-model"],
+            }
+        );
         if index == 0 {
             // Simulate an association persisted by the older implementation.
             // The next sync must notice it in the previous snapshot even when
@@ -423,14 +441,16 @@ async fn aggregate_distinguishes_terminal_unsupported_from_unknown_network_and_a
 #[tokio::test]
 async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snapshot() {
     let server = MockServer::start().await;
+    let mut model_data = vec![
+        json!({"id": "gpt-alpha"}),
+        json!({"id": "gpt-beta", "protocol": "openai"}),
+    ];
+    model_data.extend((0..249).map(|index| json!({"id": format!("catalog-{index:03}")})));
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .and(matches_header("authorization", "Bearer catalog-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [
-                {"id": "gpt-alpha"},
-                {"id": "gpt-beta", "protocol": "openai"}
-            ]
+            "data": model_data
         })))
         .expect(1)
         .mount(&server)
@@ -468,7 +488,28 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
     .await;
     assert_eq!(status, StatusCode::OK, "{synced}");
     assert_eq!(synced["status"], "ready");
-    assert_eq!(synced["models"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        synced["models"].as_array().unwrap().len(),
+        251,
+        "POST must return the full active catalog without a follow-up GET"
+    );
+    assert_eq!(synced["price_sync"]["status"], "error");
+    assert_eq!(synced["disabled_models"], json!([]));
+    let (status, page) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstreams/{}/models?tenant_external_id=catalog-tenant&limit=1",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["models"].as_array().unwrap().len(), 1);
+    assert!(
+        page.get("price_sync").is_none(),
+        "GET remains a catalog read, not a synchronization result"
+    );
 
     // The one expected mock has been consumed. A 404 is reduced to a static
     // code while the previous complete snapshot remains searchable.
@@ -485,7 +526,33 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
     assert_eq!(status, StatusCode::OK, "{failed}");
     assert_eq!(failed["status"], "stale");
     assert_eq!(failed["error_code"], "upstream_unavailable");
-    assert_eq!(failed["models"].as_array().unwrap().len(), 2);
+    assert_eq!(failed["models"].as_array().unwrap().len(), 251);
+    assert_eq!(failed["price_sync"]["status"], "skipped");
+    assert_eq!(failed["disabled_models"], json!([]));
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (status, removed) = request(
+        &state,
+        "POST",
+        &format!(
+            "/internal/v1/upstreams/{}/models/sync?tenant_external_id=catalog-tenant",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(removed["models"], json!([]));
+    assert_eq!(
+        removed["disabled_models"].as_array().unwrap().len(),
+        251,
+        "POST must also return disabled evidence beyond the GET default page"
+    );
+    assert_eq!(removed["price_sync"]["status"], "skipped");
 
     let (status, cross_tenant) = request(
         &state,
@@ -1367,6 +1434,32 @@ async fn postgres_catalog_snapshot_and_generation_cas_use_the_same_contract() {
     assert_eq!(aggregate["eligible_account_count"], 1);
     assert_eq!(aggregate["data"][0]["id"], "postgres-model");
     assert_eq!(aggregate["data"][0]["complete_coverage"], true);
+
+    // A verified empty response is distinct from a network failure: both old
+    // rows become explicitly disabled in the same PostgreSQL transaction.
+    let empty_lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(account.id, &tenant, 1, empty_lease)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(account.id, &tenant, 1, empty_lease, "openai_v1", &[])
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
+    );
+    let empty = state
+        .db
+        .upstream_model_catalog(account.id, &tenant, None, 100)
+        .await
+        .unwrap();
+    assert!(empty.models.is_empty());
+    assert_eq!(empty.disabled_models.len(), 2);
 
     let lease = Uuid::now_v7();
     assert!(

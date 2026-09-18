@@ -31,6 +31,16 @@ pub struct UpstreamModelCatalogView {
     pub expires_at: Option<i64>,
     pub error_code: Option<String>,
     pub models: Vec<UpstreamModelView>,
+    pub disabled_models: Vec<DisabledUpstreamModelView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DisabledUpstreamModelView {
+    pub id: String,
+    pub protocol: String,
+    pub status: &'static str,
+    pub disabled_at: i64,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -325,6 +335,37 @@ impl Database {
                 .await?;
         }
 
+        // Reconcile missing and returning models before publishing the snapshot.
+        // A failed discovery never reaches this transaction. Existing tombstones
+        // retain the original disappearance time until the exact model returns.
+        sqlx::query(
+            "INSERT INTO upstream_model_catalog_disabled (tenant_id, upstream_account_id, model_id, protocol, disabled_at) \
+             SELECT previous.tenant_id, previous.upstream_account_id, previous.model_id, previous.protocol, $3 \
+             FROM upstream_models previous \
+             JOIN upstream_model_catalog_state state ON state.current_snapshot_id = previous.snapshot_id \
+               AND state.upstream_account_id = previous.upstream_account_id \
+             WHERE previous.upstream_account_id = $1 AND NOT EXISTS (\
+                 SELECT 1 FROM upstream_models current_model WHERE current_model.snapshot_id = $2 \
+                   AND current_model.model_id = previous.model_id AND current_model.protocol = previous.protocol\
+             ) ON CONFLICT (upstream_account_id, model_id, protocol) DO NOTHING",
+        )
+        .bind(account_id.to_string())
+        .bind(snapshot_id.to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM upstream_model_catalog_disabled WHERE upstream_account_id = $1 AND EXISTS (\
+                 SELECT 1 FROM upstream_models current_model WHERE current_model.snapshot_id = $2 \
+                   AND current_model.model_id = upstream_model_catalog_disabled.model_id \
+                   AND current_model.protocol = upstream_model_catalog_disabled.protocol\
+             )",
+        )
+        .bind(account_id.to_string())
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
         // Once discovery has confirmed a custom association, its availability
         // belongs to the catalog. Include the previous snapshot so the first
         // sync after this change also reconciles models removed upstream.
@@ -525,7 +566,7 @@ impl Database {
                 "SELECT model_id, protocol, context_window, reservation_token_bound, reservation_bound_source FROM upstream_models WHERE snapshot_id = $1 AND LOWER(model_id) LIKE LOWER($2) ESCAPE '\\' ORDER BY model_id, protocol LIMIT $3",
             )
             .bind(snapshot_id)
-            .bind(pattern)
+            .bind(&pattern)
             .bind(limit.clamp(1, 10_000))
             .fetch_all(&self.pool)
             .await?
@@ -544,6 +585,27 @@ impl Database {
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
+        let disabled_models = sqlx::query(
+            "SELECT model_id, protocol, disabled_at FROM upstream_model_catalog_disabled \
+             WHERE upstream_account_id = $1 AND LOWER(model_id) LIKE LOWER($2) ESCAPE '\\' \
+             ORDER BY model_id, protocol LIMIT $3",
+        )
+        .bind(account_id.to_string())
+        .bind(&pattern)
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(DisabledUpstreamModelView {
+                id: row.try_get("model_id")?,
+                protocol: row.try_get("protocol")?,
+                status: "disabled",
+                disabled_at: row.try_get("disabled_at")?,
+                reason: "removed_from_upstream",
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
         let mut status: Option<String> = state.try_get("status")?;
         let expires_at: Option<i64> = state.try_get("expires_at")?;
         if status.as_deref() == Some("ready")
@@ -560,6 +622,7 @@ impl Database {
             expires_at,
             error_code: state.try_get("last_error_code")?,
             models,
+            disabled_models,
         })
     }
 
