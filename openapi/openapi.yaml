@@ -4623,6 +4623,33 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/sessions/summaries:
+    post:
+      tags: [Operator traffic]
+      operationId: batchOperatorLogicalSessionSummaries
+      summary: Read a bounded batch of logical-session summaries by identity
+      description: |
+        Returns only existing identities that still match the supplied list
+        filters. This bounded endpoint supports realtime row replacement without
+        rescanning or returning the complete first page. Global service
+        credentials must select a tenant.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LogicalSessionSummaryBatchRequest' }
+      responses:
+        '200':
+          description: Matching summaries ordered by latest activity descending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LogicalSessionSummaryBatchResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/sessions/{session_id}:
     get:
       tags: [Operator traffic]
@@ -9845,6 +9872,37 @@ components:
           oneOf:
             - $ref: '#/components/schemas/LogicalSessionListCursor'
             - type: 'null'
+    LogicalSessionIdentity:
+      type: object
+      additionalProperties: false
+      required: [key_id, session_id]
+      properties:
+        key_id: { type: string, format: uuid }
+        session_id: { type: string, minLength: 1, maxLength: 80 }
+    LogicalSessionSummaryBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [identities]
+      properties:
+        tenant_external_id: { type: string }
+        identities:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/LogicalSessionIdentity' }
+        key_id: { type: string, format: uuid }
+        state: { type: string, enum: [all, active, has_errors], default: all }
+        model: { type: string, minLength: 1, maxLength: 512 }
+        q: { type: string, minLength: 1, maxLength: 128 }
+    LogicalSessionSummaryBatchResponse:
+      type: object
+      additionalProperties: false
+      required: [generated_at, sessions]
+      properties:
+        generated_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/LogicalSessionSummary' }
     LogicalSessionDetail:
       type: object
       additionalProperties: false

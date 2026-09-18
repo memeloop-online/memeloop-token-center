@@ -232,6 +232,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))
         .route(
+            "/internal/v1/sessions/summaries",
+            post(internal_session_summaries),
+        )
+        .route(
             "/internal/v1/sessions/{session_id}",
             get(internal_session_detail),
         )

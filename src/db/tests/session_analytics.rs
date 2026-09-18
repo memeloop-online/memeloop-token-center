@@ -299,6 +299,61 @@ async fn postgres_candidate_first_sessions_match_reference_and_ignore_old_histor
         "the older large-history session must fall outside the first candidate page"
     );
 
+    let exact_summaries = state
+        .db
+        .operator_session_summaries(
+            &tenant_external_id,
+            &[
+                (key.key_id, completed_session.to_string()),
+                (key.key_id, historical_cluster_id.to_string()),
+                (second_key.key_id, active_session.to_string()),
+                (key.key_id, Uuid::now_v7().to_string()),
+            ],
+            LogicalSessionListFilter {
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("exact session summary batch");
+    assert_eq!(exact_summaries.len(), 3, "missing identities are omitted");
+    assert!(
+        exact_summaries
+            .iter()
+            .any(|session| session.cluster_id == Some(historical_cluster_id)),
+        "identity lookup is independent of first-page membership"
+    );
+    let exact_completed = exact_summaries
+        .iter()
+        .find(|session| session.cluster_id == Some(completed_session))
+        .expect("exact completed summary");
+    let listed_completed = candidate_first
+        .iter()
+        .find(|session| session.cluster_id == Some(completed_session))
+        .expect("listed completed summary");
+    assert_eq!(
+        serde_json::to_value(exact_completed).expect("exact summary JSON"),
+        serde_json::to_value(listed_completed).expect("listed summary JSON"),
+        "identity lookup must preserve the list summary contract"
+    );
+    let active_only = state
+        .db
+        .operator_session_summaries(
+            &tenant_external_id,
+            &[
+                (key.key_id, completed_session.to_string()),
+                (second_key.key_id, active_session.to_string()),
+            ],
+            LogicalSessionListFilter {
+                state: "active".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("filtered exact session summary batch");
+    assert_eq!(active_only.len(), 1);
+    assert_eq!(active_only[0].cluster_id, Some(active_session));
+
     let completed = candidate_first
         .iter()
         .find(|session| session.cluster_id == Some(completed_session))

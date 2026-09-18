@@ -630,6 +630,11 @@ export interface LogicalSessionListResponse {
   next_cursor: LogicalSessionCursor | null;
 }
 
+export interface LogicalSessionSummaryBatchResponse {
+  generated_at: number;
+  sessions: LogicalSessionSummary[];
+}
+
 export interface LogicalSessionDetail {
   session_id: string;
   cluster_id: string | null;

@@ -3,6 +3,7 @@ import type { RequestArchiveState, RequestEventKind, RequestSessionContext } fro
 // The realtime cadence still yields briefly so a burst of lifecycle events
 // becomes one authoritative list/detail read instead of one read per event.
 export const sessionEventRefreshDelayMs = 500;
+export const maxSessionSummaryIdentities = 100;
 
 export function sessionRefreshDelayMs(intervalMs: number) {
   return intervalMs <= 0 ? sessionEventRefreshDelayMs : Math.max(sessionEventRefreshDelayMs, intervalMs);
@@ -68,6 +69,83 @@ export function drainSessionEventIdentities(queue: Set<string>) {
   const drained = new Set(queue);
   queue.clear();
   return drained;
+}
+
+export function sessionSummaryTargets(eventIdentities: ReadonlySet<string>) {
+  const targets = new Map<string, SessionIdentity>();
+  let unknown = false;
+  for (const value of eventIdentities) {
+    const event = JSON.parse(value) as SessionEventIdentity;
+    if (!event.session_id) {
+      unknown = true;
+      continue;
+    }
+    const target = { key_id: event.key_id, session_id: event.session_id };
+    targets.set(sessionIdentityKey(target), target);
+    if (event.event_kind === 'projected' && event.association === 'confirmed') {
+      const formerUnlinked = { key_id: event.key_id, session_id: `unlinked:${event.key_id}` };
+      targets.set(sessionIdentityKey(formerUnlinked), formerUnlinked);
+    }
+  }
+  return {
+    identities: [...targets.values()],
+    requiresFullReload: unknown || targets.size > maxSessionSummaryIdentities,
+  };
+}
+
+function compareSessionOrder(left: SessionIdentity & { last_activity_at: number }, right: SessionIdentity & { last_activity_at: number }) {
+  return right.last_activity_at - left.last_activity_at
+    || right.session_id.localeCompare(left.session_id)
+    || right.key_id.localeCompare(left.key_id);
+}
+
+export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { last_activity_at: number }>({
+  current, updates, requested, firstPageSize, firstPageLimit, hasMore,
+}: {
+  current: T[];
+  updates: T[];
+  requested: SessionIdentity[];
+  firstPageSize: number;
+  firstPageLimit: number;
+  hasMore: boolean;
+}): { sessions: T[]; requiresFullReload: boolean } {
+  const requestedKeys = new Set(requested.map(sessionIdentityKey));
+  const updatesByKey = new Map(updates.map((summary) => [sessionIdentityKey(summary), summary]));
+  const currentIndex = new Map(current.map((summary, index) => [sessionIdentityKey(summary), index]));
+  if (current.slice(0, firstPageSize)
+    .some((summary) => requestedKeys.has(sessionIdentityKey(summary)) && !updatesByKey.has(sessionIdentityKey(summary)))) {
+    // An affected visible row disappeared or stopped matching the active
+    // server-side filters. Only a new first-page query can fill that vacancy.
+    return { sessions: current, requiresFullReload: true };
+  }
+
+  const firstPage = current.slice(0, firstPageSize);
+  const boundary = firstPage.at(-1);
+  for (const update of updates) {
+    const index = currentIndex.get(sessionIdentityKey(update));
+    if (index === undefined) {
+      if (firstPageSize < firstPageLimit || !boundary || compareSessionOrder(update, boundary) < 0) {
+        return { sessions: current, requiresFullReload: true };
+      }
+      continue;
+    }
+    if (index < firstPageSize && hasMore && boundary && compareSessionOrder(update, boundary) > 0) {
+      // A first-page row moving below the previous boundary can admit an
+      // unseen row. Exact summaries cannot prove which row should replace it.
+      return { sessions: current, requiresFullReload: true };
+    }
+    if (index >= firstPageSize && boundary && compareSessionOrder(update, boundary) < 0) {
+      // A loaded tail row became recent enough to enter the first page.
+      return { sessions: current, requiresFullReload: true };
+    }
+  }
+
+  const replaced = current
+    .filter((summary, index) => index < firstPageSize || !requestedKeys.has(sessionIdentityKey(summary))
+      || updatesByKey.has(sessionIdentityKey(summary)))
+    .map((summary) => updatesByKey.get(sessionIdentityKey(summary)) ?? summary);
+  const sortedFirstPage = replaced.slice(0, firstPageSize).sort(compareSessionOrder);
+  return { sessions: [...sortedFirstPage, ...replaced.slice(firstPageSize)], requiresFullReload: false };
 }
 
 export function sessionEventTargetsSelection(eventIdentities: ReadonlySet<string>, selected?: SessionIdentity) {

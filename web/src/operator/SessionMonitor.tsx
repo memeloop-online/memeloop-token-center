@@ -8,12 +8,14 @@ import { SessionCredentialFilter } from './SessionCredentialFilter.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
 import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
-  drainSessionEventIdentities, mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
-  sessionIdentityKey, sessionRefreshDelayMs,
+  drainSessionEventIdentities, mergeIncrementalSessionSummaries, mergeSessionPage,
+  sessionEventsRequireDetailRefresh, sessionEventTargetsSelection, sessionIdentityKey,
+  sessionRefreshDelayMs, sessionSummaryTargets,
 } from './sessionRefresh.js';
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
-  LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestDetail, RequestView,
+  LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary,
+  LogicalSessionSummaryBatchResponse, RequestDetail, RequestView,
 } from '../types.js';
 
 interface SessionFilters {
@@ -34,9 +36,10 @@ export type SessionStreamState = 'idle' | 'connecting' | 'live' | 'reconnecting'
 export { LatestRequestGate, type LatestRequest } from './latestRequestGate.js';
 
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
+const sessionPageLimit = 50;
 
 function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalSessionCursor) {
-  const params = new URLSearchParams({ limit: '50' });
+  const params = new URLSearchParams({ limit: String(sessionPageLimit) });
   if (tenant) params.set('tenant_external_id', tenant);
   if (filters.q.trim()) params.set('q', filters.q.trim());
   if (filters.keyId.trim()) params.set('key_id', filters.keyId.trim());
@@ -48,6 +51,17 @@ function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalS
     params.set('before_key_id', before.before_key_id);
   }
   return `/internal/v1/sessions?${params}`;
+}
+
+function sessionSummaryBatchBody(tenant: string, filters: SessionFilters, identities: Array<{ key_id: string; session_id: string }>) {
+  return JSON.stringify({
+    ...(tenant ? { tenant_external_id: tenant } : {}),
+    identities,
+    ...(filters.keyId.trim() ? { key_id: filters.keyId.trim() } : {}),
+    state: filters.state || 'all',
+    ...(filters.model.trim() ? { model: filters.model.trim() } : {}),
+    ...(filters.q.trim() ? { q: filters.q.trim() } : {}),
+  });
 }
 
 function detailPath(tenant: string, session: LogicalSessionSummary, cursor?: LogicalSessionDetail['next_cursor']) {
@@ -109,6 +123,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   refreshIntervalRef.current = refreshInterval;
   const backgroundPausedRef = useRef(backgroundPaused);
   const listSequence = useRef(0);
+  const sessionsRef = useRef<LogicalSessionSummary[]>(sessions);
+  const nextCursorRef = useRef<LogicalSessionCursor | null>(nextCursor);
+  sessionsRef.current = sessions;
+  nextCursorRef.current = nextCursor;
   const listRequests = useRef(new LatestRequestGate());
   const listInFlight = useRef(false);
   const detailRequests = useRef(new LatestRequestGate());
@@ -129,6 +147,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const dirtyDetailEvents = useRef(new Set<string>());
   const detailRefreshDirty = useRef(false);
   const forceDetailRefresh = useRef(false);
+  const forceListRefresh = useRef(false);
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
@@ -180,10 +199,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
         });
         firstPageSize.current = merged.firstPageSize;
         loadedOlderList.current = merged.loadedOlder;
+        sessionsRef.current = merged.sessions;
         return merged.sessions;
       });
       setListScope(requestScope);
-      if (!background || !loadedOlderList.current || resetActiveTail) setNextCursor(response.next_cursor);
+      if (!background || !loadedOlderList.current || resetActiveTail) {
+        nextCursorRef.current = response.next_cursor;
+        setNextCursor(response.next_cursor);
+      }
       setGeneratedAt(response.generated_at);
       if (!older && !background) {
         const pendingFocus = focus && handledFocus.current !== focus.revision ? focus : undefined;
@@ -211,6 +234,35 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
         setLoading(false);
         setRefreshing(false);
         if (!background && refreshDirty.current && !manualRefreshInFlight.current) scheduleRefresh();
+      }
+    }
+  }
+
+  async function loadSessionSummaries(identities: Array<{ key_id: string; session_id: string }>) {
+    const sequence = ++listSequence.current;
+    const request = listRequests.current.begin();
+    const requestScope = scopeKey;
+    listInFlight.current = true;
+    setRefreshing(true);
+    setError('');
+    try {
+      const response = await api<LogicalSessionSummaryBatchResponse>('/internal/v1/sessions/summaries', token.trim(), {
+        method: 'POST',
+        body: sessionSummaryBatchBody(tenant, filtersRef.current, identities),
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]),
+      });
+      if (!request.isCurrent() || sequence !== listSequence.current) return undefined;
+      setListScope(requestScope);
+      return response;
+    } catch (reason) {
+      if (!request.isCurrent() || sequence !== listSequence.current) return undefined;
+      setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorScope(requestScope);
+      return undefined;
+    } finally {
+      if (request.isCurrent() && sequence === listSequence.current) {
+        listInFlight.current = false;
+        setRefreshing(false);
       }
     }
   }
@@ -334,14 +386,64 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       const selectedAtBatchStart = selectedRef.current;
       const selectedIdentity = selectedAtBatchStart ? sessionIdentityKey(selectedAtBatchStart) : undefined;
       const forceSelectedDetail = forceDetailRefresh.current;
+      const forceFullList = forceListRefresh.current;
+      forceListRefresh.current = false;
       const restoreBatch = () => {
         refreshDirty.current = true;
+        if (forceFullList) forceListRefresh.current = true;
         for (const identity of batchEventIdentities) dirtyEventIdentities.current.add(identity);
         for (const identity of batchDetailEvents) dirtyDetailEvents.current.add(identity);
       };
       let retryDelay = 0;
       const refresh = async () => {
-        const listLoaded = await loadSessions(false, filtersRef.current, true);
+        const targets = sessionSummaryTargets(batchEventIdentities);
+        let listLoaded = false;
+        if (forceFullList || targets.requiresFullReload) {
+          listLoaded = await loadSessions(false, filtersRef.current, true);
+        } else if (targets.identities.length === 0) {
+          listLoaded = true;
+        } else {
+          const response = await loadSessionSummaries(targets.identities);
+          if (response) {
+            const current = sessionsRef.current;
+            const merged = mergeIncrementalSessionSummaries({
+              current,
+              updates: response.sessions,
+              requested: targets.identities,
+              firstPageSize: firstPageSize.current,
+              firstPageLimit: sessionPageLimit,
+              hasMore: loadedOlderList.current || nextCursorRef.current !== null,
+            });
+            if (merged.requiresFullReload) {
+              listLoaded = await loadSessions(false, filtersRef.current, true);
+            } else {
+              sessionsRef.current = merged.sessions;
+              setSessions(merged.sessions);
+              setGeneratedAt(response.generated_at);
+              const latestSelection = selectedRef.current;
+              if (latestSelection) {
+                const selectedUpdate = response.sessions.find((session) => sessionIdentityKey(session) === sessionIdentityKey(latestSelection));
+                if (selectedUpdate) {
+                  selectedRef.current = selectedUpdate;
+                  setSelected(selectedUpdate);
+                }
+              }
+              if (!loadedOlderList.current && nextCursorRef.current && firstPageSize.current > 0) {
+                const boundary = merged.sessions[firstPageSize.current - 1];
+                if (boundary) {
+                  const cursor = {
+                    before_last_activity_at: boundary.last_activity_at,
+                    before_session_id: boundary.session_id,
+                    before_key_id: boundary.key_id,
+                  };
+                  nextCursorRef.current = cursor;
+                  setNextCursor(cursor);
+                }
+              }
+              listLoaded = true;
+            }
+          }
+        }
         if (generation !== scopeGeneration.current || !autoRefreshRef.current) return;
         if (!listLoaded) { restoreBatch(); retryDelay = sessionRefreshDelayMs(refreshIntervalRef.current); return; }
         const latestSelection = selectedRef.current;
@@ -395,6 +497,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     dirtyDetailEvents.current.clear();
     detailRefreshDirty.current = false;
     forceDetailRefresh.current = false;
+    forceListRefresh.current = false;
     listSequence.current += 1;
     listRequests.current.invalidate();
     listInFlight.current = false;
@@ -422,6 +525,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       dirtyDetailEvents.current.clear();
       detailRefreshDirty.current = false;
       forceDetailRefresh.current = false;
+      forceListRefresh.current = false;
       listSequence.current += 1;
       listRequests.current.invalidate();
       listInFlight.current = false;
@@ -439,6 +543,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       for (const identity of eventIdentities) dirtyDetailEvents.current.add(identity);
     }
     if (overflowed && selectedAtEvent) forceDetailRefresh.current = true;
+    if (overflowed) forceListRefresh.current = true;
     return eventIdentities.size;
   }
 
@@ -466,6 +571,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       refreshDirty.current = false;
       dirtyEventIdentities.current.clear();
       dirtyDetailEvents.current.clear();
+      forceListRefresh.current = false;
       if (!refreshInFlight.current) setRefreshing(false);
     }
   }
@@ -514,10 +620,13 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     // stays dirty and is handled by the selected refresh cadence afterwards.
     const observedListEvents = new Set(dirtyEventIdentities.current);
     const observedDetailEvents = new Set(dirtyDetailEvents.current);
+    const observedForceList = forceListRefresh.current;
+    forceListRefresh.current = false;
     manualRefreshInFlight.current = true;
     refreshCancelled.current = false;
+    let listLoaded = false;
     try {
-      const listLoaded = await loadSessions(false, filtersRef.current, listScope === scopeKey && sessions.length > 0);
+      listLoaded = await loadSessions(false, filtersRef.current, listScope === scopeKey && sessions.length > 0);
       if (!listLoaded || generation !== scopeGeneration.current) return;
       for (const identity of observedListEvents) dirtyEventIdentities.current.delete(identity);
 
@@ -529,6 +638,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       for (const identity of observedDetailEvents) dirtyDetailEvents.current.delete(identity);
       if (!dirtyEventIdentities.current.size && !dirtyDetailEvents.current.size) refreshDirty.current = false;
     } finally {
+      if (!listLoaded && observedForceList) forceListRefresh.current = true;
       manualRefreshInFlight.current = false;
       if (!refreshCancelled.current && generation === scopeGeneration.current
         && (refreshDirty.current || dirtyEventIdentities.current.size > 0 || dirtyDetailEvents.current.size > 0)) {
