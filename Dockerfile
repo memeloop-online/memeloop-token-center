@@ -94,7 +94,9 @@ COPY --from=release-input /release-input/third-party-licenses /usr/share/license
 # A release-input artifact is only valid when the Docker-native binary starts
 # against the exact distroless runtime that will publish it.
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
+RUN ["/usr/local/bin/memeloop-token-center", "verify-plugin-runtime"]
 RUN ["/usr/local/bin/install-plugin-oci", "--help"]
+RUN ["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]
 RUN ["/usr/local/bin/cosign", "version", "--json"]
 
 FROM scratch AS release-input-export
@@ -114,6 +116,7 @@ COPY --from=release-input /release-input/LICENSE /usr/share/licenses/memeloop-to
 COPY --from=release-input /release-input/THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
 COPY --from=release-input /release-input/third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
 RUN ["/usr/local/bin/memeloop-token-center", "--help"]
+RUN ["/usr/local/bin/memeloop-token-center", "verify-plugin-runtime"]
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/memeloop-token-center"]

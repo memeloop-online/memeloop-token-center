@@ -830,7 +830,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/github-release-assets/memeloop-token-center-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/service-package"
           tar -xzf "$RUNNER_TEMP/github-release-assets/install-plugin-oci-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP/installer-package"
           "$RUNNER_TEMP/service-package/memeloop-token-center-$VERSION-linux-amd64/bin/memeloop-token-center" --help
+          "$RUNNER_TEMP/service-package/memeloop-token-center-$VERSION-linux-amd64/bin/memeloop-token-center" verify-plugin-runtime
           "$RUNNER_TEMP/installer-package/install-plugin-oci-$VERSION-linux-amd64/bin/install-plugin-oci" --help
+          "$RUNNER_TEMP/installer-package/install-plugin-oci-$VERSION-linux-amd64/bin/install-plugin-oci" --mtc-cosign-runtime-check
       - name: Create the immutable version-tagged GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

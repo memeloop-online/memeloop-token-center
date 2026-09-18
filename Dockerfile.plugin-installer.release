@@ -18,6 +18,7 @@ COPY --from=release-input /LICENSE /usr/share/licenses/memeloop-token-center/LIC
 COPY --from=release-input /THIRD_PARTY_NOTICES.md /usr/share/licenses/memeloop-token-center/THIRD_PARTY_NOTICES.md
 COPY --from=release-input /third-party-licenses /usr/share/licenses/memeloop-token-center/third-party
 RUN ["/usr/local/bin/install-plugin-oci", "--help"]
+RUN ["/usr/local/bin/install-plugin-oci", "--mtc-cosign-runtime-check"]
 RUN ["/usr/local/bin/cosign", "version", "--json"]
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]

@@ -4,7 +4,6 @@ use super::*;
 use std::{collections::BTreeSet, process::Stdio};
 use tokio::io::AsyncReadExt;
 
-const INSTALLER: &str = "/usr/local/bin/install-plugin-oci";
 // A complete inventory can contain sixteen packages. Each package can contain
 // 64 layers plus config/manifest and up to eight signature-key attempts. Bound
 // each package, not the aggregate; committed packages survive interrupted work.
@@ -361,18 +360,14 @@ impl ApplicationPlugins {
                 {
                     return Ok(());
                 }
-                let mut command = tokio::process::Command::new(INSTALLER);
+                let mut command = crate::plugin_distribution::plugin_installer_command()
+                    .map_err(|_| AppError::Internal)?;
                 command
                     .arg(reference)
                     .arg("--plugin-dir")
                     .arg(&policy.plugin_root)
                     .arg("--publication-attempt-id")
                     .arg(attempt_id)
-                    .env_clear()
-                    // Only fixed runtime loader/search paths cross the process
-                    // boundary; service tokens and unrelated host settings do not.
-                    .env("LD_LIBRARY_PATH", "/usr/local/lib")
-                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
@@ -1961,7 +1956,7 @@ mod tests {
             ("vendor.example/plugin", 0),
             ("private.example/other", 0),
         ] {
-            let mut command = tokio::process::Command::new(INSTALLER);
+            let mut command = tokio::process::Command::new("install-plugin-oci");
             if let Some(credentials) =
                 policy.credentials_for(&format!("{source}@sha256:{}", "a".repeat(64)))
             {

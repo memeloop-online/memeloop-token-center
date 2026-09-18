@@ -1,8 +1,7 @@
 # Third-party notices
 
-MemeLoop Token Center depends on third-party open-source software. The release
-SBOM records the complete dependency inventory and applicable package license
-metadata.
+MemeLoop Token Center depends on third-party open-source software. Published
+container images include image-level SPDX SBOM and SLSA provenance evidence.
 
 The distributed release artifact also contains these separately identifiable
 components:

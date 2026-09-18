@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use clap::Parser;
 use memeloop_token_center::plugin_distribution::{
     CosignKeylessIdentity, InstallPluginOptions, RegistryCredentials, install_plugin_oci,
+    verify_cosign_runtime,
 };
 
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
@@ -80,6 +81,15 @@ struct Arguments {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut runtime_arguments = std::env::args_os().skip(1);
+    let runtime_check = runtime_arguments
+        .next()
+        .is_some_and(|argument| argument == std::ffi::OsStr::new("--mtc-cosign-runtime-check"))
+        && runtime_arguments.next().is_none();
+    if runtime_check {
+        verify_cosign_runtime().await?;
+        return Ok(());
+    }
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
     let plugin_root = match &arguments.publication_attempt_id {

@@ -655,7 +655,7 @@ async fn system_executor_kills_on_timeout_and_rejects_oversized_output() {
 
 #[test]
 fn cosign_binary_and_version_are_fixed_security_constants() {
-    assert_eq!(COSIGN_VERIFIER_PATH, "/usr/local/bin/cosign");
+    assert_eq!(COSIGN_VERIFIER_FILENAME, "cosign");
     assert_eq!(COSIGN_VERIFIER_VERSION, "v3.1.3-mtc.3");
     assert!(cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.3"}"#));
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.1"}"#));
@@ -663,6 +663,52 @@ fn cosign_binary_and_version_are_fixed_security_constants() {
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.2"}"#));
     assert!(!cosign_version_matches(br#"{"GitVersion":"v3.1.3"}"#));
     assert!(!cosign_version_matches(br#"{"git_version":"v3.1.3"}"#));
+}
+
+#[test]
+fn cosign_binary_is_resolved_only_as_an_executable_regular_sibling() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let temporary = TempDir::new().expect("temporary directory");
+    let executable = temporary.path().join("install-plugin-oci");
+    std::fs::write(&executable, b"installer").expect("installer fixture");
+    let cosign = temporary.path().join(COSIGN_VERIFIER_FILENAME);
+    std::fs::write(&cosign, b"cosign").expect("cosign fixture");
+    std::fs::set_permissions(&cosign, std::fs::Permissions::from_mode(0o500))
+        .expect("executable cosign fixture");
+    assert_eq!(
+        cosign_verifier_path_from(&executable).expect("co-located cosign"),
+        cosign.canonicalize().expect("canonical cosign")
+    );
+
+    std::fs::remove_file(&cosign).expect("remove regular cosign");
+    let external = temporary.path().join("external-cosign");
+    std::fs::write(&external, b"cosign").expect("external fixture");
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o500))
+        .expect("external executable fixture");
+    symlink(&external, &cosign).expect("symlink fixture");
+    assert!(cosign_verifier_path_from(&executable).is_err());
+}
+
+#[test]
+fn service_runtime_resolves_installer_and_libraries_relative_to_its_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = TempDir::new().expect("temporary directory");
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir(&bin).expect("bin directory");
+    let lib = temporary.path().join("lib");
+    std::fs::create_dir(&lib).expect("lib directory");
+    let executable = bin.join("memeloop-token-center.bin");
+    std::fs::write(&executable, b"service").expect("service fixture");
+    let installer = bin.join(PLUGIN_INSTALLER_FILENAME);
+    std::fs::write(&installer, b"installer").expect("installer fixture");
+    std::fs::set_permissions(&installer, std::fs::Permissions::from_mode(0o500))
+        .expect("executable installer fixture");
+    let runtime = plugin_runtime_layout_from(&executable).expect("runtime layout");
+    assert_eq!(runtime.binary_directory, bin.canonicalize().unwrap());
+    assert_eq!(runtime.installer, installer.canonicalize().unwrap());
+    assert_eq!(runtime.library_directory, lib.canonicalize().unwrap());
 }
 
 #[tokio::test]
