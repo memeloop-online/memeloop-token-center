@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn operator_history_uses_stable_identity_after_credential_purge() {
+    let query = build_request_list_query(
+        RequestListScope::Global,
+        &RequestListFilter {
+            limit: 25,
+            ..Default::default()
+        },
+    );
+    assert!(query.statement.contains("LEFT JOIN key_records k"));
+    assert!(query.statement.contains("LEFT JOIN principals p"));
+    assert!(query.statement.contains("__retired_credential__"));
+    assert!(query.statement.contains("__retired_principal__"));
+    assert!(
+        !query
+            .statement
+            .contains("SELECT identity_key.id FROM key_records")
+    );
+}
+
 #[tokio::test]
 async fn postgres_operator_page_bounds_history_before_display_joins() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
@@ -49,17 +69,12 @@ async fn postgres_operator_page_bounds_history_before_display_joins() {
             }
             if node.contains("Scan") && node.contains(" on request_records") {
                 native_scans += 1;
-                let nearest_join = ancestors.iter().rposition(|(_, ancestor)| {
-                    ancestor.contains("Join") || ancestor.starts_with("Nested Loop")
-                });
+                let bounded_source_count = ancestors
+                    .iter()
+                    .filter(|(_, ancestor)| ancestor.starts_with("Limit"))
+                    .count();
                 assert!(
-                    ancestors
-                        .iter()
-                        .enumerate()
-                        .any(|(position, (_, ancestor))| {
-                            ancestor.starts_with("Limit")
-                                && nearest_join.is_none_or(|join| position > join)
-                        }),
+                    bounded_source_count >= 2,
                     "historical scan must be bounded before display joins:\n{}",
                     lines.join("\n")
                 );

@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import { Combobox, Option } from '../design-system';
 import { useI18n } from '../i18n.js';
 import type { KeyView, LogicalSessionSummary } from '../types.js';
+import { credentialDisplayName } from '../identityPresentation.js';
 
 /** Paged credential metadata supplements aliases from the session projection.
  * A pasted diagnostic ID remains accepted, including deep-linked credentials. */
@@ -32,7 +33,7 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
     return () => controller.abort();
   }, [scope, pageNumber]);
   const options = [...new Map([
-    ...sessions.map(session => [session.key_id, { id: session.key_id, label: session.key_alias || session.key_id }] as const),
+    ...sessions.map(session => [session.key_id, { id: session.key_id, label: credentialDisplayName(session.key_alias, t) }] as const),
     ...currentKeys.map(key => [key.key_id, { id: key.key_id, label: key.alias || key.key_id }] as const),
   ]).values()];
   const selected = options.find(option => option.id === value);

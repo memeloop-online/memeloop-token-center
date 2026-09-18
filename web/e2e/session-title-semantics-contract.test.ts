@@ -10,7 +10,8 @@ test('request table and diagnostics reuse declared names and the shared contextu
   const diagnostics = components.slice(components.indexOf('export function RequestDiagnostics'), components.indexOf('export function RequestTable'));
   const table = components.slice(components.indexOf('export function RequestTable'));
   for (const surface of [diagnostics, table]) {
-    assert.match(surface, /session_name\?\.trim\(\) \|\| unnamedSessionName\(t, locale, request\.created_at, request\.credential_identity\?\.key_alias\?\.trim\(\) \|\| request\.credential_identity\?\.key_id\)/);
+    assert.match(surface, /credentialDisplayName\(request\.credential_identity\.key_alias, t\)/);
+    assert.match(surface, /session_name\?\.trim\(\) \|\| unnamedSessionName\(t, locale, request\.created_at, sessionCredential\)/);
     assert.doesNotMatch(surface, /sessions\.reportedNameMissing/);
     assert.match(surface, /context\.association === 'confirmed'/);
     assert.match(surface, /request-session-unlinked[^\n]*sessions\.unlinkedRequests/);
@@ -60,6 +61,7 @@ test('fallback context is consistent with the list and never invents an epoch da
   assert.deepEqual(sessionFallback(detail), { time: 20, credential: 'Retained alias' });
   assert.deepEqual(sessionFallback({ requests: [...detail.requests].reverse() }), sessionFallback(detail));
   assert.deepEqual(sessionFallback(detail, { last_activity_at: 30, key_alias: ' ', key_id: 'summary-key' }), { time: 30, credential: 'summary-key' });
+  assert.deepEqual(sessionFallback(detail, { last_activity_at: 30, key_alias: '__retired_credential__', key_id: 'internal-key' }), { time: 30, credential: undefined });
   assert.deepEqual(sessionFallback({ requests: [] }), { time: undefined, credential: undefined });
   const calls: Array<{ key: string; variables?: Record<string, string | number> }> = [];
   const translate = (key: string, variables?: Record<string, string | number>) => { calls.push({ key, variables }); return key; };

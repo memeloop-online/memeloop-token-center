@@ -1,5 +1,6 @@
 import type { Locale } from './i18n.js';
 import type { ConversationRequest, ExecutionMetadata, LogicalSessionSummary, RequestCredentialIdentity, RequestSessionContext } from './types.js';
+import { RETIRED_CREDENTIAL } from './identityPresentation.js';
 
 type Observation = Pick<ConversationRequest, 'created_at' | 'request_id'> & {
   session_context?: Pick<RequestSessionContext, 'session_name'> | null;
@@ -25,7 +26,7 @@ export function latestDeclaredSessionName(detail: TitleInput) {
 
 /** The list and detail share the same summary context when one is available. */
 export function sessionFallback(detail: TitleInput, summary?: Pick<LogicalSessionSummary, 'last_activity_at' | 'key_alias' | 'key_id'>) {
-  if (summary) return { time: summary.last_activity_at, credential: summary.key_alias.trim() || summary.key_id };
+  if (summary) return { time: summary.last_activity_at, credential: summary.key_alias.trim() === RETIRED_CREDENTIAL ? undefined : summary.key_alias.trim() || summary.key_id };
   let latest: Observation | undefined;
   let identified: Observation | undefined;
   for (const request of detail.requests) {
@@ -33,7 +34,7 @@ export function sessionFallback(detail: TitleInput, summary?: Pick<LogicalSessio
     if (request.credential_identity && (!identified || later(request, identified))) identified = request;
   }
   const identity = identified?.credential_identity;
-  return { time: latest?.created_at, credential: identity?.key_alias.trim() || identity?.key_id };
+  return { time: latest?.created_at, credential: identity?.key_alias.trim() === RETIRED_CREDENTIAL ? undefined : identity?.key_alias.trim() || identity?.key_id };
 }
 
 /** Activity time is context, not a claimed session creation time or real name. */

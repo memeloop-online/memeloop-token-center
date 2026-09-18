@@ -8,6 +8,7 @@ import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost, U
 import { monitoringModelGroups } from './monitoringAccountGroups';
 import { AnalyticsMetric } from './AnalyticsMetric';
 import { analyticsAge, analyticsDuration, averageBucketTpsSeries, averageSeriesTps, formatTps, histogramP95, seriesTpsSamples } from './analyticsPresentation';
+import { upstreamDisplayName } from '../identityPresentation.js';
 
 function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n();
@@ -92,7 +93,7 @@ export function MonitoringSnapshot({ snapshot, points = [], quotaSummary }: { sn
           const metrics = value.metrics;
           return <li key={`${value.upstream_account_id}\0${index}`} data-upstream-account-id={value.upstream_account_id}>
             <div className="monitoring-top-heading">
-              <div><b title={`${locale === 'zh-CN' ? '账号 ID' : 'Account ID'}: ${value.upstream_account_id}`}>{value.upstream_name === value.upstream_account_id ? (locale === 'zh-CN' ? '未命名账号' : 'Unnamed account') : value.upstream_name}</b></div>
+              <div><b title={`${locale === 'zh-CN' ? '账号 ID' : 'Account ID'}: ${value.upstream_account_id}`}>{value.upstream_name === value.upstream_account_id ? (locale === 'zh-CN' ? '未命名账号' : 'Unnamed account') : upstreamDisplayName(value.upstream_name, t)}</b></div>
               <RoutingStatusBadge health={value.health} />
             </div>
             <MonitoringMetricList metrics={metrics} />

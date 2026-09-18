@@ -32,8 +32,8 @@ pub(super) async fn attach_output_rates(
                CAST(SUM(r.duration_ms) AS BIGINT) AS duration_ms
           FROM request_stats_facts f
           JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at
-          JOIN key_records k ON k.id = f.key_id
-          JOIN principals p ON p.id = k.principal_id
+          LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
+          LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = f.tenant_id
          WHERE {tenant} AND f.created_at >= $2 AND f.created_at <= $3
            AND ($4 = '' OR f.key_id = $4)
            AND ($5 = '' OR f.model = $5)
@@ -43,8 +43,10 @@ pub(super) async fn attach_output_rates(
            AND ($8 = '' OR f.error_code = $8)
            AND ($9 = '' OR ($9 = 'unassigned' AND f.upstream_account_id = '') OR f.upstream_account_id = $9)
            AND ($10 = '' OR f.model_route_id = $10)
-           AND ($11 = '' OR LOWER(k.alias) LIKE $11 ESCAPE '\')
-           AND ($12 = '' OR LOWER(p.external_id) LIKE $12 ESCAPE '\')
+           AND ($11 = '' OR LOWER(COALESCE(k.alias,
+                   '__retired_credential__')) LIKE $11 ESCAPE '\')
+           AND ($12 = '' OR LOWER(COALESCE(p.external_id,
+                   '__retired_principal__')) LIKE $12 ESCAPE '\')
            AND r.completed_at IS NOT NULL AND r.status_code >= 200 AND r.status_code < 300
            AND (r.error_code IS NULL OR r.error_code = '')
            AND r.usage_basis = 'provider_reported' AND r.duration_ms > 0

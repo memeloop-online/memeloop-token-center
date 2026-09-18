@@ -34,9 +34,26 @@ fn p95_disambiguates_finite_upper_bound_and_open_ended_bucket() {
 
 use super::{
     Database, DatabaseBackend, UsageAnalysisBucketPlan, UsageAnalysisGranularity,
-    UsageMetricsAccumulator, session_usage_dimension_sql, usage_analysis_heatmap_sql,
-    usage_analysis_main_sql,
+    UsageMetricsAccumulator, generation_usage_dimension_sql, session_usage_dimension_sql,
+    usage_analysis_heatmap_sql, usage_analysis_main_sql,
 };
+
+#[test]
+fn historical_usage_survives_product_identity_purge() {
+    let main = usage_analysis_main_sql(
+        DatabaseBackend::PostgreSql,
+        UsageAnalysisGranularity::Day,
+        true,
+    );
+    let sessions = session_usage_dimension_sql(UsageAnalysisGranularity::Day, true);
+    let generation = generation_usage_dimension_sql(UsageAnalysisGranularity::Day, true);
+    for sql in [main, sessions, generation] {
+        assert!(sql.contains("LEFT JOIN key_records"), "{sql}");
+        assert!(sql.contains("LEFT JOIN principals"), "{sql}");
+        assert!(sql.contains("__retired_credential__"), "{sql}");
+        assert!(sql.contains("__retired_principal__"), "{sql}");
+    }
+}
 
 #[test]
 fn inclusive_bucket_plan_separates_exact_edges_from_complete_interior() {

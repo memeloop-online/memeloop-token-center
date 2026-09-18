@@ -34,7 +34,7 @@ pub(super) async fn aggregate_terminal_generation_job(
                   COALESCE(j.error_code, ''), COALESCE(j.upstream_account_id, ''),
                   CASE WHEN j.completed_at IS NULL OR j.completed_at < j.created_at
                        THEN 0 ELSE j.completed_at - j.created_at END,
-                  j.cost_micros, COALESCE(j.billed_units, 0), k.currency,
+                  j.cost_micros, COALESCE(j.billed_units, 0), account.currency,
                   CASE
                       WHEN EXISTS (
                           SELECT 1 FROM generation_assets asset
@@ -50,7 +50,8 @@ pub(super) async fn aggregate_terminal_generation_job(
                   COALESCE(NULLIF(j.billing_unit_snapshot, ''), 'unknown'),
                   COALESCE(j.model_route_id, '')
              FROM generation_jobs j
-             JOIN key_records k ON k.id = j.key_id AND k.tenant_id = j.tenant_id
+             JOIN usage_reservations reservation ON reservation.id = j.reservation_id
+             JOIN credit_accounts account ON account.id = reservation.account_id
             WHERE j.id = $1 AND j.status IN ('succeeded', 'failed', 'cancelled')
            ON CONFLICT (job_id) DO NOTHING"#,
     )

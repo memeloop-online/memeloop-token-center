@@ -1,4 +1,5 @@
 import type { RequestView } from './types.js';
+import { RETIRED_CREDENTIAL } from './identityPresentation.js';
 
 const tokenCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
@@ -117,9 +118,10 @@ export function requestDisplayedCost(request: RequestView): string {
   return failedCostDefaultsToZero(request) ? '0' : request.cost;
 }
 
-export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' } {
+export function requestCredentialLabel(request: RequestView, fallback: string | undefined): { label: string } | { key: 'request.unnamedCredential' | 'request.missingCredential' | 'request.retiredCredential' } {
   if (request.credential_identity) {
     const label = request.credential_identity.key_alias?.trim();
+    if (label === RETIRED_CREDENTIAL) return { key: 'request.retiredCredential' };
     return label ? { label } : { key: 'request.unnamedCredential' };
   }
   return request.credential_identity === undefined && fallback?.trim()

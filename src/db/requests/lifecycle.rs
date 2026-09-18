@@ -1125,7 +1125,7 @@ impl Database {
                     return Err(AppError::NotFound);
                 }
                 let owner = sqlx::query(
-                    "SELECT q.error_code, q.input_tokens, q.output_tokens, q.service_tier, k.principal_id, k.account_id FROM request_records q JOIN key_records k ON k.id = q.key_id AND k.tenant_id = q.tenant_id WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4",
+                    "SELECT q.error_code, q.input_tokens, q.output_tokens, q.service_tier, account.principal_id, account.id AS account_id FROM request_records q JOIN usage_reservations reservation ON reservation.id = q.reservation_id AND reservation.key_id = q.key_id JOIN credit_accounts account ON account.id = reservation.account_id WHERE q.id = $1 AND q.created_at = $2 AND q.tenant_id = $3 AND q.key_id = $4",
                 )
                 .bind(&request_id)
                 .bind(created_at)
@@ -1528,7 +1528,7 @@ impl Database {
             return Ok(());
         }
         sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
+            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
         )
         .bind(&request_id)
         .bind(&tenant_id)
@@ -1789,7 +1789,7 @@ async fn insert_request_started_record_in_transaction(
         ));
     }
     sqlx::query(
-        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
     )
     .bind(&request_id)
     .bind(&tenant_id)

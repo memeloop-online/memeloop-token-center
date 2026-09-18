@@ -424,7 +424,7 @@ impl Database {
             let (upstream_name, health) = upstream_health
                 .get(&upstream_account_id)
                 .cloned()
-                .unwrap_or_else(|| (upstream_account_id.clone(), unknown_health()));
+                .unwrap_or_else(|| ("__retired_upstream__".to_owned(), unknown_health()));
             let terminal_outcomes = outcomes
                 .remove(&(upstream_account_id.clone(), model.clone()))
                 .unwrap_or_default();
@@ -1261,6 +1261,36 @@ mod tests {
         .unwrap();
         let (name, health) = results.remove(&upstream_account_id).unwrap();
         assert_eq!(name, "deleted-monitoring-provider");
+        assert_eq!(health.status, "unknown");
+        assert_eq!(health.observed_at, None);
+        assert_eq!(statements.count, 1);
+    }
+
+    #[tokio::test]
+    async fn physically_purged_upstream_uses_stable_retired_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("purged-upstream-monitoring.db")
+                .display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let upstream_account_id = Uuid::now_v7().to_string();
+        let mut connection = database.pool.acquire().await.unwrap();
+        let mut statements = MonitoringStatementCounter::default();
+        let mut results = upstream_health_batch(
+            &mut connection,
+            std::slice::from_ref(&upstream_account_id),
+            3,
+            &mut statements,
+        )
+        .await
+        .unwrap();
+        let (name, health) = results.remove(&upstream_account_id).unwrap();
+        assert_eq!(name, "__retired_upstream__");
         assert_eq!(health.status, "unknown");
         assert_eq!(health.observed_at, None);
         assert_eq!(statements.count, 1);

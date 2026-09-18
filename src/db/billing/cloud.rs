@@ -46,7 +46,7 @@ impl Database {
             ));
         }
         let rows = sqlx::query(
-            "SELECT ev.id AS event_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, ev.key_id, ev.entitlement_id, e.provider, e.external_subscription_id, ev.version, ev.subscription_status, ev.created_at FROM memeloop_cloud_subscription_events ev JOIN tenants t ON t.id = ev.tenant_id JOIN principals p ON p.id = ev.principal_id AND p.tenant_id = ev.tenant_id JOIN key_records k ON k.id = ev.key_id AND k.tenant_id = ev.tenant_id AND k.principal_id = ev.principal_id JOIN subscription_entitlements e ON e.id = ev.entitlement_id AND e.tenant_id = ev.tenant_id AND e.account_id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR ev.key_id = $3) ORDER BY ev.created_at DESC, ev.id DESC LIMIT $4",
+            "SELECT ev.id AS event_id, t.external_id AS tenant_external_id, COALESCE(p.external_id, '__retired_principal__') AS principal_external_id, ev.key_id, ev.entitlement_id, e.provider, e.external_subscription_id, ev.version, ev.subscription_status, ev.created_at FROM memeloop_cloud_subscription_events ev JOIN tenants t ON t.id = ev.tenant_id LEFT JOIN principals p ON p.id = ev.principal_id AND p.tenant_id = ev.tenant_id JOIN subscription_entitlements e ON e.id = ev.entitlement_id AND e.tenant_id = ev.tenant_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR COALESCE(p.external_id, '__retired_principal__') = $2) AND ($3 = '' OR ev.key_id = $3) ORDER BY ev.created_at DESC, ev.id DESC LIMIT $4",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(principal_external_id.unwrap_or_default())

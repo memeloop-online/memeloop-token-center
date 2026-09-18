@@ -25,6 +25,6 @@ test('request inspection retains the selected conversation', () => {
   assert.match(monitor, /RequestRefreshControl/);
   assert.match(monitor, /sessionRefreshDelayMs\(refreshIntervalRef\.current\)/);
   assert.match(credential, /optionValue/);
-  assert.match(credential, /session.key_alias \|\| session.key_id/);
+  assert.match(credential, /credentialDisplayName\(session\.key_alias, t\)/);
   assert.match(credential, /setCustomValidity\(''\);\s*\}, \[value, selected\?\.label, scope, id\]\)/);
 });

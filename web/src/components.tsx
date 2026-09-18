@@ -10,6 +10,7 @@ import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
 import { requestErrorCopy } from './requestStatusPresentation';
+import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -236,7 +237,8 @@ export function RequestDiagnostics({
   const pending = requestIsPending(request);
   const currencyForRequest = recordedCurrency(request, currency);
   const context = request.session_context;
-  const sessionLabel = context?.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id);
+  const sessionCredential = request.credential_identity ? credentialDisplayName(request.credential_identity.key_alias, t) : undefined;
+  const sessionLabel = context?.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, sessionCredential);
   const zh = locale === 'zh-CN';
   const missing = zh ? '未记录' : 'Not recorded';
   const credential = requestCredentialLabel(request, undefined);
@@ -250,7 +252,7 @@ export function RequestDiagnostics({
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
-      <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', request.credential_identity?.principal_external_id], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
+      <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', principalDisplayName(request.credential_identity?.principal_external_id, t)], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
       <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? `${costCopy.hint} ${costCopy.ledgerLabel}: ${cost.title ?? cost.text}` : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
     </section>
@@ -302,11 +304,12 @@ export function RequestTable({
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
+            const sessionCredential = request.credential_identity ? credentialDisplayName(request.credential_identity.key_alias, t) : undefined;
             const sessionLabel = context?.association === 'confirmed'
-              ? context.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id)
+              ? context.session_name?.trim() || unnamedSessionName(t, locale, request.created_at, sessionCredential)
               : t('sessions.unlinkedRequests');
             const contextualSession = context?.association === 'confirmed' && !context.session_name?.trim();
-            const sessionDisplay = contextualSession ? unnamedSessionName(t, locale, request.created_at, request.credential_identity?.key_alias?.trim() || request.credential_identity?.key_id, true) : sessionLabel;
+            const sessionDisplay = contextualSession ? unnamedSessionName(t, locale, request.created_at, sessionCredential, true) : sessionLabel;
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
             const currencyForRequest = recordedCurrency(request, currency);
             const technicalSummary = [
@@ -325,7 +328,7 @@ export function RequestTable({
             const duration = formatDurationDisplay(request.duration_ms, locale);
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
-            const credentialDetails = request.credential_identity ? `${request.credential_identity.key_id} · ${request.credential_identity.principal_external_id}` : credentialLabel;
+            const credentialDetails = request.credential_identity ? [request.credential_identity.key_id, principalDisplayName(request.credential_identity.principal_external_id, t)].filter(Boolean).join(' · ') : credentialLabel;
             const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
             return <tr key={request.request_id}>
               <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>

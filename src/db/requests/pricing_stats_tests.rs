@@ -284,8 +284,8 @@ async fn hot_path_parity(database: &Database) {
 
     if matches!(database.backend, DatabaseBackend::Sqlite) {
         // The core history tables have no key/principal foreign keys. The
-        // authoritative joins hide such stale facts, and the specialized
-        // eligible-key CTE must do the same.
+        // authoritative statistics and specialized pricing projection must
+        // both retain their durable facts after a product identity is removed.
         let principal_id: String =
             sqlx::query_scalar("SELECT principal_id FROM key_records WHERE id = $1")
                 .bind(key.to_string())
@@ -356,19 +356,12 @@ fn pricing_query_has_only_model_projection_and_disjoint_indexable_edges() {
     assert!(!query.contains("GROUPING SETS"));
     assert!(!query.contains("filtered_activity AS MATERIALIZED"));
     assert!(!query.contains("DENSE_RANK"));
-    // The visibility relation is built once; the six activity arms only join
-    // its compact `(key_id, tenant_id)` projection. Actual result equivalence
-    // (including orphaned principal/key cases) is exercised above.
-    assert_eq!(
-        query
-            .matches("pricing_visible_keys AS MATERIALIZED")
-            .count(),
-        1
-    );
-    assert_eq!(query.matches("FROM key_records").count(), 1);
-    assert_eq!(query.matches("JOIN principals").count(), 1);
-    assert_eq!(query.matches("JOIN tenants").count(), 1);
-    assert_eq!(query.matches("JOIN pricing_visible_keys").count(), 6);
+    // The global projection reads immutable facts directly so removing a
+    // credential identity neither hides history nor adds a directory join.
+    assert!(!query.contains("pricing_visible_keys"));
+    assert_eq!(query.matches("FROM key_records").count(), 0);
+    assert_eq!(query.matches("JOIN principals").count(), 0);
+    assert_eq!(query.matches("JOIN tenants").count(), 0);
     assert_eq!(query.matches("AND f.created_at < $3").count(), 2);
     assert_eq!(
         query
