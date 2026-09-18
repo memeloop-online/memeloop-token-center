@@ -179,7 +179,6 @@ spec:
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
             {{- include "memeloop-token-center.runtimeInventory.env" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
-            {{- if or (eq $role "gateway") (eq $role "all") }}
             - name: MTC_GATEWAY_POD_NAME
               valueFrom:
                 fieldRef:
@@ -192,7 +191,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            {{- end }}
             - name: MTC_RUN_MIGRATIONS_ON_START
               value: "false"
             {{- include "memeloop-token-center.proxyEnv" $ | nindent 12 }}

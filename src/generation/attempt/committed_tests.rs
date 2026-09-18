@@ -88,7 +88,7 @@ async fn committed_observation_survives_caller_cancellation_and_keeps_probe_hear
     assert!(matches!(admission, UpstreamAttemptAdmission::Probe { .. }));
     let request = Uuid::now_v7();
     let gate = crate::group_routing::test_observe_gate::install(request);
-    let guard = MediaAttemptGuard::new_media(
+    let guard = MediaAttemptGuard::new(
         &state,
         request,
         Uuid::now_v7(),

@@ -1,3 +1,22 @@
+ALTER TABLE upstream_account_health
+    ADD COLUMN transport_revision BIGINT NOT NULL DEFAULT 0;
+
+-- Preserve hard quota/authentication and transient state that predates the
+-- revision fence. Writes from a legacy replica after this migration retain
+-- revision 0 and are adopted conservatively by v108 readers (connection
+-- failures remain observe-only during the first rollout phase).
+UPDATE upstream_account_health
+SET transport_revision = (
+    SELECT account.updated_at
+    FROM upstream_accounts account
+    WHERE account.id = upstream_account_health.upstream_account_id
+)
+WHERE EXISTS (
+    SELECT 1
+    FROM upstream_accounts account
+    WHERE account.id = upstream_account_health.upstream_account_id
+);
+
 CREATE TABLE upstream_connection_failure_domains (
     upstream_account_id TEXT NOT NULL,
     credential_generation BIGINT NOT NULL,

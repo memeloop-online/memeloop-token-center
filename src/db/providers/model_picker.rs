@@ -513,7 +513,7 @@ WITH direct_sources AS (
         ON snapshot.tenant_id = account.tenant_id
        AND snapshot.upstream_account_id = account.id
        AND snapshot.id = catalog.current_snapshot_id
-      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id
+      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id AND health.transport_revision = account.updated_at
 ), ranked_groups AS MATERIALIZED (
     SELECT membership.upstream_account_id, provider_group.id AS provider_group_id,
            provider_group.name AS provider_group_label,
@@ -690,7 +690,7 @@ WITH direct_sources AS (
         ON snapshot.tenant_id = account.tenant_id
        AND snapshot.upstream_account_id = account.id
        AND snapshot.id = catalog.current_snapshot_id
-      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id
+      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id AND health.transport_revision = account.updated_at
 ), ranked_groups AS MATERIALIZED (
     SELECT membership.upstream_account_id, provider_group.id AS provider_group_id,
            provider_group.name AS provider_group_label,

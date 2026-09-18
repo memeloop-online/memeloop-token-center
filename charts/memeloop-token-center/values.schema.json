@@ -172,6 +172,7 @@
             "unavailableCooldownMillis",
             "invalidResponseCooldownMillis",
             "connectionCooldownMillis"
+            ,"failureDomainEnforcementEnabled"
           ],
           "properties": {
             "probeLeaseMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
@@ -180,6 +181,7 @@
             "unavailableCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
             "invalidResponseCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
             "connectionCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 }
+            ,"failureDomainEnforcementEnabled": { "type": "boolean" }
           },
           "description": "Shared upstream account circuit-breaker cooldowns and exclusive half-open probe timing in milliseconds. The application rejects a heartbeat that is not shorter than the lease."
         },

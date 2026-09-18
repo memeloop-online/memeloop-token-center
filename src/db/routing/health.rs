@@ -144,6 +144,40 @@ impl UpstreamFailureKind {
 }
 
 impl Database {
+    /// A pre-v108 runtime can still insert a health row with the migration's
+    /// revision-0 sentinel during the first rolling phase. Adopt only hard or
+    /// non-connection evidence into the current account revision. Legacy
+    /// connection failures are deliberately not adopted because one old pod
+    /// cannot establish the required cross-domain quorum.
+    pub(super) async fn adopt_legacy_health_revision(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE upstream_account_health
+                SET transport_revision = $3
+              WHERE upstream_account_id = $1
+                AND credential_generation = $2
+                AND transport_revision = 0
+                AND last_failure_kind <> 'connection'
+                AND EXISTS (
+                    SELECT 1 FROM upstream_accounts account
+                     WHERE account.id = upstream_account_health.upstream_account_id
+                       AND account.status = 'active'
+                       AND account.credential_generation = $2
+                       AND account.updated_at = $3
+                )",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn record_upstream_transport_diagnostic(
         &self,
         diagnostic: UpstreamTransportDiagnostic<'_>,
@@ -205,6 +239,7 @@ impl Database {
                 SET updated_at = updated_at
               WHERE upstream_account_id = $1
                 AND credential_generation = $2
+                AND transport_revision = $4
                 AND consecutive_failures = 0
                 AND probe_lease_token = $3
                 AND EXISTS (
@@ -296,12 +331,13 @@ impl Database {
         .bind(failure.failure_epoch.to_string())
         .fetch_one(&mut *transaction)
         .await?;
-        let global_breaker_opened =
-            if distinct_failure_domains >= CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD {
-                let cooldown_until = now
-                    .saturating_add(UpstreamFailureKind::Connection.base_cooldown_millis(health));
-                sqlx::query(
-                    "UPDATE upstream_account_health SET
+        let global_breaker_opened = if health.failure_domain_enforcement_enabled
+            && distinct_failure_domains >= CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD
+        {
+            let cooldown_until =
+                now.saturating_add(UpstreamFailureKind::Connection.base_cooldown_millis(health));
+            sqlx::query(
+                "UPDATE upstream_account_health SET
                      consecutive_failures = 1,
                      cooldown_until = $1,
                      probe_lease_until = 0,
@@ -309,6 +345,7 @@ impl Database {
                      updated_at = $2
                  WHERE upstream_account_id = $3
                    AND credential_generation = $4
+                   AND transport_revision = $6
                    AND consecutive_failures = 0
                    AND probe_lease_token = $5
                    AND EXISTS (
@@ -318,20 +355,20 @@ impl Database {
                         AND account.credential_generation = $4
                         AND account.updated_at = $6
                    )",
-                )
-                .bind(cooldown_until)
-                .bind(now)
-                .bind(failure.upstream_account_id.to_string())
-                .bind(failure.credential_generation)
-                .bind(failure.failure_epoch.to_string())
-                .bind(failure.transport_revision)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected()
-                    == 1
-            } else {
-                false
-            };
+            )
+            .bind(cooldown_until)
+            .bind(now)
+            .bind(failure.upstream_account_id.to_string())
+            .bind(failure.credential_generation)
+            .bind(failure.failure_epoch.to_string())
+            .bind(failure.transport_revision)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1
+        } else {
+            false
+        };
         transaction.commit().await?;
         Ok(ConnectionFailureDomainResult {
             distinct_failure_domains,
@@ -410,31 +447,37 @@ impl Database {
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         now: i64,
+        health: UpstreamHealthConfig,
     ) -> Result<Option<Uuid>, AppError> {
         let proposed = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO upstream_account_health (
                  upstream_account_id, consecutive_failures, cooldown_until,
                  probe_lease_until, probe_lease_token, credential_generation,
-                 last_failure_kind, updated_at
-             ) SELECT $1, 0, 0, 0, $3, $2, '', $4
+                 transport_revision, last_failure_kind, updated_at
+             ) SELECT $1, 0, 0, 0, $4, $2, $3, '', $5
                FROM upstream_accounts account
               WHERE account.id = $1 AND account.status = 'active'
                 AND account.credential_generation = $2
+                AND account.updated_at = $3
              ON CONFLICT (upstream_account_id) DO UPDATE SET
                  consecutive_failures = 0, cooldown_until = 0,
                  probe_lease_until = 0,
                  probe_lease_token = CASE
                      WHEN upstream_account_health.credential_generation <> excluded.credential_generation
+                          OR upstream_account_health.transport_revision <> excluded.transport_revision
                           OR upstream_account_health.probe_lease_token = ''
                          THEN excluded.probe_lease_token
                      ELSE upstream_account_health.probe_lease_token
                  END,
                  credential_generation = excluded.credential_generation,
+                 transport_revision = excluded.transport_revision,
                  last_failure_kind = '',
                  updated_at = CASE
                      WHEN upstream_account_health.credential_generation <> excluded.credential_generation
+                          OR upstream_account_health.transport_revision <> excluded.transport_revision
                           OR upstream_account_health.probe_lease_token = ''
                          THEN excluded.updated_at
                      ELSE upstream_account_health.updated_at
@@ -444,19 +487,24 @@ impl Database {
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = excluded.credential_generation
+                   AND account.updated_at = excluded.transport_revision
              )
                AND (
                  upstream_account_health.credential_generation < excluded.credential_generation
+                 OR upstream_account_health.transport_revision <> excluded.transport_revision
                  OR (
                    upstream_account_health.credential_generation = excluded.credential_generation
                    AND upstream_account_health.consecutive_failures = 0
                  )
+                 OR ($6 = 0 AND upstream_account_health.last_failure_kind = 'connection')
                )",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(proposed.to_string())
         .bind(now)
+        .bind(i64::from(health.failure_domain_enforcement_enabled))
         .execute(&self.pool)
         .await?;
         let token: Option<String> = sqlx::query_scalar(
@@ -465,13 +513,16 @@ impl Database {
                JOIN upstream_accounts account ON account.id = health.upstream_account_id
               WHERE health.upstream_account_id = $1
                 AND health.credential_generation = $2
+                AND health.transport_revision = $3
                 AND health.consecutive_failures = 0
                 AND health.probe_lease_token <> ''
                 AND account.status = 'active'
-                AND account.credential_generation = $2",
+                AND account.credential_generation = $2
+                AND account.updated_at = $3",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .fetch_optional(&self.pool)
         .await?;
         token
@@ -496,7 +547,9 @@ impl Database {
              FROM upstream_account_health health
              JOIN upstream_accounts account ON account.id = health.upstream_account_id
              WHERE account.id = $1 AND account.credential_generation = $2
-               AND health.credential_generation = $2 AND health.consecutive_failures > 0
+               AND health.credential_generation = $2
+               AND health.transport_revision = account.updated_at
+               AND health.consecutive_failures > 0
                AND (health.cooldown_until > $3 OR health.probe_lease_until > $3)",
         )
         .bind(upstream_account_id.to_string())
@@ -525,6 +578,7 @@ impl Database {
                JOIN upstream_account_health health
                  ON health.upstream_account_id = account.id
                 AND health.credential_generation = $2
+                AND health.transport_revision = $3
               WHERE account.id = $1
                 AND account.status = 'active'
                 AND account.credential_generation = $2
@@ -561,6 +615,7 @@ impl Database {
             "DELETE FROM upstream_account_health
              WHERE upstream_account_id = $1
                AND credential_generation = $2
+               AND transport_revision = $3
                AND last_failure_kind = 'quota_exhausted'
                AND consecutive_failures = $4
                AND updated_at = $5
@@ -596,56 +651,128 @@ impl Database {
         upstream_account_id: Uuid,
         credential_generation: i64,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
-        self.claim_upstream_account_attempt_with_health_config(
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.claim_upstream_account_attempt_at_revision_with_health_config(
             upstream_account_id,
             credential_generation,
+            transport_revision,
             UpstreamHealthConfig::DEFAULT,
         )
         .await
     }
 
+    pub(crate) async fn claim_upstream_account_attempt_at_revision_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+        health: UpstreamHealthConfig,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
+        self.claim_upstream_attempt_inner(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            health,
+            false,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn claim_upstream_account_attempt_with_health_config(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
         health: UpstreamHealthConfig,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
-        self.claim_upstream_attempt_inner(upstream_account_id, credential_generation, health, false)
-            .await
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.claim_upstream_account_attempt_at_revision_with_health_config(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            health,
+        )
+        .await
     }
 
+    pub(crate) async fn claim_transient_recovery_attempt_at_revision(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+        health: UpstreamHealthConfig,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
+        self.claim_upstream_attempt_inner(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            health,
+            true,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn claim_transient_recovery_attempt(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
         health: UpstreamHealthConfig,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
-        self.claim_upstream_attempt_inner(upstream_account_id, credential_generation, health, true)
-            .await
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.claim_transient_recovery_attempt_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            health,
+        )
+        .await
     }
 
     async fn claim_upstream_attempt_inner(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         health: UpstreamHealthConfig,
         transient_only: bool,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let mut initialized_epoch = false;
         loop {
             let now = unix_millis();
+            self.adopt_legacy_health_revision(
+                upstream_account_id,
+                credential_generation,
+                transport_revision,
+            )
+            .await?;
             let row = sqlx::query(
             "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until,
                     health.last_failure_kind, health.updated_at
              FROM upstream_accounts account
              LEFT JOIN upstream_account_health health
-               ON health.upstream_account_id = account.id
+              ON health.upstream_account_id = account.id
               AND health.credential_generation = $2
+              AND health.transport_revision = $3
              WHERE account.id = $1 AND account.status = 'active'
-               AND account.credential_generation = $2",
+               AND account.credential_generation = $2
+               AND account.updated_at = $3",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
             .fetch_optional(&self.pool)
             .await?;
             let Some(row) = row else {
@@ -661,7 +788,13 @@ impl Database {
                 .unwrap_or(0);
             if consecutive_failures == 0 {
                 if let Some(failure_epoch) = self
-                    .ensure_healthy_admission_epoch(upstream_account_id, credential_generation, now)
+                    .ensure_healthy_admission_epoch(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        now,
+                        health,
+                    )
                     .await?
                 {
                     return Ok(UpstreamAttemptAdmission::Healthy { failure_epoch });
@@ -680,6 +813,22 @@ impl Database {
             let cooldown_until: i64 = row.try_get("cooldown_until")?;
             let probe_lease_until: i64 = row.try_get("probe_lease_until")?;
             let last_failure_kind: String = row.try_get("last_failure_kind")?;
+            if last_failure_kind == "connection" && !health.failure_domain_enforcement_enabled {
+                if let Some(failure_epoch) = self
+                    .ensure_healthy_admission_epoch(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        now,
+                        health,
+                    )
+                    .await?
+                {
+                    return Ok(UpstreamAttemptAdmission::Healthy { failure_epoch });
+                }
+                initialized_epoch = true;
+                continue;
+            }
             let wait_eligible = matches!(last_failure_kind.as_str(), "connection" | "unavailable");
             if cooldown_until > now || probe_lease_until > now || (transient_only && !wait_eligible)
             {
@@ -699,6 +848,7 @@ impl Database {
                  WHERE upstream_account_id = $4
                    AND consecutive_failures > 0
                    AND credential_generation = $5
+                   AND transport_revision = $7
                    AND cooldown_until <= $3
                    AND probe_lease_until <= $3
                    AND ($6 = 0 OR last_failure_kind IN ('connection', 'unavailable'))
@@ -707,6 +857,7 @@ impl Database {
                      WHERE account.id = upstream_account_health.upstream_account_id
                        AND account.status = 'active'
                        AND account.credential_generation = $5
+                       AND account.updated_at = $7
                    )",
             )
             .bind(now.saturating_add(health.probe_lease_millis))
@@ -715,6 +866,7 @@ impl Database {
             .bind(upstream_account_id.to_string())
             .bind(credential_generation)
             .bind(i64::from(transient_only))
+            .bind(transport_revision)
             .execute(&self.pool)
             .await?;
             return Ok(if result.rows_affected() == 1 {
@@ -736,29 +888,33 @@ impl Database {
     /// proved unsendable. The shared token fences every terminal transition:
     /// the first conclusive success or failure wins, while stale followers
     /// become harmless no-ops.
-    pub(crate) async fn join_upstream_account_probe(
+    pub(crate) async fn join_upstream_account_probe_at_revision(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
     ) -> Result<Option<UpstreamAttemptAdmission>, AppError> {
         let now = unix_millis();
         let token: Option<String> = sqlx::query_scalar(
             "SELECT health.probe_lease_token
                FROM upstream_accounts account
                JOIN upstream_account_health health
-                 ON health.upstream_account_id = account.id
+                ON health.upstream_account_id = account.id
                 AND health.credential_generation = $2
+                AND health.transport_revision = $3
               WHERE account.id = $1
                 AND account.status = 'active'
                 AND account.credential_generation = $2
+                AND account.updated_at = $3
                 AND health.consecutive_failures > 0
                 AND health.last_failure_kind = 'connection'
-                AND health.cooldown_until <= $3
-                AND health.probe_lease_until > $3
+                AND health.cooldown_until <= $4
+                AND health.probe_lease_until > $4
                 AND health.probe_lease_token <> ''",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
@@ -774,21 +930,65 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) async fn join_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+    ) -> Result<Option<UpstreamAttemptAdmission>, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.join_upstream_account_probe_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_failure(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
         kind: UpstreamFailureKind,
     ) -> Result<bool, AppError> {
-        self.record_upstream_account_failure_with_health_config(
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_failure_at_revision_with_health_config(
             upstream_account_id,
             credential_generation,
+            transport_revision,
             kind,
             UpstreamHealthConfig::DEFAULT,
         )
         .await
     }
 
+    pub(crate) async fn record_upstream_account_failure_at_revision_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+        kind: UpstreamFailureKind,
+        health: UpstreamHealthConfig,
+    ) -> Result<bool, AppError> {
+        self.record_upstream_account_failure_inner(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            kind,
+            health,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_failure_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -796,9 +996,15 @@ impl Database {
         kind: UpstreamFailureKind,
         health: UpstreamHealthConfig,
     ) -> Result<bool, AppError> {
-        self.record_upstream_account_failure_inner(
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_failure_at_revision_with_health_config(
             upstream_account_id,
             credential_generation,
+            transport_revision,
             kind,
             health,
         )
@@ -812,10 +1018,11 @@ impl Database {
     /// times: after the first writer establishes health, its siblings are
     /// stale and become no-ops. A later half-open probe remains responsible
     /// for escalating a genuinely sustained failure.
-    pub(crate) async fn record_admitted_upstream_account_failure(
+    pub(crate) async fn record_admitted_upstream_account_failure_at_revision(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         kind: UpstreamFailureKind,
         health: UpstreamHealthConfig,
         failure_epoch: Uuid,
@@ -832,6 +1039,7 @@ impl Database {
                  updated_at = $3
              WHERE upstream_account_id = $4
                AND credential_generation = $5
+               AND transport_revision = $7
                AND consecutive_failures = 0
                AND probe_lease_token = $6
                AND EXISTS (
@@ -839,6 +1047,7 @@ impl Database {
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $5
+                   AND account.updated_at = $7
                )",
         )
         .bind(now.saturating_add(base).max(explicit_deadline))
@@ -847,15 +1056,42 @@ impl Database {
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
         .bind(failure_epoch.to_string())
+        .bind(transport_revision)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_admitted_upstream_account_failure(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        kind: UpstreamFailureKind,
+        health: UpstreamHealthConfig,
+        failure_epoch: Uuid,
+    ) -> Result<bool, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_admitted_upstream_account_failure_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            kind,
+            health,
+            failure_epoch,
+        )
+        .await
     }
 
     async fn record_upstream_account_failure_inner(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         kind: UpstreamFailureKind,
         health: UpstreamHealthConfig,
     ) -> Result<bool, AppError> {
@@ -870,43 +1106,49 @@ impl Database {
             "INSERT INTO upstream_account_health (
                  upstream_account_id, consecutive_failures, cooldown_until,
                  probe_lease_until, probe_lease_token, credential_generation,
-                 last_failure_kind, updated_at
-             ) SELECT $1, 1, $3, 0, '', $2, $4, $5
+                 transport_revision, last_failure_kind, updated_at
+             ) SELECT $1, 1, $3, 0, '', $2, $4, $5, $6
                FROM upstream_accounts account
               WHERE account.id = $1 AND account.status = 'active'
                 AND account.credential_generation = $2
+                AND account.updated_at = $4
              ON CONFLICT (upstream_account_id) DO UPDATE SET
                  consecutive_failures = CASE
                      WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                          AND upstream_account_health.transport_revision = excluded.transport_revision
                          THEN upstream_account_health.consecutive_failures + 1
                      ELSE 1
                  END,
                  cooldown_until = CASE
-                     WHEN $7 > 0 THEN CASE
+                     WHEN $8 > 0 THEN CASE
                          WHEN upstream_account_health.credential_generation = excluded.credential_generation
-                              AND upstream_account_health.cooldown_until > $7
+                              AND upstream_account_health.transport_revision = excluded.transport_revision
+                              AND upstream_account_health.cooldown_until > $8
                              THEN upstream_account_health.cooldown_until
-                         ELSE $7
+                         ELSE $8
                      END
                      WHEN upstream_account_health.credential_generation = excluded.credential_generation
                           AND upstream_account_health.cooldown_until > excluded.updated_at
                          THEN upstream_account_health.cooldown_until
                      ELSE excluded.updated_at + CASE
-                         WHEN upstream_account_health.credential_generation <> excluded.credential_generation THEN $6
-                         WHEN upstream_account_health.consecutive_failures >= 6 THEN $6 * 64
-                         WHEN upstream_account_health.consecutive_failures = 5 THEN $6 * 32
-                         WHEN upstream_account_health.consecutive_failures = 4 THEN $6 * 16
-                         WHEN upstream_account_health.consecutive_failures = 3 THEN $6 * 8
-                         WHEN upstream_account_health.consecutive_failures = 2 THEN $6 * 4
-                         WHEN upstream_account_health.consecutive_failures = 1 THEN $6 * 2
-                         ELSE $6
+                         WHEN upstream_account_health.credential_generation <> excluded.credential_generation
+                              OR upstream_account_health.transport_revision <> excluded.transport_revision THEN $7
+                         WHEN upstream_account_health.consecutive_failures >= 6 THEN $7 * 64
+                         WHEN upstream_account_health.consecutive_failures = 5 THEN $7 * 32
+                         WHEN upstream_account_health.consecutive_failures = 4 THEN $7 * 16
+                         WHEN upstream_account_health.consecutive_failures = 3 THEN $7 * 8
+                         WHEN upstream_account_health.consecutive_failures = 2 THEN $7 * 4
+                         WHEN upstream_account_health.consecutive_failures = 1 THEN $7 * 2
+                         ELSE $7
                      END
                  END,
                  probe_lease_until = 0,
                  probe_lease_token = '',
                  credential_generation = excluded.credential_generation,
+                 transport_revision = excluded.transport_revision,
                  last_failure_kind = CASE
                      WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                          AND upstream_account_health.transport_revision = excluded.transport_revision
                           AND upstream_account_health.cooldown_until > excluded.updated_at
                           AND upstream_account_health.last_failure_kind IN ('quota_exhausted', 'rate_limited', 'authentication')
                           AND excluded.last_failure_kind IN ('connection', 'unavailable', 'invalid_response')
@@ -919,11 +1161,14 @@ impl Database {
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = excluded.credential_generation
+                   AND account.updated_at = excluded.transport_revision
              )
                AND (
                  upstream_account_health.credential_generation < excluded.credential_generation
+                 OR upstream_account_health.transport_revision <> excluded.transport_revision
                  OR (
                    upstream_account_health.credential_generation = excluded.credential_generation
+                   AND upstream_account_health.transport_revision = excluded.transport_revision
                    AND upstream_account_health.probe_lease_until <= excluded.updated_at
                  )
                )",
@@ -931,6 +1176,7 @@ impl Database {
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
         .bind(now.saturating_add(base).max(explicit_deadline))
+        .bind(transport_revision)
         .bind(kind.as_str())
         .bind(now)
         .bind(base)
@@ -947,10 +1193,11 @@ impl Database {
     /// newer cohort's epoch and suppressing that cohort's genuine failure.
     /// Hard quota/authentication isolation and half-open probe leases remain
     /// separate authorities and are intentionally not touched.
-    pub(crate) async fn record_upstream_account_success(
+    pub(crate) async fn record_upstream_account_success_at_revision(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         success_epoch: Uuid,
     ) -> Result<bool, AppError> {
         let now = unix_millis();
@@ -958,10 +1205,11 @@ impl Database {
         let result = sqlx::query(
             "UPDATE upstream_account_health
              SET consecutive_failures = 0, cooldown_until = 0,
-                 probe_lease_until = 0, probe_lease_token = $3,
-                 last_failure_kind = '', updated_at = $4
+                 probe_lease_until = 0, probe_lease_token = $4,
+                 last_failure_kind = '', updated_at = $5
              WHERE upstream_account_id = $1 AND credential_generation = $2
-               AND probe_lease_token = $5
+               AND transport_revision = $3
+               AND probe_lease_token = $6
                AND (
                  (consecutive_failures = 0 AND last_failure_kind = '')
                  OR (
@@ -974,16 +1222,39 @@ impl Database {
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $2
+                   AND account.updated_at = $3
                )",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(next_epoch.to_string())
         .bind(now)
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_upstream_account_success(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        success_epoch: Uuid,
+    ) -> Result<bool, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_success_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            success_epoch,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -994,9 +1265,15 @@ impl Database {
         lease_token: Uuid,
         kind: UpstreamFailureKind,
     ) -> Result<bool, AppError> {
-        self.record_upstream_account_probe_failure_with_health_config(
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_probe_failure_at_revision_with_health_config(
             upstream_account_id,
             credential_generation,
+            transport_revision,
             lease_token,
             kind,
             UpstreamHealthConfig::DEFAULT,
@@ -1004,10 +1281,11 @@ impl Database {
         .await
     }
 
-    pub(crate) async fn record_upstream_account_probe_failure_with_health_config(
+    pub(crate) async fn record_upstream_account_probe_failure_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         lease_token: Uuid,
         kind: UpstreamFailureKind,
         health: UpstreamHealthConfig,
@@ -1032,12 +1310,14 @@ impl Database {
                  last_failure_kind = $3,
                  updated_at = $1
              WHERE upstream_account_id = $4 AND credential_generation = $5
+               AND transport_revision = $8
                AND probe_lease_token = $6
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $5
+                   AND account.updated_at = $8
                )",
         )
         .bind(now)
@@ -1047,15 +1327,17 @@ impl Database {
         .bind(credential_generation)
         .bind(lease_token.to_string())
         .bind(explicit_deadline)
+        .bind(transport_revision)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn record_upstream_account_probe_success(
+    pub(crate) async fn record_upstream_account_probe_success_at_revision(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         lease_token: Uuid,
     ) -> Result<bool, AppError> {
         let now = unix_millis();
@@ -1063,19 +1345,22 @@ impl Database {
         let result = sqlx::query(
             "UPDATE upstream_account_health
              SET consecutive_failures = 0, cooldown_until = 0,
-                 probe_lease_until = 0, probe_lease_token = $4,
-                 last_failure_kind = '', updated_at = $5
+                 probe_lease_until = 0, probe_lease_token = $5,
+                 last_failure_kind = '', updated_at = $6
              WHERE upstream_account_id = $1 AND credential_generation = $2
-               AND probe_lease_token = $3
+               AND transport_revision = $3
+               AND probe_lease_token = $4
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $2
+                   AND account.updated_at = $3
                )",
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(lease_token.to_string())
         .bind(next_epoch.to_string())
         .bind(now)
@@ -1084,32 +1369,78 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn release_upstream_account_probe(
+    #[cfg(test)]
+    pub(crate) async fn record_upstream_account_probe_success(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_probe_success_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            lease_token,
+        )
+        .await
+    }
+
+    pub(crate) async fn release_upstream_account_probe_at_revision(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
         lease_token: Uuid,
     ) -> Result<bool, AppError> {
         let result = sqlx::query(
             "UPDATE upstream_account_health
              SET probe_lease_until = 0, probe_lease_token = '', updated_at = $1
              WHERE upstream_account_id = $2 AND credential_generation = $3
-               AND probe_lease_token = $4
+               AND transport_revision = $4
+               AND probe_lease_token = $5
                AND consecutive_failures > 0 AND probe_lease_until > $1
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $3
+                   AND account.updated_at = $4
                )",
         )
         .bind(unix_millis())
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(lease_token.to_string())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn release_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.release_upstream_account_probe_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            lease_token,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -1119,19 +1450,26 @@ impl Database {
         credential_generation: i64,
         lease_token: Uuid,
     ) -> Result<bool, AppError> {
-        self.renew_upstream_account_probe_with_health_config(
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.renew_upstream_account_probe_at_revision_with_health_config(
             upstream_account_id,
             credential_generation,
+            transport_revision,
             lease_token,
             UpstreamHealthConfig::DEFAULT,
         )
         .await
     }
 
-    pub(crate) async fn renew_upstream_account_probe_with_health_config(
+    pub(crate) async fn renew_upstream_account_probe_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         lease_token: Uuid,
         health: UpstreamHealthConfig,
     ) -> Result<bool, AppError> {
@@ -1139,19 +1477,22 @@ impl Database {
         let result = sqlx::query(
             "UPDATE upstream_account_health SET probe_lease_until = $1, updated_at = $2
              WHERE upstream_account_id = $3 AND credential_generation = $4
-               AND probe_lease_token = $5
+               AND transport_revision = $5
+               AND probe_lease_token = $6
                AND consecutive_failures > 0
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $4
+                   AND account.updated_at = $5
                )",
         )
         .bind(now.saturating_add(health.probe_lease_millis))
         .bind(now)
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(lease_token.to_string())
         .execute(&self.pool)
         .await?;
@@ -1220,6 +1561,13 @@ mod tests {
         }
     }
 
+    fn enforced_failure_domains() -> UpstreamHealthConfig {
+        UpstreamHealthConfig {
+            failure_domain_enforcement_enabled: true,
+            ..UpstreamHealthConfig::DEFAULT
+        }
+    }
+
     #[tokio::test]
     async fn connection_health_requires_two_failure_domains_and_deduplicates_one_cohort() {
         let (_directory, database, account_id) = fixture().await;
@@ -1241,7 +1589,7 @@ mod tests {
                     "node-a",
                     "gateway-a",
                 ),
-                UpstreamHealthConfig::DEFAULT,
+                enforced_failure_domains(),
             )
             .await
             .unwrap();
@@ -1257,7 +1605,7 @@ mod tests {
                     "node-a",
                     "gateway-a-peer",
                 ),
-                UpstreamHealthConfig::DEFAULT,
+                enforced_failure_domains(),
             )
             .await
             .unwrap();
@@ -1285,7 +1633,7 @@ mod tests {
                     "node-b",
                     "gateway-b",
                 ),
-                UpstreamHealthConfig::DEFAULT,
+                enforced_failure_domains(),
             )
             .await
             .unwrap();
@@ -1293,10 +1641,164 @@ mod tests {
         assert!(second_domain.global_breaker_opened);
         assert!(
             database
-                .claim_upstream_account_attempt(account_id, 1)
+                .claim_upstream_account_attempt_at_revision_with_health_config(
+                    account_id,
+                    1,
+                    revision,
+                    enforced_failure_domains(),
+                )
                 .await
                 .unwrap()
                 .is_unavailable()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sqlite_domains_open_exactly_one_global_breaker() {
+        let (_directory, database, account_id) = fixture().await;
+        let revision = transport_revision(&database, account_id).await;
+        let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("healthy admission");
+        };
+        let first = database.clone();
+        let second = database.clone();
+        let (node_a, node_b) = tokio::join!(
+            first.record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-a",
+                    "gateway-a",
+                ),
+                enforced_failure_domains(),
+            ),
+            second.record_admitted_connection_failure_by_domain(
+                connection_failure(
+                    account_id,
+                    revision,
+                    failure_epoch,
+                    Uuid::now_v7(),
+                    "node-b",
+                    "gateway-b",
+                ),
+                enforced_failure_domains(),
+            ),
+        );
+        let outcomes = [node_a.unwrap(), node_b.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.global_breaker_opened)
+                .count(),
+            1
+        );
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    #[tokio::test]
+    async fn observe_rollout_ignores_legacy_single_domain_connection_breaker() {
+        let (_directory, database, account_id) = fixture().await;
+        assert!(
+            database
+                .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
+                .await
+                .unwrap()
+        );
+        assert!(
+            database
+                .claim_upstream_account_attempt(account_id, 1)
+                .await
+                .unwrap()
+                .is_healthy(),
+            "phase-one binaries must remain available while legacy replicas can write global connection breakers"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_revision_success_cannot_clear_current_revision_health() {
+        let (_directory, database, account_id) = fixture().await;
+        let old_revision = transport_revision(&database, account_id).await;
+        let UpstreamAttemptAdmission::Healthy {
+            failure_epoch: old_epoch,
+        } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("old healthy admission");
+        };
+        let new_revision = old_revision + 1;
+        sqlx::query("UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2")
+            .bind(new_revision)
+            .bind(account_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let UpstreamAttemptAdmission::Healthy {
+            failure_epoch: new_epoch,
+        } = database
+            .claim_upstream_account_attempt_at_revision_with_health_config(
+                account_id,
+                1,
+                new_revision,
+                UpstreamHealthConfig::DEFAULT,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("new healthy admission");
+        };
+        assert!(
+            database
+                .record_admitted_upstream_account_failure_at_revision(
+                    account_id,
+                    1,
+                    new_revision,
+                    UpstreamFailureKind::Unavailable,
+                    UpstreamHealthConfig::DEFAULT,
+                    new_epoch,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .record_upstream_account_success_at_revision(
+                    account_id,
+                    1,
+                    old_revision,
+                    old_epoch,
+                )
+                .await
+                .unwrap()
+        );
+        let row = sqlx::query(
+            "SELECT transport_revision, last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.try_get::<i64, _>("transport_revision").unwrap(),
+            new_revision
+        );
+        assert_eq!(
+            row.try_get::<String, _>("last_failure_kind").unwrap(),
+            "unavailable"
         );
     }
 

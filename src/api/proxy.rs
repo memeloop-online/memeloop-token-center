@@ -304,10 +304,11 @@ async fn next_sendable_proxy_route(
         {
             state
                 .db
-                .claim_upstream_account_attempt_with_strategy(
+                .claim_upstream_account_attempt_at_revision_with_strategy(
                     snapshot.tenant_id,
                     planned.route.account_id,
                     planned.route.credential_generation,
+                    planned.route.transport_revision,
                     state.config.upstream_health,
                     allow_probe,
                     Some(cooldown_ms),
@@ -317,9 +318,10 @@ async fn next_sendable_proxy_route(
         } else {
             state
                 .db
-                .claim_upstream_account_attempt_with_health_config(
+                .claim_upstream_account_attempt_at_revision_with_health_config(
                     planned.route.account_id,
                     planned.route.credential_generation,
+                    planned.route.transport_revision,
                     state.config.upstream_health,
                 )
                 .await?
@@ -443,6 +445,7 @@ async fn next_sendable_proxy_route(
             state,
             planned.route.account_id,
             planned.route.credential_generation,
+            planned.route.transport_revision,
             transport_policy.shared_probe_attempts,
         )
         .await?
@@ -735,10 +738,11 @@ async fn execute_component_primary(
         request
             .state
             .db
-            .claim_upstream_account_attempt_with_strategy(
+            .claim_upstream_account_attempt_at_revision_with_strategy(
                 snapshot.tenant_id,
                 primary.route.account_id,
                 primary.route.credential_generation,
+                primary.route.transport_revision,
                 request.state.config.upstream_health,
                 allow_probe,
                 Some(cooldown_ms),
@@ -749,9 +753,10 @@ async fn execute_component_primary(
         request
             .state
             .db
-            .claim_upstream_account_attempt_with_health_config(
+            .claim_upstream_account_attempt_at_revision_with_health_config(
                 primary.route.account_id,
                 primary.route.credential_generation,
+                primary.route.transport_revision,
                 request.state.config.upstream_health,
             )
             .await?

@@ -200,6 +200,48 @@ impl Database {
     /// A valid probe that has not yet met an explicitly active v2 recovery
     /// threshold releases only its exact lease. It leaves hard state intact
     /// and schedules the next bounded probe without replaying this request.
+    pub(crate) async fn defer_upstream_account_probe_recovery_at_revision(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+        lease_token: Uuid,
+        cooldown_millis: u64,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        self.adopt_legacy_health_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+        )
+        .await?;
+        let result = sqlx::query(
+            "UPDATE upstream_account_health
+                SET cooldown_until = $1, probe_lease_until = 0,
+                    probe_lease_token = '', updated_at = $2
+              WHERE upstream_account_id = $3 AND credential_generation = $4
+                AND transport_revision = $5
+                AND consecutive_failures > 0 AND probe_lease_token = $6
+                AND EXISTS (
+                    SELECT 1 FROM upstream_accounts account
+                     WHERE account.id = upstream_account_health.upstream_account_id
+                       AND account.status = 'active'
+                       AND account.credential_generation = $4
+                       AND account.updated_at = $5
+                )",
+        )
+        .bind(now.saturating_add(cooldown_millis.min(60_000) as i64))
+        .bind(now)
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn defer_upstream_account_probe_recovery(
         &self,
         upstream_account_id: Uuid,
@@ -207,49 +249,44 @@ impl Database {
         lease_token: Uuid,
         cooldown_millis: u64,
     ) -> Result<bool, AppError> {
-        let now = unix_millis();
-        let result = sqlx::query(
-            "UPDATE upstream_account_health
-                SET cooldown_until = $1, probe_lease_until = 0,
-                    probe_lease_token = '', updated_at = $2
-              WHERE upstream_account_id = $3 AND credential_generation = $4
-                AND consecutive_failures > 0 AND probe_lease_token = $5
-                AND EXISTS (
-                    SELECT 1 FROM upstream_accounts account
-                     WHERE account.id = upstream_account_health.upstream_account_id
-                       AND account.status = 'active'
-                       AND account.credential_generation = $4
-                )",
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.defer_upstream_account_probe_recovery_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            lease_token,
+            cooldown_millis,
         )
-        .bind(now.saturating_add(cooldown_millis.min(60_000) as i64))
-        .bind(now)
-        .bind(upstream_account_id.to_string())
-        .bind(credential_generation)
-        .bind(lease_token.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        .await
     }
 
-    pub(crate) async fn group_routing_health(
+    pub(crate) async fn group_routing_health_at_revision(
         &self,
         tenant_id: Uuid,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
     ) -> Result<Option<GroupRoutingHealth>, AppError> {
         let row = sqlx::query(
             "SELECT health.consecutive_failures, health.last_failure_kind,
                     health.cooldown_until, health.probe_lease_until, health.updated_at
              FROM upstream_accounts account
              LEFT JOIN upstream_account_health health
-               ON health.upstream_account_id = account.id
+              ON health.upstream_account_id = account.id
               AND health.credential_generation = $3
+              AND health.transport_revision = $4
              WHERE account.id = $1 AND account.tenant_id = $2
-               AND account.status = 'active' AND account.credential_generation = $3",
+               AND account.status = 'active' AND account.credential_generation = $3
+               AND account.updated_at = $4",
         )
         .bind(upstream_account_id.to_string())
         .bind(tenant_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
@@ -272,20 +309,48 @@ impl Database {
         .transpose()
     }
 
-    /// Policy affects only this admission, never stored cooldowns. Even a zero
-    /// override must acquire the existing cross-process exclusive probe lease.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn claim_upstream_account_attempt_with_strategy(
+    #[cfg(test)]
+    pub(crate) async fn group_routing_health(
         &self,
         tenant_id: Uuid,
         upstream_account_id: Uuid,
         credential_generation: i64,
+    ) -> Result<Option<GroupRoutingHealth>, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.group_routing_health_at_revision(
+            tenant_id,
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+        )
+        .await
+    }
+
+    /// Policy affects only this admission, never stored cooldowns. Even a zero
+    /// override must acquire the existing cross-process exclusive probe lease.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_upstream_account_attempt_at_revision_with_strategy(
+        &self,
+        tenant_id: Uuid,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
         health: UpstreamHealthConfig,
         allow_transient_probe: bool,
         cooldown_override_ms: Option<u64>,
         transient_only: bool,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
+        self.adopt_legacy_health_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+        )
+        .await?;
         let unavailable = |cooldown_until, probe_lease_until, transient_wait_eligible| {
             UpstreamAttemptAdmission::Unavailable {
                 cooldown_until,
@@ -295,7 +360,12 @@ impl Database {
             }
         };
         let Some(snapshot) = self
-            .group_routing_health(tenant_id, upstream_account_id, credential_generation)
+            .group_routing_health_at_revision(
+                tenant_id,
+                upstream_account_id,
+                credential_generation,
+                transport_revision,
+            )
             .await?
         else {
             return Ok(unavailable(0, 0, false));
@@ -303,7 +373,13 @@ impl Database {
         if snapshot.consecutive_failures == 0 {
             return Ok(
                 match self
-                    .ensure_healthy_admission_epoch(upstream_account_id, credential_generation, now)
+                    .ensure_healthy_admission_epoch(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        now,
+                        health,
+                    )
                     .await?
                 {
                     Some(failure_epoch) => UpstreamAttemptAdmission::Healthy { failure_epoch },
@@ -312,6 +388,24 @@ impl Database {
             );
         }
         let transient = snapshot.is_transient();
+        if snapshot.last_failure_kind == "connection" && !health.failure_domain_enforcement_enabled
+        {
+            return Ok(
+                match self
+                    .ensure_healthy_admission_epoch(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        now,
+                        health,
+                    )
+                    .await?
+                {
+                    Some(failure_epoch) => UpstreamAttemptAdmission::Healthy { failure_epoch },
+                    None => unavailable(0, 0, true),
+                },
+            );
+        }
         let cooldown = snapshot.effective_cooldown_until(cooldown_override_ms);
         let wait_eligible = matches!(
             snapshot.last_failure_kind.as_str(),
@@ -333,6 +427,7 @@ impl Database {
             "UPDATE upstream_account_health
              SET probe_lease_until = $1, probe_lease_token = $2, updated_at = $3
              WHERE upstream_account_id = $4 AND credential_generation = $5
+               AND transport_revision = $13
                AND consecutive_failures = $6 AND consecutive_failures > 0
                AND last_failure_kind = $7 AND updated_at = $8
                AND cooldown_until = $9 AND probe_lease_until <= $3
@@ -342,7 +437,8 @@ impl Database {
                AND EXISTS (SELECT 1 FROM upstream_accounts account
                    WHERE account.id = upstream_account_health.upstream_account_id
                      AND account.tenant_id = $12 AND account.status = 'active'
-                     AND account.credential_generation = $5)",
+                     AND account.credential_generation = $5
+                     AND account.updated_at = $13)",
         )
         .bind(now.saturating_add(health.probe_lease_millis))
         .bind(lease_token.to_string())
@@ -358,6 +454,7 @@ impl Database {
         ))
         .bind(cooldown)
         .bind(tenant_id.to_string())
+        .bind(transport_revision)
         .execute(&self.pool)
         .await?;
         Ok(if result.rows_affected() == 1 {
@@ -365,6 +462,36 @@ impl Database {
         } else {
             unavailable(cooldown, snapshot.probe_lease_until, wait_eligible)
         })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_upstream_account_attempt_with_strategy(
+        &self,
+        tenant_id: Uuid,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        health: UpstreamHealthConfig,
+        allow_transient_probe: bool,
+        cooldown_override_ms: Option<u64>,
+        transient_only: bool,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.claim_upstream_account_attempt_at_revision_with_strategy(
+            tenant_id,
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            health,
+            allow_transient_probe,
+            cooldown_override_ms,
+            transient_only,
+        )
+        .await
     }
 }
 

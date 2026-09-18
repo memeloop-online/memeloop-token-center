@@ -495,6 +495,7 @@ pub(in crate::api::proxy) async fn join_shared_probe(
     state: &AppState,
     upstream_account_id: Uuid,
     credential_generation: i64,
+    transport_revision: i64,
     shared_probe_attempts: u32,
 ) -> Result<Option<(UpstreamAttemptAdmission, SharedProbePermit)>, AppError> {
     let Some(permit) = try_shared_probe_permit(
@@ -506,7 +507,11 @@ pub(in crate::api::proxy) async fn join_shared_probe(
     };
     let Some(admission) = state
         .db
-        .join_upstream_account_probe(upstream_account_id, credential_generation)
+        .join_upstream_account_probe_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+        )
         .await?
     else {
         return Ok(None);
@@ -549,7 +554,6 @@ pub(crate) struct UpstreamAttemptGuard {
     credential_generation: i64,
     transport_revision: i64,
     gateway_identity: GatewayFailureDomainIdentity,
-    failure_domain_isolation: bool,
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
@@ -568,7 +572,6 @@ struct UpstreamAttemptRecord {
     credential_generation: i64,
     transport_revision: i64,
     gateway_identity: GatewayFailureDomainIdentity,
-    failure_domain_isolation: bool,
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
@@ -587,55 +590,7 @@ impl UpstreamAttemptGuard {
         admission: UpstreamAttemptAdmission,
         shared_probe_permit: Option<SharedProbePermit>,
     ) -> Self {
-        Self::new_with_failure_domain_isolation(
-            state,
-            request_id,
-            route_id,
-            upstream_account_id,
-            credential_generation,
-            transport_revision,
-            admission,
-            shared_probe_permit,
-            true,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_media(
-        state: &AppState,
-        request_id: Uuid,
-        route_id: Uuid,
-        upstream_account_id: Uuid,
-        credential_generation: i64,
-        transport_revision: i64,
-        admission: UpstreamAttemptAdmission,
-        shared_probe_permit: Option<SharedProbePermit>,
-    ) -> Self {
-        Self::new_with_failure_domain_isolation(
-            state,
-            request_id,
-            route_id,
-            upstream_account_id,
-            credential_generation,
-            transport_revision,
-            admission,
-            shared_probe_permit,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_failure_domain_isolation(
-        state: &AppState,
-        request_id: Uuid,
-        route_id: Uuid,
-        upstream_account_id: Uuid,
-        credential_generation: i64,
-        transport_revision: i64,
-        admission: UpstreamAttemptAdmission,
-        shared_probe_permit: Option<SharedProbePermit>,
-        failure_domain_isolation: bool,
-    ) -> Self {
+        let state = state;
         let (lease_token, failure_epoch) = match admission {
             UpstreamAttemptAdmission::Probe { lease_token }
             | UpstreamAttemptAdmission::SharedProbe { lease_token } => (Some(lease_token), None),
@@ -664,9 +619,10 @@ impl UpstreamAttemptGuard {
                             upstream_health,
                         )) => {
                             match database
-                                .renew_upstream_account_probe_with_health_config(
+                                .renew_upstream_account_probe_at_revision_with_health_config(
                                     upstream_account_id,
                                     credential_generation,
+                                    transport_revision,
                                     lease_token,
                                     upstream_health,
                                 )
@@ -698,7 +654,6 @@ impl UpstreamAttemptGuard {
             credential_generation,
             transport_revision,
             gateway_identity: gateway_failure_domain_identity(),
-            failure_domain_isolation,
             failure_epoch,
             lease_token,
             owns_probe_lease,
@@ -731,9 +686,10 @@ impl UpstreamAttemptGuard {
             {
                 state
                     .db
-                    .record_upstream_account_probe_delivery(
+                    .record_upstream_account_probe_delivery_at_revision(
                         self.upstream_account_id,
                         self.credential_generation,
+                        self.transport_revision,
                         token,
                     )
                     .await
@@ -744,9 +700,10 @@ impl UpstreamAttemptGuard {
                 // a later owner failure cannot overwrite this proven success.
                 state
                     .db
-                    .record_upstream_account_probe_success(
+                    .record_upstream_account_probe_success_at_revision(
                         self.upstream_account_id,
                         self.credential_generation,
+                        self.transport_revision,
                         token,
                     )
                     .await
@@ -794,7 +751,6 @@ impl UpstreamAttemptGuard {
                 credential_generation: self.credential_generation,
                 transport_revision: self.transport_revision,
                 gateway_identity: self.gateway_identity.clone(),
-                failure_domain_isolation: self.failure_domain_isolation,
                 failure_epoch: self.failure_epoch,
                 lease_token: self.lease_token,
                 owns_probe_lease: self.owns_probe_lease,
@@ -833,9 +789,10 @@ impl UpstreamAttemptGuard {
         {
             let _ = state
                 .db
-                .release_upstream_account_probe(
+                .release_upstream_account_probe_at_revision(
                     self.upstream_account_id,
                     self.credential_generation,
+                    self.transport_revision,
                     token,
                 )
                 .await;
@@ -861,7 +818,6 @@ impl Drop for UpstreamAttemptGuard {
         let credential_generation = self.credential_generation;
         let transport_revision = self.transport_revision;
         let gateway_identity = self.gateway_identity.clone();
-        let failure_domain_isolation = self.failure_domain_isolation;
         let failure_epoch = self.failure_epoch;
         let lease_token = self.lease_token;
         let owns_probe_lease = self.owns_probe_lease;
@@ -880,7 +836,6 @@ impl Drop for UpstreamAttemptGuard {
                     credential_generation,
                     transport_revision,
                     gateway_identity,
-                    failure_domain_isolation,
                     failure_epoch,
                     lease_token,
                     owns_probe_lease,
@@ -902,7 +857,6 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         credential_generation,
         transport_revision,
         gateway_identity,
-        failure_domain_isolation,
         failure_epoch,
         lease_token,
         owns_probe_lease,
@@ -965,16 +919,15 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
-            if failure_domain_isolation
-                && let Err(error) = state
-                    .db
-                    .clear_upstream_connection_failure_domain(
-                        upstream_account_id,
-                        credential_generation,
-                        transport_revision,
-                        &gateway_identity.failure_domain,
-                    )
-                    .await
+            if let Err(error) = state
+                .db
+                .clear_upstream_connection_failure_domain(
+                    upstream_account_id,
+                    credential_generation,
+                    transport_revision,
+                    &gateway_identity.failure_domain,
+                )
+                .await
             {
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="connection_failure_domain_recovery", "failed to clear recovered gateway failure domain");
             }
@@ -1003,9 +956,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     );
                     if let Err(error) = state
                         .db
-                        .defer_upstream_account_probe_recovery(
+                        .defer_upstream_account_probe_recovery_at_revision(
                             upstream_account_id,
                             credential_generation,
+                            transport_revision,
                             lease_token,
                             cooldown.max(0) as u64,
                         )
@@ -1021,9 +975,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     Some(lease_token) => {
                         state
                             .db
-                            .record_upstream_account_probe_success(
+                            .record_upstream_account_probe_success_at_revision(
                                 upstream_account_id,
                                 credential_generation,
+                                transport_revision,
                                 lease_token,
                             )
                             .await
@@ -1034,9 +989,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         };
                         state
                             .db
-                            .record_upstream_account_success(
+                            .record_upstream_account_success_at_revision(
                                 upstream_account_id,
                                 credential_generation,
+                                transport_revision,
                                 failure_epoch,
                             )
                             .await
@@ -1065,9 +1021,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 && let Some(lease_token) = lease_token
                 && let Err(error) = state
                     .db
-                    .release_upstream_account_probe(
+                    .release_upstream_account_probe_at_revision(
                         upstream_account_id,
                         credential_generation,
+                        transport_revision,
                         lease_token,
                     )
                     .await
@@ -1143,9 +1100,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 Some(lease_token) => {
                     state
                         .db
-                        .record_upstream_account_probe_failure_with_health_config(
+                        .record_upstream_account_probe_failure_at_revision_with_health_config(
                             upstream_account_id,
                             credential_generation,
+                            transport_revision,
                             lease_token,
                             kind,
                             health,
@@ -1153,39 +1111,35 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         .await
                 }
                 None => match failure_epoch {
-                    Some(failure_epoch)
-                        if failure_domain_isolation && kind == UpstreamFailureKind::Connection =>
-                    {
-                        state
-                            .db
-                            .record_admitted_connection_failure_by_domain(
-                                crate::db::AdmittedConnectionFailure {
-                                    request_id,
-                                    upstream_account_id,
-                                    credential_generation,
-                                    transport_revision,
-                                    failure_epoch,
-                                    failure_stage,
-                                    gateway_pod: &gateway_identity.pod,
-                                    gateway_node: gateway_identity.node.as_deref(),
-                                    failure_domain: &gateway_identity.failure_domain,
-                                },
-                                health,
-                            )
-                            .await
-                            .map(|result| {
-                                tracing::warn!(
-                                    %request_id,
-                                    %upstream_account_id,
-                                    failure_domain = %gateway_identity.failure_domain,
-                                    distinct_failure_domains = result.distinct_failure_domains,
-                                    global_breaker_opened = result.global_breaker_opened,
-                                    stage = "connection_failure_domain_health",
-                                    "recorded failure-domain connection evidence"
-                                );
-                                result.global_breaker_opened
-                            })
-                    }
+                    Some(failure_epoch) if kind == UpstreamFailureKind::Connection => state
+                        .db
+                        .record_admitted_connection_failure_by_domain(
+                            crate::db::AdmittedConnectionFailure {
+                                request_id,
+                                upstream_account_id,
+                                credential_generation,
+                                transport_revision,
+                                failure_epoch,
+                                failure_stage,
+                                gateway_pod: &gateway_identity.pod,
+                                gateway_node: gateway_identity.node.as_deref(),
+                                failure_domain: &gateway_identity.failure_domain,
+                            },
+                            health,
+                        )
+                        .await
+                        .map(|result| {
+                            tracing::warn!(
+                                %request_id,
+                                %upstream_account_id,
+                                failure_domain = %gateway_identity.failure_domain,
+                                distinct_failure_domains = result.distinct_failure_domains,
+                                global_breaker_opened = result.global_breaker_opened,
+                                stage = "connection_failure_domain_health",
+                                "recorded failure-domain connection evidence"
+                            );
+                            result.global_breaker_opened
+                        }),
                     Some(failure_epoch)
                         if matches!(
                             kind,
@@ -1196,9 +1150,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     {
                         state
                             .db
-                            .record_admitted_upstream_account_failure(
+                            .record_admitted_upstream_account_failure_at_revision(
                                 upstream_account_id,
                                 credential_generation,
+                                transport_revision,
                                 kind,
                                 health,
                                 failure_epoch,
@@ -1208,9 +1163,10 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     _ => {
                         state
                             .db
-                            .record_upstream_account_failure_with_health_config(
+                            .record_upstream_account_failure_at_revision_with_health_config(
                                 upstream_account_id,
                                 credential_generation,
+                                transport_revision,
                                 kind,
                                 health,
                             )

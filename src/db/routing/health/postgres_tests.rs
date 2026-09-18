@@ -31,6 +31,65 @@ async fn fixture() -> Option<(Database, Uuid, Uuid)> {
 }
 
 #[tokio::test]
+async fn postgres_concurrent_failure_domains_open_one_global_breaker() {
+    let Some((database, _tenant_id, account_id)) = fixture().await else {
+        return;
+    };
+    let revision: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+            .bind(account_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let UpstreamAttemptAdmission::Healthy { failure_epoch } = database
+        .claim_upstream_account_attempt(account_id, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("healthy admission");
+    };
+    let health = UpstreamHealthConfig {
+        failure_domain_enforcement_enabled: true,
+        ..UpstreamHealthConfig::DEFAULT
+    };
+    let node_a = database.clone();
+    let node_b = database.clone();
+    let failure = |domain: &'static str, pod: &'static str| AdmittedConnectionFailure {
+        request_id: Uuid::now_v7(),
+        upstream_account_id: account_id,
+        credential_generation: 1,
+        transport_revision: revision,
+        failure_epoch,
+        failure_stage: "proxy_connect",
+        gateway_pod: pod,
+        gateway_node: Some(domain),
+        failure_domain: domain,
+    };
+    let (first, second) = tokio::join!(
+        node_a
+            .record_admitted_connection_failure_by_domain(failure("node-a", "gateway-a"), health,),
+        node_b
+            .record_admitted_connection_failure_by_domain(failure("node-b", "gateway-b"), health,),
+    );
+    let outcomes = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| result.global_breaker_opened)
+            .count(),
+        1
+    );
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT consecutive_failures FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(failures, 1);
+}
+
+#[tokio::test]
 async fn failure_upsert_fences_generation_and_active_probe() {
     let Some((database, tenant_id, account_id)) = fixture().await else {
         return;

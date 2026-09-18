@@ -82,6 +82,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.upstreamHealth.invalidResponseCooldownMillis | quote }}
 - name: MTC_UPSTREAM_HEALTH_CONNECTION_COOLDOWN_MILLIS
   value: {{ .Values.config.upstreamHealth.connectionCooldownMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_FAILURE_DOMAIN_ENFORCEMENT_ENABLED
+  value: {{ .Values.config.upstreamHealth.failureDomainEnforcementEnabled | quote }}
 - name: MTC_KEY_PEPPER
   valueFrom:
     secretKeyRef:

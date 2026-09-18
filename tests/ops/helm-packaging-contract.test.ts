@@ -51,6 +51,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
       profiling: render('profiling', ['--show-only', 'templates/deployment.yaml', '--set', 'config.runtimeProfiling.enabled=true']),
       archiveCompression: render('archive-compression', ['--show-only', 'templates/deployment.yaml', '--set', 'config.archiveSpoolCompression.enabled=true', '--set', 'config.archiveObjectCompression.enabled=true']),
+      failureDomainEnforced: render('failure-domain-enforced', ['--show-only', 'templates/deployment.yaml', '--set', 'config.upstreamHealth.failureDomainEnforcementEnabled=true']),
       digest: render('digest', ['--set-string', 'image.tag=must-not-render', '--set-string', `image.digest=${reviewed}`]),
       retainedWorker: render('retained-worker', [...runtimeFlags, '--set-string', `image.digest=${reviewed}`, '--set-string', 'roles.worker.image.repository=ghcr.io/memeloop-online/memeloop-token-center', '--set-string', `roles.worker.image.digest=${artifact}`]),
       configmap: render('configmap-plugin', ['--set', 'plugins.enabled=true', '--set', 'plugins.existingConfigMap=token-center-plugins']),
@@ -174,7 +175,9 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('default', 'name: MTC_RUN_MIGRATIONS_ON_START', 3); has('default', 'args: ["migrate"]'); has('migration', 'restartPolicy: Never'); has('migration', '- name: registry-credentials');
     count('default', 'name: MTC_ARCHIVE_BACKEND', 3); count('default', 'value: "s3"', 3); lacks('default', 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET'); has('webhook', 'name: memeloop-cloud-integration'); has('webhook', 'key: webhook-secret');
     count('default', 'name: MTC_GATEWAY_BODY_READ_CONCURRENCY', 3); count('default', 'value: "1024"', 3);
-    for (const identity of ['MTC_GATEWAY_POD_NAME', 'MTC_GATEWAY_NODE_NAME', 'MTC_GATEWAY_FAILURE_DOMAIN']) count('default', `name: ${identity}`, 1);
+    for (const identity of ['MTC_GATEWAY_POD_NAME', 'MTC_GATEWAY_NODE_NAME', 'MTC_GATEWAY_FAILURE_DOMAIN']) count('default', `name: ${identity}`, 3);
+    count('default', /name: MTC_UPSTREAM_HEALTH_FAILURE_DOMAIN_ENFORCEMENT_ENABLED\n\s+value: "false"/, 3);
+    count('failureDomainEnforced', /name: MTC_UPSTREAM_HEALTH_FAILURE_DOMAIN_ENFORCEMENT_ENABLED\n\s+value: "true"/, 3);
     count('default', 'name: MTC_RESPONSES_BODY_MAX_BYTES', 3); count('default', 'value: "33554432"', 3); count('default', 'name: MTC_RESPONSES_BODY_READ_CONCURRENCY', 3);
     count('default', 'name: MTC_AUDIO_BODY_MAX_BYTES', 3); count('default', 'value: "26214400"', 3);
     count('default', /name: MTC_RUNTIME_PROFILING_ENABLED\n\s+value: "false"/, 1);

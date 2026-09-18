@@ -134,10 +134,11 @@ pub(crate) async fn admit(
     {
         state
             .db
-            .claim_upstream_account_attempt_with_strategy(
+            .claim_upstream_account_attempt_at_revision_with_strategy(
                 tenant_id,
                 route.account_id,
                 route.credential_generation,
+                route.transport_revision,
                 state.config.upstream_health,
                 allow_probe,
                 Some(cooldown_ms),
@@ -147,9 +148,10 @@ pub(crate) async fn admit(
     } else {
         state
             .db
-            .claim_upstream_account_attempt_with_health_config(
+            .claim_upstream_account_attempt_at_revision_with_health_config(
                 route.account_id,
                 route.credential_generation,
+                route.transport_revision,
                 state.config.upstream_health,
             )
             .await?
@@ -180,7 +182,7 @@ pub(crate) async fn admit(
         UpstreamAttemptAdmission::Unavailable { .. } => {
             Err(AppError::Upstream("generation upstream is isolated".into()))
         }
-        admission => Ok(MediaAttemptGuard::new_media(
+        admission => Ok(MediaAttemptGuard::new(
             state,
             request_id,
             route.route_id,

@@ -227,10 +227,11 @@ pub(crate) async fn wait(
                 {
                     state
                         .db
-                        .claim_upstream_account_attempt_with_strategy(
+                        .claim_upstream_account_attempt_at_revision_with_strategy(
                             snapshot.tenant_id,
                             route.account_id,
                             route.credential_generation,
+                            route.transport_revision,
                             state.config.upstream_health,
                             allow_probe,
                             Some(cooldown_ms),
@@ -240,9 +241,10 @@ pub(crate) async fn wait(
                 } else {
                     state
                         .db
-                        .claim_transient_recovery_attempt(
+                        .claim_transient_recovery_attempt_at_revision(
                             route.account_id,
                             route.credential_generation,
+                            route.transport_revision,
                             state.config.upstream_health,
                         )
                         .await?

@@ -40,6 +40,10 @@ pub struct UpstreamHealthConfig {
     pub unavailable_cooldown_millis: i64,
     pub invalid_response_cooldown_millis: i64,
     pub connection_cooldown_millis: i64,
+    /// Phase-two switch for cross-domain connection breaker enforcement.
+    /// Keep disabled while any pre-v108 runtime may still write the legacy
+    /// account-global connection breaker.
+    pub failure_domain_enforcement_enabled: bool,
 }
 
 impl UpstreamHealthConfig {
@@ -51,6 +55,7 @@ impl UpstreamHealthConfig {
         unavailable_cooldown_millis: 15_000,
         invalid_response_cooldown_millis: 15_000,
         connection_cooldown_millis: 5_000,
+        failure_domain_enforcement_enabled: false,
     };
 
     fn from_env() -> Result<Self, ConfigError> {
@@ -83,6 +88,10 @@ impl UpstreamHealthConfig {
                 "MTC_UPSTREAM_HEALTH_CONNECTION_COOLDOWN_MILLIS",
                 Self::DEFAULT.connection_cooldown_millis,
             )?,
+            failure_domain_enforcement_enabled: env_bool(
+                "MTC_UPSTREAM_HEALTH_FAILURE_DOMAIN_ENFORCEMENT_ENABLED",
+                Self::DEFAULT.failure_domain_enforcement_enabled,
+            ),
         };
         config.validate()?;
         Ok(config)

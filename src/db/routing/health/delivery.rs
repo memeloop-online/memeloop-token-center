@@ -5,10 +5,11 @@ impl Database {
     /// but not final usage/settlement. Retain the token as a terminal fence:
     /// a newer failure replaces it, so this long stream cannot later clear or
     /// overwrite that failure. No schema or credential generation is changed.
-    pub(crate) async fn record_upstream_account_probe_delivery(
+    pub(crate) async fn record_upstream_account_probe_delivery_at_revision(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+        transport_revision: i64,
         lease_token: Uuid,
     ) -> Result<bool, AppError> {
         let now = unix_millis();
@@ -17,22 +18,46 @@ impl Database {
              SET consecutive_failures = 0, cooldown_until = 0,
                  probe_lease_until = 0, last_failure_kind = '', updated_at = $1
              WHERE upstream_account_id = $2 AND credential_generation = $3
-               AND probe_lease_token = $4 AND probe_lease_until > $1
+               AND transport_revision = $4
+               AND probe_lease_token = $5 AND probe_lease_until > $1
                AND consecutive_failures > 0
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id
                    AND account.status = 'active'
                    AND account.credential_generation = $3
+                   AND account.updated_at = $4
                )",
         )
         .bind(now)
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
+        .bind(transport_revision)
         .bind(lease_token.to_string())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_upstream_account_probe_delivery(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let transport_revision: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(upstream_account_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        self.record_upstream_account_probe_delivery_at_revision(
+            upstream_account_id,
+            credential_generation,
+            transport_revision,
+            lease_token,
+        )
+        .await
     }
 }
 
