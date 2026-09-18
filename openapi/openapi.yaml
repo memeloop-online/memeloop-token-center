@@ -7863,6 +7863,7 @@ components:
         passive_health: { $ref: '#/components/schemas/ModelPickerHealthEvidence' }
     UpstreamModelCatalog:
       type: object
+      description: Internal v1 additive response update. Clients with strict unknown-field validators must update their schema before adopting the server release that adds disabled_models and the sync-only price_sync field; legacy clients that ignore unknown response properties retain their active-model semantics.
       additionalProperties: false
       required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models, disabled_models]
       properties:

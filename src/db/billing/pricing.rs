@@ -142,97 +142,114 @@ impl Database {
         source: &str,
         cache_price_estimated: bool,
     ) -> Result<ModelPriceView, AppError> {
-        validate_currency(currency)?;
-        validate_service_tier(service_tier)?;
-        if !matches!(source, "models.dev" | "litellm" | "openrouter") {
-            return Err(AppError::BadRequest("unsupported price source".into()));
-        }
-        let input_micros = decimal_to_micros(input_per_million)?;
-        let cached_input_micros = decimal_to_micros(cached_input_per_million)?;
-        let cache_write_micros = decimal_to_micros(cache_write_per_million)?;
-        let output_micros = decimal_to_micros(output_per_million)?;
-        if [
-            input_micros,
-            cached_input_micros,
-            cache_write_micros,
-            output_micros,
-        ]
+        self.upsert_synced_model_price_tiers(
+            currency,
+            &[crate::pricing::SyncedModelPriceInput {
+                model: model.to_owned(),
+                service_tier: service_tier.to_owned(),
+                input_per_million,
+                cached_input_per_million,
+                cache_write_per_million,
+                output_per_million,
+                source: source.to_owned(),
+                cache_price_estimated,
+            }],
+        )
+        .await?
         .into_iter()
-        .any(|price| price < 0)
-        {
+        .next()
+        .ok_or(AppError::Internal)
+    }
+
+    /// One bounded write transaction and one joined read per batch. Conditional
+    /// conflicts preserve operator edits committed after the syncer's earlier read.
+    pub(crate) async fn upsert_synced_model_price_tiers(
+        &self,
+        currency: &str,
+        prices: &[crate::pricing::SyncedModelPriceInput],
+    ) -> Result<Vec<ModelPriceView>, AppError> {
+        validate_currency(currency)?;
+        if prices.len() > crate::pricing::MAX_SYNC_MODELS {
             return Err(AppError::BadRequest(
-                "model prices cannot be negative".into(),
+                "model price write batch is too large".into(),
             ));
         }
+        if prices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut models = std::collections::BTreeSet::new();
+        let mut rows = Vec::with_capacity(prices.len());
+        for price in prices {
+            validate_service_tier(&price.service_tier)?;
+            if !matches!(
+                price.source.as_str(),
+                "models.dev" | "litellm" | "openrouter"
+            ) {
+                return Err(AppError::BadRequest("unsupported price source".into()));
+            }
+            if !models.insert(price.model.clone()) {
+                return Err(AppError::BadRequest(
+                    "duplicate model in price write batch".into(),
+                ));
+            }
+            let input = decimal_to_micros(price.input_per_million)?;
+            let cached = decimal_to_micros(price.cached_input_per_million)?;
+            let cache_write = decimal_to_micros(price.cache_write_per_million)?;
+            let output = decimal_to_micros(price.output_per_million)?;
+            if [input, cached, cache_write, output]
+                .into_iter()
+                .any(|price| price < 0)
+            {
+                return Err(AppError::BadRequest(
+                    "model prices cannot be negative".into(),
+                ));
+            }
+            rows.push(serde_json::json!({
+                "id": Uuid::now_v7().to_string(),
+                "tier_id": Uuid::now_v7().to_string(),
+                "model": price.model,
+                "service_tier": price.service_tier,
+                "input_micros": input,
+                "cached_micros": cached,
+                "cache_write_micros": cache_write,
+                "output_micros": output,
+                "source": price.source,
+                "cache_price_estimated": i64::from(price.cache_price_estimated),
+            }));
+        }
+        let input_json = serde_json::to_string(&rows).map_err(|_| AppError::Internal)?;
+        let input_sql = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "WITH incoming AS (SELECT * FROM jsonb_to_recordset(CAST($1 AS jsonb)) AS price(id TEXT, tier_id TEXT, model TEXT, service_tier TEXT, input_micros BIGINT, cached_micros BIGINT, cache_write_micros BIGINT, output_micros BIGINT, source TEXT, cache_price_estimated BIGINT))"
+            }
+            DatabaseBackend::Sqlite => {
+                "WITH incoming AS (SELECT json_extract(value, '$.id') AS id, json_extract(value, '$.tier_id') AS tier_id, json_extract(value, '$.model') AS model, json_extract(value, '$.service_tier') AS service_tier, json_extract(value, '$.input_micros') AS input_micros, json_extract(value, '$.cached_micros') AS cached_micros, json_extract(value, '$.cache_write_micros') AS cache_write_micros, json_extract(value, '$.output_micros') AS output_micros, json_extract(value, '$.source') AS source, json_extract(value, '$.cache_price_estimated') AS cache_price_estimated FROM json_each($1))"
+            }
+        };
+        // These are constant SQL fragments, never data-derived SQL. Every price
+        // and identity enters through the bound JSON recordset on both backends.
+        const WRITES: [&str; 4] = [
+            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) SELECT id, model, $2, input_micros, output_micros, source, $3 FROM incoming WHERE service_tier = 'default' ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at WHERE model_prices.source <> 'manual'",
+            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) SELECT id, model, $2, input_micros, output_micros, source, $3 FROM incoming WHERE service_tier <> 'default' ON CONFLICT(model, currency) DO NOTHING",
+            // A newly inserted non-default price seeds the default tier once;
+            // an existing base/default price is never altered by this bootstrap.
+            "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) SELECT incoming.id, incoming.model, $2, 'default', incoming.input_micros, incoming.cached_micros, incoming.cache_write_micros, incoming.output_micros, incoming.source, $3, 1 FROM incoming JOIN model_prices base ON base.id = incoming.id AND base.currency = $2 WHERE incoming.service_tier <> 'default' ON CONFLICT(model, currency, service_tier) DO NOTHING",
+            "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) SELECT incoming.tier_id, incoming.model, $2, incoming.service_tier, incoming.input_micros, incoming.cached_micros, incoming.cache_write_micros, incoming.output_micros, incoming.source, $3, incoming.cache_price_estimated FROM incoming JOIN model_prices base ON base.model = incoming.model AND base.currency = $2 WHERE incoming.service_tier <> 'default' OR base.source <> 'manual' ON CONFLICT(model, currency, service_tier) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, cached_input_micros_per_million = excluded.cached_input_micros_per_million, cache_write_micros_per_million = excluded.cache_write_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at, cache_price_estimated = excluded.cache_price_estimated WHERE model_price_tiers.source <> 'manual'",
+        ];
         let currency = currency.to_uppercase();
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
-        if service_tier == "default" {
-            // The caller's earlier source read is advisory: an operator may
-            // have committed a manual price since then. Decide under the write
-            // lock, preserving the base row and its default tier together.
-            let updated = sqlx::query(
-                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at WHERE model_prices.source <> 'manual'",
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(model)
-            .bind(&currency)
-            .bind(input_micros)
-            .bind(output_micros)
-            .bind(source)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            if updated.rows_affected() == 0 {
-                tx.commit().await?;
-                return self.model_price_view(model, &currency).await;
-            }
-        } else {
-            let inserted = sqlx::query(
-                "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO NOTHING",
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(model)
-            .bind(&currency)
-            .bind(input_micros)
-            .bind(output_micros)
-            .bind(source)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            if inserted.rows_affected() == 1 {
-                upsert_price_tier(
-                    &mut tx,
-                    model,
-                    &currency,
-                    "default",
-                    input_micros,
-                    cached_input_micros,
-                    cache_write_micros,
-                    output_micros,
-                    source,
-                    now,
-                    true,
-                )
+        for write_sql in WRITES {
+            sqlx::query(sqlx::AssertSqlSafe(format!("{input_sql} {write_sql}")))
+                .bind(&input_json)
+                .bind(&currency)
+                .bind(now)
+                .execute(&mut *tx)
                 .await?;
-            }
         }
-        upsert_price_tier(
-            &mut tx,
-            model,
-            &currency,
-            service_tier,
-            input_micros,
-            cached_input_micros,
-            cache_write_micros,
-            output_micros,
-            source,
-            now,
-            cache_price_estimated,
-        )
-        .await?;
         tx.commit().await?;
-        self.model_price_view(model, &currency).await
+        self.model_price_views_for_models(&currency, &models.into_iter().collect::<Vec<_>>())
+            .await
     }
 
     pub async fn list_model_prices(&self, currency: &str) -> Result<Vec<ModelPriceView>, AppError> {

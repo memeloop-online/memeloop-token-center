@@ -74,6 +74,103 @@ fn borrowed_sources<'a>(sources: &'a [(&'static str, String)]) -> Vec<(&'static 
         .collect()
 }
 
+#[tokio::test]
+async fn catalog_pricing_batches_real_matches_and_checks_catalog_limits_before_fetching() {
+    let (_directory, database) = test_database().await;
+    verify_catalog_price_batches(&database).await;
+    if let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") {
+        let database = Database::connect(&url).await.unwrap();
+        database.migrate().await.unwrap();
+        verify_catalog_price_batches(&database).await;
+    }
+}
+
+async fn verify_catalog_price_batches(database: &Database) {
+    let server = MockServer::start().await;
+    let provider = format!("bulk-{}", uuid::Uuid::now_v7());
+    let models = (0..501)
+        .map(|index| format!("{provider}/model-{index:03}"))
+        .collect::<Vec<_>>();
+    let source_models = (0..501)
+        .map(|index| {
+            (
+                format!("model-{index:03}"),
+                serde_json::json!({"cost": {"input": 1, "output": 2}}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let documents = [
+        (
+            "models.dev",
+            "/models-dev",
+            serde_json::json!({(provider.clone()): {"models": source_models}}),
+        ),
+        (
+            "litellm",
+            "/litellm",
+            serde_json::json!({"unrelated": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002}}),
+        ),
+        (
+            "openrouter",
+            "/openrouter",
+            serde_json::json!({"data": [{"id": "unrelated", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]}),
+        ),
+    ];
+    let mut sources = Vec::new();
+    for (source, request_path, document) in documents {
+        Mock::given(path(request_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .expect(2)
+            .mount(&server)
+            .await;
+        sources.push((source, format!("{}{request_path}", server.uri())));
+    }
+    let source_specs = borrowed_sources(&sources);
+    let http = reqwest::Client::new();
+    let result = sync_catalog_model_prices(database, &http, models.clone(), &source_specs, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.imported, 501,
+        "real writes must cross the 500-row batch boundary"
+    );
+    assert_eq!(result.matched, models);
+    assert!(result.unmatched.is_empty());
+    let tail = database
+        .model_price_view(&models[500], "USD")
+        .await
+        .unwrap();
+    assert_eq!(tail.source, "models.dev");
+    assert_eq!(tail.input_per_million, "1");
+    assert_eq!(tail.tiers[0].output_per_million, "2");
+
+    // Exercise the full input bound cheaply: 9,999 valid unmatched identities
+    // and one matching row, with no per-unmatched-model database round trips.
+    let mut full_catalog = (0..10_000)
+        .map(|index| format!("{provider}/unmatched-{index}"))
+        .collect::<Vec<_>>();
+    full_catalog[9_999] = models[0].clone();
+    let full = sync_catalog_model_prices(database, &http, full_catalog, &source_specs, true)
+        .await
+        .unwrap();
+    assert_eq!(full.imported, 1);
+    assert_eq!(full.unmatched.len(), 9_999);
+    let error = sync_catalog_model_prices(
+        database,
+        &http,
+        vec![models[0].clone(); 10_001],
+        &source_specs,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+    assert!(error.to_string().contains("at most 10000 models"));
+    // Exactly one request per source per accepted catalog, never per DB chunk;
+    // the rejected 10,001-entry catalog performs no network request.
+    server.verify().await;
+}
+
 #[test]
 fn exact_match_wins_before_ambiguous_provider_tails() {
     let prices = vec![

@@ -2,16 +2,19 @@ mod matching;
 mod sources;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{config::Config, db::Database, error::AppError};
 
 use self::{
-    matching::{match_price, normalized_models, source_priority},
+    matching::{IndexedPrices, normalized_models, source_priority},
     sources::fetch_source,
 };
 
+#[cfg(test)]
+use matching::match_price;
 use types::RemotePrice;
+pub(crate) use types::SyncedModelPriceInput;
 pub use types::{ModelPriceSyncResult, SyncCandidate, SyncCandidateSet, SyncSourceResult};
 
 pub const MAX_SYNC_MODELS: usize = 500;
@@ -133,7 +136,7 @@ async fn run_price_sync(
                     error: None,
                 });
                 successful_sources.push(source.to_owned());
-                fetched.push((source, prices));
+                fetched.push(IndexedPrices::new(prices));
             }
             Err(error) => {
                 tracing::warn!(source, %error, "model price source synchronization failed");
@@ -153,21 +156,12 @@ async fn run_price_sync(
         ));
     }
 
-    let mut existing = HashMap::new();
-    for batch in models.chunks(MAX_SYNC_MODELS) {
-        existing.extend(
-            db.model_price_views_for_models(currency, batch)
-                .await?
-                .into_iter()
-                .map(|price| (price.model.clone(), price)),
-        );
-    }
     let mut selected = HashMap::<String, RemotePrice>::new();
     let mut candidate_sets = HashMap::<String, Vec<SyncCandidate>>::new();
 
     for model in &models {
-        for (_source, prices) in &fetched {
-            let (matched, candidates) = match_price(model, prices);
+        for prices in &fetched {
+            let (matched, candidates) = prices.match_price(model);
             if let Some(price) = matched {
                 selected.insert(model.clone(), price);
                 break;
@@ -181,9 +175,23 @@ async fn run_price_sync(
         }
     }
 
-    let mut imported = 0;
-    let mut matched = Vec::new();
-    let mut preserved = Vec::new();
+    let selected_models = models
+        .iter()
+        .filter(|model| selected.contains_key(*model))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut existing = HashMap::new();
+    for batch in selected_models.chunks(MAX_SYNC_MODELS) {
+        existing.extend(
+            db.model_price_views_for_models(currency, batch)
+                .await?
+                .into_iter()
+                .map(|price| (price.model.clone(), price)),
+        );
+    }
+    let mut matched = HashSet::new();
+    let mut preserved = HashSet::new();
+    let mut writes = Vec::with_capacity(selected.len());
     for model in &models {
         let Some(price) = selected.get(model) else {
             continue;
@@ -203,7 +211,7 @@ async fn run_price_sync(
                 })
             });
             if preserve_manual || preserve_failed_preferred {
-                preserved.push(model.clone());
+                preserved.insert(model.clone());
                 continue;
             }
         }
@@ -215,29 +223,30 @@ async fn run_price_sync(
             .unwrap_or(price.input_per_million);
         let cache_estimated =
             price.cached_input_per_million.is_none() || price.cache_write_per_million.is_none();
-        let written = db
-            .upsert_synced_model_price_tier(
-                model,
-                currency,
-                &price.service_tier,
-                price.input_per_million,
-                cached,
-                cache_write,
-                price.output_per_million,
-                price.source,
-                cache_estimated,
-            )
-            .await?;
-        if written
-            .tiers
-            .iter()
-            .any(|tier| tier.service_tier == price.service_tier && tier.source == "manual")
-        {
-            preserved.push(model.clone());
-            continue;
+        writes.push(SyncedModelPriceInput {
+            model: model.clone(),
+            service_tier: price.service_tier.clone(),
+            input_per_million: price.input_per_million,
+            cached_input_per_million: cached,
+            cache_write_per_million: cache_write,
+            output_per_million: price.output_per_million,
+            source: price.source.to_owned(),
+            cache_price_estimated: cache_estimated,
+        });
+    }
+    for batch in writes.chunks(MAX_SYNC_MODELS) {
+        for written in db.upsert_synced_model_price_tiers(currency, batch).await? {
+            let price = &selected[&written.model];
+            if written
+                .tiers
+                .iter()
+                .any(|tier| tier.service_tier == price.service_tier && tier.source == "manual")
+            {
+                preserved.insert(written.model);
+            } else {
+                matched.insert(written.model);
+            }
         }
-        imported += 1;
-        matched.push(model.clone());
     }
 
     let mut candidates = candidate_sets
@@ -249,12 +258,16 @@ async fn run_price_sync(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.model.cmp(&right.model));
+    let ambiguous = candidates
+        .iter()
+        .map(|set| set.model.as_str())
+        .collect::<HashSet<_>>();
     let unmatched = models
         .iter()
         .filter(|model| {
-            !matched.contains(model)
-                && !preserved.contains(model)
-                && !candidates.iter().any(|set| &set.model == *model)
+            !matched.contains(*model)
+                && !preserved.contains(*model)
+                && !ambiguous.contains(model.as_str())
         })
         .cloned()
         .collect();
@@ -263,10 +276,14 @@ async fn run_price_sync(
     } else {
         "multi".to_owned()
     };
+    let mut matched = matched.into_iter().collect::<Vec<_>>();
+    let mut preserved = preserved.into_iter().collect::<Vec<_>>();
+    matched.sort();
+    preserved.sort();
     Ok(ModelPriceSyncResult {
         source,
         sources: successful_sources,
-        imported,
+        imported: matched.len(),
         matched,
         candidates,
         unmatched,
