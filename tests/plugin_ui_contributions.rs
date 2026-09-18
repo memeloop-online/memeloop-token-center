@@ -137,6 +137,33 @@ async fn arbitrary_operator_presentation_is_rejected_before_plugin_load() {
 }
 
 #[tokio::test]
+async fn normalized_operator_module_paths_are_rejected_by_the_public_manifest_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let values = fixture();
+    let mut manifest = values["installed"][0].clone();
+    manifest["contributions"]["operator_ui"][0]["renderer"] = Value::String("component_v1".into());
+    manifest["contributions"]["operator_ui"][0]["module_entry"] =
+        Value::String("assets//operator-ui.mjs".into());
+    manifest["contributions"]["operator_ui"][0]["component_id"] = Value::String("workspace".into());
+    manifest["contributions"]["operator_ui"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    write_package(&plugins, "normalized-module-path", &manifest);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("normalized-module-path.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.plugin_dir = Some(plugins.display().to_string());
+    assert!(
+        AppState::initialize(config).await.is_err(),
+        "manifest validation must reject module paths that require normalization"
+    );
+}
+
+#[tokio::test]
 async fn component_operator_contributions_support_tabs_and_existing_page_slots() {
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");

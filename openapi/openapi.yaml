@@ -7650,6 +7650,12 @@ components:
           description: Selects a core projection or a component from a signed runtime module.
         module_entry:
           type: [string, 'null']
+          minLength: 4
+          maxLength: 240
+          pattern: '^[A-Za-z0-9._/-]+\.m?js$'
+          allOf:
+            - not: { type: string, pattern: '(^/|//)' }
+            - not: { type: string, pattern: '(^|/)\.{1,2}(/|$)' }
           description: Package-relative signed JavaScript module used by component_v1.
         module_sha256:
           type: [string, 'null']
