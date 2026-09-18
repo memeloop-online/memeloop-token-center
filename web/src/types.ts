@@ -396,6 +396,44 @@ export interface ModelPriceSyncResult {
   prices: ModelPriceView[];
 }
 
+export interface UpstreamCatalogModel {
+  id: string;
+  protocol: string;
+}
+
+export interface DisabledUpstreamCatalogModel extends UpstreamCatalogModel {
+  status: 'disabled';
+  disabled_at: number;
+  reason: 'removed_from_upstream';
+}
+
+export interface UpstreamModelCatalogResponse {
+  account_id: string;
+  status: 'unknown' | 'syncing' | 'ready' | 'stale' | 'error' | string;
+  credential_generation: number;
+  last_attempt_at: number | null;
+  last_success_at: number | null;
+  expires_at: number | null;
+  error_code: string | null;
+  models: UpstreamCatalogModel[];
+  disabled_models: DisabledUpstreamCatalogModel[];
+}
+
+export interface UpstreamCatalogPriceSync {
+  status: 'ready' | 'partial' | 'error' | 'skipped';
+  currency: 'USD';
+  imported: number;
+  preserved: number;
+  unmatched: number;
+  ambiguous: number;
+  failed_sources: string[];
+  error_code: 'price_sync_failed' | null;
+}
+
+export interface UpstreamModelCatalogSyncResponse extends UpstreamModelCatalogResponse {
+  price_sync: UpstreamCatalogPriceSync;
+}
+
 export interface KeyView {
   key_id: string;
   account_id?: string;
