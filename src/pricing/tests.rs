@@ -91,7 +91,7 @@ async fn verify_catalog_price_batches(database: &Database) {
     let models = (0..501)
         .map(|index| format!("{provider}/model-{index:03}"))
         .collect::<Vec<_>>();
-    let source_models = (0..501)
+    let source_models = (0..500)
         .map(|index| {
             (
                 format!("model-{index:03}"),
@@ -108,7 +108,7 @@ async fn verify_catalog_price_batches(database: &Database) {
         (
             "litellm",
             "/litellm",
-            serde_json::json!({"unrelated": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002}}),
+            serde_json::json!({(models[500].clone()): {"input_cost_per_token": "0.000001", "output_cost_per_token": "0.000002", "service_tier": "priority"}}),
         ),
         (
             "openrouter",
@@ -140,9 +140,15 @@ async fn verify_catalog_price_batches(database: &Database) {
         .model_price_view(&models[500], "USD")
         .await
         .unwrap();
-    assert_eq!(tail.source, "models.dev");
+    // The second batch also exercises non-default-tier bootstrap: create a
+    // base/default price once without conflating its ID with the priority tier.
+    assert_eq!(tail.source, "litellm");
     assert_eq!(tail.input_per_million, "1");
+    assert_eq!(tail.tiers.len(), 2);
+    assert_eq!(tail.tiers[0].service_tier, "default");
+    assert_eq!(tail.tiers[1].service_tier, "priority");
     assert_eq!(tail.tiers[0].output_per_million, "2");
+    assert_eq!(tail.tiers[1].output_per_million, "2");
 
     // Exercise the full input bound cheaply: 9,999 valid unmatched identities
     // and one matching row, with no per-unmatched-model database round trips.
