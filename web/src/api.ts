@@ -172,8 +172,18 @@ export async function streamSse<T>(
   let buffered = '';
   try {
     while (!signal.aborted) {
-      const { done, value } = await reader.read();
-      if (done) return;
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (reason) {
+        if (signal.aborted) throw reason;
+        throw new ApiError('SSE response interrupted or invalid', response.status, 'sse_response_interrupted', responseRequestId(response));
+      }
+      const { done, value } = chunk;
+      if (done) {
+        if (signal.aborted) return;
+        throw new ApiError('SSE response interrupted or invalid', response.status, 'sse_response_interrupted', responseRequestId(response));
+      }
       buffered = normalizeSseLineEndings(buffered + decoder.decode(value, { stream: true }));
       let boundary = buffered.indexOf('\n\n');
       while (boundary >= 0) {
@@ -183,9 +193,6 @@ export async function streamSse<T>(
         boundary = buffered.indexOf('\n\n');
       }
     }
-  } catch (reason) {
-    if (signal.aborted) throw reason;
-    throw new ApiError('SSE response interrupted or invalid', response.status, 'sse_response_interrupted', responseRequestId(response));
   } finally {
     try { await reader.cancel(); } catch { /* Abort and remote close can already release the reader. */ }
     reader.releaseLock();

@@ -54,3 +54,43 @@ test('SSE failures distinguish rejected headers from a failed 200 body without e
     }
   } finally { globalThis.fetch = original; }
 });
+
+test('SSE only classifies body transport termination as recoverable interruption', async () => {
+  const original = globalThis.fetch;
+  const encoded = (value: string) => new TextEncoder().encode(value);
+  try {
+    const protocolFailure = new Error('event-contract-failure');
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoded('id: event-1\nevent: request.finished\ndata: {"event_id":"event-1"}\n\n'));
+      },
+    }));
+    await assert.rejects(
+      streamSse('/internal/v1/request-events', 'credential-canary', new AbortController().signal, () => { throw protocolFailure; }),
+      (error: unknown) => error === protocolFailure,
+    );
+
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoded('id: event-2\ndata: {invalid-json}\n\n'));
+      },
+    }));
+    await assert.rejects(
+      streamSse('/internal/v1/request-events', 'credential-canary', new AbortController().signal, () => {}),
+      (error: unknown) => error instanceof SyntaxError,
+    );
+
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.close(); },
+    }), { headers: { 'x-mtc-request-id': requestId } });
+    await assert.rejects(
+      streamSse('/internal/v1/request-events', 'credential-canary', new AbortController().signal, () => {}),
+      (error: unknown) => {
+        assert.ok(error instanceof ApiError);
+        assert.equal(error.code, 'sse_response_interrupted');
+        assert.equal(error.requestId, requestId);
+        return true;
+      },
+    );
+  } finally { globalThis.fetch = original; }
+});

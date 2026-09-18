@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser } from 'playwright';
-import { streamSse } from '../../src/api.js';
+import { ApiError, streamSse } from '../../src/api.js';
 import type { RequestEvent } from '../../src/types.js';
 
 const bootstrapToken = process.env.MTC_E2E_SERVICE_TOKEN
@@ -121,14 +121,18 @@ export function observeSessionReadyRequests({
           ({ id, event: eventName, data: event }) => {
             assert.equal(id, event.event_id, 'request-event SSE id must match its durable event id');
             assert.equal(eventName, `request.${event.event_kind}`, 'request-event SSE name must match its event kind');
+            const isReady = event.key_id === keyId && event.model === requestModel
+              && matchesReadySessionEvent(event, sessionName);
+            const eventSessionId = isReady ? event.session_context?.session_id : undefined;
+            if (isReady) {
+              assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
+              if (sessionId !== undefined) assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
+              assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
+            }
             eventAt = event.event_at;
             eventId = id;
-            if (event.key_id !== keyId || event.model !== requestModel
-              || !matchesReadySessionEvent(event, sessionName)) return;
-            const eventSessionId = event.session_context?.session_id;
-            assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-            if (sessionId === undefined) sessionId = eventSessionId;
-            else assert.equal(eventSessionId, sessionId, 'the four declared turns must commit to one logical session');
+            if (!isReady || eventSessionId === undefined) return;
+            sessionId ??= eventSessionId;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
             settled = true;
@@ -137,8 +141,9 @@ export function observeSessionReadyRequests({
           },
           openedResolve,
         );
-      } catch {
+      } catch (reason) {
         if (settled || signal.aborted) return;
+        if (!(reason instanceof ApiError) || reason.code !== 'sse_response_interrupted') throw reason;
       }
       if (!settled && !signal.aborted) {
         await delay(100);
