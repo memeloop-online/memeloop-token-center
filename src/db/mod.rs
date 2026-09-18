@@ -95,7 +95,7 @@ pub(crate) use projection_lock::{
 };
 use rotation::*;
 use rows::generation_asset_download;
-pub use session_analytics::LogicalSessionListFilter;
+pub use session_analytics::{LogicalSessionListFilter, MAX_SESSION_SUMMARY_IDENTITIES};
 pub(crate) use session_projection::{
     add_request_fact_to_session_projection_in_transaction,
     merge_request_session_projection_in_transaction,

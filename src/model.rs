@@ -1100,6 +1100,12 @@ pub struct LogicalSessionListResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct LogicalSessionSummaryBatchResponse {
+    pub generated_at: i64,
+    pub sessions: Vec<LogicalSessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct LogicalSessionDetail {
     pub session_id: String,
     pub cluster_id: Option<Uuid>,

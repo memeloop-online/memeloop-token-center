@@ -1,9 +1,23 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
-  drainSessionEventIdentities, enqueueSessionEventIdentity, mergeSessionPage, sessionEventsRequireDetailRefresh,
-  sessionEventTargetsSelection,
+  drainSessionEventIdentities, enqueueSessionEventIdentity, mergeIncrementalSessionSummaries,
+  mergeSessionPage, sessionEventsRequireDetailRefresh, sessionEventTargetsSelection,
+  sessionSummaryTargets,
 } from '../src/operator/sessionRefresh.js';
+
+test('session monitor uses bounded summary reads and keeps manual refresh authoritative', async () => {
+  const monitor = await readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8');
+  assert.match(monitor, /api<LogicalSessionSummaryBatchResponse>\('\/internal\/v1\/sessions\/summaries'/);
+  assert.match(monitor, /method: 'POST'/);
+  assert.match(monitor, /if \(forceFullList \|\| targets\.requiresFullReload\)/,
+    'overflow and unknown identities retain the full-list fallback');
+  assert.match(monitor, /if \(merged\.requiresFullReload\)/,
+    'first-page membership uncertainty retains the full-list fallback');
+  assert.match(monitor, /async function refreshNow\(\)[\s\S]*loadSessions\(false, filtersRef\.current/,
+    'manual refresh remains an authoritative list read');
+});
 
 test('one SSE chunk preserves exact credential and session scopes before React renders', () => {
   const queued = new Set<string>();
@@ -129,4 +143,187 @@ test('an active session beyond the first fifty cannot survive a terminal refresh
   assert.equal(merged.sessions.length, 50);
   assert.equal(merged.sessions.some((session) => session.session_id === terminalTail.session_id), false);
   assert.equal(merged.loadedOlder, false, 'the volatile tail must be reloaded from a new server cursor');
+});
+
+test('event batches resolve exact summary identities and fail closed for unknown ownership', () => {
+  const queued = new Set<string>();
+  enqueueSessionEventIdentity(queued, {
+    key_id: 'key-a', request_id: 'request-a', event_kind: 'projected', status_code: 200, archive_state: 'bound',
+    session_context: { association: 'confirmed', session_id: 'session-a' },
+  });
+  const projected = sessionSummaryTargets(drainSessionEventIdentities(queued));
+  assert.deepEqual(projected, {
+    identities: [
+      { key_id: 'key-a', session_id: 'session-a' },
+      { key_id: 'key-a', session_id: 'unlinked:key-a' },
+    ],
+    requiresFullReload: false,
+  }, 'a projection refreshes both its confirmed destination and former unlinked aggregate');
+
+  enqueueSessionEventIdentity(queued, {
+    key_id: 'key-b', request_id: 'request-b', event_kind: 'finished', status_code: 200, archive_state: 'bound',
+    session_context: null,
+  });
+  assert.equal(sessionSummaryTargets(drainSessionEventIdentities(queued)).requiresFullReload, true,
+    'an event without a tenant-owned session identity cannot be patched safely');
+
+  enqueueSessionEventIdentity(queued, {
+    key_id: 'key-active',
+    request_id: 'request-active',
+    event_kind: 'finished',
+    status_code: 200,
+    archive_state: 'bound',
+    session_context: { association: 'confirmed', session_id: 'session-active' },
+  });
+  assert.equal(sessionSummaryTargets(drainSessionEventIdentities(queued), 'active').requiresFullReload, true,
+    'one coalesced terminal batch must rebuild an active-filter page after its row can disappear');
+
+  for (let index = 0; index < 101; index += 1) {
+    enqueueSessionEventIdentity(queued, {
+      key_id: 'key-a', request_id: `request-${index}`, event_kind: 'finished', status_code: 200, archive_state: 'bound',
+      session_context: { association: 'confirmed', session_id: `session-${index}` },
+    });
+  }
+  assert.equal(sessionSummaryTargets(drainSessionEventIdentities(queued)).requiresFullReload, true,
+    'a batch larger than the bounded summary contract falls back to one list read');
+});
+
+test('incremental summaries replace and reorder only affected rows when first-page membership is stable', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 300, requests: 1 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 200, requests: 1 },
+    { key_id: 'key-a', session_id: 'session-c', last_activity_at: 100, requests: 1 },
+  ];
+  const updated = { ...current[1], last_activity_at: 350, requests: 2 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [updated],
+    requested: [updated],
+    firstPageSize: 3,
+    firstPageLimit: 50,
+    loadedOlder: false,
+    serverHasMore: false,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id), ['session-b', 'session-a', 'session-c']);
+  assert.equal(merged.sessions[0].requests, 2);
+  assert.equal(merged.sessions[1], current[0], 'an unaffected row retains its exact object identity');
+});
+
+test('incremental summaries use the backend UTF-8 cursor order for equal timestamps', () => {
+  const current = [
+    { key_id: 'key-a', session_id: '中', last_activity_at: 300, requests: 1 },
+    { key_id: 'key-a', session_id: 'a', last_activity_at: 300, requests: 1 },
+  ];
+  const updated = { ...current[1], requests: 2 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [updated],
+    requested: [updated],
+    firstPageSize: 2,
+    firstPageLimit: 50,
+    loadedOlder: false,
+    serverHasMore: false,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id), ['中', 'a'],
+    'UTF-8 byte ordering must match the PostgreSQL cursor rather than browser locale collation');
+});
+
+test('incremental summaries reload only when an affected identity can change first-page membership', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 300 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 200 },
+  ];
+  const newRecent = { key_id: 'key-b', session_id: 'session-new', last_activity_at: 400 };
+  assert.equal(mergeIncrementalSessionSummaries({
+    current,
+    updates: [newRecent],
+    requested: [newRecent],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: false,
+    serverHasMore: true,
+  }).requiresFullReload, true, 'a newly visible identity must refill the authoritative page');
+
+  const oldInvisible = { key_id: 'key-b', session_id: 'session-old', last_activity_at: 10 };
+  const ignored = mergeIncrementalSessionSummaries({
+    current,
+    updates: [oldInvisible],
+    requested: [oldInvisible],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: false,
+    serverHasMore: true,
+  });
+  assert.equal(ignored.requiresFullReload, false);
+  assert.deepEqual(ignored.sessions, current, 'an identity remaining below the page boundary does not disturb the list');
+
+  assert.equal(mergeIncrementalSessionSummaries({
+    current,
+    updates: [oldInvisible],
+    requested: [oldInvisible],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: false,
+    serverHasMore: false,
+  }).requiresFullReload, true,
+    'an unseen row after an exhaustive full page needs a new cursor-bearing snapshot');
+
+  assert.equal(mergeIncrementalSessionSummaries({
+    current,
+    updates: [],
+    requested: [current[0]],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: false,
+    serverHasMore: true,
+  }).requiresFullReload, true, 'a visible row removed by state/model/search filters must be backfilled');
+});
+
+test('incremental summaries keep the loaded tail globally ordered without changing first-page membership', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 400 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 300 },
+    { key_id: 'key-a', session_id: 'session-c', last_activity_at: 200 },
+    { key_id: 'key-a', session_id: 'session-d', last_activity_at: 100 },
+  ];
+  const updatedTail = { ...current[3], last_activity_at: 250 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [updatedTail],
+    requested: [updatedTail],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: true,
+    serverHasMore: true,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id),
+    ['session-a', 'session-b', 'session-d', 'session-c']);
+  assert.deepEqual(merged.sessions.slice(0, 2), current.slice(0, 2),
+    'tail-only movement must preserve the authoritative first-page membership');
+});
+
+test('an unseen summary inside a loaded tail is inserted without invalidating its older cursor', () => {
+  const current = [
+    { key_id: 'key-a', session_id: 'session-a', last_activity_at: 500 },
+    { key_id: 'key-a', session_id: 'session-b', last_activity_at: 400 },
+    { key_id: 'key-a', session_id: 'session-c', last_activity_at: 300 },
+    { key_id: 'key-a', session_id: 'session-d', last_activity_at: 100 },
+  ];
+  const unseenBetweenBoundaries = { key_id: 'key-b', session_id: 'session-new', last_activity_at: 200 };
+  const merged = mergeIncrementalSessionSummaries({
+    current,
+    updates: [unseenBetweenBoundaries],
+    requested: [unseenBetweenBoundaries],
+    firstPageSize: 2,
+    firstPageLimit: 2,
+    loadedOlder: true,
+    serverHasMore: true,
+  });
+  assert.equal(merged.requiresFullReload, false);
+  assert.deepEqual(merged.sessions.map((session) => session.session_id),
+    ['session-a', 'session-b', 'session-c', 'session-new', 'session-d'],
+    'the new row belongs before the loaded tail cursor and must not be silently skipped');
 });

@@ -3,6 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import {
   eventually,
+  baseURL,
   model,
   observeSessionReadyRequests,
   releaseSessionFixture,
@@ -22,8 +23,10 @@ interface SessionObservation {
   liveRequests: Promise<Response>[];
   sessionReadyRequests?: Promise<SessionReadyRequests>;
   sessionListRequests: string[];
+  sessionSummaryRequests: string[];
   detailRequests: string[];
   baselineSessionListRequests: number;
+  baselineSessionSummaryRequests: number;
 }
 
 const observations = new WeakMap<DogfoodWorld, SessionObservation>();
@@ -115,11 +118,15 @@ async function noHorizontalOverflow(page: Page) {
 
 When('管理员打开实时会话聚合', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  const observation: SessionObservation = { liveRequests: [], sessionListRequests: [], detailRequests: [], baselineSessionListRequests: 0 };
+  const observation: SessionObservation = {
+    liveRequests: [], sessionListRequests: [], sessionSummaryRequests: [], detailRequests: [],
+    baselineSessionListRequests: 0, baselineSessionSummaryRequests: 0,
+  };
   observations.set(this, observation);
   page.on('request', (request) => {
     const url = new URL(request.url());
     if (url.pathname === '/internal/v1/sessions') observation.sessionListRequests.push(url.toString());
+    else if (url.pathname === '/internal/v1/sessions/summaries') observation.sessionSummaryRequests.push(url.toString());
     else if (url.pathname.startsWith('/internal/v1/sessions/')) observation.detailRequests.push(url.toString());
   });
   await openAppRoute(page, 'operator', 'sessions');
@@ -230,6 +237,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
+  observation.baselineSessionSummaryRequests = observation.sessionSummaryRequests.length;
   const sendCall = (index: number) => fetch(new URL('/v1/chat/completions', page.url()), {
     method: 'POST',
     headers: {
@@ -340,8 +348,12 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
     defaultRequestRefreshInterval + 3_000,
     'completed session remained in the active filter',
   );
-  const refreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
-  assert.ok(refreshes >= 1 && refreshes <= 6, `continuous event refresh count was not bounded: ${refreshes}`);
+  const listRefreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
+  const summaryRefreshes = observation.sessionSummaryRequests.length - observation.baselineSessionSummaryRequests;
+  assert.ok(listRefreshes + summaryRefreshes >= 1 && listRefreshes + summaryRefreshes <= 6,
+    `continuous event refresh count was not bounded: lists=${listRefreshes}, summaries=${summaryRefreshes}`);
+  assert.ok(summaryRefreshes <= 4,
+    `continuous events must not issue an unbounded summary read per lifecycle event: ${summaryRefreshes}`);
   assert.match(await page.locator('.session-result-count').textContent() ?? '', /0/);
 });
 
@@ -403,12 +415,15 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
   const observation = observations.get(this)!;
   const listCount = observation.sessionListRequests.length;
+  const summaryCount = observation.sessionSummaryRequests.length;
   const detailCount = observation.detailRequests.length;
   releaseOtherEvent();
   await eventually(
-    () => assert.ok(observation.sessionListRequests.length > listCount),
+    () => assert.ok(
+      observation.sessionListRequests.length > listCount || observation.sessionSummaryRequests.length > summaryCount,
+    ),
     defaultRequestRefreshInterval + 3_000,
-    'another credential event did not refresh the session list',
+    'another credential event did not refresh the bounded session projection',
   );
   await page.locator('.session-live-state.reconnecting').waitFor();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -433,7 +448,9 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
     credential: seed.serviceCredential,
     headers: { 'Idempotency-Key': crypto.randomUUID() },
   });
-  const rejected = await fetch(new URL('/self/v1/sessions', page.url()), {
+  // This deliberately exercises an expected 401. Keep it outside the page so
+  // the browser-error contract only reports errors caused by the UI itself.
+  const rejected = await fetch(new URL('/self/v1/sessions', baseURL), {
     headers: { Authorization: `Bearer ${oldCredential}` },
   });
   assert.equal(rejected.status, 401);
@@ -449,7 +466,7 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.ok(other.sessions.every((session) => session.key_id !== seed.clientKeyId));
   const forbiddenDetail = await fetch(new URL(
     `/self/v1/sessions/${encodeURIComponent(before.sessions[0].session_id)}`,
-    page.url(),
+    baseURL,
   ), { headers: { Authorization: `Bearer ${seed.otherClientCredential}` } });
   assert.equal(forbiddenDetail.status, 404);
 

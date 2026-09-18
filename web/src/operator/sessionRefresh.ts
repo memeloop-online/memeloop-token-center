@@ -3,6 +3,7 @@ import type { RequestArchiveState, RequestEventKind, RequestSessionContext } fro
 // The realtime cadence still yields briefly so a burst of lifecycle events
 // becomes one authoritative list/detail read instead of one read per event.
 export const sessionEventRefreshDelayMs = 500;
+export const maxSessionSummaryIdentities = 100;
 
 export function sessionRefreshDelayMs(intervalMs: number) {
   return intervalMs <= 0 ? sessionEventRefreshDelayMs : Math.max(sessionEventRefreshDelayMs, intervalMs);
@@ -68,6 +69,128 @@ export function drainSessionEventIdentities(queue: Set<string>) {
   const drained = new Set(queue);
   queue.clear();
   return drained;
+}
+
+export function sessionSummaryTargets(
+  eventIdentities: ReadonlySet<string>,
+  state: '' | 'active' | 'has_errors' = '',
+) {
+  const targets = new Map<string, SessionIdentity>();
+  let unknown = false;
+  let activeMembershipChanged = false;
+  for (const value of eventIdentities) {
+    const event = JSON.parse(value) as SessionEventIdentity;
+    // A terminal request can make an otherwise visible active session vanish.
+    // The exact-summary endpoint correctly omits it, but cannot supply the
+    // row that replaces it in the filtered first page. Refresh that one
+    // coalesced terminal batch authoritatively instead of retaining a ghost.
+    if (state === 'active' && (event.event_kind === 'finished' || event.event_kind === 'projected')) {
+      activeMembershipChanged = true;
+    }
+    if (!event.session_id) {
+      unknown = true;
+      continue;
+    }
+    const target = { key_id: event.key_id, session_id: event.session_id };
+    targets.set(sessionIdentityKey(target), target);
+    if (event.event_kind === 'projected' && event.association === 'confirmed') {
+      const formerUnlinked = { key_id: event.key_id, session_id: `unlinked:${event.key_id}` };
+      targets.set(sessionIdentityKey(formerUnlinked), formerUnlinked);
+    }
+  }
+  return {
+    identities: [...targets.values()],
+    requiresFullReload: unknown || activeMembershipChanged || targets.size > maxSessionSummaryIdentities,
+  };
+}
+
+function compareUtf8(left: string, right: string) {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
+// PostgreSQL orders the cursor's text columns bytewise under the deployment's
+// C.UTF-8 collation. Do not use localeCompare here: a locale-dependent merge
+// can silently put a refreshed session on the wrong side of that cursor.
+function compareSessionOrder(left: SessionIdentity & { last_activity_at: number }, right: SessionIdentity & { last_activity_at: number }) {
+  return right.last_activity_at - left.last_activity_at
+    || compareUtf8(right.session_id, left.session_id)
+    || compareUtf8(right.key_id, left.key_id);
+}
+
+export function mergeIncrementalSessionSummaries<T extends SessionIdentity & { last_activity_at: number }>({
+  current, updates, requested, firstPageSize, firstPageLimit, loadedOlder, serverHasMore,
+}: {
+  current: T[];
+  updates: T[];
+  requested: SessionIdentity[];
+  firstPageSize: number;
+  firstPageLimit: number;
+  /** Older rows are already in `current`, after the authoritative first page. */
+  loadedOlder: boolean;
+  /** The server cursor still has rows after the loaded window. */
+  serverHasMore: boolean;
+}): { sessions: T[]; requiresFullReload: boolean } {
+  const requestedKeys = new Set(requested.map(sessionIdentityKey));
+  const updatesByKey = new Map(updates.map((summary) => [sessionIdentityKey(summary), summary]));
+  const currentIndex = new Map(current.map((summary, index) => [sessionIdentityKey(summary), index]));
+  if (current.slice(0, firstPageSize)
+    .some((summary) => requestedKeys.has(sessionIdentityKey(summary)) && !updatesByKey.has(sessionIdentityKey(summary)))) {
+    // An affected visible row disappeared or stopped matching the active
+    // server-side filters. Only a new first-page query can fill that vacancy.
+    return { sessions: current, requiresFullReload: true };
+  }
+
+  const firstPage = current.slice(0, firstPageSize);
+  const boundary = firstPage.at(-1);
+  const insertedKeys = new Set<string>();
+  for (const update of updates) {
+    const index = currentIndex.get(sessionIdentityKey(update));
+    if (index === undefined) {
+      if (firstPageSize < firstPageLimit || !boundary || compareSessionOrder(update, boundary) < 0) {
+        return { sessions: current, requiresFullReload: true };
+      }
+      if (loadedOlder) {
+        const tailBoundary = current.at(-1);
+        // An unseen identity that belongs inside the loaded tail must be
+        // inserted now. The existing cursor remains after `tailBoundary`, so
+        // it neither skips this row nor duplicates it on Load older.
+        if (!serverHasMore || !tailBoundary || compareSessionOrder(update, tailBoundary) < 0) {
+          insertedKeys.add(sessionIdentityKey(update));
+        }
+        continue;
+      }
+      // A full first page without a server cursor was exhaustive. An unseen
+      // older row needs an authoritative snapshot so it cannot become a
+      // permanently inaccessible fifty-first item.
+      if (!serverHasMore) return { sessions: current, requiresFullReload: true };
+      continue;
+    }
+    if (index < firstPageSize && (loadedOlder || serverHasMore) && boundary && compareSessionOrder(update, boundary) > 0) {
+      // A first-page row moving below the previous boundary can admit an
+      // unseen row. Exact summaries cannot prove which row should replace it.
+      return { sessions: current, requiresFullReload: true };
+    }
+    if (index >= firstPageSize && boundary && compareSessionOrder(update, boundary) < 0) {
+      // A loaded tail row became recent enough to enter the first page.
+      return { sessions: current, requiresFullReload: true };
+    }
+  }
+
+  const replaced = current
+    .filter((summary, index) => index < firstPageSize || !requestedKeys.has(sessionIdentityKey(summary))
+      || updatesByKey.has(sessionIdentityKey(summary)))
+    .map((summary) => updatesByKey.get(sessionIdentityKey(summary)) ?? summary);
+  for (const update of updates) {
+    if (insertedKeys.has(sessionIdentityKey(update))) replaced.push(update);
+  }
+  replaced.sort(compareSessionOrder);
+  return { sessions: replaced, requiresFullReload: false };
 }
 
 export function sessionEventTargetsSelection(eventIdentities: ReadonlySet<string>, selected?: SessionIdentity) {

@@ -74,7 +74,11 @@ if (new URLSearchParams(location.search).has('titles')) {
 window.fetch = async (input, init) => {
   const url = String(input);
   if (url.includes('/keys?')) return new Response(JSON.stringify([]));
-  if (url.includes('/sessions?')) {
+  const summaryBatch = url.includes('/sessions/summaries');
+  if (summaryBatch && init?.method !== 'POST') {
+    return new Response(JSON.stringify({ error: { message: 'Fixture summary batches require POST' } }), { status: 405 });
+  }
+  if (summaryBatch || url.includes('/sessions?')) {
     window.sessionListReads += 1;
     return new Promise<Response>((resolve, reject) => {
       const signal = init?.signal;
@@ -86,8 +90,15 @@ window.fetch = async (input, init) => {
       window.resolveSessionList = (result) => {
         signal?.removeEventListener('abort', abort);
         const status = typeof result === 'number' ? result : result ? 200 : 503;
+        const identities = summaryBatch
+          ? (JSON.parse(String(init?.body ?? '{}')) as { identities?: Array<{ key_id: string; session_id: string }> }).identities ?? []
+          : undefined;
+        const summaries = identities
+          ? identities.flatMap((identity) => [session, unlinkedSession]
+            .filter((candidate) => candidate.key_id === identity.key_id && candidate.session_id === identity.session_id))
+          : [session, unlinkedSession];
         resolve(new Response(JSON.stringify(status >= 200 && status < 300
-          ? { generated_at: Date.now(), sessions: [session, unlinkedSession], next_cursor: null }
+          ? { generated_at: Date.now(), sessions: summaries, ...(identities ? {} : { next_cursor: null }) }
           : { error: { message: 'Fixture list unavailable' } }), { status }));
       };
     });

@@ -4,14 +4,18 @@ use axum::{
     http::HeaderMap,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::{authenticate_downstream, management_tenant, require_service};
 use crate::{
     AppState,
-    db::{ConversationDetailFilter, LogicalSessionListFilter},
+    db::{ConversationDetailFilter, LogicalSessionListFilter, MAX_SESSION_SUMMARY_IDENTITIES},
     error::AppError,
-    model::{LogicalSessionDetail, LogicalSessionListCursor, LogicalSessionListResponse},
+    model::{
+        LogicalSessionDetail, LogicalSessionListCursor, LogicalSessionListResponse,
+        LogicalSessionSummaryBatchResponse,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +112,68 @@ pub(super) struct SessionDetailQuery {
     before_request_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct SessionSummaryIdentity {
+    key_id: Uuid,
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SessionSummaryBatchRequest {
+    tenant_external_id: Option<String>,
+    identities: Vec<SessionSummaryIdentity>,
+    key_id: Option<Uuid>,
+    state: Option<String>,
+    model: Option<String>,
+    q: Option<String>,
+}
+
+struct ValidatedSessionSummaryBatch {
+    tenant_external_id: Option<String>,
+    identities: Vec<(Uuid, String)>,
+    filter: LogicalSessionListFilter,
+}
+
+impl SessionSummaryBatchRequest {
+    fn validated(self) -> Result<ValidatedSessionSummaryBatch, AppError> {
+        let tenant_external_id = self.tenant_external_id;
+        if self.identities.is_empty() || self.identities.len() > MAX_SESSION_SUMMARY_IDENTITIES {
+            return Err(AppError::BadRequest(format!(
+                "identities must contain 1 to {MAX_SESSION_SUMMARY_IDENTITIES} entries"
+            )));
+        }
+        let filter = RecentSessionsQuery {
+            tenant_external_id: None,
+            limit: default_session_list_limit(),
+            before_last_activity_at: None,
+            before_session_id: None,
+            before_key_id: None,
+            key_id: self.key_id,
+            state: self.state,
+            model: self.model,
+            q: self.q,
+        }
+        .list_filter()?;
+        let mut seen = HashSet::new();
+        let mut identities = Vec::with_capacity(self.identities.len());
+        for identity in self.identities {
+            validate_session_id(&identity.session_id).map_err(|_| {
+                AppError::BadRequest(
+                    "each session_id must contain 1 to 80 non-control characters".into(),
+                )
+            })?;
+            if seen.insert((identity.key_id, identity.session_id.clone())) {
+                identities.push((identity.key_id, identity.session_id));
+            }
+        }
+        Ok(ValidatedSessionSummaryBatch {
+            tenant_external_id,
+            identities,
+            filter,
+        })
+    }
+}
+
 impl SessionDetailQuery {
     fn detail_filter(&self) -> Result<ConversationDetailFilter, AppError> {
         if self.before_created_at.is_some() != self.before_request_id.is_some() {
@@ -151,6 +217,25 @@ pub(super) async fn internal_sessions(
         state.db.operator_recent_sessions(&tenant, filter).await?,
         query.limit,
     )))
+}
+
+pub(super) async fn internal_session_summaries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SessionSummaryBatchRequest>,
+) -> Result<Json<LogicalSessionSummaryBatchResponse>, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let request = request.validated()?;
+    let tenant = management_tenant(&service, request.tenant_external_id)?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    let sessions = state
+        .db
+        .operator_session_summaries(&tenant, &request.identities, request.filter)
+        .await?;
+    Ok(Json(LogicalSessionSummaryBatchResponse {
+        generated_at: crate::db::unix_millis(),
+        sessions,
+    }))
 }
 
 pub(super) async fn internal_session_detail(
