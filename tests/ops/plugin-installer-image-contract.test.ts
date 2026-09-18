@@ -33,7 +33,7 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
   excludes(dockerfile, /^ARG\s+COSIGN_(?:VERSION|SHA|DIGEST|COMMIT)/m);
   contains('Dockerfile', '/usr/local/bin/cosign');
   contains('Dockerfile', '/usr/local/bin/install-plugin-oci');
-  contains('src/plugin_distribution/mod.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3"');
+  contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3"');
   contains(dockerfile, '--features plugin-distribution,experimental-plugin-revisions');
   excludes('Cargo.toml', /^sigstore\s*=/m);
   contains('packaging/cosign/v3.1.3-security.patch', '+\tgoogle.golang.org/grpc v1.83.2 // indirect');
