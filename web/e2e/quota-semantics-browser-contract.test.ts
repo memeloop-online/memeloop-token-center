@@ -43,7 +43,25 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     assert.match(await windows.innerText(), /20%/);
     assert.match(await windows.innerText(), /Codex code review/);
     assert.match(await windows.innerText(), /—/);
+    assert.equal(await windows.locator('[data-quota-window-reset]').count(), 3, 'each usage window owns its reset-time row');
+    const primaryReset = await page.evaluate(() => new Date(Date.UTC(2030, 0, 2, 10)).toLocaleString('en'));
+    const secondaryReset = await page.evaluate(() => new Date(Date.UTC(2030, 0, 3, 11)).toLocaleString('en'));
+    assert.equal(await windows.locator('[data-quota-window-reset="code:primary_window"]').innerText(), `Resets ${primaryReset}`);
+    assert.equal(await windows.locator('[data-quota-window-reset="code:secondary_window"]').innerText(), `Estimated reset ${secondaryReset}`);
+    assert.equal(await windows.locator('[data-quota-window-reset="code_review:primary_window"]').innerText(), 'Reset time unknown');
+    const knownCredit = windows.locator('[data-reset-credit-expiry="known"]');
+    assert.match(await knownCredit.innerText(), /Next reset opportunity expires:/);
     await page.keyboard.press('Escape');
+    for (const [name, state, message] of [
+      ['summary-credit-unknown', 'unknown', 'Reset opportunity expiry unknown'],
+      ['summary-credit-none', 'none', 'No unexpired reset opportunities'],
+    ] as const) {
+      await page.locator(`[data-case="${name}"] [tabindex="0"]`).focus();
+      const expiry = page.getByRole('tooltip').locator(`[data-reset-credit-expiry="${state}"]`);
+      await expiry.waitFor();
+      assert.equal(await expiry.innerText(), message);
+      await page.keyboard.press('Escape');
+    }
     assert.match(await page.locator('[data-case="summary-retained"]').innerText(), /Refresh failed · last observed Codex usage · 5-hour limit 0% used/);
     assert.equal(await page.locator('[data-case="summary-unobserved"]').getByRole('meter').count(), 0);
     const expiring = page.locator('[data-case="summary-expiring"]');

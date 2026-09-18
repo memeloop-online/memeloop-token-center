@@ -1,7 +1,7 @@
 import { DetailTooltip, ProgressBar } from '../design-system';
 import { formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaAvailableResetCredits, quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { useQuotaClock } from './useQuotaClock';
 
@@ -38,12 +38,6 @@ export function QuotaSummary({
   const presentation = quotaSummaryPresentation(snapshot, now, refreshFailed);
   const highest = presentation.usedPercent !== null && snapshot ? quotaHighestUsageWindow(snapshot.windows) : undefined;
   const resetCreditExpiry = snapshot ? quotaResetCreditExpiry(snapshot, now) : undefined;
-  const showResetCreditExpiry = Boolean(
-    snapshot
-    && showResetCreditExpiryInTooltip
-    && resetCreditExpiry?.state === 'known'
-    && (quotaAvailableResetCredits(snapshot, now) ?? 0) > 0,
-  );
   const text = t(presentation.key, {
     name: highest && snapshot ? label(snapshot.provider, highest) : '',
     percent: formatPercent(presentation.usedPercent === null ? null : presentation.usedPercent / 100, locale),
@@ -55,6 +49,9 @@ export function QuotaSummary({
     if (window.reset_at <= now) return t('quota.resetElapsed');
     return t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) });
   };
+  const windowResetAtText = (window: UpstreamQuotaSnapshot['windows'][number]) => window.reset_at === null || !Number.isFinite(window.reset_at)
+    ? t('quota.resetTimeUnknown')
+    : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) });
   const remainingText = (window: UpstreamQuotaSnapshot['windows'][number]) => {
     const remaining = quotaRemaining(window);
     if (!remaining) return t('quota.remainingUnknown');
@@ -65,12 +62,15 @@ export function QuotaSummary({
   const content = <div className="quota-summary-tooltip">
     <p>{t(historical ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at!).toLocaleString(locale) })}</p>
     {historical && <p>{text}</p>}
-    {showWindowReset && highest && resetText(highest) && <p>{resetText(highest)}</p>}
-    {showResetCreditExpiry && <p>{t('quota.creditExpiresAt', { time: new Date(resetCreditExpiry!.at!).toLocaleString(locale) })}</p>}
+    {showResetCreditExpiryInTooltip && resetCreditExpiry && <p data-reset-credit-expiry={resetCreditExpiry.state}>{t(
+      resetCreditExpiry.state === 'known' ? 'quota.creditExpiresAt' : resetCreditExpiry.state === 'none' ? 'quota.noUnexpiredCredits' : 'quota.creditExpiryUnknown',
+      { time: resetCreditExpiry.at === undefined ? '—' : new Date(resetCreditExpiry.at).toLocaleString(locale) },
+    )}</p>}
     <ul>{snapshot.windows.map(window => <li key={window.id}>
       <span>{label(snapshot.provider, window)}</span>
       <strong>{mode === 'remaining' ? t('quota.usedPercentValue', { percent: formatPercent(quotaUsedPercent(window) === null ? null : quotaUsedPercent(window)! / 100, locale) }) : formatPercent(quotaUsedPercent(window) === null ? null : quotaUsedPercent(window)! / 100, locale)}</strong>
       {mode === 'remaining' && <span>{remainingText(window)}</span>}
+      <span className="quota-summary-window-reset" data-quota-window-reset={window.id}>{windowResetAtText(window)}</span>
       {window.limit_reached === true && <span>{t('quota.limitReached')}</span>}
       {window.allowed === false && window.limit_reached !== true && <span>{t('quota.notAllowed')}</span>}
     </li>)}</ul>

@@ -30,6 +30,7 @@
 .quota-summary-tooltip ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .quota-summary-tooltip li { display: flex; flex-wrap: wrap; gap: 6px 12px; justify-content: space-between; }
 .quota-summary-tooltip li strong { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.quota-summary-tooltip .quota-summary-window-reset { color: var(--colorNeutralForeground2, #a6bac0); flex-basis: 100%; font-size: 12px; }
 .overview-upstream-quota { margin-block: 24px; }
 .overview-upstream-quota > .panel-title { margin-bottom: 16px; }
 .overview-quota-metrics .quota-summary,
