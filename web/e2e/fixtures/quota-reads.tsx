@@ -6,27 +6,39 @@ import { useUpstreamQuotaReads } from '../../src/operator/useUpstreamQuotaReads'
 import { quotaSummaryPresentation, type UpstreamQuotaSnapshot } from '../../src/operator/upstreamQuota';
 import '../../src/styles.css';
 import '../../src/theme.css';
-declare global { interface Window { quotaReadCalls: string[]; quotaReadTriggers: string[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
-window.quotaReadCalls = []; window.quotaActive = 0; window.quotaPeak = 0; window.quotaUnexpectedWrites = 0;
-window.quotaReadTriggers = [];
+declare global { interface Window { quotaReadCalls: string[]; quotaReadTriggers: string[]; quotaBatchBodies: unknown[]; quotaActive: number; quotaPeak: number; quotaUnexpectedWrites: number; releaseQuota: (index: number, status?: number) => void } }
+window.quotaReadCalls = []; window.quotaReadTriggers = []; window.quotaBatchBodies = []; window.quotaActive = 0; window.quotaPeak = 0; window.quotaUnexpectedWrites = 0;
 const pending: ((status: number) => void)[] = [];
 window.releaseQuota = (index, status = 200) => pending[index](status);
-window.fetch = async (input, init) => {
-  const url = new URL(String(input), location.origin);
-  if ((init?.method ?? 'GET') !== 'GET' || !/^\/internal\/v1\/upstreams\/account-\d\/quota$/.test(url.pathname) || url.searchParams.get('fresh') !== 'true' || !['manual', 'bulk'].includes(url.searchParams.get('trigger') ?? '')) { window.quotaUnexpectedWrites++; throw new Error('Only explicit fresh mock quota GET is allowed'); }
-  const id = url.pathname.split('/')[4];
-  window.quotaReadCalls.push(id); window.quotaReadTriggers.push(url.searchParams.get('trigger')!); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
-  const status = await new Promise<number>(resolve => pending.push(resolve));
-  window.quotaActive--;
+function snapshot(id: string, tenant: string): UpstreamQuotaSnapshot {
   const now = Date.now();
-  const snapshot: UpstreamQuotaSnapshot = {
-    contract_version: 'upstream_quota_v1', upstream_account_id: id, tenant_external_id: url.searchParams.get('tenant_external_id')!, provider: 'openai-codex', status: 'ready', observed_at: now, stale_after: now + 60_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
+  return {
+    contract_version: 'upstream_quota_v1', upstream_account_id: id, tenant_external_id: tenant, provider: 'openai-codex', status: 'ready', observed_at: now, stale_after: now + 60_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
     capabilities: { read: true, plan: true, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: true, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false }, subscription_active_until: null,
     credits: { balance: null, unlimited: null, has_credits: null, source: null }, windows: [], error_code: null,
     reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: id === 'account-1' ? null : now + 86400_000, source: 'codex_reset_credits' }],
     reset_capability: { provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: true, retryable: false, available_credits: 1, applicable_credits: 1, reason: 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract' },
   };
-  return new Response(JSON.stringify(status === 200 ? snapshot : { error: { code: 'test_unavailable', message: 'fixture failure' } }), { status });
+}
+function unobservedFailure(id: string, tenant: string): UpstreamQuotaSnapshot {
+  return { ...snapshot(id, tenant), status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', windows: [], reset_credits: [], error_code: 'quota_timeout' };
+}
+window.fetch = async (input, init) => {
+  const url = new URL(String(input), location.origin);
+  const method = init?.method ?? 'GET';
+  if (method === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') {
+    const body = JSON.parse(String(init?.body)) as { account_ids: string[]; fresh: boolean; trigger: string };
+    if (body.fresh !== true || body.trigger !== 'bulk') { window.quotaUnexpectedWrites++; throw new Error('Refresh all must request a fresh bulk read'); }
+    window.quotaBatchBodies.push(body); window.quotaReadCalls.push('batch'); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
+    const status = await new Promise<number>(resolve => pending.push(resolve)); window.quotaActive--;
+    const response = status === 200 ? { contract_version: 'upstream_quota_batch_v1', results: body.account_ids.map(id => id === 'account-2' ? { status: 'error', upstream_account_id: id, error: { code: 'quota_account_unavailable' } } : { status: 'success', upstream_account_id: id, snapshot: id === 'account-3' && window.quotaBatchBodies.length > 1 ? unobservedFailure(id, 'default') : snapshot(id, 'default') }) } : { error: { code: 'test_unavailable', message: 'fixture failure' } };
+    return new Response(JSON.stringify(response), { status });
+  }
+  if (method !== 'GET' || !/^\/internal\/v1\/upstreams\/account-\d\/quota$/.test(url.pathname) || url.searchParams.get('fresh') !== 'true' || !['manual', 'bulk'].includes(url.searchParams.get('trigger') ?? '')) { window.quotaUnexpectedWrites++; throw new Error('Only explicit fresh mock quota GETs and batch POSTs are allowed'); }
+  const id = url.pathname.split('/')[4];
+  window.quotaReadCalls.push(id); window.quotaReadTriggers.push(url.searchParams.get('trigger')!); window.quotaActive++; window.quotaPeak = Math.max(window.quotaPeak, window.quotaActive);
+  const status = await new Promise<number>(resolve => pending.push(resolve)); window.quotaActive--;
+  return new Response(JSON.stringify(status === 200 ? snapshot(id, url.searchParams.get('tenant_external_id')!) : { error: { code: 'test_unavailable', message: 'fixture failure' } }), { status });
 };
 function Fixture() {
   const { t } = useI18n();

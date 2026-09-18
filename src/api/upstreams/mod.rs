@@ -38,11 +38,11 @@ pub(in crate::api) use native_oauth_import::{
     native_oauth_import_capabilities,
 };
 pub(in crate::api) use proxy_settings::get_upstream_proxy_settings;
-pub(in crate::api) use quota::upstream_quota;
 pub(in crate::api) use quota::{
     confirm_quota_reset, current_quota_reset, get_quota_reset, prepare_quota_reset,
     reconcile_quota_reset,
 };
+pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch};
 
 pub(crate) use oauth::refresh_managed_upstream_oauth_for_worker;
 pub(in crate::api) use oauth::{

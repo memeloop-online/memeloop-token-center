@@ -8,7 +8,9 @@ mod oauth;
 mod route_counts;
 mod routes;
 
-pub use accounts::{CreateUpstreamAccountInput, UpdateUpstreamAccountInput};
+pub use accounts::{
+    BatchUpstreamAccountCredential, CreateUpstreamAccountInput, UpdateUpstreamAccountInput,
+};
 pub use model_catalog::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, DiscoveredUpstreamModel,
     ReplaceModelCatalogResult, UpstreamModelCatalogView, UpstreamModelView,

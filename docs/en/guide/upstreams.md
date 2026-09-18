@@ -53,6 +53,8 @@ This GET returns the full proxy URL, network scope, and version fields required 
 
 `GET /internal/v1/upstreams/{account_id}/quota` (requires `providers:read`) reads a provider-side quota snapshot for an account, for operator observation and optional plugin input:
 
+The provider list's **Refresh all** action uses `POST /internal/v1/upstreams/quota/batch` with the current page's account IDs. The server derives tenant ownership from the authenticated service and the loaded accounts, loads all current account credentials in one database statement, and runs at most three reads concurrently through the same cache, per-account singleflight, and global quota-read permits. Results are returned per account, so a failed account retains its prior UI snapshot while successful peers update. The batch read never performs a quota reset.
+
 - The snapshot is cached for 30 seconds with concurrent request coalescing. After a read failure, a bounded stale value is kept for at most five minutes; failure never presents old evidence as fresh.
 - Operator refresh controls request `fresh=true` and label the action as `trigger=manual` or `trigger=bulk`. This bypasses a still-current cache entry while preserving safe coalescing with a newer in-flight read.
 - The response is organized by **window**. Each window includes an identifier, period (such as five hours or weekly), reset time, used/remaining ratio, and exhausted state. Window information comes from explicit provider response fields—unknown quantities remain unknown and are never shown as zero or full.
