@@ -12,7 +12,7 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
   const copy: Record<string, [string, string, string, string]> = {
     network_scope: ['网络访问范围', 'Network access scope', '控制上游可访问的网络范围；通常保持现有值。', 'Controls the network scope available to this upstream. Usually leave unchanged.'],
     reservation_token_bounds: ['模型词元预留上限', 'Model token reservation bounds', '按准确模型名称设置保守的词元预留值，用于请求预算，不代表模型输出上限。', 'Conservative token reservations per exact model name, used for request budgeting rather than model output limits.'],
-    transport_policy: ['超时与重试参数', 'Timeout and retry parameters', '单位见各字段；这些设置影响该账号的所有请求。', 'Units are shown per field. These settings affect every request using this account.'],
+    transport_policy: ['运行时传输策略', 'Runtime transport policy', '单位见各字段；这些设置影响该账号的所有请求。', 'Units are shown per field. These settings affect every request using this account.'],
   };
   for (const [name, [zhTitle, enTitle, zhHint, enHint]] of Object.entries(copy)) {
     const field = properties.properties?.[name];
@@ -29,7 +29,7 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
       request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
       max_sse_event_bytes: '单个上游 SSE 事件允许保留的最大字节数；Responses 终止事件可能包含完整响应对象。',
       max_sse_framed_bytes: '单个网络分片可产出的完整 SSE 帧总字节数，必须不小于单事件上限。',
-      max_sse_terminal_hold_bytes: '等待 EOF 验证时可暂存的终止事件总字节数，必须不小于单事件上限。',
+      max_sse_terminal_hold_bytes: '等待 EOF 验证时可暂存的终止事件总字节数，必须介于单事件上限与单分片 framing 上限之间。',
     })) {
       const field = policy.properties?.[name];
       if (field && typeof field === 'object') field.description = description;

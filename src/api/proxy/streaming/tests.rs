@@ -251,6 +251,51 @@ fn chat_capture_uses_the_request_framing_snapshot() {
 }
 
 #[test]
+fn eof_terminal_hold_preserves_framing_budget_across_completed_and_done_chunks() {
+    let limits = crate::provider::SseFramingLimits {
+        event_bytes: 300 * 1024,
+        framed_bytes: 320 * 1024,
+        terminal_hold_bytes: 320 * 1024,
+    };
+    let prefix = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-eof-policy\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12},\"padding\":\"";
+    let suffix = b"\"}}\n\n";
+    let mut completed = Vec::with_capacity(limits.event_bytes);
+    completed.extend_from_slice(prefix);
+    completed.extend(vec![b'x'; limits.event_bytes - prefix.len() - suffix.len()]);
+    completed.extend_from_slice(suffix);
+    assert_eq!(completed.len(), limits.event_bytes);
+    let done = b"data: [DONE]\n\n";
+
+    let mut sanitizer = crate::api::sse::ResponsesStreamingSanitizer::with_limits(limits);
+    assert!(sanitizer.push(&completed).unwrap().is_empty());
+    assert!(sanitizer.push(done).unwrap().is_empty());
+    let released = sanitizer.finish().unwrap();
+    assert_eq!(released.as_ref(), [completed.as_slice(), done].concat());
+    assert!(released.len() > limits.event_bytes);
+    assert!(released.len() <= limits.framed_bytes);
+
+    let mut capture = ResponsesSseCapture::for_codex_responses_with_limits(limits);
+    let frames = capture.push_delivery_frames(&released).unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.bytes.as_ref())
+            .collect::<Vec<_>>(),
+        vec![completed.as_slice(), done.as_slice()]
+    );
+    let summary = capture.finish_summary();
+    assert_eq!(
+        summary.outcome,
+        ResponsesSseOutcome::Completed {
+            response_id: Some("resp-eof-policy".to_owned()),
+        }
+    );
+    assert_eq!(summary.usage.unwrap().total_tokens(), 12);
+    assert!(!summary.usage_invalid);
+    assert!(!summary.protocol_invalid);
+}
+
+#[test]
 fn codex_capture_accepts_a_fragmented_large_terminal_without_archive_or_billing_pollution() {
     const OBSERVED_LARGE_EVENT_BYTES: usize = 346_759;
     const FRAGMENT_BYTES: usize = 64 * 1024;

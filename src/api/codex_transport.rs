@@ -2394,6 +2394,7 @@ mod tests {
             json!({"max_sse_event_bytes": 262143}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
             json!({"unexpected": true}),
             json!("invalid"),
         ] {

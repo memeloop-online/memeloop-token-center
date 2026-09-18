@@ -113,6 +113,7 @@ impl CodexTransportPolicy {
                 .contains(&policy.max_sse_framed_bytes)
             || !(policy.max_sse_event_bytes..=SseFramingLimits::MAX_BUFFER_BYTES)
                 .contains(&policy.max_sse_terminal_hold_bytes)
+            || policy.max_sse_terminal_hold_bytes > policy.max_sse_framed_bytes
             || policy.connect_timeout_millis >= policy.request_timeout_millis
             || policy.read_timeout_millis > policy.request_timeout_millis
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
@@ -219,6 +220,7 @@ mod tests {
             json!({"max_sse_event_bytes": 16777217}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+            json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
             json!({"max_sse_framed_bytes": 16842753}),
             json!({"max_sse_terminal_hold_bytes": 16842753}),
             json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),

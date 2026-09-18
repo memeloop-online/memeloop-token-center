@@ -521,7 +521,7 @@ impl ProviderCatalog {
             "type": "object",
             "additionalProperties": false,
             "default": {},
-            "description": "Runtime-adjustable recovery policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
+            "description": "Runtime-adjustable transport policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
             "properties": {
                 "version": {
                     "type": "integer",
@@ -558,7 +558,7 @@ impl ProviderCatalog {
                 "max_sse_terminal_hold_bytes": {
                     "type": "integer", "minimum": 262144, "maximum": 16842752, "default": 8454144,
                     "title": "Maximum terminal hold bytes",
-                    "description": "Maximum validated Responses terminal bytes held until EOF. Must be at least max_sse_event_bytes."
+                    "description": "Maximum validated Responses terminal bytes held until EOF. Must be between max_sse_event_bytes and max_sse_framed_bytes."
                 },
                 "candidate_attempts": {
                     "type": "integer",

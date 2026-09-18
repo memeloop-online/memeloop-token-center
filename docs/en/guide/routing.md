@@ -53,7 +53,7 @@ Native Codex accounts can adjust connection, failover, and SSE framing budgets i
 | `failover_deadline_millis` | 300000 | 1000–300000 |
 | `max_sse_event_bytes` | 8388608 | 262144–16777216 |
 | `max_sse_framed_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
-| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
+| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–`max_sse_framed_bytes` |
 
 Change this with the existing account update `PUT /internal/v1/upstreams/{account_id}` (CAS). Candidate count and Deadline are snapshotted once on request entry. SSE limits are snapshotted once for the selected outbound attempt and shared by header admission, sanitizer, delivery capture, archive projection, and terminal hold. Runtime changes apply to later requests and never change an executing stream. After the Deadline, no new send starts, but a response stream that has been admitted successfully is not truncated.
 

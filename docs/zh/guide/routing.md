@@ -53,7 +53,7 @@
 | `failover_deadline_millis` | 300000 | 1000–300000 |
 | `max_sse_event_bytes` | 8388608 | 262144–16777216 |
 | `max_sse_framed_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
-| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
+| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–`max_sse_framed_bytes` |
 
 通过既有的 `PUT /internal/v1/upstreams/{account_id}` 账户更新（CAS）修改。候选数与 Deadline 在请求入场时快照一次；SSE 限制在选定出站尝试时快照一次，并由响应头准入、sanitizer、投递 capture、归档投影和 terminal hold 共同使用。运行时修改只影响后续请求，不会改变正在执行的流。Deadline 到期后不再发起新的发送，但成功准入的响应流不会被截断。
 

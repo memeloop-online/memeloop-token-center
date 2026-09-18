@@ -88,6 +88,8 @@ async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"max_sse_event_bytes": 262143}),
         json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
         json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
+        json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112,
+            "max_sse_terminal_hold_bytes": 1179648}),
     ] {
         let mut rejected = update.clone();
         rejected["expected_updated_at"] = saved["updated_at"].clone();
