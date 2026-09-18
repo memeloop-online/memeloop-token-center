@@ -11,6 +11,7 @@ on:
         options:
           - model-guard
           - preferred-account
+          - health-intelligence
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center'
+    if: github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center' && inputs.package != 'health-intelligence'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -151,5 +152,98 @@ jobs:
             ${{ runner.temp }}/plugin-installation.json
             ${{ runner.temp }}/plugin-package/plugin.json
             ${{ runner.temp }}/plugin-package/plugin.wasm
+          if-no-files-found: error
+          retention-days: 90
+
+  endorse-health-intelligence:
+    if: github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center' && inputs.package == 'health-intelligence'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      PLUGIN_ID: mtc-health-intelligence
+      PLUGIN_SOURCE: ghcr.io/memeloop-online/memeloop-token-center-health-intelligence-plugin
+      PLUGIN_DIGEST: sha256:d9d558a6a6118dadfd2693cfd7f479109dbca53ef8ddae201d8ea70fb93922c3
+      UPSTREAM_SIGNING_IDENTITY: https://github.com/memeloop-online/memeloop-token-center-health-intelligence-plugin/.github/workflows/publish.yml@refs/heads/master
+      SIGNING_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-first-party-plugin.yml@refs/heads/master
+      SIGNING_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Resolve installer executable trust from reviewed master source
+        run: node scripts/ci/resolve-first-party-plugin-installer.ts
+      - uses: oras-project/setup-oras@ccb71166b124a8452d1b72c4476398a909ed4d63 # main (reviewed immutable commit)
+        with:
+          version: 1.3.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load the reviewed verifier from the pinned installer
+        run: |
+          docker pull "$INSTALLER_SOURCE@$INSTALLER_DIGEST"
+          actual_revision=$(docker image inspect "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          [[ "$actual_revision" == "$INSTALLER_SOURCE_REVISION" ]]
+          container=$(docker create "$INSTALLER_SOURCE@$INSTALLER_DIGEST")
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p "$RUNNER_TEMP/plugin-tools"
+          docker cp "$container:/usr/local/bin/cosign" "$RUNNER_TEMP/plugin-tools/cosign"
+          chmod 0555 "$RUNNER_TEMP/plugin-tools/cosign"
+          "$RUNNER_TEMP/plugin-tools/cosign" version --json | node scripts/ci/first-party-plugin-command-output.ts cosign-version
+          echo "$RUNNER_TEMP/plugin-tools" >> "$GITHUB_PATH"
+      - name: Verify the upstream release and add the MTC endorsement
+        run: |
+          cosign verify \
+            --certificate-identity "$UPSTREAM_SIGNING_IDENTITY" \
+            --certificate-oidc-issuer "$SIGNING_ISSUER" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/upstream-signature-verification.json"
+          cosign sign --yes "$PLUGIN_SOURCE@$PLUGIN_DIGEST"
+          cosign verify \
+            --certificate-identity "$SIGNING_IDENTITY" \
+            --certificate-oidc-issuer "$SIGNING_ISSUER" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" > "$RUNNER_TEMP/mtc-endorsement-verification.json"
+          oras manifest fetch "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --output "$RUNNER_TEMP/plugin-oci-manifest.json"
+      - name: Clean-install the endorsed manifest-only package
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-install" "$RUNNER_TEMP/plugin-registry"
+          umask 077
+          printf '%s' "$REGISTRY_USERNAME" > "$RUNNER_TEMP/plugin-registry/username"
+          printf '%s' "$REGISTRY_PASSWORD" > "$RUNNER_TEMP/plugin-registry/password"
+          sudo chown -R 10001:10001 "$RUNNER_TEMP/plugin-registry"
+          sudo chown 10001:10001 "$RUNNER_TEMP/plugin-install"
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=32m \
+            --mount "type=bind,src=$RUNNER_TEMP/plugin-install,dst=/plugins" \
+            --mount "type=bind,src=$RUNNER_TEMP/plugin-registry,dst=/registry,readonly" \
+            --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --plugin-dir /plugins --allowed-source "$PLUGIN_SOURCE" \
+            --cosign-certificate-identity "$SIGNING_IDENTITY" \
+            --cosign-certificate-oidc-issuer "$SIGNING_ISSUER" \
+            --registry-username-file /registry/username --registry-password-file /registry/password \
+            > "$RUNNER_TEMP/plugin-installation.json"
+          node scripts/ci/health-intelligence-endorsement.ts "$RUNNER_TEMP"
+      - name: Preserve endorsement and clean-install evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: mtc-health-intelligence-endorsement-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/plugin-endorsement.json
+            ${{ runner.temp }}/plugin-oci-manifest.json
+            ${{ runner.temp }}/upstream-signature-verification.json
+            ${{ runner.temp }}/mtc-endorsement-verification.json
+            ${{ runner.temp }}/plugin-installation.json
+            ${{ runner.temp }}/plugin-install/mtc-health-intelligence/plugin.json
+            ${{ runner.temp }}/plugin-install/mtc-health-intelligence/.mtc-oci-install.json
           if-no-files-found: error
           retention-days: 90
