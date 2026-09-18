@@ -1409,6 +1409,15 @@ mod tests {
                 .await,
             Err(AppError::Internal)
         ));
+        database
+            .store_key_credential_plaintext(issued.key_id, &issued.key, pepper)
+            .await
+            .unwrap();
+        let repaired = database
+            .copy_key_credential(issued.key_id, pepper, None, true)
+            .await
+            .unwrap();
+        assert!(repaired.key == issued.key);
         sqlx::query("UPDATE key_credentials SET secret_plaintext = NULL WHERE key_id = $1")
             .bind(issued.key_id.to_string())
             .execute(&database.pool)

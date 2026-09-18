@@ -38,7 +38,7 @@ impl Database {
                 "credential does not match the active key".into(),
             ));
         }
-        sqlx::query("UPDATE key_credentials SET secret_plaintext = $1 WHERE id = $2 AND secret_plaintext IS NULL")
+        sqlx::query("UPDATE key_credentials SET secret_plaintext = $1 WHERE id = $2")
             .bind(credential)
             .bind(current.try_get::<String, _>("credential_id")?)
             .execute(&mut *tx)

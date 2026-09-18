@@ -1,6 +1,7 @@
--- Application migration 110 first verifies and promotes every recoverable
--- active NULL plaintext inside the same transaction. Never run this SQL alone.
-DROP TABLE key_credential_recovery_access_audit;
-DROP TABLE key_credential_recovery_rate_limits;
-DROP TABLE key_credential_recovery_audit;
-DROP TABLE key_credential_recovery_secrets;
+-- Expand phase: application migration 110 validates every active credential
+-- and promotes missing plaintext inside this same transaction. The application
+-- no longer accesses legacy envelope/access tables, but they MUST remain while
+-- old control replicas can still serve requests during a rolling upgrade.
+-- A separate future contract migration may remove them only after production
+-- rollout verification. Never run this SQL without the application preflight.
+SELECT 1;

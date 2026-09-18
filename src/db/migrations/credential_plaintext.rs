@@ -1,6 +1,6 @@
 use super::*;
 
-// Only the one-time upgrade understands the retired storage format. Keep the
+// Only the one-time upgrade understands the legacy storage format. Keep the
 // exact historical AAD; changing it would make original credentials unreadable.
 const LEGACY_AAD: &str = "memeloop-token-center/key-credential-recovery/v1";
 
@@ -22,18 +22,17 @@ pub(super) async fn promote_active_plaintext(
     pepper: Option<&[u8]>,
 ) -> Result<(), sqlx::Error> {
     if matches!(backend, DatabaseBackend::PostgreSql) {
-        // Fence old-version readers and writers for the whole promotion +
-        // DROP transaction. A weaker lock lets an old copy reader hold an
-        // envelope read lock while waiting to promote plaintext, deadlocking
-        // this transaction when DROP upgrades to an exclusive lock.
-        sqlx::query("LOCK TABLE key_records, key_credentials, key_credential_recovery_secrets IN ACCESS EXCLUSIVE MODE")
+        // Fence old-version writers and rotations across validation/promotion.
+        // The expand phase retains the old tables so rolling replicas can
+        // continue to use their existing schema after this commit.
+        sqlx::query("LOCK TABLE key_records, key_credentials, key_credential_recovery_secrets IN SHARE ROW EXCLUSIVE MODE")
             .execute(&mut **tx)
             .await?;
     }
     let mut cursor = String::new();
     loop {
         let rows = sqlx::query(
-            "SELECT c.id, c.key_id, c.generation, c.secret_hash, k.status, k.credential_generation, r.key_id AS envelope_key_id, r.credential_generation AS envelope_generation, r.ciphertext FROM key_credentials c JOIN key_records k ON k.id = c.key_id LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id WHERE c.revoked_at IS NULL AND c.generation = k.credential_generation AND k.status <> 'revoked' AND c.secret_plaintext IS NULL AND c.id > $1 ORDER BY c.id LIMIT 256",
+            "SELECT c.id, c.key_id, c.generation, c.secret_hash, c.secret_plaintext, k.status, k.credential_generation, r.key_id AS envelope_key_id, r.credential_generation AS envelope_generation, r.ciphertext FROM key_credentials c JOIN key_records k ON k.id = c.key_id LEFT JOIN key_credential_recovery_secrets r ON r.credential_id = c.id WHERE c.revoked_at IS NULL AND k.status <> 'revoked' AND c.id > $1 ORDER BY c.id LIMIT 256",
         )
         .bind(&cursor)
         .fetch_all(&mut **tx)
@@ -47,13 +46,25 @@ pub(super) async fn promote_active_plaintext(
             let key_id: String = row.try_get("key_id")?;
             let key_uuid = Uuid::parse_str(&key_id).map_err(|_| invalid_upgrade())?;
             let generation: i64 = row.try_get("generation")?;
-            let envelope_key_id: Option<String> = row.try_get("envelope_key_id")?;
-            let envelope_generation: Option<i64> = row.try_get("envelope_generation")?;
-            // Suspended credentials must not silently lose their only original
-            // either. Require an explicit resolution before retiring storage.
             if row.try_get::<String, _>("status")? != "active"
                 || row.try_get::<i64, _>("credential_generation")? != generation
-                || envelope_key_id.as_deref() != Some(key_id.as_str())
+            {
+                return Err(invalid_upgrade());
+            }
+            let expected: Vec<u8> = row.try_get("secret_hash")?;
+            if let Some(plaintext) = row.try_get::<Option<String>, _>("secret_plaintext")? {
+                if !crypto::verify_credential(&plaintext, pepper, &expected)
+                    || crypto::parse_credential(&plaintext)
+                        .is_some_and(|parsed| parsed.key_id != key_uuid)
+                {
+                    return Err(invalid_upgrade());
+                }
+                cursor = id;
+                continue;
+            }
+            let envelope_key_id: Option<String> = row.try_get("envelope_key_id")?;
+            let envelope_generation: Option<i64> = row.try_get("envelope_generation")?;
+            if envelope_key_id.as_deref() != Some(key_id.as_str())
                 || envelope_generation != Some(generation)
             {
                 return Err(invalid_upgrade());
@@ -63,10 +74,11 @@ pub(super) async fn promote_active_plaintext(
             let aad = format!("{LEGACY_AAD}/{key_uuid}/{generation}");
             let envelope: LegacyEnvelope = open_private_json(&ciphertext, pepper, aad.as_bytes())
                 .map_err(|_| invalid_upgrade())?;
-            let expected: Vec<u8> = row.try_get("secret_hash")?;
             if envelope.key_id != key_uuid
                 || envelope.credential_generation != generation
                 || !crypto::verify_credential(&envelope.key, pepper, &expected)
+                || crypto::parse_credential(&envelope.key)
+                    .is_some_and(|parsed| parsed.key_id != key_uuid)
             {
                 return Err(invalid_upgrade());
             }
@@ -112,19 +124,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn restore_legacy_tables(database: &Database) {
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/common/0070_key_credential_recovery.sql"
-        ))
-        .execute(&database.pool)
-        .await
-        .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/common/0079_key_credential_recovery_access_limits.sql"
-        ))
-        .execute(&database.pool)
-        .await
-        .unwrap();
+    async fn mark_upgrade_pending(database: &Database) {
         sqlx::query("DELETE FROM schema_migrations WHERE version = 110")
             .execute(&database.pool)
             .await
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrade_promotes_originals_before_drop_without_overwriting_or_rotating() {
+    async fn upgrade_promotes_originals_without_overwriting_rotating_or_dropping_legacy_tables() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
@@ -176,7 +176,7 @@ mod tests {
         database.migrate().await.unwrap();
         let legacy = issue(&database, "legacy").await;
         let direct = issue(&database, "direct").await;
-        restore_legacy_tables(&database).await;
+        mark_upgrade_pending(&database).await;
         envelope(&database, &legacy, "valid").await;
         database
             .migrate_with_credential_pepper(PEPPER)
@@ -195,9 +195,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'key_credential_recovery_%'")
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'key_credential_recovery_%'")
             .fetch_one(&database.pool).await.unwrap();
-        assert_eq!(retired, 0);
+        assert_eq!(retained, 4);
     }
 
     #[tokio::test]
@@ -212,6 +212,9 @@ mod tests {
             "aad",
             "missing_envelope",
             "suspended",
+            "active_generation",
+            "existing_plaintext_hash",
+            "existing_plaintext_identity",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let database = Database::connect(&format!(
@@ -223,7 +226,7 @@ mod tests {
             database.migrate().await.unwrap();
             let valid = issue(&database, "valid").await;
             let invalid = issue(&database, "invalid").await;
-            restore_legacy_tables(&database).await;
+            mark_upgrade_pending(&database).await;
             envelope(&database, &valid, "valid").await;
             envelope(&database, &invalid, fault).await;
             if fault == "missing_envelope" {
@@ -238,6 +241,23 @@ mod tests {
                     .set_key_status(invalid.key_id, "suspended")
                     .await
                     .unwrap();
+            }
+            if fault == "active_generation" {
+                sqlx::query("UPDATE key_credentials SET generation = 2 WHERE key_id = $1")
+                    .bind(invalid.key_id.to_string())
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+            }
+            if fault == "existing_plaintext_hash" {
+                sqlx::query("UPDATE key_credentials SET secret_plaintext = 'incorrect-original-value' WHERE key_id = $1")
+                    .bind(invalid.key_id.to_string()).execute(&database.pool).await.unwrap();
+            }
+            if fault == "existing_plaintext_identity" {
+                let (hash, _) = crypto::hash_credential(&valid.key, PEPPER);
+                sqlx::query("UPDATE key_credentials SET secret_plaintext = $1, secret_hash = $2 WHERE key_id = $3")
+                    .bind(&valid.key).bind(hash).bind(invalid.key_id.to_string())
+                    .execute(&database.pool).await.unwrap();
             }
             let result = match fault {
                 "missing_pepper" => database.migrate().await,
@@ -255,7 +275,11 @@ mod tests {
             .fetch_one(&database.pool)
             .await
             .unwrap();
-            assert_eq!(promoted, 0, "{fault}");
+            assert_eq!(
+                promoted,
+                i64::from(fault.starts_with("existing_plaintext")),
+                "{fault}"
+            );
             let applied: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 110")
                     .fetch_one(&database.pool)
@@ -276,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_copyable_upgrade_needs_no_pepper_and_never_replaces_plaintext() {
+    async fn already_copyable_upgrade_requires_the_correct_pepper_and_never_replaces_plaintext() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
@@ -286,7 +310,7 @@ mod tests {
         .unwrap();
         database.migrate().await.unwrap();
         let issued = issue(&database, "already-copyable").await;
-        restore_legacy_tables(&database).await;
+        mark_upgrade_pending(&database).await;
         // An obsolete envelope must not overwrite an existing direct value.
         envelope(&database, &issued, "hash").await;
         sqlx::query("UPDATE key_credentials SET secret_plaintext = $1 WHERE key_id = $2")
@@ -295,7 +319,17 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
-        database.migrate().await.unwrap();
+        assert!(database.migrate().await.is_err());
+        assert!(
+            database
+                .migrate_with_credential_pepper(b"wrong pepper")
+                .await
+                .is_err()
+        );
+        database
+            .migrate_with_credential_pepper(PEPPER)
+            .await
+            .unwrap();
         let copied = database
             .copy_key_credential(issued.key_id, PEPPER, None, true)
             .await
@@ -304,7 +338,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_upgrade_locks_promotes_and_drops_only_after_complete_validation() {
+    async fn automatic_startup_upgrade_uses_the_configured_pepper() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("startup-upgrade.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let issued = issue(&database, "startup").await;
+        mark_upgrade_pending(&database).await;
+        envelope(&database, &issued, "valid").await;
+        let mut config = crate::config::Config::for_test(database_url);
+        config.key_pepper = String::from_utf8(PEPPER.to_vec()).unwrap();
+        let state = crate::AppState::initialize(config).await.unwrap();
+        let copied = state
+            .db
+            .copy_key_credential(issued.key_id, PEPPER, None, true)
+            .await
+            .unwrap();
+        assert!(copied.key == issued.key);
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_credential_recovery_secrets")
+                .fetch_one(&state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_upgrade_locks_promotes_and_retains_legacy_tables_after_validation() {
         let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
             return;
         };
@@ -408,9 +471,9 @@ mod tests {
                 apply_migration_range(&mut tx, POSTGRES_MIGRATIONS, 110, 110)
                     .await
                     .unwrap();
-                let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name LIKE 'key_credential_recovery_%'")
+                let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name LIKE 'key_credential_recovery_%'")
                     .fetch_one(&mut *tx).await.unwrap();
-                assert_eq!(retired, 0);
+                assert_eq!(retained, 4);
             }
             tx.rollback().await.unwrap();
         }

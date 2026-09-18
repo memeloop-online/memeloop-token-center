@@ -1166,7 +1166,7 @@ impl Database {
     }
 
     /// Production upgrades must supply the existing authentication pepper so
-    /// legacy active credentials can be verified before their envelopes retire.
+    /// all active originals can be verified before enabling direct copy.
     pub async fn migrate_with_credential_pepper(&self, pepper: &[u8]) -> Result<(), sqlx::Error> {
         self.migrate_with_optional_credential_pepper(Some(pepper))
             .await
