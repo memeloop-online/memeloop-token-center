@@ -712,11 +712,13 @@ fn push_identity_eligibility(
             query.push(source_alias);
             query.push(".key_id AND identity_key.tenant_id = ");
             query.push(source_alias);
-            query.push(".tenant_id) OR EXISTS (SELECT 1 FROM usage_reservations identity_reservation WHERE identity_reservation.id = ");
+            query.push(".tenant_id) OR EXISTS (SELECT 1 FROM usage_reservations identity_reservation JOIN credit_accounts identity_account ON identity_account.id = identity_reservation.account_id WHERE identity_reservation.id = ");
             query.push(source_alias);
             query.push(".reservation_id AND identity_reservation.key_id = ");
             query.push(source_alias);
-            query.push(".key_id))");
+            query.push(".key_id AND identity_account.tenant_id = ");
+            query.push(source_alias);
+            query.push(".tenant_id))");
         }
         "u" => {
             query.push(" AND (EXISTS (SELECT 1 FROM key_records identity_key WHERE identity_key.id = u.key_id AND identity_key.tenant_id = u.tenant_id) OR EXISTS (SELECT 1 FROM session_archive_correlations identity_correlation WHERE identity_correlation.tenant_id = u.tenant_id AND identity_correlation.source = u.source AND identity_correlation.external_request_id = u.external_request_id AND identity_correlation.disposition = 'unlinked'))");
