@@ -20,11 +20,15 @@ pub(super) async fn deprecated_health() -> Response {
     response
 }
 
-fn readiness_contract(database_ready: bool, archive_ready: bool) -> (StatusCode, Value) {
+fn readiness_contract(
+    database: crate::metrics::DatabaseReadiness,
+    archive_ready: bool,
+) -> (StatusCode, Value) {
     // Kubernetes may safely send traffic while the durable database is
     // reachable. Archive availability is still surfaced as an explicit
     // degradation, but must not withdraw every gateway endpoint during an
     // object-store outage.
+    let database_ready = database.is_ready();
     let status = if database_ready {
         StatusCode::OK
     } else {
@@ -35,12 +39,27 @@ fn readiness_contract(database_ready: bool, archive_ready: bool) -> (StatusCode,
         (true, false) => "degraded",
         (false, _) => "not_ready",
     };
+    let database_schema = match database {
+        crate::metrics::DatabaseReadiness::Ready => json!({"status": "ok"}),
+        crate::metrics::DatabaseReadiness::Unavailable => json!({"status": "unknown"}),
+        crate::metrics::DatabaseReadiness::SchemaOutdated {
+            required_version,
+            latest_applied_version,
+            missing_migration_count,
+        } => json!({
+            "status": "outdated",
+            "required_version": required_version,
+            "latest_applied_version": latest_applied_version,
+            "missing_migration_count": missing_migration_count,
+        }),
+    };
     (
         status,
         json!({
             "status": readiness,
             "checks": {
                 "database": if database_ready { "ok" } else { "failed" },
+                "database_schema": database_schema,
                 "archive": if archive_ready { "ok" } else { "failed" }
             }
         }),
@@ -60,11 +79,35 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
                     archive.readiness_check()
                 ),
             );
-            let database_ready = matches!(database, Ok(Ok(())));
+            let database_timed_out = database.is_err();
+            let database_readiness = match database {
+                Ok(Ok(())) => crate::metrics::DatabaseReadiness::Ready,
+                Ok(Err(crate::db::DatabaseReadinessError::SchemaOutdated(schema))) => {
+                    tracing::warn!(
+                        required_schema_version = schema.required_version,
+                        latest_applied_schema_version = ?schema.latest_applied_version,
+                        missing_migration_count = schema.missing_migration_count,
+                        "readiness database schema is outdated"
+                    );
+                    crate::metrics::DatabaseReadiness::SchemaOutdated {
+                        required_version: schema.required_version,
+                        latest_applied_version: schema.latest_applied_version,
+                        missing_migration_count: schema.missing_migration_count,
+                    }
+                }
+                Ok(Err(crate::db::DatabaseReadinessError::Dependency(error))) => {
+                    tracing::warn!(
+                        error_category = error.diagnostic_category(),
+                        "readiness database dependency check failed"
+                    );
+                    crate::metrics::DatabaseReadiness::Unavailable
+                }
+                Err(_) => crate::metrics::DatabaseReadiness::Unavailable,
+            };
             let archive_ready = matches!(archive, Ok(Ok(())));
-            if !database_ready {
+            if !database_readiness.is_ready() {
                 tracing::warn!(
-                    timed_out = database.is_err(),
+                    timed_out = database_timed_out,
                     "readiness database check failed"
                 );
             }
@@ -74,11 +117,42 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
                     "readiness archive check failed"
                 );
             }
-            (database_ready, archive_ready)
+            (database_readiness, archive_ready)
         })
         .await;
     let (status, body) = readiness_contract(database_ready, archive_ready);
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outdated_schema_is_explicitly_not_ready() {
+        let (status, body) = readiness_contract(
+            crate::metrics::DatabaseReadiness::SchemaOutdated {
+                required_version: 111,
+                latest_applied_version: Some(105),
+                missing_migration_count: 6,
+            },
+            true,
+        );
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["checks"]["database"], "failed");
+        assert_eq!(body["checks"]["database_schema"]["status"], "outdated");
+        assert_eq!(body["checks"]["database_schema"]["required_version"], 111);
+        assert_eq!(
+            body["checks"]["database_schema"]["latest_applied_version"],
+            105
+        );
+        assert_eq!(
+            body["checks"]["database_schema"]["missing_migration_count"],
+            6
+        );
+    }
 }
 
 pub(super) async fn prometheus_metrics(

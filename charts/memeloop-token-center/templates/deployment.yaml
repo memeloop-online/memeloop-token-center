@@ -1,5 +1,11 @@
 {{- $archiveProbeMinimum := add (div (add (int .Values.config.s3.readinessDeadlineMillis) 999) 1000) 2 -}}
-{{- if and (eq .Values.probes.readiness.path "/readyz") (lt (int .Values.probes.readiness.timeoutSeconds) (int $archiveProbeMinimum)) -}}
+{{- if ne .Values.probes.readiness.path "/readyz" -}}
+{{- fail "probes.readiness.path must be /readyz; /livez is reserved for liveness" -}}
+{{- end -}}
+{{- if ne .Values.probes.liveness.path "/livez" -}}
+{{- fail "probes.liveness.path must be /livez" -}}
+{{- end -}}
+{{- if lt (int .Values.probes.readiness.timeoutSeconds) (int $archiveProbeMinimum) -}}
 {{- fail (printf "probes.readiness.timeoutSeconds must be >= %d for /readyz (archive deadline rounded up plus 2 seconds)" $archiveProbeMinimum) -}}
 {{- end -}}
 {{- if gt (int .Values.config.s3.connectTimeoutMillis) (int .Values.config.s3.requestTimeoutMillis) -}}

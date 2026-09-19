@@ -126,8 +126,25 @@ impl ProxyMemoryRejectionStage {
 #[derive(Clone, Copy)]
 struct CachedReadiness {
     checked_at: Instant,
-    database: bool,
+    database: DatabaseReadiness,
     archive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseReadiness {
+    Ready,
+    Unavailable,
+    SchemaOutdated {
+        required_version: i64,
+        latest_applied_version: Option<i64>,
+        missing_migration_count: usize,
+    },
+}
+
+impl DatabaseReadiness {
+    pub(crate) const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -524,10 +541,10 @@ impl Metrics {
     /// This keeps anonymous Kubernetes probes from amplifying into an S3 list
     /// and SQL query on every inbound request while still detecting dependency
     /// failures quickly enough for endpoint removal.
-    pub async fn readiness<F, Fut>(&self, check: F) -> (bool, bool)
+    pub(crate) async fn readiness<F, Fut>(&self, check: F) -> (DatabaseReadiness, bool)
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = (bool, bool)>,
+        Fut: Future<Output = (DatabaseReadiness, bool)>,
     {
         const TTL: Duration = Duration::from_secs(5);
         let Ok(mut cached) = self.inner.readiness.try_lock() else {
@@ -535,7 +552,11 @@ impl Metrics {
             // check is already running. Until the first check completes this is
             // conservatively not-ready; afterwards it is the most recent result.
             return (
-                self.inner.database_ready.load(Ordering::Relaxed) == 1,
+                if self.inner.database_ready.load(Ordering::Relaxed) == 1 {
+                    DatabaseReadiness::Ready
+                } else {
+                    DatabaseReadiness::Unavailable
+                },
                 self.inner.archive_ready.load(Ordering::Relaxed) == 1,
             );
         };
@@ -553,7 +574,7 @@ impl Metrics {
             archive,
         });
         drop(cached);
-        self.set_dependency_ready("database", database);
+        self.set_dependency_ready("database", database.is_ready());
         self.set_dependency_ready("archive", archive);
         (database, archive)
     }
@@ -1448,17 +1469,17 @@ mod tests {
         let first = metrics
             .readiness(|| async {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (true, true)
+                (DatabaseReadiness::Ready, true)
             })
             .await;
         let second = metrics
             .readiness(|| async {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (false, false)
+                (DatabaseReadiness::Unavailable, false)
             })
             .await;
-        assert_eq!(first, (true, true));
-        assert_eq!(second, (true, true));
+        assert_eq!(first, (DatabaseReadiness::Ready, true));
+        assert_eq!(second, (DatabaseReadiness::Ready, true));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
