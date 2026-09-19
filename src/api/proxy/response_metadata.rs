@@ -313,7 +313,10 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         || usage.contains_key("prompt_tokens_details")
         || usage.contains_key("prompt_tokens");
     let uncached_input = if input_includes_cache {
-        reported_input.checked_sub(cached_input).ok_or(())?
+        reported_input
+            .checked_sub(cached_input)
+            .and_then(|value| value.checked_sub(cache_write))
+            .ok_or(())?
     } else {
         reported_input
     };
@@ -443,6 +446,27 @@ mod kimi_buffered_tests {
         let ExtractedUsage::Valid(result) = parse(anthropic, kimi, Protocol::AnthropicMessages)
         else {
             panic!("native Anthropic usage")
+        };
+        assert_eq!(
+            (
+                result.input_tokens,
+                result.cached_input_tokens,
+                result.cache_write_tokens
+            ),
+            (4, 6, 3)
+        );
+
+        let translated = serde_json::json!({
+            "input_tokens":13,
+            "output_tokens":2,
+            "total_tokens":15,
+            "input_tokens_details":{"cached_tokens":6},
+            "cache_creation_input_tokens":3
+        });
+        let ExtractedUsage::Valid(result) =
+            parse(translated, "anthropic-claude", Protocol::OpenAiResponses)
+        else {
+            panic!("translated Anthropic usage")
         };
         assert_eq!(
             (

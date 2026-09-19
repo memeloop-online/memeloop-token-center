@@ -21,6 +21,7 @@ use crate::{
     model::KeyPolicy,
 };
 
+mod anthropic_bridge;
 mod archive_terminal;
 mod buffered_responses_incomplete;
 mod chat_sse_usage;
@@ -743,6 +744,31 @@ async fn response_usage_fixture_with_uri_contract_and_driver_model(
     driver: &str,
     public_model: &str,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_contract_driver_model_and_credential(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+        driver,
+        public_model,
+        UpstreamCredential::ApiKey {
+            value: "compatibility-upstream-secret".to_owned(),
+            header: "authorization".to_owned(),
+            prefix: "Bearer ".to_owned(),
+        },
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri_contract_driver_model_and_credential(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+    driver: &str,
+    public_model: &str,
+    credential: UpstreamCredential,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = format!(
@@ -774,11 +800,7 @@ async fn response_usage_fixture_with_uri_contract_and_driver_model(
                 name: format!("compatibility-{label}"),
                 driver: driver.to_owned(),
                 config: upstream_config,
-                credential: UpstreamCredential::ApiKey {
-                    value: "compatibility-upstream-secret".to_owned(),
-                    header: "authorization".to_owned(),
-                    prefix: "Bearer ".to_owned(),
-                },
+                credential,
                 oauth_session_id: None,
                 oauth_driver: None,
                 oauth_refresh_url: None,
