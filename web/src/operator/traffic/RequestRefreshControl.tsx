@@ -24,7 +24,12 @@ export function RequestRefreshControl({ intervalMs, onIntervalChange, paused, pa
     <label>{t('requestRefresh.cadence')} <strong aria-hidden="true">{labels[index]}</strong></label>
     <div className="request-refresh-slider">
       <Slider min={0} max={4} step={1} value={index} aria-label={t('requestRefresh.cadence')} aria-valuetext={labels[index]}
-        onChange={(_, data) => onIntervalChange(requestRefreshIntervals[data.value])} />
+        onChange={(event) => {
+          const nextIndex = Number(event.currentTarget.value);
+          if (Number.isInteger(nextIndex) && nextIndex >= 0 && nextIndex < requestRefreshIntervals.length) {
+            onIntervalChange(requestRefreshIntervals[nextIndex]);
+          }
+        }} />
       <div className="request-refresh-ticks" aria-hidden="true">{labels.map(label => <span key={label}>{label}</span>)}</div>
     </div>
     <span className="request-refresh-hint" role="status">
