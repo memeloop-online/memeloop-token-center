@@ -96,7 +96,9 @@ pub(super) fn plan_proxy_route(
     // Kimi still rewrites MultiAgent into Chat. http-json and New API keep
     // native Responses semantics; do not reuse the Kimi rewrite for them.
     let normalize_multi_agent =
-        multi_agent_responses && state.providers.supports_codex_multi_agent_v2(&route.driver);
+        multi_agent_responses
+        && responses_via_chat_dialect.is_some()
+        && state.providers.supports_codex_multi_agent_v2(&route.driver, &route.config);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
