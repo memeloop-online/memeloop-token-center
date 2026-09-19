@@ -12,11 +12,7 @@ pub(super) fn tenant_cas_location(
     digest: &str,
     compressed: bool,
 ) -> Result<String, AppError> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lower_hex_digest(digest) {
         return Err(AppError::Storage(
             "archive content digest is invalid".into(),
         ));
@@ -47,12 +43,14 @@ pub(crate) fn is_tenant_cas_location(tenant_id: Uuid, location: &str) -> bool {
     let digest = object
         .strip_suffix(super::compressed::SUFFIX)
         .unwrap_or(object);
+    is_lower_hex_digest(digest) && shard.len() == 2 && digest.starts_with(shard)
+}
+
+fn is_lower_hex_digest(digest: &str) -> bool {
     digest.len() == 64
-        && shard.len() == 2
-        && shard == &digest[..2]
         && digest
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
