@@ -42,6 +42,7 @@ struct MetricsInner {
     memory_admission: memory_admission::Counters,
     plugin_execution: plugin_execution::Counters,
     proxy_memory_rejections: [AtomicU64; 6],
+    request_archive_gaps: [AtomicU64; RequestArchiveGapReason::COUNT],
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
     upstream: Mutex<BTreeMap<UpstreamLabels, RequestSeries>>,
     upstream_health: Mutex<BTreeMap<UpstreamHealthLabels, u64>>,
@@ -69,6 +70,7 @@ impl Default for MetricsInner {
             memory_admission: memory_admission::Counters::default(),
             plugin_execution: plugin_execution::Counters::default(),
             proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
+            request_archive_gaps: std::array::from_fn(|_| AtomicU64::new(0)),
             http: Mutex::default(),
             upstream: Mutex::default(),
             upstream_health: Mutex::default(),
@@ -101,6 +103,27 @@ pub(crate) enum ProxyMemoryRejectionStage {
     Route,
     Plugin,
     Response,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestArchiveGapReason {
+    Capacity,
+    RetentionLimit,
+}
+
+impl RequestArchiveGapReason {
+    const COUNT: usize = 2;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::RetentionLimit => "retention_limit",
+        }
+    }
 }
 
 impl ProxyMemoryRejectionStage {
@@ -424,6 +447,10 @@ impl Metrics {
         self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_request_archive_gap(&self, reason: RequestArchiveGapReason) {
+        self.inner.request_archive_gaps[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn proxy_memory_wait(
         &self,
         stage: memory_admission::Stage,
@@ -632,6 +659,19 @@ impl Metrics {
                 "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{}\"}} {}",
                 stage.label(),
                 self.inner.proxy_memory_rejections[stage as usize].load(Ordering::Relaxed)
+            );
+        }
+        output.push_str("# HELP memeloop_token_center_request_archive_gaps_total Requests admitted with durable audit and irreversible archive gap evidence.\n");
+        output.push_str("# TYPE memeloop_token_center_request_archive_gaps_total counter\n");
+        for reason in [
+            RequestArchiveGapReason::Capacity,
+            RequestArchiveGapReason::RetentionLimit,
+        ] {
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_request_archive_gaps_total{{reason=\"{}\"}} {}",
+                reason.label(),
+                self.inner.request_archive_gaps[reason.index()].load(Ordering::Relaxed),
             );
         }
 
@@ -1550,6 +1590,22 @@ mod tests {
         ));
         assert!(rendered.contains(
             "memeloop_token_center_component_memory_bytes{component=\"stream_capture\"} 0"
+        ));
+    }
+
+    #[test]
+    fn request_archive_gap_metrics_use_fixed_reasons() {
+        let metrics = Metrics::default();
+        metrics.record_request_archive_gap(RequestArchiveGapReason::Capacity);
+        metrics.record_request_archive_gap(RequestArchiveGapReason::RetentionLimit);
+        let rendered = metrics.render(&RuntimeMetrics::default());
+        assert!(
+            rendered.contains(
+                "memeloop_token_center_request_archive_gaps_total{reason=\"capacity\"} 1"
+            )
+        );
+        assert!(rendered.contains(
+            "memeloop_token_center_request_archive_gaps_total{reason=\"retention_limit\"} 1"
         ));
     }
 

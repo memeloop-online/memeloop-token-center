@@ -592,6 +592,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "managed model route ownership",
         sql: include_str!("../../../migrations/common/0111_managed_model_routes.sql"),
     },
+    Migration {
+        version: 112,
+        name: "request archive gap evidence",
+        sql: include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1167,6 +1172,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 111,
         name: "managed model route ownership",
         sql: include_str!("../../../migrations/common/0111_managed_model_routes.sql"),
+    },
+    Migration {
+        version: 112,
+        name: "request archive gap evidence",
+        sql: include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
     },
 ];
 

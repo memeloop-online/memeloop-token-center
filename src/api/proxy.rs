@@ -1143,7 +1143,7 @@ async fn proxy_with_identity_and_conversation_spool(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
     );
-    let reservation = match state
+    let started_request = match state
         .db
         .start_proxy_request_with_archive_compression(
             StartProxyRequest {
@@ -1164,7 +1164,7 @@ async fn proxy_with_identity_and_conversation_spool(
         )
         .await
     {
-        Ok(reservation) => reservation,
+        Ok(started) => started,
         Err(error) => {
             admission.finish(
                 error.diagnostic_category(),
@@ -1175,6 +1175,16 @@ async fn proxy_with_identity_and_conversation_spool(
             return Err(error);
         }
     };
+    match started_request.archive_admission {
+        crate::db::RequestArchiveAdmission::Captured => {}
+        crate::db::RequestArchiveAdmission::GapCapacity => state
+            .metrics
+            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity),
+        crate::db::RequestArchiveAdmission::GapRetentionLimit => state
+            .metrics
+            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit),
+    }
+    let reservation = started_request.reservation;
     admission.finish("completed", None, Some(archive_request_body.len()));
     // Freeze policy before admission, but start its absolute network clock only
     // after the durable request transaction has positively committed. Waiting
