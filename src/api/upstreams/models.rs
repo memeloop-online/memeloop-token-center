@@ -4,7 +4,10 @@ use futures_util::StreamExt;
 use serde::Serialize;
 
 use super::super::*;
-use crate::db::{DiscoveredUpstreamModel, ReplaceModelCatalogResult, UpstreamModelCatalogView};
+use crate::db::{
+    DiscoveredUpstreamModel, ManagedModelRouteSyncResult, ReplaceModelCatalogResult,
+    UpstreamModelCatalogView,
+};
 
 const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_MODEL_CATALOG_BODY: usize = 2 * 1024 * 1024;
@@ -15,6 +18,13 @@ const MAX_MODEL_ID_BYTES: usize = 500;
 struct CatalogSyncResult {
     #[serde(flatten)]
     catalog: UpstreamModelCatalogView,
+    price_sync: CatalogPriceSyncResult,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedCatalogSyncResult {
+    catalog: UpstreamModelCatalogView,
+    routes: ManagedModelRouteSyncResult,
     price_sync: CatalogPriceSyncResult,
 }
 
@@ -237,6 +247,111 @@ pub(in crate::api) async fn sync_upstream_models(
     ))
 }
 
+/// Explicit opt-in to route ownership; normal/background catalog refresh keeps
+/// its historical directory-only route lifecycle semantics.
+pub(in crate::api) async fn sync_upstream_models_and_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<SyncUpstreamModelsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service(&headers, &state, "routes:write").await?;
+    let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
+    let state = state.pin_application_plugins().await?;
+    let (account, credential) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if account.tenant_external_id.as_deref() != Some(tenant.as_str()) {
+        return Err(AppError::NotFound);
+    }
+    let generation = account.credential_generation;
+    let timeout = if account.driver == "openai-codex" {
+        codex_catalog_budget(&account.config)
+            .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?
+            .total
+    } else {
+        MODEL_CATALOG_TIMEOUT
+    };
+    let lease = Uuid::now_v7();
+    let claimed = state
+        .db
+        .claim_upstream_model_catalog_sync_with_timeout(
+            account_id,
+            &tenant,
+            generation,
+            lease,
+            timeout.as_millis() as u64,
+        )
+        .await?;
+    let routes = if !claimed {
+        ManagedModelRouteSyncResult::skipped("sync_in_progress")
+    } else {
+        let discovery = tokio::time::timeout(
+            timeout,
+            discover_models(&state, &account, &credential, None, true),
+        )
+        .await
+        .unwrap_or(Err("connection_failed"))
+        .and_then(|snapshot| {
+            if snapshot.1.is_empty() {
+                Err("empty_catalog_protected")
+            } else {
+                Ok(snapshot)
+            }
+        });
+        match discovery {
+            Ok((source, models)) => {
+                let replaced = state
+                    .db
+                    .replace_upstream_model_catalog(
+                        account_id, &tenant, generation, lease, source, &models,
+                    )
+                    .await?;
+                if replaced == ReplaceModelCatalogResult::Replaced {
+                    state
+                        .db
+                        .reconcile_managed_model_routes(account_id, &tenant, generation, &models)
+                        .await?
+                } else {
+                    ManagedModelRouteSyncResult::skipped("account_or_lease_changed")
+                }
+            }
+            Err(code) => {
+                // Preserve the legacy catalog failure vocabulary; the explicit
+                // reconcile response carries the more specific protection code.
+                let catalog_code = match code {
+                    "partial_catalog" | "empty_catalog_protected" => "invalid_response",
+                    code => code,
+                };
+                state
+                    .db
+                    .record_upstream_model_catalog_failure(
+                        account_id,
+                        &tenant,
+                        generation,
+                        lease,
+                        catalog_code,
+                    )
+                    .await?;
+                ManagedModelRouteSyncResult::skipped(code)
+            }
+        }
+    };
+    let mut price_sync = CatalogPriceSyncResult::skipped();
+    price_sync.status = "deferred";
+    price_sync.error_code = Some("managed_route_price_sync_deferred");
+    Ok(Json(ManagedCatalogSyncResult {
+        catalog: state
+            .db
+            .upstream_model_catalog(account_id, &tenant, None, MAX_MODEL_COUNT as i64)
+            .await?,
+        routes,
+        price_sync,
+    }))
+}
+
 pub(crate) fn trigger_upstream_model_sync(state: AppState, account_id: Uuid) {
     tokio::spawn(async move {
         sync_upstream_models_after_refresh(&state, account_id, None).await;
@@ -329,7 +444,7 @@ async fn sync_account_models(
             price_sync: CatalogPriceSyncResult::skipped(),
         });
     }
-    let discovery = discover_models(state, &account, &credential, blocking).await;
+    let discovery = discover_models(state, &account, &credential, blocking, false).await;
     let mut price_sync = CatalogPriceSyncResult::skipped();
     match discovery {
         Ok((source_kind, models)) => {
@@ -435,6 +550,7 @@ async fn discover_models(
     account: &crate::provider::UpstreamAccountView,
     credential: &UpstreamCredential,
     blocking: Option<&crate::worker::BlockingTasks>,
+    require_complete: bool,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
     // Native Cursor credentials never enter a compatibility/plugin catalog.
     if account.driver == crate::cursor_native::DRIVER {
@@ -461,7 +577,7 @@ async fn discover_models(
         return parse_model_array(&value).map(|models| ("component", models));
     }
     if account.driver == "openai-codex" {
-        return discover_codex_models(state, account, credential).await;
+        return discover_codex_models(state, account, credential, require_complete).await;
     }
     if account.driver == crate::provider::antigravity::DRIVER {
         let config = crate::provider::antigravity::Config::from_account(&account.config)
@@ -571,6 +687,9 @@ async fn discover_models(
         body.extend_from_slice(&chunk);
     }
     let value: Value = serde_json::from_slice(&body).map_err(|_| "invalid_response")?;
+    if require_complete {
+        require_complete_catalog(&value)?;
+    }
     let data = value.get("data").ok_or("invalid_response")?;
     parse_model_array(data).map(|models| ("openai_v1", models))
 }
@@ -579,6 +698,7 @@ async fn discover_codex_models(
     state: &AppState,
     account: &crate::provider::UpstreamAccountView,
     credential: &UpstreamCredential,
+    require_complete: bool,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
     credential
         .validate(unix_millis())
@@ -627,6 +747,9 @@ async fn discover_codex_models(
             log_catalog_failure(account, &failure, started);
             failure.code
         })?;
+    if require_complete {
+        require_complete_catalog(&value)?;
+    }
     let values = value
         .get("models")
         .and_then(Value::as_array)
@@ -759,6 +882,67 @@ async fn bounded_json_response(
         body.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&body).map_err(|_| CatalogFailure::response("invalid_response"))
+}
+
+// We do not follow provider-supplied pagination URLs. A page is not a full
+// snapshot and therefore cannot authorize additions or disappearance updates.
+fn require_complete_catalog(value: &Value) -> Result<(), &'static str> {
+    for object in [Some(value), value.get("pagination"), value.get("meta")]
+        .into_iter()
+        .flatten()
+    {
+        if ["has_more", "hasMore", "partial", "truncated"]
+            .iter()
+            .any(|key| {
+                object
+                    .get(key)
+                    .is_some_and(|value| value != &Value::Bool(false) && !value.is_null())
+            })
+            || [
+                "next",
+                "next_page",
+                "next_cursor",
+                "next_page_token",
+                "continuation_token",
+            ]
+            .iter()
+            .any(|key| {
+                object.get(key).is_some_and(|value| {
+                    !value.is_null()
+                        && value != &Value::String(String::new())
+                        && value != &Value::Bool(false)
+                })
+            })
+            || object
+                .get("complete")
+                .is_some_and(|value| value != &Value::Bool(true))
+        {
+            return Err("partial_catalog");
+        }
+    }
+    if value
+        .get("links")
+        .and_then(|links| links.get("next"))
+        .is_some_and(|next| !next.is_null() && next.as_str() != Some(""))
+    {
+        return Err("partial_catalog");
+    }
+    let count = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    let total = value
+        .get("total")
+        .or_else(|| value.get("total_count"))
+        .and_then(Value::as_u64);
+    if count
+        .zip(total)
+        .is_some_and(|(count, total)| total != count as u64)
+    {
+        return Err("partial_catalog");
+    }
+    Ok(())
 }
 
 fn parse_model_array(value: &Value) -> Result<Vec<DiscoveredUpstreamModel>, &'static str> {

@@ -587,6 +587,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "direct credential copy",
         sql: include_str!("../../../migrations/common/0110_direct_credential_copy.sql"),
     },
+    Migration {
+        version: 111,
+        name: "managed model route ownership",
+        sql: include_str!("../../../migrations/common/0111_managed_model_routes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1157,6 +1162,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 110,
         name: "direct credential copy",
         sql: include_str!("../../../migrations/common/0110_direct_credential_copy.sql"),
+    },
+    Migration {
+        version: 111,
+        name: "managed model route ownership",
+        sql: include_str!("../../../migrations/common/0111_managed_model_routes.sql"),
     },
 ];
 

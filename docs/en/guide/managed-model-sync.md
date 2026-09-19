@@ -1,0 +1,11 @@
+# Managed model synchronization API
+
+`POST /internal/v1/upstreams/{account_id}/models/sync-routes` explicitly opts an account's discovered models into managed route creation. It requires **both** `providers:write` and `routes:write`, with the same tenant boundary as account management. The existing `models/sync` endpoint and background refresh retain their existing catalog-refresh behavior.
+
+The response contains `catalog`, `routes` (`added`, `disabled`, `restored`, `unchanged`, `skipped`, `warnings`), and `price_sync`. A 200 response can be a safe skip; inspect warnings. `sync_in_progress` means another directory request holds the lease and the caller can retry. Prices currently return `status: deferred`, `error_code: managed_route_price_sync_deferred`, and zero imports; this endpoint does not infer or fabricate prices.
+
+Only complete, successful, nonempty directory responses authorize route reconciliation. Partial/paginated responses, malformed records, authentication failures, timeouts, and empty catalogs preserve the last catalog and managed routes. Pagination URLs are never followed. If the catalog or account changes between publication and reconciliation, route changes are skipped and retrying converges.
+
+Each managed route has a stable tenant/account/upstream-model/protocol ownership key. Its initial public model is the upstream model, with priority zero. A catalog's `any` protocol maps only to `openai`; explicit supported protocols are retained. Unsupported protocols and model names outside route limits are skipped with a warning. Existing manual candidates, including candidates with the same public model, remain separate and are not adopted.
+
+No credential grants or groups are created or replaced. New routes therefore still need the normal explicit authorization workflow. Synchronization only controls the enabled state of its own untouched routes. A missing model disables such a route with `catalog_missing`; reappearance restores only that disable reason. Operator status changes, including disabling an already automatically disabled route, permanently protect it from automatic restoration. Changes to route fields/associations also hand control back to the operator. Archived or deleted routes are never recreated; deletion leaves a managed-key tombstone. There is no automatic takeover/reset endpoint in this release.

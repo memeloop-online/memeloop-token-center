@@ -198,8 +198,8 @@ pub(crate) use routing::{
 };
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
-    ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteCreateDisposition,
-    RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
+    ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
+    RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
 };
 pub use upstream_account_availability::{

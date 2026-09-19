@@ -6,9 +6,12 @@ mod grants;
 mod health;
 mod input;
 mod list;
+mod managed_models;
 mod resolver;
 mod routes;
 mod types;
+
+pub use managed_models::ManagedModelRouteSyncResult;
 
 pub use types::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,

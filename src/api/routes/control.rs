@@ -271,6 +271,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(sync_upstream_models),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/models/sync-routes",
+            post(sync_upstream_models_and_routes),
+        )
+        .route(
             "/internal/v1/upstream-models",
             get(aggregate_upstream_models),
         )
