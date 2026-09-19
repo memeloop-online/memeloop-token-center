@@ -63,6 +63,16 @@ interface upstream-provider {
   normalize: func(context: request-context, response-json: string) -> result<string, string>;
 }
 
+/// Background-only typed data collection. The host invokes this interface
+/// from the worker role; inference and request admission never call it.
+/// `collect` may use the bounded host HTTP/KV capabilities declared by the
+/// package. `normalize` converts the collected payload into the endpoint's
+/// manifest-declared response schema.
+interface service-data-v1 {
+  collect: func(collector-id: string, config-json: string) -> result<string, string>;
+  normalize: func(normalizer-id: string, config-json: string, collected-json: string) -> result<string, string>;
+}
+
 world plugin {
   import host;
   export traffic-policy;
@@ -78,4 +88,21 @@ interface group-routing-v1 {
 world group-routing-plugin {
   import host;
   export group-routing-v1;
+}
+
+/// Independent ABI: packages without service-data contributions keep using
+/// the original `plugin` world and need no additional exports.
+world service-data-plugin {
+  import host;
+  export service-data-v1;
+}
+
+/// Authoring world for one package that contributes both request/provider
+/// hooks and background service data. Each host execution path still links
+/// only the interface it calls.
+world combined-plugin {
+  import host;
+  export traffic-policy;
+  export upstream-provider;
+  export service-data-v1;
 }

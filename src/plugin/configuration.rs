@@ -301,6 +301,7 @@ mod tests {
             plugins: Arc::new(vec![super::super::LoadedPlugin {
                 manifest,
                 component: None,
+                service_data_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: Some(validator),
                 routing_validator: None,

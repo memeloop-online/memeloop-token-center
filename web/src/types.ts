@@ -869,7 +869,13 @@ export interface PluginOperatorUiContribution {
 
 export interface PluginServiceDataEndpoint {
   id: string;
-  url: string;
+  url?: string | null;
+  component_adapter?: {
+    api_version: 'component-v1';
+    collector: string;
+    normalizer: string;
+    config: Record<string, unknown>;
+  } | null;
   required_scope: string;
   response_schema: Record<string, unknown>;
   fallback: Record<string, unknown>;
@@ -886,7 +892,12 @@ export interface PluginServiceDataResponse {
     endpoint_id: string;
     origin: string;
     fetched_at: number;
-    source: 'network' | 'cache' | 'stale_cache' | 'fallback';
+    source: 'network' | 'cache' | 'component' | 'stale_cache' | 'fallback';
+    freshness: 'fresh' | 'stale' | 'unavailable';
+    last_attempt_at: number | null;
+    next_attempt_at: number | null;
+    consecutive_failures: number;
+    error_code?: 'timeout' | 'network' | 'http_status' | 'content_type' | 'body_limit' | 'invalid_json' | 'schema_validation' | 'component_execution' | 'component_output' | 'database' | null;
   };
 }
 

@@ -388,7 +388,7 @@ function LegacyTypedPluginData({ registered, token: credential, tenant, compact 
     {snapshot
       ? <HealthIntelligencePanel snapshot={snapshot} compact={compact} />
       : <pre className="plugin-typed-data" aria-label={`${registered.contribution.label} data`}>{renderJson(response.data, compact ? 1_500 : 12_000)}</pre>}
-    {!compact && <p className="muted">Source: {response.provenance.origin} · {new Date(response.provenance.fetched_at).toLocaleString()}</p>}
+    {!compact && <p className="muted">Source: {response.provenance.origin} · {response.provenance.fetched_at > 0 ? new Date(response.provenance.fetched_at).toLocaleString() : '—'}</p>}
   </>;
 }
 

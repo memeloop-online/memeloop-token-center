@@ -69,6 +69,32 @@ Components never see credentials. A `stream=true` declaration, cross-origin path
 
 A Provider can declare `oauth_adapter` (`api_version: "oauth-adapter-v1"`, `flow_kind: "cursor_pkce"`, with `login_url`, `poll_url`, and `refresh_url`), which the core executes through the versioned PKCE protocol. It can also declare `authorization_code_pkce` for the generic authorization-code flow. In both cases, tokens enter only the core encrypted credential table; components and plugin KV never receive tokens.
 
+## Background service data (`component-v1`)
+
+Operator tabs and cards can read typed snapshots from `contributions.service_data`. A URL endpoint uses the built-in HTTPS JSON collector. An executable endpoint declares a signed collector and normalizer:
+
+```json
+{
+  "id": "health",
+  "component_adapter": {
+    "api_version": "component-v1",
+    "collector": "source-health",
+    "normalizer": "health-v1",
+    "config": { "region": "global" }
+  },
+  "required_scope": "metrics:read",
+  "response_schema": { "type": "object" },
+  "fallback": {},
+  "cache_ttl_seconds": 600,
+  "timeout_millis": 5000,
+  "max_body_bytes": 262144
+}
+```
+
+Implement the `service-data-v1` interface in the `service-data-plugin` world. `collect(collector-id, config-json)` returns bounded JSON from declared host capabilities. `normalize(normalizer-id, config-json, collected-json)` returns the schema-ready object. Packages that also export traffic or Provider hooks use the `combined-plugin` authoring world.
+
+The Worker owns scheduling, lease fencing, timeout, persisted backoff and last-good storage. Operator reads return only the current published plugin revision's durable snapshot, including freshness and a host-owned status code. Collection therefore runs outside inference and UI request execution.
+
 ## Minimal manifest
 
 ```json

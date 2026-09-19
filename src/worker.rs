@@ -17,6 +17,7 @@ const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 6
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const PLUGIN_SERVICE_DATA_INTERVAL: Duration = Duration::from_secs(5);
 const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
@@ -100,6 +101,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
     let mut roles = JoinSet::new();
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
+    let service_data_blocking = blocking_tasks.clone();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
@@ -304,7 +306,168 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
             }
         }
     );
+    periodic!(
+        "plugin_service_data",
+        PLUGIN_SERVICE_DATA_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            refresh_plugin_service_data(state, shutdown, &service_data_blocking).await;
+        }
+    );
     supervise_roles(roles, role_stop, shutdown, SHUTDOWN_GRACE, blocking_tasks).await;
+}
+
+async fn refresh_plugin_service_data(
+    state: &AppState,
+    shutdown: &watch::Receiver<bool>,
+    blocking: &BlockingTasks,
+) {
+    let pinned = match state.clone().pin_application_plugins().await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, "worker could not pin the plugin runtime for service data");
+            return;
+        }
+    };
+    let runtime_revision = pinned.application_plugin_revision().unwrap_or(0);
+    let targets = match pinned.plugins.service_data_targets() {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!(%error, "worker could not enumerate plugin service data");
+            return;
+        }
+    };
+    for target in targets {
+        if *shutdown.borrow() {
+            return;
+        }
+        let now = crate::db::unix_millis();
+        let owner = format!("service-data-{}", Uuid::now_v7());
+        let lease_ms = i64::try_from(target.endpoint.timeout_millis)
+            .unwrap_or(10_000)
+            .saturating_add(5_000);
+        let claimed = match pinned
+            .db
+            .claim_plugin_service_data_refresh(
+                runtime_revision,
+                &target.plugin_id,
+                &target.endpoint.id,
+                &target.endpoint_revision,
+                &owner,
+                now,
+                lease_ms,
+                now,
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::warn!(%error, plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "worker could not claim plugin service data refresh");
+                continue;
+            }
+        };
+        if !claimed {
+            continue;
+        }
+        let previous_failures = pinned
+            .db
+            .plugin_service_data_snapshot(
+                runtime_revision,
+                &target.plugin_id,
+                &target.endpoint.id,
+                &target.endpoint_revision,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.consecutive_failures)
+            .unwrap_or(0);
+        let result = if target.endpoint.component_adapter.is_some() {
+            let plugins = pinned.plugins.clone();
+            let blocking_target = target.clone();
+            blocking
+                .run(move || plugins.collect_component_service_data(&blocking_target))
+                .await
+                .unwrap_or(Err(
+                    crate::plugin::service_data::PluginServiceDataCollectionFailure {
+                        code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
+                        error: crate::error::AppError::Internal,
+                    },
+                ))
+        } else {
+            pinned.plugins.collect_http_service_data(&target).await
+        };
+        let completed_at = crate::db::unix_millis();
+        match result {
+            Ok(collected) => {
+                let data_json = match serde_json::to_string(&collected.data) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        tracing::warn!(plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "worker could not encode plugin service data");
+                        continue;
+                    }
+                };
+                let next_attempt_at = completed_at.saturating_add(
+                    i64::try_from(target.endpoint.cache_ttl_seconds)
+                        .unwrap_or(i64::MAX)
+                        .saturating_mul(1_000),
+                );
+                match pinned
+                    .db
+                    .complete_plugin_service_data_refresh_success(
+                        runtime_revision,
+                        &target.plugin_id,
+                        &target.endpoint.id,
+                        &target.endpoint_revision,
+                        &owner,
+                        &data_json,
+                        collected.source,
+                        &collected.origin,
+                        completed_at,
+                        next_attempt_at,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "plugin service data lease expired before success was stored")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "worker could not persist plugin service data")
+                    }
+                }
+            }
+            Err(failure) => {
+                let shift = u32::try_from(previous_failures.clamp(0, 6)).unwrap_or(6);
+                let backoff_seconds = 5_i64
+                    .saturating_mul(1_i64.checked_shl(shift).unwrap_or(64))
+                    .min(300);
+                let next_attempt_at = completed_at.saturating_add(backoff_seconds * 1_000);
+                match pinned
+                    .db
+                    .complete_plugin_service_data_refresh_failure(
+                        runtime_revision,
+                        &target.plugin_id,
+                        &target.endpoint.id,
+                        &target.endpoint_revision,
+                        &owner,
+                        failure.code,
+                        completed_at,
+                        next_attempt_at,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "plugin service data lease expired before failure was stored")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, "worker could not persist plugin service data failure")
+                    }
+                }
+                tracing::warn!(error_code=failure.code.as_str(), plugin_id=%target.plugin_id, endpoint_id=%target.endpoint.id, error=%failure.error, "plugin service data refresh failed");
+            }
+        }
+    }
 }
 
 /// Finish the current operation on shutdown, but never start another tick.

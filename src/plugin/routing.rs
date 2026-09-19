@@ -895,6 +895,7 @@ impl PluginRuntime {
                     .memories(2)
                     .build(),
                 deadline,
+                http_body_limit: super::PLUGIN_HTTP_BODY_BYTES,
             },
         );
         store.limiter(|state| &mut state.limits);

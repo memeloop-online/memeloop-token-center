@@ -96,8 +96,8 @@ test("plugin operator host exposes typed data and versioned component slots", ()
   assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
   assert.equal(operation["x-required-scope"], "plugins:read");
   assert.equal(operation["x-manifest-required-scope"], true);
-  assert.deepEqual(operation["x-outbound-contract"].methods, ["GET"]);
-  assert.equal(operation["x-outbound-contract"].transport, "HTTPS-only-DNS-pinned-no-redirect");
+  assert.equal(operation["x-collection-contract"]["execution-role"], "worker");
+  assert.deepEqual(operation["x-collection-contract"].adapters, ["https-json", "component-v1"]);
   assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/PluginServiceDataResponse");
   const contribution = document.components.schemas.PluginOperatorUiContribution;
   assert.deepEqual(contribution.properties.slot.enum, ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after"]);
