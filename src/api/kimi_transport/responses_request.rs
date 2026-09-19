@@ -107,6 +107,17 @@ impl ToolRegistry {
                 )
             })
     }
+
+    fn declared_wire_name(&self, namespace: &str, name: &str) -> Result<&str, AppError> {
+        let wire_name = self.wire_name(namespace, name)?;
+        if self.declarations.contains_key(wire_name) {
+            Ok(wire_name)
+        } else {
+            Err(AppError::BadRequest(
+                "Responses-via-Chat tool choice must reference a declared tool".into(),
+            ))
+        }
+    }
 }
 
 fn register_tool_source(
@@ -291,6 +302,49 @@ fn unique_wire_name(identity: &ToolIdentity, used: &mut BTreeSet<String>) -> Str
 
 pub(in crate::api) fn tools(request: &Value) -> BTreeMap<String, (ToolIdentity, Value)> {
     ToolRegistry::from_request(request).declarations
+}
+
+fn map_tool_choice(choice: &Value, registry: &ToolRegistry) -> Result<Value, AppError> {
+    match choice {
+        Value::String(mode) if matches!(mode.as_str(), "auto" | "none") => Ok(choice.clone()),
+        Value::String(mode) if mode == "required" => {
+            if registry.declarations.is_empty() {
+                Err(AppError::BadRequest(
+                    "Responses-via-Chat required tool choice needs a declared tool".into(),
+                ))
+            } else {
+                Ok(choice.clone())
+            }
+        }
+        Value::Object(object)
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) =>
+        {
+            let definition = object.get("function").unwrap_or(choice);
+            let namespace = definition["namespace"]
+                .as_str()
+                .or_else(|| object.get("namespace").and_then(Value::as_str))
+                .unwrap_or("");
+            let name = definition["name"].as_str().unwrap_or("");
+            let wire_name = registry.declared_wire_name(namespace, name)?;
+            Ok(json!({"type":"function","function":{"name":wire_name}}))
+        }
+        Value::Array(_) => Err(AppError::BadRequest(
+            "openai_chat_v1 cannot preserve an array tool choice".into(),
+        )),
+        Value::Object(object)
+            if object.get("type").and_then(Value::as_str) == Some("allowed_tools") =>
+        {
+            Err(AppError::BadRequest(
+                "openai_chat_v1 cannot preserve an allowed-tools choice".into(),
+            ))
+        }
+        _ => Err(AppError::BadRequest(
+            "unsupported Responses tool choice for openai_chat_v1".into(),
+        )),
+    }
 }
 
 fn content(value: &Value) -> Result<Value, AppError> {
@@ -860,18 +914,7 @@ pub(in crate::api) fn convert_with_dialect(
     }
     let mapped_tool_choice = request
         .get("tool_choice")
-        .map(|choice| -> Result<Value, AppError> {
-            if choice.is_object() && choice.get("name").is_some() {
-                Ok(
-                    json!({"type":"function","function":{"name":registry.wire_name(
-                    choice["namespace"].as_str().unwrap_or(""),
-                    choice["name"].as_str().unwrap_or("")
-                )?}}),
-                )
-            } else {
-                Ok(choice.clone())
-            }
-        })
+        .map(|choice| map_tool_choice(choice, &registry))
         .transpose()?;
     let declarations = registry.declarations;
     if !declarations.is_empty() {
@@ -1209,6 +1252,46 @@ mod tests {
     }
 
     #[test]
+    fn strict_tool_choice_requires_an_exact_declared_mapping() {
+        for request in [
+            json!({"input":"hello","tool_choice":"required"}),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":{"type":"function","name":"missing"}
+            }),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":[{"type":"function","name":"declared"}]
+            }),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[
+                    {"type":"function","name":"declared"}
+                ]}
+            }),
+        ] {
+            assert!(convert(&request).is_err());
+        }
+
+        let namespace = format!("namespace_{}", "long".repeat(16));
+        let name = format!("tool_{}", "long".repeat(16));
+        let converted = convert(&json!({
+            "input":"hello",
+            "tools":[{"type":"namespace","name":namespace.clone(),"tools":[
+                {"type":"function","name":name.clone(),"parameters":{}}
+            ]}],
+            "tool_choice":{"type":"function","namespace":namespace,"name":name}
+        }))
+        .unwrap();
+        let declared = converted["tools"][0]["function"]["name"].as_str().unwrap();
+        assert!(declared.len() <= 64);
+        assert_eq!(converted["tool_choice"]["function"]["name"], declared);
+    }
+
+    #[test]
     fn opaque_host_state_is_omitted_without_losing_visible_history() {
         let request = json!({
             "input": [
@@ -1351,6 +1434,10 @@ mod tests {
         for request in [
             json!({"input":[{"type":"function_call_output","call_id":"missing","output":"x"}]}),
             json!({"input":[{"type":"function_call_output","call_id":"","output":"x"}]}),
+            json!({"input":[
+                {"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"},
+                {"type":"function_call","name":"other","call_id":"same","arguments":"{}"}
+            ]}),
             json!({"input":[
                 {"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"},
                 {"type":"function_call_output","call_id":"same","output":"x"},
