@@ -69,6 +69,8 @@ Components never see credentials. A `stream=true` declaration, cross-origin path
 
 A Provider can declare `oauth_adapter` (`api_version: "oauth-adapter-v1"`, `flow_kind: "cursor_pkce"`, with `login_url`, `poll_url`, and `refresh_url`), which the core executes through the versioned PKCE protocol. It can also declare `authorization_code_pkce` for the generic authorization-code flow. In both cases, tokens enter only the core encrypted credential table; components and plugin KV never receive tokens.
 
+An OpenAI-compatible Provider can declare the versioned `openai_chat_v1` Responses bridge. A fixed Chat-only Provider sets `responses_via_chat_v1`; a Provider whose accounts may expose either transport also sets `responses_transport_configurable` and declares a closed `responses_transport` config field with `native_responses` and `chat_completions`. The account selection is the sole protocol signal, independent of host names and model names.
+
 ## Background service data (`component-v1`)
 
 Operator tabs and cards can read typed snapshots from `contributions.service_data`. A URL endpoint uses the built-in HTTPS JSON collector. An executable endpoint declares a signed collector and normalizer:

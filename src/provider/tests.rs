@@ -339,6 +339,40 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
+    assert!(catalog.supports_responses_via_chat_v1("http-json"));
+    assert_eq!(
+        catalog.responses_via_chat_dialect(
+            "http-json",
+            &json!({
+                "base_url": "https://api.example.test/v1"
+            })
+        ),
+        None
+    );
+    assert_eq!(
+        catalog.responses_via_chat_dialect(
+            "http-json",
+            &json!({
+                "base_url": "https://api.example.test/v1",
+                "responses_transport": "native_responses"
+            })
+        ),
+        None
+    );
+    assert_eq!(
+        catalog.responses_via_chat_dialect(
+            "http-json",
+            &json!({
+                "base_url": "https://api.example.test/v1",
+                "responses_transport": "chat_completions"
+            })
+        ),
+        Some(ResponsesViaChatDialect::OpenAiChatV1)
+    );
+    assert_eq!(
+        catalog.responses_via_chat_dialect("kimi-oauth", &json!({})),
+        Some(ResponsesViaChatDialect::KimiV1)
+    );
 
     let mut strict_chat = catalog.get("kimi-oauth").unwrap().clone();
     strict_chat.id = "strict-chat-agent".to_owned();
@@ -406,6 +440,33 @@ fn http_json_provider_schema_accepts_exact_generation_result_origins() {
         }),
     )
     .expect("http-json image providers need an explicit asset-origin allowlist");
+}
+
+#[test]
+fn http_json_provider_schema_exposes_closed_responses_transport_selection() {
+    let catalog = ProviderCatalog::builtins();
+    let provider = catalog.get("http-json").expect("built-in provider");
+    for transport in ["native_responses", "chat_completions"] {
+        crate::schema::validate_instance(
+            &provider.config_schema,
+            &json!({
+                "base_url": "https://provider.example/v1",
+                "responses_transport": transport
+            }),
+        )
+        .expect("declared Responses transport must be accepted");
+    }
+    assert!(
+        crate::schema::validate_instance(
+            &provider.config_schema,
+            &json!({
+                "base_url": "https://provider.example/v1",
+                "responses_transport": "auto"
+            }),
+        )
+        .is_err(),
+        "routing must not infer a Responses transport from a host or model"
+    );
 }
 
 #[test]

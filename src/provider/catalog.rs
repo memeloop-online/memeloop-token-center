@@ -186,6 +186,11 @@ pub struct RequestCompatibility {
     /// This is required whenever `responses_via_chat_v1` is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_via_chat_dialect: Option<ResponsesViaChatDialect>,
+    /// Select the declared Responses transport from the account's closed
+    /// `responses_transport` configuration instead of fixing it for every
+    /// account of this Provider type.
+    #[serde(default)]
+    pub responses_transport_configurable: bool,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
 }
@@ -195,6 +200,7 @@ impl RequestCompatibility {
         !self.third_party
             && !self.responses_via_chat_v1
             && self.responses_via_chat_dialect.is_none()
+            && !self.responses_transport_configurable
             && !self.codex_multi_agent_v2
     }
 
@@ -301,6 +307,13 @@ impl ProviderCatalog {
                     "enum": ["none", "openai-chat-usage-only"],
                     "default": "none",
                     "description": "Require the OpenAI Chat include_usage terminal chunk for this compatible upstream."
+                },
+                "responses_transport": {
+                    "title": "Responses transport",
+                    "type": "string",
+                    "enum": ["native_responses", "chat_completions"],
+                    "default": "native_responses",
+                    "description": "Send Responses requests to the upstream Responses API, or translate them through the upstream Chat Completions API."
                 },
                 "image_api_mode": {
                     "title": "Image generation API",
@@ -445,7 +458,13 @@ impl ProviderCatalog {
                 provable_submit_idempotency: false,
                 provider_asset_reads_repeatable: false,
             }),
-            request_compatibility: Default::default(),
+            request_compatibility: RequestCompatibility {
+                third_party: true,
+                responses_via_chat_v1: true,
+                responses_via_chat_dialect: Some(ResponsesViaChatDialect::OpenAiChatV1),
+                responses_transport_configurable: true,
+                codex_multi_agent_v2: false,
+            },
             codex_model_capabilities: None,
             source: "builtin".to_owned(),
         }];
@@ -729,6 +748,7 @@ impl ProviderCatalog {
             third_party: true,
             responses_via_chat_v1: true,
             responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
+            responses_transport_configurable: false,
             codex_multi_agent_v2: true,
         };
         kimi.config_schema["properties"][RESPONSES_VIA_CHAT_COMPACTION_CONFIG] = json!({
@@ -885,14 +905,28 @@ impl ProviderCatalog {
         })
     }
 
-    pub fn responses_via_chat_dialect(&self, driver: &str) -> Option<ResponsesViaChatDialect> {
+    pub fn responses_via_chat_dialect(
+        &self,
+        driver: &str,
+        config: &Value,
+    ) -> Option<ResponsesViaChatDialect> {
         self.get(driver).and_then(|provider| {
             let compatibility = &provider.request_compatibility;
             if compatibility.third_party
                 && compatibility.responses_via_chat_v1
                 && compatibility.responses_via_chat_dialect.is_some()
             {
-                compatibility.responses_via_chat_dialect
+                if compatibility.responses_transport_configurable
+                    && config
+                        .get("responses_transport")
+                        .and_then(Value::as_str)
+                        .unwrap_or("native_responses")
+                        != "chat_completions"
+                {
+                    None
+                } else {
+                    compatibility.responses_via_chat_dialect
+                }
             } else {
                 None
             }
