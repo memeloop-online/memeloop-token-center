@@ -58,13 +58,13 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     assert.equal(await page.getByText('old-first-response', { exact: true }).count(), 0, 'an aborted first credential response cannot populate the second credential page');
 
     const cadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
-    assert.equal(await cadence.getAttribute('aria-valuenow'), '1', 'the default cadence is five seconds');
+    assert.equal(await cadence.inputValue(), '1', 'the default cadence is five seconds');
     assert.deepEqual(await page.locator('.request-refresh-ticks span').allTextContents(), ['Manual', '5s', '30s', '1m', '5m']);
     await cadence.press('Home');
-    assert.equal(await cadence.getAttribute('aria-valuenow'), '0');
+    assert.equal(await cadence.inputValue(), '0');
     await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
     await cadence.press('ArrowRight');
-    assert.equal(await cadence.getAttribute('aria-valuenow'), '1');
+    assert.equal(await cadence.inputValue(), '1');
 
     const beforeHidden = listReads;
     const noHiddenPoll = page.waitForRequest(request => new URL(request.url()).pathname === '/self/v1/requests', { timeout: 5_200 })
@@ -102,15 +102,15 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     historyRefresh = false;
     await cadence.press('ArrowRight');
     await cadence.press('ArrowRight');
-    assert.equal(await cadence.getAttribute('aria-valuenow'), '2', 'the third ladder position is thirty seconds');
+    assert.equal(await cadence.inputValue(), '2', 'the third ladder position is thirty seconds');
     await page.reload();
     await page.locator('.request-model-cell code').filter({ hasText: /^second-00$/ }).waitFor();
     const restoredCadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
-    assert.equal(await restoredCadence.getAttribute('aria-valuenow'), '2', 'the selected cadence is restored from storage');
+    assert.equal(await restoredCadence.inputValue(), '2', 'the selected cadence is restored from storage');
     await page.getByRole('tab', { name: 'My sessions and requests', exact: true }).click();
     const sessionsCadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
-    assert.equal(await sessionsCadence.getAttribute('aria-valuenow'), '2', 'Requests and Sessions share the cadence preference');
+    assert.equal(await sessionsCadence.inputValue(), '2', 'Requests and Sessions share the cadence preference');
     await page.getByRole('tab', { name: 'Recent requests', exact: true }).click();
-    assert.equal(await page.getByRole('slider', { name: 'Refresh cadence', exact: true }).getAttribute('aria-valuenow'), '2');
+    assert.equal(await page.getByRole('slider', { name: 'Refresh cadence', exact: true }).inputValue(), '2');
   } finally { await browser.close(); await server.close(); }
 });
