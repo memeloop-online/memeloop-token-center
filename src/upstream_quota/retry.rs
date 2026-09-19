@@ -170,31 +170,30 @@ impl<'a> ReadSession<'a> {
         endpoint: &'static str,
         result: Result<T, &'static str>,
     ) -> Result<T, &'static str> {
-        if let Err(code) = &result {
-            if let Some(entry) = self
+        if let Err(code) = &result
+            && let Some(entry) = self
                 .attempts
                 .lock()
                 .expect("quota diagnostics lock")
                 .iter_mut()
                 .rev()
                 .find(|entry| entry.endpoint_kind == endpoint && entry.outcome == "success")
-            {
-                entry.outcome = "error";
-                entry.failure_stage = "payload";
-                entry.error_code = Some(*code);
-                tracing::info!(
-                    operation = "quota_supplier_read",
-                    endpoint_kind = endpoint,
-                    attempt = entry.attempt,
-                    limit = entry.limit,
-                    outcome = "error",
-                    failure_stage = "payload",
-                    error_code = *code,
-                    trigger = entry.trigger,
-                    cache_hit = false,
-                    "quota payload validation failed without retry"
-                );
-            }
+        {
+            entry.outcome = "error";
+            entry.failure_stage = "payload";
+            entry.error_code = Some(*code);
+            tracing::info!(
+                operation = "quota_supplier_read",
+                endpoint_kind = endpoint,
+                attempt = entry.attempt,
+                limit = entry.limit,
+                outcome = "error",
+                failure_stage = "payload",
+                error_code = *code,
+                trigger = entry.trigger,
+                cache_hit = false,
+                "quota payload validation failed without retry"
+            );
         }
         result
     }
@@ -292,7 +291,7 @@ impl<'a> ReadSession<'a> {
                 send().await
             })
             .await
-            .unwrap_or_else(|_| Err(Failure::terminal("quota_timeout", "deadline")));
+            .unwrap_or(Err(Failure::terminal("quota_timeout", "deadline")));
             match result {
                 Ok(value) => {
                     self.record(context, attempt, started, None, "success", None);
@@ -304,10 +303,9 @@ impl<'a> ReadSession<'a> {
                             .next()
                             .map(|delay| delay.max(failure.retry_after.unwrap_or_default()))
                             .filter(|delay| {
-                                started.checked_add(*delay).is_some()
-                                    && tokio::time::Instant::now()
-                                        .checked_add(*delay)
-                                        .is_some_and(|at| at < self.deadline)
+                                tokio::time::Instant::now()
+                                    .checked_add(*delay)
+                                    .is_some_and(|at| at < self.deadline)
                             })
                     } else {
                         None
@@ -334,7 +332,8 @@ impl<'a> ReadSession<'a> {
 pub(super) fn cached(mut snapshot: QuotaSnapshot, trigger: QuotaReadTrigger) -> QuotaSnapshot {
     snapshot.cache_hit = true;
     tracing::info!(operation = "quota_supplier_read", upstream_account_id = %snapshot.upstream_account_id,
-        trigger = trigger.as_str(), cache_hit = true, outcome = "cache_hit", "quota cache read completed");
+        trigger = trigger.as_str(), cache_hit = true, outcome = "cache_hit", failure_stage = "none",
+        attempt = 0, limit = 0, "quota cache read completed");
     // Attempts remain the original supplier observation, not invented attempts
     // made by this cache consumer. Their trigger and cache_hit remain accurate.
     snapshot

@@ -261,6 +261,67 @@ mod tests {
     }
 
     #[test]
+    fn quota_policy_does_not_change_native_usage_method() {
+        // Only this fixed usages GET is enrolled, never the token POST or model endpoint.
+        assert_eq!(USAGE_URL, "https://api.kimi.com/coding/v1/usages");
+    }
+
+    #[tokio::test]
+    async fn usage_retry_after_recovers_without_token_or_model_traffic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let credential = crate::oauth::managed::kimi::credential_from_native_import(&json!({
+            "type":"kimi", "access_token":"fixture-access", "refresh_token":"fixture-refresh",
+            "token_type":"bearer", "device_id":"fixture-device"
+        }))
+        .unwrap();
+        let count = AtomicUsize::new(0);
+        Mock::given(method("GET"))
+            .and(path("/coding/v1/usages"))
+            .respond_with(move |_: &wiremock::Request| {
+                if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(503).insert_header("Retry-After", "0")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"usage":{"limit":100,"remaining":50}}))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+        let session = retry::ReadSession::testing(codex_quota_budget(&json!({})).unwrap());
+        assert!(
+            get_usage(
+                &http,
+                &credential,
+                &format!("{}/coding/v1/usages", server.uri()),
+                QuotaRequestContext {
+                    account_id: Uuid::from_u128(1),
+                    credential_generation: 2,
+                    endpoint_kind: "usage",
+                    trigger: QuotaReadTrigger::Bulk
+                },
+                &session
+            )
+            .await
+            .is_ok()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method.as_str() == "GET" && r.url.path() == "/coding/v1/usages")
+        );
+        assert_eq!(session.attempts().len(), 3);
+    }
+
+    #[test]
     fn timestamps_and_window_metadata_preserve_exact_milliseconds() {
         for reset in [
             json!(1_800_000_123_i64),
