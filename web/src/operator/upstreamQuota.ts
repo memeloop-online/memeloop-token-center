@@ -53,12 +53,38 @@ export interface UpstreamQuotaSnapshot {
     evidence: 'server_driver_contract' | 'unknown_provider';
   };
   error_code: string | null;
+  /** Additive sanitized diagnostics; older gateways may omit these fields. */
+  attempts?: UpstreamQuotaAttempt[];
+  cache_hit?: boolean;
   reset_credits: { status: string | null; granted_at: number | null; expires_at: number | null; source: 'codex_reset_credits' }[];
+}
+
+export type QuotaAttemptOutcome = 'success' | 'retry' | 'error';
+export type QuotaAttemptTrigger = 'manual' | 'bulk' | 'background_recovery' | 'reset_workflow';
+
+/** Allowlisted supplier-read evidence. It contains no URLs, credentials, or response bodies. */
+export interface UpstreamQuotaAttempt {
+  endpoint_kind: string;
+  attempt: number;
+  limit: number;
+  failure_stage: string;
+  outcome: QuotaAttemptOutcome;
+  error_code: string | null;
+  elapsed_ms: number;
+  retry_delay_ms: number | null;
+  trigger: QuotaAttemptTrigger;
+  cache_hit: false;
+}
+
+export interface UpstreamQuotaDiagnostic {
+  error_code: string | null;
+  attempts: UpstreamQuotaAttempt[];
+  cache_hit: boolean;
 }
 
 export type UpstreamQuotaBatchResult =
   | { status: 'success'; upstream_account_id: string; snapshot: UpstreamQuotaSnapshot }
-  | { status: 'error'; upstream_account_id: string; error: { code: string } };
+  | { status: 'error'; upstream_account_id: string; error: { code: string }; diagnostic?: Partial<UpstreamQuotaDiagnostic> };
 
 export interface UpstreamQuotaBatchResponse {
   contract_version: 'upstream_quota_batch_v1';
@@ -146,6 +172,64 @@ export function quotaUnitMessage(unit: string): 'quota.unitRequests' | 'quota.un
 }
 
 export type QuotaObservationState = 'unobserved' | 'current' | 'historical';
+
+const SAFE_QUOTA_CODE = /^[a-z][a-z0-9_.:-]{0,63}$/;
+const SAFE_DIAGNOSTIC_TOKEN = /^[a-z][a-z0-9_.:-]{0,63}$/;
+
+function safeDiagnosticToken(value: unknown): string | null {
+  return typeof value === 'string' && SAFE_DIAGNOSTIC_TOKEN.test(value) ? value : null;
+}
+
+/** Keep only normalized, non-sensitive diagnostic codes from a gateway response. */
+export function normalizeQuotaErrorCode(value: unknown): string | null {
+  return typeof value === 'string' && SAFE_QUOTA_CODE.test(value) ? value : null;
+}
+
+function normalizeQuotaAttempt(value: unknown): UpstreamQuotaAttempt | null {
+  if (!value || typeof value !== 'object') return null;
+  const attempt = value as Record<string, unknown>;
+  const endpointKind = safeDiagnosticToken(attempt.endpoint_kind);
+  const failureStage = safeDiagnosticToken(attempt.failure_stage);
+  const outcome = attempt.outcome === 'success' || attempt.outcome === 'retry' || attempt.outcome === 'error' ? attempt.outcome : null;
+  const trigger = attempt.trigger === 'manual' || attempt.trigger === 'bulk' || attempt.trigger === 'background_recovery' || attempt.trigger === 'reset_workflow' ? attempt.trigger : null;
+  const integer = (candidate: unknown, minimum: number, maximum: number) => typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= minimum && candidate <= maximum ? candidate : null;
+  const attemptNumber = integer(attempt.attempt, 1, 4);
+  const limit = integer(attempt.limit, 1, 4);
+  const elapsed = integer(attempt.elapsed_ms, 0, Number.MAX_SAFE_INTEGER);
+  const retryDelay = attempt.retry_delay_ms === null ? null : attempt.retry_delay_ms === undefined ? undefined : integer(attempt.retry_delay_ms, 0, Number.MAX_SAFE_INTEGER);
+  if (!endpointKind || !failureStage || !outcome || !trigger || attemptNumber === null || limit === null || elapsed === null || retryDelay === undefined || attempt.cache_hit !== false) return null;
+  return {
+    endpoint_kind: endpointKind,
+    attempt: attemptNumber,
+    limit,
+    failure_stage: failureStage,
+    outcome,
+    error_code: normalizeQuotaErrorCode(attempt.error_code),
+    elapsed_ms: elapsed,
+    retry_delay_ms: retryDelay,
+    trigger,
+    cache_hit: false,
+  };
+}
+
+/** Normalize additive diagnostic fields and discard unsafe supplier data. */
+export function quotaRefreshDiagnostic(snapshot?: Pick<UpstreamQuotaSnapshot, 'error_code' | 'attempts' | 'cache_hit'>, fallbackErrorCode?: unknown, additive?: Partial<UpstreamQuotaDiagnostic>): UpstreamQuotaDiagnostic {
+  const rawAttempts = additive?.attempts ?? snapshot?.attempts;
+  const attempts = Array.isArray(rawAttempts)
+    ? rawAttempts.map(normalizeQuotaAttempt).filter((value): value is UpstreamQuotaAttempt => value !== null).slice(0, 8)
+    : [];
+  return {
+    error_code: normalizeQuotaErrorCode(snapshot?.error_code) ?? normalizeQuotaErrorCode(fallbackErrorCode) ?? normalizeQuotaErrorCode(additive?.error_code),
+    attempts,
+    cache_hit: additive?.cache_hit === true || snapshot?.cache_hit === true,
+  };
+}
+
+/** A failed refresh never replaces the effective quota observation. */
+export function quotaEffectiveSnapshot(previous: UpstreamQuotaSnapshot | undefined, candidate: UpstreamQuotaSnapshot): UpstreamQuotaSnapshot {
+  if ((candidate.status === 'error' || candidate.error_code) && previous?.observed_at !== null && previous?.observed_at !== undefined) return previous;
+  return candidate;
+}
 
 /** A retained snapshot is evidence from its observation time, never a current successful read. */
 export function quotaObservationState(snapshot: UpstreamQuotaSnapshot, now = Date.now(), refreshFailed = false): QuotaObservationState {
@@ -235,7 +319,13 @@ export function quotaSourceLabel(source: string) {
 /** Only translate known normalized codes; never render supplier/error payloads. */
 export function quotaReadErrorMessage(code: string | null | undefined) {
   switch (code) {
+    case 'quota_account_not_found':
+    case 'quota_account_inactive':
     case 'credential_invalid': return 'quota.errorCredential';
+    case 'quota_account_unavailable': return 'quota.errorDestination';
+    case 'quota_batch_timeout': return 'quota.errorTimeout';
+    case 'quota_batch_failed':
+    case 'quota_read_failed': return 'quota.errorTransport';
     case 'quota_not_authorized': return 'quota.errorSupplierAuthorization';
     case 'quota_destination_invalid': return 'quota.errorDestination';
     case 'quota_transport_failed': return 'quota.errorTransport';

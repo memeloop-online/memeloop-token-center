@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { formatCountdown } from '../src/format.js';
-import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaHighestUsageWindow, quotaObservationState, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   assert.equal(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, 85_000, 'operator deadline preserves ten seconds beyond the server read budget');
@@ -120,4 +120,31 @@ test('quota observation state does not confuse a failed refresh or expired snaps
   assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit, { ...credit, expires_at: null }] }, 1500), { state: 'unknown' }, 'incomplete evidence cannot establish the earliest expiry');
   assert.deepEqual(quotaResetCreditExpiry(snapshot, 1500), { state: 'unknown' }, 'window reset dates cannot substitute for absent credit expiry');
   assert.deepEqual(quotaResetCreditExpiry({ ...snapshot, reset_credits: [credit] }, 10000), { state: 'none' }, 'expired credits never count as upcoming opportunities');
+});
+
+test('quota refresh diagnostics stay separate from the effective observation and remain sanitized', () => {
+  const observed: UpstreamQuotaSnapshot = {
+    contract_version: 'upstream_quota_v1', upstream_account_id: 'account', tenant_external_id: 'tenant', provider: 'openai-codex',
+    status: 'ready', observed_at: 1_000, stale_after: 2_000, stale: false, freshness: 'fresh', plan_type: null, workspace: null,
+    capabilities: { read: true, plan: true, workspace: false, window_amounts: false, window_amount_unit: false, window_percent: true, reset_credit_expiry: true, subscription_expiry: false, supplier_read_only: true, refreshes_credentials: false, consumes_reset_credit: false },
+    subscription_active_until: null, credits: { balance: null, unlimited: null, has_credits: null, source: null }, windows: [], reset_credits: [], reset_capability: {
+      provider_supported: true, implementation_available: false, prepare_available: false, confirmation_required: false, retryable: false, available_credits: null, applicable_credits: null, reason: 'quota_reset_not_supported', credit_error_code: null, evidence: 'server_driver_contract',
+    }, error_code: null,
+  };
+  const failed: UpstreamQuotaSnapshot = {
+    ...observed,
+    status: 'error', observed_at: null, stale_after: null, freshness: 'unobserved', error_code: 'quota_timeout',
+    attempts: [
+      { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'credits', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'https://secret.invalid/proxy', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'https://user:password@proxy.invalid', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+    ],
+    cache_hit: false,
+  };
+  const diagnostic = quotaRefreshDiagnostic(failed);
+  assert.equal(diagnostic.error_code, 'quota_timeout');
+  assert.equal(diagnostic.cache_hit, false);
+  assert.equal(diagnostic.attempts.length, 1, 'unsafe endpoint and error fields are dropped');
+  assert.deepEqual(diagnostic.attempts[0], { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false });
+  assert.equal(quotaEffectiveSnapshot(observed, failed), observed, 'the failed read keeps the last effective observation');
 });

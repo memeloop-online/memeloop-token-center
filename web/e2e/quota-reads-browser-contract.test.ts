@@ -36,6 +36,13 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     await page.locator('[data-account="account-0"] [data-reset-credit-expiry="known"]').first().waitFor();
     await page.locator('[data-account="account-1"] [data-reset-credit-expiry="unknown"]').first().waitFor();
     assert.match(await page.locator('[data-account="account-2"] [data-summary]').innerText(), /failed/i);
+    const accountError = page.locator('[data-account="account-2"] [data-quota-error-code]');
+    await accountError.waitFor();
+    assert.equal(await accountError.getAttribute('data-quota-error-code'), 'quota_account_unavailable');
+    assert.equal(await accountError.getAttribute('data-quota-attempt-count'), '0');
+    assert.equal(await accountError.getAttribute('data-quota-cache-hit'), 'false');
+    assert.match(await accountError.innerText(), /Quota connection configuration validation failed/);
+    assert.equal(await page.getByText('raw supplier body', { exact: true }).count(), 0, 'unsafe batch diagnostics never reach the page');
     await page.locator('[data-account="account-2"]').getByRole('button', { name: 'Refresh quota', exact: true }).click();
     await page.waitForFunction(() => window.quotaReadCalls.length === 2);
     await page.evaluate(() => window.releaseQuota(1));
@@ -49,6 +56,10 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     assert.ok(await page.locator('[data-account="account-2"] [data-reset-credit-expiry="known"]').count() > 0, 'a failed batch item retains the previous successful snapshot');
     assert.match(await page.locator('[data-account="account-3"] [data-summary]').innerText(), /failed/i);
     assert.ok(await page.locator('[data-account="account-3"] [data-reset-credit-expiry="known"]').count() > 0, 'an unobserved supplier error retains the previous quota evidence');
+    const retainedError = page.locator('[data-account="account-3"] [data-quota-error-code]');
+    assert.equal(await retainedError.getAttribute('data-quota-error-code'), 'quota_timeout');
+    assert.equal(await retainedError.getAttribute('data-quota-attempt-count'), '1');
+    assert.equal(await retainedError.getAttribute('data-quota-cache-hit'), 'false');
     assert.equal(await page.evaluate(() => window.quotaUnexpectedWrites), 0);
 
     await page.goto(url);
