@@ -298,7 +298,9 @@ impl Database {
         if !schema.is_ready() {
             return Err(DatabaseReadinessError::SchemaOutdated(schema));
         }
-        self.archive_staging_readiness_check().await?;
+        self.archive_staging_readiness_check()
+            .await
+            .map_err(AppError::from)?;
         Ok(())
     }
 
