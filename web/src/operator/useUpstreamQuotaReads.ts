@@ -1,19 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
-import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaBatchResponse, type UpstreamQuotaReadTrigger, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaEffectiveSnapshot, quotaRefreshDiagnostic, UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaBatchResponse, type UpstreamQuotaDiagnostic, type UpstreamQuotaReadTrigger, type UpstreamQuotaSnapshot } from './upstreamQuota';
 
 export interface QuotaReadAccount { id: string; credential_generation: number; tenant_external_id?: string | null; status: string }
-export interface QuotaReadState { generation: number; snapshot?: UpstreamQuotaSnapshot; busy: boolean; queued?: boolean; refreshFailed: boolean; error?: 'quota.readFailed' | 'quota.errorPermission' }
+export interface QuotaReadState { generation: number; snapshot?: UpstreamQuotaSnapshot; diagnostic?: UpstreamQuotaDiagnostic; busy: boolean; queued?: boolean; refreshFailed: boolean; error?: 'quota.readFailed' | 'quota.errorPermission' }
 
-function refreshFailed(snapshot: UpstreamQuotaSnapshot) {
-  return snapshot.status === 'error' || Boolean(snapshot.error_code);
+function refreshFailed(snapshot: UpstreamQuotaSnapshot, diagnostic?: UpstreamQuotaDiagnostic) {
+  return snapshot.status === 'error' || Boolean(snapshot.error_code) || Boolean(diagnostic?.error_code);
 }
 
-/** An unobserved error has no newer quota evidence than the retained row. */
-function visibleSnapshot(previous: QuotaReadState | undefined, generation: number, snapshot: UpstreamQuotaSnapshot) {
-  return refreshFailed(snapshot) && snapshot.observed_at === null && previous?.generation === generation && previous.snapshot
-    ? previous.snapshot
-    : snapshot;
+function diagnosticForApiFailure(reason: unknown): UpstreamQuotaDiagnostic {
+  const status = reason instanceof ApiError ? reason.status : undefined;
+  const code = status === 401 || status === 403 ? 'quota_not_authorized'
+    : status === 408 || status === 504 ? 'quota_timeout'
+      : status === 429 ? 'quota_rate_limited' : 'quota_read_failed';
+  return { error_code: code, attempts: [], cache_hit: false };
 }
 
 /** One shared read owner for list, detail and batch actions; never calls reset or OAuth. */
@@ -43,7 +44,7 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     const key = `${scope}\0${accountTenant}\0${account.id}\0${generation}`;
     const existing = requests.current.get(key); if (existing) return existing.promise;
     const controller = new AbortController();
-    setEntries(previous => ({ ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, busy: true, refreshFailed: false } }));
+    setEntries(previous => ({ ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, diagnostic: previous[account.id]?.generation === generation ? previous[account.id].diagnostic : undefined, busy: true, refreshFailed: false } }));
     const promise = (async () => {
       try {
         const snapshot = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(account.id, accountTenant, { fresh: true, trigger }), token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS)]) });
@@ -52,13 +53,16 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
         if (snapshot.contract_version !== 'upstream_quota_v1' || snapshot.upstream_account_id !== account.id || snapshot.tenant_external_id !== accountTenant) throw new Error('Quota scope mismatch');
         setEntries(previous => {
           if (!ownsIdentity() || !isEligible()) return previous;
+          const previousEntry = previous[account.id]?.generation === generation ? previous[account.id] : undefined;
+          const diagnostic = quotaRefreshDiagnostic(snapshot);
           return {
             ...previous,
             [account.id]: {
               generation,
-              snapshot: visibleSnapshot(previous[account.id], generation, snapshot),
+              snapshot: quotaEffectiveSnapshot(previousEntry?.snapshot, snapshot),
+              diagnostic,
               busy: false,
-              refreshFailed: refreshFailed(snapshot),
+              refreshFailed: refreshFailed(snapshot, diagnostic),
             },
           };
         });
@@ -66,7 +70,8 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
         if (!ownsIdentity() || controller.signal.aborted) return;
         if (!isEligible()) { clearPending(); return; }
         const error = reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed';
-        setEntries(previous => ownsIdentity() && isEligible() ? { ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, busy: false, refreshFailed: true, error } } : previous);
+        const diagnostic = diagnosticForApiFailure(reason);
+        setEntries(previous => ownsIdentity() && isEligible() ? { ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, diagnostic, busy: false, refreshFailed: true, error } } : previous);
       } finally { if (requests.current.get(key)?.controller === controller) requests.current.delete(key); }
     })();
     requests.current.set(key, { controller, promise });
@@ -80,7 +85,7 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     const run = { controller: new AbortController() }; batch.current = run;
     setEntries(previous => {
       const queued = { ...previous };
-      for (const account of selected) queued[account.id] = { generation: account.credential_generation, snapshot: previous[account.id]?.generation === account.credential_generation ? previous[account.id].snapshot : undefined, busy: false, queued: true, refreshFailed: false };
+      for (const account of selected) queued[account.id] = { generation: account.credential_generation, snapshot: previous[account.id]?.generation === account.credential_generation ? previous[account.id].snapshot : undefined, diagnostic: previous[account.id]?.generation === account.credential_generation ? previous[account.id].diagnostic : undefined, busy: false, queued: true, refreshFailed: false };
       return queued;
     });
     setProgress({ done: 0, total: selected.length, busy: true });
@@ -110,15 +115,22 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
           }
           const result = results.get(account.id);
           if (result?.status === 'success' && result.snapshot.contract_version === 'upstream_quota_v1' && result.snapshot.upstream_account_id === account.id && result.snapshot.tenant_external_id === accountTenant) {
+            const diagnostic = quotaRefreshDiagnostic(result.snapshot);
+            const previousEntry = previous[account.id]?.generation === account.credential_generation ? previous[account.id] : undefined;
             settled[account.id] = {
               generation: account.credential_generation,
-              snapshot: visibleSnapshot(previous[account.id], account.credential_generation, result.snapshot),
+              snapshot: quotaEffectiveSnapshot(previousEntry?.snapshot, result.snapshot),
+              diagnostic,
               busy: false,
               queued: false,
-              refreshFailed: refreshFailed(result.snapshot),
+              refreshFailed: refreshFailed(result.snapshot, diagnostic),
             };
           } else {
-            settled[account.id] = { generation: account.credential_generation, snapshot: previous[account.id]?.generation === account.credential_generation ? previous[account.id].snapshot : undefined, busy: false, queued: false, refreshFailed: true, error: 'quota.readFailed' };
+            const diagnostic = result?.status === 'error'
+              ? quotaRefreshDiagnostic(undefined, result.error.code, result.diagnostic)
+              : { error_code: 'quota_batch_timeout', attempts: [], cache_hit: false };
+            const previousEntry = previous[account.id]?.generation === account.credential_generation ? previous[account.id] : undefined;
+            settled[account.id] = { generation: account.credential_generation, snapshot: previousEntry?.snapshot, diagnostic, busy: false, queued: false, refreshFailed: true, error: diagnostic.error_code === 'quota_not_authorized' ? 'quota.errorPermission' : 'quota.readFailed' };
           }
         }
         return settled;
@@ -126,11 +138,12 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
     } catch (reason) {
       if (!owns() || run.controller.signal.aborted) return;
       const error = reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed';
+      const diagnostic = diagnosticForApiFailure(reason);
       setEntries(previous => {
         const settled = { ...previous };
         for (const account of selected) {
           const entry = settled[account.id];
-          if (entry?.generation === account.credential_generation) settled[account.id] = { ...entry, busy: false, queued: false, refreshFailed: true, error };
+          if (entry?.generation === account.credential_generation) settled[account.id] = { ...entry, busy: false, queued: false, refreshFailed: true, diagnostic, error };
         }
         return settled;
       });
