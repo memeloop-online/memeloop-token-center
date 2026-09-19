@@ -179,7 +179,7 @@ async fn minio_tenant_cas_create_if_absent_is_atomic_and_replayable() {
     let store = ArchiveStore::from_config(&config)
         .await
         .expect("construct MinIO archive store");
-    let tenant_id = Uuid::now_v7();
+    let tenant_id = Uuid::from_u128(0x8c93_e9e1_f936_4c84_a7d6_84ab_8f38_97ad);
     let body = Bytes::from("minio exact CAS body ".repeat(5_000));
     let first_staging = format!("staging/s3-cas/{}/first", Uuid::now_v7());
     let mut first = store

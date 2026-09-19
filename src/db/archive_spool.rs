@@ -940,6 +940,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn complete_response_archive_spool(
         &self,
         task: &ArchiveSpoolTask,
