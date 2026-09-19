@@ -113,10 +113,10 @@ paths:
       description: |
         Available on every HTTP role for Kubernetes probes. PostgreSQL and archive
         checks run concurrently with bounded deadlines and a five-second singleflight
-        cache, so probe bursts do not amplify dependency traffic. PostgreSQL alone
-        determines the HTTP status. An archive failure is returned as HTTP 200 with
-        `status: degraded` and `checks.archive: failed`; archive-dependent image/video
-        operations still fail closed.
+        cache, so probe bursts do not amplify dependency traffic. Database reachability
+        and the complete migration registry determine the HTTP status. An archive failure
+        is returned as HTTP 200 with `status: degraded` and `checks.archive: failed`;
+        archive-dependent image/video operations still fail closed.
       security: []
       responses:
         '200':
@@ -125,7 +125,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
         '503':
-          description: PostgreSQL readiness failed or timed out.
+          description: PostgreSQL readiness failed, timed out, or its schema is missing a migration required by this binary.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
@@ -6746,9 +6746,18 @@ components:
         checks:
           type: object
           additionalProperties: false
-          required: [database, archive]
+          required: [database, database_schema, archive]
           properties:
             database: { type: string, enum: [ok, failed] }
+            database_schema:
+              type: object
+              additionalProperties: false
+              required: [status]
+              properties:
+                status: { type: string, enum: [ok, unknown, outdated] }
+                required_version: { type: integer, format: int64, minimum: 0 }
+                latest_applied_version: { type: [integer, 'null'], format: int64, minimum: 0 }
+                missing_migration_count: { type: integer, minimum: 0 }
             archive: { type: string, enum: [ok, failed] }
     VersionInfo:
       type: object

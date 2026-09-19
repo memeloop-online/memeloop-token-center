@@ -124,49 +124,14 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
     (status, Json(body)).into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn outdated_schema_is_explicitly_not_ready() {
-        let (status, body) = readiness_contract(
-            crate::metrics::DatabaseReadiness::SchemaOutdated {
-                required_version: 111,
-                latest_applied_version: Some(105),
-                missing_migration_count: 6,
-            },
-            true,
-        );
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "not_ready");
-        assert_eq!(body["checks"]["database"], "failed");
-        assert_eq!(body["checks"]["database_schema"]["status"], "outdated");
-        assert_eq!(body["checks"]["database_schema"]["required_version"], 111);
-        assert_eq!(
-            body["checks"]["database_schema"]["latest_applied_version"],
-            105
-        );
-        assert_eq!(
-            body["checks"]["database_schema"]["missing_migration_count"],
-            6
-        );
-    }
-}
-
 pub(super) async fn prometheus_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     require_service(&headers, &state, "metrics:read").await?;
     let runtime = match state.db.runtime_metrics().await {
-        Ok(value) => {
-            state.metrics.set_dependency_ready("database", true);
-            Some(value)
-        }
+        Ok(value) => Some(value),
         Err(error) => {
-            state.metrics.set_dependency_ready("database", false);
             tracing::warn!(%error, "database runtime metrics collection failed");
             None
         }
@@ -356,7 +321,7 @@ mod tests {
 
     #[test]
     fn healthy_database_and_archive_report_ready() {
-        let (status, body) = readiness_contract(true, true);
+        let (status, body) = readiness_contract(crate::metrics::DatabaseReadiness::Ready, true);
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
@@ -366,7 +331,7 @@ mod tests {
 
     #[test]
     fn archive_failure_is_reported_as_degraded_without_withdrawing_readiness() {
-        let (status, body) = readiness_contract(true, false);
+        let (status, body) = readiness_contract(crate::metrics::DatabaseReadiness::Ready, false);
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "degraded");
@@ -376,7 +341,8 @@ mod tests {
 
     #[test]
     fn database_failure_withdraws_readiness_even_when_archive_is_healthy() {
-        let (status, body) = readiness_contract(false, true);
+        let (status, body) =
+            readiness_contract(crate::metrics::DatabaseReadiness::Unavailable, true);
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "not_ready");
@@ -386,11 +352,38 @@ mod tests {
 
     #[test]
     fn simultaneous_database_and_archive_failure_remains_not_ready() {
-        let (status, body) = readiness_contract(false, false);
+        let (status, body) =
+            readiness_contract(crate::metrics::DatabaseReadiness::Unavailable, false);
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "not_ready");
         assert_eq!(body["checks"]["database"], "failed");
         assert_eq!(body["checks"]["archive"], "failed");
+    }
+
+    #[test]
+    fn outdated_schema_is_explicitly_not_ready() {
+        let (status, body) = readiness_contract(
+            crate::metrics::DatabaseReadiness::SchemaOutdated {
+                required_version: 111,
+                latest_applied_version: Some(105),
+                missing_migration_count: 6,
+            },
+            true,
+        );
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["checks"]["database"], "failed");
+        assert_eq!(body["checks"]["database_schema"]["status"], "outdated");
+        assert_eq!(body["checks"]["database_schema"]["required_version"], 111);
+        assert_eq!(
+            body["checks"]["database_schema"]["latest_applied_version"],
+            105
+        );
+        assert_eq!(
+            body["checks"]["database_schema"]["missing_migration_count"],
+            6
+        );
     }
 }
