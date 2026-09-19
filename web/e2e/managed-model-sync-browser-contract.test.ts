@@ -5,6 +5,10 @@ import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import type { ManagedModelSyncResponse } from '../src/types.js';
 
+declare global {
+  interface Window { managedHandoffPayloads: Array<Record<string, unknown>> }
+}
+
 async function openFixture() {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
