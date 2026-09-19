@@ -563,7 +563,13 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
     );
 
     const REQUESTS: usize = 1024;
+    // Keep this pressure test above the pool capacity in total work while
+    // bounding active transactions below the constructor's effective pool
+    // ceiling. The assertion concerns same-session projection contention;
+    // SQLx pool acquisition timeouts are unrelated runner saturation.
+    const MAX_IN_FLIGHT: usize = 24;
     let admission_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let admission_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut admissions = Vec::with_capacity(REQUESTS);
     for index in 0..REQUESTS {
         let database = database.clone();
@@ -571,11 +577,13 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         let price = price.clone();
         let model = model.clone();
         let admission_barrier = admission_barrier.clone();
+        let admission_limit = admission_limit.clone();
         admissions.push(tokio::spawn(async move {
             let request_id = Uuid::now_v7();
             let request_object =
                 format!("objects/blake3/metered-conversation-child-request-{index}");
             admission_barrier.wait().await;
+            let _permit = admission_limit.acquire_owned().await.unwrap();
             let reservation = database
                 .start_proxy_request(StartProxyRequest {
                     request_id,
@@ -600,11 +608,13 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
     }
 
     let finish_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let finish_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut finishes = Vec::with_capacity(REQUESTS);
     for (index, request_id, reservation) in admitted {
         let database = database.clone();
         let key = key.clone();
         let finish_barrier = finish_barrier.clone();
+        let finish_limit = finish_limit.clone();
         let session_id = session_id.clone();
         finishes.push(tokio::spawn(async move {
             let request_json = serde_json::json!({
@@ -617,6 +627,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
                 ..ConversationHints::default()
             };
             finish_barrier.wait().await;
+            let _permit = finish_limit.acquire_owned().await.unwrap();
             database
                 .finish_proxy_request(FinishProxyRequest {
                     usage_basis: None,

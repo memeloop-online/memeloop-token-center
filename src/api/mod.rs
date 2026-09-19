@@ -30,6 +30,7 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+mod anthropic;
 mod audio;
 mod auth;
 mod billing;

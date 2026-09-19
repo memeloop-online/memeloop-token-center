@@ -103,13 +103,6 @@ pub(super) async fn send_reqwest_proxy_route(
     if route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
         request = crate::oauth::managed::kimi::apply_headers(request, &route.route.credential)
             .map_err(|_| ProxySendError::Credential)?;
-        if matches!(
-            protocol,
-            Protocol::AnthropicMessages | Protocol::AnthropicCountTokens
-        ) && !headers.contains_key("anthropic-version")
-        {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
     }
     if route.route.driver == crate::oauth::copilot::PROVIDER_DRIVER {
         let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
@@ -120,13 +113,12 @@ pub(super) async fn send_reqwest_proxy_route(
             .header("Editor-Version", &product)
             .header("Editor-Plugin-Version", &product);
     }
-    if let Some(version) = headers.get("anthropic-version") {
-        request = request.header("anthropic-version", version);
-    }
-    if route.route.driver == crate::oauth::claude::PROVIDER_DRIVER {
-        request = request.header("anthropic-beta", crate::oauth::claude::OAUTH_BETA_HEADER);
-    } else if let Some(beta) = headers.get("anthropic-beta") {
-        request = request.header("anthropic-beta", beta);
+    if protocol.is_anthropic() {
+        request = crate::api::anthropic::apply_request_headers(
+            request,
+            headers,
+            route.route.driver == crate::oauth::claude::PROVIDER_DRIVER,
+        );
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();

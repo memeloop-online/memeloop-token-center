@@ -12,6 +12,7 @@ use super::{
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ResponsesSseEventKind {
     Lifecycle,
+    Ping,
     Completed,
     ProviderIncomplete,
     Failed,
@@ -22,6 +23,7 @@ impl ResponsesSseEventKind {
     fn from_name(name: &[u8]) -> Self {
         match trim_ascii_whitespace(name) {
             b"response.created" | b"response.queued" | b"response.in_progress" => Self::Lifecycle,
+            b"ping" => Self::Ping,
             b"response.completed" | b"message_stop" => Self::Completed,
             b"response.incomplete" => Self::ProviderIncomplete,
             b"response.failed" | b"error" | b"response.error" => Self::Failed,
@@ -437,7 +439,12 @@ impl ResponsesSseCapture {
                 }
                 Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
                 Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
-                Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
+                Some(
+                    ResponsesSseEventKind::Lifecycle
+                    | ResponsesSseEventKind::Ping
+                    | ResponsesSseEventKind::Other,
+                )
+                | None => {}
             }
             return ChatSseDeliveryClass::Control;
         };
@@ -595,7 +602,9 @@ impl ResponsesSseCapture {
                 }
                 self.terminal_incomplete = true;
             }
-            ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other => {}
+            ResponsesSseEventKind::Lifecycle
+            | ResponsesSseEventKind::Ping
+            | ResponsesSseEventKind::Other => {}
         }
         if self.response_delivery_is_billable(kind, &value) {
             ChatSseDeliveryClass::Billable
@@ -615,7 +624,12 @@ impl ResponsesSseCapture {
             (_, ResponsesSseEventKind::Completed | ResponsesSseEventKind::ProviderIncomplete) => {
                 completed_response_has_billable_result(value)
             }
-            (_, ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Failed) => false,
+            (
+                _,
+                ResponsesSseEventKind::Lifecycle
+                | ResponsesSseEventKind::Ping
+                | ResponsesSseEventKind::Failed,
+            ) => false,
         }
     }
 }

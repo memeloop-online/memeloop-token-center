@@ -2,6 +2,20 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn anthropic_ping_is_a_non_billable_control_frame() {
+    let mut capture = ResponsesSseCapture::for_delivery();
+    let frames = capture
+        .push_delivery_frames(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0].bytes,
+        Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+    );
+    assert!(!frames[0].billable);
+}
+
+#[test]
 fn stateful_sse_delivery_framer_redacts_split_comments_and_keeps_done_nonbillable() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
     assert!(capture.push_delivery_frames(b": pi").unwrap().is_empty());
