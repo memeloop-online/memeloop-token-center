@@ -23,7 +23,7 @@ import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceLi
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import { ProviderModelCatalog } from '../ProviderModelCatalog';
 import { ManagedModelSync } from '../ManagedModelSync';
-import { managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
+import { inferManagedRouteProtocol, managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
 import { consumeRouteDraftPrefill, consumeRouteFocus, storeCatalogRouteAction } from '../routePrefill';
 import { providerDisplayName } from '../providerDisplayName';
 import '../routeFormScope.css';
@@ -874,7 +874,8 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   const supportedByAll = candidateIds.length === 0 || candidateProtocolSets.some((values) => !values)
     ? knownProtocols
     : knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values?.includes(protocol)));
-  const protocolCompatible = supportedByAll.includes(draft.protocol);
+  const selectedManagedProtocol = inferManagedRouteProtocol(draft.protocol);
+  const protocolCompatible = selectedManagedProtocol !== undefined && supportedByAll.includes(selectedManagedProtocol);
   const singleProtocol = candidateIds.length > 0
     ? knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values && values.length > 0 && values.includes(protocol)))
     : [];
@@ -908,7 +909,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </AdvancedFormSection>
     <div className="route-protocol-field"><div className="route-protocol-heading"><label htmlFor={protocolId}>{t('routes.protocol')}</label><DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip></div><Select id={protocolId} aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'openai-audio' ? 'OpenAI Audio' : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></div>
     {!protocolCompatible && <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, public_model: !draft.public_model.trim() || draft.public_model === draft.upstream_model ? upstream_model : draft.public_model, custom_model_confirmed: false })} onProtocolInferred={(protocol) => { if (managedRouteProtocols.includes(protocol) && draft.protocol !== protocol) onChange({ ...draft, protocol }); }} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, public_model: !draft.public_model.trim() || draft.public_model === draft.upstream_model ? upstream_model : draft.public_model, custom_model_confirmed: false })} onProtocolInferred={(protocol) => { const inferredProtocol = inferManagedRouteProtocol(protocol); if (inferredProtocol && draft.protocol !== inferredProtocol) onChange({ ...draft, protocol: inferredProtocol }); }} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
     <AdvancedFormSection action title={journey.priority} invalid={!priorityValid}>
     <label>{t('routes.priority')}<Input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : String(draft.priority)} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     </AdvancedFormSection>
