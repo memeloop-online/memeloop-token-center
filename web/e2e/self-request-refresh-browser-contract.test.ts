@@ -132,8 +132,8 @@ test('Portal and Operator refresh preferences stay isolated in both directions',
     const page = await browser.newPage();
     await page.addInitScript(() => {
       localStorage.setItem('mtc-locale', 'en');
-      localStorage.setItem('mtc.operator.request-refresh-ms.v1', '0');
-      localStorage.setItem('mtc.self.request-refresh-ms.v1', '30000');
+      if (localStorage.getItem('mtc.operator.request-refresh-ms.v1') === null) localStorage.setItem('mtc.operator.request-refresh-ms.v1', '0');
+      if (localStorage.getItem('mtc.self.request-refresh-ms.v1') === null) localStorage.setItem('mtc.self.request-refresh-ms.v1', '30000');
     });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/self-operator-refresh-isolation.html`);
     const operator = page.locator('[data-refresh-scope="operator"] input[type="range"]');
