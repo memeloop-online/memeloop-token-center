@@ -115,12 +115,12 @@ impl Lane {
         // Tokio's fair semaphore is a turnstile, not the dynamic capacity.
         // Only its FIFO head waits for capacity, so shrinking cannot leak
         // permits through cancellation or grant new work above the new limit.
-        if let Ok(turn) = self.turn.clone().try_acquire_owned() {
-            if let Some(permit) = self.take(metrics) {
-                drop(turn);
-                metrics.observe_codex_dispatch("admitted");
-                return Ok(permit);
-            }
+        if let Ok(turn) = self.turn.clone().try_acquire_owned()
+            && let Some(permit) = self.take(metrics)
+        {
+            drop(turn);
+            metrics.observe_codex_dispatch("admitted");
+            return Ok(permit);
         }
         let timeout = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
