@@ -5,10 +5,10 @@ import { api } from '../api';
 import { ChartDataView } from '../charts/ChartDataView';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import { costOption, heatmapOption, latencyOption, throughputOption, totalTokens, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
-import { Metric, NumberMetric } from '../components';
 import { Button } from '../design-system';
 import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
+import { UsageSummaryMetrics } from '../operator/UsageSummaryMetrics';
 import type { KeyView, SelfUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisTimeBucket } from '../types';
 import '../operator/usage.css';
 import { selfErrorMessage } from './errors';
@@ -105,20 +105,9 @@ export function UsagePage({ credential, credentialView, onError }: {
   if (scopedRemote.status === 'loading') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div></div><div className="boot" role="status">{t('common.loading')}</div></div>;
   if (scopedRemote.status === 'error') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div><Button type="button" appearance="secondary" onClick={() => setRefresh((value) => value + 1)}>{t('usage.refresh')}</Button></div><div className="notice error" role="alert">{scopedRemote.message}</div></div>;
   if (!stats) return <div className="empty">{t('common.noData')}</div>;
-  const successRate = stats.summary.requests ? stats.summary.success / stats.summary.requests : null;
   return <div className="self-page self-usage-page usage-page" data-self-page="usage">
     <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <Button type="button" key={value} appearance={range === value ? 'primary' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</Button>)}</div></div>
-    <section className="metrics self-usage-metrics">
-      <NumberMetric label={t('usage.requests')} value={stats.summary.requests} />
-      <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
-      <NumberMetric label={t('usage.failures')} value={stats.summary.failed} tone="negative" />
-      <NumberMetric label={t('usage.totalTokens')} value={totalTokens(stats.summary)} />
-      <NumberMetric label={t('usage.cachedTokens')} value={stats.summary.cached_input_tokens} />
-      <NumberMetric label={t('usage.cacheWriteTokens')} value={stats.summary.cache_write_tokens} />
-      <Metric label={t('usage.average')} value={formatMilliseconds(stats.summary.avg_duration_ms, locale)} />
-      <Metric label={t('usage.p95Approx')} value={formatMilliseconds(stats.summary.p95_duration_ms, locale)} />
-      <Metric label={localSettlementLabel(locale)} labelContent={<LocalSettlementNotice />} value={<CostLines values={stats.summary.costs} />} />
-    </section>
+    <UsageSummaryMetrics stats={stats} currency={credentialView.currency} timeZone={timeZone} />
     <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
       <section className="usage-chart-grid self-usage-charts">
         <ChartPanel timeZone={timeZone} title={t('usage.throughput')} values={stats.time_series}><EChart ariaLabel={t('usage.throughput')} locale={locale} option={throughput} timeZone={timeZone} /></ChartPanel>
