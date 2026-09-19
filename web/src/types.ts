@@ -427,7 +427,7 @@ export interface UpstreamModelCatalogResponse {
   disabled_models: DisabledUpstreamCatalogModel[];
 }
 
-export interface UpstreamCatalogPriceSync {
+export interface UpstreamModelPriceSyncResult {
   status: 'ready' | 'partial' | 'error' | 'skipped';
   currency: 'USD';
   imported: number;
@@ -437,6 +437,8 @@ export interface UpstreamCatalogPriceSync {
   failed_sources: string[];
   error_code: 'price_sync_failed' | null;
 }
+
+export type UpstreamCatalogPriceSync = UpstreamModelPriceSyncResult;
 
 export interface UpstreamModelCatalogSyncResponse extends UpstreamModelCatalogResponse {
   price_sync: UpstreamCatalogPriceSync;
@@ -451,7 +453,7 @@ export interface ManagedRouteSyncCounts {
   warnings: string[];
 }
 
-export interface ManagedRoutePriceSync {
+export interface LegacyManagedRoutePriceSync {
   status: 'deferred';
   currency: 'USD';
   imported: 0;
@@ -461,6 +463,8 @@ export interface ManagedRoutePriceSync {
   failed_sources: [];
   error_code: 'managed_route_price_sync_deferred';
 }
+
+export type ManagedRoutePriceSync = UpstreamModelPriceSyncResult | LegacyManagedRoutePriceSync;
 
 export interface ManagedModelSyncResponse {
   catalog: UpstreamModelCatalogResponse;

@@ -8,6 +8,7 @@ const catalogErrorCodes = new Set([
   'rate_limited', 'upstream_unavailable', 'redirect_rejected', 'response_too_large', 'invalid_response',
   'codex_no_trusted_models',
 ]);
+const priceSyncStatuses = new Set(['ready', 'partial', 'error', 'skipped']);
 const reservationBoundSources = new Set(['mtc_context_window_bound', 'administrator_override']);
 
 function isInteger(value: unknown, minimum?: number): value is number {
@@ -83,12 +84,22 @@ function isCounts(value: unknown): value is ManagedRouteSyncCounts {
 function isPriceSync(value: unknown): value is ManagedRoutePriceSync {
   if (!value || typeof value !== 'object') return false;
   const price = value as Record<string, unknown>;
-  return hasOnlyKeys(price, ['status', 'currency', 'imported', 'preserved', 'unmatched', 'ambiguous', 'failed_sources', 'error_code'])
-    && price.status === 'deferred'
-    && price.currency === 'USD'
-    && ['imported', 'preserved', 'unmatched', 'ambiguous'].every((field) => price[field] === 0)
-    && Array.isArray(price.failed_sources) && price.failed_sources.length === 0
-    && price.error_code === 'managed_route_price_sync_deferred';
+  if (!hasOnlyKeys(price, ['status', 'currency', 'imported', 'preserved', 'unmatched', 'ambiguous', 'failed_sources', 'error_code'])
+    || price.currency !== 'USD'
+    || !['imported', 'preserved', 'unmatched', 'ambiguous'].every((field) => isInteger(price[field], 0))
+    || !Array.isArray(price.failed_sources)
+    || !price.failed_sources.every((source) => typeof source === 'string' && source.length > 0)) {
+    return false;
+  }
+  if (price.status === 'deferred') {
+    return ['imported', 'preserved', 'unmatched', 'ambiguous'].every((field) => price[field] === 0)
+      && price.failed_sources.length === 0
+      && price.error_code === 'managed_route_price_sync_deferred';
+  }
+  if (typeof price.status !== 'string' || !priceSyncStatuses.has(price.status)) return false;
+  return price.status === 'error'
+    ? price.error_code === 'price_sync_failed'
+    : price.error_code === null;
 }
 
 export function parseManagedModelSync(value: unknown): ManagedModelSyncResponse {
@@ -103,7 +114,10 @@ export function parseManagedModelSync(value: unknown): ManagedModelSyncResponse 
 
 /** Warnings mean reconciliation was skipped or partial even when the HTTP call succeeded. */
 export function managedSyncTone(result: ManagedModelSyncResponse): 'success' | 'partial' {
-  return result.routes.warnings.length > 0 ? 'partial' : 'success';
+  return result.routes.warnings.length > 0
+    || result.price_sync.status === 'partial'
+    || result.price_sync.status === 'error'
+    ? 'partial' : 'success';
 }
 
 /** Route protocols the route form can express; only catalog wildcard entries map to openai. */

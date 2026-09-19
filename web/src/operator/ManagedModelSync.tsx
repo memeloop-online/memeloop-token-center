@@ -36,6 +36,18 @@ export function ManagedModelSync({ accountId, tenant, token, disabled = false, o
   const syncing = visible.phase === 'syncing';
   const result = visible.phase === 'done' ? visible.result : undefined;
   const tone = result ? managedSyncTone(result) : 'success';
+  const priceSync = result?.price_sync;
+  const priceSummary = priceSync && priceSync.status !== 'deferred' ? t('managedSync.price.summary', {
+    imported: formatNumber(priceSync.imported, locale),
+    preserved: formatNumber(priceSync.preserved, locale),
+    unmatched: formatNumber(priceSync.unmatched, locale),
+    ambiguous: formatNumber(priceSync.ambiguous, locale),
+  }) : '';
+  const failedSources = priceSync && priceSync.status !== 'deferred' && priceSync.failed_sources.length > 0
+    ? t('managedSync.price.sources', {
+      sources: new Intl.ListFormat(locale, { style: 'long', type: 'conjunction' }).format(priceSync.failed_sources),
+    })
+    : '';
   const warningText = (code: string) => {
     const key = `managedSync.warning.${code}`;
     const translated = t(key);
@@ -82,7 +94,14 @@ export function ManagedModelSync({ accountId, tenant, token, disabled = false, o
         unchanged: formatNumber(result.routes.unchanged, locale),
         skipped: formatNumber(result.routes.skipped, locale),
       })}</p>
-      <p className="muted">{t('managedSync.pricePending')}</p>
+      {priceSync?.status === 'deferred'
+        ? <p className="muted">{t('managedSync.priceDeferred')}</p>
+        : priceSync && <>
+          <p className={priceSync.status === 'error' ? 'error' : 'muted'} role={priceSync.status === 'error' ? 'alert' : 'status'}>
+            {t(`managedSync.price.${priceSync.status}`)} · {priceSummary}
+          </p>
+          {failedSources && <p className={priceSync.status === 'error' ? 'error' : 'muted'}>{failedSources}</p>}
+        </>}
       {result.routes.warnings.length > 0 && <ul className="managed-model-sync-warnings">
         {result.routes.warnings.map((warning) => <li key={warning}>{warningText(warning)}</li>)}
       </ul>}

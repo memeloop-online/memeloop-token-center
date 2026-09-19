@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import type { ManagedModelSyncResponse } from '../src/types.js';
 
 async function openFixture() {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -15,7 +16,7 @@ async function openFixture() {
   return { server, browser, page, url: `http://127.0.0.1:${address.port}/e2e/fixtures/managed-model-sync.html` };
 }
 
-function syncResponse(overrides: { warnings?: string[]; models?: number } = {}) {
+function syncResponse(overrides: { warnings?: string[]; models?: number } = {}): ManagedModelSyncResponse {
   const count = overrides.models ?? 2;
   return {
     catalog: {
@@ -26,7 +27,7 @@ function syncResponse(overrides: { warnings?: string[]; models?: number } = {}) 
       disabled_models: [],
     },
     routes: { added: 1, disabled: 0, restored: 0, unchanged: count - 1, skipped: 0, warnings: overrides.warnings ?? [] },
-    price_sync: { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' },
+    price_sync: { status: 'partial', currency: 'USD', imported: 7, preserved: 2, unmatched: 1, ambiguous: 3, failed_sources: ['litellm'], error_code: null },
   };
 }
 
@@ -55,7 +56,7 @@ async function stubBrowseCatalog(page: Page) {
   });
 }
 
-test('managed sync shows per-account catalog and route outcomes with deferred pricing', { timeout: 60_000 }, async () => {
+test('managed sync shows per-account catalog, route, and price outcomes', { timeout: 60_000 }, async () => {
   const { server, browser, page, url } = await openFixture();
   try {
     await stubBrowseCatalog(page);
@@ -66,6 +67,7 @@ test('managed sync shows per-account catalog and route outcomes with deferred pr
       if (new URL(request.url()).pathname === '/internal/v1/model-prices/sync') legacyPriceSyncRequests += 1;
     });
     let warnings: string[] = [];
+    let legacyPricing = false;
     let malformed = false;
     let fail = false;
     const syncTenants: string[] = [];
@@ -75,18 +77,21 @@ test('managed sync shows per-account catalog and route outcomes with deferred pr
       syncTenants.push(new URL(request.url()).searchParams.get('tenant_external_id') ?? '');
       if (fail) return route.fulfill({ status: 502, json: { error: { code: 'upstream_unavailable', message: '上游暂不可用，请稍后重试。' } } });
       if (malformed) return route.fulfill({ json: { catalog: { account_id: 'managed-account' } } });
-      return route.fulfill({ json: syncResponse({ warnings }) });
+      const response = syncResponse({ warnings });
+      if (legacyPricing) response.price_sync = { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' };
+      return route.fulfill({ json: response });
     });
     await page.goto(url);
 
     const sync = page.getByRole('button', { name: '同步模型', exact: true });
     await sync.waitFor({ state: 'visible' });
     await sync.click();
-    await page.getByText('同步完成', { exact: true }).waitFor();
+    await page.getByText('同步完成，部分内容需要关注', { exact: true }).waitFor();
     await page.getByText('目录 2 个模型 · 新增 1 · 停用 0 · 恢复 0 · 保留 1 · 跳过 0', { exact: true }).waitFor();
-    await page.getByText('本次未执行价格同步', { exact: true }).waitFor();
+    await page.getByText('部分价格待处理 · 更新 7 · 保留 2 · 未匹配 1 · 待确认 3', { exact: true }).waitFor();
+    await page.getByText('待恢复的价格源：litellm', { exact: true }).waitFor();
     assert.deepEqual(syncTenants, ['fixture-a']);
-    assert.equal(legacyPriceSyncRequests, 0, 'managed sync defers pricing without legacy price requests');
+    assert.equal(legacyPriceSyncRequests, 0, 'managed sync uses the combined server-side price result');
 
     warnings = ['sync_in_progress', 'operator_route_preserved', 'complete_catalog_unsupported'];
     await sync.click();
@@ -94,6 +99,11 @@ test('managed sync shows per-account catalog and route outcomes with deferred pr
     await page.getByText('另一次同步正在进行，本次跳过路由核对，请稍后重试。', { exact: true }).waitFor();
     await page.getByText('部分路由由管理员手动管理，已保持原样。', { exact: true }).waitFor();
     await page.getByText('此接入方式无法确认目录完整性，本次跳过路由核对。', { exact: true }).waitFor();
+
+    warnings = [];
+    legacyPricing = true;
+    await sync.click();
+    await page.getByText('价格同步服务正在更新', { exact: true }).waitFor();
 
     malformed = true;
     await sync.click();

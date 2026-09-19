@@ -3,7 +3,11 @@ import test from 'node:test';
 import {
   findManagedRoute, inferManagedRouteProtocol, managedSyncTone, parseManagedModelSync,
 } from '../src/operator/managedModelSync.js';
-import type { ManagedModelSyncResponse, ModelRouteView } from '../src/types.js';
+import type { ManagedModelSyncResponse, ModelRouteView, UpstreamModelPriceSyncResult } from '../src/types.js';
+
+function priceSync(overrides: Partial<UpstreamModelPriceSyncResult> = {}): UpstreamModelPriceSyncResult {
+  return { status: 'ready', currency: 'USD', imported: 1, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: null, ...overrides };
+}
 
 function response(overrides: Partial<ManagedModelSyncResponse['routes']> = {}): ManagedModelSyncResponse {
   return {
@@ -13,7 +17,7 @@ function response(overrides: Partial<ManagedModelSyncResponse['routes']> = {}): 
       error_code: null, models: [{ id: 'model-a', protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null }], disabled_models: [],
     },
     routes: { added: 1, disabled: 0, restored: 0, unchanged: 0, skipped: 0, warnings: [], ...overrides },
-    price_sync: { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' },
+    price_sync: priceSync(),
   };
 }
 
@@ -21,7 +25,17 @@ test('managed sync parser accepts the strict sync-routes contract', () => {
   const parsed = parseManagedModelSync(response());
   assert.equal(parsed.catalog.models.length, 1);
   assert.equal(parsed.routes.added, 1);
-  assert.equal(parsed.price_sync.status, 'deferred');
+  assert.equal(parsed.price_sync.status, 'ready');
+});
+
+test('managed sync parser accepts only the exact legacy deferred response during rolling deployment', () => {
+  const legacy = {
+    ...response(),
+    price_sync: { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' },
+  };
+  assert.equal(parseManagedModelSync(legacy).price_sync.status, 'deferred');
+  assert.throws(() => parseManagedModelSync({ ...legacy, price_sync: { ...legacy.price_sync, imported: 1 } }), /invalid managed sync response/);
+  assert.throws(() => parseManagedModelSync({ ...legacy, price_sync: { ...legacy.price_sync, failed_sources: ['litellm'] } }), /invalid managed sync response/);
 });
 
 test('managed sync parser rejects partial or shaped-wrong payloads', () => {
@@ -36,8 +50,9 @@ test('managed sync parser rejects partial or shaped-wrong payloads', () => {
     { ...response(), catalog: { ...response().catalog, credential_generation: 1.5 } },
     { ...response(), catalog: { ...response().catalog, models: [{ id: 'model-a', protocol: 'openai', context_window: 0, reservation_token_bound: null, reservation_bound_source: null }] } },
     { ...response(), catalog: { ...response().catalog, models: [{ id: 'model-a', protocol: 'openai', context_window: null, reservation_token_bound: null }] } },
-    { ...response(), price_sync: { ...response().price_sync, imported: 1 } },
-    { ...response(), price_sync: { ...response().price_sync, failed_sources: ['litellm'] } },
+    { ...response(), price_sync: { ...response().price_sync, status: 'error', error_code: null } },
+    { ...response(), price_sync: { ...response().price_sync, status: 'partial', error_code: 'price_sync_failed' } },
+    { ...response(), price_sync: { ...response().price_sync, failed_sources: [''] } },
   ]) assert.throws(() => parseManagedModelSync(value), /invalid managed sync response/);
 });
 
@@ -45,6 +60,8 @@ test('warnings mark the outcome partial even when counters look clean', () => {
   assert.equal(managedSyncTone(response()), 'success');
   assert.equal(managedSyncTone(response({ warnings: ['catalog_not_ready'] })), 'partial');
   assert.equal(managedSyncTone(response({ skipped: 1 })), 'success', 'protected entries without warnings stay a clean success');
+  assert.equal(managedSyncTone({ ...response(), price_sync: priceSync({ status: 'partial', unmatched: 1 }) }), 'partial');
+  assert.equal(managedSyncTone({ ...response(), price_sync: priceSync({ status: 'error', imported: 0, error_code: 'price_sync_failed' }) }), 'partial');
 });
 
 test('catalog protocols preserve supported values and only map the explicit wildcard', () => {
