@@ -167,8 +167,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
-    count('default', /readinessProbe:\s+httpGet:\s+path: "?\/readyz"?/g, 3);
-    count('default', /livenessProbe:\s+httpGet:\s+path: "?\/livez"?/g, 3);
+    count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
+    count('default', /livenessProbe:\s+httpGet: \{ path: "?\/livez"?, port: http \}/g, 3);
     has('configmap', 'configMap:'); has('pvc', 'persistentVolumeClaim:');
     for (const needle of ['name: install-plugin-0', `image: "ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@${installer}"`, '- --registry-username-file', '- --registry-password-file', '- --cosign-public-key', 'medium: Memory', 'sizeLimit: "16Mi"', 'secretName: plugin-cosign-keys', 'secretName: plugin-registry-auth']) count('oci', needle, 3);
     count('oci', 'readOnlyRootFilesystem: true', 7); count('oci', 'allowPrivilegeEscalation: false', 7);
