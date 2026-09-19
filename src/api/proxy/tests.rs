@@ -4575,12 +4575,19 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         refs.view.archive_state,
         crate::model::RequestArchiveState::Bound
     );
-    assert!(refs.request_object.starts_with("staging/proxy/"));
-    assert!(
-        refs.response_object
-            .as_deref()
-            .is_some_and(|locator| locator.starts_with("staging/proxy/"))
-    );
+    let authenticated = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert!(crate::archive::is_tenant_cas_location(
+        authenticated.tenant_id,
+        &refs.request_object
+    ));
+    assert!(refs.response_object.as_deref().is_some_and(|locator| {
+        crate::archive::is_tenant_cas_location(authenticated.tenant_id, locator)
+    }));
     let archived_request = fixture
         .state
         .archive
@@ -5310,6 +5317,46 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
         Some("upstream_failed_response")
     );
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_object,
+        format!("gap://{}/request", rows[0].request_id)
+    );
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let gap_spools: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'gap') + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'gap')",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(gap_spools, 2);
+    assert!(!crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+    let retained_cipher_bytes: i64 = sqlx::query_scalar(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_cipher_bytes, 0);
+    let object_writers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(object_writers, 0, "failed requests must never enter CAS");
+    pool.close().await;
 }
 
 #[tokio::test]

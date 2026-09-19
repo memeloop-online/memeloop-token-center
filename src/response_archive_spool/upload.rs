@@ -480,16 +480,21 @@ async fn upload(
         {
             return Err(AppError::Internal);
         }
+        *phase = "cas_promote";
+        let published = state
+            .archive
+            .promote_staged_text_to_cas(task.identity.tenant_id, &stored)
+            .await?;
         *phase = "terminal_bind";
         let bind_state = state.clone();
         let bind_task = task.clone();
         let bind_lease = attempt.lease.clone();
-        let bind_locator = stored.object_locator.clone();
+        let bind_locator = published.object_locator.clone();
         let bound = super::await_owned_unbounded(
             async move {
                 bind_state
                     .db
-                    .complete_response_archive_spool(&bind_task, &bind_lease, &bind_locator)
+                    .complete_response_archive_spool_cas(&bind_task, &bind_lease, &bind_locator)
                     .await
             },
             "response_spool_terminal_bind",

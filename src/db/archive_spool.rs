@@ -64,6 +64,39 @@ pub(crate) struct ArchiveSpoolChunk {
     pub byte_count: i64,
 }
 
+pub(crate) async fn gap_failed_archive_spools_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    tenant_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    for purpose in [
+        BufferedArchivePurpose::Request,
+        BufferedArchivePurpose::Response,
+    ] {
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+            purpose,
+            "UPDATE response_archive_spools SET state = 'gap', updated_at = $1, expires_at = $1, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $2 AND tenant_id = $3 AND state IN ('capturing', 'pending', 'uploading')",
+        )))
+        .bind(now)
+        .bind(request_id.to_string())
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+        if changed.rows_affected() == 1 {
+            emit_response_archive_transition_event_in_transaction(
+                tx,
+                purpose,
+                request_id,
+                now,
+                "archive_gap",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn insert_request_archive_gap_in_transaction(
     tx: &mut Transaction<'_, Any>,
     now: i64,
@@ -802,10 +835,10 @@ impl Database {
         let hint_now = archive_clock(&mut tx, self.backend).await?;
         let claim = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 399 AND COALESCE(r.error_code, '') = '' AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 399 AND COALESCE(r.error_code, '') = '' AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
             }
         };
         let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
@@ -940,6 +973,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn complete_response_archive_spool(
         &self,
         task: &ArchiveSpoolTask,
@@ -967,6 +1001,57 @@ impl Database {
             self.backend,
             staging,
             locator,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        let bound = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'bound', bound_locator = $1, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'uploading'")))
+            .bind(locator).bind(now).bind(task.identity.request_id.to_string())
+            .bind(task.identity.tenant_id.to_string()).bind(task.identity.reservation_id.to_string())
+            .execute(&mut *tx).await?;
+        if bound.rows_affected() != 1 {
+            return Ok(false);
+        }
+        emit_response_archive_transition_event_in_transaction(
+            &mut tx,
+            purpose,
+            task.identity.request_id,
+            now,
+            "archive_bound",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn complete_response_archive_spool_cas(
+        &self,
+        task: &ArchiveSpoolTask,
+        staging: &ArchiveStagingWriteLease,
+        locator: &str,
+    ) -> Result<bool, AppError> {
+        let purpose = task.purpose;
+        if staging.key.owner != ArchiveStagingOwner::ProxyRequest(task.identity.request_id)
+            || staging.key.purpose != purpose.staging()
+            || !crate::archive::is_tenant_cas_location(task.identity.tenant_id, locator)
+        {
+            return Ok(false);
+        }
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
+            return Ok(false);
+        };
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL AND response_object = $5")))
+            .bind(locator).bind(task.identity.request_id.to_string()).bind(task.identity.tenant_id.to_string())
+            .bind(task.identity.reservation_id.to_string()).bind(format!("gap://{}/{}", task.identity.request_id, purpose.as_str())).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if !super::archive_staging::publish_archive_staging_cas_in_transaction(
+            &mut tx,
+            self.backend,
+            staging,
         )
         .await?
         {
