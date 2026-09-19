@@ -6,8 +6,19 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { managedHandoffPayloads: Array<Record<string, unknown>> } }
+declare global { interface Window { managedHandoffPayloads: Array<Record<string, unknown>>; managedHandoffRouteReads: string[] } }
 window.managedHandoffPayloads = [];
+window.managedHandoffRouteReads = [];
+
+const pagedFocusRouteId = '00000000-0000-0000-0000-000000000101';
+
+function route(id: string, createdAt: number, publicModel = `model-${id.slice(-3)}`) {
+  return {
+    id, tenant_external_id: 'fixture-a', public_model: publicModel,
+    upstream_account_ids: ['browse-account'], upstream_model: publicModel, protocol: 'openai',
+    priority: 0, enabled: true, created_at: createdAt, updated_at: createdAt, grant_revision: 0,
+  };
+}
 
 const accounts = [
   { id: 'browse-account', tenant_external_id: 'fixture-a', name: 'Browse account', driver: 'fixture-provider', status: 'active', connection_method: 'api_key', config: {}, credential_generation: 1, created_at: 1, updated_at: 1 },
@@ -29,7 +40,16 @@ window.fetch = async (input, init) => {
   if (method !== 'GET') return json({ error: { message: 'unexpected mutation' } }, 404);
   if (url.pathname === '/internal/v1/provider-types') return json([{ id: 'fixture-provider', display_name: 'Fixture provider', protocols: ['openai', 'anthropic'] }]);
   if (url.pathname === '/internal/v1/upstreams') return json(accounts);
-  if (url.pathname === '/internal/v1/model-routes' || url.pathname === '/internal/v1/provider-groups' || url.pathname === '/internal/v1/route-groups' || url.pathname === '/internal/v1/keys') return json([]);
+  if (url.pathname === '/internal/v1/model-routes') {
+    window.managedHandoffRouteReads.push(url.search);
+    if (new URLSearchParams(location.search).get('paged-focus') !== '1') return json([]);
+    if (url.searchParams.has('before_created_at')) return json([route(pagedFocusRouteId, 1_800_000_000_000, 'catalog-model-paged')]);
+    return json(Array.from({ length: 100 }, (_, index) => route(
+      `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
+      1_800_000_000_100 - index,
+    )));
+  }
+  if (url.pathname === '/internal/v1/provider-groups' || url.pathname === '/internal/v1/route-groups' || url.pathname === '/internal/v1/keys') return json([]);
   if (url.pathname === '/internal/v1/upstream-models') return json({
     data: [{ id: 'catalog-model-fresh', protocol: 'anthropic', supported_account_count: 1, eligible_account_count: 1, complete_coverage: true, context_window: null, reservation_token_bound: null }],
     eligible_account_count: 1, unknown_account_count: 0, unsupported_account_count: 0, stale_account_count: 0,

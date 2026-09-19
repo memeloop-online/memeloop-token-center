@@ -6,7 +6,17 @@ import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import type { ManagedModelSyncResponse } from '../src/types.js';
 
 declare global {
-  interface Window { managedHandoffPayloads: Array<Record<string, unknown>> }
+  interface Window { managedHandoffPayloads: Array<Record<string, unknown>>; managedHandoffRouteReads: string[] }
+}
+
+const pagedFocusRouteId = '00000000-0000-0000-0000-000000000101';
+
+function pagedRoute(id: string, createdAt: number, publicModel = `model-${id.slice(-3)}`) {
+  return {
+    id, tenant_external_id: 'fixture-a', public_model: publicModel,
+    upstream_account_ids: ['browse-account'], upstream_model: publicModel, protocol: 'openai',
+    priority: 0, enabled: true, created_at: createdAt, updated_at: createdAt, grant_revision: 0,
+  };
 }
 
 async function openFixture() {
@@ -206,7 +216,7 @@ test('catalog route actions stay disabled after a failed route read and recover 
     } }));
     await page.route('**/internal/v1/model-routes**', async route => {
       routeReads += 1;
-      if (routeReads === 1) return route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'route list unavailable' } } });
+      if (routeReads <= 4) return route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'route list unavailable' } } });
       return route.fulfill({ json: [] });
     });
     await page.goto(url);
@@ -219,7 +229,7 @@ test('catalog route actions stay disabled after a failed route read and recover 
       const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === '添加路由');
       return Boolean(button && !button.disabled);
     });
-    assert.equal(routeReads, 2);
+    assert.equal(routeReads, 5, 'the first read exhausts bounded automatic retries before the explicit retry succeeds');
   } finally {
     await browser.close();
     await server.close();
@@ -268,7 +278,7 @@ test('catalog add performs a real cross-page handoff without expanding route aut
     await page.getByRole('button', { name: '查看目录（3）', exact: true }).click();
     await page.locator('.provider-catalog-models li', { hasText: 'catalog-model-fresh' }).getByRole('button', { name: '添加路由', exact: true }).click();
     await page.waitForURL('**/e2e/fixtures/managed-model-handoff.html');
-    await page.getByText('已从目录模型预填草稿，请确认后创建。', { exact: true }).waitFor();
+    await page.getByText('已根据目录模型预填草稿，确认后即可创建。', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-route-focus-v1')), null, 'a create handoff replaces stale route focus');
     await page.waitForFunction(() => {
       const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === '创建路由');
@@ -283,6 +293,53 @@ test('catalog add performs a real cross-page handoff without expanding route aut
     assert.deepEqual(payload.route_group_ids, []);
     assert.deepEqual(payload.granted_credential_ids, []);
     assert.equal(payload.protocol, 'anthropic');
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('catalog view handoff finds and focuses a route on the second cursor page', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    await page.route('**/internal/v1/upstreams/browse-account/models**', async route => route.fulfill({ json: {
+      account_id: 'browse-account', status: 'ready', credential_generation: 1,
+      last_attempt_at: 1_800_000_000_000, last_success_at: 1_800_000_000_000, expires_at: 1_800_086_400_000,
+      error_code: null,
+      models: [{ id: 'catalog-model-paged', protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null }],
+      disabled_models: [],
+    } }));
+    await page.route('**/internal/v1/model-routes**', async route => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      const requestUrl = new URL(route.request().url());
+      if (requestUrl.searchParams.has('before_created_at')) {
+        return route.fulfill({ json: [pagedRoute(pagedFocusRouteId, 1_800_000_000_000, 'catalog-model-paged')] });
+      }
+      return route.fulfill({ json: Array.from({ length: 100 }, (_, index) => pagedRoute(
+        `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
+        1_800_000_000_100 - index,
+      )) });
+    });
+    await page.goto(`${url}?handoff=paged-focus`);
+    await page.getByRole('button', { name: '查看目录（1）', exact: true }).click();
+    await page.getByRole('button', { name: '查看路由', exact: true }).click();
+    await page.waitForURL('**/e2e/fixtures/managed-model-handoff.html?paged-focus=1');
+
+    const focusedRoute = page.locator(`[data-route-id="${pagedFocusRouteId}"]`);
+    await focusedRoute.waitFor();
+    assert.equal(await focusedRoute.evaluate((element) => document.activeElement === element), true, 'the route selected from the catalog receives keyboard focus');
+    assert.equal(await focusedRoute.getAttribute('class'), 'route-focus');
+    const reads = await page.evaluate(() => window.managedHandoffRouteReads);
+    assert.equal(reads.length, 2, 'a focused handoff reads only as far as the target page');
+    const first = new URLSearchParams(reads[0]);
+    const second = new URLSearchParams(reads[1]);
+    assert.equal(first.get('tenant_external_id'), 'fixture-a');
+    assert.equal(first.get('limit'), '100');
+    assert.equal(first.has('before_id'), false);
+    assert.equal(second.get('tenant_external_id'), 'fixture-a');
+    assert.equal(second.get('limit'), '100');
+    assert.equal(second.get('before_created_at'), '1800000000001');
+    assert.equal(second.get('before_id'), '00000000-0000-0000-0000-000000000100');
   } finally {
     await browser.close();
     await server.close();

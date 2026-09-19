@@ -15,9 +15,10 @@ function Fixture() {
   const [lastAction, setLastAction] = useState('');
   const [routeCacheRevision, setRouteCacheRevision] = useState(0);
   const routeAction = (action: CatalogRouteAction) => {
-    if (new URLSearchParams(window.location.search).get('handoff') === '1') {
+    const handoff = new URLSearchParams(window.location.search).get('handoff');
+    if (handoff === '1' || handoff === 'paged-focus') {
       storeCatalogRouteAction('fixture-a', 'browse-account', action);
-      window.location.assign('/e2e/fixtures/managed-model-handoff.html');
+      window.location.assign(`/e2e/fixtures/managed-model-handoff.html${handoff === 'paged-focus' ? '?paged-focus=1' : ''}`);
       return;
     }
     setLastAction(JSON.stringify(action));

@@ -931,6 +931,8 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
+  const routePageSize = 100;
+  const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
@@ -959,7 +961,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   scopeRef.current = { token, tenant, writeTenant };
   const upstreamsRef = useRef(upstreams);
   upstreamsRef.current = upstreams;
-  const load = async () => {
+  const load = async (requestedFocusRouteId = '') => {
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -970,7 +972,28 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       // The table is the route page's primary content. Credential choices are
       // only used by an opened create/edit form, so never put their paged
       // read on this critical path.
-      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal });
+      const nextRoutes: ModelRouteView[] = [];
+      const visitedCursors = new Set<string>();
+      let beforeCreatedAt: number | undefined;
+      let beforeId: string | undefined;
+      for (let pageIndex = 0; pageIndex < maximumFocusedRoutePages; pageIndex += 1) {
+        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
+        if (beforeCreatedAt !== undefined && beforeId) {
+          routeQuery.set('before_created_at', String(beforeCreatedAt));
+          routeQuery.set('before_id', beforeId);
+        }
+        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: controller.signal });
+        nextRoutes.push(...page);
+        if (!requestedFocusRouteId || page.some((route) => route.id === requestedFocusRouteId) || page.length < routePageSize) break;
+        const last = page.at(-1);
+        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) throw new Error(t('providerCatalog.routesIncomplete'));
+        const cursor = `${last.created_at}\u0000${last.id}`;
+        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
+        visitedCursors.add(cursor);
+        beforeCreatedAt = last.created_at;
+        beforeId = last.id;
+        if (pageIndex === maximumFocusedRoutePages - 1) throw new Error(t('providerCatalog.routesIncomplete'));
+      }
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setError('');
     }
@@ -1012,9 +1035,9 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       setForm({ ...emptyRouteDraft, upstream_account_id: prefill.accountId, upstream_account_ids: [prefill.accountId], upstream_model: prefill.upstreamModel, public_model: prefill.publicModel, protocol: prefill.protocol });
       setWorkspaceOpen(true); setCredentialsRequested(true); setMessage(t('routes.prefilled'));
     }
-    const focus = consumeRouteFocus(writeTenant);
-    setFocusRouteId(canUsePrefill ? '' : focus ?? '');
-    void load();
+    const focus = canUsePrefill ? '' : consumeRouteFocus(writeTenant) ?? '';
+    setFocusRouteId(focus);
+    void load(focus);
     return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
