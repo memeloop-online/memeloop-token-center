@@ -5,8 +5,8 @@ titleTemplate: false
 
 hero:
   name: MTC Docs
-  text: Product documentation · 产品文档
-  tagline: Your browser language selects the matching edition. Use the links below to choose another language. · 页面将按浏览器语言打开，也可通过下方入口选择。
+  text: Product Documentation · 产品文档
+  tagline: Memeloop Token Center 文档中心 — your browser language is detected automatically; either button overrides it · 浏览器会自动选择语言，也可手动切换
   actions:
     - theme: brand
       text: 中文文档

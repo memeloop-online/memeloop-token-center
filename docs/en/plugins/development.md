@@ -1,6 +1,6 @@
 # Plugin development
 
-This page covers the minimum end-to-end loop for an MTC plugin: implement WIT exports → write `plugin.json` → package and sign as OCI → have an operator install and publish it. The authoritative interface is [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit) (current package version `memeloop:token-center@0.2.0`) and the [manifest schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json).
+This page covers the minimum end-to-end loop for an MTC plugin: implement WIT exports → write `plugin.json` → package and sign as OCI → submit it to the deployment's release process. The authoritative interface is [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit) (current package version `memeloop:token-center@0.2.0`) and the [manifest schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json).
 
 ## WIT ABI
 
@@ -67,9 +67,7 @@ Components never see credentials. A `stream=true` declaration, cross-origin path
 
 ## OAuth declaration
 
-A Provider can declare `oauth_adapter` (`api_version: "oauth-adapter-v1"`, `flow_kind: "cursor_pkce"`, with `login_url`, `poll_url`, and `refresh_url`), which the control plane executes through the versioned PKCE protocol. It can also declare `authorization_code_pkce` for the generic authorization-code flow. In both cases, tokens enter only the core encrypted credential table; components and plugin KV never receive tokens.
-
-Provider-specific onboarding fields belong in the provider `config_schema`. The start request supplies the validated `provider_config` plus an optional account `proxy_url`; the control plane encrypts the bounded login state and applies one transport choice to authorization polling, refresh and account traffic.
+A Provider can declare `oauth_adapter` (`api_version: "oauth-adapter-v1"`, `flow_kind: "cursor_pkce"`, with `login_url`, `poll_url`, and `refresh_url`), which the core executes through the versioned PKCE protocol. It can also declare `authorization_code_pkce` for the generic authorization-code flow. In both cases, tokens enter only the core encrypted credential table; components and plugin KV never receive tokens.
 
 ## Minimal manifest
 
@@ -128,15 +126,14 @@ oras push --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
   ghcr.io/example/token-center-plugins/example-policy:1.0.0 \
   plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
   plugin.wasm:application/vnd.wasm.content.layer.v1+wasm \
-  README.md:application/vnd.memeloop.token-center.plugin.asset.v1 \
-  assets/operator-ui.mjs:application/vnd.memeloop.token-center.plugin.asset.v1
+  README.md:application/vnd.memeloop.token-center.plugin.asset.v1
 digest="$(oras resolve ghcr.io/example/token-center-plugins/example-policy:1.0.0)"
 cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-policy@${digest}"
 ```
 
-Installation references must pin a digest (never a tag). The operator installation policy configures a trusted-repository allowlist and Cosign public keys; artifacts with a failed signature or an unallowlisted source cannot be installed.
+Installation references must pin a digest (never a tag). The deployment release policy should configure a trusted-repository allowlist and Cosign public keys; artifacts with a failed signature or an unallowlisted source do not enter the release process.
 
 ## Boundaries
 
-- The extension points listed here are the complete current ABI. Operator React modules use the signed, digest-addressed `component_v1` contract; streaming request hooks and plugin-created accounts/routes are outside this ABI.
-- Group routing uses the separate `group-routing-plugin` world; see [Group routing](routing.md). Operator interface extensions are described in [Operator UI](operator-ui.md).
+- The extension points listed here are the complete current ABI: streaming request hooks, arbitrary JavaScript UI, and plugin-created accounts/routes do not exist. Do not design around them as future features.
+- Group routing uses the separate `group-routing-plugin` world; see [Group routing](routing.md).

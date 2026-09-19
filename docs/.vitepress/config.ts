@@ -47,7 +47,7 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
   const entries = readdirSync(dir)
     .filter((entry) => !entry.startsWith('.'))
     .sort((a, b) => {
-      const order = ['index.md', 'getting-started.md', 'upstreams.md', 'routing.md', 'credentials.md', 'requests.md', 'api.md', 'development.md', 'operator-ui.md']
+      const order = ['index.md', 'getting-started.md', 'upstreams.md', 'routing.md', 'credentials.md', 'requests.md', 'api.md', 'development.md']
       const rank = (name: string) => order.includes(name) ? order.indexOf(name) : order.length
       return rank(a) - rank(b) || a.localeCompare(b)
     })
@@ -118,11 +118,13 @@ const localeBootstrap = `(() => {
       ? location.pathname.slice(base.length)
       : null;
 
-    if (relativePath === '' || relativePath === 'index.html') {
+    const rootWithoutTrailingSlash = base.endsWith('/') ? base.slice(0, -1) : base;
+    if (location.pathname === rootWithoutTrailingSlash || relativePath === '' || relativePath === 'index.html') {
       const savedLocale = localStorage.getItem(localeKey);
       const locale = savedLocale === 'zh' || savedLocale === 'en'
         ? savedLocale
-        : navigator.languages.some((language) => language.toLowerCase().startsWith('zh'))
+        : (navigator.languages?.length ? navigator.languages : [navigator.language])
+          .some((language) => language.toLowerCase().startsWith('zh'))
           ? 'zh'
           : 'en';
       location.replace(base + locale + '/' + location.search + location.hash);
@@ -141,8 +143,8 @@ export default defineConfig({
   title: 'Memeloop Token Center',
   description: 'Memeloop Token Center product documentation',
   cleanUrls: true,
-  lastUpdated: true,
   appearance: true,
+  lastUpdated: true,
   srcExclude: computeSrcExclude(),
 
   head: [

@@ -13,7 +13,7 @@ export default {
         const locale = path.match(/^\/(zh|en)(?:\/|$)/)?.[1]
         if (!locale) return
         try {
-          localStorage.setItem('mtc-docs-locale', locale)
+          window.localStorage.setItem('mtc-docs-locale', locale)
         } catch {
           // Navigation continues when browser storage is unavailable.
         }
