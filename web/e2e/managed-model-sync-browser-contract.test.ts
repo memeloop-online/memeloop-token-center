@@ -278,7 +278,11 @@ test('catalog add performs a real cross-page handoff without expanding route aut
     await page.getByRole('button', { name: '查看目录（3）', exact: true }).click();
     await page.locator('.provider-catalog-models li', { hasText: 'catalog-model-fresh' }).getByRole('button', { name: '添加路由', exact: true }).click();
     await page.waitForURL('**/e2e/fixtures/managed-model-handoff.html');
-    await page.getByText('已根据目录模型预填草稿，确认后即可创建。', { exact: true }).waitFor();
+    const workspace = page.getByRole('region', { name: '创建模型路由', exact: true });
+    await workspace.getByText('已根据目录模型预填草稿，确认后即可创建。', { exact: true }).waitFor();
+    assert.equal(await workspace.getByLabel('公开模型 · 必填', { exact: true }).inputValue(), 'catalog-model-fresh');
+    assert.equal(await workspace.getByLabel('上游模型', { exact: true }).inputValue(), 'catalog-model-fresh');
+    await workspace.getByText('Browse account', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-route-focus-v1')), null, 'a create handoff replaces stale route focus');
     await page.waitForFunction(() => {
       const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === '创建路由');
@@ -287,6 +291,8 @@ test('catalog add performs a real cross-page handoff without expanding route aut
     await page.getByRole('button', { name: '创建路由', exact: true }).click();
     await page.waitForFunction(() => window.managedHandoffPayloads.length === 1);
     const payload = await page.evaluate(() => window.managedHandoffPayloads[0]);
+    assert.equal(payload.public_model, 'catalog-model-fresh');
+    assert.equal(payload.upstream_model, 'catalog-model-fresh');
     assert.deepEqual(payload.upstream_account_ids, ['browse-account']);
     assert.deepEqual(payload.included_provider_group_ids, []);
     assert.deepEqual(payload.excluded_provider_group_ids, []);
