@@ -2121,7 +2121,9 @@ async fn execute_component_provider(
             return finish_component_provider_failure(&request, "provider_unsafe_target").await;
         }
     };
-    let outbound_http = match network::client_for_config_url(
+    // The component chooses the HTTP method. Treat every prepared operation
+    // as non-replayable unless a future adapter contract proves otherwise.
+    let outbound_http = match network::client_for_config_url_no_retry(
         &request.state.http,
         &target,
         config,

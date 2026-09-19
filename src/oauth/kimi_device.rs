@@ -120,7 +120,7 @@ async fn post(
     form: &[(&str, &str)],
     allow_test_loopback: bool,
 ) -> Result<Value, AppError> {
-    let client = network::client_for_config_url(
+    let client = network::client_for_config_url_no_retry(
         http,
         endpoint,
         &json!({"network_scope":"public"}),
@@ -512,7 +512,13 @@ fn issued_credential(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
@@ -530,6 +536,61 @@ mod tests {
             &[("client_id", kimi::CLIENT_ID)],
             false,
         ));
+    }
+
+    #[tokio::test]
+    async fn device_and_token_post_transport_does_not_replay_an_accepted_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tokio::pin!(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let read = stream.read(&mut chunk).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(kimi::CLIENT_ID.len()).any(|window| {
+                                window == kimi::CLIENT_ID.as_bytes()
+                            }) {
+                                break;
+                            }
+                        }
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                }
+            }
+        });
+        let error = post(
+            &crate::build_http_client().unwrap(),
+            &format!("http://{address}/device"),
+            None,
+            "fixture-device",
+            &[("client_id", kimi::CLIENT_ID)],
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Upstream(_)));
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "device authorization and token polling share a non-replayable POST transport"
+        );
     }
 
     #[tokio::test]

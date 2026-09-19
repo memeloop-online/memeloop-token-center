@@ -233,7 +233,7 @@ async fn refresh_at(
     request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
     validate_credential(credential)?;
-    let client = network::client_for_config_url(
+    let client = network::client_for_config_url_no_retry(
         http,
         endpoint,
         &json!({"network_scope": "public"}),
@@ -323,12 +323,16 @@ async fn refresh_with_client(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use super::*;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
+        sync::oneshot,
     };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -502,6 +506,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_does_not_replay_after_the_server_accepts_the_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            tokio::pin!(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let read = stream.read(&mut chunk).await.unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(b"refresh_token=fixture-refresh".len()).any(|window| {
+                                window == b"refresh_token=fixture-refresh"
+                            }) {
+                                break;
+                            }
+                        }
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                }
+            }
+        });
+        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let error = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &credential("fixture-device"),
+            true,
+            &format!("http://{address}/token"),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Upstream(_)));
+        assert!(guard.0.load(Ordering::SeqCst));
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an accepted refresh-token POST has an unknown outcome and must not be replayed"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_request_uses_socks5h_remote_dns_and_preserves_account_proxy() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -566,7 +626,7 @@ mod tests {
         // `reqwest::Proxy::all` after validating the fixed Kimi destination.
         // Keep this hostname absent from local DNS so this request can succeed
         // only when the SOCKS5H client sends the original name to the proxy.
-        let client = crate::build_explicit_proxy_http_client(&proxy_url, &[]).unwrap();
+        let client = crate::build_no_retry_http_client(Some(&proxy_url), &[]).unwrap();
         let refreshed = refresh_with_client(
             &client,
             &current,

@@ -965,7 +965,7 @@ async fn refresh_managed_upstream_oauth_impl(
                     )
                     .await?
                 } else {
-                    network::client_for_url(
+                    network::client_for_url_no_retry(
                         &state.http,
                         &refresh_url,
                         refresh_scope,

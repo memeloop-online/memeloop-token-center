@@ -16,7 +16,15 @@ use memeloop_token_center::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpListener,
+    sync::{oneshot, watch},
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{
@@ -203,28 +211,22 @@ async fn direct_only_provider_accepts_its_schema_declared_api_key() {
     assert_eq!(account["connection_method"], "api_key");
     assert!(!account.to_string().contains("direct-provider-secret"));
 }
-#[tokio::test]
-async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_secrets_billing_and_archive()
- {
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/vendor/infer"))
-        .and(matches_header("x-plugin-shape", "buffered-v1"))
-        .and(body_json(json!({
-            "prompt": "from-component",
-            "model": "vendor-model"
-        })))
-        .respond_with(ResponseTemplate::new(207).set_body_json(json!({
-            "vendor_answer": "non-openai-shape"
-        })))
-        .expect(2)
-        .mount(&mock)
-        .await;
 
+struct ComponentProviderFixture {
+    _directory: tempfile::TempDir,
+    state: AppState,
+    key: String,
+    account_id: Uuid,
+}
+
+async fn component_provider_fixture(
+    base_url: &str,
+    database_name: &str,
+) -> ComponentProviderFixture {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("component-provider.db").display()
+        directory.path().join(database_name).display()
     );
     let mut config = Config::for_test(database_url);
     config.plugin_dir = Some("examples/plugins".to_owned());
@@ -261,7 +263,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
                 tenant_external_id: "component-provider-tenant".into(),
                 name: "same-account-api-or-oauth".into(),
                 driver: "example-oauth-http".into(),
-                config: json!({"base_url": mock.uri(), "network_scope": "public"}),
+                config: json!({"base_url": base_url, "network_scope": "public"}),
                 credential: UpstreamCredential::ApiKey {
                     value: "component-api-secret".into(),
                     header: "authorization".into(),
@@ -319,8 +321,41 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         )
         .await
         .unwrap();
+    ComponentProviderFixture {
+        _directory: directory,
+        state,
+        key: issued.key,
+        account_id: account.id,
+    }
+}
 
-    let first = call_component_provider(&state, &issued.key).await;
+#[tokio::test]
+async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_secrets_billing_and_archive()
+ {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/vendor/infer"))
+        .and(matches_header("x-plugin-shape", "buffered-v1"))
+        .and(body_json(json!({
+            "prompt": "from-component",
+            "model": "vendor-model"
+        })))
+        .respond_with(ResponseTemplate::new(207).set_body_json(json!({
+            "vendor_answer": "non-openai-shape"
+        })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let ComponentProviderFixture {
+        _directory,
+        state,
+        key: issued_key,
+        account_id,
+    } = component_provider_fixture(&mock.uri(), "component-provider.db").await;
+    let pepper = state.config.key_pepper.as_bytes();
+
+    let first = call_component_provider(&state, &issued_key).await;
     assert_eq!(first.0, StatusCode::OK, "{}", first.1);
     // The real component response expands its tiny upstream body. Its adapter
     // maximum, not the upstream Content-Length, must cover normalization.
@@ -338,7 +373,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
     let rotated = state
         .db
         .rotate_upstream_credential(
-            account.id,
+            account_id,
             UpstreamCredential::ApiKey {
                 value: "component-api-secret-rotated".into(),
                 header: "authorization".into(),
@@ -349,10 +384,10 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         )
         .await
         .unwrap();
-    assert_eq!(rotated.id, account.id);
+    assert_eq!(rotated.id, account_id);
     assert_eq!(rotated.connection_method, "api_key");
 
-    let second = call_component_provider(&state, &issued.key).await;
+    let second = call_component_provider(&state, &issued_key).await;
     assert_eq!(second.0, StatusCode::OK);
     assert_eq!(second.1["usage"]["prompt_tokens"], 7);
 
@@ -383,7 +418,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
 
     let key = state
         .db
-        .authenticate_key(&issued.key, pepper)
+        .authenticate_key(&issued_key, pepper)
         .await
         .unwrap();
     let requests = state.db.list_requests(key.key_id, 10).await.unwrap();
@@ -402,7 +437,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             StatsFilter {
                 from_created_at: Some(unix_millis().saturating_sub(60_000)),
                 to_created_at: Some(unix_millis().saturating_add(1)),
-                upstream_account_id: Some(account.id),
+                upstream_account_id: Some(account_id),
                 ..StatsFilter::default()
             },
         )
@@ -452,6 +487,79 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
+}
+
+#[tokio::test]
+async fn component_provider_does_not_replay_after_the_server_accepts_the_prepared_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        tokio::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request
+                            .windows(b"{\"prompt\":\"from-component\",\"model\":\"vendor-model\"}".len())
+                            .any(|window| {
+                                window == b"{\"prompt\":\"from-component\",\"model\":\"vendor-model\"}"
+                            })
+                        {
+                            break;
+                        }
+                    }
+                    assert!(request.starts_with(b"POST /vendor/infer "));
+                    server_attempts.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            }
+        }
+    });
+    let ComponentProviderFixture {
+        _directory,
+        state,
+        key,
+        account_id: _,
+    } = component_provider_fixture(&base_url, "component-provider-disconnect.db").await;
+    let response = call_component_provider(&state, &key).await;
+    assert_eq!(response.0, StatusCode::BAD_GATEWAY, "{}", response.1);
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a component-prepared method is not replayable after the server accepts it"
+    );
+
+    let authenticated = state
+        .db
+        .authenticate_key(&key, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let requests = state
+        .db
+        .list_requests(authenticated.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].status_code, Some(502));
+    assert_eq!(
+        requests[0].error_code.as_deref(),
+        Some("upstream_connection")
+    );
 }
 
 async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) {
