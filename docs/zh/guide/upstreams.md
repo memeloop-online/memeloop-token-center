@@ -2,90 +2,22 @@
 
 ![上游服务列表中的账号、路由、可用性与额度刷新入口；身份信息已替换。](/images/providers.png)
 
-上游账户（upstream account）是 MTC 与 AI 供应商之间的连接单元。它有稳定的 `account_id`、供应商驱动 `driver`、连接配置 `config` 和一份当前加密的凭证代。
+上游账户是 MTC 连接模型供应商的配置单元。部署管理员负责连接和授权，客户端通过公开模型名使用已开放的能力。
 
-## 账户模型
+## 连接模型
 
-- `api_key`、`oauth`、`none` 是**连接方式**。重新授权时，账户标识、路由和历史归属保持不变。
-- 供应商密钥与 OAuth 令牌加密存储，账户接口不返回这些值；`config` 中不含凭证材料。
-- 每个账户维护一份按凭证代同步的模型目录（`POST /internal/v1/upstreams/{account_id}/models/sync`），路由创建时用目录校验公开/上游模型兼容性。
-- 常用管理接口：`GET/POST /internal/v1/upstreams`、`GET/PUT /internal/v1/upstreams/{account_id}`、`GET /internal/v1/upstreams/{account_id}/health`、`GET /internal/v1/upstream-availability`。
+上游可以使用 API Key、OAuth 或供应商支持的其他连接方式。MTC 保存连接状态，并为每个账户维护可用于路由校验的模型目录。
 
-## 同步模型与价格
+账户的公开信息包括连接状态、可用模型、路由关系和有限的额度观测。凭证材料不会出现在客户端请求或公开页面中。
 
-在上游账户详情或编辑页选择「同步模型及价格」。MTC 使用该账户的连接配置读取模型目录，再从已配置的价格源匹配价格，分别展示两个步骤的结果。价格源暂未收录的模型会列为待补充，可在模型计费中填写。
+## 模型目录与路由
 
-手动同步与账户后台刷新使用同一个服务端协调器。成功目录先提交，再自动同步 USD 价格；价格源故障不会回滚模型可用性，也不会覆盖人工定价。同步响应通过 `price_sync` 单独报告价格状态（`ready`、`partial`、`error` 或 `skipped`）。目录接口在 `disabled_models` 中保留已消失模型及其停用时间，`models` 仍只包含当前可选模型。临时目录读取失败不会修改这两个列表。
+模型目录用于确认公开模型名与供应商模型之间的兼容性。管理员完成同步和路由配置后，客户端只需调用 `/v1/models` 与已授权的公开模型名。
 
-兼容性说明：这些字段属于 internal v1 响应的增量扩展。严格拒绝未知响应字段的客户端需要随本次版本一起更新校验 schema；原有可选模型列表语义不变。
+上游不可用时，路由可以根据健康状态选择其他已授权候选。正在执行的请求保留入场时的候选快照。
 
-目录新增的模型会进入路由模型选择器。已被目录确认的模型随后移除时，对应账户暂停参与该模型的路由；模型重新出现后恢复参与。手动设置的路由启停状态保持原样。仅人工配置、从未出现在目录中的私有模型继续采用自定义选择。
+## 额度与可用性
 
-新模型的公开名称、账户选择和客户端授权由路由配置管理。
+额度观测以供应商提供的窗口和时间为准。未知数量保持未知，不会显示成零或满额。额度观测是只读信息，不会自动刷新凭证或发起模型请求。
 
-## OAuth 登录
-
-OAuth 账户通过管理端登录流程创建，令牌加密存储：
-
-| 供应商 | 流程 | 端点 |
-| --- | --- | --- |
-| Codex / Kimi / Copilot / Cursor | 设备码（start + poll） | `POST /internal/v1/oauth/{provider}/start`、`POST /internal/v1/oauth/{provider}/poll` |
-| Claude | 授权码（start + complete） | `POST /internal/v1/oauth/claude/start`、`POST /internal/v1/oauth/claude/complete` |
-| 插件声明的供应商 | 通用授权码 PKCE | `POST /internal/v1/oauth/authorization-code/start`、`.../complete` |
-| 插件适配器 | PKCE 轮询 | `POST /internal/v1/oauth/provider-adapter/start`、`.../poll` |
-
-登录相关的管理接口需要 `oauth:write`。既有账户支持 `POST /internal/v1/upstreams/{account_id}/oauth/refresh` 与 `POST /internal/v1/upstreams/{account_id}/oauth/disconnect`。
-
-OAuth start 请求可携带 `proxy_url`。供应商登录需要指定网络出口时，填写私网 IP 字面值形式的 `socks5h://` 地址；直连环境可留空。所选网络路径随登录会话加密保存，并由账户继续用于轮询或换票、令牌刷新、撤销与运行时流量。重新授权沿用账户当前设置。插件适配器通过供应商 `config_schema` 声明表单字段；完成校验的 `provider_config` 进入有界加密登录会话，授权完成后成为账户配置。
-
-## 账户代理
-
-账户可以配置私有 SOCKS5 代理。代理 URL（含可选的代理用户名密码）加密存储，通过专用管理接口查看和修改：
-
-- 普通账户元数据只暴露 `has_proxy`、代理 scheme、远程 DNS 语义、不含主机的标签和指纹，用于界面展示与识别。
-- 需要查看或复制完整代理 URL 时，使用显式管理接口（需要 `providers:write`、全局运营权限并校验租户归属）：
-
-```bash
-curl "https://mtc.example.com/internal/v1/upstreams/0193f2ab-7c1e-7000-8000-0000000000a1/transport-proxy?tenant_external_id=default" \
-  -H "Authorization: Bearer mts_example_service_token"
-```
-
-该 GET 返回完整代理 URL、网络范围和编辑所需的版本字段，响应为 `Cache-Control: private, no-store`。`PUT` 同路径携带当前版本可修改代理，保留账户的 API 密钥与 OAuth 令牌。规则要点：
-
-- `socks5`：目标与代理由 MTC 解析并固定；`socks5h`：供应商主机名交给代理解析，仅允许安全私网 IP 字面值代理。
-- HTTP(S) 代理、公网 SOCKS 和主机名形式的 `socks5h` 一律拒绝；元数据地址等特殊地址永远被阻断。
-
-## 额度读取
-
-`GET /internal/v1/upstreams/{account_id}/quota`（需要 `providers:read`）按账户读取供应商侧额度快照，用于运营观测与（可选的）路由插件输入：
-
-供应商列表的“刷新全部”使用 `POST /internal/v1/upstreams/quota/batch`，只提交当前页账号 ID。服务端从认证服务与加载出的账号归属推导租户，一条数据库语句加载全部当前账号/凭据，并以最多 3 路并发复用同一缓存、按账号 singleflight 和全局额度读取 permits。响应逐账号返回，因此单个账号失败时会保留界面上的旧快照，其他成功账号仍正常更新；批量读取绝不会执行额度重置。
-
-- 快照缓存 30 秒并带并发合并；读取失败后最多保留 5 分钟的有界旧值，失败不会把旧证据伪装成新值。
-- 运营端刷新控件会显式请求 `fresh=true`，并以 `trigger=manual` 或 `trigger=bulk` 标记动作；这会跳过仍在有效期内的缓存，同时保留与更新中的读取安全合并的能力。
-- 返回按**窗口**组织：每个窗口包含标识、周期（如 5 小时或每周）、重置时间、已用/剩余比例与是否耗尽。窗口信息来自供应商响应的显式字段——未知的量保持未知，绝不显示成 0 或满额。
-- `unsupported` 表示该账户类型没有额度适配器，不等于「无限额度」。
-- 额度读取不刷新令牌、不发起模型请求、不消费重置额度。
-
-当前适配范围：
-
-| 供应商 | 读取内容 |
-| --- | --- |
-| Codex（原生 OAuth） | 用量窗口、重置时间、重置额度余额 |
-| Kimi（原生 OAuth） | 用量窗口比例与周期 |
-| Google Antigravity（插件 OAuth） | 按 group/bucket 的剩余比例与显式窗口元数据 |
-| Cursor（原生 OAuth） | 只读的模型列表、当前账期用量与计划信息。**MTC 不提供 Cursor 推理能力**：Cursor 账户只能用于上述只读读取，不能作为模型请求的上游。 |
-
-## 额度重置
-
-部分供应商提供「重置额度」积分。MTC 把它建模为显式二次确认操作，任何读取都不会隐式触发：
-
-1. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`（`Idempotency-Key`）：基于新鲜的只读观测创建操作，返回一次性 `confirmation_token`（120 秒有效）——此步不消耗任何额度。
-2. `POST /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/confirm`：凭确认令牌真正向供应商发起重置。
-3. `POST /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile`：重置后重新核对观测；`GET /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}` 可查询操作状态。
-
-准备、确认、对账各有独立的幂等键；未决操作会阻止对同一账户的再次 prepare。
-
-## 删除与退役
-
-删除账户前用 `GET /internal/v1/upstreams/{account_id}/deletion-readiness` 检查是否仍有路由引用。账户被停用后历史请求归属保持不变。
+不同供应商提供的数据范围不同；客户端应以请求结果和部署展示的当前状态为准。

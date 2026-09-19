@@ -8,6 +8,11 @@ const docsDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const LOCALES = ['zh', 'en'] as const
 type Locale = (typeof LOCALES)[number]
 
+const EXCLUDED_SITE_PAGES = new Set([
+  'zh/plugins/operator-ui.md',
+  'en/plugins/operator-ui.md'
+])
+
 // Directories that are part of the VitePress site rather than legacy content.
 const SITE_DIRS = new Set([...LOCALES, 'public', '.vitepress', 'node_modules'])
 
@@ -25,6 +30,7 @@ function computeSrcExclude(): string[] {
       patterns.push(entry)
     }
   }
+  patterns.push(...EXCLUDED_SITE_PAGES)
   return patterns
 }
 
@@ -55,6 +61,8 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
   const items: DefaultTheme.SidebarItem[] = []
   for (const entry of entries) {
     const full = path.join(dir, entry)
+    const relative = path.relative(docsDir, full).split(path.sep).join('/')
+    if (EXCLUDED_SITE_PAGES.has(relative)) continue
     if (statSync(full).isDirectory()) {
       const children = sidebarItems(full, `${linkPrefix}${entry}/`)
       if (children.length === 0) continue
@@ -118,11 +126,13 @@ const localeBootstrap = `(() => {
       ? location.pathname.slice(base.length)
       : null;
 
-    if (relativePath === '' || relativePath === 'index.html') {
+    const rootWithoutTrailingSlash = base.endsWith('/') ? base.slice(0, -1) : base;
+    if (location.pathname === rootWithoutTrailingSlash || relativePath === '' || relativePath === 'index.html') {
       const savedLocale = localStorage.getItem(localeKey);
       const locale = savedLocale === 'zh' || savedLocale === 'en'
         ? savedLocale
-        : navigator.languages.some((language) => language.toLowerCase().startsWith('zh'))
+        : (navigator.languages?.length ? navigator.languages : [navigator.language])
+          .some((language) => language.toLowerCase().startsWith('zh'))
           ? 'zh'
           : 'en';
       location.replace(base + locale + '/' + location.search + location.hash);
@@ -141,8 +151,8 @@ export default defineConfig({
   title: 'Memeloop Token Center',
   description: 'Memeloop Token Center product documentation',
   cleanUrls: true,
-  lastUpdated: true,
   appearance: true,
+  lastUpdated: true,
   srcExclude: computeSrcExclude(),
 
   head: [

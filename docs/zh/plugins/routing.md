@@ -9,14 +9,11 @@ interface group-routing-v1 {
 }
 ```
 
-## 运营配置
+## 宿主如何使用策略
 
-Provider Group 与 Route Group 编辑器中出现「原生 / 已安装策略」选择器、插件配置表单和整数优先级：
+组路由策略只处理宿主已经授权的候选。部署可以为分组选择原生策略或已安装的插件策略，并为多个命中分组提供稳定优先级；选择策略本身不会授予新的模型或账户权限。
 
-- `PUT /internal/v1/provider-groups/{group_id}/routing-strategy`（Route Group 同形）要求 `tenant_external_id`、`expected_updated_at`、`expected_strategy_version` 与 `routing_priority`；`routing_strategy` 传 `null` 恢复原生策略。冲突返回 409 并刷新版本，操作员显式重试；即使清除策略版本号也会递增。
-- Provider Group 只有被路由显式 include 才参与；Route Group 仍是授权集合，选择策略不会带来授权。
-- 多个分组命中时优先级高者先执行，同优先级按组 UUID 升序；配置了策略的分组候选先于未配置的原生候选。
-- 策略代码缺失、无效或 trap 时，该分组回退为原生处理（请求不受影响，只记录低基数诊断）。
+策略代码缺失、无效或 trap 时，宿主回退到原生处理，请求继续使用核心的授权、健康和预算边界。
 
 ## plan：规划
 

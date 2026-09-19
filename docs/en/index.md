@@ -27,13 +27,13 @@ features:
 
 ## Explore the product
 
-Three live product views show how MTC connects configuration with day-to-day operations.
+Three real product views show how MTC connects model access with daily requests and usage.
 
 <ProductGallery locale="en" />
 
-## Start with the workflow that fits your role
+## Start with the workflow that fits your team
 
-- **Operators:** [connect upstream accounts](/en/guide/upstreams), [build model routes](/en/guide/routing), and [issue client credentials](/en/guide/credentials).
+- **Deployment teams:** [connect upstream accounts](/en/guide/upstreams), [build model routes](/en/guide/routing), and [issue client credentials](/en/guide/credentials).
 - **Application teams:** use the [API guide](/en/guide/api) and inspect activity in [Requests](/en/guide/requests).
 - **Plugin developers:** browse the [extension model](/en/plugins/) and follow the [development guide](/en/plugins/development).
 

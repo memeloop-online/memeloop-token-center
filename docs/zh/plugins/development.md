@@ -1,6 +1,6 @@
 # 插件开发
 
-本文覆盖开发一个 MTC 插件的最小闭环：实现 WIT 导出 → 编写 `plugin.json` → OCI 打包签名 → 交由运营者安装发布。接口的权威定义是 [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit)（当前包版本 `memeloop:token-center@0.2.0`）与[清单 Schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json)。
+本文覆盖开发一个 MTC 插件的最小闭环：实现 WIT 导出 → 编写 `plugin.json` → OCI 打包与签名 → 提交到部署的发布流程。接口的权威定义是 [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit)（当前包版本 `memeloop:token-center@0.2.0`）与[清单 Schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json)。
 
 ## WIT ABI
 
@@ -67,9 +67,7 @@ record metering {
 
 ## OAuth 声明
 
-Provider 可以声明 `oauth_adapter`（`api_version: "oauth-adapter-v1"`，`flow_kind: "cursor_pkce"`，提供 `login_url`、`poll_url`、`refresh_url`），由控制面执行版本化 PKCE 协议；也可以声明 `authorization_code_pkce` 使用通用授权码流程。两种方式下 token 都只进入核心加密凭证表，组件与插件 KV 不接触 token。
-
-供应商接入字段统一放入该供应商的 `config_schema`。start 请求提交校验后的 `provider_config`，并可携带账户 `proxy_url`；控制面加密保存有界登录状态，同一网络路径覆盖授权轮询、刷新与账户运行流量。
+Provider 可以声明 `oauth_adapter`（`api_version: "oauth-adapter-v1"`，`flow_kind: "cursor_pkce"`，提供 `login_url`、`poll_url`、`refresh_url`），由核心执行版本化 PKCE 协议；也可以声明 `authorization_code_pkce` 使用通用授权码流程。两种方式下 token 都只进入核心加密凭证表，组件与插件 KV 不接触 token。
 
 ## 最小清单
 
@@ -128,15 +126,14 @@ oras push --artifact-type application/vnd.memeloop.token-center.plugin.v1 \
   ghcr.io/example/token-center-plugins/example-policy:1.0.0 \
   plugin.json:application/vnd.memeloop.token-center.plugin.manifest.v1+json \
   plugin.wasm:application/vnd.wasm.content.layer.v1+wasm \
-  README.md:application/vnd.memeloop.token-center.plugin.asset.v1 \
-  assets/operator-ui.mjs:application/vnd.memeloop.token-center.plugin.asset.v1
+  README.md:application/vnd.memeloop.token-center.plugin.asset.v1
 digest="$(oras resolve ghcr.io/example/token-center-plugins/example-policy:1.0.0)"
 cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-policy@${digest}"
 ```
 
-安装引用必须固定到 digest（不使用 tag）。运营侧的安装策略会配置可信仓库 allowlist 与 Cosign 公钥，验签失败或来源不在 allowlist 的制品无法安装。
+安装引用必须固定到 digest（不使用 tag）。部署的发布策略应配置可信仓库 allowlist 与 Cosign 公钥，验签失败或来源不在 allowlist 的制品不会进入发布流程。
 
 ## 边界说明
 
-- 本文列出的扩展点构成当前 ABI。Operator React 模块使用经过签名、按摘要寻址的 `component_v1` 契约；流式请求钩子与插件自创账户/路由不在该 ABI 中。
-- 组路由使用独立的 `group-routing-plugin` world，见[组路由](routing.md)；Operator 界面扩展见[Operator UI](operator-ui.md)。
+- 本文列出的扩展点是当前 ABI 的全部：流式请求钩子、任意 JavaScript UI、插件自创账户/路由等都不存在，请勿按「将来会有」设计。
+- 组路由使用独立的 `group-routing-plugin` world，见[组路由](routing.md)。

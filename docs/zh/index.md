@@ -27,13 +27,13 @@ features:
 
 ## 探索产品界面
 
-三个真实产品视图，呈现从配置到日常运营的完整动线。
+三个真实产品视图，呈现模型接入、请求和用量之间的使用动线。
 
 <ProductGallery locale="zh" />
 
 ## 从你的工作入口开始
 
-- **运营人员：** [连接上游账号](/zh/guide/upstreams)、[编排模型路由](/zh/guide/routing)、[签发客户端凭据](/zh/guide/credentials)。
+- **部署团队：** [连接上游账号](/zh/guide/upstreams)、[编排模型路由](/zh/guide/routing)、[签发客户端凭据](/zh/guide/credentials)。
 - **应用团队：** 通过 [API 指南](/zh/guide/api)接入服务，在[请求视图](/zh/guide/requests)中查看运行情况。
 - **插件开发者：** 了解[扩展模型](/zh/plugins/)，跟随[开发指南](/zh/plugins/development)构建插件。
 
