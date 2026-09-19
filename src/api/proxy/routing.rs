@@ -2,6 +2,7 @@ use super::*;
 use crate::db::UpstreamFailureKind;
 
 mod admission;
+mod anthropic;
 mod candidates;
 mod clock;
 mod codex;
@@ -97,21 +98,29 @@ pub(super) fn plan_proxy_route(
     // native Responses semantics; do not reuse the Kimi rewrite for them.
     let bridge_multi_agent = matches!(protocol, Protocol::OpenAiResponses)
         && codex_multi_agent_v2_request
-        && responses_via_chat_dialect.is_some()
         && state
             .providers
             .supports_codex_multi_agent_v2(&route.driver, &route.config);
-    let prepare_plaintext_collaboration = matches!(protocol, Protocol::OpenAiResponses)
-        && codex_multi_agent_v2_request
-        && bridge_multi_agent;
-    let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
-        &route,
-        protocol,
-        request_json,
-        prepare_plaintext_collaboration,
-        bridge_multi_agent,
-        responses_via_chat_dialect,
-    )?;
+    let responses_via_anthropic = matches!(protocol, Protocol::OpenAiResponses)
+        && state
+            .providers
+            .supports_responses_via_anthropic_messages_v1(&route.driver);
+    let (mut forwarded_json, responses_chat, responses_anthropic) =
+        if responses_via_anthropic {
+            let (forwarded, context) =
+                anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
+            (forwarded, None, Some(context))
+        } else {
+            let (forwarded, context) = kimi::prepare_forwarded_request(
+                &route,
+                protocol,
+                request_json,
+                bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                responses_via_chat_dialect,
+            )?;
+            (forwarded, context, None)
+        };
     let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
         &route,
         protocol,
@@ -119,7 +128,11 @@ pub(super) fn plan_proxy_route(
         passthrough_responses,
         &mut forwarded_json,
     )?;
-    let upstream_path = upstream_path_for(protocol, compact_v2_bridge, responses_chat.is_some());
+    let upstream_path = if responses_anthropic.is_some() {
+        Protocol::AnthropicMessages.path()
+    } else {
+        upstream_path_for(protocol, compact_v2_bridge, responses_chat.is_some())
+    };
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,
@@ -156,6 +169,8 @@ pub(super) fn plan_proxy_route(
         None => inject_controlled_output_ceiling(
             if responses_chat.is_some() {
                 Protocol::OpenAiChat
+            } else if responses_anthropic.is_some() {
+                Protocol::AnthropicMessages
             } else {
                 protocol
             },
@@ -210,6 +225,7 @@ pub(super) fn plan_proxy_route(
         upstream_path,
         compact_v2_bridge,
         wrap_compact_as_sse,
+        responses_anthropic,
     })
 }
 
@@ -342,6 +358,7 @@ pub(super) async fn materialize_proxy_route(
         upstream_path: planned.upstream_path,
         compact_v2_bridge: planned.compact_v2_bridge,
         wrap_compact_as_sse: planned.wrap_compact_as_sse,
+        responses_anthropic: planned.responses_anthropic,
     })
 }
 

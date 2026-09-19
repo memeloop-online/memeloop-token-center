@@ -96,6 +96,12 @@ pub(super) async fn send_reqwest_proxy_route(
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
         || (crate::provider::is_new_api_driver(&route.route.driver)
+    let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
+        && route.upstream_stream)
+        || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
+            && matches!(protocol, Protocol::OpenAiResponses)
+            && route.upstream_stream)
+        || (crate::provider::is_new_api_driver(&route.route.driver)
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
     {
@@ -128,7 +134,7 @@ pub(super) async fn send_reqwest_proxy_route(
             .header("Editor-Version", &product)
             .header("Editor-Plugin-Version", &product);
     }
-    if protocol.is_anthropic() {
+    if protocol.is_anthropic() || route.responses_anthropic.is_some() {
         request = crate::api::anthropic::apply_request_headers(
             request,
             headers,
@@ -155,6 +161,13 @@ pub(super) async fn send_reqwest_proxy_route(
                 )?
             } else if route.compact_v2_bridge {
                 translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
+            } else if let Some(context) = route.responses_anthropic.clone() {
+                super::anthropic::translate(
+                    response,
+                    context,
+                    route.upstream_stream,
+                    sse_framing_limits,
+                )?
             } else {
                 UpstreamResponse::Reqwest(response)
             };
