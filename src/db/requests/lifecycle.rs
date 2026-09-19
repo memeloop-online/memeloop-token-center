@@ -70,6 +70,7 @@ pub(crate) enum RequestArchiveAdmission {
     GapRetentionLimit,
 }
 
+#[derive(Debug)]
 pub(crate) struct StartedProxyRequest {
     pub(crate) reservation: UsageReservation,
     pub(crate) archive_admission: RequestArchiveAdmission,
