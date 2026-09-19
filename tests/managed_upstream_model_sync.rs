@@ -12,6 +12,7 @@ use memeloop_token_center::{
     error::AppError,
     provider::UpstreamCredential,
 };
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use sqlx::Connection;
 use tower::ServiceExt;
@@ -31,6 +32,19 @@ async fn state() -> (AppState, tempfile::TempDir) {
         AppState::initialize(Config::for_test(url)).await.unwrap(),
         directory,
     )
+}
+
+async fn state_with_price_sources(server: &MockServer) -> (AppState, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("managed-pricing.db").display()
+    );
+    let mut config = Config::for_test(url);
+    config.pricing_models_dev_url = format!("{}/models-dev", server.uri());
+    config.pricing_litellm_url = format!("{}/litellm", server.uri());
+    config.pricing_openrouter_url = format!("{}/openrouter", server.uri());
+    (AppState::initialize(config).await.unwrap(), directory)
 }
 
 async fn account(state: &AppState, tenant: &str, base_url: &str) -> Uuid {
@@ -150,7 +164,8 @@ async fn explicit_endpoint_creates_owned_candidates_idempotently_without_adoptin
         request(&state, account, &state.config.service_token, "sync-routes").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["routes"]["added"], 2);
-    assert_eq!(first["price_sync"]["status"], "deferred");
+    assert_eq!(first["price_sync"]["status"], "error");
+    assert_eq!(first["price_sync"]["error_code"], "price_sync_failed");
     assert_eq!(first["price_sync"]["imported"], 0);
     let (_, second) = request(&state, account, &state.config.service_token, "sync-routes").await;
     assert_eq!(second["routes"]["added"], 0);
@@ -177,6 +192,181 @@ async fn explicit_endpoint_creates_owned_candidates_idempotently_without_adoptin
             "sync never grants credentials"
         );
     }
+}
+
+#[tokio::test]
+async fn managed_sync_prices_the_complete_catalog_without_delegating_global_price_edits() {
+    let pricing = MockServer::start().await;
+    let upstream = MockServer::start().await;
+    let (state, _directory) = state_with_price_sources(&pricing).await;
+    let tenant = "managed-pricing";
+    let account = account(&state, tenant, &upstream.uri()).await;
+    let token = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "tenant-managed-pricing".into(),
+                scopes: vec!["providers:write".into(), "routes:write".into()],
+                tenant_external_id: Some(tenant.into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price("manual", "USD", Decimal::ONE, Decimal::TWO)
+        .await
+        .unwrap();
+    serve(
+        &upstream,
+        json!({"data": [
+            {"id": "manual"},
+            {"id": "priced-without-request-history"},
+            {"id": "ambiguous"},
+            {"id": "unmatched"}
+        ]}),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/models-dev"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "provider-a": {"models": {
+                "manual": {"cost": {"input": 9, "output": 9}},
+                "priced-without-request-history": {"cost": {"input": 2, "output": 4}},
+                "ambiguous": {"cost": {"input": 3, "output": 6}}
+            }},
+            "provider-b": {"models": {
+                "ambiguous": {"cost": {"input": 5, "output": 10}}
+            }}
+        })))
+        .expect(1)
+        .mount(&pricing)
+        .await;
+    for source_path in ["/litellm", "/openrouter"] {
+        Mock::given(method("GET"))
+            .and(path(source_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&pricing)
+            .await;
+    }
+
+    let (status, first) = request(&state, account, &token.token, "sync-routes").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["routes"]["added"], 4);
+    assert_eq!(first["price_sync"]["status"], "partial");
+    assert_eq!(first["price_sync"]["currency"], "USD");
+    assert_eq!(first["price_sync"]["imported"], 1);
+    assert_eq!(first["price_sync"]["preserved"], 1);
+    assert_eq!(first["price_sync"]["ambiguous"], 1);
+    assert_eq!(first["price_sync"]["unmatched"], 1);
+    assert_eq!(
+        first["price_sync"]["failed_sources"],
+        json!(["litellm", "openrouter"])
+    );
+    assert_eq!(
+        state
+            .db
+            .model_price_view("manual", "USD")
+            .await
+            .unwrap()
+            .input_per_million,
+        "1"
+    );
+    assert_eq!(
+        state
+            .db
+            .model_price_view("priced-without-request-history", "USD")
+            .await
+            .unwrap()
+            .input_per_million,
+        "2"
+    );
+    pricing.verify().await;
+    pricing.reset().await;
+
+    Mock::given(method("GET"))
+        .and(path("/models-dev"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&pricing)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/litellm"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "manual": {
+                "input_cost_per_token": "0.000008",
+                "output_cost_per_token": "0.000016"
+            },
+            "priced-without-request-history": {
+                "input_cost_per_token": "0.000009",
+                "output_cost_per_token": "0.000018"
+            }
+        })))
+        .expect(1)
+        .mount(&pricing)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/openrouter"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&pricing)
+        .await;
+
+    let (status, second) = request(&state, account, &token.token, "sync-routes").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["routes"]["unchanged"], 4);
+    assert_eq!(second["price_sync"]["status"], "partial");
+    assert_eq!(second["price_sync"]["imported"], 0);
+    assert_eq!(second["price_sync"]["preserved"], 2);
+    assert_eq!(
+        state
+            .db
+            .model_price_view("priced-without-request-history", "USD")
+            .await
+            .unwrap()
+            .input_per_million,
+        "2",
+        "a failed preferred source must retain its last-known price"
+    );
+    assert_eq!(
+        state
+            .db
+            .model_price_view("manual", "USD")
+            .await
+            .unwrap()
+            .input_per_million,
+        "1",
+        "managed synchronization must never overwrite a manual price"
+    );
+    pricing.verify().await;
+    pricing.reset().await;
+
+    for source_path in ["/models-dev", "/litellm", "/openrouter"] {
+        Mock::given(method("GET"))
+            .and(path(source_path))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&pricing)
+            .await;
+    }
+    let (status, unavailable) = request(&state, account, &token.token, "sync-routes").await;
+    assert_eq!(status, StatusCode::OK, "{unavailable}");
+    assert_eq!(unavailable["routes"]["unchanged"], 4);
+    assert_eq!(unavailable["price_sync"]["status"], "error");
+    assert_eq!(unavailable["price_sync"]["error_code"], "price_sync_failed");
+    assert_eq!(
+        state
+            .db
+            .model_price_view("priced-without-request-history", "USD")
+            .await
+            .unwrap()
+            .input_per_million,
+        "2",
+        "complete source outage must leave the last-known price untouched"
+    );
+    pricing.verify().await;
 }
 
 #[tokio::test]
@@ -219,6 +409,7 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
         assert_eq!(result["routes"]["added"], 0);
         assert_eq!(result["routes"]["disabled"], 0);
         assert_eq!(result["routes"]["warnings"][0], code);
+        assert_eq!(result["price_sync"]["status"], "skipped");
         assert_eq!(result["catalog"]["models"][0]["id"], "keep");
     }
     for response in [
@@ -238,6 +429,7 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
         assert_eq!(result["routes"]["warnings"][0], "partial_catalog");
         assert_eq!(result["routes"]["added"], 0);
         assert_eq!(result["routes"]["disabled"], 0);
+        assert_eq!(result["price_sync"]["status"], "skipped");
     }
     server.reset().await;
     Mock::given(method("GET"))
@@ -247,6 +439,7 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
         .await;
     let (_, result) = request(&state, account, &state.config.service_token, "sync-routes").await;
     assert_eq!(result["routes"]["warnings"][0], "upstream_unavailable");
+    assert_eq!(result["price_sync"]["status"], "skipped");
     let routes = state.db.list_model_routes(Some(tenant)).await.unwrap();
     assert_eq!(routes.len(), 1);
     assert!(routes[0].enabled);

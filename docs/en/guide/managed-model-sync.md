@@ -2,7 +2,11 @@
 
 `POST /internal/v1/upstreams/{account_id}/models/sync-routes` explicitly opts an account's discovered models into managed route creation. It requires **both** `providers:write` and `routes:write`, with the same tenant boundary as account management. The existing `models/sync` endpoint and background refresh retain their existing catalog-refresh behavior.
 
-The response contains `catalog`, `routes` (`added`, `disabled`, `restored`, `unchanged`, `skipped`, `warnings`), and `price_sync`. A 200 response can be a safe skip; inspect warnings. `sync_in_progress` means another directory request holds the lease and the caller can retry. Prices currently return `status: deferred`, `error_code: managed_route_price_sync_deferred`, and zero imports; this endpoint does not infer or fabricate prices.
+The response contains `catalog`, `routes` (`added`, `disabled`, `restored`, `unchanged`, `skipped`, `warnings`), and `price_sync`. A 200 response can be a safe skip; inspect warnings. `sync_in_progress` means another directory request holds the lease and the caller can retry.
+
+After a complete nonempty catalog is published and its managed routes are reconciled, the same request synchronizes USD prices for the deduplicated model identities in that catalog. It uses the configured `models.dev`, LiteLLM, and OpenRouter catalogs plus the existing deterministic matcher. The set does not come from historical requests, and the client cannot submit model names, source URLs, currency, or price values through this endpoint.
+
+This price stage is a bounded server-owned consequence of a verified catalog, not permission to edit arbitrary global prices. The caller still needs only the endpoint's `providers:write` and `routes:write` scopes; direct price management continues to require global `prices:write`. Manual prices are never replaced. If a preferred source is unavailable, its last-known price is retained instead of falling back to a lower-priority source. Unmatched and ambiguous models are reported without a write, and source or pricing failures never roll back catalog or route changes or write a fabricated zero.
 
 Only complete, successful, nonempty directory responses authorize route reconciliation. Partial/paginated responses, malformed records, authentication failures, timeouts, and empty catalogs preserve the last catalog and managed routes. Pagination URLs are never followed. If the catalog or account changes between publication and reconciliation, route changes are skipped and retrying converges.
 
