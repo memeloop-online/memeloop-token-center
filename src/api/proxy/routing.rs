@@ -85,7 +85,9 @@ pub(super) fn plan_proxy_route(
     if is_codex {
         codex::validate_route(&route, protocol)?;
     }
-    let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
+    let responses_via_chat_dialect = state
+        .providers
+        .responses_via_chat_dialect(&route.driver, &route.config);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
