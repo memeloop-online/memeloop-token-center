@@ -4,15 +4,18 @@ import { Button, Disclosure, Input } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import type { ModelRouteView, UpstreamCatalogPriceSync, UpstreamModelCatalogResponse, UpstreamModelCatalogSyncResponse } from '../types';
-import { findManagedRoute, inferManagedRouteProtocol, type CatalogRouteAction } from './managedModelSync';
+import { findManagedRoute, inferManagedRouteProtocol, isUpstreamModelCatalog, type CatalogRouteAction } from './managedModelSync';
 
 const maximumDisabledModelsShown = 100;
 const maximumCatalogModelsShown = 50;
+const routePageSize = 100;
+const maximumRoutesLoaded = 10_000;
 
-export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRouteAction, routeActionDisabled }: {
+export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRouteAction, routeActionDisabled, routeCacheRevision = 0 }: {
   accountId: string; tenant: string; token: string; disabled?: boolean;
   onRouteAction?: (action: CatalogRouteAction) => void;
   routeActionDisabled?: boolean;
+  routeCacheRevision?: number;
 }) {
   const { locale, t } = useI18n();
   const [catalog, setCatalog] = useState<UpstreamModelCatalogResponse>();
@@ -26,6 +29,8 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
   const [routesError, setRoutesError] = useState('');
   const controller = useRef<AbortController | undefined>(undefined);
   const routesController = useRef<AbortController | undefined>(undefined);
+  const routesRequested = useRef(false);
+  const loadedRouteCacheRevision = useRef(routeCacheRevision);
   const query = new URLSearchParams({ tenant_external_id: tenant, limit: '10000' });
   const path = `/internal/v1/upstreams/${accountId}/models`;
   const errorText = (reason: unknown) => reason instanceof Error ? reason.message : t('common.requestFailed');
@@ -35,25 +40,15 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
     return message === key ? t('providerCatalog.error.unavailable') : message;
   };
   const parseCatalog = (value: unknown): UpstreamModelCatalogResponse => {
-    if (!value || typeof value !== 'object' || !('account_id' in value) || typeof value.account_id !== 'string'
-      || !('status' in value) || typeof value.status !== 'string'
-      || !('credential_generation' in value) || typeof value.credential_generation !== 'number'
-      || !('last_attempt_at' in value) || (value.last_attempt_at !== null && typeof value.last_attempt_at !== 'number')
-      || !('last_success_at' in value) || (value.last_success_at !== null && typeof value.last_success_at !== 'number')
-      || !('expires_at' in value) || (value.expires_at !== null && typeof value.expires_at !== 'number')
-      || !('error_code' in value) || (value.error_code !== null && typeof value.error_code !== 'string')
-      || !('models' in value) || !Array.isArray(value.models)
-      || !value.models.every(model => model && typeof model.id === 'string' && typeof model.protocol === 'string')
-      || !('disabled_models' in value) || !Array.isArray(value.disabled_models)
-      || !value.disabled_models.every(model => model && typeof model.id === 'string' && typeof model.protocol === 'string'
-        && model.status === 'disabled' && typeof model.disabled_at === 'number' && model.reason === 'removed_from_upstream')) {
+    if (!isUpstreamModelCatalog(value)) {
       throw new Error(t('providerCatalog.error.invalid_response'));
     }
-    return value as UpstreamModelCatalogResponse;
+    return value;
   };
   const parseSync = (value: unknown): UpstreamModelCatalogSyncResponse => {
-    const catalog = parseCatalog(value);
-    const priceSync = (value as Record<string, unknown>).price_sync;
+    if (!value || typeof value !== 'object') throw new Error(t('providerCatalog.error.invalid_response'));
+    const { price_sync: priceSync, ...catalogValue } = value as Record<string, unknown>;
+    const catalog = parseCatalog(catalogValue);
     if (!priceSync || typeof priceSync !== 'object') {
       throw new Error(t('providerCatalog.error.invalid_response'));
     }
@@ -61,7 +56,10 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
     const failedSources = fields.failed_sources;
     if (typeof fields.status !== 'string' || !['ready', 'partial', 'error', 'skipped'].includes(fields.status)
       || fields.currency !== 'USD'
-      || !['imported', 'preserved', 'unmatched', 'ambiguous'].every((field) => typeof fields[field] === 'number')
+      || !['imported', 'preserved', 'unmatched', 'ambiguous'].every((field) => {
+        const count = fields[field];
+        return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+      })
       || !Array.isArray(failedSources) || !failedSources.every((source) => typeof source === 'string')
       || (fields.error_code !== null && fields.error_code !== 'price_sync_failed')) {
       throw new Error(t('providerCatalog.error.invalid_response'));
@@ -76,6 +74,7 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
     const read = new AbortController(); controller.current = read;
     setCatalog(undefined); setCatalogMessage(''); setCatalogError(''); setPriceSync(undefined);
     setBrowseFilter(''); setRoutes(undefined); setRoutesLoading(false); setRoutesError('');
+    routesRequested.current = false; loadedRouteCacheRevision.current = routeCacheRevision;
     if (!token || !tenant) { setBusy(false); return () => read.abort(); }
     setBusy(true);
     void api<unknown>(`${path}?${query}`, token, { signal: read.signal }).then(parseCatalog)
@@ -85,15 +84,51 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
     return () => { read.abort(); controller.current?.abort(); routesController.current?.abort(); };
   }, [accountId, tenant, token]);
 
-  function loadRoutes() {
-    if (routes || routesLoading || routesError || !token || !tenant) return;
+  async function loadRoutes(force = false) {
+    if (!token || !tenant || (!force && (routes || routesLoading))) return;
+    routesRequested.current = true;
+    routesController.current?.abort();
     const read = new AbortController(); routesController.current = read;
-    const routesQuery = new URLSearchParams({ tenant_external_id: tenant });
-    setRoutesLoading(true);
-    void apiRead<ModelRouteView[]>(`/internal/v1/model-routes?${routesQuery}`, token, { signal: read.signal })
-      .then((value) => { if (!read.signal.aborted) { setRoutes(value); setRoutesLoading(false); routesController.current = undefined; } })
-      .catch((reason) => { if (!read.signal.aborted) { setRoutesError(errorText(reason)); setRoutesLoading(false); routesController.current = undefined; } });
+    setRoutesLoading(true); setRoutesError('');
+    if (force) setRoutes(undefined);
+    try {
+      const loaded: ModelRouteView[] = [];
+      let beforeCreatedAt: number | undefined;
+      let beforeId: string | undefined;
+      while (loaded.length < maximumRoutesLoaded) {
+        const routesQuery = new URLSearchParams({ tenant_external_id: tenant, limit: String(routePageSize) });
+        if (beforeCreatedAt !== undefined && beforeId) {
+          routesQuery.set('before_created_at', String(beforeCreatedAt));
+          routesQuery.set('before_id', beforeId);
+        }
+        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes?${routesQuery}`, token, { signal: read.signal });
+        if (read.signal.aborted) return;
+        loaded.push(...page);
+        if (page.length < routePageSize) break;
+        const last = page.at(-1);
+        if (!last || !Number.isSafeInteger(last.created_at) || !last.id
+          || (last.created_at === beforeCreatedAt && last.id === beforeId)) {
+          throw new Error(t('providerCatalog.routesIncomplete'));
+        }
+        beforeCreatedAt = last.created_at; beforeId = last.id;
+      }
+      if (loaded.length >= maximumRoutesLoaded) throw new Error(t('providerCatalog.routesIncomplete'));
+      if (!read.signal.aborted) setRoutes(loaded);
+    } catch (reason) {
+      if (!read.signal.aborted) { setRoutes(undefined); setRoutesError(errorText(reason)); }
+    } finally {
+      if (!read.signal.aborted) { setRoutesLoading(false); routesController.current = undefined; }
+    }
   }
+
+  useEffect(() => {
+    if (loadedRouteCacheRevision.current === routeCacheRevision) return;
+    loadedRouteCacheRevision.current = routeCacheRevision;
+    if (routesRequested.current) void loadRoutes(true);
+    // The revision is an explicit invalidation signal; the current scoped
+    // route request is restarted even when a previous result is in flight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeCacheRevision]);
 
   async function sync() {
     controller.current?.abort();
@@ -144,18 +179,19 @@ export function ProviderModelCatalog({ accountId, tenant, token, disabled, onRou
     {priceSummary && <p role="status">{t('providerCatalog.pricesLabel')}: {priceSummary}</p>}
     {failedSources && <p className={priceSync?.status === 'partial' ? 'muted' : 'error'} role={priceSync?.status === 'partial' ? 'status' : 'alert'}>{t('providerCatalog.pricesLabel')}: {failedSources}</p>}
     {priceFailure && <p className="error" role="alert">{t('providerCatalog.pricesLabel')}: {priceFailure}</p>}
-    {catalogModels.length > 0 && <Disclosure title={t('providerCatalog.viewCatalog', { count: formatNumber(catalogModels.length, locale) })} onOpenChange={(open) => { if (open) loadRoutes(); }}>
+    {catalogModels.length > 0 && <Disclosure title={t('providerCatalog.viewCatalog', { count: formatNumber(catalogModels.length, locale) })} onOpenChange={(open) => { if (open) void loadRoutes(); }}>
       <Input value={browseFilter} placeholder={t('providerCatalog.searchCatalog')} aria-label={t('providerCatalog.searchCatalog')} onChange={(_, data) => setBrowseFilter(data.value)} />
       {routesLoading && <p className="muted" role="status">{t('providerCatalog.routesLoading')}</p>}
-      {routesError && <p className="error" role="alert">{routesError}</p>}
+      {routesError && <div className="row-actions"><p className="error" role="alert">{routesError}</p><Button appearance="secondary" type="button" onClick={() => void loadRoutes(true)}>{t('providerCatalog.routesRetry')}</Button></div>}
       {filteredModels.length === 0 && <p className="muted">{t('providerCatalog.noCatalogMatches')}</p>}
       <ul className="provider-catalog-models">
         {filteredModels.slice(0, maximumCatalogModelsShown).map((model) => {
           const protocol = inferManagedRouteProtocol(model.protocol);
-          const existing = routes ? findManagedRoute(routes, accountId, model.id, protocol) : undefined;
+          const existing = routes && protocol ? findManagedRoute(routes, accountId, model.id, protocol) : undefined;
           return <li key={`${model.id} ${model.protocol}`}>
             <code>{model.id}</code><span className="muted">{model.protocol}</span>
-            {onRouteAction && <Button appearance="secondary" type="button" disabled={routeActionDisabled || routesLoading}
+            {!protocol && <span className="muted">{t('providerCatalog.routeProtocolUnsupported')}</span>}
+            {onRouteAction && protocol && <Button appearance="secondary" type="button" disabled={routeActionDisabled || routesLoading || !routes || Boolean(routesError)}
               onClick={() => onRouteAction(existing ? { kind: 'view', routeId: existing.id } : { kind: 'create', model, protocol })}>{existing ? t('providerCatalog.viewRoute') : t('providerCatalog.addRoute')}</Button>}
           </li>;
         })}

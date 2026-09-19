@@ -22,7 +22,7 @@ function syncResponse(overrides: { warnings?: string[]; models?: number } = {}) 
       account_id: 'managed-account', status: 'ready', credential_generation: 1,
       last_attempt_at: 1_800_000_000_000, last_success_at: 1_800_000_000_000, expires_at: 1_800_086_400_000,
       error_code: null,
-      models: Array.from({ length: count }, (_, index) => ({ id: `catalog-model-${index}`, protocol: 'openai' })),
+      models: Array.from({ length: count }, (_, index) => ({ id: `catalog-model-${index}`, protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null })),
       disabled_models: [],
     },
     routes: { added: 1, disabled: 0, restored: 0, unchanged: count - 1, skipped: 0, warnings: overrides.warnings ?? [] },
@@ -37,7 +37,11 @@ async function stubBrowseCatalog(page: Page) {
       account_id: 'browse-account', status: 'ready', credential_generation: 1,
       last_attempt_at: 1_800_000_000_000, last_success_at: 1_800_000_000_000, expires_at: 1_800_086_400_000,
       error_code: null,
-      models: [{ id: 'catalog-model-managed', protocol: 'openai' }, { id: 'catalog-model-fresh', protocol: 'anthropic' }],
+      models: [
+        { id: 'catalog-model-managed', protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null },
+        { id: 'catalog-model-fresh', protocol: 'anthropic', context_window: null, reservation_token_bound: null, reservation_bound_source: null },
+        { id: 'catalog-model-unknown', protocol: 'vendor-specific', context_window: null, reservation_token_bound: null, reservation_bound_source: null },
+      ],
       disabled_models: [],
     } });
   });
@@ -80,15 +84,16 @@ test('managed sync shows per-account catalog and route outcomes with deferred pr
     await sync.click();
     await page.getByText('同步完成', { exact: true }).waitFor();
     await page.getByText('目录 2 个模型 · 新增 1 · 停用 0 · 恢复 0 · 保留 1 · 跳过 0', { exact: true }).waitFor();
-    await page.getByText('价格同步待处理', { exact: true }).waitFor();
+    await page.getByText('本次未执行价格同步', { exact: true }).waitFor();
     assert.deepEqual(syncTenants, ['fixture-a']);
     assert.equal(legacyPriceSyncRequests, 0, 'managed sync defers pricing without legacy price requests');
 
-    warnings = ['sync_in_progress', 'operator_route_preserved'];
+    warnings = ['sync_in_progress', 'operator_route_preserved', 'complete_catalog_unsupported'];
     await sync.click();
     await page.getByText('同步完成，部分内容需要关注', { exact: true }).waitFor();
     await page.getByText('另一次同步正在进行，本次跳过路由核对，请稍后重试。', { exact: true }).waitFor();
     await page.getByText('部分路由由管理员手动管理，已保持原样。', { exact: true }).waitFor();
+    await page.getByText('此接入方式无法确认目录完整性，本次跳过路由核对。', { exact: true }).waitFor();
 
     malformed = true;
     await sync.click();
@@ -145,22 +150,156 @@ test('catalog browsing offers view for managed routes and add for uncovered mode
     page.on('pageerror', error => pageErrors.push(error.message));
     await page.goto(url);
 
-    await page.getByRole('button', { name: '查看目录（2）', exact: true }).click();
+    await page.getByRole('button', { name: '查看目录（3）', exact: true }).click();
     const managedRow = page.locator('.provider-catalog-models li', { hasText: 'catalog-model-managed' });
     const freshRow = page.locator('.provider-catalog-models li', { hasText: 'catalog-model-fresh' });
+    const unknownRow = page.locator('.provider-catalog-models li', { hasText: 'catalog-model-unknown' });
     await managedRow.getByRole('button', { name: '查看路由', exact: true }).waitFor();
     await freshRow.getByRole('button', { name: '添加路由', exact: true }).waitFor();
+    await unknownRow.getByText('暂不支持为此协议添加托管路由', { exact: true }).waitFor();
+    assert.equal(await unknownRow.getByRole('button').count(), 0, 'an unknown protocol cannot be coerced into an OpenAI route');
 
     await freshRow.getByRole('button', { name: '添加路由', exact: true }).click();
     await page.waitForFunction(() => document.getElementById('last-action')?.textContent?.includes('catalog-model-fresh'));
     const create = JSON.parse(await page.locator('#last-action').textContent() ?? '{}');
-    assert.deepEqual(create, { kind: 'create', model: { id: 'catalog-model-fresh', protocol: 'anthropic' }, protocol: 'anthropic' });
+    assert.deepEqual(create, {
+      kind: 'create',
+      model: { id: 'catalog-model-fresh', protocol: 'anthropic', context_window: null, reservation_token_bound: null, reservation_bound_source: null },
+      protocol: 'anthropic',
+    });
 
     await managedRow.getByRole('button', { name: '查看路由', exact: true }).click();
     await page.waitForFunction(() => document.getElementById('last-action')?.textContent?.includes('route-existing'));
     const view = JSON.parse(await page.locator('#last-action').textContent() ?? '{}');
     assert.deepEqual(view, { kind: 'view', routeId: 'route-existing' });
     assert.deepEqual(pageErrors, []);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('catalog route actions stay disabled after a failed route read and recover on retry', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    let routeReads = 0;
+    await page.route('**/internal/v1/upstreams/browse-account/models**', async route => route.fulfill({ json: {
+      account_id: 'browse-account', status: 'ready', credential_generation: 1,
+      last_attempt_at: 1_800_000_000_000, last_success_at: 1_800_000_000_000, expires_at: 1_800_086_400_000,
+      error_code: null,
+      models: [{ id: 'catalog-model-fresh', protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null }],
+      disabled_models: [],
+    } }));
+    await page.route('**/internal/v1/model-routes**', async route => {
+      routeReads += 1;
+      if (routeReads === 1) return route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'route list unavailable' } } });
+      return route.fulfill({ json: [] });
+    });
+    await page.goto(url);
+    await page.getByRole('button', { name: '查看目录（1）', exact: true }).click();
+    const add = page.getByRole('button', { name: '添加路由', exact: true });
+    await page.getByRole('button', { name: '重试读取路由', exact: true }).waitFor();
+    assert.equal(await add.isDisabled(), true, 'a failed route list is not evidence that the model is uncovered');
+    await page.getByRole('button', { name: '重试读取路由', exact: true }).click();
+    await page.waitForFunction(() => {
+      const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === '添加路由');
+      return Boolean(button && !button.disabled);
+    });
+    assert.equal(routeReads, 2);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('managed sync invalidates an opened catalog route cache before offering add or view', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    let routeReads = 0;
+    await page.route('**/internal/v1/upstreams/browse-account/models**', async route => route.fulfill({ json: {
+      account_id: 'browse-account', status: 'ready', credential_generation: 1,
+      last_attempt_at: 1_800_000_000_000, last_success_at: 1_800_000_000_000, expires_at: 1_800_086_400_000,
+      error_code: null,
+      models: [{ id: 'catalog-model-fresh', protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null }],
+      disabled_models: [],
+    } }));
+    await page.route('**/internal/v1/model-routes**', async route => {
+      routeReads += 1;
+      return route.fulfill({ json: routeReads === 1 ? [] : [{
+        id: 'route-after-sync', tenant_external_id: 'fixture-a', public_model: 'catalog-model-fresh',
+        upstream_account_ids: ['browse-account'], candidate_upstream_account_ids: ['browse-account'],
+        upstream_model: 'catalog-model-fresh', protocol: 'openai', priority: 0, enabled: true,
+        created_at: 1_800_000_000_000, updated_at: 1_800_000_000_000, grant_revision: 0,
+      }] });
+    });
+    await page.route('**/internal/v1/upstreams/managed-account/models/sync-routes**', async route => route.fulfill({ json: syncResponse() }));
+    await page.goto(url);
+    await page.getByRole('button', { name: '查看目录（1）', exact: true }).click();
+    await page.getByRole('button', { name: '添加路由', exact: true }).waitFor();
+    await page.getByRole('button', { name: '同步模型', exact: true }).click();
+    await page.getByRole('button', { name: '查看路由', exact: true }).waitFor();
+    assert.equal(routeReads, 2, 'a successful managed sync reloads the already-open route cache');
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('catalog add performs a real cross-page handoff without expanding route authorization', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    await stubBrowseCatalog(page);
+    await page.addInitScript(() => sessionStorage.setItem('mtc-route-focus-v1', JSON.stringify({ tenant: 'fixture-a', routeId: 'stale-focus' })));
+    await page.goto(`${url}?handoff=1`);
+    await page.getByRole('button', { name: '查看目录（3）', exact: true }).click();
+    await page.locator('.provider-catalog-models li', { hasText: 'catalog-model-fresh' }).getByRole('button', { name: '添加路由', exact: true }).click();
+    await page.waitForURL('**/e2e/fixtures/managed-model-handoff.html');
+    await page.getByText('已从目录模型预填草稿，请确认后创建。', { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-route-focus-v1')), null, 'a create handoff replaces stale route focus');
+    await page.waitForFunction(() => {
+      const button = [...document.querySelectorAll<HTMLButtonElement>('button')].find((candidate) => candidate.textContent?.trim() === '创建路由');
+      return Boolean(button && !button.disabled);
+    });
+    await page.getByRole('button', { name: '创建路由', exact: true }).click();
+    await page.waitForFunction(() => window.managedHandoffPayloads.length === 1);
+    const payload = await page.evaluate(() => window.managedHandoffPayloads[0]);
+    assert.deepEqual(payload.upstream_account_ids, ['browse-account']);
+    assert.deepEqual(payload.included_provider_group_ids, []);
+    assert.deepEqual(payload.excluded_provider_group_ids, []);
+    assert.deepEqual(payload.route_group_ids, []);
+    assert.deepEqual(payload.granted_credential_ids, []);
+    assert.equal(payload.protocol, 'anthropic');
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('route handoff storage survives scope mismatch and cannot prefill a foreign account', { timeout: 60_000 }, async () => {
+  const { server, browser, url } = await openFixture();
+  try {
+    const mismatch = await browser.newPage();
+    await mismatch.addInitScript(() => {
+      localStorage.setItem('mtc-locale', 'zh-CN');
+      sessionStorage.setItem('mtc-route-draft-prefill-v1', JSON.stringify({ tenant: 'fixture-b', accountId: 'foreign-account', upstreamModel: 'catalog-model-fresh', publicModel: 'catalog-model-fresh', protocol: 'anthropic' }));
+    });
+    await mismatch.goto(new URL('/e2e/fixtures/managed-model-handoff.html', url).href);
+    assert.notEqual(await mismatch.evaluate(() => sessionStorage.getItem('mtc-route-draft-prefill-v1')), null, 'a different tenant cannot consume or delete the handoff');
+    await mismatch.evaluate(() => sessionStorage.setItem('mtc-route-draft-prefill-v1', JSON.stringify({ tenant: 'fixture-a', accountId: 42 })));
+    await mismatch.reload();
+    assert.notEqual(await mismatch.evaluate(() => sessionStorage.getItem('mtc-route-draft-prefill-v1')), null, 'a malformed handoff remains available for diagnosis instead of being deleted before validation');
+    await mismatch.close();
+
+    const foreign = await browser.newPage();
+    await foreign.addInitScript(() => {
+      localStorage.setItem('mtc-locale', 'zh-CN');
+      sessionStorage.setItem('mtc-route-draft-prefill-v1', JSON.stringify({ tenant: 'fixture-a', accountId: 'foreign-account', upstreamModel: 'catalog-model-fresh', publicModel: 'catalog-model-fresh', protocol: 'anthropic' }));
+    });
+    await foreign.goto(new URL('/e2e/fixtures/managed-model-handoff.html', url).href);
+    assert.equal(await foreign.getByText('已从目录模型预填草稿，请确认后创建。', { exact: true }).count(), 0);
+    assert.equal(await foreign.getByRole('button', { name: '创建模型路由', exact: true }).getAttribute('aria-expanded'), 'false');
+    assert.equal(await foreign.evaluate(() => window.managedHandoffPayloads.length), 0);
+    await foreign.close();
   } finally {
     await browser.close();
     await server.close();
