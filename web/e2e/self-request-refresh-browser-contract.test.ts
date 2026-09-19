@@ -58,11 +58,15 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     assert.equal(await page.getByText('old-first-response', { exact: true }).count(), 0, 'an aborted first credential response cannot populate the second credential page');
 
     const cadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
+    const waitForCadenceText = async (expected: string) => {
+      await page.waitForFunction(({ expected }) => document.querySelector<HTMLElement>('[role="slider"][aria-label="Refresh cadence"]')?.getAttribute('aria-valuetext') === expected, { expected });
+      assert.equal(await cadence.getAttribute('aria-valuetext'), expected);
+    };
     assert.equal(await cadence.inputValue(), '1', 'the default cadence is five seconds');
     assert.deepEqual(await page.locator('.request-refresh-ticks span').allTextContents(), ['Manual', '5s', '30s', '1m', '5m']);
     await cadence.press('Home');
     assert.equal(await cadence.inputValue(), '0');
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
+    await waitForCadenceText('Manual');
     await cadence.press('ArrowRight');
     assert.equal(await cadence.inputValue(), '1');
 
@@ -85,7 +89,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     assert.ok(listReads > beforeHidden, 'visible pages resume polling');
 
     await cadence.press('Home');
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
+    await waitForCadenceText('Manual');
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
     await page.locator('.request-model-cell code').filter({ hasText: /^older-second$/ }).waitFor();
     const loaded = await page.locator('.request-id-control.compact code').allTextContents();
@@ -95,7 +99,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     await refreshStarted;
     await page.getByRole('status').filter({ hasText: 'Updating the list and summary' }).waitFor();
     await heldHistoryRefresh!.fulfill({ json: [request('new-injected', 2_000), ...firstPage.slice(0, 49)] });
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
+    await waitForCadenceText('Manual');
     assert.deepEqual(await page.locator('.request-id-control.compact code').allTextContents(), loaded, 'refresh cannot inject or reorder an explicit history window');
     assert.equal(await page.getByText('new-injected', { exact: true }).count(), 0);
 
