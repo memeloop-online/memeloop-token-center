@@ -8,7 +8,7 @@ use super::{
     HostState, PLUGIN_MEMORY_BYTES, PLUGIN_TABLE_ELEMENTS, PluginRuntime,
     PluginServiceDataEndpoint, PluginServiceDataProvenance, PluginServiceDataView,
     epoch_deadline_ticks, plugin_configuration_schema_digest, plugin_failure,
-    plugin_reported_error, service_data_component,
+    plugin_reported_error,
 };
 use crate::{
     db::PluginServiceDataRefreshErrorCode,

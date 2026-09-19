@@ -1795,7 +1795,9 @@ impl memeloop::token_center::host::Host for HostState {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        let (status, response_headers, response_body) = self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let http_body_limit = self.http_body_limit;
+        let (status, response_headers, response_body) = runtime.block_on(async move {
             let response = request
                 .send()
                 .await
@@ -1815,7 +1817,7 @@ impl memeloop::token_center::host::Host for HostState {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| "plugin HTTP response read failed".to_owned())?;
-                if response_body.len().saturating_add(chunk.len()) > self.http_body_limit {
+                if response_body.len().saturating_add(chunk.len()) > http_body_limit {
                     return Err("plugin HTTP response exceeds its configured body limit".to_owned());
                 }
                 response_body.extend_from_slice(&chunk);
@@ -2381,6 +2383,27 @@ fn canonical_json(value: &Value) -> Value {
             )
         }
         value => value.clone(),
+    }
+}
+
+fn estimated_json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len(),
+        // Every input byte can expand to at most one six-byte JSON escape.
+        Value::String(value) => value.len().saturating_mul(6).saturating_add(2),
+        Value::Array(values) => values.iter().fold(2usize, |total, value| {
+            total
+                .saturating_add(1)
+                .saturating_add(estimated_json_bytes(value))
+        }),
+        Value::Object(values) => values.iter().fold(2usize, |total, (key, value)| {
+            total
+                .saturating_add(key.len().saturating_mul(6))
+                .saturating_add(4)
+                .saturating_add(estimated_json_bytes(value))
+        }),
     }
 }
 

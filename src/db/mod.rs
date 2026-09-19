@@ -156,9 +156,7 @@ pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 use migrations::{apply_migration_range, maintain_postgres_partitions};
 pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
-pub(crate) use plugin_service_data::{
-    PluginServiceDataRefreshErrorCode, PluginServiceDataSnapshot,
-};
+pub(crate) use plugin_service_data::PluginServiceDataRefreshErrorCode;
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView,
     BatchUpstreamAccountCredential, ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh,
