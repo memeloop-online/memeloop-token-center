@@ -411,10 +411,10 @@ impl Database {
         identity: ArchiveSpoolIdentity,
     ) -> Result<bool, AppError> {
         let purpose = BufferedArchivePurpose::Response;
-        // Validate and create the request-owned spool before touching the
-        // cross-request budget row. The final budget update still commits in
-        // this transaction, but no longer serializes unrelated streams while
-        // their request ownership is read.
+        // Validate request ownership and exact replays before touching the
+        // cross-request budget row. The provisional budget update then owns
+        // the short byte-and-slot decision and rolls back with any rejected
+        // spool insert.
         let mut tx = self.archive_state_transaction().await?;
         let mut hold = BudgetHold::late("response_begin", Some(identity.request_id));
         let now = archive_clock(&mut tx, self.backend).await?;
@@ -449,15 +449,26 @@ impl Database {
             return Ok(accepted);
         }
         hold.phase("budget_and_slot_admission");
-        let budget_lock = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
-            }
-            DatabaseBackend::Sqlite => {
-                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1"
-            }
-        };
-        sqlx::query(budget_lock).fetch_one(&mut *tx).await?;
+        let budget = sqlx::query(
+            "UPDATE response_archive_spool_budget
+             SET cipher_bytes = cipher_bytes + $1
+             WHERE singleton = 1
+               AND cipher_bytes <= $2
+               AND cipher_bytes - request_cipher_bytes <= $3",
+        )
+        .bind(SPOOL_OVERHEAD)
+        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .execute(&mut *tx)
+        .await?;
+        if budget.rows_affected() != 1 {
+            BudgetHold::rollback_optional(tx, Some(hold)).await?;
+            return Ok(spool_write_rejected(
+                identity,
+                "begin",
+                "global_cipher_capacity",
+            ));
+        }
         let active_slots: i64 = sqlx::query_scalar(
             "SELECT
                 (SELECT COUNT(*) FROM response_archive_spools
@@ -497,27 +508,6 @@ impl Database {
                 spool_write_rejected(identity, "begin", "existing_spool_not_eligible");
             }
             return Ok(accepted);
-        }
-        hold.phase("budget_update");
-        let budget = sqlx::query(
-            "UPDATE response_archive_spool_budget
-             SET cipher_bytes = cipher_bytes + $1
-             WHERE singleton = 1
-               AND cipher_bytes <= $2
-               AND cipher_bytes - request_cipher_bytes <= $3",
-        )
-        .bind(SPOOL_OVERHEAD)
-        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD)
-        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
-        .execute(&mut *tx)
-        .await?;
-        if budget.rows_affected() != 1 {
-            BudgetHold::rollback_optional(tx, Some(hold)).await?;
-            return Ok(spool_write_rejected(
-                identity,
-                "begin",
-                "global_cipher_capacity",
-            ));
         }
         hold.commit(tx).await?;
         Ok(true)

@@ -309,13 +309,21 @@ async fn streaming_and_buffered_response_admission_share_one_slot_boundary() {
         request_id: Uuid::new_v4(),
         ..first_stream
     };
-    sqlx::query("INSERT INTO request_records (id, tenant_id, reservation_id) VALUES ($1, $2, $3)")
-        .bind(second_stream.request_id.to_string())
-        .bind(second_stream.tenant_id.to_string())
-        .bind(second_stream.reservation_id.to_string())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO request_records (
+             id, tenant_id, key_id, created_at, protocol, model,
+             input_tokens, output_tokens, cost_micros, request_object,
+             reservation_id
+         )
+         SELECT $1, tenant_id, key_id, created_at + 1, protocol, model,
+                0, 0, 0, 'inline-json:{}', reservation_id
+         FROM request_records WHERE id = $2",
+    )
+    .bind(second_stream.request_id.to_string())
+    .bind(first_stream.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
     sqlx::query(
         "WITH digits(d) AS (
