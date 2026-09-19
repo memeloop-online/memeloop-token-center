@@ -7994,7 +7994,7 @@ components:
             warnings:
               type: array
               items: { type: string }
-              description: Machine-readable reasons such as sync_in_progress, partial_catalog, empty_catalog_protected, account_changed, account_or_lease_changed, catalog_not_ready, catalog_changed, operator_route_preserved, unsupported_route_model_or_protocol, or a discovery error code.
+              description: Machine-readable reasons such as sync_in_progress, partial_catalog, empty_catalog_protected, complete_catalog_unsupported (the current component plugin ABI cannot attest completeness), account_changed, account_or_lease_changed, catalog_not_ready, catalog_changed, operator_route_preserved, unsupported_route_model_or_protocol, or a discovery error code.
         price_sync:
           type: object
           additionalProperties: false

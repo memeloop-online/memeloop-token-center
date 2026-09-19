@@ -325,6 +325,7 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
                 // reconcile response carries the more specific protection code.
                 let catalog_code = match code {
                     "partial_catalog" | "empty_catalog_protected" => "invalid_response",
+                    "complete_catalog_unsupported" => "unsupported",
                     code => code,
                 };
                 state
@@ -576,7 +577,8 @@ async fn discover_models(
     }
     .map_err(|_| "upstream_unavailable")?;
     if let Some(value) = plugin_result {
-        return parse_model_array(&value).map(|models| ("component", models));
+        return parse_component_model_catalog(&value, require_complete)
+            .map(|models| ("component", models));
     }
     if account.driver == "openai-codex" {
         return discover_codex_models(state, account, credential, require_complete).await;
@@ -978,6 +980,19 @@ fn require_complete_catalog(value: &Value) -> Result<(), &'static str> {
         return Err("partial_catalog");
     }
     Ok(())
+}
+
+fn parse_component_model_catalog(
+    value: &Value,
+    require_complete: bool,
+) -> Result<Vec<DiscoveredUpstreamModel>, &'static str> {
+    // The current plugin ABI exposes only a bare array, with no versioned
+    // completeness/continuation contract. Preserve refresh-only support, but
+    // never use an unverifiable component snapshot for managed route changes.
+    if require_complete {
+        return Err("complete_catalog_unsupported");
+    }
+    parse_model_array(value)
 }
 
 fn parse_model_array(value: &Value) -> Result<Vec<DiscoveredUpstreamModel>, &'static str> {
@@ -1389,6 +1404,19 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(failure, CatalogFailure::transport("send", false, true));
+    }
+
+    #[test]
+    fn component_catalog_cannot_authorize_managed_route_changes_without_complete_contract() {
+        let value = json!([{"id": "a-valid-but-possibly-partial-model"}]);
+        assert_eq!(
+            parse_component_model_catalog(&value, true).unwrap_err(),
+            "complete_catalog_unsupported"
+        );
+        assert_eq!(
+            parse_component_model_catalog(&value, false).unwrap().len(),
+            1
+        );
     }
 
     #[test]
