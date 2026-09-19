@@ -150,6 +150,8 @@ test('quota refresh diagnostics stay separate from the effective observation and
   assert.equal(diagnostic.cache_hit, false);
   assert.equal(diagnostic.attempts.length, 1, 'unsafe endpoint and error fields are dropped');
   assert.deepEqual(diagnostic.attempts[0], { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false });
-  assert.equal(quotaRefreshDiagnostic({ ...failed, error_code: 'proxy.internal:1080' }).error_code, null, 'unknown top-level codes are discarded');
+  for (const unsafeCode of ['proxy.internal:1080', 'socks5h', 'proxy_password']) {
+    assert.equal(quotaRefreshDiagnostic({ ...failed, error_code: unsafeCode }).error_code, null, `unknown top-level code ${unsafeCode} is discarded`);
+  }
   assert.equal(quotaEffectiveSnapshot(observed, failed), observed, 'the failed read keeps the last effective observation');
 });
