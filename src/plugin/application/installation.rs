@@ -592,11 +592,17 @@ fn reclaim_installation_attempt_roots(
     referenced_attempts: &BTreeSet<String>,
     minimum_age: Duration,
 ) -> Result<usize, AppError> {
-    let parent = std::fs::symlink_metadata(plugin_root).map_err(|_| AppError::Internal)?;
+    let Some(parent) = allow_missing_plugin_root(std::fs::symlink_metadata(plugin_root))? else {
+        return Ok(0);
+    };
     if !parent.is_dir() || parent.file_type().is_symlink() {
         return Err(AppError::Forbidden);
     }
-    let entries = std::fs::read_dir(plugin_root).map_err(|_| AppError::Internal)?;
+    let Some(entries) = allow_missing_plugin_root(std::fs::read_dir(plugin_root))? else {
+        // The installer creates this directory later. Treat a concurrent
+        // removal before that point the same as a first installation.
+        return Ok(0);
+    };
     let mut reclaimed = 0usize;
     for entry in entries {
         if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
@@ -667,6 +673,14 @@ fn reclaim_installation_attempt_roots(
         }
     }
     Ok(reclaimed)
+}
+
+fn allow_missing_plugin_root<T>(result: std::io::Result<T>) -> Result<Option<T>, AppError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(AppError::Internal),
+    }
 }
 
 async fn bounded_install_phase<T>(
@@ -1839,6 +1853,41 @@ mod tests {
             None
         );
         assert_eq!(inventory_attempt_id(std::ffi::OsStr::new(&attempt)), None);
+    }
+
+    #[test]
+    fn first_install_reclamation_accepts_only_a_missing_plugin_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin_root = directory.path().join("not-created-until-install");
+        assert_eq!(
+            reclaim_installation_attempt_roots(
+                &plugin_root,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Duration::ZERO,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!plugin_root.exists());
+
+        std::fs::write(&plugin_root, b"not a directory").unwrap();
+        assert!(matches!(
+            reclaim_installation_attempt_roots(
+                &plugin_root,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                Duration::ZERO,
+            ),
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            allow_missing_plugin_root::<()>(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture",
+            ))),
+            Err(AppError::Internal)
+        ));
     }
 
     #[cfg(target_os = "linux")]
