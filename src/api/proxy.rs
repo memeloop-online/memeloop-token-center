@@ -1522,6 +1522,10 @@ async fn proxy_with_identity_and_conversation_spool(
             && (!consumed_outbound_attempt
                 || attempt_budget.terminal_reason(outbound_attempts).is_none())
         {
+            // Same-account transport retries happen inside send_proxy_route.
+            // A candidate transition is different: release before selection
+            // can wait on health/database admission, then rejoin the new lane.
+            drop(dispatch_permit.take());
             next_failover_reason = Some(reason);
             continue;
         }
