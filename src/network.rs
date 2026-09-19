@@ -85,6 +85,27 @@ pub async fn client_for_url(
     crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
 }
 
+/// Return a one-operation client that preserves the ordinary URL validation
+/// and DNS-pinning boundary but disables reqwest's implicit protocol retries.
+/// Use this when the caller cannot prove that replaying the request is safe.
+pub(crate) async fn client_for_url_no_retry(
+    _shared_http: &reqwest::Client,
+    value: &str,
+    scope: OutboundScope,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    let target = checked_http_url(value)?;
+    let (host, addresses, loopback) =
+        validated_endpoint(&target, scope, allow_test_loopback).await?;
+    validate_transport_security(target.scheme(), &addresses, scope, loopback)?;
+    let pins: Vec<_> = host
+        .as_deref()
+        .map(|host| (host, addresses.as_slice()))
+        .into_iter()
+        .collect();
+    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+}
+
 fn validated_literal_client(
     shared_http: &reqwest::Client,
     address: IpAddr,
@@ -194,22 +215,20 @@ pub async fn client_for_config_url_no_retry(
 /// this layer owns the SOCKS5H transport boundary. When a proxy is present the
 /// target hostname is deliberately not resolved locally.
 pub(crate) async fn client_for_oauth_url_no_retry(
-    _shared_http: &reqwest::Client,
+    shared_http: &reqwest::Client,
     value: &str,
     proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
     let target = checked_http_url(value)?;
     let Some((proxy_url, proxy_scope)) = proxy else {
-        let (host, addresses, loopback) =
-            validated_endpoint(&target, OutboundScope::Public, allow_test_loopback).await?;
-        validate_transport_security(target.scheme(), &addresses, OutboundScope::Public, loopback)?;
-        let pins: Vec<_> = host
-            .as_deref()
-            .map(|host| (host, addresses.as_slice()))
-            .into_iter()
-            .collect();
-        return crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal);
+        return client_for_url_no_retry(
+            shared_http,
+            value,
+            OutboundScope::Public,
+            allow_test_loopback,
+        )
+        .await;
     };
     if proxy_scope != OutboundScope::Private {
         return Err(AppError::BadRequest(
@@ -248,16 +267,13 @@ async fn config_url_client(
     let target_scope = scope_from_config(config);
     let Some((proxy_url, proxy_scope)) = proxy else {
         if no_retry {
-            let target = checked_http_url(value)?;
-            let (host, addresses, loopback) =
-                validated_endpoint(&target, target_scope, allow_test_loopback).await?;
-            validate_transport_security(target.scheme(), &addresses, target_scope, loopback)?;
-            let pins: Vec<_> = host
-                .as_deref()
-                .map(|host| (host, addresses.as_slice()))
-                .into_iter()
-                .collect();
-            return crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal);
+            return client_for_url_no_retry(
+                shared_private_client,
+                value,
+                target_scope,
+                allow_test_loopback,
+            )
+            .await;
         }
         return client_for_url(
             shared_private_client,

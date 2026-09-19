@@ -1431,14 +1431,19 @@ fn upstream_transport_proxy_request_hash(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
     use serde_json::{Value, json};
-    use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1450,6 +1455,13 @@ mod tests {
         AppState, api,
         config::{Config, RuntimeRole},
     };
+
+    mod http1_request {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/http1_request.rs"
+        ));
+    }
 
     #[tokio::test]
     async fn generic_reauthorization_preserves_account_and_fences_refresh_generation() {
@@ -2155,38 +2167,31 @@ mod tests {
         assert_eq!(oauth_server.received_requests().await.unwrap().len(), 2);
     }
 
-    #[tokio::test]
-    async fn consumed_refresh_disconnect_is_not_replayed_on_the_next_attempt() {
+    async fn assert_consumed_refresh_disconnect_is_not_replayed(oauth_driver: &str) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refresh_url = format!("http://{}/oauth/refresh", listener.local_addr().unwrap());
-        let (check_second, check_second_after_request) = tokio::sync::oneshot::channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
+            tokio::pin!(shutdown_rx);
             loop {
-                let read = first.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if request
-                    .windows(b"\r\n\r\n{}".len())
-                    .any(|window| window == b"\r\n\r\n{}")
-                {
-                    break;
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        let request = http1_request::read_bounded_http1_request(&mut stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(request.method, "POST");
+                        assert_eq!(request.path, "/oauth/refresh");
+                        assert_eq!(request.body.as_slice(), b"{}");
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
                 }
             }
-            assert!(
-                request
-                    .windows("refresh-once".len())
-                    .any(|window| window == b"refresh-once")
-            );
-            drop(first);
-            check_second_after_request.await.unwrap();
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_ok()
         });
 
         let directory = tempfile::tempdir().unwrap();
@@ -2194,7 +2199,7 @@ mod tests {
             "sqlite://{}?mode=rwc",
             directory
                 .path()
-                .join("oauth-refresh-disconnect.db")
+                .join(format!("{oauth_driver}-refresh-disconnect.db"))
                 .display()
         );
         let state = AppState::initialize(Config::for_test(database_url))
@@ -2205,9 +2210,12 @@ mod tests {
             .create_upstream_account(
                 CreateUpstreamAccountInput {
                     tenant_external_id: "oauth-refresh-disconnect".into(),
-                    name: "cursor-refresh-disconnect".into(),
+                    name: format!("{oauth_driver}-refresh-disconnect"),
                     driver: "http-json".into(),
-                    config: json!({"base_url": "https://api.example.test"}),
+                    config: json!({
+                        "base_url": "https://api.example.test",
+                        "network_scope": "public"
+                    }),
                     credential: UpstreamCredential::OAuth {
                         access_token: "access-before-disconnect".into(),
                         refresh_token: Some("refresh-once".into()),
@@ -2219,7 +2227,7 @@ mod tests {
                         proxy_network_scope: None,
                     },
                     oauth_session_id: Some(Uuid::from_u128(3)),
-                    oauth_driver: Some("cursor".into()),
+                    oauth_driver: Some(oauth_driver.into()),
                     oauth_refresh_url: Some(refresh_url),
                 },
                 state.config.key_pepper.as_bytes(),
@@ -2256,10 +2264,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::CONFLICT);
-        check_second.send(()).unwrap();
+        let second_body: Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
         assert!(
-            !server.await.unwrap(),
-            "an expired lease must not resend a refresh token whose outcome is unknown"
+            second_body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("outcome is unknown"))
+        );
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an accepted refresh-token POST must not be replayed, including after lease expiry"
         );
         let candidates = state
             .db
@@ -2267,5 +2285,15 @@ mod tests {
             .await
             .unwrap();
         assert!(candidates.iter().all(|(id, _)| *id != account.id));
+    }
+
+    #[tokio::test]
+    async fn cursor_refresh_disconnect_is_not_replayed_and_remains_outcome_unknown() {
+        assert_consumed_refresh_disconnect_is_not_replayed("cursor").await;
+    }
+
+    #[tokio::test]
+    async fn provider_adapter_refresh_disconnect_is_not_replayed_and_remains_outcome_unknown() {
+        assert_consumed_refresh_disconnect_is_not_replayed("provider_adapter").await;
     }
 }
