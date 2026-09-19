@@ -179,6 +179,11 @@ pub struct RequestCompatibility {
     /// This is required whenever `responses_via_chat_v1` is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_via_chat_dialect: Option<ResponsesViaChatDialect>,
+    /// The provider accepts OpenAI Responses traffic through the host's
+    /// versioned Anthropic Messages adapter.  This capability is explicit so
+    /// an Anthropic-looking URL or model name can never enable translation.
+    #[serde(default)]
+    pub responses_via_anthropic_messages_v1: bool,
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
 }
@@ -188,17 +193,18 @@ impl RequestCompatibility {
         !self.third_party
             && !self.responses_via_chat_v1
             && self.responses_via_chat_dialect.is_none()
+            && !self.responses_via_anthropic_messages_v1
             && !self.codex_multi_agent_v2
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
         // Third-party MultiAgentV2 is executable only through an explicitly
-        // declared Responses-via-Chat transport. Native Codex has its own
+        // declared, versioned Responses transport. Native Codex has its own
         // upstream Responses transport and does not use this predicate.
         self.third_party
             && self.codex_multi_agent_v2
-            && self.responses_via_chat_v1
-            && self.responses_via_chat_dialect.is_some()
+            && ((self.responses_via_chat_v1 && self.responses_via_chat_dialect.is_some())
+                || self.responses_via_anthropic_messages_v1)
     }
 }
 
@@ -618,10 +624,10 @@ impl ProviderCatalog {
             poll_url: "https://auth.openai.com/api/accounts/deviceauth/token".to_owned(),
             refresh_url: crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned(),
         });
-        types.push(builtin_interactive_oauth_provider(
+        let mut claude = builtin_interactive_oauth_provider(
             "anthropic-claude",
             "Anthropic Claude",
-            vec!["anthropic"],
+            vec!["anthropic", "openai"],
             "https://api.anthropic.com",
             InteractiveOAuthDefinition {
                 flow_kind: OAuthFlowKind::ClaudeManualPkce,
@@ -629,7 +635,28 @@ impl ProviderCatalog {
                 poll_url: "https://platform.claude.com/v1/oauth/token",
                 refresh_url: "https://platform.claude.com/v1/oauth/token",
             },
-        ));
+        );
+        claude.request_compatibility = RequestCompatibility {
+            third_party: true,
+            responses_via_anthropic_messages_v1: true,
+            codex_multi_agent_v2: true,
+            ..Default::default()
+        };
+        claude.codex_model_capabilities = Some(CodexModelCapabilities {
+            version: CODEX_MODEL_CAPABILITIES_VERSION.to_owned(),
+            agent_instructions_template: CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned(),
+            shell_type: "unified_exec".to_owned(),
+            apply_patch_tool_type: Some("freeform".to_owned()),
+            fallback_context_window: Some(200_000),
+            input_modalities: vec!["text".to_owned(), "image".to_owned()],
+            supports_image_detail_original: false,
+            include_skills_usage_instructions: false,
+            include_plugin_usage_instructions: false,
+            include_apps_usage_instructions: false,
+            supported_reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+        });
+        types.push(claude);
         let mut copilot = builtin_interactive_oauth_provider(
             "github-copilot",
             "GitHub Copilot",
@@ -678,6 +705,7 @@ impl ProviderCatalog {
             third_party: true,
             responses_via_chat_v1: true,
             responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
+            responses_via_anthropic_messages_v1: false,
             codex_multi_agent_v2: true,
         };
         kimi.codex_model_capabilities = Some(CodexModelCapabilities {
@@ -838,6 +866,15 @@ impl ProviderCatalog {
             } else {
                 None
             }
+        })
+    }
+
+    pub fn supports_responses_via_anthropic_messages_v1(&self, driver: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            provider.request_compatibility.third_party
+                && provider
+                    .request_compatibility
+                    .responses_via_anthropic_messages_v1
         })
     }
 

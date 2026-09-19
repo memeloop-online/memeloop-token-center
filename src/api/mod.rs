@@ -61,6 +61,7 @@ pub(crate) use proxy::{
 mod proxy_diagnostics;
 mod request_detail;
 mod request_normalization;
+mod responses_via_anthropic;
 mod responses_via_chat;
 mod router;
 mod routes;

@@ -64,6 +64,8 @@ pub(super) async fn send_reqwest_proxy_route(
         &outbound_base_url,
         if route.responses_chat.is_some() {
             Protocol::OpenAiChat.path()
+        } else if route.responses_anthropic.is_some() {
+            Protocol::AnthropicMessages.path()
         } else {
             protocol.path()
         },
@@ -79,7 +81,8 @@ pub(super) async fn send_reqwest_proxy_route(
     // upstream representation to SSE instead of inheriting a downstream
     // `Accept: application/json` default. Keep generic compatible routes
     // transparent.
-    let accept = if (route.responses_chat.is_some() && route.upstream_stream)
+    let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
+        && route.upstream_stream)
         || (route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
@@ -113,7 +116,7 @@ pub(super) async fn send_reqwest_proxy_route(
             .header("Editor-Version", &product)
             .header("Editor-Plugin-Version", &product);
     }
-    if protocol.is_anthropic() {
+    if protocol.is_anthropic() || route.responses_anthropic.is_some() {
         request = crate::api::anthropic::apply_request_headers(
             request,
             headers,
@@ -133,6 +136,13 @@ pub(super) async fn send_reqwest_proxy_route(
         Ok(response) => {
             let response = if let Some(context) = route.responses_chat.clone() {
                 super::kimi::translate(
+                    response,
+                    context,
+                    route.upstream_stream,
+                    sse_framing_limits,
+                )?
+            } else if let Some(context) = route.responses_anthropic.clone() {
+                super::anthropic::translate(
                     response,
                     context,
                     route.upstream_stream,
