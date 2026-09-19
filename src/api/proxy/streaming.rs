@@ -1075,7 +1075,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     let mut response = response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)?;
-    if protocol.is_anthropic() {
+    if !response_headers.is_empty() {
         crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
     }
     Ok(response)

@@ -358,6 +358,7 @@ mod tests {
                 },
             )),
             responses_chat: None,
+            responses_anthropic: None,
         };
 
         let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();

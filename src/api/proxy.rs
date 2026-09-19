@@ -669,7 +669,7 @@ async fn finish_non_sse_proxy_response(
     )
     .await;
     if let Ok(response) = result.as_mut()
-        && protocol.is_anthropic()
+        && !response_headers.is_empty()
     {
         crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
     }
@@ -1638,6 +1638,7 @@ async fn proxy_with_identity_and_conversation_spool(
             .pointer("/stream_options/include_usage")
             .and_then(Value::as_bool)
             == Some(true);
+    let responses_anthropic_route = active_route.is_responses_via_anthropic();
     drop(request_json);
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
@@ -1648,7 +1649,7 @@ async fn proxy_with_identity_and_conversation_spool(
     let upstream_account_id = Some(active_route.route.account_id);
     let route_driver = Some(active_route.route.driver.as_str());
     let status = upstream.status();
-    let response_headers = if protocol.is_anthropic() {
+    let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
         crate::api::anthropic::downstream_response_headers(upstream.headers())
     } else {
         HeaderMap::new()
@@ -1661,7 +1662,7 @@ async fn proxy_with_identity_and_conversation_spool(
             request_id,
             status,
         );
-        if protocol.is_anthropic() {
+        if protocol.is_anthropic() || responses_anthropic_route {
             let content_type = upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
