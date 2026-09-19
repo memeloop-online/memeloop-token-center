@@ -667,6 +667,17 @@ async fn discover_models(
     if !status.is_success() {
         return Err("upstream_unavailable");
     }
+    if require_complete
+        && (status == StatusCode::PARTIAL_CONTENT
+            || response.headers().contains_key(header::CONTENT_RANGE)
+            || response
+                .headers()
+                .get(header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().contains("next")))
+    {
+        return Err("partial_catalog");
+    }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_MODEL_CATALOG_BODY as u64)
@@ -741,7 +752,7 @@ async fn discover_codex_models(
         transport = "codex_account_client", total_timeout_ms = budget.total.as_millis() as u64,
         read_timeout_ms = budget.read.as_millis() as u64,
         "upstream model catalog request started");
-    let value = bounded_json_response(request, budget)
+    let value = bounded_json_response(request, budget, require_complete)
         .await
         .map_err(|failure| {
             log_catalog_failure(account, &failure, started);
@@ -836,6 +847,7 @@ fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'sta
 async fn bounded_json_response(
     request: wreq::RequestBuilder,
     budget: CatalogBudget,
+    require_complete: bool,
 ) -> Result<Value, CatalogFailure> {
     let deadline = tokio::time::Instant::now() + budget.total;
     let response = tokio::time::timeout_at(deadline, request.send())
@@ -856,6 +868,17 @@ async fn bounded_json_response(
     }
     if !status.is_success() {
         return Err(CatalogFailure::response("upstream_unavailable"));
+    }
+    if require_complete
+        && (status == StatusCode::PARTIAL_CONTENT
+            || response.headers().contains_key(header::CONTENT_RANGE)
+            || response
+                .headers()
+                .get(header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().contains("next")))
+    {
+        return Err(CatalogFailure::response("partial_catalog"));
     }
     if response
         .content_length()
@@ -887,10 +910,35 @@ async fn bounded_json_response(
 // We do not follow provider-supplied pagination URLs. A page is not a full
 // snapshot and therefore cannot authorize additions or disappearance updates.
 fn require_complete_catalog(value: &Value) -> Result<(), &'static str> {
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("errors").is_some_and(|errors| {
+            !errors.is_null() && errors.as_array().is_none_or(|errors| !errors.is_empty())
+        })
+        || value
+            .get("success")
+            .is_some_and(|success| success != &Value::Bool(true))
+    {
+        return Err("partial_catalog");
+    }
+    let count = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
     for object in [Some(value), value.get("pagination"), value.get("meta")]
         .into_iter()
         .flatten()
     {
+        let total = object
+            .get("total")
+            .or_else(|| object.get("total_count"))
+            .and_then(Value::as_u64);
+        if count
+            .zip(total)
+            .is_some_and(|(count, total)| total != count as u64)
+        {
+            return Err("partial_catalog");
+        }
         if ["has_more", "hasMore", "partial", "truncated"]
             .iter()
             .any(|key| {
@@ -924,21 +972,6 @@ fn require_complete_catalog(value: &Value) -> Result<(), &'static str> {
         .get("links")
         .and_then(|links| links.get("next"))
         .is_some_and(|next| !next.is_null() && next.as_str() != Some(""))
-    {
-        return Err("partial_catalog");
-    }
-    let count = value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(Value::as_array)
-        .map(Vec::len);
-    let total = value
-        .get("total")
-        .or_else(|| value.get("total_count"))
-        .and_then(Value::as_u64);
-    if count
-        .zip(total)
-        .is_some_and(|(count, total)| total != count as u64)
     {
         return Err("partial_catalog");
     }
@@ -1259,7 +1292,7 @@ mod tests {
             crate::provider::CodexTransportPolicy::default(),
         )
         .unwrap();
-        let task = tokio::spawn(bounded_json_response(client.get(url), budget));
+        let task = tokio::spawn(bounded_json_response(client.get(url), budget, false));
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut bytes = [0; 4096];
         let mut received = 0;
@@ -1349,6 +1382,7 @@ mod tests {
                 total: Duration::from_secs(5),
                 read: Duration::from_secs(5),
             },
+            false,
         )
         .await
         .unwrap_err();

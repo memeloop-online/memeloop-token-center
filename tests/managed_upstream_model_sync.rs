@@ -200,6 +200,14 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
             json!({"data": [{"id": "new"}], "total": 2}),
             "partial_catalog",
         ),
+        (
+            json!({"data": [{"id": "new"}], "meta": {"total": 2}}),
+            "partial_catalog",
+        ),
+        (
+            json!({"data": [{"id": "new"}], "error": {"code": "partial_failure"}}),
+            "partial_catalog",
+        ),
         (json!({"data": [{"id": "new"}, {}]}), "invalid_response"),
         (json!({"data": []}), "empty_catalog_protected"),
     ] {
@@ -212,6 +220,24 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
         assert_eq!(result["routes"]["warnings"][0], code);
         assert_eq!(result["catalog"]["models"][0]["id"], "keep");
     }
+    for response in [
+        ResponseTemplate::new(206).set_body_json(json!({"data": [{"id": "new"}]})),
+        ResponseTemplate::new(200)
+            .insert_header("Link", "</v1/models?page=2>; rel=\"next\"")
+            .set_body_json(json!({"data": [{"id": "new"}]})),
+    ] {
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let (_, result) =
+            request(&state, account, &state.config.service_token, "sync-routes").await;
+        assert_eq!(result["routes"]["warnings"][0], "partial_catalog");
+        assert_eq!(result["routes"]["added"], 0);
+        assert_eq!(result["routes"]["disabled"], 0);
+    }
     server.reset().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -223,6 +249,38 @@ async fn failed_partial_and_empty_discovery_never_change_owned_routes_or_catalog
     let routes = state.db.list_model_routes(Some(tenant)).await.unwrap();
     assert_eq!(routes.len(), 1);
     assert!(routes[0].enabled);
+}
+
+#[tokio::test]
+async fn timeout_preserves_routes_and_releases_the_directory_lease_for_retry() {
+    let (state, _directory) = state().await;
+    let server = MockServer::start().await;
+    let tenant = "managed-timeout";
+    let account = account(&state, tenant, &server.uri()).await;
+    let models = publish(&state, account, tenant, &["keep"]).await;
+    state
+        .db
+        .reconcile_managed_model_routes(account, tenant, 1, &models)
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"id": "new"}]}))
+                .set_delay(std::time::Duration::from_secs(9)),
+        )
+        .mount(&server)
+        .await;
+    let (status, result) =
+        request(&state, account, &state.config.service_token, "sync-routes").await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["routes"]["warnings"][0], "connection_failed");
+    assert_eq!(result["routes"]["disabled"], 0);
+    assert!(state.db.list_model_routes(Some(tenant)).await.unwrap()[0].enabled);
+    serve(&server, json!({"data": [{"id": "keep"}]})).await;
+    let (_, result) = request(&state, account, &state.config.service_token, "sync-routes").await;
+    assert_eq!(result["routes"]["unchanged"], 1);
 }
 
 #[tokio::test]
