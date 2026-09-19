@@ -160,6 +160,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) sse_framing_limits: crate::provider::SseFramingLimits,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
+    pub(super) dispatch_permit: Option<crate::codex_clients::DispatchPermit>,
 }
 
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
@@ -188,6 +189,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         sse_framing_limits,
         buffered_request,
         proxy_lifecycle_permit,
+        dispatch_permit,
     } = input;
     let stream_activity = state
         .metrics
@@ -218,6 +220,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // permit until proxy finalization or timeout reconciliation; accepted
         // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let _dispatch_permit = dispatch_permit;
         let archive_memory = memory.clone();
         let request_memory = memory;
         let _stream_activity = stream_activity;
@@ -1051,6 +1054,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // and connection-drain-owned, but must not retain scarce admission
         // concurrency past that boundary.
         drop(_proxy_lifecycle_permit);
+        drop(_dispatch_permit);
         if let Err(error) = archive_eof_owner.await {
             tracing::error!(
                 task_cancelled = error.is_cancelled(),

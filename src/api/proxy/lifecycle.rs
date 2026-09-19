@@ -1,6 +1,44 @@
 use super::*;
 use crate::{db::Database, proxy_lifecycle::ProxyArchiveAttempt};
 
+/// Unlike health failover exhaustion, local dispatch overload keeps its typed
+/// public body in both the response and the durable local-error archive.
+pub(super) async fn finish_dispatch_failure(
+    request: &BufferedRequest<'_>,
+    error: crate::codex_clients::DispatchError,
+    last_dispatched_upstream: Option<(Uuid, Uuid)>,
+) -> Result<Response, AppError> {
+    use crate::codex_clients::DispatchError;
+    let (status, body, retryable) = match error {
+        DispatchError::Capacity | DispatchError::Timeout => {
+            (StatusCode::SERVICE_UNAVAILABLE, error.overload_body(), true)
+        }
+        DispatchError::InvalidPolicy => (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": {"type": "upstream_error", "code": "invalid_transport_policy", "message": "invalid Codex transport policy"}}),
+            false,
+        ),
+    };
+    let mut response = finish_local_buffered_error_with_upstream_attribution(
+        request,
+        status,
+        Bytes::from(serde_json::to_vec(&body).map_err(|_| AppError::Internal)?),
+        "application/json",
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
+        Some(error.code().to_owned()),
+        ProxyRequestUpstreamAttribution::LastDispatched(last_dispatched_upstream),
+    )
+    .await?;
+    if retryable {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    Ok(response)
+}
 pub(super) async fn finish_unavailable(
     request: &BufferedRequest<'_>,
     error_code: &str,

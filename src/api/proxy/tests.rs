@@ -24,6 +24,7 @@ use crate::{
 mod archive_terminal;
 mod buffered_responses_incomplete;
 mod chat_sse_usage;
+mod codex_dispatch;
 mod codex_quota;
 mod cursor;
 mod filter_assistant;

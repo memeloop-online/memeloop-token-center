@@ -1073,6 +1073,25 @@ async fn proxy_with_identity_and_conversation_spool(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
+    // Queue before durable admission: overload consumes no request record,
+    // reservation, RPM allowance, archive transaction or billable usage.
+    let mut dispatch_permit = if codex_transport::is_driver(&primary.driver) {
+        match state
+            .codex_clients
+            .acquire_dispatch(primary, &state.metrics)
+            .await
+        {
+            Ok(permit) => Some(permit),
+            Err(crate::codex_clients::DispatchError::InvalidPolicy) => {
+                return Err(AppError::BadRequest(
+                    "invalid Codex transport policy".into(),
+                ));
+            }
+            Err(error) => return Ok(error.response()),
+        }
+    } else {
+        None
+    };
     let memory_wait = if codex_transport::is_driver(&primary.driver) {
         crate::provider::CodexTransportPolicy::parse(primary.config.get("transport_policy"))
             .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?
@@ -1344,6 +1363,34 @@ async fn proxy_with_identity_and_conversation_spool(
             return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
                 .await;
         };
+        if !active_route.is_codex()
+            || !dispatch_permit
+                .as_ref()
+                .is_some_and(|permit| permit.matches(&active_route.route))
+        {
+            // Never occupy two account/endpoint lanes during failover.
+            drop(dispatch_permit.take());
+            if active_route.is_codex() {
+                match state
+                    .codex_clients
+                    .acquire_dispatch(&active_route.route, &state.metrics)
+                    .await
+                {
+                    Ok(permit) => dispatch_permit = Some(permit),
+                    Err(error) => {
+                        upstream_attempt
+                            .complete(UpstreamAttemptTerminal::Inconclusive)
+                            .await;
+                        return lifecycle::finish_dispatch_failure(
+                            &buffered_request,
+                            error,
+                            last_dispatch,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         // Selection may have waited for database admission; do not dispatch
         // when the original deadline expired during that wait.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
@@ -1479,6 +1526,10 @@ async fn proxy_with_identity_and_conversation_spool(
             && (!consumed_outbound_attempt
                 || attempt_budget.terminal_reason(outbound_attempts).is_none())
         {
+            // Same-account transport retries happen inside send_proxy_route.
+            // A candidate transition is different: release before selection
+            // can wait on health/database admission, then rejoin the new lane.
+            drop(dispatch_permit.take());
             next_failover_reason = Some(reason);
             continue;
         }
@@ -1799,6 +1850,7 @@ async fn proxy_with_identity_and_conversation_spool(
         sse_framing_limits,
         buffered_request,
         proxy_lifecycle_permit,
+        dispatch_permit,
     })
     .await
 }

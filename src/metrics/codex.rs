@@ -52,6 +52,37 @@ impl CodexBadRequestRetry {
 }
 
 impl Metrics {
+    pub(crate) fn observe_codex_dispatch(&self, outcome: &'static str) {
+        assert!(matches!(
+            outcome,
+            "queued" | "admitted" | "capacity" | "timeout" | "cancelled" | "released"
+        ));
+        let mut values = self
+            .inner
+            .codex_dispatch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let value = values.entry(outcome).or_default();
+        *value = value.saturating_add(1);
+    }
+
+    pub(super) fn render_codex_dispatch(&self, output: &mut String) {
+        output.push_str("# HELP memeloop_token_center_codex_dispatch_total Codex dispatch admission and release events, without account or endpoint labels.\n");
+        output.push_str("# TYPE memeloop_token_center_codex_dispatch_total counter\n");
+        for (outcome, value) in self
+            .inner
+            .codex_dispatch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_codex_dispatch_total{{outcome=\"{outcome}\"}} {value}"
+            );
+        }
+    }
+
     pub(crate) fn observe_codex_bad_request_classification(
         &self,
         classification: CodexBadRequestClassification,

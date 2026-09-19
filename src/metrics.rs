@@ -48,6 +48,7 @@ struct MetricsInner {
     proxy_lifecycle_deadlines: [AtomicU64; ProxyLifecycleDeadlineOutcome::COUNT],
     codex_bad_request_classifications: Mutex<BTreeMap<CodexBadRequestClassification, u64>>,
     codex_bad_request_retries: Mutex<BTreeMap<CodexBadRequestRetry, u64>>,
+    codex_dispatch: Mutex<BTreeMap<&'static str, u64>>,
     active_http_requests: AtomicI64,
     active_streams: [AtomicI64; ActiveStreamKind::COUNT],
     active_upstreams: Mutex<BTreeMap<UpstreamActivityLabels, i64>>,
@@ -73,6 +74,7 @@ impl Default for MetricsInner {
             proxy_lifecycle_deadlines: std::array::from_fn(|_| AtomicU64::new(0)),
             codex_bad_request_classifications: Mutex::default(),
             codex_bad_request_retries: Mutex::default(),
+            codex_dispatch: Mutex::default(),
             active_http_requests: AtomicI64::new(0),
             active_streams: std::array::from_fn(|_| AtomicI64::new(0)),
             active_upstreams: Mutex::default(),
@@ -588,6 +590,7 @@ impl Metrics {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut output = String::with_capacity(16 * 1024);
+        self.render_codex_dispatch(&mut output);
         self.inner.memory_admission.render(&mut output);
         self.inner.plugin_execution.render(&mut output);
         output.push_str("# HELP memeloop_token_center_proxy_memory_rejections_total Capacity rejections by fixed admission stage.\n");
