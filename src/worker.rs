@@ -381,22 +381,21 @@ async fn refresh_plugin_service_data(
             .flatten()
             .map(|snapshot| snapshot.consecutive_failures)
             .unwrap_or(0);
-        let result =
-            if target.endpoint.component_adapter.is_some() {
-                let plugins = pinned.plugins.clone();
-                let blocking_target = target.clone();
-                blocking
+        let result = if target.endpoint.component_adapter.is_some() {
+            let plugins = pinned.plugins.clone();
+            let blocking_target = target.clone();
+            blocking
                 .run(move || plugins.collect_component_service_data(&blocking_target))
                 .await
-                .unwrap_or_else(|| {
-                    Err(crate::plugin::service_data::PluginServiceDataCollectionFailure {
+                .unwrap_or(Err(
+                    crate::plugin::service_data::PluginServiceDataCollectionFailure {
                         code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
                         error: crate::error::AppError::Internal,
-                    })
-                })
-            } else {
-                pinned.plugins.collect_http_service_data(&target).await
-            };
+                    },
+                ))
+        } else {
+            pinned.plugins.collect_http_service_data(&target).await
+        };
         let completed_at = crate::db::unix_millis();
         match result {
             Ok(collected) => {

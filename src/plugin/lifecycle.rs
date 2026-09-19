@@ -620,6 +620,7 @@ mod tests {
             plugins: Arc::new(vec![super::super::LoadedPlugin {
                 manifest,
                 component: None,
+                service_data_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,
                 routing_validator: None,
@@ -663,6 +664,7 @@ mod tests {
             plugins: Arc::new(vec![super::super::LoadedPlugin {
                 manifest,
                 component: None,
+                service_data_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,
                 routing_validator: None,
