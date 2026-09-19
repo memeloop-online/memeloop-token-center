@@ -1630,10 +1630,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code, attempts, cache_hit]
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
-                  cache_hit: { type: boolean, description: True when this caller reused a cached or singleflight result. Attempt diagnostics still describe the original supplier read. }
+                  cache_hit: { type: boolean, description: Optional additive v1 diagnostic. True for cached or singleflight results and stale evidence returned before a supplier attempt. Ordinary cache hits preserve the original attempt history; early admission failures have no current supplier attempts. }
                   attempts:
                     type: array
                     maxItems: 8

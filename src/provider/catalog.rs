@@ -718,10 +718,7 @@ impl ProviderCatalog {
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
         for provider in &mut types {
-            if matches!(
-                provider.id.as_str(),
-                "openai-codex" | "kimi-oauth" | "google-antigravity"
-            ) {
+            if matches!(provider.id.as_str(), "openai-codex" | "kimi-oauth") {
                 provider.config_schema["properties"]["quota_read_policy"] = json!({
                     "type": "object", "additionalProperties": false, "default": {},
                     "description": "Runtime-adjustable read-only quota retry policy. Does not affect inference, reset consumption or OAuth; max_attempts includes the first request.",

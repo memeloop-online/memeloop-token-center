@@ -24,6 +24,17 @@
             "network_scope"
           ],
           "properties": {
+            "quota_read_policy": {
+              "type": "object",
+              "additionalProperties": false,
+              "default": {},
+              "description": "Runtime-adjustable read-only quota retry policy. Does not affect generation, reset or OAuth. max_attempts includes the first request.",
+              "properties": {
+                "max_attempts": { "type": "integer", "minimum": 1, "maximum": 4, "default": 3 },
+                "initial_delay_millis": { "type": "integer", "minimum": 50, "maximum": 2000, "default": 200 },
+                "total_timeout_millis": { "type": "integer", "minimum": 1000, "maximum": 30000, "default": 20000 }
+              }
+            },
             "base_url": {
               "type": "string",
               "format": "uri",

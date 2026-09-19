@@ -571,6 +571,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn early_stale_fallback_marks_cache_reuse_without_replaying_old_diagnostics() {
+        let account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",
+            "driver":"openai-codex", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        let session = ReadSession::testing(policy());
+        session
+            .run(context(), || async { Ok::<(), Failure>(()) })
+            .await
+            .unwrap();
+        let mut previous = QuotaSnapshot::empty(&account, "tenant", None);
+        previous.status = "ready";
+        previous.observed_at = Some(unix_millis());
+        previous.attempts = session.attempts();
+        assert_eq!(previous.attempts.len(), 1);
+        for code in [
+            "quota_busy",
+            "quota_refresh_in_progress",
+            "invalid_quota_read_policy",
+        ] {
+            let fallback = stale_or_error(
+                Some(previous.clone()),
+                QuotaSnapshot::empty(&account, "tenant", Some(code)),
+                unix_millis(),
+            );
+            assert!(fallback.cache_hit);
+            assert!(fallback.stale);
+            assert!(fallback.attempts.is_empty());
+            assert_eq!(fallback.observed_at, previous.observed_at);
+            assert_eq!(fallback.error_code, Some(code));
+        }
+    }
+
+    #[tokio::test]
     async fn credential_rotation_between_attempts_prevents_the_next_send() {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::initialize(crate::config::Config::for_test(format!(

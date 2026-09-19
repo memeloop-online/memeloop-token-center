@@ -577,7 +577,7 @@ impl QuotaCache {
             }
             (cached.value.clone(), cached.refresh_generation)
         };
-        let fallback = |error| stale_or_error(previous.clone(), empty(Some(error)), now);
+        let fallback = |error| stale_or_error(previous.clone(), empty(Some(error)), unix_millis());
         let total_deadline = tokio::time::Instant::now() + QUOTA_TOTAL_READ_BUDGET;
         let flight_deadline =
             total_deadline.min(tokio::time::Instant::now() + QUOTA_SINGLEFLIGHT_WAIT);
@@ -740,6 +740,11 @@ fn stale_or_error(
             value.stale = true;
             value.freshness = "stale";
             value.error_code = empty.error_code;
+            // Admission/policy failures can return before a supplier session
+            // exists. These reuse cached evidence, not the previous read's
+            // attempts. A real refresh below replaces both diagnostic fields.
+            value.cache_hit = true;
+            value.attempts.clear();
             value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
                 value.reset_capability.implementation_available;
@@ -1000,7 +1005,10 @@ async fn get_codex_json(
             let started = tokio::time::Instant::now();
             let mut request = http
                 .get(url)
-                .timeout(budget.read)
+                // read is a post-header body-inactivity budget, never a
+                // connection/request deadline. The account's connection limit
+                // (including a 15s SOCKS handshake) runs inside session.deadline.
+                .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
                 .default_headers(false)
                 .header(
                     auth.credential_header.clone(),
@@ -1138,6 +1146,8 @@ mod tests {
         assert_eq!(fallback.tenant_external_id, "after-rename");
         assert_eq!(fallback.freshness, "stale");
         assert_eq!(fallback.error_code, Some("quota_timeout"));
+        assert!(fallback.cache_hit);
+        assert!(fallback.attempts.is_empty());
         assert_eq!(
             fallback.reset_capability.reason,
             "quota_reset_not_supported"
@@ -1149,6 +1159,7 @@ mod tests {
         );
         assert!(expired.observed_at.is_none());
         assert_eq!(expired.status, "error");
+        assert!(!expired.cache_hit);
     }
 
     #[test]
@@ -1278,6 +1289,82 @@ mod tests {
             "background_recovery"
         );
         assert_eq!(QuotaReadTrigger::ResetWorkflow.as_str(), "reset_workflow");
+    }
+
+    #[tokio::test]
+    async fn default_total_budget_allows_a_fifteen_second_proxy_connect_policy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
+        let config = json!({
+            "transport_policy": {"connect_timeout_millis":15000},
+            "quota_read_policy": {"max_attempts":1}
+        });
+        let budget = codex_quota_budget(&config).unwrap();
+        assert_eq!(budget.total, Duration::from_secs(20));
+        assert_eq!(budget.read, Duration::from_secs(8));
+        let client = crate::build_codex_http_client_with_policy(
+            crate::provider::CodexTransportPolicy::parse(config.get("transport_policy")).unwrap(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let session = retry::ReadSession::testing(budget);
+            get_codex_json(
+                &client,
+                CodexQuotaAuth {
+                    credential_header: http::header::AUTHORIZATION,
+                    credential_value: http::HeaderValue::from_static("Bearer fixture-token"),
+                    account: http::HeaderValue::from_static("fixture-account"),
+                    proxy_url: Some(&proxy_url),
+                },
+                "http://quota.example.invalid/usage",
+                QuotaRequestContext {
+                    account_id: Uuid::from_u128(1),
+                    credential_generation: 2,
+                    endpoint_kind: "usage",
+                    trigger: QuotaReadTrigger::Manual,
+                },
+                budget,
+                &session,
+            )
+            .await
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        // Stall inside the proxy handshake, beyond the body-inactivity budget
+        // but still inside the explicitly configured 15-second connection limit.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::resume();
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 5];
+        socket.read_exact(&mut connect).await.unwrap();
+        assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+        let mut target_and_port = vec![0; connect[4] as usize + 2];
+        socket.read_exact(&mut target_and_port).await.unwrap();
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        while !received.ends_with(b"\r\n\r\n") {
+            assert!(received.len() < 4096);
+            received.push(socket.read_u8().await.unwrap());
+        }
+        let body = br#"{"plan_type":"pro"}"#;
+        socket
+            .write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap()["plan_type"], "pro");
     }
 
     #[tokio::test]
