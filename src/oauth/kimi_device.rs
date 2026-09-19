@@ -518,11 +518,18 @@ mod tests {
     };
 
     use super::*;
-    use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
+    use tokio::{net::TcpListener, sync::oneshot};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
     };
+
+    mod http1_request {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/http1_request.rs"
+        ));
+    }
 
     #[test]
     fn form_post_future_is_send_without_retaining_the_form_serializer() {
@@ -553,20 +560,15 @@ mod tests {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.unwrap();
-                        let mut request = Vec::new();
-                        let mut chunk = [0_u8; 4096];
-                        loop {
-                            let read = stream.read(&mut chunk).await.unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            request.extend_from_slice(&chunk[..read]);
-                            if request.windows(kimi::CLIENT_ID.len()).any(|window| {
-                                window == kimi::CLIENT_ID.as_bytes()
-                            }) {
-                                break;
-                            }
-                        }
+                        let request = http1_request::read_bounded_http1_request(&mut stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(request.method, "POST");
+                        assert_eq!(request.path, "/device");
+                        assert_eq!(
+                            request.body,
+                            format!("client_id={}", kimi::CLIENT_ID).into_bytes()
+                        );
                         server_attempts.fetch_add(1, Ordering::SeqCst);
                         drop(stream);
                     }

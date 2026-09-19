@@ -339,6 +339,13 @@ mod tests {
         matchers::{body_string_contains, header, method, path},
     };
 
+    mod http1_request {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/http1_request.rs"
+        ));
+    }
+
     struct RecordingRequestGuard(AtomicBool);
 
     #[async_trait::async_trait]
@@ -520,20 +527,18 @@ mod tests {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.unwrap();
-                        let mut request = Vec::new();
-                        let mut chunk = [0_u8; 4096];
-                        loop {
-                            let read = stream.read(&mut chunk).await.unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            request.extend_from_slice(&chunk[..read]);
-                            if request.windows(b"refresh_token=fixture-refresh".len()).any(|window| {
-                                window == b"refresh_token=fixture-refresh"
-                            }) {
-                                break;
-                            }
-                        }
+                        let request = http1_request::read_bounded_http1_request(&mut stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(request.method, "POST");
+                        assert_eq!(request.path, "/token");
+                        assert_eq!(
+                            request.body,
+                            format!(
+                                "client_id={CLIENT_ID}&grant_type=refresh_token&refresh_token=fixture-refresh"
+                            )
+                            .into_bytes()
+                        );
                         server_attempts.fetch_add(1, Ordering::SeqCst);
                         drop(stream);
                     }

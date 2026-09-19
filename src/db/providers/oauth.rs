@@ -1444,7 +1444,6 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use serde_json::{Value, json};
-    use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1456,6 +1455,13 @@ mod tests {
         AppState, api,
         config::{Config, RuntimeRole},
     };
+
+    mod http1_request {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/http1_request.rs"
+        ));
+    }
 
     #[tokio::test]
     async fn generic_reauthorization_preserves_account_and_fences_refresh_generation() {
@@ -2175,26 +2181,12 @@ mod tests {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.unwrap();
-                        let mut request = Vec::new();
-                        let mut chunk = [0_u8; 4096];
-                        loop {
-                            let read = stream.read(&mut chunk).await.unwrap();
-                            if read == 0 {
-                                break;
-                            }
-                            request.extend_from_slice(&chunk[..read]);
-                            if request
-                                .windows(b"\r\n\r\n{}".len())
-                                .any(|window| window == b"\r\n\r\n{}")
-                            {
-                                break;
-                            }
-                        }
-                        assert!(
-                            request
-                                .windows("refresh-once".len())
-                                .any(|window| window == b"refresh-once")
-                        );
+                        let request = http1_request::read_bounded_http1_request(&mut stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(request.method, "POST");
+                        assert_eq!(request.path, "/oauth/refresh");
+                        assert_eq!(request.body.as_slice(), b"{}");
                         server_attempts.fetch_add(1, Ordering::SeqCst);
                         drop(stream);
                     }

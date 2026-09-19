@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
@@ -16,12 +21,7 @@ use memeloop_token_center::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use tokio::{
-    io::AsyncReadExt,
     net::TcpListener,
     sync::{oneshot, watch},
 };
@@ -31,6 +31,13 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header as matches_header, method, path},
 };
+
+mod http1_request {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/http1_request.rs"
+    ));
+}
 
 #[tokio::test]
 async fn plugin_provider_onboards_through_the_real_management_api() {
@@ -504,24 +511,15 @@ async fn component_provider_does_not_replay_after_the_server_accepts_the_prepare
                 _ = &mut shutdown_rx => break,
                 accepted = listener.accept() => {
                     let (mut stream, _) = accepted.unwrap();
-                    let mut request = Vec::new();
-                    let mut chunk = [0_u8; 4096];
-                    loop {
-                        let read = stream.read(&mut chunk).await.unwrap();
-                        if read == 0 {
-                            break;
-                        }
-                        request.extend_from_slice(&chunk[..read]);
-                        if request
-                            .windows(b"{\"prompt\":\"from-component\",\"model\":\"vendor-model\"}".len())
-                            .any(|window| {
-                                window == b"{\"prompt\":\"from-component\",\"model\":\"vendor-model\"}"
-                            })
-                        {
-                            break;
-                        }
-                    }
-                    assert!(request.starts_with(b"POST /vendor/infer "));
+                    let request = http1_request::read_bounded_http1_request(&mut stream)
+                        .await
+                        .unwrap();
+                    assert_eq!(request.method, "POST");
+                    assert_eq!(request.path, "/vendor/infer");
+                    assert_eq!(
+                        request.body.as_slice(),
+                        b"{\"prompt\":\"from-component\",\"model\":\"vendor-model\"}"
+                    );
                     server_attempts.fetch_add(1, Ordering::SeqCst);
                     drop(stream);
                 }
