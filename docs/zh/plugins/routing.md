@@ -76,40 +76,6 @@ interface group-routing-v1 {
 
 清单中声明 `"health_policy": "native"` 时，插件排序照常生效，但宿主不采用插件的健康指令：准入、冷却、探针与恢复全部走原生路径，`observe` 也不会被调用。这适合只想做候选偏好的策略包。
 
-## 可选额度上下文
-
-签名清单可以用 `capabilities: [{ "kind": "group_routing_quota" }]` 选择加入（要求 `health_policy: "native"`）。加入后 `plan` 输入增加 `quota_context`：
-
-```json
-{
-  "quota_context": {
-    "version": "account-windows-v1",
-    "now_ms": 1000,
-    "accounts": [
-      {
-        "account_id": "authorized-account-id",
-        "generation": 7,
-        "provider": "example-oauth",
-        "observed_at": 900,
-        "valid_until": 1100,
-        "windows": [
-          {
-            "id": "summary",
-            "period_seconds": 604800,
-            "reset_at": 2000,
-            "reset_is_estimated": false,
-            "remaining_fraction": 0.5,
-            "exhausted": false
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-时间为 Unix 毫秒；窗口的周期、重置时间、剩余比例与耗尽状态都可以为 `null`——未知就是未知，宿主不会合成「可用」。未声明该能力的插件收到的输入与之前完全一致（不含 `quota_context` 字段）。
-
 ## 隔离
 
 每次调用有独立的 fuel、内存与最多 100 ms 执行时间；路由组件没有网络与 KV 访问，即使同包其他贡献声明了这些能力。请求从规划到终态观测固定使用同一份已编译组件与清单快照，中途升级插件不改变在途请求的行为。

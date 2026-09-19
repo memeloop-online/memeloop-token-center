@@ -76,40 +76,6 @@ At request termination, the host calls the component again. The input replaces `
 
 When the manifest declares `"health_policy": "native"`, plugin ordering still applies, but the host ignores plugin health instructions: admission, cooldown, probes, and recovery all use native paths, and `observe` is not called. This is suitable for strategy packages that only prefer candidates.
 
-## Optional quota context
-
-A signed manifest can opt in with `capabilities: [{ "kind": "group_routing_quota" }]` (which requires `health_policy: "native"`). After opting in, `plan` input gains `quota_context`:
-
-```json
-{
-  "quota_context": {
-    "version": "account-windows-v1",
-    "now_ms": 1000,
-    "accounts": [
-      {
-        "account_id": "authorized-account-id",
-        "generation": 7,
-        "provider": "example-oauth",
-        "observed_at": 900,
-        "valid_until": 1100,
-        "windows": [
-          {
-            "id": "summary",
-            "period_seconds": 604800,
-            "reset_at": 2000,
-            "reset_is_estimated": false,
-            "remaining_fraction": 0.5,
-            "exhausted": false
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Times are Unix milliseconds. A window's period, reset time, remaining ratio, and exhausted state may each be `null`—unknown stays unknown, and the host does not synthesize “available.” A plugin without this capability receives exactly the previous input, without a `quota_context` field.
-
 ## Isolation
 
 Each call has independent fuel and memory and at most 100 ms of execution time. The routing component has no network or KV access, even if other contributions in the same package declare those capabilities. From planning through terminal observation, a request uses the same compiled component and manifest snapshot; upgrading a plugin mid-request does not change in-flight behavior.

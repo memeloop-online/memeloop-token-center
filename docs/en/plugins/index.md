@@ -16,7 +16,6 @@ The manifest's `capabilities` determine what a plugin can do:
 | `log` | Emit bounded host log events |
 | `kv` | Use key/value storage isolated to the plugin namespace |
 | `http` | Access only HTTPS origins listed in the manifest |
-| `group_routing_quota` | Read quota-window snapshots for authorized candidates |
 
 The host bounds fuel, memory, and execution time for every call. A plugin cannot see upstream credentials or bypass model permissions, balances, rate limits, or audit boundaries.
 

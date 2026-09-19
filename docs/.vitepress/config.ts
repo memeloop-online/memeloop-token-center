@@ -8,11 +8,6 @@ const docsDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const LOCALES = ['zh', 'en'] as const
 type Locale = (typeof LOCALES)[number]
 
-const EXCLUDED_SITE_PAGES = new Set([
-  'zh/plugins/operator-ui.md',
-  'en/plugins/operator-ui.md'
-])
-
 // Directories that are part of the VitePress site rather than legacy content.
 const SITE_DIRS = new Set([...LOCALES, 'public', '.vitepress', 'node_modules'])
 
@@ -30,7 +25,6 @@ function computeSrcExclude(): string[] {
       patterns.push(entry)
     }
   }
-  patterns.push(...EXCLUDED_SITE_PAGES)
   return patterns
 }
 
@@ -53,7 +47,7 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
   const entries = readdirSync(dir)
     .filter((entry) => !entry.startsWith('.'))
     .sort((a, b) => {
-      const order = ['index.md', 'getting-started.md', 'upstreams.md', 'routing.md', 'credentials.md', 'requests.md', 'api.md', 'development.md', 'operator-ui.md']
+      const order = ['index.md', 'getting-started.md', 'upstreams.md', 'routing.md', 'credentials.md', 'requests.md', 'api.md', 'development.md']
       const rank = (name: string) => order.includes(name) ? order.indexOf(name) : order.length
       return rank(a) - rank(b) || a.localeCompare(b)
     })
@@ -61,8 +55,6 @@ function sidebarItems(dir: string, linkPrefix: string): DefaultTheme.SidebarItem
   const items: DefaultTheme.SidebarItem[] = []
   for (const entry of entries) {
     const full = path.join(dir, entry)
-    const relative = path.relative(docsDir, full).split(path.sep).join('/')
-    if (EXCLUDED_SITE_PAGES.has(relative)) continue
     if (statSync(full).isDirectory()) {
       const children = sidebarItems(full, `${linkPrefix}${entry}/`)
       if (children.length === 0) continue

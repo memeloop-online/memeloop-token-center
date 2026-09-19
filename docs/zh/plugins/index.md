@@ -16,7 +16,6 @@ MTC 插件是版本化的 WebAssembly 组件（Component Model），用于在明
 | `log` | 产生有界的宿主日志事件 |
 | `kv` | 使用按插件命名空间隔离的键值存储 |
 | `http` | 仅访问清单精确列出的 HTTPS origin |
-| `group_routing_quota` | 读取已授权候选的额度窗口快照 |
 
 主机为每次调用提供有界的 fuel、内存和执行期限。插件不会看到上游凭证，也不能绕过模型权限、余额、限流或审计边界。
 
