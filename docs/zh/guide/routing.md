@@ -1,72 +1,26 @@
 # 模型路由
 
-模型路由决定「客户端请求的公开模型名」由哪些上游账户承接。授权是关系型的：模型权限不藏在模型名列表里，而是由凭证 → 路由 → 账户的显式授予链决定。
+模型路由把客户端可见的公开模型名映射到一个或多个上游模型。部署管理员配置路由和凭证授权后，客户端只需要使用公开模型名，不必了解实际供应商名称或账号选择。
 
-## 授权链
+![凭据通过路由或路由组获得授权；路由选取账户和上游组，经健康与模型兼容检查后形成可派发候选。](/diagrams/routing.svg)
 
-![凭据通过路由或路由组获得授权；路由选取账户和上游组，经排除规则、健康与模型兼容检查后形成可派发候选。](/diagrams/routing.svg)
+## 客户端看到什么
 
-- 路由组（Route Group）是授权的集合：把一组路由整体授予凭证。
-- Provider Group 是上游账户的集合：只有被路由显式 include 时才参与候选；exclusion 永远优先于直接账户和 include。
-- 凭证组（Credential Group）不参与授权图。
-- 候选始终绑定请求中的公开模型与协议；目录不兼容、已停用或未授权的账户不会成为候选。
+请求中的 `model` 使用公开模型名，例如 `example-chat`。MTC 在请求进入时根据当前授权选择可用的上游候选，并在候选失败时按部署策略继续尝试其他候选。
 
-## 创建路由
+路由可以提供：
 
-`POST /internal/v1/model-routes`（完整定义见 [model-route JSON Schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/model-route.schema.json)）：
+- 一个公开名称对应多个供应商模型；
+- 按应用或凭证授予不同的模型范围；
+- 对模型兼容性、健康状态和请求预算进行统一检查；
+- 在候选不可用时进行有界的故障转移。
 
-| 字段 | 说明 |
-| --- | --- |
-| `public_model` | 客户端可见的公开模型名 |
-| `upstream_model` | 发往供应商的模型名；不在所选账户目录中时需 `custom_model_confirmed=true` |
-| `protocol` | `openai`、`anthropic` 或 `generation` |
-| `upstream_account_ids` | 候选账户（或用 `included_provider_group_ids`） |
-| `priority` | 同模型多条路由时的优先级，默认 0 |
+## 对请求的影响
 
-不再使用的路由用 `POST /internal/v1/model-routes/{route_id}/archive` 归档；历史请求的归属不受影响。
+路由和健康状态在请求进入时形成快照。在途请求继续使用自己的快照；之后发生的配置变化不会为已开始的请求增加候选或延长发送期限。成功准入的响应流不会因为后续路由变化被截断。
 
-## 候选排序与账户偏好
-
-网关在传输准备前解析出有界、已授权的候选集合。排序来自路由优先级与健康状态；账户「偏好」只能由已安装的流量策略插件在**已授权集合内**调整顺序——它不能增加账户、覆盖授予或强行启用不可用账户。客户端请求本身不能指定上游账户。
-
-## 健康与故障转移边界
-
-冷却和「是否允许重试」是两个独立决定：
-
-- **可以换候选**：明确的 HTTP 429 拒绝、投递前确定的连接失败。
-- **绝不重放**：派发后收到的 503、其他 5xx、输出帧错误、已产生可见输出、不确定的发送超时。已派发的请求无法证明供应商没有执行，盲目重试可能造成重复计费。
-
-对原生 Codex 上游，结构化的 `usage_limit_reached` 429 会被识别为配额耗尽并按供应商给出的 `resets_at` / `Retry-After` 冷却（上限七天）；普通限流使用常规冷却。冷却期外的恢复通过单半开探针完成。
-
-候选全部不可用且故障性质为临时不可用（`unavailable`）时，未发出的请求可以在原有 Deadline 内等待一次恢复；等待不会补充尝试次数或延长期限。已经消耗过出站尝试的请求不会进入等待。
-
-## Codex 传输策略 `transport_policy`
-
-原生 Codex 账户可以在 `config.transport_policy` 中调整连接、故障转移与 SSE framing 预算（版本 1，缺失 `version` 按 1 处理；未知字段与越界值会被拒绝）：
-
-| 字段 | 默认 | 允许范围 |
-| --- | --- | --- |
-| `connect_attempts` | 2 | 1–4 |
-| `connect_retry_delay_millis` | 150 | 0–2000 |
-| `shared_probe_attempts` | 跟随服务健康设置 | 0–4 |
-| `candidate_attempts` | 3 | 1–8 |
-| `failover_deadline_millis` | 300000 | 1000–300000 |
-| `max_sse_event_bytes` | 8388608 | 262144–16777216 |
-| `max_sse_framed_bytes` | 8454144 | `max_sse_event_bytes`–16842752 |
-| `max_sse_terminal_hold_bytes` | 8454144 | `max_sse_event_bytes`–`max_sse_framed_bytes` |
-
-通过既有的 `PUT /internal/v1/upstreams/{account_id}` 账户更新（CAS）修改。候选数与 Deadline 在请求入场时快照一次；SSE 限制在选定出站尝试时快照一次，并由响应头准入、sanitizer、投递 capture、归档投影和 terminal hold 共同使用。运行时修改只影响后续请求，不会改变正在执行的流。Deadline 到期后不再发起新的发送，但成功准入的响应流不会被截断。
-
-每个获准投递的 SSE 流会先从进程级代理内存预算中预留 framing 与 terminal 两份缓冲 envelope。提高账号上限会相应降低可准入的并发流数量，而不会让 framing 与终止缓冲区的聚合内存越过全局预算；归档 JSON 转换仍使用独立的加权准入。
-
-## 自定义模型的预留上限 `reservation_token_bounds`
-
-请求执行前，网关会按价格与词元上限预留一笔余额；取得供应商完整用量后按实结算，预留金额不等于最终费用。
-
-- 目录外的自定义模型必须配置精确的 `reservation_token_bounds`；缺失时该候选被跳过（在预留、归档或发送之前停止），不影响其他已授权候选。
-- 取值依据只能是：同步的账户模型目录中**精确同名模型**的上限，或供应商确认的该模型输出限制。不要借用其他模型的上下文窗口或历史未知值。
-- 目录只公布上下文窗口时，它只能作为保守预留界限，而不是供应商宣称的输出最大值。
+客户端可以通过 `/v1/models` 查看当前凭证可访问的公开模型。模型列表不代表每次请求都能使用所有候选，最终可用性还取决于上游状态和请求约束。
 
 ## 插件路由
 
-运营者还可以为 Provider Group / Route Group 选择已安装插件提供的路由策略（group-routing-v1 ABI），插件只对已授权候选做排序与有界的健康建议。协议细节见[插件：组路由](../plugins/routing.md)。
+插件可以为已授权候选提供有界的排序或健康建议。插件不能读取上游凭证、扩大模型权限或绕过余额、限流与审计边界。协议细节见[插件组路由](../plugins/routing.md)。

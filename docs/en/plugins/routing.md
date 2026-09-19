@@ -9,14 +9,11 @@ interface group-routing-v1 {
 }
 ```
 
-## Operator configuration
+## How the host uses a strategy
 
-Provider Group and Route Group editors expose a **native / installed strategy** selector, plugin configuration form, and integer priority:
+Group routing strategies process only candidates already authorized by the host. A deployment can choose a native or installed strategy for a group and provide a stable priority when multiple groups match; choosing a strategy never grants a new model or account permission.
 
-- `PUT /internal/v1/provider-groups/{group_id}/routing-strategy` (same shape for Route Group) requires `tenant_external_id`, `expected_updated_at`, `expected_strategy_version`, and `routing_priority`; send `null` as `routing_strategy` to restore the native strategy. A conflict returns 409 and refreshes the version for an explicit operator retry; even clearing the strategy increments the version.
-- A Provider Group participates only when explicitly included by a route; a Route Group remains an authorization set, and selecting a strategy grants no authorization.
-- When multiple groups match, the highest priority executes first; ties sort by group UUID ascending. Candidates from groups with a configured strategy precede unconfigured native candidates.
-- If strategy code is missing, invalid, or traps, that group falls back to native handling (the request is unaffected; only low-cardinality diagnostics are recorded).
+If strategy code is missing, invalid, or traps, the host falls back to native handling. The request continues to use the core authorization, health, and budget boundaries.
 
 ## `plan`: planning
 
@@ -78,40 +75,6 @@ At request termination, the host calls the component again. The input replaces `
 ## Native health mode
 
 When the manifest declares `"health_policy": "native"`, plugin ordering still applies, but the host ignores plugin health instructions: admission, cooldown, probes, and recovery all use native paths, and `observe` is not called. This is suitable for strategy packages that only prefer candidates.
-
-## Optional quota context
-
-A signed manifest can opt in with `capabilities: [{ "kind": "group_routing_quota" }]` (which requires `health_policy: "native"`). After opting in, `plan` input gains `quota_context`:
-
-```json
-{
-  "quota_context": {
-    "version": "account-windows-v1",
-    "now_ms": 1000,
-    "accounts": [
-      {
-        "account_id": "authorized-account-id",
-        "generation": 7,
-        "provider": "example-oauth",
-        "observed_at": 900,
-        "valid_until": 1100,
-        "windows": [
-          {
-            "id": "summary",
-            "period_seconds": 604800,
-            "reset_at": 2000,
-            "reset_is_estimated": false,
-            "remaining_fraction": 0.5,
-            "exhausted": false
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Times are Unix milliseconds. A window's period, reset time, remaining ratio, and exhausted state may each be `null`—unknown stays unknown, and the host does not synthesize “available.” A plugin without this capability receives exactly the previous input, without a `quota_context` field.
 
 ## Isolation
 

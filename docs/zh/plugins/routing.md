@@ -9,14 +9,11 @@ interface group-routing-v1 {
 }
 ```
 
-## 运营配置
+## 宿主如何使用策略
 
-Provider Group 与 Route Group 编辑器中出现「原生 / 已安装策略」选择器、插件配置表单和整数优先级：
+组路由策略只处理宿主已经授权的候选。部署可以为分组选择原生策略或已安装的插件策略，并为多个命中分组提供稳定优先级；选择策略本身不会授予新的模型或账户权限。
 
-- `PUT /internal/v1/provider-groups/{group_id}/routing-strategy`（Route Group 同形）要求 `tenant_external_id`、`expected_updated_at`、`expected_strategy_version` 与 `routing_priority`；`routing_strategy` 传 `null` 恢复原生策略。冲突返回 409 并刷新版本，操作员显式重试；即使清除策略版本号也会递增。
-- Provider Group 只有被路由显式 include 才参与；Route Group 仍是授权集合，选择策略不会带来授权。
-- 多个分组命中时优先级高者先执行，同优先级按组 UUID 升序；配置了策略的分组候选先于未配置的原生候选。
-- 策略代码缺失、无效或 trap 时，该分组回退为原生处理（请求不受影响，只记录低基数诊断）。
+策略代码缺失、无效或 trap 时，宿主回退到原生处理，请求继续使用核心的授权、健康和预算边界。
 
 ## plan：规划
 
@@ -78,40 +75,6 @@ Provider Group 与 Route Group 编辑器中出现「原生 / 已安装策略」�
 ## 原生健康模式
 
 清单中声明 `"health_policy": "native"` 时，插件排序照常生效，但宿主不采用插件的健康指令：准入、冷却、探针与恢复全部走原生路径，`observe` 也不会被调用。这适合只想做候选偏好的策略包。
-
-## 可选额度上下文
-
-签名清单可以用 `capabilities: [{ "kind": "group_routing_quota" }]` 选择加入（要求 `health_policy: "native"`）。加入后 `plan` 输入增加 `quota_context`：
-
-```json
-{
-  "quota_context": {
-    "version": "account-windows-v1",
-    "now_ms": 1000,
-    "accounts": [
-      {
-        "account_id": "authorized-account-id",
-        "generation": 7,
-        "provider": "example-oauth",
-        "observed_at": 900,
-        "valid_until": 1100,
-        "windows": [
-          {
-            "id": "summary",
-            "period_seconds": 604800,
-            "reset_at": 2000,
-            "reset_is_estimated": false,
-            "remaining_fraction": 0.5,
-            "exhausted": false
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-时间为 Unix 毫秒；窗口的周期、重置时间、剩余比例与耗尽状态都可以为 `null`——未知就是未知，宿主不会合成「可用」。未声明该能力的插件收到的输入与之前完全一致（不含 `quota_context` 字段）。
 
 ## 隔离
 
