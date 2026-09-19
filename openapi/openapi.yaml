@@ -2106,6 +2106,29 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/upstreams/{account_id}/models/sync-routes:
+    post:
+      tags: [Upstream providers]
+      operationId: syncUpstreamModelsAndManagedRoutes
+      summary: Refresh a complete catalog and reconcile explicitly managed model routes
+      description: Requires both providers:write and routes:write. This opt-in operation is separate from models/sync and background refresh. Only a successful, complete, nonempty discovery can add or disable managed routes. Failed, timed-out, paginated, partial, malformed and empty responses preserve the last catalog and all managed routes. A concurrent refresh returns skipped with sync_in_progress; callers may retry. Managed identity is tenant/account/upstream_model/protocol, not public model; retries cannot duplicate owned routes and existing manual candidates are never adopted. Public model equals upstream model, with priority zero and wildcard catalog protocols mapped only to openai. No credential grants or groups are created or replaced. Operator status changes (including no-op disables), edits, archive and deletion protect the route from subsequent reconciliation; deletion leaves an ownership tombstone. Only catalog_missing disables can be restored automatically. Catalog publication precedes a transactional route reconciliation; changed/stale snapshots skip reconciliation safely and a retry converges. The price phase is explicitly deferred and imports no prices.
+      security: [{ serviceBearer: [] }]
+      x-required-scopes: [providers:write, routes:write]
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Catalog state plus route change counters and warnings; inspect warnings because success does not imply reconciliation ran.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ManagedUpstreamModelSyncResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/upstream-models:
     get:
       tags: [Model routes]
@@ -7949,6 +7972,45 @@ components:
         models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/models' }
         disabled_models: { $ref: '#/components/schemas/UpstreamModelCatalog/properties/disabled_models' }
         price_sync: { $ref: '#/components/schemas/UpstreamModelPriceSyncResult' }
+    ManagedUpstreamModelSyncResponse:
+      type: object
+      additionalProperties: false
+      required: [catalog, routes, price_sync]
+      properties:
+        catalog: { $ref: '#/components/schemas/UpstreamModelCatalog' }
+        routes:
+          type: object
+          additionalProperties: false
+          required: [added, disabled, restored, unchanged, skipped, warnings]
+          properties:
+            added: { type: integer, minimum: 0 }
+            disabled: { type: integer, minimum: 0 }
+            restored: { type: integer, minimum: 0 }
+            unchanged: { type: integer, minimum: 0 }
+            skipped:
+              type: integer
+              minimum: 0
+              description: Number of protected/unsupported owned entries, or one when the entire account reconciliation is skipped.
+            warnings:
+              type: array
+              items: { type: string }
+              description: Machine-readable reasons such as sync_in_progress, partial_catalog, empty_catalog_protected, complete_catalog_unsupported (the current component plugin ABI cannot attest completeness), account_changed, account_or_lease_changed, catalog_not_ready, catalog_changed, operator_route_preserved, unsupported_route_model_or_protocol, or a discovery error code.
+        price_sync:
+          type: object
+          additionalProperties: false
+          required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
+          properties:
+            status: { const: deferred }
+            currency: { const: USD }
+            imported: { const: 0 }
+            preserved: { const: 0 }
+            unmatched: { const: 0 }
+            ambiguous: { const: 0 }
+            failed_sources:
+              type: array
+              maxItems: 0
+              items: { type: string }
+            error_code: { const: managed_route_price_sync_deferred }
     UpstreamModelPriceSyncResult:
       type: object
       additionalProperties: false

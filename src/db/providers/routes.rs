@@ -304,6 +304,13 @@ impl Database {
         expected_updated_at: i64,
     ) -> Result<ModelRouteView, AppError> {
         let mut tx = self.begin_write_transaction().await?;
+        let tenant_id: String = sqlx::query_scalar("SELECT route.tenant_id FROM model_routes route JOIN tenants tenant ON tenant.id = route.tenant_id WHERE route.id = $1 AND tenant.external_id = $2 AND route.archived_at IS NULL")
+            .bind(route_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let current = sqlx::query(
             "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
         )
@@ -313,6 +320,10 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let mut route = model_route_view(current)?;
+        // Even a no-op operator disable is explicit intent. Never let a model
+        // reappearing upstream reverse it because it was already auto-disabled.
+        sqlx::query("UPDATE managed_model_routes SET operator_override = 1 WHERE tenant_id = $1 AND model_route_id = $2")
+            .bind(&tenant_id).bind(route_id.to_string()).execute(&mut *tx).await?;
         if route.enabled == enabled {
             tx.commit().await?;
             return Ok(route);
@@ -326,7 +337,6 @@ impl Database {
         if !route.enabled && enabled {
             // Serialize this activation with routing-relation replacement, so
             // the candidate verified below is part of this status change.
-            lock_routing_relation_writes(&mut tx, &tenant_id).await?;
             ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
                 .await?;
         }
@@ -438,6 +448,10 @@ impl Database {
         .into_iter()
         .map(|row| parse_uuid(row.try_get("id")?))
         .collect::<Result<Vec<_>, _>>()?;
+        // Keep the managed identity as a tombstone while the composite foreign
+        // key continues to reject every cross-tenant ownership edge.
+        sqlx::query("UPDATE managed_model_routes SET model_route_id = NULL, operator_override = 1 WHERE tenant_id = $1 AND model_route_id = $2")
+            .bind(&tenant_id).bind(route_id.to_string()).execute(&mut *tx).await?;
         let changed = sqlx::query(
             "DELETE FROM model_routes WHERE id = $1 AND tenant_id = $2 AND enabled = 0 AND updated_at = $3",
         )
