@@ -158,6 +158,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) upstream_account_id: Uuid,
     pub(super) credential_generation: i64,
     pub(super) sse_framing_limits: crate::provider::SseFramingLimits,
+    pub(super) response_headers: HeaderMap,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
     pub(super) dispatch_permit: Option<crate::codex_clients::DispatchPermit>,
@@ -187,6 +188,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         upstream_account_id,
         credential_generation,
         sse_framing_limits,
+        response_headers,
         buffered_request,
         proxy_lifecycle_permit,
         dispatch_permit,
@@ -1070,9 +1072,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     if let Some(content_type) = content_type {
         response = response.header(header::CONTENT_TYPE, content_type);
     }
-    response
+    let mut response = response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::Internal)?;
+    if protocol.is_anthropic() {
+        crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -25,3 +25,14 @@ MTC 为客户端提供模型请求接口和凭证范围内的自助查询接口�
 ## Responses 传输
 
 `/v1/responses` 支持 HTTP 与 WebSocket 传输。客户端应处理增量事件、正常终态和错误终态；网络中断后是否可以继续请求取决于客户端的幂等策略和上游能力。
+
+## Anthropic Messages 与 Claude Code 网关
+
+MTC 通过 `POST /v1/messages` 和 `POST /v1/messages/count_tokens` 提供 Anthropic Messages 接口，并复用客户端凭据认证、路由授权、审计、计费和上游网络策略。Claude Code 可将 `ANTHROPIC_BASE_URL` 指向 MTC，并使用 MTC 客户端凭据。
+
+- `anthropic-version`、`anthropic-beta`、其他 `anthropic-*` 请求头，以及 `x-claude-code-*` 会话和代理标识会传递给 Anthropic 格式上游。请求字段保持开放，工具、思考、缓存和上下文管理等新能力可与对应 beta 能力一起传递。
+- 流式 Messages 响应以 `text/event-stream` 持续转发，心跳使用 Anthropic 的 `event: ping` 与 `{"type":"ping"}` 数据格式。Ping 是传输控制事件。`retry-after`、`retry-after-ms`、`x-should-retry` 和 `anthropic-ratelimit-*` 响应头会返回给客户端，用于重试和额度展示。
+- `GET /v1/models` 支持 Anthropic 网关模型发现：`limit` 可取 1 至 1000，并可携带一个 `before_id` 或 `after_id` 游标。响应使用 Anthropic 列表结构，仅列出当前 MTC 客户端凭据拥有有效 Anthropic 路由的模型。
+- Anthropic 格式上游返回错误时，MTC 会将状态码、响应体和重试/额度响应头返回给客户端；审计记录保留请求终态事实，不保存上游错误响应体。
+
+当选中的上游支持该端点时，可使用 `/v1/messages/count_tokens`。各服务商的协议转换由对应 provider adapter 提供，核心网关保持 Anthropic Messages 信封结构。

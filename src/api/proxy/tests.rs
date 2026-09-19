@@ -841,6 +841,248 @@ async fn response_usage_fixture_with_uri_contract_and_driver_model(
     }
 }
 
+async fn anthropic_messages_fixture(label: &str, upstream: &MockServer) -> CodexRouteFixture {
+    let fixture = response_usage_fixture(label, upstream, 0).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE model_routes SET protocol = 'anthropic' WHERE id = $1")
+        .bind(fixture.route_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    fixture
+}
+
+async fn send_anthropic_message(
+    fixture: &CodexRouteFixture,
+    body: Value,
+    stream: bool,
+) -> Response {
+    router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/messages?beta=true")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .header("anthropic-version", "2023-06-01")
+                .header(
+                    "anthropic-beta",
+                    "prompt-caching-2024-07-31,context-management-2025-06-27",
+                )
+                .header("anthropic-workspace-id", "workspace-a")
+                .header("x-claude-code-session-id", "claude-session-a")
+                .header("x-claude-code-agent-id", "agent-a")
+                .header("x-claude-code-parent-agent-id", "parent-a")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": fixture.model,
+                        "max_tokens": 64,
+                        "stream": stream,
+                        "tools": [{
+                            "name": "run",
+                            "description": "run a reviewed command",
+                            "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+                        }],
+                        "messages": [
+                            {"role": "user", "content": "use the tool"},
+                            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "run", "input": {"command": "pwd"}}]},
+                            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "/workspace"}]}
+                        ],
+                        "metadata": {"user_id": "tenant-user"},
+                        "request": body
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn anthropic_messages_preserves_open_headers_tool_envelope_and_retry_metadata() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("retry-after", "2")
+                .insert_header("retry-after-ms", "2000")
+                .insert_header("x-should-retry", "true")
+                .insert_header("anthropic-ratelimit-requests-remaining", "12")
+                .insert_header("anthropic-ratelimit-tokens-remaining", "800")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "700")
+                .insert_header("anthropic-ratelimit-output-tokens-remaining", "100")
+                .insert_header("anthropic-ratelimit-unified-5h-utilization", "0.5")
+                .set_body_json(json!({
+                    "id": "msg_contract",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                })),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = anthropic_messages_fixture("messages-contract", &upstream).await;
+    let discovery = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::get("/v1/models?limit=1000")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let discovery = to_bytes(discovery.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&discovery).unwrap(),
+        json!({
+            "data": [{
+                "type": "model",
+                "id": fixture.model,
+                "display_name": fixture.model,
+                "created_at": "1970-01-01T00:00:00Z"
+            }],
+            "has_more": false,
+            "first_id": fixture.model,
+            "last_id": fixture.model
+        })
+    );
+    let response = send_anthropic_message(&fixture, json!({"future_field": true}), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "2");
+    assert_eq!(response.headers()["retry-after-ms"], "2000");
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-5h-utilization"],
+        "0.5"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-requests-remaining"],
+        "12"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-tokens-remaining"],
+        "800"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-input-tokens-remaining"],
+        "700"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-output-tokens-remaining"],
+        "100"
+    );
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let mut requests = upstream.received_requests().await.unwrap();
+    let request = requests.remove(0);
+    assert_eq!(request.url.path(), "/v1/messages");
+    assert_eq!(request.headers["anthropic-version"], "2023-06-01");
+    assert_eq!(
+        request.headers["anthropic-beta"],
+        "prompt-caching-2024-07-31,context-management-2025-06-27"
+    );
+    assert_eq!(request.headers["anthropic-workspace-id"], "workspace-a");
+    assert_eq!(
+        request.headers["x-claude-code-session-id"],
+        "claude-session-a"
+    );
+    assert_eq!(request.headers["x-claude-code-agent-id"], "agent-a");
+    assert_eq!(request.headers["x-claude-code-parent-agent-id"], "parent-a");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["tools"][0]["name"], "run");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(body["request"]["future_field"], true);
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn anthropic_messages_forwards_raw_error_and_retry_metadata() {
+    let upstream = MockServer::start().await;
+    let error = json!({
+        "type": "error",
+        "error": {"type": "rate_limit_error", "message": "retry after plan window"}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "17")
+                .insert_header("retry-after-ms", "17000")
+                .insert_header("x-should-retry", "true")
+                .insert_header("anthropic-ratelimit-requests-remaining", "0")
+                .insert_header("anthropic-ratelimit-tokens-remaining", "0")
+                .insert_header("anthropic-ratelimit-unified-5h-utilization", "1")
+                .set_body_json(error.clone()),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = anthropic_messages_fixture("messages-error", &upstream).await;
+    let response = send_anthropic_message(&fixture, json!({}), false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "17");
+    assert_eq!(response.headers()["retry-after-ms"], "17000");
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-5h-utilization"],
+        "1"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-requests-remaining"],
+        "0"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-tokens-remaining"],
+        "0"
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), error);
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn anthropic_messages_forwards_sse_ping_and_tool_stream_fixture() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            include_str!("../../../tests/fixtures/anthropic/claude_code_tool_stream.sse"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = anthropic_messages_fixture("messages-stream", &upstream).await;
+    let response = send_anthropic_message(&fixture, json!({}), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(
+        body.windows(b"event: ping".len())
+            .any(|window| window == b"event: ping")
+    );
+    assert!(
+        body.windows(b"{\"type\":\"ping\"}".len())
+            .any(|window| window == b"{\"type\":\"ping\"}")
+    );
+    assert!(
+        body.windows(b"tool_use".len())
+            .any(|window| window == b"tool_use")
+    );
+    assert!(
+        body.windows(b"message_stop".len())
+            .any(|window| window == b"message_stop")
+    );
+    upstream.verify().await;
+}
+
 async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) -> Response {
     router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(

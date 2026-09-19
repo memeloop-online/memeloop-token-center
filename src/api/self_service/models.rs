@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Deserialize, Default)]
 pub(in crate::api) struct ModelsQuery {
     client_version: Option<String>,
+    /// Claude Code discovery requests this standard gateway shape.  The
+    /// Messages discovery contract is distinguished from MTC's OpenAI-shaped
+    /// catalog without requiring a client-specific user agent.
+    limit: Option<usize>,
+    before_id: Option<String>,
+    after_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -25,6 +31,15 @@ pub(in crate::api) async fn list_models(
         .db
         .granted_model_capability_sources(key.key_id, key.tenant_id)
         .await?;
+    if query.limit.is_some() || query.before_id.is_some() || query.after_id.is_some() {
+        return Ok(Json(anthropic_models_page(
+            &state.providers,
+            &sources,
+            query.limit.unwrap_or(20),
+            query.before_id.as_deref(),
+            query.after_id.as_deref(),
+        )?));
+    }
     if query
         .client_version
         .as_deref()
@@ -82,6 +97,80 @@ pub(in crate::api) async fn list_models(
             Value::Object(model)
         }).collect::<Vec<_>>()
     })))
+}
+
+/// Anthropic's gateway discovery response is purposefully a small projection:
+/// each listed model has a currently usable authorized Anthropic route.  Do
+/// not disclose OpenAI-only or generation-only routes and do not infer a
+/// model's availability from another protocol.
+fn anthropic_models_page(
+    providers: &crate::provider::ProviderCatalog,
+    sources: &[crate::db::GrantedModelCapabilitySource],
+    limit: usize,
+    before_id: Option<&str>,
+    after_id: Option<&str>,
+) -> Result<Value, AppError> {
+    if !(1..=1000).contains(&limit) {
+        return Err(AppError::BadRequest(
+            "Anthropic model discovery limit must be between 1 and 1000".into(),
+        ));
+    }
+    if before_id.is_some() && after_id.is_some() {
+        return Err(AppError::BadRequest(
+            "Anthropic model discovery accepts one cursor at a time".into(),
+        ));
+    }
+    let models = sources
+        .iter()
+        .filter(|source| source.protocol == "anthropic" && providers.get(&source.driver).is_some())
+        .map(|source| source.public_model.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let models = models.into_iter().collect::<Vec<_>>();
+    let (start, end, reverse_page) = match (before_id, after_id) {
+        (Some(before_id), None) => {
+            let end = anthropic_model_cursor(&models, before_id)?;
+            (0, end, true)
+        }
+        (None, Some(after_id)) => {
+            let start = anthropic_model_cursor(&models, after_id)? + 1;
+            (start, models.len(), false)
+        }
+        (None, None) => (0, models.len(), false),
+        (Some(_), Some(_)) => unreachable!("validated before paging"),
+    };
+    let (page_start, page_end, has_more) = if reverse_page {
+        let page_start = end.saturating_sub(limit).max(start);
+        (page_start, end, page_start > start)
+    } else {
+        let page_end = start.saturating_add(limit).min(end);
+        (start, page_end, page_end < end)
+    };
+    let page = models[page_start..page_end].to_vec();
+    let first_id = page.first().cloned();
+    let last_id = page.last().cloned();
+    Ok(json!({
+        "data": page.into_iter().map(|id| json!({
+            "type": "model",
+            "id": id.clone(),
+            "display_name": id,
+            "created_at": "1970-01-01T00:00:00Z"
+        })).collect::<Vec<_>>(),
+        "has_more": has_more,
+        "first_id": first_id,
+        "last_id": last_id
+    }))
+}
+
+fn anthropic_model_cursor(models: &[String], cursor: &str) -> Result<usize, AppError> {
+    let cursor = cursor.trim();
+    if cursor.is_empty() {
+        return Err(AppError::BadRequest(
+            "Anthropic model discovery cursor must not be empty".into(),
+        ));
+    }
+    models
+        .binary_search_by(|model| model.as_str().cmp(cursor))
+        .map_err(|_| AppError::BadRequest("Anthropic model discovery cursor was not found".into()))
 }
 
 #[derive(Default)]
@@ -465,6 +554,96 @@ fn generation_parameter_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_discovery_lists_only_authorized_anthropic_routes() {
+        fn source(
+            model: &str,
+            protocol: &str,
+            driver: &str,
+        ) -> crate::db::GrantedModelCapabilitySource {
+            crate::db::GrantedModelCapabilitySource {
+                public_model: model.into(),
+                upstream_model: "private-upstream-name".into(),
+                protocol: protocol.into(),
+                driver: driver.into(),
+                config_json: "{}".into(),
+            }
+        }
+
+        let providers = crate::provider::ProviderCatalog::builtins();
+        let response = anthropic_models_page(
+            &providers,
+            &[
+                source("claude-route", "anthropic", "http-json"),
+                source("claude-route", "anthropic", "http-json"),
+                source("openai-only", "openai", "http-json"),
+                source("unloaded", "anthropic", "missing-provider"),
+            ],
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            json!({
+                "data": [{
+                    "type": "model",
+                    "id": "claude-route",
+                    "display_name": "claude-route",
+                    "created_at": "1970-01-01T00:00:00Z"
+                }],
+                "has_more": false,
+                "first_id": "claude-route",
+                "last_id": "claude-route"
+            })
+        );
+
+        let invalid = anthropic_models_page(&providers, &[], 0, None, None);
+        assert!(matches!(invalid, Err(AppError::BadRequest(_))));
+        let ambiguous = anthropic_models_page(&providers, &[], 1, Some("a"), Some("b"));
+        assert!(matches!(ambiguous, Err(AppError::BadRequest(_))));
+
+        let paged_sources = [
+            source("claude-alpha", "anthropic", "http-json"),
+            source("claude-beta", "anthropic", "http-json"),
+            source("claude-gamma", "anthropic", "http-json"),
+        ];
+        let first_page = anthropic_models_page(&providers, &paged_sources, 1, None, None).unwrap();
+        assert_eq!(first_page["data"][0]["id"], "claude-alpha");
+        assert_eq!(first_page["first_id"], "claude-alpha");
+        assert_eq!(first_page["last_id"], "claude-alpha");
+        assert_eq!(first_page["has_more"], true);
+        let after_page =
+            anthropic_models_page(&providers, &paged_sources, 1, None, Some("claude-alpha"))
+                .unwrap();
+        assert_eq!(after_page["data"][0]["id"], "claude-beta");
+        let after_second_page =
+            anthropic_models_page(&providers, &paged_sources, 1, None, Some("claude-beta"))
+                .unwrap();
+        assert_eq!(after_second_page["data"][0]["id"], "claude-gamma");
+        let before_page_one =
+            anthropic_models_page(&providers, &paged_sources, 1, Some("claude-gamma"), None)
+                .unwrap();
+        assert_eq!(before_page_one["data"][0]["id"], "claude-beta");
+        let before_page_two =
+            anthropic_models_page(&providers, &paged_sources, 1, Some("claude-beta"), None)
+                .unwrap();
+        assert_eq!(before_page_two["data"][0]["id"], "claude-alpha");
+        let before_page =
+            anthropic_models_page(&providers, &paged_sources, 5, Some("claude-gamma"), None)
+                .unwrap();
+        assert_eq!(before_page["data"].as_array().unwrap().len(), 2);
+        assert!(matches!(
+            anthropic_models_page(&providers, &paged_sources, 1, None, Some("")),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            anthropic_models_page(&providers, &paged_sources, 1, None, Some("missing")),
+            Err(AppError::BadRequest(_))
+        ));
+    }
 
     #[test]
     fn codex_model_info_is_conservative_and_marks_only_declared_multi_agent_models() {

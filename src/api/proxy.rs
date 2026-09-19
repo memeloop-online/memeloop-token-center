@@ -545,6 +545,7 @@ struct NonSseProxyResponseInput<'buffered, 'state, 'attempt> {
     content_type: Option<HeaderValue>,
     protocol: Protocol,
     capture_json_usage: bool,
+    response_headers: HeaderMap,
     upstream_attempt: &'attempt mut UpstreamAttemptGuard,
 }
 
@@ -559,6 +560,7 @@ async fn finish_non_sse_proxy_response(
         content_type,
         protocol,
         capture_json_usage,
+        response_headers,
         upstream_attempt,
     } = input;
     let response_content_type = content_type
@@ -657,7 +659,7 @@ async fn finish_non_sse_proxy_response(
             crate::model::RequestUsageBasis::NotObserved,
         )
     };
-    let result = finish_buffered_request(
+    let mut result = finish_buffered_request(
         buffered_request,
         status,
         response_body,
@@ -666,6 +668,11 @@ async fn finish_non_sse_proxy_response(
         None,
     )
     .await;
+    if let Ok(response) = result.as_mut()
+        && protocol.is_anthropic()
+    {
+        crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
+    }
     let attempt_terminal = match result.as_ref() {
         Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
         Ok(_) => UpstreamAttemptTerminal::invalid_response(),
@@ -1641,6 +1648,11 @@ async fn proxy_with_identity_and_conversation_spool(
     let upstream_account_id = Some(active_route.route.account_id);
     let route_driver = Some(active_route.route.driver.as_str());
     let status = upstream.status();
+    let response_headers = if protocol.is_anthropic() {
+        crate::api::anthropic::downstream_response_headers(upstream.headers())
+    } else {
+        HeaderMap::new()
+    };
     if !status.is_success() {
         crate::api::trigger_copilot_remint_on_auth_failure(
             &state,
@@ -1649,6 +1661,56 @@ async fn proxy_with_identity_and_conversation_spool(
             request_id,
             status,
         );
+        if protocol.is_anthropic() {
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_owned();
+            let body = read_bounded_upstream(
+                upstream,
+                MAX_PROXY_RESPONSE_BODY,
+                &buffered_request.memory,
+                buffered_request.started,
+                false,
+                buffered_request.conversation.as_ref(),
+            )
+            .await
+            .map(Bytes::from);
+            let mut result = match body {
+                Ok(body) => {
+                    finish_unarchived_proxy_response(
+                        &buffered_request,
+                        status,
+                        body,
+                        &content_type,
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
+                        ),
+                        Some(format!("http_{}", status.as_u16())),
+                    )
+                    .await
+                }
+                Err(error) => finish_proxy_failure(&buffered_request, error.code()).await,
+            };
+            if let Ok(response) = result.as_mut() {
+                crate::api::anthropic::append_response_headers(
+                    response.headers_mut(),
+                    &response_headers,
+                );
+            }
+            upstream_attempt
+                .complete(if status.is_client_error() {
+                    UpstreamAttemptTerminal::Inconclusive
+                } else {
+                    UpstreamAttemptTerminal::invalid_response()
+                })
+                .await;
+            codex_retry.complete(CodexRetryTerminal::Failed);
+            return result;
+        }
         drop(upstream);
         let result = finish_buffered_request(
             &buffered_request,
@@ -1829,6 +1891,7 @@ async fn proxy_with_identity_and_conversation_spool(
             content_type,
             protocol,
             capture_json_usage,
+            response_headers,
             upstream_attempt: &mut upstream_attempt,
         })
         .await;
@@ -1858,6 +1921,7 @@ async fn proxy_with_identity_and_conversation_spool(
         upstream_account_id: active_route.route.account_id,
         credential_generation: active_route.route.credential_generation,
         sse_framing_limits,
+        response_headers,
         buffered_request,
         proxy_lifecycle_permit,
         dispatch_permit,
@@ -2552,6 +2616,10 @@ async fn finish_local_buffered_error_with_upstream_attribution(
 enum BufferedResponseStorage {
     DurableArchive,
     InlineLocalJson(String),
+    /// A passthrough error is returned to the client so its protocol-level
+    /// recovery can inspect it, while archival retains only the request and
+    /// terminal facts. Upstream error text is not a durable audit payload.
+    Omit,
 }
 
 struct BufferedFinishPolicy {
@@ -2603,6 +2671,29 @@ async fn finish_buffered_request_with_upstream_attribution(
     .await
 }
 
+async fn finish_unarchived_proxy_response(
+    request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
+    error_code: Option<String>,
+) -> Result<Response, AppError> {
+    finish_buffered_request_with_upstream_attribution_and_response_object(
+        request,
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        BufferedFinishPolicy {
+            upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+            response_storage: BufferedResponseStorage::Omit,
+        },
+    )
+    .await
+}
+
 async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     request: &BufferedRequest<'_>,
     mut status: StatusCode,
@@ -2616,9 +2707,10 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         upstream_attribution,
         response_storage,
     } = policy;
-    let inline_response_object = match response_storage {
-        BufferedResponseStorage::DurableArchive => None,
-        BufferedResponseStorage::InlineLocalJson(stored_response) => Some(stored_response),
+    let (inline_response_object, archive_response) = match response_storage {
+        BufferedResponseStorage::DurableArchive => (None, true),
+        BufferedResponseStorage::InlineLocalJson(stored_response) => (Some(stored_response), false),
+        BufferedResponseStorage::Omit => (None, false),
     };
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
@@ -2654,7 +2746,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     let capture_started = Instant::now();
     let response_capture_permit = request.state.proxy_memory_budget.reservation();
     let base_capture_bytes = body.len().max(256);
-    let response_capture_admitted = inline_response_object.is_none()
+    let response_capture_admitted = archive_response
         && (request.memory.has_buffered_response()
             || response_capture_permit.try_grow(
                 base_capture_bytes,
@@ -2683,7 +2775,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     } else {
         None
     };
-    let response_archive = inline_response_object.is_none().then(|| {
+    let response_archive = archive_response.then(|| {
         archive_body.as_ref().map_or_else(
             || Err(AppError::Overloaded),
             |archive_body| {

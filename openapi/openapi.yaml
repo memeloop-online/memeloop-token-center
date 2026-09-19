@@ -5655,16 +5655,35 @@ paths:
 
   /v1/models:
     get:
-      tags: [OpenAI compatible]
+      tags: [OpenAI compatible, Anthropic compatible]
       operationId: listAllowedModels
       summary: List currently routable models granted to the current credential
+      description: Without Anthropic pagination parameters, returns the OpenAI-compatible model list. Anthropic gateway discovery accepts `limit` from 1 to 1000 with optional `before_id` or `after_id`, and returns only models with an authorized Anthropic route.
       security: [{ clientBearer: [] }]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: When Anthropic pagination is selected, omitted limit uses 20.
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+        - name: before_id
+          in: query
+          required: false
+          schema: { type: string, minLength: 1 }
+        - name: after_id
+          in: query
+          required: false
+          schema: { type: string, minLength: 1 }
       responses:
         '200':
-          description: OpenAI-compatible model list.
+          description: OpenAI-compatible or Anthropic gateway model list, selected by the pagination query.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OpenAIModelList' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/OpenAIModelList'
+                  - $ref: '#/components/schemas/AnthropicModelList'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /v1/chat/completions:
@@ -5807,6 +5826,16 @@ paths:
           in: header
           required: false
           schema: { type: string }
+        - name: anthropic-beta
+          in: header
+          required: false
+          description: Capability values pass through to Anthropic-format upstream routes.
+          schema: { type: string }
+        - name: beta
+          in: query
+          required: false
+          description: Accepted for Claude Code gateway compatibility; routing matches the Messages path.
+          schema: { type: string }
       requestBody:
         required: true
         content:
@@ -5831,6 +5860,11 @@ paths:
         - name: anthropic-version
           in: header
           required: false
+          schema: { type: string }
+        - name: anthropic-beta
+          in: header
+          required: false
+          description: Capability values pass through to Anthropic-format upstream routes.
           schema: { type: string }
       requestBody:
         required: true
@@ -10260,6 +10294,24 @@ components:
               generation_schema:
                 type: object
                 description: Sanitized closed scalar JSON Schema for downstream input.parameters only. It never contains workflow internals, references, remote schemas, or recursive/complex constructs, and is omitted unless every effective generation candidate has the same schema.
+    AnthropicModelList:
+      type: object
+      required: [data, has_more, first_id, last_id]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/AnthropicModelInfo' }
+        has_more: { type: boolean }
+        first_id: { type: [string, 'null'] }
+        last_id: { type: [string, 'null'] }
+    AnthropicModelInfo:
+      type: object
+      required: [type, id, display_name, created_at]
+      properties:
+        type: { const: model }
+        id: { type: string }
+        display_name: { type: string }
+        created_at: { type: string, format: date-time }
     OpenAIChatRequest:
       type: object
       required: [model, messages]

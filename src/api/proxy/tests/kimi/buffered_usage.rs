@@ -105,6 +105,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         content_type: Some(HeaderValue::from_static("application/json")),
         protocol: Protocol::OpenAiChat,
         capture_json_usage: true,
+        response_headers: HeaderMap::new(),
         upstream_attempt: &mut attempt,
     })
     .await

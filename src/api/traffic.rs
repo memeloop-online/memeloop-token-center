@@ -145,6 +145,10 @@ pub(super) enum Protocol {
 }
 
 impl Protocol {
+    pub(super) const fn is_anthropic(self) -> bool {
+        matches!(self, Self::AnthropicMessages | Self::AnthropicCountTokens)
+    }
+
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::OpenAiChat | Self::OpenAiResponses | Self::OpenAiEmbeddings => "openai",
