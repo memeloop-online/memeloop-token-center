@@ -1,73 +1,89 @@
 {
   "model": "gpt-5.6-sol",
   "stream": true,
-  "input": [
+  "tools": [
     {
-      "type": "additional_tools",
-      "role": "developer",
+      "type": "namespace",
+      "name": "multi_agent_v1",
+      "description": "Tools for spawning and managing sub-agents.",
       "tools": [
         {
-          "type": "namespace",
-          "name": "collaboration",
-          "description": "Tools for spawning and managing sub-agents.",
-          "tools": [
-            {
-              "type": "function",
-              "name": "followup_task",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "target": {"type": "string"},
-                  "message": {"type": "string", "encrypted": true}
-                },
-                "required": ["target", "message"],
-                "additionalProperties": false
+          "type": "function",
+          "name": "spawn_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "Initial plain-text task for the new agent. Use either message or items."
               },
-              "strict": false
+              "model": {"type": "string"},
+              "agent_type": {"type": "string"},
+              "fork_context": {"type": "boolean"},
+              "reasoning_effort": {"type": "string"}
             },
-            {
-              "type": "function",
-              "name": "send_message",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "target": {"type": "string"},
-                  "message": {"type": "string", "encrypted": true}
-                },
-                "required": ["target", "message"],
-                "additionalProperties": false
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "send_input",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {"type": "string"},
+              "message": {
+                "type": "string",
+                "description": "Legacy plain-text message to send to the agent."
               },
-              "strict": false
+              "interrupt": {"type": "boolean"}
             },
-            {
-              "type": "function",
-              "name": "spawn_agent",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "task_name": {"type": "string"},
-                  "message": {"type": "string", "encrypted": true},
-                  "agent_type": {"type": "string"},
-                  "fork_turns": {"type": "string"}
-                },
-                "required": ["task_name", "message"],
-                "additionalProperties": false
-              },
-              "strict": false
+            "required": ["target"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "resume_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "wait_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "targets": {"type": "array", "items": {"type": "string"}},
+              "timeout_ms": {"type": "number"}
             },
-            {
-              "type": "function",
-              "name": "wait_agent",
-              "parameters": {
-                "type": "object",
-                "properties": {"timeout_ms": {"type": "number"}}
-              },
-              "strict": false
-            }
-          ]
+            "required": ["targets"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "close_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": false
+          },
+          "strict": false
         }
       ]
-    },
+    }
+  ],
+  "input": [
     {
       "type": "message",
       "role": "user",

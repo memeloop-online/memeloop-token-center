@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn opaque_encrypted_agent_payload_still_fails_closed() {
         let mut request = json!({"input":[{"type":"agent_message","content":[
-            {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            {"type":"encrypted_content","encrypted_content":"gAAAAABmFixtureFernetCiphertextThatMustRemainOpaque"}
         ]}]});
         let error =
             crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
@@ -678,24 +678,22 @@ mod tests {
     }
 
     #[test]
-    fn codex_multi_agent_v1_fixture_keeps_tools_and_plaintext_schema_for_chat() {
+    fn codex_multi_agent_v1_fixture_remains_plaintext_and_converts_to_chat() {
         let mut request: Value =
             serde_json::from_str(include_str!("fixtures/codex-multi-agent-v1.json"))
                 .expect("valid Codex MultiAgentV1 fixture");
+        let original = request.clone();
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
             .unwrap();
 
-        let collaboration = &request["input"][0]["tools"][0];
-        assert_eq!(collaboration["name"], "collaboration");
-        for tool in collaboration["tools"].as_array().unwrap() {
-            let message = tool.pointer("/parameters/properties/message");
-            if matches!(
-                tool["name"].as_str(),
-                Some("spawn_agent" | "send_message" | "followup_task")
-            ) {
-                assert!(message.is_some_and(|message| message.get("encrypted").is_none()));
-            }
-        }
+        assert_eq!(request, original);
+        let multi_agent = &request["tools"][0];
+        assert_eq!(multi_agent["name"], "multi_agent_v1");
+        assert_eq!(
+            multi_agent["tools"][0]["parameters"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert!(!request.to_string().contains("encrypted"));
 
         let output = convert(&request).expect("V1 fixture converts to Responses-via-Chat");
         let names = output["tools"]
@@ -705,10 +703,11 @@ mod tests {
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
         for expected in [
-            "collaboration__spawn_agent",
-            "collaboration__send_message",
-            "collaboration__followup_task",
-            "collaboration__wait_agent",
+            "multi_agent_v1__spawn_agent",
+            "multi_agent_v1__send_input",
+            "multi_agent_v1__resume_agent",
+            "multi_agent_v1__wait_agent",
+            "multi_agent_v1__close_agent",
         ] {
             assert!(names.contains(&expected));
         }

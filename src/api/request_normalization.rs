@@ -139,7 +139,10 @@ fn rewrite_tool_list(value: &mut Value, in_collaboration_namespace: bool) {
             let nested_is_collaboration =
                 tool.get("name").and_then(Value::as_str) == Some("collaboration");
             if let Some(nested) = tool.get_mut("tools") {
-                rewrite_tool_list(nested, nested_is_collaboration);
+                rewrite_tool_list(
+                    nested,
+                    in_collaboration_namespace || nested_is_collaboration,
+                );
             }
             continue;
         }
@@ -303,6 +306,7 @@ mod tests {
             "Codex Work/0.154.0 (Linux; x86_64)",
             "Codex Work/0.154.0-dev",
             "codex-tui/0.1.0",
+            "codex_exec/0.154.0",
             "codex_vscode/0.154.0",
             "codex_atlas/0.154.0",
             "codex_chatgpt_desktop/0.154.0",
@@ -324,6 +328,8 @@ mod tests {
             "codex-chrome-extension-sidepanel",
             "codex-chrome-extension-sidepanel/not-a-version",
             "codex_vscode/1junk",
+            "codex_exec",
+            "codex_exec/not-a-version",
             "codex_cli_rs-other",
             "codex_vscode",
             "codex_vscode-not-versioned",
@@ -385,9 +391,11 @@ mod tests {
         let mut request = json!({
             "tools": [
                 {"type":"namespace","name":"collaboration","tools":[
-                    {"type":"function","name":"spawn_agent","x-meta":"keep","parameters":{
-                        "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"keep"},"other":{"type":"string"}}
-                    }},
+                    {"type":"namespace","name":"nested","tools":[
+                        {"type":"function","name":"spawn_agent","x-meta":"keep","parameters":{
+                            "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"keep"},"other":{"type":"string"}}
+                        }}
+                    ]},
                     {"type":"function","name":"send_message","parameters":{
                         "type":"object","properties":{"message":{"type":"string","encrypted":true}}
                     }}
@@ -403,22 +411,28 @@ mod tests {
             ],
             "input": [{"type":"additional_tools","tools":[
                 {"type":"namespace","name":"collaboration","tools":[
-                    {"type":"function","name":"followup_task","parameters":{
-                        "type":"object","properties":{"message":{"type":"string","encrypted":false}}
-                    }}
+                    {"type":"namespace","name":"nested","tools":[
+                        {"type":"function","name":"followup_task","parameters":{
+                            "type":"object","properties":{"message":{"type":"string","encrypted":false}}
+                        }}
+                    ]}
                 ]}
             ]}]
         });
         normalize_codex_multi_agent_v2(&mut request, true).unwrap();
 
         assert!(
-            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
-        assert_eq!(request["tools"][0]["tools"][0]["x-meta"], "keep");
+        assert_eq!(request["tools"][0]["tools"][0]["name"], "nested");
         assert_eq!(
-            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
+            request["tools"][0]["tools"][0]["tools"][0]["x-meta"],
+            "keep"
+        );
+        assert_eq!(
+            request["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
             "keep"
         );
         assert!(
@@ -427,7 +441,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            request["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["input"][0]["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
@@ -446,22 +460,30 @@ mod tests {
     #[test]
     fn parent_carrier_preparation_strips_schema_without_downgrading_agent_message() {
         let mut request = json!({
-            "tools": [{"type":"function","name":"spawn_agent","parameters":{
-                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
-            }}],
+            "tools": [{"type":"namespace","name":"collaboration","x-namespace":"keep","tools":[
+                {"type":"function","name":"spawn_agent","description":"keep","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"task"}}
+                }}
+            ]}],
             "input": [{"type":"agent_message","role":"system",
                 "internal_chat_message_metadata_passthrough":{"turn_id":"keep-for-native"},
                 "content":[{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]
             }]
         });
+        let original_input = request["input"].clone();
 
         prepare_plaintext_collaboration_tools(&mut request, true).unwrap();
 
-        assert!(
-            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
-                .get("encrypted")
-                .is_none()
-        );
+        let message = request
+            .pointer("/tools/0/tools/0/parameters/properties/message")
+            .expect("collaboration spawn_agent message schema exists");
+        assert_eq!(message["type"], "string");
+        assert_eq!(message["description"], "task");
+        assert!(message.get("encrypted").is_none());
+        assert_eq!(request["tools"][0]["name"], "collaboration");
+        assert_eq!(request["tools"][0]["x-namespace"], "keep");
+        assert_eq!(request["tools"][0]["tools"][0]["description"], "keep");
+        assert_eq!(request["input"], original_input);
         assert_eq!(request["input"][0]["type"], "agent_message");
         assert_eq!(request["input"][0]["role"], "system");
         assert_eq!(
