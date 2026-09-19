@@ -67,17 +67,23 @@
       "type": "additional_tools",
       "tools": [
         {
-          "type": "function",
-          "name": "followup_task",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "message": {
-                "type": "string",
-                "encrypted": {"type": "boolean"}
+          "type": "namespace",
+          "name": "collaboration",
+          "tools": [
+            {
+              "type": "function",
+              "name": "followup_task",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "message": {
+                    "type": "string",
+                    "encrypted": {"type": "boolean"}
+                  }
+                }
               }
             }
-          }
+          ]
         }
       ]
     },

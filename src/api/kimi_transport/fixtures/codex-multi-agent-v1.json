@@ -1,0 +1,77 @@
+{
+  "model": "gpt-5.6-sol",
+  "stream": true,
+  "input": [
+    {
+      "type": "additional_tools",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "collaboration",
+          "description": "Tools for spawning and managing sub-agents.",
+          "tools": [
+            {
+              "type": "function",
+              "name": "followup_task",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "target": {"type": "string"},
+                  "message": {"type": "string", "encrypted": true}
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+              },
+              "strict": false
+            },
+            {
+              "type": "function",
+              "name": "send_message",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "target": {"type": "string"},
+                  "message": {"type": "string", "encrypted": true}
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+              },
+              "strict": false
+            },
+            {
+              "type": "function",
+              "name": "spawn_agent",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "task_name": {"type": "string"},
+                  "message": {"type": "string", "encrypted": true},
+                  "agent_type": {"type": "string"},
+                  "fork_turns": {"type": "string"}
+                },
+                "required": ["task_name", "message"],
+                "additionalProperties": false
+              },
+              "strict": false
+            },
+            {
+              "type": "function",
+              "name": "wait_agent",
+              "parameters": {
+                "type": "object",
+                "properties": {"timeout_ms": {"type": "number"}}
+              },
+              "strict": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "Delegate one task."}]
+    }
+  ]
+}

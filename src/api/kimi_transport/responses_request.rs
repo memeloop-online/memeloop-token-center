@@ -626,7 +626,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
@@ -675,6 +675,44 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message["role"] == "tool" && message["tool_call_id"] == "followup-call"
         }));
+    }
+
+    #[test]
+    fn codex_multi_agent_v1_fixture_keeps_tools_and_plaintext_schema_for_chat() {
+        let mut request: Value =
+            serde_json::from_str(include_str!("fixtures/codex-multi-agent-v1.json"))
+                .expect("valid Codex MultiAgentV1 fixture");
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+            .unwrap();
+
+        let collaboration = &request["input"][0]["tools"][0];
+        assert_eq!(collaboration["name"], "collaboration");
+        for tool in collaboration["tools"].as_array().unwrap() {
+            let message = tool.pointer("/parameters/properties/message");
+            if matches!(
+                tool["name"].as_str(),
+                Some("spawn_agent" | "send_message" | "followup_task")
+            ) {
+                assert!(message.is_some_and(|message| message.get("encrypted").is_none()));
+            }
+        }
+
+        let output = convert(&request).expect("V1 fixture converts to Responses-via-Chat");
+        let names = output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        for expected in [
+            "collaboration__spawn_agent",
+            "collaboration__send_message",
+            "collaboration__followup_task",
+            "collaboration__wait_agent",
+        ] {
+            assert!(names.contains(&expected));
+        }
+        assert!(!output.to_string().contains("encrypted"));
     }
 
     #[test]

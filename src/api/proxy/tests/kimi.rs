@@ -223,85 +223,73 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_collaboration_schema_on_the_wire() {
+async fn native_codex_responses_marks_v1_v2_collaboration_messages_plaintext_on_the_wire() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
-    let collaboration_tools = json!([{
-        "type": "namespace",
-        "name": "collaboration",
-        "tools": [{
-            "type": "function",
-            "name": "followup_task",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "encrypted": {"type": "boolean"}
-                    }
-                }
-            }
-        }]
-    }]);
-    let request = json!({
-        "model": fixture.model,
-        "input": [{
-            "type": "additional_tools",
-            "tools": collaboration_tools
-        }],
-        "tools": collaboration_tools,
-        "stream": true
-    });
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             completed_codex_sse("native collaboration accepted").into_bytes(),
             "text/event-stream",
         ))
-        .expect(1)
+        .expect(2)
         .mount(&upstream)
         .await;
 
-    let response = send_official_codex_responses_to_endpoint(
-        &fixture,
-        upstream.uri(),
-        &request,
-        "text/event-stream",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
+    for source in [
+        include_str!("../../kimi_transport/fixtures/codex-multi-agent-v1.json"),
+        include_str!("../../kimi_transport/fixtures/codex-multi-agent-v2.json"),
+    ] {
+        let mut request: Value = serde_json::from_str(source).unwrap();
+        request["model"] = Value::String(fixture.model.clone());
+        request["stream"] = Value::Bool(true);
+        let response = send_official_codex_responses_to_endpoint(
+            &fixture,
+            upstream.uri(),
+            &request,
+            "text/event-stream",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+    }
 
     let requests = upstream.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let forwarded: Value = requests[0].body_json().unwrap();
-    // The native transport may append its own image-generation tool. Compare
-    // the client-owned collaboration namespace instead of rejecting that
-    // reviewed transport addition.
-    let expected_collaboration = request["tools"]
-        .as_array()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
-        })
-        .expect("fixture contains collaboration namespace");
-    let forwarded_collaboration = forwarded["tools"]
-        .as_array()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
-        })
-        .expect("native wire preserves collaboration namespace");
-    assert_eq!(forwarded_collaboration, expected_collaboration);
-    assert_eq!(
-        forwarded_collaboration["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
-        json!({"type": "boolean"})
-    );
-    assert_eq!(forwarded["input"][0], request["input"][0]);
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let forwarded: Value = request.body_json().unwrap();
+        let namespaces = forwarded["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                forwarded["input"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "additional_tools")
+                    .flat_map(|item| item["tools"].as_array().into_iter().flatten()),
+            )
+            .filter(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
+            .collect::<Vec<_>>();
+        assert!(!namespaces.is_empty());
+        for namespace in namespaces {
+            assert_eq!(namespace["name"], "collaboration");
+            for tool in namespace["tools"].as_array().unwrap() {
+                let message = tool.pointer("/parameters/properties/message");
+                if matches!(
+                    tool["name"].as_str(),
+                    Some("spawn_agent" | "send_message" | "followup_task")
+                ) {
+                    assert!(message.is_some_and(|message| message.get("encrypted").is_none()));
+                } else if let Some(message) = message {
+                    assert!(message.get("encrypted").is_some());
+                }
+            }
+        }
+    }
     upstream.verify().await;
 }
 
