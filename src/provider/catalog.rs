@@ -545,6 +545,18 @@ impl ProviderCatalog {
                     "title": "Memory queue timeout (ms)",
                     "description": "Maximum wait for gateway memory capacity within the request deadline."
                 },
+                "dispatch_max_in_flight": {
+                    "type": "integer", "minimum": 1, "maximum": 64, "default": 4,
+                    "description": "Concurrent Codex requests per account and proxy endpoint, including retries and response streams. Runtime decreases drain existing requests."
+                },
+                "dispatch_max_queued": {
+                    "type": "integer", "minimum": 0, "maximum": 1024, "default": 32,
+                    "description": "Maximum FIFO waiters before durable request admission. Zero rejects immediately when busy."
+                },
+                "dispatch_queue_timeout_millis": {
+                    "type": "integer", "minimum": 1, "maximum": 300000, "default": 30000,
+                    "description": "Maximum dispatch queue wait before returning 503 with Retry-After, without request or billing admission."
+                },
                 "max_sse_event_bytes": {
                     "type": "integer", "minimum": 262144, "maximum": 16777216, "default": 8388608,
                     "title": "Maximum SSE event bytes",

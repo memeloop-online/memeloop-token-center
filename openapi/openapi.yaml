@@ -20,6 +20,19 @@ info:
     `X-MTC-API-Version: v1`.
     Issued client and service credential secrets are returned only by create/rotate
     operations and must be stored by the caller immediately.
+
+    Native Codex account `transport_policy` supports runtime dispatch controls:
+    `dispatch_max_in_flight` (1..64, default 4), `dispatch_max_queued`
+    (0..1024, default 32), and `dispatch_queue_timeout_millis`
+    (1..300000, default 30000). Each gateway process queues fairly per account
+    and credential-free proxy endpoint identity. Queue capacity/timeout rejects
+    return HTTP 503, `Retry-After: 1`, and error.code
+    `codex_dispatch_queue_capacity` / `codex_dispatch_queue_timeout`.
+    Primary queue rejection occurs before durable request, reservation, RPM,
+    archive and billing admission. Same-account transport retries and response
+    streams retain their dispatch permit; candidate failover acquires the new
+    lane without holding the previous lane. Runtime reductions drain existing
+    requests rather than cancelling them; new queue waits use the current policy.
   license:
     name: Apache-2.0
     identifier: Apache-2.0

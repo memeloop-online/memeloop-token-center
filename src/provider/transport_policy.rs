@@ -60,6 +60,9 @@ pub(crate) struct CodexTransportPolicy {
     pub request_timeout_millis: u64,
     /// Maximum local memory queue time; does not extend the request deadline.
     pub memory_admission_wait_millis: u64,
+    pub dispatch_max_in_flight: usize,
+    pub dispatch_max_queued: usize,
+    pub dispatch_queue_timeout_millis: u64,
     pub max_sse_event_bytes: usize,
     pub max_sse_framed_bytes: usize,
     pub max_sse_terminal_hold_bytes: usize,
@@ -79,6 +82,9 @@ impl Default for CodexTransportPolicy {
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
+            dispatch_max_in_flight: 4,
+            dispatch_max_queued: 32,
+            dispatch_queue_timeout_millis: 30_000,
             max_sse_event_bytes: SseFramingLimits::DEFAULT_EVENT_BYTES,
             max_sse_framed_bytes: SseFramingLimits::DEFAULT_FRAMED_BYTES,
             max_sse_terminal_hold_bytes: SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES,
@@ -107,6 +113,9 @@ impl CodexTransportPolicy {
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
+            || !(1..=64).contains(&policy.dispatch_max_in_flight)
+            || policy.dispatch_max_queued > 1024
+            || !(1..=300_000).contains(&policy.dispatch_queue_timeout_millis)
             || !(SseFramingLimits::MIN_EVENT_BYTES..=SseFramingLimits::MAX_EVENT_BYTES)
                 .contains(&policy.max_sse_event_bytes)
             || !(policy.max_sse_event_bytes..=SseFramingLimits::MAX_BUFFER_BYTES)
@@ -216,6 +225,11 @@ mod tests {
             json!({"request_timeout_millis": 1260001}),
             json!({"memory_admission_wait_millis": 99}),
             json!({"memory_admission_wait_millis": 300001}),
+            json!({"dispatch_max_in_flight": 0}),
+            json!({"dispatch_max_in_flight": 65}),
+            json!({"dispatch_max_queued": 1025}),
+            json!({"dispatch_queue_timeout_millis": 0}),
+            json!({"dispatch_queue_timeout_millis": 300001}),
             json!({"max_sse_event_bytes": 262143}),
             json!({"max_sse_event_bytes": 16777217}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
