@@ -22,6 +22,9 @@ import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import { ProviderModelCatalog } from '../ProviderModelCatalog';
+import { ManagedModelSync } from '../ManagedModelSync';
+import { inferManagedRouteProtocol, managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
+import { consumeRouteDraftPrefill, consumeRouteFocus, storeCatalogRouteAction } from '../routePrefill';
 import { providerDisplayName } from '../providerDisplayName';
 import '../routeFormScope.css';
 import {
@@ -169,6 +172,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [providerDetail, setProviderDetail] = useState<string>();
   const quotaReads = useUpstreamQuotaReads(token, tenant, values);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
+  const [routeCacheRevisions, setRouteCacheRevisions] = useState<Record<string, number>>({});
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
   const providerSuccess = useRef<HTMLDivElement>(null);
@@ -230,12 +234,19 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   useEffect(() => {
     setProviderDetail(undefined);
     setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
-    setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
+    setBusy(''); setHealth({}); setDeletionReadiness({}); setRouteCacheRevisions({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
 
   const statusFilter = useResourceListStatusFilter('upstreams', tenant, values, (value) => value.status === 'active');
 
   const canManage = (value: UpstreamAccount) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
+
+  const openCatalogRouteAction = (account: UpstreamAccount, action: CatalogRouteAction) => {
+    const target = account.tenant_external_id ?? writeTenant;
+    if (!target) return;
+    storeCatalogRouteAction(target, account.id, action);
+    window.location.assign(appHref('operator', 'routes'));
+  };
 
   async function refreshOAuth(value: UpstreamAccount) {
     if (!canManage(value)) return;
@@ -384,10 +395,14 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
               <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
               {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
             </div>
+            <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onReconciled={() => {
+              setRouteCacheRevisions((current) => ({ ...current, [value.id]: (current[value.id] ?? 0) + 1 }));
+              void onChanged();
+            }} /></div>
           </div>
           {detailOpen && <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
             <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></div>
-            <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || Boolean(busy) || proxyEditorOpen} />
+            <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(value, action)} routeActionDisabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[value.id] ?? 0} />
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
@@ -416,7 +431,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     </article>
     <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
       {error && <div className="notice error" role="alert">{error}</div>}
-      {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={Boolean(busy) || proxyEditorOpen} />}
+      {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
       {editing || rotating ? providerEditors : reauthorizing ? <>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { await onChanged(); setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); }} />
     </> : <>
@@ -842,7 +857,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   onCatalogValidity: (valid: boolean, allowCustom: boolean) => void;
 }) {
   const { locale, t } = useI18n();
-  const knownProtocols = ['openai', 'anthropic', 'openai-audio', 'generation'];
+  const knownProtocols = managedRouteProtocols;
   const journey = formJourneyCopy(locale);
   const priorityHintId = useId();
   const protocolId = useId();
@@ -859,7 +874,16 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   const supportedByAll = candidateIds.length === 0 || candidateProtocolSets.some((values) => !values)
     ? knownProtocols
     : knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values?.includes(protocol)));
-  const protocolCompatible = supportedByAll.includes(draft.protocol);
+  const selectedManagedProtocol = inferManagedRouteProtocol(draft.protocol);
+  const protocolCompatible = selectedManagedProtocol !== undefined && supportedByAll.includes(selectedManagedProtocol);
+  const singleProtocol = candidateIds.length > 0
+    ? knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values && values.length > 0 && values.includes(protocol)))
+    : [];
+  const singleProtocolKey = singleProtocol.join(',');
+  useEffect(() => {
+    if (singleProtocol.length === 1 && draft.protocol !== singleProtocol[0]) onChange({ ...draft, protocol: singleProtocol[0] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [singleProtocolKey, draft.protocol]);
   const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale), details: `${t('providers.provider')}: ${providerDisplayName(value.driver, providers, locale)}; ${zh ? '账号 ID' : 'Account ID'}: ${value.id}; Driver: ${value.driver}` }));
   const providerGroupOptions = providerGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupOptions = routeGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
@@ -885,16 +909,16 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </AdvancedFormSection>
     <div className="route-protocol-field"><div className="route-protocol-heading"><label htmlFor={protocolId}>{t('routes.protocol')}</label><DetailTooltip content={t('routes.protocolCompatibilityHint')}><Button appearance="subtle" type="button">{journey.protocolHelp}</Button></DetailTooltip></div><Select id={protocolId} aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'openai-audio' ? 'OpenAI Audio' : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</Select></div>
     {!protocolCompatible && <p className="field-error" role="alert">{t('routes.protocolIncompatible')}</p>}
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, public_model: !draft.public_model.trim() || draft.public_model === draft.upstream_model ? upstream_model : draft.public_model, custom_model_confirmed: false })} onProtocolInferred={(protocol) => { const inferredProtocol = inferManagedRouteProtocol(protocol); if (inferredProtocol && draft.protocol !== inferredProtocol) onChange({ ...draft, protocol: inferredProtocol }); }} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
     <AdvancedFormSection action title={journey.priority} invalid={!priorityValid}>
     <label>{t('routes.priority')}<Input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : String(draft.priority)} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     </AdvancedFormSection>
-    </FormSection><FormSection title={journey.routeAccess} description={t('routes.accessHint')}>
+    </FormSection><AdvancedFormSection action title={journey.routeAccess} description={t('routes.accessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <AdvancedFormSection action title={t('routes.individualGrants', { count: draft.granted_credential_ids.length })} description={t('routes.individualGrantsHint')}>
       <ExactCredentialCombobox token={token} tenant={tenant} credentials={credentials} value={draft.granted_credential_ids} onChange={(granted_credential_ids) => onChange({ ...draft, granted_credential_ids })} onSelectionLabels={labels => setCredentialLabels({ scope: labelScope, labels })} />
     </AdvancedFormSection>
-    </FormSection>
+    </AdvancedFormSection>
     <section className="form-journey-preview" aria-label={journey.preview}>
       <h4>{journey.preview}</h4>
       <dl><div><dt>{t('routes.publicModel')}</dt><dd>{draft.public_model.trim() || journey.noModel}</dd></div>
@@ -907,6 +931,8 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
+  const routePageSize = 100;
+  const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
@@ -925,6 +951,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [focusRouteId, setFocusRouteId] = useState('');
   useLayoutEffect(() => { if (message && !workspaceOpen) successNotice.current?.focus(); }, [message, workspaceOpen]);
   const loadSequence = useRef(0);
   const loadAbort = useRef<AbortController | undefined>(undefined);
@@ -932,7 +959,9 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const credentialLoadAbort = useRef<AbortController | undefined>(undefined);
   const scopeRef = useRef({ token, tenant, writeTenant });
   scopeRef.current = { token, tenant, writeTenant };
-  const load = async () => {
+  const upstreamsRef = useRef(upstreams);
+  upstreamsRef.current = upstreams;
+  const load = async (requestedFocusRouteId = '') => {
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -943,7 +972,28 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       // The table is the route page's primary content. Credential choices are
       // only used by an opened create/edit form, so never put their paged
       // read on this critical path.
-      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: controller.signal });
+      const nextRoutes: ModelRouteView[] = [];
+      const visitedCursors = new Set<string>();
+      let beforeCreatedAt: number | undefined;
+      let beforeId: string | undefined;
+      for (let pageIndex = 0; pageIndex < maximumFocusedRoutePages; pageIndex += 1) {
+        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
+        if (beforeCreatedAt !== undefined && beforeId) {
+          routeQuery.set('before_created_at', String(beforeCreatedAt));
+          routeQuery.set('before_id', beforeId);
+        }
+        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: controller.signal });
+        nextRoutes.push(...page);
+        if (!requestedFocusRouteId || page.some((route) => route.id === requestedFocusRouteId) || page.length < routePageSize) break;
+        const last = page.at(-1);
+        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) throw new Error(t('providerCatalog.routesIncomplete'));
+        const cursor = `${last.created_at}\u0000${last.id}`;
+        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
+        visitedCursors.add(cursor);
+        beforeCreatedAt = last.created_at;
+        beforeId = last.id;
+        if (pageIndex === maximumFocusedRoutePages - 1) throw new Error(t('providerCatalog.routesIncomplete'));
+      }
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setError('');
     }
@@ -974,10 +1024,34 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   useEffect(() => {
     loadSequence.current += 1; credentialLoadSequence.current += 1; setRoutes([]); setCredentials([]); setCredentialsRequested(false); setCredentialError(''); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
     setEditing(undefined); setWorkspaceOpen(false); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
-    setBusy(''); setMessage(''); setError(''); void load();
+    setBusy(''); setMessage(''); setError('');
+    const prefill = consumeRouteDraftPrefill(writeTenant);
+    const prefillAccount = prefill && upstreamsRef.current.find((account) => account.id === prefill.accountId
+      && (!account.tenant_external_id || account.tenant_external_id === writeTenant)
+      && account.status === 'active');
+    const prefillProvider = providers.find((provider) => provider.id === prefillAccount?.driver);
+    const canUsePrefill = Boolean(prefill && prefillAccount && prefillProvider?.protocols.includes(prefill.protocol));
+    if (prefill && canUsePrefill) {
+      setForm({ ...emptyRouteDraft, upstream_account_id: prefill.accountId, upstream_account_ids: [prefill.accountId], upstream_model: prefill.upstreamModel, public_model: prefill.publicModel, protocol: prefill.protocol });
+      setWorkspaceOpen(true); setCredentialsRequested(true); setMessage(t('routes.prefilled'));
+    }
+    const focus = canUsePrefill ? '' : consumeRouteFocus(writeTenant) ?? '';
+    setFocusRouteId(focus);
+    void load(focus);
     return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
+  useEffect(() => {
+    if (focusRouteId && routes.some((route) => route.id === focusRouteId && !route.enabled) && !statusFilter.showInactive) {
+      statusFilter.setSelection('all');
+    }
+  }, [focusRouteId, routes, statusFilter.showInactive, statusFilter.setSelection]);
+  useLayoutEffect(() => {
+    if (!focusRouteId || !statusFilter.values.some((route) => route.id === focusRouteId)) return;
+    const row = document.querySelector<HTMLElement>(`[data-route-id="${CSS.escape(focusRouteId)}"]`);
+    row?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: 'center' });
+  }, [focusRouteId, statusFilter.values]);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
   const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
   const canSubmit = (draft: RouteDraft, catalogValid: boolean) => {
@@ -1060,9 +1134,10 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     finally { setBusy(''); }
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id} tabIndex={focusRouteId === route.id ? -1 : undefined} data-route-id={route.id} className={focusRouteId === route.id ? 'route-focus' : undefined}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
     </article>
-    <CreateJourney title={editing ? t('routes.editTitle', { model: editing.public_model }) : t('routes.createTitle')} description={t('routes.description')} open={workspaceOpen} busy={Boolean(busy)} onOpenChange={(open) => { setWorkspaceOpen(open); if (!open) setEditing(undefined); }} onOpen={() => setCredentialsRequested(true)}>
+    <CreateJourney title={editing ? t('routes.editTitle', { model: editing.public_model }) : t('routes.createTitle')} description={t('routes.description')} open={workspaceOpen} busy={Boolean(busy)} onOpenChange={(open) => { setWorkspaceOpen(open); if (!open) setEditing(undefined); }} onOpen={() => { setCredentialsRequested(true); setMessage(''); }}>
+      {message && workspaceOpen && <div className="notice success" role="status">{message}</div>}
       {(error || providerGroups.error || routeGroups.error || credentialError) && <div className="notice error" role="alert">{error || providerGroups.error || routeGroups.error || credentialError}</div>}
       <RouteFields key={editing?.id ?? 'create'} token={token} tenant={writeTenant} draft={editing ? editForm : form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={editing ? setEditForm : setForm} onCatalogValidity={(valid, allowCustom) => editing ? setEditCatalog({ valid, allowCustom }) : setFormCatalog({ valid, allowCustom })} />
       <div className="journey-actions"><p>{t('routes.description')}</p><Button appearance="primary" type="button" disabled={Boolean(busy) || !canSubmit(editing ? editForm : form, editing ? editCatalog.valid : formCatalog.valid)} onClick={() => void (editing ? saveEdit() : createRoute())}>{t(editing ? 'common.save' : 'routes.create')}</Button></div>

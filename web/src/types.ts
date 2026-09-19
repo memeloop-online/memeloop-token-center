@@ -396,12 +396,18 @@ export interface ModelPriceSyncResult {
   prices: ModelPriceView[];
 }
 
-export interface UpstreamCatalogModel {
+interface UpstreamCatalogModelIdentity {
   id: string;
   protocol: string;
 }
 
-export interface DisabledUpstreamCatalogModel extends UpstreamCatalogModel {
+export interface UpstreamCatalogModel extends UpstreamCatalogModelIdentity {
+  context_window: number | null;
+  reservation_token_bound: number | null;
+  reservation_bound_source: 'mtc_context_window_bound' | 'administrator_override' | null;
+}
+
+export interface DisabledUpstreamCatalogModel extends UpstreamCatalogModelIdentity {
   status: 'disabled';
   disabled_at: number;
   reason: 'removed_from_upstream';
@@ -409,17 +415,19 @@ export interface DisabledUpstreamCatalogModel extends UpstreamCatalogModel {
 
 export interface UpstreamModelCatalogResponse {
   account_id: string;
-  status: 'unknown' | 'syncing' | 'ready' | 'stale' | 'error' | string;
+  status: 'unknown' | 'syncing' | 'ready' | 'stale' | 'error';
   credential_generation: number;
   last_attempt_at: number | null;
   last_success_at: number | null;
   expires_at: number | null;
-  error_code: string | null;
+  error_code: 'unsupported' | 'destination_invalid' | 'credential_invalid' | 'connection_failed'
+    | 'authentication_failed' | 'rate_limited' | 'upstream_unavailable' | 'redirect_rejected'
+    | 'response_too_large' | 'invalid_response' | 'codex_no_trusted_models' | null;
   models: UpstreamCatalogModel[];
   disabled_models: DisabledUpstreamCatalogModel[];
 }
 
-export interface UpstreamCatalogPriceSync {
+export interface UpstreamModelPriceSyncResult {
   status: 'ready' | 'partial' | 'error' | 'skipped';
   currency: 'USD';
   imported: number;
@@ -430,8 +438,38 @@ export interface UpstreamCatalogPriceSync {
   error_code: 'price_sync_failed' | null;
 }
 
+export type UpstreamCatalogPriceSync = UpstreamModelPriceSyncResult;
+
 export interface UpstreamModelCatalogSyncResponse extends UpstreamModelCatalogResponse {
   price_sync: UpstreamCatalogPriceSync;
+}
+
+export interface ManagedRouteSyncCounts {
+  added: number;
+  disabled: number;
+  restored: number;
+  unchanged: number;
+  skipped: number;
+  warnings: string[];
+}
+
+export interface LegacyManagedRoutePriceSync {
+  status: 'deferred';
+  currency: 'USD';
+  imported: 0;
+  preserved: 0;
+  unmatched: 0;
+  ambiguous: 0;
+  failed_sources: [];
+  error_code: 'managed_route_price_sync_deferred';
+}
+
+export type ManagedRoutePriceSync = UpstreamModelPriceSyncResult | LegacyManagedRoutePriceSync;
+
+export interface ManagedModelSyncResponse {
+  catalog: UpstreamModelCatalogResponse;
+  routes: ManagedRouteSyncCounts;
+  price_sync: ManagedRoutePriceSync;
 }
 
 export interface KeyView {

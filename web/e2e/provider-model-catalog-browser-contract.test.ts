@@ -23,7 +23,7 @@ test('provider sync consumes its combined catalog result and keeps price outcome
   try {
     const page = await browser.newPage();
     await page.addInitScript(() => { if (!localStorage.getItem('mtc-locale')) localStorage.setItem('mtc-locale', 'zh-CN'); });
-    const models = Array.from({ length: 501 }, (_, index) => ({ id: `model-${index}`, protocol: 'openai' }));
+    const models = Array.from({ length: 501 }, (_, index) => ({ id: `model-${index}`, protocol: 'openai', context_window: null, reservation_token_bound: null, reservation_bound_source: null }));
     const disabledModels = [{ id: 'retired-model', protocol: 'openai', status: 'disabled' as const, disabled_at: 1_800_000_000_000, reason: 'removed_from_upstream' as const }];
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));

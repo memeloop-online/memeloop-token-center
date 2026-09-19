@@ -12,6 +12,7 @@ const resourceHook = readFileSync(new URL('../src/operator/hooks/useOperatorReso
 const resourceListStatusFilter = readFileSync(new URL('../src/operator/ResourceListStatusFilter.tsx', import.meta.url), 'utf8');
 const typedFilterBuilder = readFileSync(new URL('../src/operator/TypedFilterBuilder.tsx', import.meta.url), 'utf8');
 const upstreamModelCombobox = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+const managedModelSync = readFileSync(new URL('../src/operator/managedModelSync.ts', import.meta.url), 'utf8');
 
 test('operator exposes controlled built-in and plugin routing without coupling credentials to the URL', () => {
   assert.match(operator, /type OperatorApplicationRoute = OperatorRouteKey \| PluginRouteKey/);
@@ -72,7 +73,8 @@ test('pricing sync and resource refreshes retain only current operation results'
 });
 
 test('route create and edit use the canonical OpenAI Audio protocol', () => {
-  assert.match(managementPages, /\['openai', 'anthropic', 'openai-audio', 'generation'\]/);
+  assert.match(managedModelSync, /\['openai', 'anthropic', 'openai-audio', 'generation'\]/);
+  assert.match(managementPages, /const knownProtocols = managedRouteProtocols/);
   assert.doesNotMatch(managementPages, /protocol === 'audio'/);
   assert.match(upstreamModelCombobox, /protocol === 'openai-audio'/);
   assert.doesNotMatch(upstreamModelCombobox, /protocol === 'audio'/);
