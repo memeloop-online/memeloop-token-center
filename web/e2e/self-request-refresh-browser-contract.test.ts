@@ -77,7 +77,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
       Object.defineProperty(document, 'hidden', { configurable: true, value: true });
       document.dispatchEvent(new Event('visibilitychange'));
     });
-    await page.getByRole('status').filter({ hasText: 'paused in background' }).waitFor();
+    await page.locator('[role="status"][data-refresh-state="paused"]').waitFor();
     assert.equal(await noHiddenPoll, false, 'hidden pages do not poll');
     assert.equal(listReads, beforeHidden, 'hidden pages do not poll');
     const resumedPoll = page.waitForResponse(response => new URL(response.url()).pathname === '/self/v1/requests', { timeout: 7_000 });
@@ -97,7 +97,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     const refreshStarted = page.waitForRequest(request => new URL(request.url()).pathname === '/self/v1/requests', { timeout: 5_000 });
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await refreshStarted;
-    await page.getByRole('status').filter({ hasText: 'Updating the list and summary' }).waitFor();
+    await page.locator('[role="status"][data-refresh-state="refreshing"]').waitFor();
     await heldHistoryRefresh!.fulfill({ json: [request('new-injected', 2_000), ...firstPage.slice(0, 49)] });
     await waitForCadenceText('Manual');
     assert.deepEqual(await page.locator('.request-id-control.compact code').allTextContents(), loaded, 'refresh cannot inject or reorder an explicit history window');

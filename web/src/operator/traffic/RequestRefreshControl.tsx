@@ -20,6 +20,7 @@ export function RequestRefreshControl({ intervalMs, onIntervalChange, paused, pa
     t('requestRefresh.fiveMinutes'),
   ];
   const index = Math.max(0, requestRefreshIntervals.findIndex(value => value === intervalMs));
+  const state = refreshing ? 'refreshing' : paused && intervalMs !== 0 ? 'paused' : intervalMs === 0 ? 'manual' : 'polling';
   return <div className="request-refresh-control">
     <label>{t('requestRefresh.cadence')} <strong aria-hidden="true">{labels[index]}</strong></label>
     <div className="request-refresh-slider">
@@ -32,7 +33,7 @@ export function RequestRefreshControl({ intervalMs, onIntervalChange, paused, pa
         }} />
       <div className="request-refresh-ticks" aria-hidden="true">{labels.map(label => <span key={label}>{label}</span>)}</div>
     </div>
-    <span className="request-refresh-hint" role="status">
+    <span className="request-refresh-hint" role="status" data-refresh-state={state}>
       {refreshing
         ? t('requestRefresh.refreshing')
         : paused && intervalMs !== 0
