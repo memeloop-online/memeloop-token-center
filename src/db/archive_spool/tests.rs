@@ -298,6 +298,87 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool_capacity() {
+    use crate::db::{CreateKeyInput, RequestArchiveAdmission, StartProxyRequest};
+    let (_dir, db, _) = fixture().await;
+    let pepper = b"archive-retention-limit-pepper-over-32-bytes";
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "retention-limit".into(),
+                principal_external_id: "member".into(),
+                alias: "retention-limit".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = db.authenticate_key(&issued.key, pepper).await.unwrap();
+    let price = db
+        .upsert_model_price(
+            "retention-limit",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let request_id = Uuid::new_v4();
+    let locator = format!("gap://{request_id}/request");
+    let body = bytes::Bytes::from(vec![b'x'; REQUEST_ARCHIVE_PLAIN_LIMIT.saturating_add(1)]);
+    let admitted = db
+        .start_proxy_request_with_archive(
+            StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 7,
+                output_token_ceiling: 11,
+                protocol: "openai",
+                model: "retention-limit",
+                request_object: &locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &body,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.archive_admission,
+        RequestArchiveAdmission::GapRetentionLimit
+    );
+    assert_eq!(budget(&db).await, 0);
+    let gap = sqlx::query(
+        "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
+                cleaned_at
+         FROM request_archive_spools WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(gap.get::<String, _>("state"), "gap");
+    assert_eq!(gap.get::<String, _>("gap_reason"), "retention_limit");
+    assert_eq!(gap.get::<i64, _>("body_byte_count"), body.len() as i64);
+    assert_eq!(
+        gap.get::<String, _>("body_blake3"),
+        blake3::hash(&body).to_hex().to_string()
+    );
+    assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
+    assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, 0);
+}
+
 #[tokio::test]
 async fn request_binding_is_atomic_with_staging_and_preserves_terminal_facts() {
     use crate::archive_staging::{
@@ -772,7 +853,7 @@ async fn identity_sequence_replay_and_exact_quota() {
     );
     // Seed the global accounting boundary without allocating 256MiB in CI.
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(CIPHER_LIMIT - 3 - CHUNK_OVERHEAD)
+        .bind(RESPONSE_CIPHER_LIMIT - 3 - CHUNK_OVERHEAD)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -781,13 +862,13 @@ async fn identity_sequence_replay_and_exact_quota() {
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, CIPHER_LIMIT);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(
         !db.append_response_archive_spool(id, 2, 8, "x")
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, CIPHER_LIMIT);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(!db.seal_response_archive_spool(id, 2, 15).await.unwrap());
     assert!(db.seal_response_archive_spool(id, 2, 16).await.unwrap());
     assert!(db.seal_response_archive_spool(id, 2, 16).await.unwrap());
@@ -1397,7 +1478,7 @@ async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
 async fn empty_spool_admission_is_bounded_and_replay_does_not_recharge() {
     let (_dir, db, id) = fixture().await;
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD + 1)
+        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD + 1)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1407,16 +1488,19 @@ async fn empty_spool_admission_is_bounded_and_replay_does_not_recharge() {
         .await
         .unwrap();
     assert_eq!(rows, 0);
-    assert_eq!(budget(&db).await, CIPHER_LIMIT - SPOOL_OVERHEAD + 1);
+    assert_eq!(
+        budget(&db).await,
+        RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD + 1
+    );
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
         .execute(&db.pool)
         .await
         .unwrap();
     assert!(db.begin_response_archive_spool(id).await.unwrap());
-    assert_eq!(budget(&db).await, CIPHER_LIMIT);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(db.begin_response_archive_spool(id).await.unwrap());
-    assert_eq!(budget(&db).await, CIPHER_LIMIT);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(
         !db.append_response_archive_spool(id, 0, 1, "x")
             .await
@@ -1427,7 +1511,7 @@ async fn empty_spool_admission_is_bounded_and_replay_does_not_recharge() {
         .await
         .unwrap();
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
-    assert_eq!(budget(&db).await, CIPHER_LIMIT - SPOOL_OVERHEAD);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert!(!db.begin_response_archive_spool(id).await.unwrap());
 }

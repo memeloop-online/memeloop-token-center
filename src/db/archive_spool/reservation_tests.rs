@@ -160,29 +160,35 @@ async fn reservations_preserve_the_global_capacity_boundary() {
     )
     .unwrap();
     let amount = SPOOL_OVERHEAD + archive.sealed_len(body.len()).unwrap() as i64 + CHUNK_OVERHEAD;
-    sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(CIPHER_LIMIT - amount + 1)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE response_archive_spool_budget
+         SET cipher_bytes = $1, request_cipher_bytes = $1",
+    )
+    .bind(REQUEST_CIPHER_LIMIT - amount + 1)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     assert!(
         db.reserve_buffered_archive_capacity(&archive)
             .await
             .unwrap()
             .is_none()
     );
-    assert_eq!(budget(&db).await, CIPHER_LIMIT - amount + 1);
-    sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(CIPHER_LIMIT - amount)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount + 1);
+    sqlx::query(
+        "UPDATE response_archive_spool_budget
+         SET cipher_bytes = $1, request_cipher_bytes = $1",
+    )
+    .bind(REQUEST_CIPHER_LIMIT - amount)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let reservation = db
         .reserve_buffered_archive_capacity(&archive)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(budget(&db).await, CIPHER_LIMIT);
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT);
     assert!(
         db.reserve_buffered_archive_capacity(&archive)
             .await
@@ -190,5 +196,108 @@ async fn reservations_preserve_the_global_capacity_boundary() {
             .is_none()
     );
     reservation.release().await;
-    assert_eq!(budget(&db).await, CIPHER_LIMIT - amount);
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount);
+}
+
+#[tokio::test]
+async fn concurrent_request_reservations_cannot_cross_the_purpose_boundary() {
+    let (_directory, db, id) = fixture().await;
+    let body = bytes::Bytes::from_static(b"one remaining request archive slot");
+    let sample = crate::response_archive_spool::BufferedArchive::new(
+        id,
+        BufferedArchivePurpose::Request,
+        &body,
+        PEPPER,
+        false,
+    )
+    .unwrap();
+    let amount = SPOOL_OVERHEAD + sample.sealed_len(body.len()).unwrap() as i64 + CHUNK_OVERHEAD;
+    sqlx::query(
+        "UPDATE response_archive_spool_budget
+         SET cipher_bytes = $1, request_cipher_bytes = $1",
+    )
+    .bind(REQUEST_CIPHER_LIMIT - amount)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let db = db.clone();
+        let body = body.clone();
+        let identity = ArchiveSpoolIdentity {
+            request_id: Uuid::new_v4(),
+            ..id
+        };
+        tasks.spawn(async move {
+            let archive = crate::response_archive_spool::BufferedArchive::new(
+                identity,
+                BufferedArchivePurpose::Request,
+                &body,
+                PEPPER,
+                false,
+            )
+            .unwrap();
+            db.reserve_buffered_archive_capacity(&archive)
+                .await
+                .unwrap()
+        });
+    }
+    let mut reservations = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        if let Some(reservation) = result.unwrap() {
+            reservations.push(reservation);
+        }
+    }
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT);
+    reservations[0].release().await;
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount);
+}
+
+#[tokio::test]
+async fn response_pressure_cannot_consume_request_archive_partition() {
+    let (_directory, db, id) = fixture().await;
+    sqlx::query(
+        "UPDATE response_archive_spool_budget
+         SET cipher_bytes = $1, request_cipher_bytes = 0",
+    )
+    .bind(RESPONSE_CIPHER_LIMIT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let body = bytes::Bytes::from_static(b"request partition remains available");
+    let request_archive = crate::response_archive_spool::BufferedArchive::new(
+        id,
+        BufferedArchivePurpose::Request,
+        &body,
+        PEPPER,
+        false,
+    )
+    .unwrap();
+    let request_reservation = db
+        .reserve_buffered_archive_capacity(&request_archive)
+        .await
+        .unwrap()
+        .expect("response backlog must leave request capacity available");
+
+    let response_archive = crate::response_archive_spool::BufferedArchive::new(
+        ArchiveSpoolIdentity {
+            request_id: Uuid::new_v4(),
+            ..id
+        },
+        BufferedArchivePurpose::Response,
+        &body,
+        PEPPER,
+        false,
+    )
+    .unwrap();
+    assert!(
+        db.reserve_buffered_archive_capacity(&response_archive)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    request_reservation.release().await;
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
 }

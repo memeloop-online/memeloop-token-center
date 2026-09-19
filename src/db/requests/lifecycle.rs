@@ -63,6 +63,26 @@ pub struct StartProxyRequest<'a> {
     pub model_route_id: Option<Uuid>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestArchiveAdmission {
+    Captured,
+    GapCapacity,
+    GapRetentionLimit,
+}
+
+pub(crate) struct StartedProxyRequest {
+    pub(crate) reservation: UsageReservation,
+    pub(crate) archive_admission: RequestArchiveAdmission,
+}
+
+impl std::ops::Deref for StartedProxyRequest {
+    type Target = UsageReservation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reservation
+    }
+}
+
 /// Admission contract for a synchronous request billed in provider-defined
 /// generation units rather than tokens.
 ///
@@ -179,7 +199,9 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None).await
+        self.start_proxy_request_inner(input, None)
+            .await
+            .map(|started| started.reservation)
     }
 
     pub async fn start_metered_synchronous_request(
@@ -226,7 +248,7 @@ impl Database {
         input: StartProxyRequest<'_>,
         body: &bytes::Bytes,
         pepper: &[u8],
-    ) -> Result<UsageReservation, AppError> {
+    ) -> Result<StartedProxyRequest, AppError> {
         self.start_proxy_request_with_archive_compression(input, body, pepper, false)
             .await
     }
@@ -237,7 +259,7 @@ impl Database {
         body: &bytes::Bytes,
         pepper: &[u8],
         compression_enabled: bool,
-    ) -> Result<UsageReservation, AppError> {
+    ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
         let result = self
             .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)))
@@ -261,10 +283,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
-    ) -> Result<UsageReservation, AppError> {
-        if archive.is_some_and(|(body, _, _)| body.len() > 64 * 1024 * 1024) {
-            return Err(AppError::Overloaded);
-        }
+    ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
         let reservation_id = Uuid::now_v7();
@@ -274,7 +293,11 @@ impl Database {
             reservation_id,
         };
         let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
+        let exceeds_retention_limit = archive.is_some_and(|(body, _, _)| {
+            body.len() > super::super::archive_spool::REQUEST_ARCHIVE_PLAIN_LIMIT
+        });
         let buffered_archive = archive
+            .filter(|_| !exceeds_retention_limit)
             .map(|(body, pepper, compression_enabled)| {
                 crate::response_archive_spool::BufferedArchive::new(
                     identity,
@@ -286,23 +309,29 @@ impl Database {
                 .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
-        // Prepare the existing bounded first insert batch before reserving
-        // capacity. Cancellation here leaves no admission
-        // facts, and the ciphertext is dropped with this future.
-        let prepared_request_batch = match buffered_archive.as_ref() {
-            Some(archive) => Some(archive.prepare_first_batch().await?),
-            None => None,
-        };
         // Reserve capacity in a short, independently committed transaction.
         // Request/account/session locks and compression only hold the private
         // reservation row, never the shared counter used by every stream.
         let budget_reservation = match buffered_archive.as_ref() {
-            Some(archive) => Some(
-                self.reserve_buffered_archive_capacity(archive)
-                    .await?
-                    .ok_or(AppError::Overloaded)?,
-            ),
+            Some(archive) => self.reserve_buffered_archive_capacity(archive).await?,
             None => None,
+        };
+        let archive_admission = if archive.is_none() {
+            RequestArchiveAdmission::Captured
+        } else if exceeds_retention_limit {
+            RequestArchiveAdmission::GapRetentionLimit
+        } else if budget_reservation.is_none() {
+            RequestArchiveAdmission::GapCapacity
+        } else {
+            RequestArchiveAdmission::Captured
+        };
+        // Seal only after capacity has been reserved. A full spool degrades to
+        // durable gap evidence without spending CPU or transient ciphertext
+        // memory on a body which cannot be retained.
+        let prepared_request_batch = match (buffered_archive.as_ref(), budget_reservation.as_ref())
+        {
+            (Some(archive), Some(_)) => Some(archive.prepare_first_batch().await?),
+            _ => None,
         };
         let (mut transaction, now, mut hold) =
             if let Some(reservation) = budget_reservation.as_ref() {
@@ -347,7 +376,7 @@ impl Database {
             BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
         }
-        if let Some(archive) = buffered_archive {
+        if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
             let capture_started = std::time::Instant::now();
@@ -377,6 +406,21 @@ impl Database {
                 }
                 return Err(AppError::Overloaded);
             }
+        } else if archive.is_some() {
+            let (body, _, _) = archive.ok_or(AppError::Internal)?;
+            let reason = match archive_admission {
+                RequestArchiveAdmission::GapCapacity => "capacity",
+                RequestArchiveAdmission::GapRetentionLimit => "retention_limit",
+                RequestArchiveAdmission::Captured => return Err(AppError::Internal),
+            };
+            super::super::archive_spool::insert_request_archive_gap_in_transaction(
+                &mut transaction,
+                now,
+                identity,
+                body,
+                reason,
+            )
+            .await?;
         } else if prepared_request_batch.is_some() {
             return Err(AppError::Internal);
         }
@@ -401,7 +445,10 @@ impl Database {
         if let Some(reservation) = budget_reservation.as_ref() {
             reservation.release().await;
         }
-        Ok(reservation)
+        Ok(StartedProxyRequest {
+            reservation,
+            archive_admission,
+        })
     }
 
     /// Moves an admitted but unfinished request to the next authorized route

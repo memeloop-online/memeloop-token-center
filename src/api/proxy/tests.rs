@@ -4362,6 +4362,126 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
 }
 
 #[tokio::test]
+async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream() {
+    let fixture = codex_route_fixture("archive-capacity-degradation").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE response_archive_spool_budget
+         SET cipher_bytes = 268435456, request_cipher_bytes = 0
+         WHERE singleton = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("archive capacity is independent from inference");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.clone().into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let request = json!({
+        "model": fixture.model,
+        "input": "dispatch even when durable archive capacity is full",
+        "stream": true
+    });
+    let request_bytes = serde_json::to_vec(&request).unwrap();
+    let response = send_codex_route(&fixture, &upstream, "/v1/responses", request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap()
+            .as_ref(),
+        sse.as_bytes()
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let gap = sqlx::query(
+        "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
+                cleaned_at
+         FROM request_archive_spools WHERE request_id = $1",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(gap.get::<String, _>("state"), "gap");
+    assert_eq!(gap.get::<String, _>("gap_reason"), "capacity");
+    assert_eq!(
+        gap.get::<i64, _>("body_byte_count"),
+        request_bytes.len() as i64
+    );
+    assert_eq!(
+        gap.get::<String, _>("body_blake3"),
+        blake3::hash(&request_bytes).to_hex().to_string()
+    );
+    assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
+    assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    upstream.verify().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn durable_admission_database_failure_never_dispatches_upstream() {
+    let fixture = codex_route_fixture("archive-admission-database-failure").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_proxy_admission
+         BEFORE INSERT ON request_records
+         BEGIN SELECT RAISE(ABORT, 'synthetic admission failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("must remain unreachable"),
+            "text/event-stream",
+        ))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "database admission must commit before dispatch",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    upstream.verify().await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal() {
     let fixture = codex_route_fixture("retry-stream-failure").await;
     let upstream = MockServer::start().await;

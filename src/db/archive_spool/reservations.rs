@@ -112,9 +112,62 @@ impl Database {
         let started = Instant::now();
         let mut tx = self.begin_write_transaction().await?;
         let now = archive_clock(&mut tx, self.backend).await?;
-        let updated = sqlx::query(sqlx::AssertSqlSafe(spool_sql(archive.purpose(),
-            "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-            .bind(amount).bind(CIPHER_LIMIT - amount).execute(&mut *tx).await?;
+        // Serialize the short purpose-specific byte/slot decision on the
+        // existing singleton row. Request and response captures each retain
+        // half of the fixed budget, so an object outage on one side cannot
+        // consume the other's capacity.
+        let budget_lock = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1"
+            }
+        };
+        sqlx::query(budget_lock).fetch_one(&mut *tx).await?;
+        let active_slots: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
+            archive.purpose(),
+            "SELECT
+                (SELECT COUNT(*) FROM response_archive_spools
+                 WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading'))
+              + (SELECT COUNT(*) FROM archive_budget_reservations
+                 WHERE purpose = $1)",
+        )))
+        .bind(archive.purpose().as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_slots >= ARCHIVE_SLOT_LIMIT {
+            tx.rollback().await?;
+            tracing::warn!(phase = "archive_capacity_reserve", requested_bytes = amount,
+                request_id = %archive.identity().request_id, purpose = archive.purpose().as_str(),
+                reason = "slot_capacity", "archive capacity reservation unavailable");
+            return Ok(None);
+        }
+        let (statement, purpose_limit) = match archive.purpose() {
+            BufferedArchivePurpose::Request => (
+                "UPDATE response_archive_spool_budget
+                 SET cipher_bytes = cipher_bytes + $1,
+                     request_cipher_bytes = request_cipher_bytes + $1
+                 WHERE singleton = 1
+                   AND cipher_bytes <= $2
+                   AND request_cipher_bytes <= $3",
+                REQUEST_CIPHER_LIMIT,
+            ),
+            BufferedArchivePurpose::Response => (
+                "UPDATE response_archive_spool_budget
+                 SET cipher_bytes = cipher_bytes + $1
+                 WHERE singleton = 1
+                   AND cipher_bytes <= $2
+                   AND cipher_bytes - request_cipher_bytes <= $3",
+                RESPONSE_CIPHER_LIMIT,
+            ),
+        };
+        let updated = sqlx::query(statement)
+            .bind(amount)
+            .bind(CIPHER_LIMIT - amount)
+            .bind(purpose_limit - amount)
+            .execute(&mut *tx)
+            .await?;
         if updated.rows_affected() != 1 {
             tx.rollback().await?;
             tracing::warn!(phase = "archive_capacity_reserve", requested_bytes = amount,

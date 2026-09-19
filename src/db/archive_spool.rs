@@ -19,8 +19,16 @@ use crate::archive_staging::ArchiveStagingPurpose;
 use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
+/// Bodies above the default Responses envelope remain valid inference input,
+/// but retaining them during a configured larger-ingress deployment would let
+/// a few conversations monopolize the durable spool. They therefore keep only
+/// irreversible gap evidence.
+pub(crate) const REQUEST_ARCHIVE_PLAIN_LIMIT: usize = 16 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
 const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
+pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;
+pub(super) const RESPONSE_CIPHER_LIMIT: i64 = CIPHER_LIMIT - REQUEST_CIPHER_LIMIT;
+pub(super) const ARCHIVE_SLOT_LIMIT: i64 = 4096;
 const CHUNK_LIMIT: i64 = 65536;
 const CHUNK_OVERHEAD: i64 = 512;
 const SPOOL_OVERHEAD: i64 = 1024;
@@ -54,6 +62,48 @@ pub(crate) struct ArchiveSpoolChunk {
     pub seq: i64,
     pub ciphertext: String,
     pub byte_count: i64,
+}
+
+pub(crate) async fn insert_request_archive_gap_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    now: i64,
+    identity: ArchiveSpoolIdentity,
+    body: &bytes::Bytes,
+    reason: &'static str,
+) -> Result<(), AppError> {
+    if !matches!(reason, "capacity" | "retention_limit") {
+        return Err(AppError::Internal);
+    }
+    let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
+    let digest = blake3::hash(body).to_hex().to_string();
+    let inserted = sqlx::query(
+        "INSERT INTO request_archive_spools (
+            request_id, tenant_id, reservation_id, state, chunk_count,
+            byte_count, cipher_bytes, attempts, next_attempt_at, created_at,
+            updated_at, expires_at, cleaned_at, last_error_code, gap_reason,
+            body_byte_count, body_blake3
+         )
+         SELECT $1, $2, $3, 'gap', 0, 0, 0, 0, $4, $4, $4, $4, $4,
+                'capacity', $5, $6, $7
+         WHERE EXISTS (
+             SELECT 1 FROM request_records
+             WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3
+               AND completed_at IS NULL
+         )",
+    )
+    .bind(identity.request_id.to_string())
+    .bind(identity.tenant_id.to_string())
+    .bind(identity.reservation_id.to_string())
+    .bind(now)
+    .bind(reason)
+    .bind(byte_count)
+    .bind(digest)
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(())
 }
 
 impl Database {
@@ -398,6 +448,31 @@ impl Database {
             if !accepted { spool_write_rejected(identity, "begin", "existing_spool_not_eligible"); }
             return Ok(accepted);
         }
+        hold.phase("budget_and_slot_admission");
+        let budget_lock = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1"
+            }
+        };
+        sqlx::query(budget_lock).fetch_one(&mut *tx).await?;
+        let active_slots: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spools
+             WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_slots >= ARCHIVE_SLOT_LIMIT {
+            BudgetHold::rollback_optional(tx, Some(hold)).await?;
+            return Ok(spool_write_rejected(
+                identity,
+                "begin",
+                "response_slot_capacity",
+            ));
+        }
+        hold.phase("spool_insert");
         let inserted = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, next_attempt_at, created_at, updated_at, expires_at, cipher_bytes) VALUES ($1, $2, $3, 'capturing', $4, $4, $4, $5, $6) ON CONFLICT(request_id) DO NOTHING")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(now).bind(now + CAPTURE_TTL)
@@ -421,8 +496,18 @@ impl Database {
             return Ok(accepted);
         }
         hold.phase("budget_update");
-        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-            .bind(SPOOL_OVERHEAD).bind(CIPHER_LIMIT - SPOOL_OVERHEAD).execute(&mut *tx).await?;
+        let budget = sqlx::query(
+            "UPDATE response_archive_spool_budget
+             SET cipher_bytes = cipher_bytes + $1
+             WHERE singleton = 1
+               AND cipher_bytes <= $2
+               AND cipher_bytes - request_cipher_bytes <= $3",
+        )
+        .bind(SPOOL_OVERHEAD)
+        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .execute(&mut *tx)
+        .await?;
         if budget.rows_affected() != 1 {
             BudgetHold::rollback_optional(tx, Some(hold)).await?;
             return Ok(spool_write_rejected(
@@ -598,8 +683,18 @@ impl Database {
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET chunk_count = chunk_count + $1, byte_count = byte_count + $2, cipher_bytes = cipher_bytes + $3, updated_at = $4, expires_at = $5 WHERE request_id = $6")))
             .bind(batch_count).bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         hold.phase("budget_update");
-        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-            .bind(cipher_bytes).bind(CIPHER_LIMIT - cipher_bytes).execute(&mut *tx).await?;
+        let budget = sqlx::query(
+            "UPDATE response_archive_spool_budget
+             SET cipher_bytes = cipher_bytes + $1
+             WHERE singleton = 1
+               AND cipher_bytes <= $2
+               AND cipher_bytes - request_cipher_bytes <= $3",
+        )
+        .bind(cipher_bytes)
+        .bind(CIPHER_LIMIT - cipher_bytes)
+        .bind(RESPONSE_CIPHER_LIMIT - cipher_bytes)
+        .execute(&mut *tx)
+        .await?;
         if budget.rows_affected() != 1 {
             BudgetHold::rollback_optional(tx, Some(hold)).await?;
             return Ok(spool_write_rejected(
