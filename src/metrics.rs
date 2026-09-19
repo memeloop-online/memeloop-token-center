@@ -59,6 +59,7 @@ struct MetricsInner {
     database_ready: AtomicI64,
     archive_ready: AtomicI64,
     readiness: tokio::sync::Mutex<Option<CachedReadiness>>,
+    readiness_snapshot: Mutex<Option<CachedReadiness>>,
     process_started: Instant,
 }
 
@@ -85,6 +86,7 @@ impl Default for MetricsInner {
             database_ready: AtomicI64::new(0),
             archive_ready: AtomicI64::new(0),
             readiness: tokio::sync::Mutex::default(),
+            readiness_snapshot: Mutex::default(),
             process_started: Instant::now(),
         }
     }
@@ -126,8 +128,25 @@ impl ProxyMemoryRejectionStage {
 #[derive(Clone, Copy)]
 struct CachedReadiness {
     checked_at: Instant,
-    database: bool,
+    database: DatabaseReadiness,
     archive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseReadiness {
+    Ready,
+    Unavailable,
+    SchemaOutdated {
+        required_version: i64,
+        latest_applied_version: Option<i64>,
+        missing_migration_count: usize,
+    },
+}
+
+impl DatabaseReadiness {
+    pub(crate) const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -524,20 +543,26 @@ impl Metrics {
     /// This keeps anonymous Kubernetes probes from amplifying into an S3 list
     /// and SQL query on every inbound request while still detecting dependency
     /// failures quickly enough for endpoint removal.
-    pub async fn readiness<F, Fut>(&self, check: F) -> (bool, bool)
+    pub(crate) async fn readiness<F, Fut>(&self, check: F) -> (DatabaseReadiness, bool)
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = (bool, bool)>,
+        Fut: Future<Output = (DatabaseReadiness, bool)>,
     {
         const TTL: Duration = Duration::from_secs(5);
         let Ok(mut cached) = self.inner.readiness.try_lock() else {
             // Never let a probe burst build a waiter queue while one dependency
-            // check is already running. Until the first check completes this is
-            // conservatively not-ready; afterwards it is the most recent result.
-            return (
-                self.inner.database_ready.load(Ordering::Relaxed) == 1,
-                self.inner.archive_ready.load(Ordering::Relaxed) == 1,
-            );
+            // check is already running. Return the complete prior snapshot so
+            // an unrelated metrics scrape cannot turn schema drift into a
+            // false-ready boolean. Before the first completed check, fail closed.
+            return self
+                .inner
+                .readiness_snapshot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .copied()
+                .map(|value| (value.database, value.archive))
+                .unwrap_or((DatabaseReadiness::Unavailable, false));
         };
         if let Some(value) = *cached
             && value.checked_at.elapsed() < TTL
@@ -547,13 +572,19 @@ impl Metrics {
         // Deliberately hold this mutex across the checks: it is a singleflight
         // lock used only by /readyz, never by request processing or /metrics.
         let (database, archive) = check().await;
-        *cached = Some(CachedReadiness {
+        let snapshot = CachedReadiness {
             checked_at: Instant::now(),
             database,
             archive,
-        });
+        };
+        *cached = Some(snapshot);
+        *self
+            .inner
+            .readiness_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
         drop(cached);
-        self.set_dependency_ready("database", database);
+        self.set_dependency_ready("database", database.is_ready());
         self.set_dependency_ready("archive", archive);
         (database, archive)
     }
@@ -1448,18 +1479,45 @@ mod tests {
         let first = metrics
             .readiness(|| async {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (true, true)
+                (DatabaseReadiness::Ready, true)
             })
             .await;
         let second = metrics
             .readiness(|| async {
                 calls.fetch_add(1, Ordering::Relaxed);
-                (false, false)
+                (DatabaseReadiness::Unavailable, false)
             })
             .await;
-        assert_eq!(first, (true, true));
-        assert_eq!(second, (true, true));
+        assert_eq!(first, (DatabaseReadiness::Ready, true));
+        assert_eq!(second, (DatabaseReadiness::Ready, true));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_lock_contention_preserves_schema_outdated_snapshot() {
+        let metrics = Metrics::default();
+        let schema_outdated = DatabaseReadiness::SchemaOutdated {
+            required_version: 111,
+            latest_applied_version: Some(105),
+            missing_migration_count: 6,
+        };
+        *metrics
+            .inner
+            .readiness_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(CachedReadiness {
+            checked_at: Instant::now(),
+            database: schema_outdated,
+            archive: true,
+        });
+        metrics.set_dependency_ready("database", true);
+        let _singleflight = metrics.inner.readiness.lock().await;
+
+        let result = metrics
+            .readiness(|| async { (DatabaseReadiness::Ready, true) })
+            .await;
+
+        assert_eq!(result, (schema_outdated, true));
     }
 
     #[test]

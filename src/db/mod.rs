@@ -224,6 +224,31 @@ pub(crate) enum DatabaseBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DatabaseSchemaStatus {
+    pub(crate) required_version: i64,
+    pub(crate) latest_applied_version: Option<i64>,
+    pub(crate) missing_migration_count: usize,
+}
+
+impl DatabaseSchemaStatus {
+    pub(crate) const fn is_ready(self) -> bool {
+        self.missing_migration_count == 0
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DatabaseReadinessError {
+    Dependency(AppError),
+    SchemaOutdated(DatabaseSchemaStatus),
+}
+
+impl From<AppError> for DatabaseReadinessError {
+    fn from(error: AppError) -> Self {
+        Self::Dependency(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OAuthRefreshWritePhase {
     Disconnect,
     Claim,
@@ -265,8 +290,26 @@ impl Database {
     }
 
     pub async fn readiness_check(&self) -> Result<(), AppError> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
-        self.archive_staging_readiness_check().await?;
+        self.readiness_check_detailed()
+            .await
+            .map_err(|error| match error {
+                DatabaseReadinessError::Dependency(error) => error,
+                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+            })
+    }
+
+    pub(crate) async fn readiness_check_detailed(&self) -> Result<(), DatabaseReadinessError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(AppError::from)?;
+        let schema = self.schema_status().await.map_err(AppError::from)?;
+        if !schema.is_ready() {
+            return Err(DatabaseReadinessError::SchemaOutdated(schema));
+        }
+        self.archive_staging_readiness_check()
+            .await
+            .map_err(AppError::from)?;
         Ok(())
     }
 

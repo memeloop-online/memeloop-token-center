@@ -597,17 +597,23 @@
       "properties": {
         "startup": { "$ref": "#/definitions/probe" },
         "readiness": {
-          "description": "For /readyz, Helm also enforces timeoutSeconds >= ceil(config.s3.readinessDeadlineMillis / 1000) + 2. /livez does not depend on archive deadlines.",
+          "description": "Readiness uses /readyz and enforces timeoutSeconds >= ceil(config.s3.readinessDeadlineMillis / 1000) + 2.",
           "allOf": [
             { "$ref": "#/definitions/probe" },
             {
               "properties": {
+                "path": { "const": "/readyz" },
                 "timeoutSeconds": { "minimum": 7 }
               }
             }
           ]
         },
-        "liveness": { "$ref": "#/definitions/probe" }
+        "liveness": {
+          "allOf": [
+            { "$ref": "#/definitions/probe" },
+            { "properties": { "path": { "const": "/livez" } } }
+          ]
+        }
       }
     },
     "networkPolicy": {

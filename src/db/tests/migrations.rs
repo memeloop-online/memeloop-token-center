@@ -1,6 +1,51 @@
 use super::super::*;
 
 #[tokio::test]
+async fn readiness_rejects_schema_gaps_and_an_outdated_migration_frontier() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("readiness-schema-gap.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let required_version = SQLITE_MIGRATIONS.last().unwrap().version;
+    let missing_version = SQLITE_MIGRATIONS[SQLITE_MIGRATIONS.len() - 2].version;
+    sqlx::query("DELETE FROM schema_migrations WHERE version = $1")
+        .bind(missing_version)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+    let error = database.readiness_check_detailed().await.unwrap_err();
+    let DatabaseReadinessError::SchemaOutdated(status) = error else {
+        panic!("schema gap must be reported separately from dependency failure");
+    };
+    assert_eq!(status.required_version, required_version);
+    assert_eq!(status.latest_applied_version, Some(required_version));
+    assert_eq!(status.missing_migration_count, 1);
+
+    sqlx::query("DELETE FROM schema_migrations WHERE version > $1")
+        .bind(105_i64)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let error = database.readiness_check_detailed().await.unwrap_err();
+    let DatabaseReadinessError::SchemaOutdated(status) = error else {
+        panic!("outdated schema frontier must be reported separately from dependency failure");
+    };
+    assert_eq!(status.required_version, required_version);
+    assert_eq!(status.latest_applied_version, Some(105));
+    assert_eq!(
+        status.missing_migration_count,
+        SQLITE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 105)
+            .count()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_v105_upgrades_real_v103_audio_rows_without_losing_generation_units() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

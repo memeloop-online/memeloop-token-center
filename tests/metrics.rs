@@ -95,6 +95,7 @@ async fn health_version_and_metrics_contract_is_operational() {
     let readiness: Value =
         serde_json::from_str(&body_text(readiness).await).expect("readiness JSON");
     assert_eq!(readiness["checks"]["database"], "ok");
+    assert_eq!(readiness["checks"]["database_schema"]["status"], "ok");
     assert_eq!(readiness["checks"]["archive"], "ok");
 
     let compatibility = get(&application, "/healthz").await;

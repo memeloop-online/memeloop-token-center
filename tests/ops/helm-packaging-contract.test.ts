@@ -74,7 +74,6 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       hostAlias: render('host-alias', ['--show-only', 'templates/deployment.yaml', '--set-string', 'hostAliases[0].ip=10.28.0.22', '--set-string', 'hostAliases[0].hostnames[0]=private-upstream.example.test']),
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
-      archiveLive: render('archive-live', ['--set', 'config.s3.readinessDeadlineMillis=30000', '--set', 'probes.readiness.path=/livez']),
       proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
       fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
       maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
@@ -168,6 +167,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
+    count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
+    count('default', /livenessProbe:\s+httpGet: \{ path: "?\/livez"?, port: http \}/g, 3);
     has('configmap', 'configMap:'); has('pvc', 'persistentVolumeClaim:');
     for (const needle of ['name: install-plugin-0', `image: "ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@${installer}"`, '- --registry-username-file', '- --registry-password-file', '- --cosign-public-key', 'medium: Memory', 'sizeLimit: "16Mi"', 'secretName: plugin-cosign-keys', 'secretName: plugin-registry-auth']) count('oci', needle, 3);
     count('oci', 'readOnlyRootFilesystem: true', 7); count('oci', 'allowPrivilegeEscalation: false', 7);
@@ -209,6 +210,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['plugins.runtimeInventory.cosignPublicKeysSecret.keys[0]=../escape'],
       ['plugins.runtimeInventory.registrySecrets[0].name=registry','plugins.runtimeInventory.registrySecrets[0].keys[0]=../escape'],
       ['networkPolicy.egress.clusterDependencies.enabled=true'], ['config.archiveBackend=filesystem'], ['config.archiveBackend=memory'], ['image.digest=sha256:abc123'], ['probes.readiness.timeoutSeconds=6'], [`image.digest=sha256:${'A'.repeat(64)}`],
+      ['probes.readiness.path=/livez'], ['probes.liveness.path=/readyz'],
       ['plugins.enabled=true'], ['plugins.enabled=true','plugins.existingConfigMap=x','plugins.existingClaim=x'], ['plugins.ociInstaller.enabled=true'],
       ['roles.gateway.replicaCounnt=2'], ['ingress.gateway.classname=nginx'], ['ingress.enabled=true'], ['ingress.gateway.enabled=true'], ['ingress.control.enabled=true'],
       ['ingress.control.enabled=true','ingress.control.host=x'], ['ingress.control.enabled=true','ingress.control.className=higress-private','ingress.control.host=x','ingress.control.sourceRanges[0]=0.0.0.0/0','ingress.control.tlsSecretName=x'],

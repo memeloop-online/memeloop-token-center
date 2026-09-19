@@ -1171,6 +1171,30 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
 ];
 
 impl Database {
+    pub(super) async fn schema_status(&self) -> Result<DatabaseSchemaStatus, sqlx::Error> {
+        let migrations = match self.backend {
+            DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
+            DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
+        };
+        let required_version = migrations
+            .last()
+            .map(|migration| migration.version)
+            .unwrap_or_default();
+        let applied_versions =
+            sqlx::query_scalar::<_, i64>("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(&self.pool)
+                .await?;
+        let missing_migration_count = migrations
+            .iter()
+            .filter(|migration| applied_versions.binary_search(&migration.version).is_err())
+            .count();
+        Ok(DatabaseSchemaStatus {
+            required_version,
+            latest_applied_version: applied_versions.last().copied(),
+            missing_migration_count,
+        })
+    }
+
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
         self.migrate_with_optional_credential_pepper(None).await
     }
