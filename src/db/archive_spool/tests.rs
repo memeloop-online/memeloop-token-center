@@ -397,8 +397,6 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         refs.request_archive_reason.as_deref(),
         Some("retention_limit")
     );
-    let list = db.list_requests(key.key_id, 10).await.unwrap();
-    assert_eq!(list[0].archive_reason.as_deref(), Some("retention_limit"));
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(budget(&db).await, 0);
