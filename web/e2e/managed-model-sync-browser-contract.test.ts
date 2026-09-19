@@ -299,6 +299,11 @@ test('catalog add performs a real cross-page handoff without expanding route aut
     assert.deepEqual(payload.route_group_ids, []);
     assert.deepEqual(payload.granted_credential_ids, []);
     assert.equal(payload.protocol, 'anthropic');
+    await page.getByText('路由已创建', { exact: true }).waitFor();
+    await page.getByRole('button', { name: '创建模型路由', exact: true }).click();
+    const reopenedWorkspace = page.getByRole('region', { name: '创建模型路由', exact: true });
+    await reopenedWorkspace.waitFor();
+    assert.equal(await reopenedWorkspace.getByText('路由已创建', { exact: true }).count(), 0, 'opening a new blank draft clears the previous creation result');
   } finally {
     await browser.close();
     await server.close();
