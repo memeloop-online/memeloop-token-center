@@ -2,13 +2,21 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use object_store::{ObjectStoreExt, PutPayload};
 
-use super::{ArchiveStore, path::archive_path, path::content_location};
+use super::{
+    ArchiveStore,
+    path::{archive_path, content_location, is_any_v1_cas_location},
+};
 use crate::error::AppError;
 
 const DEFAULT_ARCHIVE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 impl ArchiveStore {
     pub async fn put(&self, location: &str, data: Bytes) -> Result<(), AppError> {
+        if is_any_v1_cas_location(location) {
+            return Err(AppError::BadRequest(
+                "archive CAS objects are immutable".into(),
+            ));
+        }
         let location = archive_path(location)?;
         self.inner
             .put(&location, PutPayload::from_bytes(data))
@@ -23,6 +31,11 @@ impl ArchiveStore {
     }
 
     pub async fn delete(&self, location: &str) -> Result<(), AppError> {
+        if is_any_v1_cas_location(location) {
+            return Err(AppError::BadRequest(
+                "archive CAS objects are immutable".into(),
+            ));
+        }
         self.inner.delete(&archive_path(location)?).await?;
         Ok(())
     }

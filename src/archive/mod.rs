@@ -18,6 +18,7 @@ use futures_util::{Stream, TryStreamExt, stream};
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
 mod backend;
+mod cas;
 mod compressed;
 mod download;
 mod multipart;
@@ -26,6 +27,7 @@ mod path;
 mod readiness;
 mod staging;
 
+pub use cas::CasArchiveObject;
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
@@ -33,6 +35,7 @@ pub(crate) use multipart::ARCHIVE_MULTIPART_PART_BYTES;
 pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;
+pub(crate) use path::is_tenant_cas_location;
 pub use staging::ArchiveStagingObjectStore;
 
 #[derive(Clone)]

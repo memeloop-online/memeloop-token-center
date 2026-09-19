@@ -991,6 +991,57 @@ impl Database {
         Ok(true)
     }
 
+    pub(crate) async fn complete_response_archive_spool_cas(
+        &self,
+        task: &ArchiveSpoolTask,
+        staging: &ArchiveStagingWriteLease,
+        locator: &str,
+    ) -> Result<bool, AppError> {
+        let purpose = task.purpose;
+        if staging.key.owner != ArchiveStagingOwner::ProxyRequest(task.identity.request_id)
+            || staging.key.purpose != purpose.staging()
+            || !crate::archive::is_tenant_cas_location(task.identity.tenant_id, locator)
+        {
+            return Ok(false);
+        }
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
+            return Ok(false);
+        };
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL AND response_object = $5")))
+            .bind(locator).bind(task.identity.request_id.to_string()).bind(task.identity.tenant_id.to_string())
+            .bind(task.identity.reservation_id.to_string()).bind(format!("gap://{}/{}", task.identity.request_id, purpose.as_str())).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if !super::archive_staging::publish_archive_staging_cas_in_transaction(
+            &mut tx,
+            self.backend,
+            staging,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        let bound = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'bound', bound_locator = $1, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'uploading'")))
+            .bind(locator).bind(now).bind(task.identity.request_id.to_string())
+            .bind(task.identity.tenant_id.to_string()).bind(task.identity.reservation_id.to_string())
+            .execute(&mut *tx).await?;
+        if bound.rows_affected() != 1 {
+            return Ok(false);
+        }
+        emit_response_archive_transition_event_in_transaction(
+            &mut tx,
+            purpose,
+            task.identity.request_id,
+            now,
+            "archive_bound",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub(crate) async fn retry_response_archive_spool(
         &self,
         task: &ArchiveSpoolTask,
