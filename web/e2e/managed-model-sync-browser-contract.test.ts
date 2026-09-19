@@ -273,8 +273,8 @@ test('catalog add performs a real cross-page handoff without expanding route aut
   const { server, browser, page, url } = await openFixture();
   try {
     await stubBrowseCatalog(page);
-    await page.addInitScript(() => sessionStorage.setItem('mtc-route-focus-v1', JSON.stringify({ tenant: 'fixture-a', routeId: 'stale-focus' })));
     await page.goto(`${url}?handoff=1`);
+    await page.evaluate(() => sessionStorage.setItem('mtc-route-focus-v1', JSON.stringify({ tenant: 'fixture-a', routeId: 'stale-focus' })));
     await page.getByRole('button', { name: '查看目录（3）', exact: true }).click();
     await page.locator('.provider-catalog-models li', { hasText: 'catalog-model-fresh' }).getByRole('button', { name: '添加路由', exact: true }).click();
     await page.waitForURL('**/e2e/fixtures/managed-model-handoff.html');
