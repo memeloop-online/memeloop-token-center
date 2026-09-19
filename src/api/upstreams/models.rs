@@ -1152,11 +1152,13 @@ mod tests {
                 &ManagedModelRouteSyncResult::skipped(warning)
             ));
         }
-        let mut result = ManagedModelRouteSyncResult::default();
-        result.warnings = vec![
-            "operator_route_preserved".into(),
-            "unsupported_route_model_or_protocol".into(),
-        ];
+        let result = ManagedModelRouteSyncResult {
+            warnings: vec![
+                "operator_route_preserved".into(),
+                "unsupported_route_model_or_protocol".into(),
+            ],
+            ..ManagedModelRouteSyncResult::default()
+        };
         assert!(managed_route_snapshot_is_current(&result));
     }
 
