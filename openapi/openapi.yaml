@@ -2131,9 +2131,16 @@ paths:
       tags: [Upstream providers]
       operationId: syncUpstreamModelsAndManagedRoutes
       summary: Refresh a complete catalog and reconcile explicitly managed model routes
-      description: Requires both providers:write and routes:write. This opt-in operation is separate from models/sync and background refresh. Only a successful, complete, nonempty discovery can add or disable managed routes. Failed, timed-out, paginated, partial, malformed and empty responses preserve the last catalog and all managed routes. A concurrent refresh returns skipped with sync_in_progress; callers may retry. Managed identity is tenant/account/upstream_model/protocol, not public model; retries cannot duplicate owned routes and existing manual candidates are never adopted. Public model equals upstream model, with priority zero and wildcard catalog protocols mapped only to openai. No credential grants or groups are created or replaced. Operator status changes (including no-op disables), edits, archive and deletion protect the route from subsequent reconciliation; deletion leaves an ownership tombstone. Only catalog_missing disables can be restored automatically. Catalog publication precedes a transactional route reconciliation; changed/stale snapshots skip reconciliation safely and a retry converges. The price phase is explicitly deferred and imports no prices.
+      description: Requires both providers:write and routes:write. This opt-in operation is separate from models/sync and background refresh. Only a successful, complete, nonempty discovery can add or disable managed routes. Failed, timed-out, paginated, partial, malformed and empty responses preserve the last catalog and all managed routes. A concurrent refresh returns skipped with sync_in_progress; callers may retry. Managed identity is tenant/account/upstream_model/protocol, not public model; retries cannot duplicate owned routes and existing manual candidates are never adopted. Public model equals upstream model, with priority zero and wildcard catalog protocols mapped only to openai. No credential grants or groups are created or replaced. Operator status changes (including no-op disables), edits, archive and deletion protect the route from subsequent reconciliation; deletion leaves an ownership tombstone. Only catalog_missing disables can be restored automatically. Catalog publication precedes a transactional route reconciliation; changed/stale snapshots skip reconciliation safely and a retry converges. After a successful catalog publication and route reconciliation, the server synchronizes USD prices for the deduplicated model identities in this complete response. It uses only configured public price catalogs and the existing deterministic matcher; the caller cannot supply models, source URLs, currency, or price values. This bounded server-owned side effect is not a delegation of global prices:write. Manual prices and last-known prices whose preferred source is unavailable are preserved; pricing failures never roll back catalog or route changes.
       security: [{ serviceBearer: [] }]
       x-required-scopes: [providers:write, routes:write]
+      x-price-sync-contract:
+        authority: server-verified-catalog
+        model-set: current-complete-discovery
+        currency: USD
+        caller-supplied-models: forbidden
+        caller-supplied-sources: forbidden
+        caller-supplied-prices: forbidden
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/TenantFilter'
@@ -8015,26 +8022,11 @@ components:
               type: array
               items: { type: string }
               description: Machine-readable reasons such as sync_in_progress, partial_catalog, empty_catalog_protected, complete_catalog_unsupported (the current component plugin ABI cannot attest completeness), account_changed, account_or_lease_changed, catalog_not_ready, catalog_changed, operator_route_preserved, unsupported_route_model_or_protocol, or a discovery error code.
-        price_sync:
-          type: object
-          additionalProperties: false
-          required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
-          properties:
-            status: { const: deferred }
-            currency: { const: USD }
-            imported: { const: 0 }
-            preserved: { const: 0 }
-            unmatched: { const: 0 }
-            ambiguous: { const: 0 }
-            failed_sources:
-              type: array
-              maxItems: 0
-              items: { type: string }
-            error_code: { const: managed_route_price_sync_deferred }
+        price_sync: { $ref: '#/components/schemas/UpstreamModelPriceSyncResult' }
     UpstreamModelPriceSyncResult:
       type: object
       additionalProperties: false
-      description: Directory availability is committed before pricing. Skipped means discovery failed, a directory lease was already held, or the successful directory was empty. Partial includes unavailable sources, unmatched models, or ambiguous matches. No automatic sync overwrites manual prices.
+      description: Directory availability is committed before pricing. Skipped means discovery failed, a directory lease was already held, or the successful directory was empty. Partial includes unavailable sources, unmatched models, or ambiguous matches. Error means no source completed or the bounded pricing service failed; existing prices are retained. No automatic sync overwrites manual prices, writes a fabricated zero, or replaces a last-known price with a lower-priority source while its preferred source is unavailable.
       required: [status, currency, imported, preserved, unmatched, ambiguous, failed_sources, error_code]
       properties:
         status: { type: string, enum: [ready, partial, error, skipped] }

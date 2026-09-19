@@ -19,12 +19,23 @@ test("catalog sync has a complete POST-only response with required pricing outco
   const document = cloneDocument();
   const catalog = document.components.schemas.UpstreamModelCatalog;
   const sync = document.components.schemas.UpstreamModelCatalogSyncResponse;
+  const managed = document.components.schemas.ManagedUpstreamModelSyncResponse;
+  const managedOperation = document.paths["/internal/v1/upstreams/{account_id}/models/sync-routes"].post;
   assert.equal(document.paths["/internal/v1/upstreams/{account_id}/models"].get.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamModelCatalog");
   assert.equal(document.paths["/internal/v1/upstreams/{account_id}/models/sync"].post.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamModelCatalogSyncResponse");
   assert.ok(sync.required.includes("price_sync"));
   assert.ok(!("price_sync" in catalog.properties));
   assert.equal(catalog.properties.models.maxItems, 10000);
   assert.equal(catalog.properties.disabled_models.maxItems, 10000);
+  assert.equal(managed.properties.price_sync.$ref, "#/components/schemas/UpstreamModelPriceSyncResult");
+  assert.deepEqual(managedOperation["x-price-sync-contract"], {
+    authority: "server-verified-catalog",
+    "model-set": "current-complete-discovery",
+    currency: "USD",
+    "caller-supplied-models": "forbidden",
+    "caller-supplied-sources": "forbidden",
+    "caller-supplied-prices": "forbidden",
+  });
 });
 
 function sourceWith(controlExtra = "", gatewayExtra = "", commonExtra = ""): string {

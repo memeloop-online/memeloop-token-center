@@ -287,6 +287,7 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
             timeout.as_millis() as u64,
         )
         .await?;
+    let mut price_sync = CatalogPriceSyncResult::skipped();
     let routes = if !claimed {
         ManagedModelRouteSyncResult::skipped("sync_in_progress")
     } else {
@@ -312,10 +313,15 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
                     )
                     .await?;
                 if replaced == ReplaceModelCatalogResult::Replaced {
-                    state
+                    let routes = state
                         .db
                         .reconcile_managed_model_routes(account_id, &tenant, generation, &models)
-                        .await?
+                        .await?;
+                    if managed_route_snapshot_is_current(&routes) {
+                        price_sync =
+                            sync_discovered_model_prices(&state, account_id, &models).await;
+                    }
+                    routes
                 } else {
                     ManagedModelRouteSyncResult::skipped("account_or_lease_changed")
                 }
@@ -343,9 +349,6 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
             }
         }
     };
-    let mut price_sync = CatalogPriceSyncResult::skipped();
-    price_sync.status = "deferred";
-    price_sync.error_code = Some("managed_route_price_sync_deferred");
     Ok(Json(ManagedCatalogSyncResult {
         catalog: state
             .db
@@ -354,6 +357,15 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
         routes,
         price_sync,
     }))
+}
+
+fn managed_route_snapshot_is_current(result: &ManagedModelRouteSyncResult) -> bool {
+    !result.warnings.iter().any(|warning| {
+        matches!(
+            warning.as_str(),
+            "account_changed" | "catalog_not_ready" | "catalog_changed"
+        )
+    })
 }
 
 pub(crate) fn trigger_upstream_model_sync(state: AppState, account_id: Uuid) {
@@ -471,56 +483,7 @@ async fn sync_account_models(
             // Routing availability commits first. Price-source outages must not
             // undo a confirmed disappearance or turn discovery into a failure.
             // Both the explicit endpoint and every background refresh enter here.
-            let price_models = models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if !price_models.is_empty() {
-                let sources = crate::pricing::model_price_sources(&state.config);
-                match crate::pricing::sync_catalog_model_prices(
-                    &state.db,
-                    &state.http,
-                    price_models,
-                    &sources,
-                    state.config.allow_oauth_loopback,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        let failed_sources = result
-                            .source_results
-                            .into_iter()
-                            .filter(|source| source.error.is_some())
-                            .map(|source| source.source)
-                            .collect::<Vec<_>>();
-                        price_sync = CatalogPriceSyncResult {
-                            status: if failed_sources.is_empty()
-                                && result.unmatched.is_empty()
-                                && result.candidates.is_empty()
-                            {
-                                "ready"
-                            } else {
-                                "partial"
-                            },
-                            currency: "USD",
-                            imported: result.imported,
-                            preserved: result.preserved.len(),
-                            unmatched: result.unmatched.len(),
-                            ambiguous: result.candidates.len(),
-                            failed_sources,
-                            error_code: None,
-                        };
-                    }
-                    Err(error) => {
-                        tracing::warn!(%account_id, error_category = error.diagnostic_category(),
-                            "catalog committed but model price synchronization failed");
-                        price_sync.status = "error";
-                        price_sync.error_code = Some("price_sync_failed");
-                    }
-                }
-            }
+            price_sync = sync_discovered_model_prices(state, account_id, &models).await;
         }
         Err(code) => {
             let replaced = state
@@ -547,6 +510,73 @@ async fn sync_account_models(
             .await?,
         price_sync,
     })
+}
+
+/// Synchronize only the identities supplied by the just-verified catalog.
+///
+/// This is a server-owned catalog side effect, not delegated `prices:write`:
+/// callers cannot supply a currency, source URL, or price value. The pricing
+/// service fixes those to USD and the configured public catalogs and preserves
+/// manual prices and last-known prices when a preferred source is unavailable.
+async fn sync_discovered_model_prices(
+    state: &AppState,
+    account_id: Uuid,
+    models: &[DiscoveredUpstreamModel],
+) -> CatalogPriceSyncResult {
+    let price_models = models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if price_models.is_empty() {
+        return CatalogPriceSyncResult::skipped();
+    }
+    let sources = crate::pricing::model_price_sources(&state.config);
+    match crate::pricing::sync_catalog_model_prices(
+        &state.db,
+        &state.http,
+        price_models,
+        &sources,
+        state.config.allow_oauth_loopback,
+    )
+    .await
+    {
+        Ok(result) => {
+            let failed_sources = result
+                .source_results
+                .into_iter()
+                .filter(|source| source.error.is_some())
+                .map(|source| source.source)
+                .collect::<Vec<_>>();
+            CatalogPriceSyncResult {
+                status: if failed_sources.is_empty()
+                    && result.unmatched.is_empty()
+                    && result.candidates.is_empty()
+                {
+                    "ready"
+                } else {
+                    "partial"
+                },
+                currency: "USD",
+                imported: result.imported,
+                preserved: result.preserved.len(),
+                unmatched: result.unmatched.len(),
+                ambiguous: result.candidates.len(),
+                failed_sources,
+                error_code: None,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%account_id, error_category = error.diagnostic_category(),
+                "catalog committed but model price synchronization failed");
+            CatalogPriceSyncResult {
+                status: "error",
+                error_code: Some("price_sync_failed"),
+                ..CatalogPriceSyncResult::skipped()
+            }
+        }
+    }
 }
 
 async fn discover_models(
@@ -1114,6 +1144,23 @@ fn validate_model_id(id: &str) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn managed_pricing_requires_the_reconciled_catalog_to_remain_current() {
+        for warning in ["account_changed", "catalog_not_ready", "catalog_changed"] {
+            assert!(!managed_route_snapshot_is_current(
+                &ManagedModelRouteSyncResult::skipped(warning)
+            ));
+        }
+        let result = ManagedModelRouteSyncResult {
+            warnings: vec![
+                "operator_route_preserved".into(),
+                "unsupported_route_model_or_protocol".into(),
+            ],
+            ..ManagedModelRouteSyncResult::default()
+        };
+        assert!(managed_route_snapshot_is_current(&result));
+    }
 
     #[tokio::test]
     async fn manual_and_background_catalog_sync_share_full_catalog_pricing_and_failure_isolation() {
