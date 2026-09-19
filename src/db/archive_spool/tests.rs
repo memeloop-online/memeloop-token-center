@@ -357,7 +357,7 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
     );
     assert_eq!(budget(&db).await, 0);
     let gap = sqlx::query(
-        "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
+        "SELECT state, last_error_code, gap_reason, body_byte_count, body_blake3, cipher_bytes,
                 cleaned_at
          FROM request_archive_spools WHERE request_id = $1",
     )
@@ -366,6 +366,7 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
     .await
     .unwrap();
     assert_eq!(gap.get::<String, _>("state"), "gap");
+    assert_eq!(gap.get::<String, _>("last_error_code"), "retention_limit");
     assert_eq!(gap.get::<String, _>("gap_reason"), "retention_limit");
     assert_eq!(gap.get::<i64, _>("body_byte_count"), body.len() as i64);
     assert_eq!(

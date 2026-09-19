@@ -84,7 +84,7 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
             body_byte_count, body_blake3
          )
          SELECT $1, $2, $3, 'gap', 0, 0, 0, 0, $4, $4, $4, $4, $4,
-                'capacity', $5, $6, $7
+                $5, $5, $6, $7
          WHERE EXISTS (
              SELECT 1 FROM request_records
              WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3
@@ -459,8 +459,11 @@ impl Database {
         };
         sqlx::query(budget_lock).fetch_one(&mut *tx).await?;
         let active_slots: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM response_archive_spools
-             WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading')",
+            "SELECT
+                (SELECT COUNT(*) FROM response_archive_spools
+                 WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading'))
+              + (SELECT COUNT(*) FROM archive_budget_reservations
+                 WHERE purpose = 'response')",
         )
         .fetch_one(&mut *tx)
         .await?;
