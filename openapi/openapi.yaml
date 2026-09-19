@@ -1630,7 +1630,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code, attempts, cache_hit]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
                   cache_hit: { type: boolean, description: True when this caller reused a cached or singleflight result. Attempt diagnostics still describe the original supplier read. }

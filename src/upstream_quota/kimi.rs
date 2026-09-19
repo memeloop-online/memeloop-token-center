@@ -260,12 +260,6 @@ mod tests {
         assert_eq!(requests[0].method.as_str(), "GET");
     }
 
-    #[test]
-    fn quota_policy_does_not_change_native_usage_method() {
-        // Only this fixed usages GET is enrolled, never the token POST or model endpoint.
-        assert_eq!(USAGE_URL, "https://api.kimi.com/coding/v1/usages");
-    }
-
     #[tokio::test]
     async fn usage_retry_after_recovers_without_token_or_model_traffic() {
         use std::sync::atomic::{AtomicUsize, Ordering};

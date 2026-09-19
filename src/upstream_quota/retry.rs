@@ -149,7 +149,7 @@ impl<'a> ReadSession<'a> {
     pub(super) fn attempts(&self) -> Vec<Attempt> {
         self.attempts
             .lock()
-            .expect("quota diagnostics lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .cloned()
             .map(|mut entry| {
@@ -174,7 +174,7 @@ impl<'a> ReadSession<'a> {
             && let Some(entry) = self
                 .attempts
                 .lock()
-                .expect("quota diagnostics lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter_mut()
                 .rev()
                 .find(|entry| entry.endpoint_kind == endpoint && entry.outcome == "success")
@@ -227,7 +227,10 @@ impl<'a> ReadSession<'a> {
             retry_delay_ms = entry.retry_delay_ms, trigger = entry.trigger, cache_hit = false,
             "quota supplier attempt completed");
         }
-        let mut attempts = self.attempts.lock().expect("quota diagnostics lock");
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = attempts
             .iter_mut()
             .find(|entry| entry.endpoint_kind == context.endpoint_kind && entry.attempt == attempt)
