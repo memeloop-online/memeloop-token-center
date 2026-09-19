@@ -1968,6 +1968,29 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
+    if !(200..400).contains(&request.status_code)
+        || request
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !code.is_empty())
+    {
+        // Failed terminal requests retain their request/route/usage facts, but
+        // their captured bodies are not successful text archives. Fence both
+        // spool purposes in this same terminal transaction and make their
+        // bounded ciphertext immediately eligible for the existing GC path.
+        // A worker can therefore never promote a 4xx/5xx/client-abort body to
+        // immutable CAS, even across a crash between settlement and cleanup.
+        for table in ["request_archive_spools", "response_archive_spools"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET state = 'gap', updated_at = $1, expires_at = $1, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $2 AND tenant_id = $3 AND state IN ('capturing', 'pending', 'uploading')"
+            )))
+            .bind(completed_at)
+            .bind(&request_id)
+            .bind(&tenant_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
     if project_aggregates {
         sqlx::query(

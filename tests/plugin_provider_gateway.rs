@@ -464,13 +464,10 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .request_archive_refs(key.key_id, request.request_id)
             .await
             .unwrap();
-        let request_prefix = format!("staging/proxy/{}/request/", request.request_id);
-        assert!(refs.request_object.starts_with(&request_prefix));
-        assert!(refs.request_object.ends_with("/body"));
+        let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
+        assert!(refs.request_object.starts_with(&cas_prefix));
         let response_object = refs.response_object.as_deref().unwrap();
-        let response_prefix = format!("staging/proxy/{}/response/", request.request_id);
-        assert!(response_object.starts_with(&response_prefix));
-        assert!(response_object.ends_with("/body"));
+        assert!(response_object.starts_with(&cas_prefix));
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
