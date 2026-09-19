@@ -4,10 +4,11 @@ import { Buckets, NumberMetric, RequestTable } from '../components';
 import { Button, Disclosure, Field, Input, Select } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
+import { RequestRefreshControl } from '../operator/traffic/RequestRefreshControl';
 import type { KeyView, RequestView, SelfStats } from '../types';
 import { selfErrorMessage } from './errors';
 import { emptyRequestFilters, requestPageSize, requestsPath, statsPath, type RequestFilters } from './requestPaths';
-import { selfRequestRefreshIntervals, useSelfRequestRefresh } from './useSelfRequestRefresh';
+import { useSelfRequestRefresh } from './useSelfRequestRefresh';
 import './requestFilters.css';
 
 type FetchMode = 'replace' | 'append' | 'refresh';
@@ -20,7 +21,6 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
   onOpenSession: (sessionId: string) => void;
 }) {
   const { locale, t } = useI18n();
-  const zh = locale === 'zh-CN';
   const [filters, setFilters] = useState<RequestFilters>(emptyRequestFilters);
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [stats, setStats] = useState<SelfStats>();
@@ -144,16 +144,6 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
     setFilters((current) => ({ ...current, ...patch }));
   }
 
-  const cadenceLabels = zh ? ['手动', '5秒', '30秒', '1分', '5分'] : ['Manual', '5s', '30s', '1m', '5m'];
-  const cadenceIndex = Math.max(0, selfRequestRefreshIntervals.findIndex((interval) => interval === intervalMs));
-  const refreshState = refreshing
-    ? (zh ? '轮询 · 正在更新第一页与统计' : 'Polling · updating the first page and summary')
-    : intervalMs === 0
-    ? (zh ? '手动 · 点击“刷新”更新列表与统计，不会自动轮询' : 'Manual · press Refresh to update the list and summary; no automatic polling')
-    : paused
-      ? (zh ? '轮询 · 后台已暂停，返回后继续' : 'Polling · paused in background; resumes on return')
-      : (zh ? `轮询 · 每 ${cadenceLabels[cadenceIndex]} 更新第一页与统计` : `Polling · first page and summary every ${cadenceLabels[cadenceIndex]}`);
-
   return <div className="self-page self-requests-page" data-self-page="requests">
     {stats && <section className="metrics self-request-summary">
       <NumberMetric label={t('traffic.total')} value={stats.summary.total_requests} />
@@ -169,14 +159,9 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
           <span>{t('self.loadedRequests', { count: formatNumber(requests.length, locale) })}</span>
         </div>
         <div className="self-request-refresh">
-          <Field label={zh ? '刷新节奏' : 'Refresh cadence'} className="self-request-cadence">
-            <Select value={String(intervalMs)} onChange={(event) => setIntervalMs(Number(event.target.value))}>
-              {selfRequestRefreshIntervals.map((interval, index) => <option key={interval} value={String(interval)}>{cadenceLabels[index]}</option>)}
-            </Select>
-          </Field>
+          <RequestRefreshControl intervalMs={intervalMs} onIntervalChange={setIntervalMs} paused={paused} supportsLive={false} refreshing={refreshing} />
           <Button appearance="secondary" type="button" disabled={loading || refreshing}
             onClick={() => void fetchPage(appliedFilters.current, 'refresh')}>{t('usage.refresh')}</Button>
-          <span className={paused && intervalMs !== 0 ? 'self-request-refresh-state paused' : 'self-request-refresh-state'} role="status">{refreshState}</span>
         </div>
       </div>
       <form className="self-request-filter-panel" onSubmit={applyFilters}>
@@ -195,7 +180,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
           </Field>
         </div>
         <div className="self-request-advanced">
-          <Disclosure title={zh ? '高级筛选' : 'Advanced filters'}>
+          <Disclosure title={t('self.advancedFilters')}>
             <div className="self-request-filter-grid">
               <Field label={t('traffic.errorCode')}><Input value={filters.errorCode} onChange={(event) => patchFilters({ errorCode: event.target.value })} placeholder={t('self.exactMatch')} /></Field>
               <Field label={t('traffic.upstreamId')}><Input value={filters.upstreamAccountId} onChange={(event) => patchFilters({ upstreamAccountId: event.target.value })} placeholder="019f…" /></Field>

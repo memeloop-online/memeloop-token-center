@@ -38,6 +38,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
       const first = authorization === 'Bearer first';
       if (url.pathname.endsWith('/key')) return route.fulfill({ json: first ? key('First credential', 1) : key('Second credential', 2) });
       if (url.pathname.endsWith('/stats')) return route.fulfill({ json: stats(first ? 'key-first credential' : 'key-second credential') });
+      if (url.pathname.endsWith('/sessions')) return route.fulfill({ json: { generated_at: 1, sessions: [], next_cursor: null } });
       if (!url.pathname.endsWith('/requests')) return route.fulfill({ json: [] });
       if (first) { heldFirstRequest = route; return; }
       listReads += 1;
@@ -56,11 +57,18 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     if (heldFirstRequest) await heldFirstRequest.fulfill({ json: [request('old-first-response', 3_000)] }).catch(() => undefined);
     assert.equal(await page.getByText('old-first-response', { exact: true }).count(), 0, 'an aborted first credential response cannot populate the second credential page');
 
-    const cadence = page.getByLabel('Refresh cadence', { exact: true });
-    assert.deepEqual(await cadence.locator('option').allTextContents(), ['Manual', '5s', '30s', '1m', '5m']);
-    await cadence.selectOption('0');
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
-    await cadence.selectOption('5000');
+    const cadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
+    const waitForCadenceText = async (expected: string) => {
+      await page.waitForFunction(({ expected }) => document.querySelector<HTMLInputElement>('input[type="range"][aria-label="Refresh cadence"]')?.getAttribute('aria-valuetext') === expected, { expected });
+      assert.equal(await cadence.getAttribute('aria-valuetext'), expected);
+    };
+    assert.equal(await cadence.inputValue(), '1', 'the default cadence is five seconds');
+    assert.deepEqual(await page.locator('.request-refresh-ticks span').allTextContents(), ['Manual', '5s', '30s', '1m', '5m']);
+    await cadence.press('Home');
+    assert.equal(await cadence.inputValue(), '0');
+    await waitForCadenceText('Manual');
+    await cadence.press('ArrowRight');
+    assert.equal(await cadence.inputValue(), '1');
 
     const beforeHidden = listReads;
     const noHiddenPoll = page.waitForRequest(request => new URL(request.url()).pathname === '/self/v1/requests', { timeout: 5_200 })
@@ -69,7 +77,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
       Object.defineProperty(document, 'hidden', { configurable: true, value: true });
       document.dispatchEvent(new Event('visibilitychange'));
     });
-    await page.getByRole('status').filter({ hasText: 'paused in background' }).waitFor();
+    await page.locator('[role="status"][data-refresh-state="paused"]').waitFor();
     assert.equal(await noHiddenPoll, false, 'hidden pages do not poll');
     assert.equal(listReads, beforeHidden, 'hidden pages do not poll');
     const resumedPoll = page.waitForResponse(response => new URL(response.url()).pathname === '/self/v1/requests', { timeout: 7_000 });
@@ -80,8 +88,8 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     await resumedPoll;
     assert.ok(listReads > beforeHidden, 'visible pages resume polling');
 
-    await cadence.selectOption('0');
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
+    await cadence.press('Home');
+    await waitForCadenceText('Manual');
     await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
     await page.locator('.request-model-cell code').filter({ hasText: /^older-second$/ }).waitFor();
     const loaded = await page.locator('.request-id-control.compact code').allTextContents();
@@ -89,10 +97,71 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     const refreshStarted = page.waitForRequest(request => new URL(request.url()).pathname === '/self/v1/requests', { timeout: 5_000 });
     await page.getByRole('button', { name: 'Refresh', exact: true }).click();
     await refreshStarted;
-    await page.getByRole('status').filter({ hasText: 'updating the first page' }).waitFor();
+    await page.locator('[role="status"][data-refresh-state="refreshing"]').waitFor();
     await heldHistoryRefresh!.fulfill({ json: [request('new-injected', 2_000), ...firstPage.slice(0, 49)] });
-    await page.getByRole('status').filter({ hasText: 'Manual' }).waitFor();
+    await waitForCadenceText('Manual');
     assert.deepEqual(await page.locator('.request-id-control.compact code').allTextContents(), loaded, 'refresh cannot inject or reorder an explicit history window');
     assert.equal(await page.getByText('new-injected', { exact: true }).count(), 0);
+
+    historyRefresh = false;
+    await cadence.press('ArrowRight');
+    await cadence.press('ArrowRight');
+    assert.equal(await cadence.inputValue(), '2', 'the third ladder position is thirty seconds');
+    await page.reload();
+    await page.locator('.request-model-cell code').filter({ hasText: /^second-00$/ }).waitFor();
+    const restoredCadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
+    assert.equal(await restoredCadence.inputValue(), '2', 'the selected cadence is restored from storage');
+    await page.getByRole('tab', { name: 'My sessions and requests', exact: true }).click();
+    const sessionsCadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
+    assert.equal(await sessionsCadence.inputValue(), '2', 'Requests and Sessions share the cadence preference');
+    await page.getByRole('tab', { name: 'Recent requests', exact: true }).click();
+    assert.equal(await page.getByRole('slider', { name: 'Refresh cadence', exact: true }).inputValue(), '2');
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('Portal and Operator refresh preferences stay isolated in both directions', { timeout: 20_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => {
+      localStorage.setItem('mtc-locale', 'en');
+      if (localStorage.getItem('mtc.operator.request-refresh-ms.v1') === null) localStorage.setItem('mtc.operator.request-refresh-ms.v1', '0');
+      if (localStorage.getItem('mtc.self.request-refresh-ms.v1') === null) localStorage.setItem('mtc.self.request-refresh-ms.v1', '30000');
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/self-operator-refresh-isolation.html`);
+    const operator = page.locator('[data-refresh-scope="operator"] input[type="range"]');
+    const portal = page.locator('[data-refresh-scope="portal"] input[type="range"]');
+    assert.equal(await operator.inputValue(), '0', 'Operator restores its live-stream preference');
+    assert.equal(await operator.getAttribute('aria-valuetext'), 'Live');
+    assert.equal(await portal.inputValue(), '2', 'Portal restores its polling preference');
+    assert.equal(await portal.getAttribute('aria-valuetext'), '30s');
+
+    await portal.press('Home');
+    assert.equal(await portal.inputValue(), '0', 'Portal can select manual refresh');
+    assert.equal(await portal.getAttribute('aria-valuetext'), 'Manual');
+    assert.equal(await page.evaluate(() => localStorage.getItem('mtc.self.request-refresh-ms.v1')), '0');
+    assert.equal(await operator.inputValue(), '0', 'Portal changes do not alter Operator');
+    assert.equal(await operator.getAttribute('aria-valuetext'), 'Live');
+
+    await operator.press('ArrowRight');
+    assert.equal(await operator.inputValue(), '1', 'Operator can select its five-second cadence');
+    assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.request-refresh-ms.v1')), '5000');
+    assert.equal(await portal.inputValue(), '0', 'Operator changes do not alter Portal');
+    assert.equal(await portal.getAttribute('aria-valuetext'), 'Manual');
+
+    await page.reload();
+    const restoredOperator = page.locator('[data-refresh-scope="operator"] input[type="range"]');
+    const restoredPortal = page.locator('[data-refresh-scope="portal"] input[type="range"]');
+    assert.equal(await restoredOperator.inputValue(), '1', 'Operator preference persists independently');
+    assert.equal(await restoredOperator.getAttribute('aria-valuetext'), '5s');
+    assert.equal(await restoredPortal.inputValue(), '0', 'Portal preference persists independently');
+    assert.equal(await restoredPortal.getAttribute('aria-valuetext'), 'Manual');
   } finally { await browser.close(); await server.close(); }
 });

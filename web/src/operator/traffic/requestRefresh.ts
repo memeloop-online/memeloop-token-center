@@ -4,6 +4,7 @@ import { mergeLiveRequestEvents, requestViewFromEvent } from './requestTraffic.j
 export const requestRefreshIntervals = [0, 5_000, 30_000, 60_000, 300_000] as const;
 export const defaultRequestRefreshInterval = 5_000;
 export const requestRefreshPreferenceKey = 'mtc.operator.request-refresh-ms.v1';
+export const selfRequestRefreshPreferenceKey = 'mtc.self.request-refresh-ms.v1';
 export const requestEventCacheCapacity = 2_000;
 export function requestRefreshPreference(value: string | null): number {
   const number = value === null || !value.trim() ? NaN : Number(value);
