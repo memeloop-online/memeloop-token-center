@@ -9,6 +9,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
@@ -21,6 +22,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(super) component_context: Option<RequestContext>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
 }
 
 impl PlannedProxyRoute {
@@ -42,6 +44,7 @@ impl PreparedProxyRoute {
     pub(in crate::api::proxy) fn release_request_buffers(&mut self) {
         self.forwarded_body = Bytes::new();
         self.responses_chat = None;
+        self.responses_anthropic = None;
     }
 
     pub(in crate::api::proxy) fn is_codex(&self) -> bool {

@@ -2456,9 +2456,12 @@ fn validate_provider_contribution(
     }
     if provider.request_compatibility.codex_multi_agent_v2
         && !provider.request_compatibility.responses_via_chat_v1
+        && !provider
+            .request_compatibility
+            .responses_via_anthropic_messages_v1
     {
         return Err(AppError::BadRequest(format!(
-            "plugin {plugin_id} provider {} must declare responses_via_chat_v1 for Codex MultiAgentV2 compatibility",
+            "plugin {plugin_id} provider {} must declare a versioned Responses adapter for Codex MultiAgentV2 compatibility",
             provider.id
         )));
     }
@@ -2497,6 +2500,43 @@ fn validate_provider_contribution(
     {
         return Err(AppError::BadRequest(format!(
             "plugin {plugin_id} provider {} declares a Responses-via-Chat dialect without responses_via_chat_v1",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_via_anthropic_messages_v1
+        && !provider.request_compatibility.third_party
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party for Responses-via-Anthropic compatibility",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_via_anthropic_messages_v1
+        && (!provider
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "openai")
+            || !provider
+                .protocols
+                .iter()
+                .any(|protocol| protocol == "anthropic"))
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare openai and anthropic protocols for Responses-via-Anthropic compatibility",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_via_anthropic_messages_v1
+        && provider.request_compatibility.responses_via_chat_v1
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must select one Responses translation transport",
             provider.id
         )));
     }
