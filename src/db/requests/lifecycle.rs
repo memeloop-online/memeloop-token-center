@@ -310,9 +310,16 @@ impl Database {
                 .map_err(|_| AppError::Overloaded)
             })
             .transpose()?;
+        // Prepare only the existing bounded first insert batch before taking
+        // the shared budget lock. Cancellation here exposes no admission
+        // facts, and capacity rejection drops this transient ciphertext.
+        let prepared_request_batch = match buffered_archive.as_ref() {
+            Some(archive) => Some(archive.prepare_first_batch().await?),
+            None => None,
+        };
         // Reserve capacity in a short, independently committed transaction.
-        // Request/account/session locks and compression only hold the private
-        // reservation row, never the shared counter used by every stream.
+        // Request/account/session locks hold only the private reservation row,
+        // never the shared counter used by every stream.
         let budget_reservation = match buffered_archive.as_ref() {
             Some(archive) => self.reserve_buffered_archive_capacity(archive).await?,
             None => None,
@@ -325,14 +332,6 @@ impl Database {
             RequestArchiveAdmission::GapCapacity
         } else {
             RequestArchiveAdmission::Captured
-        };
-        // Seal only after capacity has been reserved. A full spool degrades to
-        // durable gap evidence without spending CPU or transient ciphertext
-        // memory on a body which cannot be retained.
-        let prepared_request_batch = match (buffered_archive.as_ref(), budget_reservation.as_ref())
-        {
-            (Some(archive), Some(_)) => Some(archive.prepare_first_batch().await?),
-            _ => None,
         };
         let (mut transaction, now, mut hold) =
             if let Some(reservation) = budget_reservation.as_ref() {
