@@ -36,6 +36,7 @@ mod memory_metrics;
 mod phase_diagnostics;
 mod postgres_attempt_deadline;
 mod recovery_wait;
+mod responses_transport;
 mod soonest_reset;
 mod sse_delivery;
 
@@ -743,6 +744,27 @@ async fn response_usage_fixture_with_uri_contract_and_driver_model(
     driver: &str,
     public_model: &str,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_contract_driver_model_and_config(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+        driver,
+        public_model,
+        json!({}),
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri_contract_driver_model_and_config(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+    driver: &str,
+    public_model: &str,
+    extra_upstream_config: Value,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = format!(
@@ -765,6 +787,12 @@ async fn response_usage_fixture_with_uri_contract_and_driver_model(
     });
     if let Some(stream_usage_contract) = stream_usage_contract {
         upstream_config["stream_usage_contract"] = json!(stream_usage_contract);
+    }
+    if let Some(extra) = extra_upstream_config.as_object() {
+        upstream_config
+            .as_object_mut()
+            .expect("fixture upstream config is an object")
+            .extend(extra.clone());
     }
     let upstream_account = state
         .db

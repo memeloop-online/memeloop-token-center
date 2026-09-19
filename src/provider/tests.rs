@@ -284,7 +284,7 @@ fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
 #[test]
 fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     let mut catalog = ProviderCatalog::builtins();
-    assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth"));
+    assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth", &json!({})));
     assert!(catalog.supports_responses_via_chat_v1("kimi-oauth"));
     assert!(
         catalog
@@ -336,9 +336,17 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
         kimi_capabilities.default_reasoning_level.as_deref(),
         Some("medium")
     );
-    assert!(!catalog.supports_codex_multi_agent_v2("openai-codex"));
+    assert!(!catalog.supports_codex_multi_agent_v2("openai-codex", &json!({})));
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
-    assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
+    assert!(catalog.supports_codex_multi_agent_v2("http-json", &json!({})));
+    assert!(catalog.supports_codex_multi_agent_v2(
+        "http-json",
+        &json!({"responses_transport":"native_responses"})
+    ));
+    assert!(catalog.supports_codex_multi_agent_v2(
+        "http-json",
+        &json!({"responses_transport":"chat_completions"})
+    ));
     assert!(catalog.supports_responses_via_chat_v1("http-json"));
     assert_eq!(
         catalog.responses_via_chat_dialect(

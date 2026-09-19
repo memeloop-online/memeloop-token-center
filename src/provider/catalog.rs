@@ -423,7 +423,7 @@ impl ProviderCatalog {
                 responses_via_chat_v1: true,
                 responses_via_chat_dialect: Some(ResponsesViaChatDialect::OpenAiChatV1),
                 responses_transport_configurable: true,
-                codex_multi_agent_v2: false,
+                codex_multi_agent_v2: true,
             },
             codex_model_capabilities: None,
             source: "builtin".to_owned(),
@@ -828,11 +828,20 @@ impl ProviderCatalog {
         self.types.iter().find(|provider| provider.id == driver)
     }
 
-    pub fn supports_codex_multi_agent_v2(&self, driver: &str) -> bool {
+    pub fn supports_codex_multi_agent_v2(&self, driver: &str, config: &Value) -> bool {
         self.get(driver).is_some_and(|provider| {
-            provider
-                .request_compatibility
-                .supports_codex_multi_agent_v2()
+            let compatibility = &provider.request_compatibility;
+            if compatibility.responses_transport_configurable {
+                matches!(
+                    config
+                        .get("responses_transport")
+                        .and_then(Value::as_str)
+                        .unwrap_or("native_responses"),
+                    "native_responses" | "chat_completions"
+                )
+            } else {
+                compatibility.supports_codex_multi_agent_v2()
+            }
         })
     }
 
@@ -879,7 +888,11 @@ impl ProviderCatalog {
     /// MultiAgentV2 without the third-party normalization hook.
     pub fn supports_codex_multi_agent_v2_model_catalog(&self, driver: &str) -> bool {
         driver == crate::oauth::codex_device::PROVIDER_DRIVER
-            || self.supports_codex_multi_agent_v2(driver)
+            || self.get(driver).is_some_and(|provider| {
+                provider
+                    .request_compatibility
+                    .supports_codex_multi_agent_v2()
+            })
     }
 
     pub(crate) fn codex_model_capabilities_for_catalog(
