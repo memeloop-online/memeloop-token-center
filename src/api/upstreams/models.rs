@@ -324,8 +324,9 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
                 // Preserve the legacy catalog failure vocabulary; the explicit
                 // reconcile response carries the more specific protection code.
                 let catalog_code = match code {
-                    "partial_catalog" | "empty_catalog_protected" => "invalid_response",
-                    "complete_catalog_unsupported" => "unsupported",
+                    "partial_catalog"
+                    | "empty_catalog_protected"
+                    | "complete_catalog_unsupported" => "invalid_response",
                     code => code,
                 };
                 state
