@@ -1,6 +1,6 @@
 import type {
   ManagedModelSyncResponse, ManagedRoutePriceSync, ManagedRouteSyncCounts, ModelRouteView, UpstreamCatalogModel, UpstreamModelCatalogResponse,
-} from '../types';
+} from '../types.js';
 
 /** The sync-routes contract is strict; reject partial payloads instead of guessing. */
 export class ManagedSyncResponseError extends Error {
