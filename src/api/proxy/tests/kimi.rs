@@ -208,10 +208,15 @@ async fn send_official_codex_responses_to_endpoint(
     accept: &'static str,
     user_agent: &'static str,
 ) -> Response {
+    let originator = user_agent
+        .split_once('/')
+        .map(|(originator, _)| originator)
+        .expect("versioned official Codex user agent");
     let request = Request::post("/v1/responses")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, accept)
         .header(header::USER_AGENT, user_agent)
+        .header("originator", originator)
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
@@ -279,6 +284,14 @@ async fn native_codex_responses_preserves_v1_and_marks_v2_messages_plaintext_on_
     assert!(!v1_namespace.to_string().contains("encrypted"));
 
     let forwarded: Value = requests[1].body_json().unwrap();
+    assert_eq!(
+        requests[1].headers["originator"].to_str().unwrap(),
+        "codex_exec"
+    );
+    assert_eq!(
+        requests[1].headers[header::USER_AGENT].to_str().unwrap(),
+        "codex_exec/0.154.0"
+    );
     {
         let namespaces = forwarded["tools"]
             .as_array()
@@ -371,6 +384,10 @@ async fn codex_exec_direct_and_resume_requests_reach_native_upstream_unchanged()
     for (forwarded, original) in forwarded.iter().zip(requests.iter()) {
         let body: Value = forwarded.body_json().unwrap();
         assert_eq!(body["input"], original["input"]);
+        assert_eq!(
+            forwarded.headers["originator"].to_str().unwrap(),
+            "codex_exec"
+        );
     }
     upstream.verify().await;
 }
