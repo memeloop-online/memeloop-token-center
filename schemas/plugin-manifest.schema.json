@@ -138,7 +138,7 @@
                 "uniqueItems": true,
                 "items": {
                   "type": "string",
-                  "enum": ["openai", "anthropic", "generation"]
+                  "enum": ["openai", "anthropic", "openai-audio", "generation"]
                 }
               },
               "modalities": {

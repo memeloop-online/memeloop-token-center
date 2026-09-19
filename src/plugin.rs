@@ -2422,7 +2422,7 @@ fn validate_provider_contribution(
     plugin_id: &str,
     provider: &ProviderType,
 ) -> Result<(), AppError> {
-    const PROTOCOLS: &[&str] = &["openai", "anthropic", "generation"];
+    const PROTOCOLS: &[&str] = &["openai", "anthropic", "openai-audio", "generation"];
     const MODALITIES: &[&str] = &["text", "embedding", "image", "video", "audio"];
     if provider.id.is_empty()
         || provider.id.len() > MAX_PLUGIN_ID_BYTES
