@@ -1281,24 +1281,25 @@ paths:
     get:
       tags: [System]
       operationId: getPluginServiceData
-      summary: Read one manifest-declared typed plugin data feed through the core proxy
+      summary: Read one manifest-declared typed plugin data snapshot
       description: |
         The caller must hold `plugins:read` and the endpoint's manifest-declared
         `required_scope`; a tenant-scoped service credential remains bound to its own
-        tenant. The core performs a GET-only, DNS-pinned HTTPS request to the declared
-        capability allowlist origin with no browser/service credential, headers, or
-        tenant value forwarded. The response is body-capped, schema-validated typed JSON.
-        On bounded upstream failure it returns a stale cache entry or schema-valid manifest
-        fallback with `partial=true`; remote HTML, scripts, and iframes are never returned.
+        tenant. A worker periodically refreshes the endpoint through either the bounded
+        GET-only HTTPS collector or its signed component collector/normalizer. Operator
+        requests only read the durable last-good snapshot, so collection latency and
+        source outages cannot block inference or the UI request path. The response includes
+        freshness, retry timing and a host-owned failure code. Remote HTML, scripts,
+        credentials and arbitrary plugin error text are never returned.
       security: [{ serviceBearer: [] }]
       x-required-scope: plugins:read
       x-manifest-required-scope: true
-      x-outbound-contract:
-        methods: [GET]
+      x-collection-contract:
+        execution-role: worker
+        adapters: [https-json, component-v1]
         allowed-origins: manifest-http-capability
-        transport: HTTPS-only-DNS-pinned-no-redirect
         browser-credentials-forwarded: false
-        response: schema-validated-typed-json
+        response: durable-schema-validated-last-good
       parameters:
         - name: tenant_external_id
           in: query
@@ -7720,7 +7721,8 @@ components:
               items: { $ref: '#/components/schemas/PluginOperatorUiContribution' }
             service_data:
               type: array
-              description: Server-side typed JSON feeds; URLs are capability-audited and never called directly by the browser.
+              maxItems: 32
+              description: Worker-collected typed JSON feeds using a capability-audited HTTPS URL or signed component adapter.
               items: { $ref: '#/components/schemas/PluginServiceDataEndpoint' }
     PluginOperatorUiContribution:
       type: object
@@ -7769,10 +7771,24 @@ components:
     PluginServiceDataEndpoint:
       type: object
       additionalProperties: false
-      required: [id, url, required_scope, response_schema, fallback, cache_ttl_seconds, timeout_millis, max_body_bytes]
+      required: [id, required_scope, response_schema, fallback, cache_ttl_seconds, timeout_millis, max_body_bytes]
+      oneOf:
+        - required: [url]
+          not: { required: [component_adapter] }
+        - required: [component_adapter]
+          not: { required: [url] }
       properties:
         id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
-        url: { type: string, format: uri, description: HTTPS URL declared by the plugin HTTP capability; credentials, fragments, and query strings are rejected. }
+        url: { type: string, format: uri, description: HTTPS JSON collector URL declared by the plugin HTTP capability; credentials, fragments, and query strings are rejected. }
+        component_adapter:
+          type: object
+          additionalProperties: false
+          required: [api_version, collector, normalizer, config]
+          properties:
+            api_version: { type: string, const: component-v1 }
+            collector: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+            normalizer: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+            config: { type: object, additionalProperties: true }
         required_scope: { type: string, enum: [credits:read, entitlements:read, keys:read, metrics:read, plugins:read, prices:read, providers:read, requests:read, routes:read, schemas:read, service_tokens:read, tenants:read] }
         response_schema: { type: object, additionalProperties: true, description: Object-root JSON Schema for response data. writeOnly fields are rejected. }
         fallback: { type: object, additionalProperties: true, description: Schema-valid fallback typed data. }
@@ -7790,13 +7806,18 @@ components:
     PluginServiceDataProvenance:
       type: object
       additionalProperties: false
-      required: [plugin_id, endpoint_id, origin, fetched_at, source]
+      required: [plugin_id, endpoint_id, origin, fetched_at, source, freshness, last_attempt_at, next_attempt_at, consecutive_failures]
       properties:
         plugin_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
         endpoint_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
-        origin: { type: string, format: uri, description: Audited upstream origin only; no request path or credentials are exposed. }
-        fetched_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
-        source: { type: string, enum: [network, cache, stale_cache, fallback] }
+        origin: { type: string, description: Audited HTTPS origin or signed component collector identity; no request path or credentials are exposed. }
+        fetched_at: { type: integer, format: int64, minimum: 0, description: Unix epoch milliseconds of the last successful collection; zero until the first successful collection. }
+        source: { type: string, enum: [network, cache, component, stale_cache, fallback] }
+        freshness: { type: string, enum: [fresh, stale, unavailable] }
+        last_attempt_at: { type: [integer, 'null'], format: int64 }
+        next_attempt_at: { type: [integer, 'null'], format: int64 }
+        consecutive_failures: { type: integer, minimum: 0 }
+        error_code: { type: [string, 'null'], enum: [timeout, network, http_status, content_type, body_limit, invalid_json, schema_validation, component_execution, component_output, database, null] }
     PluginConfiguration:
       type: object
       additionalProperties: false

@@ -273,10 +273,11 @@ pub(in crate::api) async fn get_plugin_service_data(
     if !service.allows(&endpoint.required_scope) {
         return Err(AppError::Forbidden);
     }
-    let tenant_external_id = management_tenant(&service, query.tenant_external_id)?;
+    let _tenant_external_id = management_tenant(&service, query.tenant_external_id)?;
+    let runtime_revision = state.application_plugin_revision().unwrap_or(0);
     let data = state
         .plugins
-        .service_data(&plugin_id, &endpoint_id, tenant_external_id.as_deref())
+        .service_data(runtime_revision, &plugin_id, &endpoint_id)
         .await?;
     state
         .plugins

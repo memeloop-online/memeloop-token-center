@@ -597,6 +597,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request archive gap evidence",
         sql: include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
     },
+    Migration {
+        version: 113,
+        name: "durable plugin service data snapshots",
+        sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1177,6 +1182,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 112,
         name: "request archive gap evidence",
         sql: include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
+    },
+    Migration {
+        version: 113,
+        name: "durable plugin service data snapshots",
+        sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
     },
 ];
 

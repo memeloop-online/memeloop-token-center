@@ -30,6 +30,7 @@ mod configuration;
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
 pub mod routing;
+pub(crate) mod service_data;
 mod ui_projection;
 pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
@@ -58,10 +59,10 @@ const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
 const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
 const PLUGIN_CONFIGURATION_CACHE_ENTRIES: usize = 64;
 const PLUGIN_CONFIGURATION_CACHE_BYTES: usize = 16 * 1024 * 1024;
-const PLUGIN_SERVICE_DATA_CACHE_ENTRIES: usize = 128;
-const PLUGIN_SERVICE_DATA_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
 const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
+const MAX_PLUGIN_SERVICE_DATA_ENDPOINTS: usize = 32;
+const PLUGIN_SERVICE_DATA_COMPONENT_API: &str = "component-v1";
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
@@ -101,6 +102,16 @@ wasmtime::component::bindgen!({
     world: "plugin",
     path: "wit/token-center.wit",
 });
+
+mod service_data_component {
+    wasmtime::component::bindgen!({
+        world: "service-data-plugin",
+        path: "wit/token-center.wit",
+        with: {
+            "memeloop:token-center/host@0.2.0": super::memeloop::token_center::host,
+        },
+    });
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -219,7 +230,12 @@ pub struct PluginServiceDataEndpoint {
     pub id: String,
     /// A complete, manifest-audited HTTPS URL. Requests are GET-only, carry
     /// no caller credentials, and are DNS-pinned by `network::client_for_url`.
-    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional executable collector/normalizer. The worker invokes this
+    /// adapter outside every inference and operator request path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_adapter: Option<PluginServiceDataComponentAdapter>,
     pub required_scope: String,
     pub response_schema: Value,
     #[serde(default = "empty_json_object")]
@@ -230,6 +246,16 @@ pub struct PluginServiceDataEndpoint {
     pub timeout_millis: u64,
     #[serde(default = "default_plugin_data_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceDataComponentAdapter {
+    pub api_version: String,
+    pub collector: String,
+    pub normalizer: String,
+    #[serde(default = "empty_json_object")]
+    pub config: Value,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -247,8 +273,17 @@ pub struct PluginServiceDataProvenance {
     pub plugin_id: String,
     pub endpoint_id: String,
     pub origin: String,
+    /// Unix epoch milliseconds for the last successful collection. A value of
+    /// zero preserves the published V1 contract when no collection has
+    /// succeeded; `freshness` is authoritative for availability.
     pub fetched_at: i64,
     pub source: String,
+    pub freshness: String,
+    pub last_attempt_at: Option<i64>,
+    pub next_attempt_at: Option<i64>,
+    pub consecutive_failures: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 fn default_plugin_data_cache_ttl_seconds() -> u64 {
@@ -323,6 +358,7 @@ pub enum PluginCapability {
 struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
+    service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
     routing_validator: Option<crate::schema::CompiledSchema>,
@@ -388,14 +424,6 @@ struct ConfigurationCache {
     // Hash collisions conservatively fence older reads for another tenant.
     published_generations: [u64; 32],
     entries: BTreeMap<Uuid, CachedPluginConfigurations>,
-}
-
-#[derive(Clone)]
-struct CachedPluginServiceData {
-    loaded_at: Instant,
-    fetched_at: i64,
-    data: Value,
-    estimated_bytes: usize,
 }
 
 #[derive(Clone, Default)]
@@ -502,7 +530,6 @@ pub struct PluginRuntime {
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
     configuration_cache: Arc<tokio::sync::RwLock<ConfigurationCache>>,
-    service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -532,6 +559,7 @@ struct HostState {
     kv: Option<PluginKv>,
     limits: StoreLimits,
     deadline: Instant,
+    http_body_limit: usize,
 }
 
 fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
@@ -649,6 +677,43 @@ impl PluginRuntime {
             let routing_fingerprint = plugin_configuration_schema_digest(&serde_json::json!({
                 "manifest": manifest, "component_sha256": component_sha256,
             }))?;
+            let service_data_component = if manifest
+                .contributions
+                .service_data
+                .iter()
+                .any(|endpoint| endpoint.component_adapter.is_some())
+            {
+                let component = component.as_ref().ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "plugin {} needs a component for service data",
+                        manifest.id
+                    ))
+                })?;
+                let mut linker = Linker::new(&engine);
+                service_data_component::ServiceDataPlugin::add_to_linker::<_, HasSelf<_>>(
+                    &mut linker,
+                    |state| state,
+                )
+                .map_err(|_| plugin_runtime_failure("service_data_linker_configuration"))?;
+                let instance_pre = linker.instantiate_pre(component).map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "plugin {} service data component has an incompatible ABI",
+                        manifest.id
+                    ))
+                })?;
+                Some(
+                    service_data_component::ServiceDataPluginPre::new(instance_pre).map_err(
+                        |_| {
+                            AppError::BadRequest(format!(
+                                "plugin {} service data component has an incompatible ABI",
+                                manifest.id
+                            ))
+                        },
+                    )?,
+                )
+            } else {
+                None
+            };
             #[cfg(feature = "experimental-plugin-revisions")]
             let identity = {
                 let receipt_path = directory.join(".mtc-oci-install.json");
@@ -682,6 +747,7 @@ impl PluginRuntime {
             plugins.push(LoadedPlugin {
                 manifest,
                 component,
+                service_data_component,
                 ui_modules,
                 configuration_validator,
                 routing_validator,
@@ -704,7 +770,6 @@ impl PluginRuntime {
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
             configuration_cache: Arc::default(),
-            service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
             #[cfg(feature = "experimental-plugin-revisions")]
@@ -775,22 +840,15 @@ impl PluginRuntime {
     /// plugin identifiers never leave the cache through this interface.
     pub async fn runtime_metrics(&self) -> PluginRuntimeMetrics {
         let configuration_cache = self.configuration_cache.read().await;
-        let service_data_cache = self.service_data_cache.read().await;
         PluginRuntimeMetrics {
             loaded_plugins: self.plugins.len(),
-            cache_entries: configuration_cache
-                .entries
-                .len()
-                .saturating_add(service_data_cache.len()),
+            cache_entries: configuration_cache.entries.len(),
             cache_bytes: configuration_cache
                 .entries
                 .values()
                 .fold(0usize, |total, entry| {
                     total.saturating_add(entry.estimated_bytes)
-                })
-                .saturating_add(service_data_cache.values().fold(0usize, |total, entry| {
-                    total.saturating_add(entry.estimated_bytes)
-                })),
+                }),
         }
     }
 
@@ -802,192 +860,6 @@ impl PluginRuntime {
             .iter()
             .find(|plugin| plugin.manifest.id == plugin_id)
             .and_then(|plugin| plugin.manifest.contributions.configuration.clone())
-    }
-
-    pub fn service_data_endpoint(
-        &self,
-        plugin_id: &str,
-        endpoint_id: &str,
-    ) -> Option<PluginServiceDataEndpoint> {
-        self.plugins
-            .iter()
-            .find(|plugin| plugin.manifest.id == plugin_id)
-            .and_then(|plugin| {
-                plugin
-                    .manifest
-                    .contributions
-                    .service_data
-                    .iter()
-                    .find(|endpoint| endpoint.id == endpoint_id)
-            })
-            .cloned()
-    }
-
-    /// Fetch one declared typed-data feed through the core. The caller has
-    /// already authenticated and authorized the selected manifest endpoint;
-    /// this method never receives or forwards a browser/service credential.
-    pub async fn service_data(
-        &self,
-        plugin_id: &str,
-        endpoint_id: &str,
-        tenant_external_id: Option<&str>,
-    ) -> Result<PluginServiceDataView, AppError> {
-        let endpoint = self
-            .service_data_endpoint(plugin_id, endpoint_id)
-            .ok_or(AppError::NotFound)?;
-        let cache_key = service_data_cache_key(plugin_id, endpoint_id, tenant_external_id);
-        let origin = plugin_service_data_origin(&endpoint.url)?;
-        if let Some(cached) = self
-            .service_data_cache
-            .read()
-            .await
-            .get(&cache_key)
-            .filter(|cached| {
-                cached.loaded_at.elapsed() < Duration::from_secs(endpoint.cache_ttl_seconds)
-            })
-            .cloned()
-        {
-            return Ok(service_data_view(
-                plugin_id,
-                endpoint_id,
-                origin,
-                cached.data,
-                false,
-                cached.fetched_at,
-                "cache",
-            ));
-        }
-
-        let result = self.fetch_service_data(&endpoint).await;
-        match result {
-            Ok(data) => {
-                let fetched_at = crate::db::unix_millis();
-                self.cache_service_data(
-                    cache_key,
-                    CachedPluginServiceData {
-                        loaded_at: Instant::now(),
-                        fetched_at,
-                        estimated_bytes: estimated_json_bytes(&data),
-                        data: data.clone(),
-                    },
-                )
-                .await;
-                Ok(service_data_view(
-                    plugin_id,
-                    endpoint_id,
-                    origin,
-                    data,
-                    false,
-                    fetched_at,
-                    "network",
-                ))
-            }
-            Err(_) => {
-                if let Some(cached) = self
-                    .service_data_cache
-                    .read()
-                    .await
-                    .get(&cache_key)
-                    .cloned()
-                {
-                    return Ok(service_data_view(
-                        plugin_id,
-                        endpoint_id,
-                        origin,
-                        cached.data,
-                        true,
-                        cached.fetched_at,
-                        "stale_cache",
-                    ));
-                }
-                Ok(service_data_view(
-                    plugin_id,
-                    endpoint_id,
-                    origin,
-                    endpoint.fallback,
-                    true,
-                    crate::db::unix_millis(),
-                    "fallback",
-                ))
-            }
-        }
-    }
-
-    async fn fetch_service_data(
-        &self,
-        endpoint: &PluginServiceDataEndpoint,
-    ) -> Result<Value, AppError> {
-        let http = self.http.as_ref().ok_or(AppError::Internal)?;
-        let timeout = Duration::from_millis(endpoint.timeout_millis);
-        let request = async {
-            let client =
-                network::client_for_url(http, &endpoint.url, OutboundScope::Public, false).await?;
-            let response = client
-                .get(&endpoint.url)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
-            if !response.status().is_success() {
-                return Err(AppError::Upstream(
-                    "plugin service data is unavailable".into(),
-                ));
-            }
-            let json_content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| {
-                    let media_type = value.split(';').next().unwrap_or_default().trim();
-                    media_type == "application/json" || media_type.ends_with("+json")
-                });
-            if !json_content_type {
-                return Err(AppError::Upstream(
-                    "plugin service data is unavailable".into(),
-                ));
-            }
-            let mut body = Vec::new();
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
-                if body.len().saturating_add(chunk.len()) > endpoint.max_body_bytes {
-                    return Err(AppError::Upstream(
-                        "plugin service data is unavailable".into(),
-                    ));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            let data: Value = serde_json::from_slice(&body)
-                .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
-            crate::schema::validate_instance(&endpoint.response_schema, &data)?;
-            Ok(data)
-        };
-        tokio::time::timeout(timeout, request)
-            .await
-            .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?
-    }
-
-    async fn cache_service_data(&self, key: String, entry: CachedPluginServiceData) {
-        if entry.estimated_bytes > PLUGIN_SERVICE_DATA_CACHE_BYTES {
-            return;
-        }
-        let mut cache = self.service_data_cache.write().await;
-        cache.insert(key, entry);
-        while cache.len() > PLUGIN_SERVICE_DATA_CACHE_ENTRIES
-            || cache.values().fold(0usize, |total, value| {
-                total.saturating_add(value.estimated_bytes)
-            }) > PLUGIN_SERVICE_DATA_CACHE_BYTES
-        {
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.loaded_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            cache.remove(&oldest);
-        }
     }
 
     pub async fn resolved_traffic_configurations(
@@ -1120,6 +992,7 @@ impl PluginRuntime {
                     kv: self.kv.clone(),
                     limits,
                     deadline: Instant::now() + self.execution_timeout,
+                    http_body_limit: PLUGIN_HTTP_BODY_BYTES,
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1240,16 +1113,20 @@ impl PluginRuntime {
         provider_id: &str,
         config: &Value,
     ) -> Result<Option<Value>, AppError> {
-        let Some(plugin) = self.plugins.iter().find(|plugin| {
+        let Some((plugin, provider)) = self.plugins.iter().find_map(|plugin| {
             plugin
                 .manifest
                 .contributions
                 .providers
                 .iter()
-                .any(|provider| provider.id == provider_id)
+                .find(|provider| provider.id == provider_id)
+                .map(|provider| (plugin, provider))
         }) else {
             return Ok(None);
         };
+        if provider.component_adapter.is_none() {
+            return Ok(None);
+        }
         let Some(component) = plugin.component.as_ref() else {
             return Ok(None);
         };
@@ -1273,6 +1150,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
+                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -1532,6 +1410,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
+                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -1817,9 +1696,16 @@ impl memeloop::token_center::host::Host for HostState {
             .kv
             .as_ref()
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
-        self.runtime
-            .block_on(kv.database.plugin_kv_get(&self.plugin_id, &key))
-            .map_err(|_| "plugin KV get failed".to_owned())
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "plugin execution deadline exceeded".to_owned())?;
+        self.runtime.block_on(async {
+            tokio::time::timeout(remaining, kv.database.plugin_kv_get(&self.plugin_id, &key))
+                .await
+                .map_err(|_| "plugin KV get timed out".to_owned())?
+                .map_err(|_| "plugin KV get failed".to_owned())
+        })
     }
 
     fn kv_put(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
@@ -1834,9 +1720,19 @@ impl memeloop::token_center::host::Host for HostState {
             .kv
             .as_ref()
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
-        self.runtime
-            .block_on(kv.database.plugin_kv_put(&self.plugin_id, &key, &value))
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "plugin execution deadline exceeded".to_owned())?;
+        self.runtime.block_on(async {
+            tokio::time::timeout(
+                remaining,
+                kv.database.plugin_kv_put(&self.plugin_id, &key, &value),
+            )
+            .await
+            .map_err(|_| "plugin KV put timed out".to_owned())?
             .map_err(|_| "plugin KV put failed".to_owned())
+        })
     }
 
     fn http_request(
@@ -1846,8 +1742,8 @@ impl memeloop::token_center::host::Host for HostState {
         headers_json: String,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
-        if body.len() > PLUGIN_HTTP_BODY_BYTES {
-            return Err("plugin HTTP request exceeds 16 MiB".to_owned());
+        if body.len() > self.http_body_limit {
+            return Err("plugin HTTP request exceeds its configured body limit".to_owned());
         }
         let url = url::Url::parse(&url).map_err(|_| "plugin HTTP URL is invalid".to_owned())?;
         if !matches!(url.scheme(), "http" | "https")
@@ -1919,8 +1815,8 @@ impl memeloop::token_center::host::Host for HostState {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| "plugin HTTP response read failed".to_owned())?;
-                if response_body.len().saturating_add(chunk.len()) > PLUGIN_HTTP_BODY_BYTES {
-                    return Err("plugin HTTP response exceeds 16 MiB".to_owned());
+                if response_body.len().saturating_add(chunk.len()) > self.http_body_limit {
+                    return Err("plugin HTTP response exceeds its configured body limit".to_owned());
                 }
                 response_body.extend_from_slice(&chunk);
             }
@@ -2225,6 +2121,12 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
 }
 
 fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), AppError> {
+    if manifest.contributions.service_data.len() > MAX_PLUGIN_SERVICE_DATA_ENDPOINTS {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} declares too many service data endpoints",
+            manifest.id
+        )));
+    }
     let mut ids = BTreeSet::new();
     for endpoint in &manifest.contributions.service_data {
         if !safe_plugin_token(&endpoint.id, 64) || !ids.insert(&endpoint.id) {
@@ -2239,35 +2141,31 @@ fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), 
                 manifest.id
             )));
         }
-        let parsed = url::Url::parse(&endpoint.url).map_err(|_| {
-            AppError::BadRequest(format!(
-                "plugin {} service data endpoint has an invalid URL",
-                manifest.id
-            ))
-        })?;
-        if endpoint.url.len() > 2_048
-            || parsed.scheme() != "https"
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.fragment().is_some()
-            || parsed.query().is_some()
-            || parsed.port() == Some(0)
-        {
-            return Err(AppError::BadRequest(format!(
-                "plugin {} service data endpoint must use a bounded HTTPS URL",
-                manifest.id
-            )));
-        }
-        let origin = parsed.origin().ascii_serialization();
-        let origin_allowed = manifest.capabilities.iter().any(|capability| {
-            matches!(capability, PluginCapability::Http { allowed_origins } if allowed_origins.contains(&origin))
-        });
-        if !origin_allowed {
-            return Err(AppError::BadRequest(format!(
-                "plugin {} service data endpoint origin is not declared by the HTTP capability",
-                manifest.id
-            )));
+        match (&endpoint.url, &endpoint.component_adapter) {
+            (Some(url), None) => validate_service_data_url(manifest, url)?,
+            (None, Some(adapter)) => {
+                if manifest.wasm.is_none()
+                    || adapter.api_version != PLUGIN_SERVICE_DATA_COMPONENT_API
+                    || !safe_plugin_token(&adapter.collector, 64)
+                    || !safe_plugin_token(&adapter.normalizer, 64)
+                    || !adapter.config.is_object()
+                    || serde_json::to_vec(&adapter.config)
+                        .map_err(|_| AppError::Internal)?
+                        .len()
+                        > MAX_PLUGIN_SERVICE_DATA_BODY_BYTES
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} service data component adapter is invalid",
+                        manifest.id
+                    )));
+                }
+            }
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "plugin {} service data endpoint must declare exactly one collector",
+                    manifest.id
+                )));
+            }
         }
         if endpoint.cache_ttl_seconds == 0
             || endpoint.cache_ttl_seconds > 3_600
@@ -2291,6 +2189,40 @@ fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), 
         }
         crate::schema::validate_definition(&endpoint.response_schema)?;
         crate::schema::validate_instance(&endpoint.response_schema, &endpoint.fallback)?;
+    }
+    Ok(())
+}
+
+fn validate_service_data_url(manifest: &PluginManifest, url: &str) -> Result<(), AppError> {
+    let parsed = url::Url::parse(url).map_err(|_| {
+        AppError::BadRequest(format!(
+            "plugin {} service data endpoint has an invalid URL",
+            manifest.id
+        ))
+    })?;
+    if url.len() > 2_048
+        || parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.query().is_some()
+        || parsed.port() == Some(0)
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} service data endpoint must use a bounded HTTPS URL",
+            manifest.id
+        )));
+    }
+    let origin = parsed.origin().ascii_serialization();
+    let origin_allowed = manifest.capabilities.iter().any(|capability| {
+        matches!(capability, PluginCapability::Http { allowed_origins } if allowed_origins.contains(&origin))
+    });
+    if !origin_allowed {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} service data endpoint origin is not declared by the HTTP capability",
+            manifest.id
+        )));
     }
     Ok(())
 }
@@ -2411,37 +2343,6 @@ fn safe_plugin_label(value: &str) -> bool {
         && !value.contains(['<', '>'])
 }
 
-fn service_data_cache_key(plugin_id: &str, endpoint_id: &str, tenant: Option<&str>) -> String {
-    format!("{plugin_id}\0{endpoint_id}\0{}", tenant.unwrap_or("global"))
-}
-
-fn plugin_service_data_origin(url: &str) -> Result<String, AppError> {
-    let url = url::Url::parse(url).map_err(|_| AppError::Internal)?;
-    Ok(url.origin().ascii_serialization())
-}
-
-fn service_data_view(
-    plugin_id: &str,
-    endpoint_id: &str,
-    origin: String,
-    data: Value,
-    partial: bool,
-    fetched_at: i64,
-    source: &str,
-) -> PluginServiceDataView {
-    PluginServiceDataView {
-        data,
-        partial,
-        provenance: PluginServiceDataProvenance {
-            plugin_id: plugin_id.to_owned(),
-            endpoint_id: endpoint_id.to_owned(),
-            origin,
-            fetched_at,
-            source: source.to_owned(),
-        },
-    }
-}
-
 pub fn plugin_configuration_schema_digest(schema: &Value) -> Result<String, AppError> {
     let canonical = canonical_json(schema);
     let bytes = serde_json::to_vec(&canonical).map_err(|_| AppError::Internal)?;
@@ -2480,28 +2381,6 @@ fn canonical_json(value: &Value) -> Value {
             )
         }
         value => value.clone(),
-    }
-}
-
-fn estimated_json_bytes(value: &Value) -> usize {
-    match value {
-        Value::Null => 4,
-        Value::Bool(_) => 5,
-        Value::Number(number) => number.to_string().len(),
-        // Every input byte can expand to at most one six-byte JSON escape
-        // (for example `\u0000`), so this remains a conservative budget.
-        Value::String(value) => value.len().saturating_mul(6).saturating_add(2),
-        Value::Array(values) => values.iter().fold(2usize, |total, value| {
-            total
-                .saturating_add(1)
-                .saturating_add(estimated_json_bytes(value))
-        }),
-        Value::Object(values) => values.iter().fold(2usize, |total, (key, value)| {
-            total
-                .saturating_add(key.len().saturating_mul(6))
-                .saturating_add(4)
-                .saturating_add(estimated_json_bytes(value))
-        }),
     }
 }
 
@@ -3158,6 +3037,7 @@ mod tests {
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
+            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
         };
         let error = memeloop::token_center::host::Host::http_request(
             &mut state,
@@ -3294,6 +3174,7 @@ mod tests {
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
+            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
         };
         assert!(
             memeloop::token_center::host::Host::kv_get(&mut state, "secret".to_owned()).is_err()

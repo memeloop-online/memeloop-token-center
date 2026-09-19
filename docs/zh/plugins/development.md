@@ -69,6 +69,32 @@ record metering {
 
 Provider 可以声明 `oauth_adapter`（`api_version: "oauth-adapter-v1"`，`flow_kind: "cursor_pkce"`，提供 `login_url`、`poll_url`、`refresh_url`），由核心执行版本化 PKCE 协议；也可以声明 `authorization_code_pkce` 使用通用授权码流程。两种方式下 token 都只进入核心加密凭证表，组件与插件 KV 不接触 token。
 
+## 后台服务数据（`component-v1`）
+
+Operator 页签和卡片可读取 `contributions.service_data` 的类型化快照。URL 端点使用内置 HTTPS JSON 采集器；可执行端点声明签名组件中的 collector 与 normalizer：
+
+```json
+{
+  "id": "health",
+  "component_adapter": {
+    "api_version": "component-v1",
+    "collector": "source-health",
+    "normalizer": "health-v1",
+    "config": { "region": "global" }
+  },
+  "required_scope": "metrics:read",
+  "response_schema": { "type": "object" },
+  "fallback": {},
+  "cache_ttl_seconds": 600,
+  "timeout_millis": 5000,
+  "max_body_bytes": 262144
+}
+```
+
+组件在 `service-data-plugin` world 实现 `service-data-v1`。`collect(collector-id, config-json)` 通过已声明的宿主能力返回有界 JSON；`normalize(normalizer-id, config-json, collected-json)` 返回符合 Schema 的对象。同时提供流量或 Provider 钩子的包使用 `combined-plugin` authoring world。
+
+Worker 负责调度、租约隔离、超时、持久退避和 last-good 存储。Operator 只读取当前已发布插件 revision 的持久快照，并获得 freshness 与宿主固定状态码。采集过程与推理、UI 请求执行相互独立。
+
 ## 最小清单
 
 ```json

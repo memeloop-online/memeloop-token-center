@@ -90,6 +90,55 @@ async fn operator_ui_fixture_loads_and_data_permission_is_checked_before_any_out
 }
 
 #[tokio::test]
+async fn authorized_service_data_reads_the_durable_fallback_without_network_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let values = fixture();
+    write_package(&plugins, "observability-suite", &values["installed"][0]);
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("fallback.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.plugin_dir = Some(plugins.display().to_string());
+    let state = AppState::initialize(config)
+        .await
+        .expect("load UI plugin fixture");
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "plugins-with-metrics".into(),
+                scopes: vec!["plugins:read".into(), "metrics:read".into()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("create scoped service credential");
+    let response = api::router_for_role(state, RuntimeRole::Control)
+        .oneshot(
+            Request::get("/internal/v1/plugins/observability-suite/data/health")
+                .header(header::AUTHORIZATION, format!("Bearer {}", issued.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        body["data"],
+        serde_json::json!({"status": "offline", "checks": []})
+    );
+    assert_eq!(body["partial"], true);
+    assert_eq!(body["provenance"]["freshness"], "unavailable");
+    assert_eq!(body["provenance"]["source"], "fallback");
+    assert_eq!(body["provenance"]["last_attempt_at"], Value::Null);
+}
+
+#[tokio::test]
 async fn conflicting_new_plugin_category_prevents_the_plugin_set_from_loading() {
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");

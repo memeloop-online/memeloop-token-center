@@ -70,6 +70,7 @@ mod plugin_installations;
 mod plugin_kv;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;
+mod plugin_service_data;
 mod projection_lock;
 mod providers;
 mod requests;
@@ -155,6 +156,9 @@ pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 use migrations::{apply_migration_range, maintain_postgres_partitions};
 pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
+pub(crate) use plugin_service_data::{
+    PluginServiceDataRefreshErrorCode, PluginServiceDataSnapshot,
+};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView,
     BatchUpstreamAccountCredential, ClaimUpstreamOAuthRefreshResult, ClaimedUpstreamOAuthRefresh,

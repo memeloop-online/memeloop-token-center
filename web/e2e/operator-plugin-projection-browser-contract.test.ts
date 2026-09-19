@@ -37,7 +37,7 @@ test('real Operator route authenticates projection reads and discards prior tena
         if (tenant === 'beta') return route.fulfill({ status: 403, json: { error: { message: 'Tenant feed denied' } } });
         return route.fulfill({ json: {
           data: { schema_version: 1, plugin_id: 'dashboard', slot_id: 'summary', components: [{ kind: 'metric', label: 'Tenant requests', value: 'alpha-private-42' }, { kind: 'link', label: 'Details', href: 'https://example.com/details' }] },
-          partial: true, provenance: { plugin_id: 'dashboard', endpoint_id: 'summary-data', origin: 'https://example.com', fetched_at: Date.now(), source: 'fallback' },
+          partial: true, provenance: { plugin_id: 'dashboard', endpoint_id: 'summary-data', origin: 'https://example.com', fetched_at: 0, source: 'fallback', freshness: 'unavailable', last_attempt_at: null, next_attempt_at: null, consecutive_failures: 0 },
         } });
       }
       return route.fulfill({ json: [] });

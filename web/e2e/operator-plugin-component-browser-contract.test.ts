@@ -54,7 +54,7 @@ test('an installed runtime module renders without rebuilding MTC and failures st
       }] });
       if (url.pathname === '/internal/v1/plugins/component-dashboard/data/health') {
         dataCalls.push({ tenant: url.searchParams.get('tenant_external_id'), authorization: route.request().headers().authorization });
-        return route.fulfill({ json: { data: { status: 'ready' }, partial: false, provenance: { plugin_id: 'component-dashboard', endpoint_id: 'health', origin: 'https://example.com', fetched_at: Date.now(), source: 'network' } } });
+        return route.fulfill({ json: { data: { status: 'ready' }, partial: false, provenance: { plugin_id: 'component-dashboard', endpoint_id: 'health', origin: 'https://example.com', fetched_at: Date.now(), source: 'component', freshness: 'fresh', last_attempt_at: Date.now(), next_attempt_at: Date.now() + 30_000, consecutive_failures: 0 } } });
       }
       if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: [] });
       return route.fulfill({ json: [] });
