@@ -118,6 +118,9 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         .oauth_adapter
         .clone()
         .ok_or_else(|| AppError::BadRequest("provider does not offer OAuth".into()))?;
+    let (_, secret_patch) =
+        super::config_secrets::split_for_storage(&provider.config_schema, &body.provider_config)?;
+    crate::provider::validate_provider_adapter_secret_patch(&secret_patch)?;
     let client = match current_credential.as_ref() {
         Some(credential) => authorization_code::reauthorization_client(
             credential,
@@ -277,6 +280,18 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                 &state,
             )
             .await?;
+            let provider = state
+                .providers
+                .get(&ready.provider_driver)
+                .ok_or_else(|| AppError::BadRequest("unknown provider".into()))?;
+            let (public_config, secret_patch) = super::config_secrets::split_for_storage(
+                &provider.config_schema,
+                &ready.provider_config,
+            )?;
+            ready.credential = ready
+                .credential
+                .with_provider_adapter_secret_patch(&secret_patch)?;
+            ready.provider_config = public_config;
             let reauthorizing = ready.reauthorize.is_some();
             let mut account = if let Some(target) = ready.reauthorize {
                 state
@@ -291,7 +306,7 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                             oauth_session_id: ready.session_id,
                             oauth_driver: authorization_code::FLOW.into(),
                             oauth_refresh_url: Some(ready.refresh_url),
-                            provider_config: None,
+                            provider_config: Some(ready.provider_config),
                             credential: ready.credential,
                         },
                         state.config.key_pepper.as_bytes(),

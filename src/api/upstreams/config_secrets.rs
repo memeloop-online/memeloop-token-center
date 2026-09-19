@@ -143,6 +143,29 @@ fn redact(schema: &Value, value: &mut Value) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(super) fn split_for_storage(
+    schema: &Value,
+    complete: &Value,
+) -> Result<(Value, Value), AppError> {
+    if secret_cycle(schema)? || has_secret(schema, schema, true)? {
+        return Err(AppError::BadRequest(
+            "dynamic secret configuration cannot be stored for an OAuth provider".into(),
+        ));
+    }
+    fn at<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+        path.iter().try_fold(value, |value, key| value.get(key))
+    }
+    let mut patch = Vec::new();
+    for path in paths(schema)? {
+        if let Some(value) = at(complete, &path) {
+            patch.push(serde_json::json!({"path": path, "value": value}));
+        }
+    }
+    let mut public = complete.clone();
+    redact(schema, &mut public)?;
+    Ok((public, Value::Array(patch)))
+}
+
 pub(super) fn redact_account(
     state: &AppState,
     account: &mut UpstreamAccountView,
@@ -167,6 +190,48 @@ pub(super) fn public_account(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn storage_split_keeps_public_fields_and_round_trips_write_only_paths() {
+        let schema = json!({
+            "type":"object",
+            "properties":{
+                "base_url":{"type":"string"},
+                "nested":{"type":"object","properties":{
+                    "label":{"type":"string"},
+                    "secret":{"type":"string","writeOnly":true}
+                }}
+            }
+        });
+        let complete = json!({
+            "base_url":"https://provider.example/api",
+            "nested":{"label":"current","secret":"synthetic-secret"}
+        });
+        let (public, patch) = split_for_storage(&schema, &complete).unwrap();
+        assert_eq!(
+            public,
+            json!({
+                "base_url":"https://provider.example/api",
+                "nested":{"label":"current"}
+            })
+        );
+        let credential = crate::provider::UpstreamCredential::OAuth {
+            access_token: "synthetic-access".into(),
+            refresh_token: None,
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        }
+        .with_provider_adapter_secret_patch(&patch)
+        .unwrap();
+        assert_eq!(
+            credential.hydrate_provider_adapter_config(public).unwrap(),
+            complete
+        );
+    }
 
     #[test]
     fn excessive_distinct_output_paths_fail_closed_with_a_specific_error() {

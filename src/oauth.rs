@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use uuid::Uuid;
 
-use crate::{db::Database, error::AppError};
+use crate::{db::Database, error::AppError, provider::seal_private_json};
 
 mod adapter;
 pub mod authorization_code;
@@ -27,6 +27,7 @@ pub(crate) use endpoint::{oauth_adapter_endpoint_scope, validate_oauth_adapter_e
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_LOGIN_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_OAUTH_LOGIN_STATE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<String, AppError> {
     let base_url = crate::provider::validate_config(config)?;
@@ -37,6 +38,20 @@ pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<
         ));
     }
     Ok(base_url)
+}
+
+pub(crate) fn seal_oauth_login_state<T: serde::Serialize>(
+    state: &T,
+    key_material: &[u8],
+    aad: &[u8],
+) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(state).map_err(|_| AppError::Internal)?;
+    if bytes.len() > MAX_OAUTH_LOGIN_STATE_BYTES {
+        return Err(AppError::BadRequest(
+            "OAuth login state exceeds the session limit".into(),
+        ));
+    }
+    seal_private_json(state, key_material, aad)
 }
 
 #[async_trait::async_trait]
@@ -119,6 +134,16 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[test]
+    fn oauth_login_state_has_one_pre_encryption_size_limit() {
+        let oversized = "x".repeat(MAX_OAUTH_LOGIN_STATE_BYTES + 1);
+        assert!(matches!(
+            seal_oauth_login_state(&oversized, b"test-key", b"test-aad"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(seal_oauth_login_state(&"bounded", b"test-key", b"test-aad").is_ok());
+    }
 
     async fn sqlite_database() -> (tempfile::TempDir, Database) {
         let directory = tempfile::tempdir().expect("OAuth test temporary directory");

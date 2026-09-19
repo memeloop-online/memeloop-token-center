@@ -494,10 +494,12 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let config: serde_json::Value =
+        let persisted_config: serde_json::Value =
             serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
-        let base_url = validate_config(&config)?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
+        let credential = open_credential(&ciphertext, key_material)?;
+        let config = credential.hydrate_provider_adapter_config(persisted_config)?;
+        let base_url = validate_config(&config)?;
         Ok(Some(ResolvedUpstream {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
@@ -507,7 +509,7 @@ impl Database {
             base_url,
             config,
             upstream_model: row.try_get("upstream_model")?,
-            credential: open_credential(&ciphertext, key_material)?,
+            credential,
         }))
     }
 }

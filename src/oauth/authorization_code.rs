@@ -458,7 +458,7 @@ pub async fn start(
         flow_kind: FLOW.into(),
         tenant_external_id: session.tenant_external_id.clone(),
         operator_service_id: session.operator_service_id,
-        state_ciphertext: seal_private_json(
+        state_ciphertext: super::seal_oauth_login_state(
             &LoginState {
                 exchange_started: false,
                 input,
@@ -610,7 +610,7 @@ pub async fn complete(
     db.replace_oauth_login_poll_state(
         session.session_id,
         lease_owner,
-        seal_private_json(&login, key, STATE_AAD)?,
+        super::seal_oauth_login_state(&login, key, STATE_AAD)?,
     )
     .await?;
     let tokens = dispatch_token_request(prepared)
@@ -1579,6 +1579,11 @@ mod tests {
             state["authorization_code"]["identity"] =
                 json!({"issuer":GOOGLE_ISSUER,"subject":"same-refreshed-account"});
         }
+        current = current
+            .with_provider_adapter_secret_patch(&json!([
+                {"path":["client_secret"],"value":"provider-config-secret"}
+            ]))
+            .unwrap();
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -1600,6 +1605,12 @@ mod tests {
             "refresh preserves identity and complete client context"
         );
         assert!(same_reauthorization_identity(&current, &refreshed));
+        assert_eq!(
+            refreshed
+                .hydrate_provider_adapter_config(json!({"base_url":"https://provider.example"}))
+                .unwrap()["client_secret"],
+            "provider-config-secret"
+        );
         match refreshed {
             UpstreamCredential::OAuth {
                 access_token,

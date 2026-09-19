@@ -286,7 +286,10 @@ async fn explicit_proxy_read_preserves_full_url_but_excludes_other_secrets_and_r
                     name: stored_account.name.clone(),
                     config: json!({"base_url": "https://10.1.2.3", "network_scope": "public"}),
                     expected_updated_at: stored_account.updated_at,
+                    expected_credential_generation: None,
+                    credential: None,
                 },
+                state.config.key_pepper.as_bytes(),
             )
             .await
             .unwrap();
