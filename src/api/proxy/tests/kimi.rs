@@ -552,7 +552,6 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                         }}
                     ]}
                 ]},
-                {"type":"compaction","encrypted_content":{"ciphertext":"host-state"}},
                 {"type":"reasoning","summary":[],
                     "encrypted_content":{"ciphertext":"host-state"}},
                 {"type":"agent_message","author":"/root","recipient":"/worker",

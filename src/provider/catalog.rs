@@ -888,12 +888,17 @@ impl ProviderCatalog {
 
     /// Model catalogs also include native Codex routes, whose transport reads
     /// MultiAgentV2 without the third-party normalization hook.
-    pub fn supports_codex_multi_agent_v2_model_catalog(&self, driver: &str) -> bool {
+    pub fn supports_codex_multi_agent_v2_model_catalog(
+        &self,
+        driver: &str,
+        config: &Value,
+    ) -> bool {
         driver == crate::oauth::codex_device::PROVIDER_DRIVER
             || self.get(driver).is_some_and(|provider| {
-                provider
-                    .request_compatibility
-                    .supports_codex_multi_agent_v2()
+                let compatibility = &provider.request_compatibility;
+                compatibility.supports_codex_multi_agent_v2()
+                    && (!compatibility.responses_transport_configurable
+                        || self.responses_via_chat_dialect(driver, config).is_some())
             })
     }
 

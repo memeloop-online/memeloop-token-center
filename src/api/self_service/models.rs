@@ -188,7 +188,9 @@ fn codex_model_availability(
             availability.third_party_source_seen = true;
         }
         let native = source.driver == crate::oauth::codex_device::PROVIDER_DRIVER;
-        let compatible = providers.supports_codex_multi_agent_v2_model_catalog(&source.driver);
+        let config = serde_json::from_str::<Value>(&source.config_json).unwrap_or(Value::Null);
+        let compatible =
+            providers.supports_codex_multi_agent_v2_model_catalog(&source.driver, &config);
         let capabilities = if compatible && !native {
             providers.codex_model_capabilities_for_catalog(&source.driver)
         } else {
@@ -733,6 +735,16 @@ mod tests {
         assert!(!incompatible["mixed-incompatible"].openai_multi_agent_v2);
         assert!(
             incompatible["mixed-incompatible"]
+                .codex_model_capabilities
+                .is_none()
+        );
+
+        let mut chat_bridge = source("chat-bridge", "http-json");
+        chat_bridge.config_json = json!({"responses_transport":"chat_completions"}).to_string();
+        let chat_bridge = codex_model_availability(&providers, &[chat_bridge]);
+        assert!(chat_bridge["chat-bridge"].openai_multi_agent_v2);
+        assert!(
+            chat_bridge["chat-bridge"]
                 .codex_model_capabilities
                 .is_none()
         );
