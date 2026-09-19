@@ -88,18 +88,21 @@ pub(super) fn plan_proxy_route(
     let responses_via_chat_dialect = state
         .providers
         .responses_via_chat_dialect(&route.driver, &route.config);
-    let normalize_multi_agent = matches!(protocol, Protocol::OpenAiResponses)
+    let bridge_multi_agent = matches!(protocol, Protocol::OpenAiResponses)
         && codex_multi_agent_v2_request
         && responses_via_chat_dialect.is_some()
         && state
             .providers
             .supports_codex_multi_agent_v2(&route.driver, &route.config);
+    let prepare_plaintext_collaboration = matches!(protocol, Protocol::OpenAiResponses)
+        && codex_multi_agent_v2_request
+        && (is_codex || bridge_multi_agent);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
         request_json,
-        normalize_multi_agent,
-        normalize_multi_agent,
+        prepare_plaintext_collaboration,
+        bridge_multi_agent,
         responses_via_chat_dialect,
     )?;
     let codex_plan = if is_codex {

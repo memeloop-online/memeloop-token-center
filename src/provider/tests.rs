@@ -347,6 +347,20 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
         "http-json",
         &json!({"responses_transport":"chat_completions"})
     ));
+    let mut unreviewed_configurable = catalog.get("http-json").unwrap().clone();
+    unreviewed_configurable.id = "unreviewed-configurable".into();
+    unreviewed_configurable
+        .request_compatibility
+        .codex_multi_agent_v2 = false;
+    catalog.extend([unreviewed_configurable]).unwrap();
+    assert!(!catalog.supports_codex_multi_agent_v2(
+        "unreviewed-configurable",
+        &json!({"responses_transport":"native_responses"})
+    ));
+    assert!(!catalog.supports_codex_multi_agent_v2(
+        "unreviewed-configurable",
+        &json!({"responses_transport":"chat_completions"})
+    ));
     assert!(catalog.supports_responses_via_chat_v1("http-json"));
     assert_eq!(
         catalog.responses_via_chat_dialect(

@@ -831,7 +831,9 @@ impl ProviderCatalog {
     pub fn supports_codex_multi_agent_v2(&self, driver: &str, config: &Value) -> bool {
         self.get(driver).is_some_and(|provider| {
             let compatibility = &provider.request_compatibility;
-            if compatibility.responses_transport_configurable {
+            if !compatibility.supports_codex_multi_agent_v2() {
+                false
+            } else if compatibility.responses_transport_configurable {
                 matches!(
                     config
                         .get("responses_transport")
@@ -840,7 +842,7 @@ impl ProviderCatalog {
                     "native_responses" | "chat_completions"
                 )
             } else {
-                compatibility.supports_codex_multi_agent_v2()
+                true
             }
         })
     }
