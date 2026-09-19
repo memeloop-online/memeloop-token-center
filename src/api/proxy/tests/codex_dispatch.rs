@@ -90,7 +90,11 @@ async fn failover_dispatch_overload_preserves_response_archive_and_releases_old_
         let upstream = std::sync::Arc::new(MockServer::start().await);
         Mock::given(method("POST"))
             .and(header_matcher("chatgpt-account-id", "account-123"))
-            .respond_with(ResponseTemplate::new(503))
+            // Only a definite rejection permits replay; a dispatched 503
+            // deliberately cannot reach candidate failover in this gateway.
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": {"type": "rate_limit_exceeded"}
+            })))
             .expect(1)
             .mount(&upstream)
             .await;
