@@ -1,4 +1,4 @@
-use super::super::archive_spool::BudgetHold;
+use super::super::archive_spool::{BudgetHold, gap_failed_archive_spools_in_transaction};
 use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
 use super::conversations::{
@@ -1980,16 +1980,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         // bounded ciphertext immediately eligible for the existing GC path.
         // A worker can therefore never promote a 4xx/5xx/client-abort body to
         // immutable CAS, even across a crash between settlement and cleanup.
-        for table in ["request_archive_spools", "response_archive_spools"] {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {table} SET state = 'gap', updated_at = $1, expires_at = $1, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $2 AND tenant_id = $3 AND state IN ('capturing', 'pending', 'uploading')"
-            )))
-            .bind(completed_at)
-            .bind(&request_id)
-            .bind(&tenant_id)
-            .execute(&mut **tx)
+        gap_failed_archive_spools_in_transaction(tx, request.request_id, &tenant_id, completed_at)
             .await?;
-        }
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
     if project_aggregates {

@@ -64,6 +64,39 @@ pub(crate) struct ArchiveSpoolChunk {
     pub byte_count: i64,
 }
 
+pub(crate) async fn gap_failed_archive_spools_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    tenant_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    for purpose in [
+        BufferedArchivePurpose::Request,
+        BufferedArchivePurpose::Response,
+    ] {
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+            purpose,
+            "UPDATE response_archive_spools SET state = 'gap', updated_at = $1, expires_at = $1, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $2 AND tenant_id = $3 AND state IN ('capturing', 'pending', 'uploading')",
+        )))
+        .bind(now)
+        .bind(request_id.to_string())
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+        if changed.rows_affected() == 1 {
+            emit_response_archive_transition_event_in_transaction(
+                tx,
+                purpose,
+                request_id,
+                now,
+                "archive_gap",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn insert_request_archive_gap_in_transaction(
     tx: &mut Transaction<'_, Any>,
     now: i64,
