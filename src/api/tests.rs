@@ -618,6 +618,31 @@ async fn upstream_rate_limit_status_is_preserved_but_its_body_is_sanitized() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status_code, Some(429));
     assert_eq!(requests[0].error_code.as_deref(), Some("http_429"));
+    let refs = state
+        .db
+        .request_archive_refs(issued.key_id, requests[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(
+            "inline-json:{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}"
+        )
+    );
+    assert!(
+        !refs
+            .response_object
+            .as_deref()
+            .unwrap()
+            .contains("must-not-reach-client")
+    );
+    assert!(
+        !refs
+            .response_object
+            .as_deref()
+            .unwrap()
+            .contains("provider-sensitive-token")
+    );
 }
 
 #[tokio::test]
