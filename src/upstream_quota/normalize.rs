@@ -252,6 +252,8 @@ mod tests {
                 evidence: "server_driver_contract",
             },
             error_code: None,
+            attempts: Vec::new(),
+            cache_hit: false,
         }
     }
 

@@ -717,6 +717,19 @@ impl ProviderCatalog {
         });
         kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
         types.push(kimi);
+        for provider in &mut types {
+            if matches!(provider.id.as_str(), "openai-codex" | "kimi-oauth") {
+                provider.config_schema["properties"]["quota_read_policy"] = json!({
+                    "type": "object", "additionalProperties": false, "default": {},
+                    "description": "Runtime-adjustable read-only quota retry policy. Does not affect inference, reset consumption or OAuth; max_attempts includes the first request.",
+                    "properties": {
+                        "max_attempts": {"type":"integer", "minimum":1, "maximum":4, "default":3},
+                        "initial_delay_millis": {"type":"integer", "minimum":50, "maximum":2000, "default":200},
+                        "total_timeout_millis": {"type":"integer", "minimum":1000, "maximum":30000, "default":20000}
+                    }
+                });
+            }
+        }
         Self {
             types: Arc::new(types),
             builtin_managed_oauth: Arc::new(vec![

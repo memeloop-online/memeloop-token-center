@@ -9,13 +9,14 @@ pub(super) async fn read(
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
     trigger: QuotaReadTrigger,
+    session: &retry::ReadSession<'_>,
 ) -> Result<QuotaSnapshot, &'static str> {
     credential
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
     // Match normal Kimi model traffic and OAuth refresh: the fixed public
     // destination may use direct pinned DNS or the account proxy policy.
-    let http = crate::network::client_for_config_url(
+    let http = crate::network::client_for_config_url_no_retry(
         &state.http,
         USAGE_URL,
         &json!({"network_scope":"public"}),
@@ -29,10 +30,11 @@ pub(super) async fn read(
         credential,
         USAGE_URL,
         QuotaRequestContext::for_account(account, "usage", trigger),
+        session,
     )
     .await?;
     let now = unix_millis();
-    snapshot.windows = windows(&payload, now)?;
+    snapshot.windows = session.validated("usage", windows(&payload, now))?;
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
     snapshot.observed_at = Some(now);
@@ -47,25 +49,34 @@ async fn get_usage(
     credential: &UpstreamCredential,
     url: &str,
     context: QuotaRequestContext,
+    session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    let started = tokio::time::Instant::now();
-    let request = crate::oauth::managed::kimi::apply_headers(
-        http.get(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .timeout(Duration::from_secs(6)),
-        credential,
-    )
-    .map_err(|_| "credential_invalid")?;
-    let response = credential
-        .apply(request, unix_millis())
-        .map_err(|_| "credential_invalid")?
-        .send()
+    session
+        .run(context, || async {
+            let started = tokio::time::Instant::now();
+            let request = crate::oauth::managed::kimi::apply_headers(
+                http.get(url)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .timeout(session.budget.read),
+                credential,
+            )
+            .map_err(|_| retry::Failure::terminal("credential_invalid", "credential"))?;
+            let response = credential
+                .apply(request, unix_millis())
+                .map_err(|_| retry::Failure::terminal("credential_invalid", "credential"))?
+                .send()
+                .await
+                .map_err(retry::Failure::reqwest)?;
+            if let Some(failure) =
+                retry::Failure::status(response.status().as_u16(), response.headers())
+            {
+                return Err(failure);
+            }
+            decode_response(response, context, started)
+                .await
+                .map_err(|code| retry::Failure::terminal(code, "body"))
+        })
         .await
-        .map_err(|error| {
-            log_quota_request_error(context, "send", &error, started);
-            quota_reqwest_error_code(error.is_timeout())
-        })?;
-    decode_response(response, context, started).await
 }
 
 fn amount(value: &Value) -> Option<f64> {
@@ -238,6 +249,7 @@ mod tests {
                     endpoint_kind: "usage",
                     trigger: QuotaReadTrigger::Manual,
                 },
+                &retry::ReadSession::testing(codex_quota_budget(&json!({})).unwrap()),
             )
             .await
             .unwrap_err(),
@@ -246,6 +258,61 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method.as_str(), "GET");
+    }
+
+    #[tokio::test]
+    async fn usage_retry_after_recovers_without_token_or_model_traffic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let credential = crate::oauth::managed::kimi::credential_from_native_import(&json!({
+            "type":"kimi", "access_token":"fixture-access", "refresh_token":"fixture-refresh",
+            "token_type":"bearer", "device_id":"fixture-device"
+        }))
+        .unwrap();
+        let count = AtomicUsize::new(0);
+        Mock::given(method("GET"))
+            .and(path("/coding/v1/usages"))
+            .respond_with(move |_: &wiremock::Request| {
+                if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(503).insert_header("Retry-After", "0")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"usage":{"limit":100,"remaining":50}}))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+        let session = retry::ReadSession::testing(codex_quota_budget(&json!({})).unwrap());
+        assert!(
+            get_usage(
+                &http,
+                &credential,
+                &format!("{}/coding/v1/usages", server.uri()),
+                QuotaRequestContext {
+                    account_id: Uuid::from_u128(1),
+                    credential_generation: 2,
+                    endpoint_kind: "usage",
+                    trigger: QuotaReadTrigger::Bulk
+                },
+                &session
+            )
+            .await
+            .is_ok()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method.as_str() == "GET" && r.url.path() == "/coding/v1/usages")
+        );
+        assert_eq!(session.attempts().len(), 3);
     }
 
     #[test]

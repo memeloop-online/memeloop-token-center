@@ -34,6 +34,8 @@ plugin-distribution = ["dep:oci-client"]
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "multipart"] }
+# Only the delay iterator is used; the quota deadline owns Tokio sleeping.
+backon = { version = "1.6", default-features = false, features = ["std"] }
 base64 = "0.22"
 blake3 = "1"
 bytes = "1"

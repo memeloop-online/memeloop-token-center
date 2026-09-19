@@ -395,7 +395,7 @@ mod tests {
         );
         let mut long = account;
         long.config = json!({"transport_policy":{"request_timeout_millis":1260000}});
-        assert_eq!(observation_timeout_millis(10_000, &target, &long), 30_000);
+        assert_eq!(observation_timeout_millis(10_000, &target, &long), 20_000);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ pub(super) async fn read(
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
     trigger: QuotaReadTrigger,
+    session: &retry::ReadSession<'_>,
 ) -> Result<QuotaSnapshot, &'static str> {
     if !matches!(credential, UpstreamCredential::OAuth { .. }) {
         return Err("credential_invalid");
@@ -43,9 +44,10 @@ pub(super) async fn read(
         &config,
         &endpoint,
         QuotaRequestContext::for_account(account, "antigravity_quota_summary", trigger),
+        session,
     )
     .await?;
-    snapshot.windows = windows(&payload)?;
+    snapshot.windows = session.validated("antigravity_quota_summary", windows(&payload))?;
     let now = unix_millis();
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
@@ -60,26 +62,37 @@ async fn get_summary(
     config: &Config,
     endpoint: &str,
     context: QuotaRequestContext,
+    session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    let started = tokio::time::Instant::now();
-    let request = http
-        .post(endpoint)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .timeout(Duration::from_secs(6))
-        .json(&json!({"project": config.project_id}));
-    let request = credential
-        .apply(request, unix_millis())
-        .map_err(|_| "credential_invalid")?;
-    let response = config
-        .apply_headers(request)
-        .map_err(|_| "quota_destination_invalid")?
-        .send()
+    // retrieveUserQuotaSummary is a documented read RPC despite using POST;
+    // no other Antigravity POST (onboarding, token or model) enters this scope.
+    session
+        .run(context, || async {
+            let started = tokio::time::Instant::now();
+            let request = http
+                .post(endpoint)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .timeout(session.budget.read)
+                .json(&json!({"project": config.project_id}));
+            let request = credential
+                .apply(request, unix_millis())
+                .map_err(|_| retry::Failure::terminal("credential_invalid", "credential"))?;
+            let response = config
+                .apply_headers(request)
+                .map_err(|_| retry::Failure::terminal("quota_destination_invalid", "client"))?
+                .send()
+                .await
+                .map_err(retry::Failure::reqwest)?;
+            if let Some(failure) =
+                retry::Failure::status(response.status().as_u16(), response.headers())
+            {
+                return Err(failure);
+            }
+            decode_response(response, context, started)
+                .await
+                .map_err(|code| retry::Failure::terminal(code, "body"))
+        })
         .await
-        .map_err(|error| {
-            log_quota_request_error(context, "send", &error, started);
-            quota_reqwest_error_code(error.is_timeout())
-        })?;
-    decode_response(response, context, started).await
 }
 
 fn field<'a>(value: &'a Value, camel: &str, snake: &str) -> &'a Value {
@@ -332,7 +345,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_transport_is_one_read_only_post_and_sanitizes_errors() {
+    async fn summary_transport_retries_only_the_read_rpc_with_explicit_retry_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{body_json, header, method, path},
@@ -354,19 +368,28 @@ mod tests {
             (403, Some("quota_not_authorized")),
             (429, Some("quota_rate_limited")),
             (500, Some("quota_upstream_error")),
+            (503, None),
         ] {
             let server = MockServer::start().await;
             let payload = json!({"groups":[{"buckets":[{"remainingFraction":1.0}]}]});
+            let response_payload = payload.clone();
+            let count = AtomicUsize::new(0);
+            let expected_count = if status == 503 { 3 } else { 1 };
             Mock::given(method("POST"))
                 .and(path(SUMMARY_PATH))
                 .and(header("authorization", "Bearer fixture-token"))
                 .and(body_json(json!({"project":"fixture-project"})))
-                .respond_with(if status == 200 {
-                    ResponseTemplate::new(status).set_body_json(&payload)
-                } else {
-                    ResponseTemplate::new(status).set_body_string("supplier-secret")
+                .respond_with(move |_: &wiremock::Request| {
+                    let attempt = count.fetch_add(1, Ordering::SeqCst);
+                    if status == 200 || (status == 503 && attempt == 2) {
+                        ResponseTemplate::new(200).set_body_json(&response_payload)
+                    } else if status == 503 {
+                        ResponseTemplate::new(503).insert_header("Retry-After", "0")
+                    } else {
+                        ResponseTemplate::new(status).set_body_string("supplier-secret")
+                    }
                 })
-                .expect(1)
+                .expect(expected_count)
                 .mount(&server)
                 .await;
             let config = Config {
@@ -385,6 +408,7 @@ mod tests {
                     endpoint_kind: "antigravity_quota_summary",
                     trigger: QuotaReadTrigger::Manual,
                 },
+                &retry::ReadSession::testing(codex_quota_budget(&json!({})).unwrap()),
             )
             .await;
             if let Some(expected) = expected {
@@ -393,7 +417,12 @@ mod tests {
                 assert_eq!(result.unwrap(), payload);
             }
             let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), 1); // No discovery, refresh, reset, model call or retry.
+            assert_eq!(requests.len(), expected_count as usize);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() == SUMMARY_PATH)
+            );
             assert!(requests[0].headers.get("x-goog-api-client").is_none());
         }
     }

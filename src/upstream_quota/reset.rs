@@ -39,7 +39,15 @@ async fn fresh_snapshot(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable())?;
-    let budget = codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable())?;
+    let mut budget = codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable())?;
+    // Even the reset workflow's credit precheck remains a single attempt.
+    // Consumption below is a separate no-retry transport and never enters the reader.
+    budget.attempt_limit = 1;
+    let session = retry::ReadSession::new(
+        Some(state),
+        tokio::time::Instant::now() + budget.total,
+        budget,
+    );
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
@@ -66,6 +74,7 @@ async fn fresh_snapshot(
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
+            &session,
         ),
     )
     .await
@@ -469,6 +478,43 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, method, path},
     };
+
+    #[tokio::test]
+    async fn consumption_does_not_retry_retry_after_or_auth_errors() {
+        for status in [429, 503, 401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/consume"))
+                .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "0"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let credential = UpstreamCredential::OAuth {
+                access_token: "fixture-token".into(),
+                refresh_token: None,
+                expires_at: None,
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            };
+            let http = crate::build_no_retry_http_client(None, &[]).unwrap();
+            assert_eq!(
+                dispatch_once(
+                    &http,
+                    &credential,
+                    reqwest::header::HeaderValue::from_static("fixture-account"),
+                    &format!("{}/consume", server.uri()),
+                    "stable-operation-id"
+                )
+                .await
+                .unwrap_err(),
+                "reset_supplier_response_unknown"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
 
     #[tokio::test]
     async fn consumption_is_one_post_and_redirects_are_unknown_without_following() {
