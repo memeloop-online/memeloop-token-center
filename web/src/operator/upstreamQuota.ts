@@ -197,14 +197,16 @@ function normalizeQuotaAttempt(value: unknown): UpstreamQuotaAttempt | null {
   const limit = integer(attempt.limit, 1, 4);
   const elapsed = integer(attempt.elapsed_ms, 0, Number.MAX_SAFE_INTEGER);
   const retryDelay = attempt.retry_delay_ms === null ? null : attempt.retry_delay_ms === undefined ? undefined : integer(attempt.retry_delay_ms, 0, Number.MAX_SAFE_INTEGER);
-  if (!endpointKind || !failureStage || !outcome || !trigger || attemptNumber === null || limit === null || elapsed === null || retryDelay === undefined || attempt.cache_hit !== false) return null;
+  const rawErrorCode = attempt.error_code;
+  const errorCode = rawErrorCode === null || rawErrorCode === undefined ? null : normalizeQuotaErrorCode(rawErrorCode);
+  if (!endpointKind || !failureStage || !outcome || !trigger || attemptNumber === null || limit === null || elapsed === null || retryDelay === undefined || attempt.cache_hit !== false || (rawErrorCode !== null && rawErrorCode !== undefined && errorCode === null)) return null;
   return {
     endpoint_kind: endpointKind,
     attempt: attemptNumber,
     limit,
     failure_stage: failureStage,
     outcome,
-    error_code: normalizeQuotaErrorCode(attempt.error_code),
+    error_code: errorCode,
     elapsed_ms: elapsed,
     retry_delay_ms: retryDelay,
     trigger,
