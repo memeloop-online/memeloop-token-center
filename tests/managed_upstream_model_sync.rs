@@ -446,12 +446,15 @@ async fn endpoint_requires_both_scopes_and_enforces_tenant_boundaries() {
     let (state, _directory) = state().await;
     let account_a = account(&state, "tenant-a", "http://127.0.0.1:18081").await;
     let account_b = account(&state, "tenant-b", "http://127.0.0.1:18081").await;
-    for scopes in [vec!["providers:write"], vec!["routes:write"]] {
+    for (name, scopes) in [
+        ("single-scope-providers", vec!["providers:write"]),
+        ("single-scope-routes", vec!["routes:write"]),
+    ] {
         let token = state
             .db
             .create_service_token(
                 CreateServiceTokenInput {
-                    name: "single-scope".into(),
+                    name: name.into(),
                     scopes: scopes.into_iter().map(str::to_owned).collect(),
                     tenant_external_id: Some("tenant-a".into()),
                 },
