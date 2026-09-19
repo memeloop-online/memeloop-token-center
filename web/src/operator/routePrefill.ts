@@ -39,7 +39,14 @@ export function consumeRouteDraftPrefill(tenant: string): RouteDraftPrefill | un
   if (typeof prefill.tenant !== 'string' || typeof prefill.accountId !== 'string'
     || typeof prefill.upstreamModel !== 'string' || typeof prefill.publicModel !== 'string'
     || typeof prefill.protocol !== 'string' || !prefill.accountId || !prefill.upstreamModel) return undefined;
-  return prefill.tenant === tenant ? prefill as RouteDraftPrefill : undefined;
+  if (prefill.tenant !== tenant) return undefined;
+  return {
+    tenant: prefill.tenant,
+    accountId: prefill.accountId,
+    upstreamModel: prefill.upstreamModel,
+    publicModel: prefill.publicModel,
+    protocol: prefill.protocol,
+  };
 }
 
 export function storeRouteFocus(tenant: string, routeId: string): void {
