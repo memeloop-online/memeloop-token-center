@@ -1,6 +1,6 @@
 {
   "name": "@memeloop/token-center-operator-ui-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Versioned React extension contract for Memeloop Token Center Operator plugins",
   "type": "module",
   "files": ["index.js", "index.d.ts", "README.md"],
