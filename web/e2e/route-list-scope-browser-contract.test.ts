@@ -16,15 +16,11 @@ test('route list exposes group-only candidate scope and readable models without 
   try {
     const page = await browser.newPage({ hasTouch: true }); const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
-    const describedTooltip = async (trigger: Locator) => {
-      const element = await trigger.elementHandle(); assert.ok(element);
-      const description = await page.waitForFunction(element =>
-        (element.getAttribute('aria-describedby') ?? '').split(/\s+/)
-          .find(id => document.getElementById(id)?.getAttribute('role') === 'tooltip') || false,
-      element);
-      const id = await description.jsonValue(); assert.equal(typeof id, 'string');
-      const tooltip = page.locator(`[role="tooltip"][id=${JSON.stringify(id)}]`);
-      await tooltip.waitFor();
+    const describedTooltip = async (trigger: Locator, expectedText: string | RegExp) => {
+      assert.ok((await trigger.getAttribute('aria-describedby'))?.trim(), 'tooltip trigger must expose an accessible description');
+      // Fluent keeps description portals mounted while hidden; use the active, user-visible tooltip instead of its generated ID.
+      const tooltip = page.getByRole('tooltip').filter({ hasText: expectedText, visible: true });
+      await tooltip.waitFor({ state: 'visible' });
       return tooltip;
     };
     for (const locale of ['zh-CN', 'en']) {
@@ -40,7 +36,7 @@ test('route list exposes group-only candidate scope and readable models without 
       assert.match(await rows.filter({ hasText: 'Kimi direct' }).locator('.route-list-source-name').innerText(), /Kimi personal account/);
       const mixedRange = rows.filter({ hasText: 'Kimi mixed' }).getByRole('button', { name: locale === 'en' ? '1 candidate accounts' : '1 个候选账号', exact: true });
       await mixedRange.click();
-      const mixedTip = await describedTooltip(mixedRange);
+      const mixedTip = await describedTooltip(mixedRange, /团队排除组/);
       assert.match(await mixedTip.innerText(), /团队排除组/);
       assert.doesNotMatch(await mixedTip.innerText(), /Kimi team account/, 'the list must not re-expand excluded members beyond the server candidate set');
       await page.keyboard.press('Escape');
@@ -49,10 +45,10 @@ test('route list exposes group-only candidate scope and readable models without 
         await page.setViewportSize({ width, height: 900 }); await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
         await range.focus(); await range.press('Shift+Tab'); await page.keyboard.press('Tab');
         assert.equal(await range.evaluate(el => el === document.activeElement), true);
-        const tip = await describedTooltip(range);
+        const tip = await describedTooltip(range, /Kimi personal account/);
         assert.match(await tip.innerText(), /Kimi personal account/); assert.match(await tip.innerText(), /Kimi team account/);
         await page.keyboard.press('Escape'); await tip.waitFor({ state: 'hidden' });
-        await range.tap(); await describedTooltip(range);
+        await range.tap(); await describedTooltip(range, /Kimi personal account/);
         const bounds = await tip.boundingBox(); assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);
         const model = group.locator('.route-model-name').first();
         const style = await model.evaluate(el => { const cs = getComputedStyle(el); const probe = document.createElement('span'); probe.style.color = 'var(--colorNeutralForeground1)'; el.append(probe); const expected = getComputedStyle(probe).color; probe.remove(); return { color: cs.color, expected, weight: Number(cs.fontWeight), text: el.textContent }; });
