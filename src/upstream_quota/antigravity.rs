@@ -14,6 +14,7 @@ pub(super) async fn read(
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
     trigger: QuotaReadTrigger,
+    session: &retry::ReadSession<'_>,
 ) -> Result<QuotaSnapshot, &'static str> {
     if !matches!(credential, UpstreamCredential::OAuth { .. }) {
         return Err("credential_invalid");
@@ -43,9 +44,10 @@ pub(super) async fn read(
         &config,
         &endpoint,
         QuotaRequestContext::for_account(account, "antigravity_quota_summary", trigger),
+        session,
     )
     .await?;
-    snapshot.windows = windows(&payload)?;
+    snapshot.windows = session.validated("antigravity_quota_summary", windows(&payload))?;
     let now = unix_millis();
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
@@ -60,26 +62,37 @@ async fn get_summary(
     config: &Config,
     endpoint: &str,
     context: QuotaRequestContext,
+    session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    let started = tokio::time::Instant::now();
-    let request = http
-        .post(endpoint)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .timeout(Duration::from_secs(6))
-        .json(&json!({"project": config.project_id}));
-    let request = credential
-        .apply(request, unix_millis())
-        .map_err(|_| "credential_invalid")?;
-    let response = config
-        .apply_headers(request)
-        .map_err(|_| "quota_destination_invalid")?
-        .send()
+    // retrieveUserQuotaSummary is a documented read RPC despite using POST;
+    // no other Antigravity POST (onboarding, token or model) enters this scope.
+    session
+        .run(context, || async {
+            let started = tokio::time::Instant::now();
+            let request = http
+                .post(endpoint)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .timeout(session.budget.read)
+                .json(&json!({"project": config.project_id}));
+            let request = credential
+                .apply(request, unix_millis())
+                .map_err(|_| retry::Failure::terminal("credential_invalid", "credential"))?;
+            let response = config
+                .apply_headers(request)
+                .map_err(|_| retry::Failure::terminal("quota_destination_invalid", "client"))?
+                .send()
+                .await
+                .map_err(retry::Failure::reqwest)?;
+            if let Some(failure) =
+                retry::Failure::status(response.status().as_u16(), response.headers())
+            {
+                return Err(failure);
+            }
+            decode_response(response, context, started)
+                .await
+                .map_err(|code| retry::Failure::terminal(code, "body"))
+        })
         .await
-        .map_err(|error| {
-            log_quota_request_error(context, "send", &error, started);
-            quota_reqwest_error_code(error.is_timeout())
-        })?;
-    decode_response(response, context, started).await
 }
 
 fn field<'a>(value: &'a Value, camel: &str, snake: &str) -> &'a Value {
@@ -385,6 +398,7 @@ mod tests {
                     endpoint_kind: "antigravity_quota_summary",
                     trigger: QuotaReadTrigger::Manual,
                 },
+                &retry::ReadSession::testing(codex_quota_budget(&json!({})).unwrap()),
             )
             .await;
             if let Some(expected) = expected {

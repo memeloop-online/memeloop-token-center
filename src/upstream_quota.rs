@@ -5,6 +5,7 @@ mod kimi;
 mod normalize;
 pub(crate) mod observations;
 pub(crate) mod reset;
+mod retry;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -92,44 +93,59 @@ pub(crate) fn log_quota_read_completed(
 struct QuotaBudget {
     total: Duration,
     read: Duration,
-    connect_attempts: usize,
-    connect_retry_delay: Duration,
+    attempt_limit: usize,
+    retry_delay: Duration,
 }
 
 fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
+    let quota = config
+        .get("quota_read_policy")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    #[derive(Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct Policy {
+        max_attempts: usize,
+        initial_delay_millis: u64,
+        total_timeout_millis: u64,
+    }
+    impl Default for Policy {
+        fn default() -> Self {
+            Self {
+                max_attempts: 3,
+                initial_delay_millis: 200,
+                total_timeout_millis: 20_000,
+            }
+        }
+    }
+    let quota: Policy = serde_json::from_value(quota).map_err(|_| "invalid_quota_read_policy")?;
+    if !(1..=4).contains(&quota.max_attempts)
+        || !(50..=2000).contains(&quota.initial_delay_millis)
+        || !(1000..=30_000).contains(&quota.total_timeout_millis)
+    {
+        return Err("invalid_quota_read_policy");
+    }
     let value = config.get("transport_policy");
     let policy = crate::provider::CodexTransportPolicy::parse(value)?;
-    // Quota reads honor a shorter explicit account timeout and connection
-    // policy, but never inherit the generation path's 21-minute ceiling.
+    // Account quota policy is runtime-adjustable and entirely independent of
+    // inference connect_attempts. Explicit shorter transport timeouts still win.
     let explicit_total = value.is_some_and(|p| p.get("request_timeout_millis").is_some());
+    let quota_total = Duration::from_millis(quota.total_timeout_millis).min(QUOTA_MAX_READ_BUDGET);
     let total = if explicit_total {
-        Duration::from_millis(policy.request_timeout_millis).min(QUOTA_MAX_READ_BUDGET)
+        Duration::from_millis(policy.request_timeout_millis).min(quota_total)
     } else {
-        let attempts =
-            u64::try_from(policy.connect_attempts).map_err(|_| "invalid_transport_policy")?;
-        let connection_budget = policy
-            .connect_timeout_millis
-            .saturating_mul(attempts)
-            .saturating_add(
-                policy
-                    .connect_retry_delay_millis
-                    .saturating_mul(attempts.saturating_sub(1)),
-            )
-            .saturating_add(1_000);
-        Duration::from_millis(connection_budget)
-            .max(QUOTA_TIMEOUT)
-            .min(QUOTA_MAX_READ_BUDGET)
+        quota_total
     };
     let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
         Duration::from_millis(policy.read_timeout_millis).min(total)
     } else {
-        total
+        QUOTA_TIMEOUT.min(total)
     };
     Ok(QuotaBudget {
         total,
         read,
-        connect_attempts: policy.connect_attempts,
-        connect_retry_delay: Duration::from_millis(policy.connect_retry_delay_millis),
+        attempt_limit: quota.max_attempts,
+        retry_delay: Duration::from_millis(quota.initial_delay_millis),
     })
 }
 
@@ -307,6 +323,9 @@ pub(crate) struct QuotaSnapshot {
     credits: Credits,
     reset_capability: ResetCapability,
     error_code: Option<&'static str>,
+    /// Low-sensitivity per-endpoint attempt history for this read (including errors).
+    attempts: Vec<retry::Attempt>,
+    cache_hit: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -453,6 +472,8 @@ impl QuotaSnapshot {
                 },
             },
             error_code: error,
+            attempts: Vec::new(),
+            cache_hit: false,
         }
     }
 }
@@ -552,7 +573,7 @@ impl QuotaCache {
                 && now < cached.refresh_after
                 && let Some(value) = &cached.value
             {
-                return value.clone();
+                return retry::cached(value.clone(), trigger);
             }
             (cached.value.clone(), cached.refresh_generation)
         };
@@ -582,7 +603,7 @@ impl QuotaCache {
                 && (cached.refresh_generation != observed_refresh_generation
                     || (!force_refresh && unix_millis() < cached.refresh_after))
             {
-                return value.clone();
+                return retry::cached(value.clone(), trigger);
             }
         }
         let permit_deadline = total_deadline.min(tokio::time::Instant::now() + QUOTA_PERMIT_WAIT);
@@ -604,22 +625,23 @@ impl QuotaCache {
         };
         // Includes DNS/proxy setup, supplier reads and bounded body decoding.
         let refresh_started = tokio::time::Instant::now();
-        let overall_timeout = if account.driver == "openai-codex" {
-            codex_quota_budget(&account.config)
-                .map(|budget| budget.total)
-                .unwrap_or(QUOTA_TIMEOUT)
-        } else {
-            QUOTA_TIMEOUT
+        let budget = match codex_quota_budget(&account.config) {
+            Ok(budget) => budget,
+            Err(error) => return fallback(error),
         };
-        let supplier_deadline = total_deadline.min(tokio::time::Instant::now() + overall_timeout);
+        let supplier_deadline = total_deadline.min(tokio::time::Instant::now() + budget.total);
+        let session = retry::ReadSession::new(Some(state), supplier_deadline, budget);
         let result = match tokio::time::timeout_at(supplier_deadline, async {
             match account.driver.as_str() {
                 "google-antigravity" => {
-                    antigravity::read(state, account, credential, empty(None), trigger).await
+                    antigravity::read(state, account, credential, empty(None), trigger, &session)
+                        .await
                 }
-                "kimi-oauth" => kimi::read(state, account, credential, empty(None), trigger).await,
+                "kimi-oauth" => {
+                    kimi::read(state, account, credential, empty(None), trigger, &session).await
+                }
                 "cursor" => cursor::read(state, credential, empty(None)).await,
-                _ => read_codex(state, account, credential, empty(None), trigger).await,
+                _ => read_codex(state, account, credential, empty(None), trigger, &session).await,
             }
         })
         .await
@@ -670,6 +692,8 @@ impl QuotaCache {
             }
             Err(error) => fallback(error),
         };
+        value.attempts = session.attempts();
+        value.cache_hit = false;
         if value.error_code.is_some() && value.reset_capability.implementation_available {
             value.reset_capability.retryable = value.reset_capability.implementation_available;
             value.reset_capability.prepare_available =
@@ -678,10 +702,12 @@ impl QuotaCache {
         }
         let mut cached = entry.cached.lock().await;
         cached.refresh_after = unix_millis()
-            + if value.error_code.is_none() {
+            + if value.error_code.is_none() && value.reset_capability.credit_error_code.is_none() {
                 FRESH_MS
             } else {
-                10_000
+                // Coalesce current waiters via refresh_generation, but a later
+                // manual click must be able to recover from a transient failure.
+                0
             };
         cached.refresh_generation = cached.refresh_generation.saturating_add(1);
         cached.value = Some(value.clone());
@@ -732,6 +758,7 @@ async fn read_codex(
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
     trigger: QuotaReadTrigger,
+    session: &retry::ReadSession<'_>,
 ) -> Result<QuotaSnapshot, &'static str> {
     let observation_started_at = unix_millis();
     let recovery_fence = match state
@@ -816,6 +843,7 @@ async fn read_codex(
             USAGE_URL,
             QuotaRequestContext::for_account(account, "usage", trigger),
             budget,
+            session,
         ),
         get_codex_json(
             &http,
@@ -823,13 +851,20 @@ async fn read_codex(
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits", trigger),
             budget,
+            session,
         ),
     );
     let observed_at = unix_millis();
-    normalize::usage(&mut snapshot, &usage?, observed_at)?;
+    session.validated(
+        "usage",
+        normalize::usage(&mut snapshot, &usage?, observed_at),
+    )?;
     match reset {
         Ok(reset) => {
-            if let Err(error) = normalize::reset_credits(&mut snapshot, &reset, observed_at) {
+            if let Err(error) = session.validated(
+                "credits",
+                normalize::reset_credits(&mut snapshot, &reset, observed_at),
+            ) {
                 snapshot.reset_capability.credit_error_code = Some(error);
             }
         }
@@ -957,87 +992,54 @@ async fn get_codex_json(
     url: &str,
     context: QuotaRequestContext,
     budget: QuotaBudget,
+    session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    let deadline = tokio::time::Instant::now() + budget.total;
-    for attempt in 1..=budget.connect_attempts {
-        let started = tokio::time::Instant::now();
-        let mut request = http
-            .get(url)
-            .default_headers(false)
-            .header(
-                auth.credential_header.clone(),
-                auth.credential_value.clone(),
-            )
-            .header(http::header::ACCEPT, "application/json")
-            .header(http::header::ACCEPT_ENCODING, "identity")
-            .header(
-                http::header::USER_AGENT,
-                crate::oauth::managed::codex::USER_AGENT,
-            )
-            .header("chatgpt-account-id", auth.account.clone())
-            .header(
-                "originator",
-                if context.endpoint_kind == "credits" {
-                    "Codex Desktop"
-                } else {
-                    crate::oauth::managed::codex::ORIGINATOR
-                },
-            );
-        if context.endpoint_kind == "credits" {
-            request = request.header("openai-beta", "codex-1");
-        }
-        if let Some(proxy_url) = auth.proxy_url {
-            request = request
-                .proxy(wreq::Proxy::all(proxy_url).map_err(|_| "quota_destination_invalid")?);
-        }
-        let result = tokio::time::timeout_at(deadline, request.send())
-            .await
-            .map_err(|_| {
-                log_codex_quota_request_error(context, "send", true, false, started);
-                ("quota_timeout", true)
-            })
-            .and_then(|response| {
-                response.map_err(|error| {
-                    log_codex_quota_request_error(
-                        context,
-                        "send",
-                        error.is_timeout(),
-                        error.is_connect(),
-                        started,
-                    );
-                    (
-                        quota_transport_error_code(error.is_timeout()),
-                        error.is_timeout() || error.is_connect(),
-                    )
-                })
-            });
-        match result {
-            Ok(response) => {
-                return decode_codex_response(response, context, started, deadline, budget.read)
-                    .await;
-            }
-            Err((error, retryable))
-                if retryable
-                    && attempt < budget.connect_attempts
-                    && tokio::time::Instant::now() + budget.connect_retry_delay < deadline =>
-            {
-                tracing::warn!(
-                    operation = "quota_supplier_read",
-                    upstream_account_id = %context.account_id,
-                    credential_generation = context.credential_generation,
-                    endpoint_kind = context.endpoint_kind,
-                    trigger = context.trigger.as_str(),
-                    attempt,
-                    attempt_limit = budget.connect_attempts,
-                    error_code = error,
-                    "retrying a read-only quota supplier request after a connection failure"
+    let deadline = session.deadline;
+    session
+        .run(context, || async {
+            let started = tokio::time::Instant::now();
+            let mut request = http
+                .get(url)
+                .timeout(budget.read)
+                .default_headers(false)
+                .header(
+                    auth.credential_header.clone(),
+                    auth.credential_value.clone(),
+                )
+                .header(http::header::ACCEPT, "application/json")
+                .header(http::header::ACCEPT_ENCODING, "identity")
+                .header(
+                    http::header::USER_AGENT,
+                    crate::oauth::managed::codex::USER_AGENT,
+                )
+                .header("chatgpt-account-id", auth.account.clone())
+                .header(
+                    "originator",
+                    if context.endpoint_kind == "credits" {
+                        "Codex Desktop"
+                    } else {
+                        crate::oauth::managed::codex::ORIGINATOR
+                    },
                 );
-                tokio::time::sleep(budget.connect_retry_delay).await;
+            if context.endpoint_kind == "credits" {
+                request = request.header("openai-beta", "codex-1");
             }
-            Err((error, _)) => return Err(error),
-        }
-    }
-    unreachable!("bounded quota connection attempt loop always returns")
+            if let Some(proxy_url) = auth.proxy_url {
+                request = request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| {
+                    retry::Failure::terminal("quota_destination_invalid", "client")
+                })?);
+            }
+            let response = request.send().await.map_err(retry::Failure::wreq)?;
+            if let Some(failure) =
+                retry::Failure::status(response.status().as_u16(), response.headers())
+            {
+                return Err(failure);
+            }
+            decode_codex_response(response, context, started, deadline, budget.read)
+                .await
+                .map_err(|code| retry::Failure::terminal(code, "body"))
+        })
+        .await
 }
 
 async fn decode_codex_response(
@@ -1204,23 +1206,23 @@ mod tests {
     }
 
     #[test]
-    fn quota_budget_reserves_time_for_bounded_connection_retries() {
+    fn quota_budget_is_independent_from_inference_connection_retries() {
         assert_eq!(
             codex_quota_budget(&json!({})).unwrap(),
             QuotaBudget {
-                total: Duration::from_millis(11_150),
-                read: Duration::from_millis(11_150),
-                connect_attempts: 2,
-                connect_retry_delay: Duration::from_millis(150),
+                total: Duration::from_secs(20),
+                read: QUOTA_TIMEOUT,
+                attempt_limit: 3,
+                retry_delay: Duration::from_millis(200),
             }
         );
         assert_eq!(
             codex_quota_budget(&json!({"transport_policy":{"connect_attempts":4}})).unwrap(),
             QuotaBudget {
-                total: Duration::from_millis(21_450),
-                read: Duration::from_millis(21_450),
-                connect_attempts: 4,
-                connect_retry_delay: Duration::from_millis(150),
+                total: Duration::from_secs(20),
+                read: QUOTA_TIMEOUT,
+                attempt_limit: 3,
+                retry_delay: Duration::from_millis(200),
             }
         );
         assert_eq!(
@@ -1233,8 +1235,8 @@ mod tests {
             QuotaBudget {
                 total: Duration::from_secs(20),
                 read: Duration::from_secs(2),
-                connect_attempts: 2,
-                connect_retry_delay: Duration::from_millis(150),
+                attempt_limit: 3,
+                retry_delay: Duration::from_millis(200),
             }
         );
         assert_eq!(
@@ -1245,7 +1247,7 @@ mod tests {
             }}))
             .unwrap()
             .total,
-            QUOTA_MAX_READ_BUDGET
+            Duration::from_secs(20)
         );
     }
 
@@ -1306,9 +1308,15 @@ mod tests {
                 QuotaBudget {
                     total: Duration::from_secs(20),
                     read: Duration::from_secs(20),
-                    connect_attempts: 1,
-                    connect_retry_delay: Duration::ZERO,
+                    attempt_limit: 1,
+                    retry_delay: Duration::ZERO,
                 },
+                &retry::ReadSession::testing(QuotaBudget {
+                    total: Duration::from_secs(20),
+                    read: Duration::from_secs(20),
+                    attempt_limit: 1,
+                    retry_delay: Duration::ZERO,
+                }),
             )
             .await
         });
@@ -1383,8 +1391,8 @@ mod tests {
         let budget = QuotaBudget {
             total: Duration::from_secs(8),
             read: Duration::from_secs(8),
-            connect_attempts: 1,
-            connect_retry_delay: Duration::ZERO,
+            attempt_limit: 1,
+            retry_delay: Duration::ZERO,
         };
         let usage_context = QuotaRequestContext {
             account_id: Uuid::from_u128(1),
@@ -1408,6 +1416,7 @@ mod tests {
                 &format!("{}/usage", server.uri()),
                 usage_context,
                 budget,
+                &retry::ReadSession::testing(budget),
             )
             .await
             .unwrap()["plan_type"],
@@ -1425,6 +1434,7 @@ mod tests {
                 &format!("{}/credits", server.uri()),
                 credits_context,
                 budget,
+                &retry::ReadSession::testing(budget),
             )
             .await
             .unwrap_err(),

@@ -7,6 +7,20 @@ use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
 impl Database {
+    /// Read-only fence before quota attempts; never opens or refreshes a credential.
+    pub(crate) async fn quota_read_generation_current(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+    ) -> Result<bool, AppError> {
+        Ok(sqlx::query("SELECT 1 FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id=a.id AND c.generation=a.credential_generation WHERE a.id=$1 AND a.credential_generation=$2 AND a.status='active' AND c.revoked_at IS NULL")
+            .bind(account_id.to_string())
+            .bind(generation)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
     pub(crate) async fn quota_observation_targets(
         &self,
         plugins: &[String],

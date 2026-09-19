@@ -1633,6 +1633,26 @@ paths:
                 required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, freshness, plan_type, workspace, capabilities, subscription_active_until, reset_credits, windows, credits, reset_capability, error_code]
                 properties:
                   contract_version: { const: upstream_quota_v1 }
+                  cache_hit: { type: boolean, description: True when this caller reused a cached or singleflight result. Attempt diagnostics still describe the original supplier read. }
+                  attempts:
+                    type: array
+                    maxItems: 8
+                    description: Sanitized per-endpoint supplier attempts; no URLs, proxy credentials, tokens or supplier error bodies. Shared by manual and batch reads. Empty when no supplier attempt was made.
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [endpoint_kind, attempt, limit, failure_stage, outcome, error_code, elapsed_ms, retry_delay_ms, trigger, cache_hit]
+                      properties:
+                        endpoint_kind: { type: string }
+                        attempt: { type: integer, minimum: 1, maximum: 4 }
+                        limit: { type: integer, minimum: 1, maximum: 4 }
+                        failure_stage: { type: string }
+                        outcome: { type: string, enum: [success, retry, error] }
+                        error_code: { type: [string, 'null'] }
+                        elapsed_ms: { type: integer, minimum: 0 }
+                        retry_delay_ms: { type: [integer, 'null'], minimum: 0 }
+                        trigger: { type: string, enum: [manual, bulk, background_recovery, reset_workflow] }
+                        cache_hit: { const: false }
                   upstream_account_id: { type: string, format: uuid }
                   tenant_external_id: { type: string }
                   provider: { type: string }
