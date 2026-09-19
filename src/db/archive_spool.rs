@@ -84,7 +84,7 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
             body_byte_count, body_blake3
          )
          SELECT $1, $2, $3, 'gap', 0, 0, 0, 0, $4, $4, $4, $4, $4,
-                $5, $5, $6, $7
+                'capacity', $5, $6, $7
          WHERE EXISTS (
              SELECT 1 FROM request_records
              WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3

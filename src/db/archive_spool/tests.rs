@@ -366,7 +366,7 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
     .await
     .unwrap();
     assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("last_error_code"), "retention_limit");
+    assert_eq!(gap.get::<String, _>("last_error_code"), "capacity");
     assert_eq!(gap.get::<String, _>("gap_reason"), "retention_limit");
     assert_eq!(gap.get::<i64, _>("body_byte_count"), body.len() as i64);
     assert_eq!(
@@ -375,6 +375,30 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
     );
     assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
     assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    sqlx::query(
+        "UPDATE request_records
+         SET completed_at = 2, status_code = 200,
+             response_object = 'metadata-only-json:{}'
+         WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let refs = db
+        .request_archive_refs(key.key_id, request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_eq!(
+        refs.request_archive_reason.as_deref(),
+        Some("retention_limit")
+    );
+    let list = db.list_requests(key.key_id, 10).await.unwrap();
+    assert_eq!(list[0].archive_reason.as_deref(), Some("retention_limit"));
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(budget(&db).await, 0);
