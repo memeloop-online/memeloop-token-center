@@ -90,6 +90,7 @@ pub(super) fn plan_proxy_route(
         &route,
         protocol,
         request_json,
+        matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request,
         matches!(protocol, Protocol::OpenAiResponses)
             && codex_multi_agent_v2_request
             && state.providers.supports_codex_multi_agent_v2(&route.driver),

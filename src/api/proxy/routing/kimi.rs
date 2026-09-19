@@ -11,10 +11,17 @@ pub(super) fn prepare_forwarded_request(
     route: &ResolvedUpstream,
     protocol: Protocol,
     request: &Value,
+    prepare_plaintext_collaboration: bool,
     normalize_multi_agent: bool,
     responses_via_chat_dialect: Option<crate::provider::ResponsesViaChatDialect>,
 ) -> Result<(Value, Option<responses_via_chat::Context>), AppError> {
     let mut forwarded = request.clone();
+    if prepare_plaintext_collaboration {
+        crate::api::request_normalization::prepare_plaintext_collaboration_tools(
+            &mut forwarded,
+            true,
+        )?;
+    }
     if normalize_multi_agent {
         crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut forwarded, true)?;
     }
@@ -500,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn native_parent_route_preserves_collaboration_schema() {
+    fn native_parent_route_marks_collaboration_messages_plaintext_only() {
         let request = json!({
             "model": "public-model",
             "tools": [{"type":"namespace","name":"collaboration","tools":[{
@@ -518,13 +525,54 @@ mod tests {
             &route("openai-codex"),
             Protocol::OpenAiResponses,
             &request,
+            true,
             false,
             None,
         )
         .unwrap();
 
-        assert_eq!(forwarded["tools"], request["tools"]);
-        assert_eq!(forwarded["input"][0], request["input"][0]);
+        assert!(
+            forwarded["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert!(
+            forwarded["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(forwarded["tools"][0]["name"], "collaboration");
+        assert_eq!(forwarded["input"][0]["type"], "additional_tools");
+    }
+
+    #[test]
+    fn direct_and_resume_requests_bypass_collaboration_schema_rewrite() {
+        for request in [
+            json!({"model":"public-model","input":"direct request"}),
+            json!({
+                "model":"public-model",
+                "previous_response_id":"response-for-resume",
+                "input":[{"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"resume request"}
+                ]}]
+            }),
+        ] {
+            let (forwarded, _) = prepare_forwarded_request(
+                &route("openai-codex"),
+                Protocol::OpenAiResponses,
+                &request,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(forwarded["input"], request["input"]);
+            assert_eq!(
+                forwarded.get("previous_response_id"),
+                request.get("previous_response_id")
+            );
+        }
     }
 
     #[test]
@@ -543,6 +591,7 @@ mod tests {
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
+            true,
             true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         )
@@ -570,6 +619,7 @@ mod tests {
             &kimi_route(),
             Protocol::OpenAiResponses,
             &request,
+            true,
             true,
             Some(crate::provider::ResponsesViaChatDialect::KimiV1),
         ) {

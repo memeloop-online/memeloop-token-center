@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn opaque_encrypted_agent_payload_still_fails_closed() {
         let mut request = json!({"input":[{"type":"agent_message","content":[
-            {"type":"encrypted_content","encrypted_content":{"ciphertext":"opaque"}}
+            {"type":"encrypted_content","encrypted_content":"gAAAAABmFixtureFernetCiphertextThatMustRemainOpaque"}
         ]}]});
         let error =
             crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
@@ -626,7 +626,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
@@ -675,6 +675,43 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message["role"] == "tool" && message["tool_call_id"] == "followup-call"
         }));
+    }
+
+    #[test]
+    fn codex_multi_agent_v1_fixture_remains_plaintext_and_converts_to_chat() {
+        let mut request: Value =
+            serde_json::from_str(include_str!("fixtures/codex-multi-agent-v1.json"))
+                .expect("valid Codex MultiAgentV1 fixture");
+        let original = request.clone();
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut request, true)
+            .unwrap();
+
+        assert_eq!(request, original);
+        let multi_agent = &request["tools"][0];
+        assert_eq!(multi_agent["name"], "multi_agent_v1");
+        assert_eq!(
+            multi_agent["tools"][0]["parameters"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert!(!request.to_string().contains("encrypted"));
+
+        let output = convert(&request).expect("V1 fixture converts to Responses-via-Chat");
+        let names = output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        for expected in [
+            "multi_agent_v1__spawn_agent",
+            "multi_agent_v1__send_input",
+            "multi_agent_v1__resume_agent",
+            "multi_agent_v1__wait_agent",
+            "multi_agent_v1__close_agent",
+        ] {
+            assert!(names.contains(&expected));
+        }
+        assert!(!output.to_string().contains("encrypted"));
     }
 
     #[test]

@@ -1,0 +1,93 @@
+{
+  "model": "gpt-5.6-sol",
+  "stream": true,
+  "tools": [
+    {
+      "type": "namespace",
+      "name": "multi_agent_v1",
+      "description": "Tools for spawning and managing sub-agents.",
+      "tools": [
+        {
+          "type": "function",
+          "name": "spawn_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "Initial plain-text task for the new agent. Use either message or items."
+              },
+              "model": {"type": "string"},
+              "agent_type": {"type": "string"},
+              "fork_context": {"type": "boolean"},
+              "reasoning_effort": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "send_input",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {"type": "string"},
+              "message": {
+                "type": "string",
+                "description": "Legacy plain-text message to send to the agent."
+              },
+              "interrupt": {"type": "boolean"}
+            },
+            "required": ["target"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "resume_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "wait_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "targets": {"type": "array", "items": {"type": "string"}},
+              "timeout_ms": {"type": "number"}
+            },
+            "required": ["targets"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "function",
+          "name": "close_agent",
+          "parameters": {
+            "type": "object",
+            "properties": {"target": {"type": "string"}},
+            "required": ["target"],
+            "additionalProperties": false
+          },
+          "strict": false
+        }
+      ]
+    }
+  ],
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "input_text", "text": "Delegate one task."}]
+    }
+  ]
+}

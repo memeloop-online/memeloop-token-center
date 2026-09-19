@@ -206,11 +206,17 @@ async fn send_official_codex_responses_to_endpoint(
     endpoint: String,
     body: &Value,
     accept: &'static str,
+    user_agent: &'static str,
 ) -> Response {
+    let originator = user_agent
+        .split_once('/')
+        .map(|(originator, _)| originator)
+        .expect("versioned official Codex user agent");
     let request = Request::post("/v1/responses")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, accept)
-        .header(header::USER_AGENT, "codex_vscode/0.154.0")
+        .header(header::USER_AGENT, user_agent)
+        .header("originator", originator)
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap();
@@ -223,85 +229,166 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_collaboration_schema_on_the_wire() {
+async fn native_codex_responses_preserves_v1_and_marks_v2_messages_plaintext_on_the_wire() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
-    let collaboration_tools = json!([{
-        "type": "namespace",
-        "name": "collaboration",
-        "tools": [{
-            "type": "function",
-            "name": "followup_task",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "encrypted": {"type": "boolean"}
-                    }
-                }
-            }
-        }]
-    }]);
-    let request = json!({
-        "model": fixture.model,
-        "input": [{
-            "type": "additional_tools",
-            "tools": collaboration_tools
-        }],
-        "tools": collaboration_tools,
-        "stream": true
-    });
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             completed_codex_sse("native collaboration accepted").into_bytes(),
             "text/event-stream",
         ))
-        .expect(1)
+        .expect(2)
         .mount(&upstream)
         .await;
 
-    let response = send_official_codex_responses_to_endpoint(
-        &fixture,
-        upstream.uri(),
-        &request,
-        "text/event-stream",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
+    for (source, user_agent) in [
+        (
+            include_str!("../../kimi_transport/fixtures/codex-multi-agent-v1.json"),
+            "codex_vscode/0.154.0",
+        ),
+        (
+            include_str!("../../kimi_transport/fixtures/codex-multi-agent-v2.json"),
+            "codex_exec/0.154.0",
+        ),
+    ] {
+        let mut request: Value = serde_json::from_str(source).unwrap();
+        request["model"] = Value::String(fixture.model.clone());
+        request["stream"] = Value::Bool(true);
+        let response = send_official_codex_responses_to_endpoint(
+            &fixture,
+            upstream.uri(),
+            &request,
+            "text/event-stream",
+            user_agent,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+    }
 
     let requests = upstream.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let forwarded: Value = requests[0].body_json().unwrap();
-    // The native transport may append its own image-generation tool. Compare
-    // the client-owned collaboration namespace instead of rejecting that
-    // reviewed transport addition.
-    let expected_collaboration = request["tools"]
+    assert_eq!(requests.len(), 2);
+    let forwarded_v1: Value = requests[0].body_json().unwrap();
+    let expected_v1: Value = serde_json::from_str(include_str!(
+        "../../kimi_transport/fixtures/codex-multi-agent-v1.json"
+    ))
+    .unwrap();
+    let v1_namespace = forwarded_v1["tools"]
         .as_array()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
-        })
-        .expect("fixture contains collaboration namespace");
-    let forwarded_collaboration = forwarded["tools"]
-        .as_array()
-        .and_then(|tools| {
-            tools
-                .iter()
-                .find(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
-        })
-        .expect("native wire preserves collaboration namespace");
-    assert_eq!(forwarded_collaboration, expected_collaboration);
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "multi_agent_v1"))
+        .expect("native wire preserves the real V1 namespace");
+    assert_eq!(v1_namespace, &expected_v1["tools"][0]);
+    assert!(!v1_namespace.to_string().contains("encrypted"));
+
+    let forwarded: Value = requests[1].body_json().unwrap();
     assert_eq!(
-        forwarded_collaboration["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
-        json!({"type": "boolean"})
+        requests[1].headers["originator"].to_str().unwrap(),
+        "codex_exec"
     );
-    assert_eq!(forwarded["input"][0], request["input"][0]);
+    assert_eq!(
+        requests[1].headers[header::USER_AGENT].to_str().unwrap(),
+        "codex_exec/0.154.0"
+    );
+    {
+        let namespaces = forwarded["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                forwarded["input"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "additional_tools")
+                    .flat_map(|item| item["tools"].as_array().into_iter().flatten()),
+            )
+            .filter(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
+            .collect::<Vec<_>>();
+        assert!(!namespaces.is_empty());
+        for namespace in namespaces {
+            assert_eq!(namespace["name"], "collaboration");
+            for tool in namespace["tools"].as_array().unwrap() {
+                let message = tool.pointer("/parameters/properties/message");
+                if matches!(
+                    tool["name"].as_str(),
+                    Some("spawn_agent" | "send_message" | "followup_task")
+                ) {
+                    assert!(message.is_some_and(|message| message.get("encrypted").is_none()));
+                } else if let Some(message) = message {
+                    assert!(message.get("encrypted").is_some());
+                }
+            }
+        }
+    }
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_exec_direct_and_resume_requests_reach_native_upstream_unchanged() {
+    let upstream = MockServer::start().await;
+    let fixture = codex_route_fixture("native-codex-exec-direct-resume").await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("ordinary request accepted").into_bytes(),
+            "text/event-stream",
+        ))
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let requests = [
+        json!({
+            "model": fixture.model,
+            "input": [{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"direct request"}
+            ]}],
+            "stream": true
+        }),
+        json!({
+            "model": fixture.model,
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"first turn"}
+                ]},
+                {"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"first answer"}
+                ]},
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"resume request"}
+                ]}
+            ],
+            "stream": true
+        }),
+    ];
+    for request in &requests {
+        let response = send_official_codex_responses_to_endpoint(
+            &fixture,
+            upstream.uri(),
+            request,
+            "text/event-stream",
+            "codex_exec/0.154.0",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+    }
+
+    let forwarded = upstream.received_requests().await.unwrap();
+    assert_eq!(forwarded.len(), requests.len());
+    for (forwarded, original) in forwarded.iter().zip(requests.iter()) {
+        let body: Value = forwarded.body_json().unwrap();
+        assert_eq!(body["input"], original["input"]);
+        assert_eq!(
+            forwarded.headers["originator"].to_str().unwrap(),
+            "codex_exec"
+        );
+    }
     upstream.verify().await;
 }
 
@@ -383,7 +470,11 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
             "tools": [
                 {"type":"web_search"},
                 {"type":"namespace","name":"collaboration","tools":[
-                    {"type":"function","name":"followup_task","parameters":{"type":"object"}}
+                    {"type":"function","name":"followup_task","parameters":{
+                        "type":"object","properties":{
+                            "message":{"type":"string","encrypted":{"type":"boolean"}}
+                        }
+                    }}
                 ]}
             ],
             "stream": false
@@ -453,7 +544,11 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                 {"type":"additional_tools","tools":[
                     {"type":"web_search"},
                     {"type":"namespace","name":"collaboration","tools":[
-                        {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+                        {"type":"function","name":"spawn_agent","parameters":{
+                            "type":"object","properties":{
+                                "message":{"type":"string","encrypted":{"type":"boolean"}}
+                            }
+                        }}
                     ]}
                 ]},
                 {"type":"compaction","encrypted_content":{"ciphertext":"host-state"}},
@@ -496,6 +591,18 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                     .is_some_and(|name| name.starts_with("collaboration__"))
             })
         }));
+        for tool in body["tools"].as_array().into_iter().flatten() {
+            if tool
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.starts_with("collaboration__"))
+            {
+                let message = tool
+                    .pointer("/function/parameters/properties/message")
+                    .expect("collaboration tool keeps its message schema");
+                assert!(message.get("encrypted").is_none());
+            }
+        }
     }
 }
 

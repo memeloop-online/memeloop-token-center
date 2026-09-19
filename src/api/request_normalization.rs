@@ -5,8 +5,8 @@ use crate::error::AppError;
 
 const COLLABORATION_TOOL_NAMES: &[&str] = &["spawn_agent", "send_message", "followup_task"];
 
-/// CPA applies MultiAgentV2 compatibility only to the official Codex client
-/// envelope.  Keep that boundary strict so a normal Responses caller cannot
+/// MultiAgent compatibility applies only to the official Codex client
+/// envelope. Keep that boundary strict so a normal Responses caller cannot
 /// accidentally trigger the agent-message downgrade on a third-party route.
 pub(super) fn is_official_codex_user_agent(headers: &HeaderMap) -> bool {
     let mut values = headers.get_all(header::USER_AGENT).iter();
@@ -73,7 +73,7 @@ pub(super) fn normalize_codex_multi_agent_v2(
         return Ok(());
     }
 
-    prepare_codex_multi_agent_v2_tools(request, true)?;
+    prepare_plaintext_collaboration_tools(request, true)?;
     if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
         let mut normalized = Vec::with_capacity(input.len());
         let mut last_opaque_agent = None;
@@ -103,10 +103,11 @@ pub(super) fn normalize_codex_multi_agent_v2(
     Ok(())
 }
 
-/// Remove the encrypted collaboration message marker that third-party
-/// compatibility adapters cannot read. Native Codex requests must bypass this
-/// conversion entirely and retain their original collaboration schema.
-pub(super) fn prepare_codex_multi_agent_v2_tools(
+/// Ask the parent model to emit readable collaboration task arguments. The
+/// rewrite is intentionally limited to message-bearing functions inside the
+/// collaboration namespace. Other tool schemas and opaque child messages are
+/// left intact.
+pub(super) fn prepare_plaintext_collaboration_tools(
     request: &mut Value,
     enabled: bool,
 ) -> Result<(), AppError> {
@@ -115,29 +116,38 @@ pub(super) fn prepare_codex_multi_agent_v2_tools(
     }
 
     if let Some(tools) = request.get_mut("tools") {
-        rewrite_tool_list(tools);
+        rewrite_tool_list(tools, false);
     }
     if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
         for item in input {
             if let Some("additional_tools") = item.get("type").and_then(Value::as_str)
                 && let Some(tools) = item.get_mut("tools")
             {
-                rewrite_tool_list(tools);
+                rewrite_tool_list(tools, false);
             }
         }
     }
     Ok(())
 }
 
-fn rewrite_tool_list(value: &mut Value) {
+fn rewrite_tool_list(value: &mut Value, in_collaboration_namespace: bool) {
     let Some(tools) = value.as_array_mut() else {
         return;
     };
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            let nested_is_collaboration =
+                tool.get("name").and_then(Value::as_str) == Some("collaboration");
             if let Some(nested) = tool.get_mut("tools") {
-                rewrite_tool_list(nested);
+                rewrite_tool_list(
+                    nested,
+                    in_collaboration_namespace || nested_is_collaboration,
+                );
             }
+            continue;
+        }
+
+        if !in_collaboration_namespace {
             continue;
         }
 
@@ -296,6 +306,7 @@ mod tests {
             "Codex Work/0.154.0 (Linux; x86_64)",
             "Codex Work/0.154.0-dev",
             "codex-tui/0.1.0",
+            "codex_exec/0.154.0",
             "codex_vscode/0.154.0",
             "codex_atlas/0.154.0",
             "codex_chatgpt_desktop/0.154.0",
@@ -317,6 +328,8 @@ mod tests {
             "codex-chrome-extension-sidepanel",
             "codex-chrome-extension-sidepanel/not-a-version",
             "codex_vscode/1junk",
+            "codex_exec",
+            "codex_exec/not-a-version",
             "codex_cli_rs-other",
             "codex_vscode",
             "codex_vscode-not-versioned",
@@ -359,9 +372,11 @@ mod tests {
     #[test]
     fn disabled_normalization_leaves_native_shape_untouched() {
         let mut request = json!({
-            "tools": [{"type":"function","name":"spawn_agent","parameters":{
-                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
-            }}],
+            "tools": [{"type":"namespace","name":"collaboration","tools":[{
+                "type":"function","name":"spawn_agent","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
+                }
+            }]}],
             "input": [{"type":"agent_message","role":"system","content":[
                 {"type":"encrypted_content","encrypted_content":"opaque"}
             ]}]
@@ -375,9 +390,16 @@ mod tests {
     fn collaboration_schema_rewrite_covers_nested_and_additional_tools_only() {
         let mut request = json!({
             "tools": [
-                {"type":"function","name":"spawn_agent","x-meta":"keep","parameters":{
-                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"keep"},"other":{"type":"string"}}
-                }},
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"namespace","name":"nested","tools":[
+                        {"type":"function","name":"spawn_agent","x-meta":"keep","parameters":{
+                            "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"keep"},"other":{"type":"string"}}
+                        }}
+                    ]},
+                    {"type":"function","name":"send_message","parameters":{
+                        "type":"object","properties":{"message":{"type":"string","encrypted":true}}
+                    }}
+                ]},
                 {"type":"function","name":"unrelated","parameters":{
                     "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
                 }},
@@ -388,30 +410,38 @@ mod tests {
                 ]}
             ],
             "input": [{"type":"additional_tools","tools":[
-                {"type":"function","name":"followup_task","parameters":{
-                    "type":"object","properties":{"message":{"type":"string","encrypted":false}}
-                }}
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"namespace","name":"nested","tools":[
+                        {"type":"function","name":"followup_task","parameters":{
+                            "type":"object","properties":{"message":{"type":"string","encrypted":false}}
+                        }}
+                    ]}
+                ]}
             ]}]
         });
         normalize_codex_multi_agent_v2(&mut request, true).unwrap();
 
         assert!(
-            request["tools"][0]["parameters"]["properties"]["message"]
+            request["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
-        assert_eq!(request["tools"][0]["x-meta"], "keep");
+        assert_eq!(request["tools"][0]["tools"][0]["name"], "nested");
         assert_eq!(
-            request["tools"][0]["parameters"]["properties"]["message"]["description"],
+            request["tools"][0]["tools"][0]["tools"][0]["x-meta"],
+            "keep"
+        );
+        assert_eq!(
+            request["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
             "keep"
         );
         assert!(
-            request["tools"][2]["tools"][0]["parameters"]["properties"]["message"]
+            request["tools"][0]["tools"][1]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
         assert!(
-            request["input"][0]["tools"][0]["parameters"]["properties"]["message"]
+            request["input"][0]["tools"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
@@ -420,27 +450,40 @@ mod tests {
                 .get("encrypted")
                 .is_some()
         );
+        assert!(
+            request["tools"][2]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
+        );
     }
 
     #[test]
     fn parent_carrier_preparation_strips_schema_without_downgrading_agent_message() {
         let mut request = json!({
-            "tools": [{"type":"function","name":"spawn_agent","parameters":{
-                "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"}}}
-            }}],
+            "tools": [{"type":"namespace","name":"collaboration","x-namespace":"keep","tools":[
+                {"type":"function","name":"spawn_agent","description":"keep","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":{"type":"boolean"},"description":"task"}}
+                }}
+            ]}],
             "input": [{"type":"agent_message","role":"system",
                 "internal_chat_message_metadata_passthrough":{"turn_id":"keep-for-native"},
                 "content":[{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]
             }]
         });
+        let original_input = request["input"].clone();
 
-        prepare_codex_multi_agent_v2_tools(&mut request, true).unwrap();
+        prepare_plaintext_collaboration_tools(&mut request, true).unwrap();
 
-        assert!(
-            request["tools"][0]["parameters"]["properties"]["message"]
-                .get("encrypted")
-                .is_none()
-        );
+        let message = request
+            .pointer("/tools/0/tools/0/parameters/properties/message")
+            .expect("collaboration spawn_agent message schema exists");
+        assert_eq!(message["type"], "string");
+        assert_eq!(message["description"], "task");
+        assert!(message.get("encrypted").is_none());
+        assert_eq!(request["tools"][0]["name"], "collaboration");
+        assert_eq!(request["tools"][0]["x-namespace"], "keep");
+        assert_eq!(request["tools"][0]["tools"][0]["description"], "keep");
+        assert_eq!(request["input"], original_input);
         assert_eq!(request["input"][0]["type"], "agent_message");
         assert_eq!(request["input"][0]["role"], "system");
         assert_eq!(

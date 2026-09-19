@@ -46,6 +46,7 @@ const MAX_CODEX_ORIGINATOR_BYTES: usize = 128;
 const MAX_CODEX_USER_AGENT_BYTES: usize = 512;
 const EXACT_CODEX_ORIGINATORS: &[&str] = &[
     "codex_cli_rs",
+    "codex_exec",
     "codex-tui",
     "codex_vscode",
     "codex_atlas",
@@ -194,6 +195,7 @@ fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
     }
     let expected_prefix = match originator {
         "codex_cli_rs" => "codex_cli_rs/",
+        "codex_exec" => "codex_exec/",
         "codex-tui" => "codex-tui/",
         "codex_vscode" => "codex_vscode/",
         "codex_atlas" => "codex_atlas/",
@@ -2088,15 +2090,17 @@ mod tests {
 
     #[test]
     fn current_codex_cli_identity_passes_through() {
-        let identity = select_codex_client_identity(
-            Some("codex_cli_rs"),
-            Some("codex_cli_rs/0.150.0 (Linux 6.8.0; x86_64) terminal/0.1"),
-        );
-        assert_eq!(identity.originator, "codex_cli_rs");
-        assert_eq!(
-            identity.user_agent,
-            "codex_cli_rs/0.150.0 (Linux 6.8.0; x86_64) terminal/0.1"
-        );
+        for (originator, user_agent) in [
+            (
+                "codex_cli_rs",
+                "codex_cli_rs/0.150.0 (Linux 6.8.0; x86_64) terminal/0.1",
+            ),
+            ("codex_exec", "codex_exec/0.154.0 (Linux; x86_64)"),
+        ] {
+            let identity = select_codex_client_identity(Some(originator), Some(user_agent));
+            assert_eq!(identity.originator, originator);
+            assert_eq!(identity.user_agent, user_agent);
+        }
     }
 
     #[test]
