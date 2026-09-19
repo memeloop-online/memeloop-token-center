@@ -304,7 +304,8 @@ impl Database {
         expected_updated_at: i64,
     ) -> Result<ModelRouteView, AppError> {
         let mut tx = self.begin_write_transaction().await?;
-        let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id = $1")
+        let tenant_id: String = sqlx::query_scalar("SELECT route.tenant_id FROM model_routes route JOIN tenants tenant ON tenant.id = route.tenant_id WHERE route.id = $1 AND tenant.external_id = $2 AND route.archived_at IS NULL")
+            .bind(route_id.to_string())
             .bind(tenant_external_id)
             .fetch_optional(&mut *tx)
             .await?
@@ -447,6 +448,10 @@ impl Database {
         .into_iter()
         .map(|row| parse_uuid(row.try_get("id")?))
         .collect::<Result<Vec<_>, _>>()?;
+        // Keep the managed identity as a tombstone while the composite foreign
+        // key continues to reject every cross-tenant ownership edge.
+        sqlx::query("UPDATE managed_model_routes SET model_route_id = NULL, operator_override = 1 WHERE tenant_id = $1 AND model_route_id = $2")
+            .bind(&tenant_id).bind(route_id.to_string()).execute(&mut *tx).await?;
         let changed = sqlx::query(
             "DELETE FROM model_routes WHERE id = $1 AND tenant_id = $2 AND enabled = 0 AND updated_at = $3",
         )

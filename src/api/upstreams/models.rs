@@ -256,7 +256,9 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
     Query(query): Query<SyncUpstreamModelsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
-    require_service(&headers, &state, "routes:write").await?;
+    if !service.allows("routes:write") {
+        return Err(AppError::Forbidden);
+    }
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
     let state = state.pin_application_plugins().await?;
     let (account, credential) = state

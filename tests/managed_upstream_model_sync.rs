@@ -13,6 +13,7 @@ use memeloop_token_center::{
     provider::UpstreamCredential,
 };
 use serde_json::{Value, json};
+use sqlx::Connection;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{
@@ -394,6 +395,35 @@ async fn exercise_concurrency(state: &AppState, tenant: &str) {
         .unwrap();
     assert_eq!(result.disabled, 0);
     assert_eq!(result.warnings, vec!["catalog_changed"]);
+    assert_ownership_tenant_boundary(state, account).await;
+}
+
+async fn assert_ownership_tenant_boundary(state: &AppState, owner_id: Uuid) {
+    let other_tenant = format!("managed-foreign-{}", Uuid::now_v7());
+    let other_account = account(state, &other_tenant, "http://127.0.0.1:18081").await;
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: other_tenant,
+            public_model: "foreign".into(),
+            upstream_account_id: other_account,
+            upstream_model: "foreign".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let mut observer = sqlx::AnyConnection::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    // A cross-tenant ownership edge is rejected by the schema itself, not only
+    // by HTTP authorization or by the reconciliation service's predicates.
+    let attempted = sqlx::query("INSERT INTO managed_model_routes (tenant_id, upstream_account_id, upstream_model, protocol, model_route_id, managed_updated_at) SELECT tenant_id, id, 'foreign', 'openai', $1, 1 FROM upstream_accounts WHERE id = $2")
+        .bind(route.id.to_string()).bind(owner_id.to_string()).execute(&mut observer).await;
+    assert!(
+        attempted.is_err(),
+        "managed ownership must enforce its composite tenant FK"
+    );
 }
 
 #[tokio::test]
