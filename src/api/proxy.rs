@@ -1082,6 +1082,11 @@ async fn proxy_with_identity_and_conversation_spool(
             .await
         {
             Ok(permit) => Some(permit),
+            Err(crate::codex_clients::DispatchError::InvalidPolicy) => {
+                return Err(AppError::BadRequest(
+                    "invalid Codex transport policy".into(),
+                ));
+            }
             Err(error) => return Ok(error.response()),
         }
     } else {
@@ -1376,13 +1381,12 @@ async fn proxy_with_identity_and_conversation_spool(
                         upstream_attempt
                             .complete(UpstreamAttemptTerminal::Inconclusive)
                             .await;
-                        let mut response =
-                            finish_unavailable(&buffered_request, error.code(), last_dispatch)
-                                .await?;
-                        response
-                            .headers_mut()
-                            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                        return Ok(response);
+                        return lifecycle::finish_dispatch_failure(
+                            &buffered_request,
+                            error,
+                            last_dispatch,
+                        )
+                        .await;
                     }
                 }
             }

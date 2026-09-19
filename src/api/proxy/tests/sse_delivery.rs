@@ -2,7 +2,7 @@ use super::*;
 
 mod incomplete_usage;
 
-async fn gated_sse_upstream(
+pub(super) async fn gated_sse_upstream(
     body: Vec<u8>,
 ) -> (
     String,

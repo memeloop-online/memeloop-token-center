@@ -59,15 +59,24 @@ impl DispatchError {
 
     pub(crate) fn response(self) -> axum::response::Response {
         use axum::response::IntoResponse;
+        if self == Self::InvalidPolicy {
+            return crate::error::AppError::BadRequest("invalid Codex transport policy".into())
+                .into_response();
+        }
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "1")],
-            axum::Json(serde_json::json!({"error": {
-                "type": "service_overloaded", "code": self.code(),
-                "message": "Codex dispatch capacity is temporarily unavailable"
-            }})),
+            axum::Json(self.overload_body()),
         )
             .into_response()
+    }
+
+    pub(crate) fn overload_body(self) -> serde_json::Value {
+        debug_assert!(self != Self::InvalidPolicy);
+        serde_json::json!({"error": {
+            "type": "service_overloaded", "code": self.code(),
+            "message": "Codex dispatch capacity is temporarily unavailable"
+        }})
     }
 }
 
