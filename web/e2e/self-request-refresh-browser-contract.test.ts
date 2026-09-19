@@ -59,7 +59,7 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
 
     const cadence = page.getByRole('slider', { name: 'Refresh cadence', exact: true });
     const waitForCadenceText = async (expected: string) => {
-      await page.waitForFunction(({ expected }) => document.querySelector<HTMLElement>('[role="slider"][aria-label="Refresh cadence"]')?.getAttribute('aria-valuetext') === expected, { expected });
+      await page.waitForFunction(({ expected }) => document.querySelector<HTMLInputElement>('input[type="range"][aria-label="Refresh cadence"]')?.getAttribute('aria-valuetext') === expected, { expected });
       assert.equal(await cadence.getAttribute('aria-valuetext'), expected);
     };
     assert.equal(await cadence.inputValue(), '1', 'the default cadence is five seconds');
