@@ -13,6 +13,8 @@ pub(super) struct Attempt {
     outcome: &'static str,
     error_code: Option<&'static str>,
     elapsed_ms: u64,
+    #[serde(skip)]
+    started_at: tokio::time::Instant,
     retry_delay_ms: Option<u64>,
     trigger: &'static str,
     cache_hit: bool,
@@ -159,6 +161,7 @@ impl<'a> ReadSession<'a> {
                     entry.outcome = "error";
                     entry.failure_stage = "deadline";
                     entry.error_code = Some("quota_timeout");
+                    entry.elapsed_ms = entry.started_at.elapsed().as_millis() as u64;
                 }
                 entry
             })
@@ -215,6 +218,7 @@ impl<'a> ReadSession<'a> {
             outcome,
             error_code: failure.map(|f| f.code),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            started_at: started,
             retry_delay_ms: delay.map(|d| d.as_millis() as u64),
             trigger: context.trigger.as_str(),
             cache_hit: false,
@@ -482,7 +486,7 @@ mod tests {
         let session = ReadSession::testing(policy());
         assert_eq!(
             session
-                .run(context(), || std::future::pending::<Result<(), Failure>>())
+                .run(context(), std::future::pending::<Result<(), Failure>>)
                 .await
                 .unwrap_err(),
             "quota_timeout"
