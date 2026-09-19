@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Memeloop Token Center API
-  version: 0.1.1
+  version: 0.1.2
   summary: Multi-protocol AI gateway, credential, quota, and archive API
   description: |
     Contract for the API surface implemented under `src/api/`.
