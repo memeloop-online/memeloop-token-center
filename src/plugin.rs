@@ -2422,7 +2422,7 @@ fn validate_provider_contribution(
     plugin_id: &str,
     provider: &ProviderType,
 ) -> Result<(), AppError> {
-    const PROTOCOLS: &[&str] = &["openai", "anthropic", "generation"];
+    const PROTOCOLS: &[&str] = &["openai", "anthropic", "openai-audio", "generation"];
     const MODALITIES: &[&str] = &["text", "embedding", "image", "video", "audio"];
     if provider.id.is_empty()
         || provider.id.len() > MAX_PLUGIN_ID_BYTES
@@ -2497,6 +2497,27 @@ fn validate_provider_contribution(
     {
         return Err(AppError::BadRequest(format!(
             "plugin {plugin_id} provider {} declares a Responses-via-Chat dialect without responses_via_chat_v1",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_transport_configurable
+        && (!provider.request_compatibility.third_party
+            || !provider.request_compatibility.responses_via_chat_v1)
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare third_party Responses-via-Chat compatibility before account-selectable transport",
+            provider.id
+        )));
+    }
+    if provider
+        .request_compatibility
+        .responses_transport_configurable
+        && !config_schema_declares_responses_transport(&provider.config_schema)
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} must declare the closed responses_transport configuration",
             provider.id
         )));
     }
@@ -2580,6 +2601,25 @@ fn validate_provider_contribution(
         )));
     }
     Ok(())
+}
+
+fn config_schema_declares_responses_transport(schema: &Value) -> bool {
+    schema
+        .pointer("/properties/responses_transport/type")
+        .and_then(Value::as_str)
+        == Some("string")
+        && schema
+            .pointer("/properties/responses_transport/enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.len() == 2
+                    && values
+                        .iter()
+                        .any(|value| value.as_str() == Some("native_responses"))
+                    && values
+                        .iter()
+                        .any(|value| value.as_str() == Some("chat_completions"))
+            })
 }
 
 fn safe_child(root: &Path, child: &str) -> Result<PathBuf, AppError> {
@@ -2668,6 +2708,31 @@ fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configurable_responses_transport_requires_a_closed_provider_schema() {
+        let mut provider = crate::provider::ProviderCatalog::builtins()
+            .get("http-json")
+            .expect("built-in configurable provider")
+            .clone();
+        provider.id = "plugin-openai-compatible".into();
+        assert!(validate_provider_contribution("provider-plugin", &provider).is_ok());
+
+        provider.config_schema["properties"]
+            .as_object_mut()
+            .expect("object properties")
+            .remove("responses_transport");
+        assert!(validate_provider_contribution("provider-plugin", &provider).is_err());
+
+        let mut provider = crate::provider::ProviderCatalog::builtins()
+            .get("http-json")
+            .expect("built-in configurable provider")
+            .clone();
+        provider.id = "plugin-openai-compatible".into();
+        provider.config_schema["properties"]["responses_transport"]["enum"] =
+            serde_json::json!(["native_responses", "chat_completions", "automatic"]);
+        assert!(validate_provider_contribution("provider-plugin", &provider).is_err());
+    }
 
     #[test]
     fn operator_ui_module_entries_preserve_exact_safe_segments() {

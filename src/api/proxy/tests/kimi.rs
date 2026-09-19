@@ -426,6 +426,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         third_party: true,
         responses_via_chat_v1: true,
         responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1),
+        responses_transport_configurable: false,
         codex_multi_agent_v2: true,
     };
     let mut strict_chat_capabilities = kimi_capabilities;
@@ -551,7 +552,6 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                         }}
                     ]}
                 ]},
-                {"type":"compaction","encrypted_content":{"ciphertext":"host-state"}},
                 {"type":"reasoning","summary":[],
                     "encrypted_content":{"ciphertext":"host-state"}},
                 {"type":"agent_message","author":"/root","recipient":"/worker",

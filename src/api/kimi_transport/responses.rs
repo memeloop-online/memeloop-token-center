@@ -86,7 +86,8 @@ impl Context {
 
     fn validate_custom_call(&self, call: &Value) -> Result<(), &'static str> {
         let name = call["function"]["name"].as_str().unwrap_or("");
-        if self.tools.get(name).is_some_and(|tool| tool.custom) {
+        let identity = self.tools.get(name).ok_or("tool_name_unknown")?;
+        if identity.custom {
             let args = call["function"]["arguments"].as_str().unwrap_or("");
             let parsed = crate::api::sse::parse_unique_json(args.as_bytes())
                 .map_err(|_| "tool_arguments_invalid")?;
@@ -781,6 +782,35 @@ mod tests {
     }
 
     #[test]
+    fn buffered_rejects_unknown_tool_wire_name_after_collision_mapping() {
+        let context = Context::new(&json!({
+            "model":"generic",
+            "tools":[
+                {"type":"namespace","name":"team/alpha","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}}
+                ]},
+                {"type":"namespace","name":"team?alpha","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}}
+                ]}
+            ]
+        }));
+        assert_eq!(context.tools.len(), 2);
+        let unknown = format!("{}_unknown", context.tools.keys().next().unwrap());
+        assert_eq!(
+            buffered(
+                &context,
+                &json!({
+                    "choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[
+                        {"id":"call","function":{"name":unknown,"arguments":"{}"}}
+                    ]}}],
+                    "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+                })
+            ),
+            Err("tool_name_unknown")
+        );
+    }
+
+    #[test]
     fn stream_delivers_deltas_but_cannot_complete_without_usage() {
         let mut stream = Stream::new(Context::for_kimi(&json!({"model":"kimi-k3"})));
         let events = stream
@@ -854,5 +884,42 @@ mod tests {
         assert!(wire.matches("\"encrypted_function_args\":[]").count() >= 2);
         assert!(wire.contains("spawn agent"));
         assert!(wire.contains("follow"));
+    }
+
+    #[test]
+    fn stream_rejects_unknown_tool_wire_name_before_completion() {
+        let context = Context::new(&json!({
+            "model":"generic",
+            "tools":[
+                {"type":"namespace","name":"team/alpha","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}}
+                ]},
+                {"type":"namespace","name":"team?alpha","tools":[
+                    {"type":"function","name":"lookup","parameters":{"type":"object"}}
+                ]}
+            ]
+        }));
+        assert_eq!(context.tools.len(), 2);
+        let unknown = format!("{}_unknown", context.tools.keys().next().unwrap());
+        let mut stream = Stream::new(context);
+        stream
+            .observe(&json!({
+                "choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index":0,"id":"call","function":{"name":unknown,"arguments":"{}"}
+                }]},"finish_reason":null}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+            }))
+            .unwrap();
+        stream
+            .observe(&json!({
+                "choices":[],
+                "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+            }))
+            .unwrap();
+        assert_eq!(stream.finish(), Err("tool_name_unknown"));
     }
 }
