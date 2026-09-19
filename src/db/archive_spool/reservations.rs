@@ -117,8 +117,7 @@ impl Database {
         // until this transaction commits or rolls back the provisional charge.
         let (statement, purpose_limit) = match archive.purpose() {
             BufferedArchivePurpose::Request => (
-                "UPDATE response_archive_spool_budget
-                 SET cipher_bytes = cipher_bytes + $1,
+                "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1,
                      request_cipher_bytes = request_cipher_bytes + $1
                  WHERE singleton = 1
                    AND cipher_bytes <= $2
@@ -126,8 +125,7 @@ impl Database {
                 REQUEST_CIPHER_LIMIT,
             ),
             BufferedArchivePurpose::Response => (
-                "UPDATE response_archive_spool_budget
-                 SET cipher_bytes = cipher_bytes + $1
+                "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
                  WHERE singleton = 1
                    AND cipher_bytes <= $2
                    AND cipher_bytes - request_cipher_bytes <= $3",

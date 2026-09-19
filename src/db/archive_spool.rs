@@ -450,8 +450,7 @@ impl Database {
         }
         hold.phase("budget_and_slot_admission");
         let budget = sqlx::query(
-            "UPDATE response_archive_spool_budget
-             SET cipher_bytes = cipher_bytes + $1
+            "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
              WHERE singleton = 1
                AND cipher_bytes <= $2
                AND cipher_bytes - request_cipher_bytes <= $3",
@@ -677,8 +676,7 @@ impl Database {
             .bind(batch_count).bind(byte_count).bind(cipher_bytes).bind(now).bind(now + CAPTURE_TTL).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         hold.phase("budget_update");
         let budget = sqlx::query(
-            "UPDATE response_archive_spool_budget
-             SET cipher_bytes = cipher_bytes + $1
+            "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
              WHERE singleton = 1
                AND cipher_bytes <= $2
                AND cipher_bytes - request_cipher_bytes <= $3",
