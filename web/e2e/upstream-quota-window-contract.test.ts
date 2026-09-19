@@ -138,6 +138,10 @@ test('quota refresh diagnostics stay separate from the effective observation and
       { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
       { endpoint_kind: 'credits', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'https://secret.invalid/proxy', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
       { endpoint_kind: 'https://user:password@proxy.invalid', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'proxy.internal:1080', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'socks5h', attempt: 1, limit: 3, failure_stage: 'error', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'proxy_password', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
+      { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'proxy_password', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false },
     ],
     cache_hit: false,
   };
@@ -146,5 +150,6 @@ test('quota refresh diagnostics stay separate from the effective observation and
   assert.equal(diagnostic.cache_hit, false);
   assert.equal(diagnostic.attempts.length, 1, 'unsafe endpoint and error fields are dropped');
   assert.deepEqual(diagnostic.attempts[0], { endpoint_kind: 'usage', attempt: 1, limit: 3, failure_stage: 'body', outcome: 'error', error_code: 'quota_timeout', elapsed_ms: 8000, retry_delay_ms: 200, trigger: 'manual', cache_hit: false });
+  assert.equal(quotaRefreshDiagnostic({ ...failed, error_code: 'proxy.internal:1080' }).error_code, null, 'unknown top-level codes are discarded');
   assert.equal(quotaEffectiveSnapshot(observed, failed), observed, 'the failed read keeps the last effective observation');
 });

@@ -30,7 +30,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { s
       {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
     </div>
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
-    {(snapshot.status !== 'unsupported' || refreshError || refreshDiagnostic.error_code) && readFailed && <div className="notice error" role="alert" data-quota-error-code={refreshDiagnostic.error_code ?? snapshot.error_code ?? undefined} data-quota-cache-hit={String(refreshDiagnostic.cache_hit)} data-quota-attempt-count={refreshDiagnostic.attempts.length}>
+    {(snapshot.status !== 'unsupported' || refreshError || refreshDiagnostic.error_code) && readFailed && <div className="notice error" role="alert" data-quota-error-code={refreshDiagnostic.error_code ?? undefined} data-quota-cache-hit={String(refreshDiagnostic.cache_hit)} data-quota-attempt-count={refreshDiagnostic.attempts.length}>
       <p>{t(errorMessage)}</p>
       <p>{snapshot.observed_at === null ? t('quota.refreshFailedNoObservation') : t('quota.refreshFailedRetainedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</p>
     </div>}
@@ -131,7 +131,7 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
       onSnapshot?.(value);
     } catch (reason) {
       if (scopeRef.current === scope && !controller.signal.aborted) {
-        setDiagnostic({ error_code: reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota_not_authorized' : reason instanceof ApiError && reason.status === 429 ? 'quota_rate_limited' : 'quota_read_failed', attempts: [], cache_hit: false });
+        setDiagnostic({ error_code: reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota_not_authorized' : reason instanceof ApiError && [408, 504].includes(reason.status) ? 'quota_timeout' : reason instanceof ApiError && reason.status === 429 ? 'quota_rate_limited' : 'quota_read_failed', attempts: [], cache_hit: false });
         setError(reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed');
         onRefreshFailed?.();
       }

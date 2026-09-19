@@ -43,6 +43,7 @@ test('quota reads share ownership, bounded batches, partial failures and credit 
     assert.equal(await accountError.getAttribute('data-quota-cache-hit'), 'false');
     assert.match(await accountError.innerText(), /Quota connection configuration validation failed/);
     assert.equal(await page.getByText('raw supplier body', { exact: true }).count(), 0, 'unsafe batch diagnostics never reach the page');
+    assert.equal(await page.locator('[data-account="account-4"] [data-quota-error-code]').count(), 0, 'unknown snapshot codes never enter data attributes');
     await page.locator('[data-account="account-2"]').getByRole('button', { name: 'Refresh quota', exact: true }).click();
     await page.waitForFunction(() => window.quotaReadCalls.length === 2);
     await page.evaluate(() => window.releaseQuota(1));

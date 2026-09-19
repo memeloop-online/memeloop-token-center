@@ -173,23 +173,36 @@ export function quotaUnitMessage(unit: string): 'quota.unitRequests' | 'quota.un
 
 export type QuotaObservationState = 'unobserved' | 'current' | 'historical';
 
-const SAFE_QUOTA_CODE = /^[a-z][a-z0-9_.:-]{0,63}$/;
-const SAFE_DIAGNOSTIC_TOKEN = /^[a-z][a-z0-9_.:-]{0,63}$/;
+const QUOTA_ENDPOINT_KINDS = ['usage', 'credits', 'antigravity_quota_summary'] as const;
+const QUOTA_FAILURE_STAGES = [
+  'none', 'deadline', 'payload', 'proxy_connect', 'dns', 'tls', 'connect', 'timeout', 'transport',
+  'headers', 'body', 'request', 'other', 'credential', 'client',
+] as const;
+const QUOTA_ERROR_CODES = [
+  'quota_account_not_found', 'quota_account_inactive', 'credential_invalid', 'quota_account_unavailable',
+  'quota_batch_timeout', 'quota_batch_failed', 'quota_read_failed', 'quota_not_authorized',
+  'quota_destination_invalid', 'quota_transport_failed', 'quota_timeout', 'quota_rate_limited',
+  'quota_busy', 'quota_refresh_in_progress', 'quota_response_too_large', 'quota_too_many_windows',
+  'quota_duplicate_window', 'quota_invalid_credit_payload', 'quota_too_many_credits',
+  'quota_incomplete_credit_payload', 'quota_invalid_payload', 'quota_upstream_error',
+  'quota_usage_unavailable', 'quota_project_required', 'quota_credential_check_failed',
+  'credential_generation_changed', 'invalid_quota_read_policy',
+] as const;
 
-function safeDiagnosticToken(value: unknown): string | null {
-  return typeof value === 'string' && SAFE_DIAGNOSTIC_TOKEN.test(value) ? value : null;
+function allowlistedDiagnosticValue(value: unknown, values: readonly string[]): string | null {
+  return typeof value === 'string' && values.includes(value) ? value : null;
 }
 
 /** Keep only normalized, non-sensitive diagnostic codes from a gateway response. */
 export function normalizeQuotaErrorCode(value: unknown): string | null {
-  return typeof value === 'string' && SAFE_QUOTA_CODE.test(value) ? value : null;
+  return allowlistedDiagnosticValue(value, QUOTA_ERROR_CODES);
 }
 
 function normalizeQuotaAttempt(value: unknown): UpstreamQuotaAttempt | null {
   if (!value || typeof value !== 'object') return null;
   const attempt = value as Record<string, unknown>;
-  const endpointKind = safeDiagnosticToken(attempt.endpoint_kind);
-  const failureStage = safeDiagnosticToken(attempt.failure_stage);
+  const endpointKind = allowlistedDiagnosticValue(attempt.endpoint_kind, QUOTA_ENDPOINT_KINDS);
+  const failureStage = allowlistedDiagnosticValue(attempt.failure_stage, QUOTA_FAILURE_STAGES);
   const outcome = attempt.outcome === 'success' || attempt.outcome === 'retry' || attempt.outcome === 'error' ? attempt.outcome : null;
   const trigger = attempt.trigger === 'manual' || attempt.trigger === 'bulk' || attempt.trigger === 'background_recovery' || attempt.trigger === 'reset_workflow' ? attempt.trigger : null;
   const integer = (candidate: unknown, minimum: number, maximum: number) => typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= minimum && candidate <= maximum ? candidate : null;
