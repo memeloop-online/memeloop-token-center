@@ -118,3 +118,50 @@ test('self request polling is accessible, identity-safe, visibility-aware, and h
     assert.equal(await page.getByRole('slider', { name: 'Refresh cadence', exact: true }).inputValue(), '2');
   } finally { await browser.close(); await server.close(); }
 });
+
+test('Portal and Operator refresh preferences stay isolated in both directions', { timeout: 20_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => {
+      localStorage.setItem('mtc-locale', 'en');
+      localStorage.setItem('mtc.operator.request-refresh-ms.v1', '0');
+      localStorage.setItem('mtc.self.request-refresh-ms.v1', '30000');
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/self-operator-refresh-isolation.html`);
+    const operator = page.locator('[data-refresh-scope="operator"] input[type="range"]');
+    const portal = page.locator('[data-refresh-scope="portal"] input[type="range"]');
+    assert.equal(await operator.inputValue(), '0', 'Operator restores its live-stream preference');
+    assert.equal(await operator.getAttribute('aria-valuetext'), 'Live');
+    assert.equal(await portal.inputValue(), '2', 'Portal restores its polling preference');
+    assert.equal(await portal.getAttribute('aria-valuetext'), '30s');
+
+    await portal.press('Home');
+    assert.equal(await portal.inputValue(), '0', 'Portal can select manual refresh');
+    assert.equal(await portal.getAttribute('aria-valuetext'), 'Manual');
+    assert.equal(await page.evaluate(() => localStorage.getItem('mtc.self.request-refresh-ms.v1')), '0');
+    assert.equal(await operator.inputValue(), '0', 'Portal changes do not alter Operator');
+    assert.equal(await operator.getAttribute('aria-valuetext'), 'Live');
+
+    await operator.press('ArrowRight');
+    assert.equal(await operator.inputValue(), '1', 'Operator can select its five-second cadence');
+    assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.request-refresh-ms.v1')), '5000');
+    assert.equal(await portal.inputValue(), '0', 'Operator changes do not alter Portal');
+    assert.equal(await portal.getAttribute('aria-valuetext'), 'Manual');
+
+    await page.reload();
+    const restoredOperator = page.locator('[data-refresh-scope="operator"] input[type="range"]');
+    const restoredPortal = page.locator('[data-refresh-scope="portal"] input[type="range"]');
+    assert.equal(await restoredOperator.inputValue(), '1', 'Operator preference persists independently');
+    assert.equal(await restoredOperator.getAttribute('aria-valuetext'), '5s');
+    assert.equal(await restoredPortal.inputValue(), '0', 'Portal preference persists independently');
+    assert.equal(await restoredPortal.getAttribute('aria-valuetext'), 'Manual');
+  } finally { await browser.close(); await server.close(); }
+});

@@ -3,8 +3,10 @@ import {
   defaultRequestRefreshInterval,
   requestRefreshIntervals,
   requestRefreshPreference,
-  requestRefreshPreferenceKey,
+  selfRequestRefreshPreferenceKey,
 } from '../operator/traffic/requestRefresh';
+
+const selfRequestRefreshPreferenceEvent = 'mtc-self-request-refresh-preference';
 
 /**
  * Same cadence ladder as operator traffic, but self requests are GET polling
@@ -23,13 +25,13 @@ export interface SelfRequestRefresh {
 /**
  * Local polling cadence for the self-service requests page. The callback owns
  * all credentials and fetching; this hook only schedules ticks for a nonzero
- * interval once initial data exists. The same preference is used by the
- * operator traffic view so Requests and Sessions retain one shared setting.
+ * interval once initial data exists. Requests and Sessions share this Portal
+ * preference, while the Operator traffic view keeps its own live-stream setting.
  */
 export function useSelfRequestRefresh(refresh: () => void, ready: boolean): SelfRequestRefresh {
   const [intervalMs, setIntervalMsState] = useState<number>(() => {
     try {
-      return requestRefreshPreference(window.localStorage.getItem(requestRefreshPreferenceKey));
+      return requestRefreshPreference(window.localStorage.getItem(selfRequestRefreshPreferenceKey));
     } catch {
       return defaultSelfRequestRefreshInterval;
     }
@@ -42,8 +44,8 @@ export function useSelfRequestRefresh(refresh: () => void, ready: boolean): Self
     const next = selfRequestRefreshIntervals.some((interval) => interval === value) ? value : defaultSelfRequestRefreshInterval;
     setIntervalMsState(next);
     try {
-      window.localStorage.setItem(requestRefreshPreferenceKey, String(next));
-      window.dispatchEvent(new CustomEvent('mtc-request-refresh-preference', { detail: next }));
+      window.localStorage.setItem(selfRequestRefreshPreferenceKey, String(next));
+      window.dispatchEvent(new CustomEvent(selfRequestRefreshPreferenceEvent, { detail: next }));
     } catch {
       // Keep the in-memory selection usable in private storage contexts.
     }
@@ -51,17 +53,17 @@ export function useSelfRequestRefresh(refresh: () => void, ready: boolean): Self
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
-      if (event.key === requestRefreshPreferenceKey) setIntervalMsState(requestRefreshPreference(event.newValue));
+      if (event.key === selfRequestRefreshPreferenceKey) setIntervalMsState(requestRefreshPreference(event.newValue));
     };
     const onPreference = (event: Event) => {
       const value = (event as CustomEvent<number>).detail;
       setIntervalMsState(requestRefreshPreference(String(value)));
     };
     window.addEventListener('storage', onStorage);
-    window.addEventListener('mtc-request-refresh-preference', onPreference);
+    window.addEventListener(selfRequestRefreshPreferenceEvent, onPreference);
     return () => {
       window.removeEventListener('storage', onStorage);
-      window.removeEventListener('mtc-request-refresh-preference', onPreference);
+      window.removeEventListener(selfRequestRefreshPreferenceEvent, onPreference);
     };
   }, []);
 
