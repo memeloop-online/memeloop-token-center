@@ -289,7 +289,16 @@ impl Database {
         }
     }
 
-    pub(crate) async fn readiness_check(&self) -> Result<(), DatabaseReadinessError> {
+    pub async fn readiness_check(&self) -> Result<(), AppError> {
+        self.readiness_check_detailed()
+            .await
+            .map_err(|error| match error {
+                DatabaseReadinessError::Dependency(error) => error,
+                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+            })
+    }
+
+    pub(crate) async fn readiness_check_detailed(&self) -> Result<(), DatabaseReadinessError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
             .await

@@ -73,7 +73,7 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
         .metrics
         .readiness(move || async move {
             let (database, archive) = tokio::join!(
-                tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check()),
+                tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check_detailed()),
                 tokio::time::timeout(
                     archive.readiness_deadline() + Duration::from_secs(1),
                     archive.readiness_check()

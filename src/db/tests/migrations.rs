@@ -17,7 +17,7 @@ async fn readiness_rejects_schema_gaps_and_an_outdated_migration_frontier() {
         .await
         .unwrap();
 
-    let error = database.readiness_check().await.unwrap_err();
+    let error = database.readiness_check_detailed().await.unwrap_err();
     let DatabaseReadinessError::SchemaOutdated(status) = error else {
         panic!("schema gap must be reported separately from dependency failure");
     };
@@ -30,7 +30,7 @@ async fn readiness_rejects_schema_gaps_and_an_outdated_migration_frontier() {
         .execute(&database.pool)
         .await
         .unwrap();
-    let error = database.readiness_check().await.unwrap_err();
+    let error = database.readiness_check_detailed().await.unwrap_err();
     let DatabaseReadinessError::SchemaOutdated(status) = error else {
         panic!("outdated schema frontier must be reported separately from dependency failure");
     };
