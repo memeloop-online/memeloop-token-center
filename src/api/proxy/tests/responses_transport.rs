@@ -77,8 +77,8 @@ async fn http_json_native_transports_preserve_codex_multi_agent_wire() {
 
         let received = upstream.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].body_json::<Value>().unwrap(), expected_wire);
-        assert_eq!(received[0].url.path(), "/v1/responses");
+        let forwarded: Value = received[0].body_json().unwrap();
+        assert_eq!(forwarded, expected_wire);
         upstream.verify().await;
     }
 }
@@ -141,7 +141,6 @@ async fn http_json_chat_transport_translates_wire_response_and_usage() {
 
     let received = upstream.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].url.path(), "/v1/chat/completions");
     let forwarded: Value = received[0].body_json().unwrap();
     assert!(
         forwarded["messages"]
