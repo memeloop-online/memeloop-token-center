@@ -7167,6 +7167,20 @@ components:
       properties:
         api_version: { type: string, enum: [buffered-v1] }
         max_response_bytes: { type: integer, minimum: 1, maximum: 4194304 }
+    RequestCompatibility:
+      type: object
+      additionalProperties: false
+      required: [third_party, responses_via_chat_v1, responses_transport_configurable, codex_multi_agent_v2]
+      properties:
+        third_party: { type: boolean }
+        responses_via_chat_v1: { type: boolean }
+        responses_via_chat_dialect:
+          type: string
+          enum: [openai_chat_v1, kimi_v1]
+        responses_transport_configurable:
+          type: boolean
+          description: Account configuration selects native_responses or chat_completions through the provider's closed responses_transport schema.
+        codex_multi_agent_v2: { type: boolean }
     ProviderType:
       type: object
       additionalProperties: false
@@ -7189,6 +7203,10 @@ components:
         component_adapter:
           oneOf:
             - $ref: '#/components/schemas/ComponentAdapterContribution'
+            - type: 'null'
+        request_compatibility:
+          oneOf:
+            - $ref: '#/components/schemas/RequestCompatibility'
             - type: 'null'
         source: { type: string }
     ApiKeyCredential:

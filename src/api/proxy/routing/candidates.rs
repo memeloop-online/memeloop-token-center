@@ -111,25 +111,6 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
 ) -> Result<Option<PlannedProxyRoute>, AppError> {
     for candidate in candidates.by_ref() {
         summary.examined += 1;
-        if !candidate_allowed_for_multi_agent_request(
-            &candidate.driver,
-            request.codex_multi_agent_v2_request,
-            request
-                .state
-                .providers
-                .supports_codex_multi_agent_v2(&candidate.driver),
-        ) {
-            summary.multi_agent_incompatible += 1;
-            tracing::info!(
-                %request.request_id,
-                route_id = %candidate.route_id,
-                upstream_account_id = %candidate.account_id,
-                driver = %candidate.driver,
-                stage = "candidate_multi_agent_incompatible",
-                "proxy skipped a candidate without MultiAgentV2 compatibility"
-            );
-            continue;
-        }
         if !request.state.providers.is_public(&candidate.driver) {
             summary.retired_provider += 1;
             tracing::warn!(
@@ -169,6 +150,25 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
                 ));
             }
         };
+        if !candidate_allowed_for_multi_agent_request(
+            &route.driver,
+            request.codex_multi_agent_v2_request,
+            request
+                .state
+                .providers
+                .supports_codex_multi_agent_v2(&route.driver, &route.config),
+        ) {
+            summary.multi_agent_incompatible += 1;
+            tracing::info!(
+                %request.request_id,
+                route_id = %route.route_id,
+                upstream_account_id = %route.account_id,
+                driver = %route.driver,
+                stage = "candidate_multi_agent_incompatible",
+                "proxy skipped a candidate without MultiAgentV2 compatibility"
+            );
+            continue;
+        }
         if candidate_compatibility(request.protocol, &route)
             == CandidateCompatibility::ProtocolMismatch
         {

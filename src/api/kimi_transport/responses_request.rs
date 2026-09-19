@@ -3,7 +3,7 @@ use crate::provider::ResponsesViaChatDialect;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::api) struct ToolIdentity {
     pub name: String,
     pub namespace: String,
@@ -20,61 +20,331 @@ pub(super) fn qualified(namespace: &str, name: &str) -> String {
     }
 }
 
-pub(in crate::api) fn tools(request: &Value) -> BTreeMap<String, (ToolIdentity, Value)> {
-    fn insert(
-        result: &mut BTreeMap<String, (ToolIdentity, Value)>,
-        tools: &Value,
-        namespace: &str,
-    ) {
-        let Some(tools) = tools.as_array() else {
+fn nested_namespace(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.into()
+    } else if parent.ends_with("__") {
+        format!("{parent}{child}")
+    } else {
+        format!("{parent}__{child}")
+    }
+}
+
+#[derive(Clone)]
+struct ToolSource {
+    identity: ToolIdentity,
+    declaration: Option<Value>,
+}
+
+#[derive(Default)]
+struct ToolRegistry {
+    declarations: BTreeMap<String, (ToolIdentity, Value)>,
+    wire_by_identity: BTreeMap<(String, String), String>,
+    error: Option<String>,
+}
+
+impl ToolRegistry {
+    fn from_request(request: &Value) -> Self {
+        let mut sources = BTreeMap::<(String, String), ToolSource>::new();
+        let mut error = None;
+        collect_tool_declarations(&mut sources, &mut error, &request["tools"], "");
+        if let Some(input) = request["input"].as_array() {
+            for item in input {
+                match item["type"].as_str() {
+                    Some("additional_tools") => {
+                        collect_tool_declarations(&mut sources, &mut error, &item["tools"], "")
+                    }
+                    Some("function_call" | "custom_tool_call") => register_tool_source(
+                        &mut sources,
+                        &mut error,
+                        ToolIdentity {
+                            name: item["name"].as_str().unwrap_or("").trim().into(),
+                            namespace: item["namespace"].as_str().unwrap_or("").trim().into(),
+                            custom: item["type"] == "custom_tool_call",
+                        },
+                        None,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        collect_tool_choice_sources(&mut sources, &mut error, request.get("tool_choice"));
+
+        let mut used = BTreeSet::new();
+        let mut declarations = BTreeMap::new();
+        let mut wire_by_identity = BTreeMap::new();
+        for ((namespace, name), source) in sources {
+            let identity_key = (namespace, name);
+            let wire_name = unique_wire_name(&source.identity, &mut used);
+            wire_by_identity.insert(identity_key, wire_name.clone());
+            if let Some(mut declaration) = source.declaration {
+                declaration["function"]["name"] = Value::String(wire_name.clone());
+                declarations.insert(wire_name, (source.identity, declaration));
+            }
+        }
+        Self {
+            declarations,
+            wire_by_identity,
+            error,
+        }
+    }
+
+    fn validate(&self) -> Result<(), AppError> {
+        if let Some(error) = &self.error {
+            Err(AppError::BadRequest(error.clone()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wire_name(&self, namespace: &str, name: &str) -> Result<&str, AppError> {
+        self.wire_by_identity
+            .get(&(namespace.trim().into(), name.trim().into()))
+            .map(String::as_str)
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "Responses-via-Chat tool identity is missing from the request registry".into(),
+                )
+            })
+    }
+
+    fn declared_wire_name(&self, namespace: &str, name: &str) -> Result<&str, AppError> {
+        let wire_name = self.wire_name(namespace, name)?;
+        if self.declarations.contains_key(wire_name) {
+            Ok(wire_name)
+        } else {
+            Err(AppError::BadRequest(
+                "Responses-via-Chat tool choice must reference a declared tool".into(),
+            ))
+        }
+    }
+}
+
+fn register_tool_source(
+    sources: &mut BTreeMap<(String, String), ToolSource>,
+    error: &mut Option<String>,
+    identity: ToolIdentity,
+    declaration: Option<Value>,
+) {
+    if identity.name.is_empty() {
+        error.get_or_insert_with(|| "Responses-via-Chat tool name is required".into());
+        return;
+    }
+    let key = (identity.namespace.clone(), identity.name.clone());
+    if let Some(existing) = sources.get_mut(&key) {
+        if existing.identity.custom != identity.custom {
+            error.get_or_insert_with(|| {
+                "Responses-via-Chat tool identity has conflicting function kinds".into()
+            });
             return;
-        };
-        for tool in tools {
-            let kind = tool["type"].as_str().unwrap_or("function");
-            if kind == "namespace" {
-                insert(result, &tool["tools"], tool["name"].as_str().unwrap_or(""));
-                continue;
+        }
+        match (&existing.declaration, declaration) {
+            (Some(current), Some(candidate)) if current != &candidate => {
+                error.get_or_insert_with(|| {
+                    "Responses-via-Chat tool identity has conflicting declarations".into()
+                });
             }
-            if !matches!(kind, "function" | "custom") {
-                continue;
-            }
-            let definition = tool.get("function").unwrap_or(tool);
-            let name = definition["name"].as_str().unwrap_or("").trim();
+            (None, Some(candidate)) => existing.declaration = Some(candidate),
+            _ => {}
+        }
+        return;
+    }
+    sources.insert(
+        key,
+        ToolSource {
+            identity,
+            declaration,
+        },
+    );
+}
+
+fn collect_tool_declarations(
+    sources: &mut BTreeMap<(String, String), ToolSource>,
+    error: &mut Option<String>,
+    value: &Value,
+    namespace: &str,
+) {
+    let Some(tools) = value.as_array() else {
+        if !value.is_null() {
+            error.get_or_insert_with(|| "Responses-via-Chat tools must be an array".into());
+        }
+        return;
+    };
+    for tool in tools {
+        let kind = tool["type"].as_str().unwrap_or("function");
+        if kind == "namespace" {
+            let name = tool["name"].as_str().unwrap_or("").trim();
             if name.is_empty() {
+                error.get_or_insert_with(|| {
+                    "Responses-via-Chat namespace tool name is required".into()
+                });
                 continue;
             }
-            let wire_name = qualified(namespace, name);
-            let mut function = json!({"name":wire_name,"description":definition["description"].as_str().unwrap_or("")});
-            function["parameters"] = if kind == "custom" {
-                json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]})
-            } else {
-                definition
-                    .get("parameters")
-                    .or_else(|| definition.get("parametersJsonSchema"))
-                    .or_else(|| definition.get("input_schema"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({}))
-            };
-            result.entry(wire_name).or_insert((
-                ToolIdentity {
-                    name: name.into(),
-                    namespace: namespace.into(),
-                    custom: kind == "custom",
-                },
-                json!({"type":"function","function":function}),
-            ));
+            let nested_namespace = nested_namespace(namespace, name);
+            collect_tool_declarations(sources, error, &tool["tools"], &nested_namespace);
+            continue;
         }
+        if !matches!(kind, "function" | "custom") {
+            continue;
+        }
+        let definition = tool.get("function").unwrap_or(tool);
+        let name = definition["name"].as_str().unwrap_or("").trim();
+        let identity = ToolIdentity {
+            name: name.into(),
+            namespace: namespace.into(),
+            custom: kind == "custom",
+        };
+        let mut function = json!({
+            "name": qualified(namespace, name),
+            "description": definition["description"].as_str().unwrap_or("")
+        });
+        function["parameters"] = if kind == "custom" {
+            json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]})
+        } else {
+            definition
+                .get("parameters")
+                .or_else(|| definition.get("parametersJsonSchema"))
+                .or_else(|| definition.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        };
+        register_tool_source(
+            sources,
+            error,
+            identity,
+            Some(json!({"type":"function","function":function})),
+        );
     }
-    let mut result = BTreeMap::new();
-    insert(&mut result, &request["tools"], "");
-    if let Some(input) = request["input"].as_array() {
-        for item in input {
-            if item["type"] == "additional_tools" {
-                insert(&mut result, &item["tools"], "");
+}
+
+fn collect_tool_choice_sources(
+    sources: &mut BTreeMap<(String, String), ToolSource>,
+    error: &mut Option<String>,
+    choice: Option<&Value>,
+) {
+    let Some(choice) = choice else { return };
+    match choice {
+        Value::Array(choices) => {
+            for choice in choices {
+                collect_tool_choice_sources(sources, error, Some(choice));
             }
         }
+        Value::Object(object) => {
+            if let Some(tools) = object.get("tools") {
+                collect_tool_choice_sources(sources, error, Some(tools));
+            }
+            let kind = object.get("type").and_then(Value::as_str);
+            if matches!(kind, Some("function" | "custom")) {
+                let definition = object.get("function").unwrap_or(choice);
+                register_tool_source(
+                    sources,
+                    error,
+                    ToolIdentity {
+                        name: definition["name"].as_str().unwrap_or("").trim().into(),
+                        namespace: definition["namespace"]
+                            .as_str()
+                            .or_else(|| object.get("namespace").and_then(Value::as_str))
+                            .unwrap_or("")
+                            .trim()
+                            .into(),
+                        custom: kind == Some("custom"),
+                    },
+                    None,
+                );
+            }
+        }
+        _ => {}
     }
-    result
+}
+
+fn unique_wire_name(identity: &ToolIdentity, used: &mut BTreeSet<String>) -> String {
+    const LIMIT: usize = 64;
+    let source = qualified(&identity.namespace, &identity.name);
+    let mut base = source
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if base.is_empty() {
+        base.push_str("tool");
+    }
+    if base.len() <= LIMIT && used.insert(base.clone()) {
+        return base;
+    }
+    let digest = blake3::hash(
+        format!(
+            "{}\0{}\0{}",
+            identity.namespace, identity.name, identity.custom
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    for attempt in 0_u32.. {
+        let suffix = if attempt == 0 {
+            format!("__{}", &digest[..12])
+        } else {
+            format!("__{}_{attempt}", &digest[..12])
+        };
+        let prefix_length = LIMIT.saturating_sub(suffix.len());
+        let candidate = format!("{}{}", &base[..base.len().min(prefix_length)], suffix);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("tool wire-name suffix space is unbounded")
+}
+
+pub(in crate::api) fn tools(request: &Value) -> BTreeMap<String, (ToolIdentity, Value)> {
+    ToolRegistry::from_request(request).declarations
+}
+
+fn map_tool_choice(choice: &Value, registry: &ToolRegistry) -> Result<Value, AppError> {
+    match choice {
+        Value::String(mode) if matches!(mode.as_str(), "auto" | "none") => Ok(choice.clone()),
+        Value::String(mode) if mode == "required" => {
+            if registry.declarations.is_empty() {
+                Err(AppError::BadRequest(
+                    "Responses-via-Chat required tool choice needs a declared tool".into(),
+                ))
+            } else {
+                Ok(choice.clone())
+            }
+        }
+        Value::Object(object)
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) =>
+        {
+            let definition = object.get("function").unwrap_or(choice);
+            let namespace = definition["namespace"]
+                .as_str()
+                .or_else(|| object.get("namespace").and_then(Value::as_str))
+                .unwrap_or("");
+            let name = definition["name"].as_str().unwrap_or("");
+            let wire_name = registry.declared_wire_name(namespace, name)?;
+            Ok(json!({"type":"function","function":{"name":wire_name}}))
+        }
+        Value::Array(_) => Err(AppError::BadRequest(
+            "openai_chat_v1 cannot preserve an array tool choice".into(),
+        )),
+        Value::Object(object)
+            if object.get("type").and_then(Value::as_str) == Some("allowed_tools") =>
+        {
+            Err(AppError::BadRequest(
+                "openai_chat_v1 cannot preserve an allowed-tools choice".into(),
+            ))
+        }
+        _ => Err(AppError::BadRequest(
+            "unsupported Responses tool choice for openai_chat_v1".into(),
+        )),
+    }
 }
 
 fn content(value: &Value) -> Result<Value, AppError> {
@@ -240,11 +510,123 @@ fn validate_image_details(value: &Value) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_call_pairs(request: &Value) -> Result<(), AppError> {
+    let Some(input) = request["input"].as_array() else {
+        return Ok(());
+    };
+    let mut calls = BTreeSet::new();
+    let mut outputs = BTreeSet::new();
+    for item in input {
+        match item["type"].as_str() {
+            Some("function_call" | "custom_tool_call") => {
+                let call_id = item["call_id"]
+                    .as_str()
+                    .filter(|call_id| !call_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Responses-via-Chat tool call requires a call_id".into(),
+                        )
+                    })?;
+                if item["name"]
+                    .as_str()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat tool call requires a name".into(),
+                    ));
+                }
+                if !calls.insert(call_id) {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat tool call_id must be unique".into(),
+                    ));
+                }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                let call_id = item["call_id"]
+                    .as_str()
+                    .filter(|call_id| !call_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "Responses-via-Chat tool output requires a call_id".into(),
+                        )
+                    })?;
+                if !calls.contains(call_id) {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat tool output requires its preceding tool call".into(),
+                    ));
+                }
+                if !outputs.insert(call_id) {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat tool output call_id must be unique".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_strict_top_level_fields(request: &Value) -> Result<(), AppError> {
+    let object = request.as_object().ok_or_else(|| {
+        AppError::BadRequest("Responses-via-Chat request body must be an object".into())
+    })?;
+    for (name, value) in object {
+        match name.as_str() {
+            "model"
+            | "stream"
+            | "instructions"
+            | "input"
+            | "max_output_tokens"
+            | "temperature"
+            | "top_p"
+            | "parallel_tool_calls"
+            | "service_tier"
+            | "tools"
+            | "tool_choice"
+            | "previous_response_id" => {}
+            "text" => {
+                let Some(text) = value.as_object() else {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat text options must be an object".into(),
+                    ));
+                };
+                if text.keys().any(|field| field != "format") {
+                    return Err(AppError::BadRequest(
+                        "Responses-via-Chat cannot preserve this text option".into(),
+                    ));
+                }
+            }
+            // These fields control Responses-host persistence and opaque
+            // reasoning state. Their inert Codex values have an explicit
+            // bridge disposition instead of falling through silently.
+            "store" if value.is_null() || value.as_bool() == Some(false) => {}
+            "include"
+                if value.as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|item| item.as_str() == Some("reasoning.encrypted_content"))
+                }) => {}
+            "reasoning"
+                if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) => {
+            }
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "unsupported Responses field for openai_chat_v1: {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Enforce the declared Responses-to-Chat capability boundary. Model-visible
 /// tools require an exact mapping. Reviewed host-managed declarations may be
 /// omitted while idle because Chat transports cannot execute them.
 pub(super) fn validate_bridge_features(request: &Value) -> Result<(), AppError> {
     validate_image_details(request)?;
+    validate_call_pairs(request)?;
+    ToolRegistry::from_request(request).validate()?;
     if request.get("tools").is_some() {
         validate_tools(request, &request["tools"])?;
     }
@@ -327,6 +709,9 @@ pub(in crate::api) fn convert_with_dialect(
     dialect: ResponsesViaChatDialect,
 ) -> Result<Value, AppError> {
     validate_bridge_features(request)?;
+    if dialect == ResponsesViaChatDialect::OpenAiChatV1 {
+        validate_strict_top_level_fields(request)?;
+    }
     if request
         .get("previous_response_id")
         .is_some_and(|id| !id.is_null())
@@ -335,6 +720,7 @@ pub(in crate::api) fn convert_with_dialect(
             "Responses-via-Chat continuation requires the complete input history".into(),
         ));
     }
+    let registry = ToolRegistry::from_request(request);
     let mut output =
         json!({"model":request["model"], "stream":request["stream"].as_bool().unwrap_or(false)});
     let mut messages = Vec::<Value>::new();
@@ -396,7 +782,14 @@ pub(in crate::api) fn convert_with_dialect(
             "compaction"
                 if item.get("encrypted_content").is_some()
                     && item.get("content").is_none()
-                    && item.get("summary").is_none() => {}
+                    && item.get("summary").is_none() =>
+            {
+                if dialect == ResponsesViaChatDialect::OpenAiChatV1 {
+                    return Err(AppError::BadRequest(
+                        "openai_chat_v1 requires native Responses transport for compaction".into(),
+                    ));
+                }
+            }
             "function_call" | "custom_tool_call" => {
                 if preserve_reasoning {
                     combine(
@@ -412,7 +805,10 @@ pub(in crate::api) fn convert_with_dialect(
                     item["arguments"].as_str().unwrap_or("").into()
                 };
                 let call = json!({"id":id,"type":"function","function":{
-                    "name":qualified(item["namespace"].as_str().unwrap_or(""),item["name"].as_str().unwrap_or("")),
+                    "name":registry.wire_name(
+                        item["namespace"].as_str().unwrap_or(""),
+                        item["name"].as_str().unwrap_or("")
+                    )?,
                     "arguments":arguments}});
                 let merge = messages
                     .last()
@@ -516,16 +912,15 @@ pub(in crate::api) fn convert_with_dialect(
             format.clone()
         };
     }
-    let declarations = tools(request);
+    let mapped_tool_choice = request
+        .get("tool_choice")
+        .map(|choice| map_tool_choice(choice, &registry))
+        .transpose()?;
+    let declarations = registry.declarations;
     if !declarations.is_empty() {
         output["tools"] = Value::Array(declarations.into_values().map(|(_, tool)| tool).collect());
-        if let Some(choice) = request.get("tool_choice") {
-            output["tool_choice"] = if choice.is_object() && choice.get("name").is_some() {
-                json!({"type":"function","function":{"name":qualified(
-                    choice["namespace"].as_str().unwrap_or(""), choice["name"].as_str().unwrap_or(""))}})
-            } else {
-                choice.clone()
-            };
+        if let Some(choice) = mapped_tool_choice {
+            output["tool_choice"] = choice;
         }
     }
     Ok(output)
@@ -766,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_openai_chat_dialect_omits_kimi_reasoning_fields() {
+    fn strict_openai_chat_dialect_rejects_unmapped_reasoning_fields() {
         let request = json!({
             "input":[
                 {"type":"reasoning","summary":[{"type":"summary_text","text":"private trace"}]},
@@ -774,11 +1169,7 @@ mod tests {
             ],
             "reasoning":{"effort":"high"}
         });
-        let converted =
-            convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1).unwrap();
-        assert!(converted.to_string().contains("answer"));
-        assert!(!converted.to_string().contains("reasoning_content"));
-        assert!(!converted.to_string().contains("reasoning_effort"));
+        assert!(convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1).is_err());
         let kimi = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
         assert_eq!(kimi["reasoning_effort"], "high");
         assert!(kimi.to_string().contains("reasoning_content"));
@@ -861,6 +1252,46 @@ mod tests {
     }
 
     #[test]
+    fn strict_tool_choice_requires_an_exact_declared_mapping() {
+        for request in [
+            json!({"input":"hello","tool_choice":"required"}),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":{"type":"function","name":"missing"}
+            }),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":[{"type":"function","name":"declared"}]
+            }),
+            json!({
+                "input":"hello",
+                "tools":[{"type":"function","name":"declared","parameters":{}}],
+                "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[
+                    {"type":"function","name":"declared"}
+                ]}
+            }),
+        ] {
+            assert!(convert(&request).is_err());
+        }
+
+        let namespace = format!("namespace_{}", "long".repeat(16));
+        let name = format!("tool_{}", "long".repeat(16));
+        let converted = convert(&json!({
+            "input":"hello",
+            "tools":[{"type":"namespace","name":namespace.clone(),"tools":[
+                {"type":"function","name":name.clone(),"parameters":{}}
+            ]}],
+            "tool_choice":{"type":"function","namespace":namespace,"name":name}
+        }))
+        .unwrap();
+        let declared = converted["tools"][0]["function"]["name"].as_str().unwrap();
+        assert!(declared.len() <= 64);
+        assert_eq!(converted["tool_choice"]["function"]["name"], declared);
+    }
+
+    #[test]
     fn opaque_host_state_is_omitted_without_losing_visible_history() {
         let request = json!({
             "input": [
@@ -908,5 +1339,142 @@ mod tests {
             "tools": [{"type":"computer_use_preview","display_width":1024}]
         });
         assert!(convert(&request).is_err());
+    }
+
+    #[test]
+    fn strict_tool_registry_caps_names_and_reverses_nested_collisions() {
+        let first_namespace = format!("team/{}", "alpha".repeat(12));
+        let second_namespace = format!("team?{}", "alpha".repeat(12));
+        let nested = "nested";
+        let full_first = nested_namespace(&first_namespace, nested);
+        let full_second = nested_namespace(&second_namespace, nested);
+        let tool_name = format!("lookup_{}", "catalog".repeat(12));
+        let request = json!({
+            "model":"strict-chat",
+            "input":[
+                {"type":"function_call","namespace":full_first,"name":tool_name,
+                    "call_id":"call-a","arguments":"{}"},
+                {"type":"function_call","namespace":full_second,"name":tool_name,
+                    "call_id":"call-b","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-a","output":"a"},
+                {"type":"function_call_output","call_id":"call-b","output":"b"}
+            ],
+            "tools":[
+                {"type":"namespace","name":first_namespace,"tools":[
+                    {"type":"namespace","name":nested,"tools":[
+                        {"type":"function","name":tool_name,"parameters":{"type":"object"}}
+                    ]}
+                ]},
+                {"type":"namespace","name":second_namespace,"tools":[
+                    {"type":"namespace","name":nested,"tools":[
+                        {"type":"function","name":tool_name,"parameters":{"type":"object"}}
+                    ]}
+                ]}
+            ]
+        });
+        let registry = ToolRegistry::from_request(&request);
+        registry.validate().unwrap();
+        assert_eq!(registry.declarations.len(), 2);
+        assert!(
+            registry
+                .declarations
+                .keys()
+                .all(|wire_name| wire_name.len() <= 64)
+        );
+        let wire_names = registry.declarations.keys().cloned().collect::<Vec<_>>();
+        assert_ne!(wire_names[0], wire_names[1]);
+
+        let converted = convert(&request).unwrap();
+        let calls = converted["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| {
+            call["function"]["name"]
+                .as_str()
+                .is_some_and(|name| name.len() <= 64)
+        }));
+
+        let context = super::super::responses::Context::new(&request);
+        let translated = super::super::responses::buffered(
+            &context,
+            &json!({
+                "id":"chat-tools",
+                "created":1,
+                "choices":[{
+                    "index":0,
+                    "message":{"role":"assistant","tool_calls":[
+                        {"id":"up-a","type":"function","function":{"name":wire_names[0],"arguments":"{}"}},
+                        {"id":"up-b","type":"function","function":{"name":wire_names[1],"arguments":"{}"}}
+                    ]},
+                    "finish_reason":"tool_calls"
+                }],
+                "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+            }),
+        )
+        .unwrap();
+        let restored = translated["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| {
+                (
+                    item["namespace"].as_str().unwrap().to_owned(),
+                    item["name"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            restored,
+            BTreeSet::from([(full_first, tool_name.clone()), (full_second, tool_name)])
+        );
+    }
+
+    #[test]
+    fn tool_outputs_require_unique_nonempty_preceding_calls() {
+        for request in [
+            json!({"input":[{"type":"function_call_output","call_id":"missing","output":"x"}]}),
+            json!({"input":[{"type":"function_call_output","call_id":"","output":"x"}]}),
+            json!({"input":[
+                {"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"},
+                {"type":"function_call","name":"other","call_id":"same","arguments":"{}"}
+            ]}),
+            json!({"input":[
+                {"type":"function_call","name":"lookup","call_id":"same","arguments":"{}"},
+                {"type":"function_call_output","call_id":"same","output":"x"},
+                {"type":"function_call_output","call_id":"same","output":"y"}
+            ]}),
+        ] {
+            assert!(convert(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_top_level_matrix_rejects_unmapped_semantics() {
+        let supported = json!({
+            "model":"strict-chat",
+            "input":"hello",
+            "stream":false,
+            "store":false,
+            "include":["reasoning.encrypted_content"],
+            "text":{"format":{"type":"text"}}
+        });
+        assert!(convert(&supported).is_ok());
+        for (field, value) in [
+            ("store", json!(true)),
+            ("metadata", json!({"tenant":"example"})),
+            ("prompt_cache_key", json!("cache")),
+            ("reasoning", json!({"effort":"high"})),
+            ("text", json!({"verbosity":"high"})),
+        ] {
+            let mut request = supported.clone();
+            request[field] = value;
+            assert!(convert(&request).is_err(), "field {field} must fail closed");
+        }
+        assert!(
+            convert(&json!({
+                "input":[{"type":"compaction","encrypted_content":"opaque"}]
+            }))
+            .is_err()
+        );
     }
 }
