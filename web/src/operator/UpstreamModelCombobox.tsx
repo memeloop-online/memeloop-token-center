@@ -45,13 +45,14 @@ interface Props {
   protocol: string;
   value: string;
   onChange: (value: string) => void;
+  onProtocolInferred?: (protocol: string) => void;
   customModelConfirmed: boolean;
   onValidityChange: (valid: boolean, allowCustom: boolean) => void;
   upstreams?: UpstreamAccount[];
   providers?: ProviderType[];
 }
 
-export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [], providers = [] }: Props) {
+export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, onProtocolInferred, customModelConfirmed, onValidityChange, upstreams = [], providers = [] }: Props) {
   const { locale, t } = useI18n();
   const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
   const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
@@ -154,6 +155,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
 
   const choose = (model: CatalogModel) => {
     onChange(model.id); setCustomConfirmed(false);
+    if (model.protocol !== 'any') onProtocolInferred?.(model.protocol);
   };
   const sync = async () => {
     if (syncAccountIds.length === 0) return;

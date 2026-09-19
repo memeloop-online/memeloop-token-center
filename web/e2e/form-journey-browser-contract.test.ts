@@ -52,7 +52,7 @@ test('real form composition keeps OAuth proxy optional and route drafts across d
     assert.equal(await input.inputValue(), '7', 'closing the workspace preserves its draft');
     await page.getByRole('region', { name: '配置预览' }).waitFor();
     const sourceSection = page.locator('.route-form-sections > .mtc-form-section').nth(1);
-    const accessSection = page.locator('.route-form-sections > .mtc-form-section').nth(2);
+    const accessSection = page.locator('.route-form-sections > .form-journey-disclosure');
     const sourceBounds = await sourceSection.boundingBox();
     const accessBounds = await accessSection.boundingBox();
     assert.ok(sourceBounds && accessBounds && accessBounds.y >= sourceBounds.y + sourceBounds.height, 'authorization follows the complete source/model step, including on desktop');

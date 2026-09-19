@@ -55,7 +55,7 @@ test('proxy writes stay versioned, capability-gated and secret-free; model IA pr
   const forms = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
   assert.match(forms, /Number.isInteger\(draft.priority\) && Math.abs\(draft.priority\) <= 1000000/);
   for (const section of ['identitySection', 'upstreamSection']) assert.ok(forms.includes(`<FormSection title={t('routes.${section}')}`));
-  assert.ok(forms.includes('<FormSection title={journey.routeAccess}'));
+  assert.ok(forms.includes('<AdvancedFormSection action title={journey.routeAccess}'), 'route access stays available behind advanced settings');
   const sections = await readFile(new URL('../src/design-system/primitives.tsx', import.meta.url), 'utf8');
   assert.match(sections, /<fieldset className="mtc-form-section"/);
   assert.match(sections, /<legend>\{title\}<\/legend>/);

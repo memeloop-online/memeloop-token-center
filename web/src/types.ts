@@ -434,6 +434,32 @@ export interface UpstreamModelCatalogSyncResponse extends UpstreamModelCatalogRe
   price_sync: UpstreamCatalogPriceSync;
 }
 
+export interface ManagedRouteSyncCounts {
+  added: number;
+  disabled: number;
+  restored: number;
+  unchanged: number;
+  skipped: number;
+  warnings: string[];
+}
+
+export interface ManagedRoutePriceSync {
+  status: 'deferred';
+  currency: 'USD';
+  imported: 0;
+  preserved: 0;
+  unmatched: 0;
+  ambiguous: 0;
+  failed_sources: string[];
+  error_code: 'managed_route_price_sync_deferred';
+}
+
+export interface ManagedModelSyncResponse {
+  catalog: UpstreamModelCatalogResponse;
+  routes: ManagedRouteSyncCounts;
+  price_sync: ManagedRoutePriceSync;
+}
+
 export interface KeyView {
   key_id: string;
   account_id?: string;

@@ -30,6 +30,7 @@ test('route account metadata, explicit help and access preview preserve the exac
     assert.match(await page.locator('.shared-model-popover').innerText(), /Kimi Code/);
     await model.press('ArrowDown'); await model.press('Enter'); await model.press('Escape');
     await page.getByLabel(/公开模型/).fill('kimi-personal');
+    await page.getByRole('button', { name: '3. 模型访问授权', exact: true }).click();
     const groups = page.getByRole('combobox', { name: '所属路由组', exact: true });
     await groups.fill('个人模型组'); await groups.press('Enter'); await groups.press('Escape');
     await groups.fill('待建模型组'); await groups.press('Enter'); await groups.press('Escape');

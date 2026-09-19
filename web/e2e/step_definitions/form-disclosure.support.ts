@@ -3,6 +3,10 @@ import type { Locator } from 'playwright';
 
 /** Re-entering a workspace must reveal the field, not toggle it closed. */
 export async function openIndividualAuthorization(editor: Locator, kind: 'credential' | 'model') {
+  if (kind === 'credential') {
+    const access = editor.getByRole('button', { name: /^(?:3\. 模型访问授权|3\. Model access)$/, exact: true });
+    if (await access.getAttribute('aria-expanded') === 'false') await access.click();
+  }
   const disclosure = editor.getByRole('button', { name: kind === 'credential' ? /^单独授权凭据/ : /^单独授权模型/ });
   await disclosure.waitFor({ state: 'visible' });
   if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click();

@@ -457,6 +457,8 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   assert.ok(groupedCatalogBody.data.some((catalogModel) => catalogModel.id === 'mock-provider-model'));
   const createRouteButton = routeEditor.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => assert.equal(await createRouteButton.isEnabled(), true), 10_000, 'group-only route did not become valid after catalog search');
+  const routeAccess = routeEditor.getByRole('button', { name: '3. 模型访问授权', exact: true });
+  if (await routeAccess.getAttribute('aria-expanded') === 'false') await routeAccess.click();
   const routeGroupInput = routeEditor.getByRole('combobox', { name: '所属路由组', exact: true });
   await routeGroupInput.fill('默认路由');
   const routeGroupListId = await routeGroupInput.getAttribute('aria-controls');
