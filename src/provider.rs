@@ -13,7 +13,8 @@ pub(crate) use catalog::{
 pub use catalog::{
     CodexModelCapabilities, CodexReasoningLevel, ComponentAdapterContribution,
     GenerationAdapterContribution, OAuthAdapterContribution, OAuthFlowKind, ProviderCatalog,
-    ProviderType, RequestCompatibility, ResponsesViaChatDialect,
+    ProviderType, RESPONSES_VIA_CHAT_COMPACTION_CONFIG, RequestCompatibility,
+    ResponsesViaChatDialect,
 };
 pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
 pub use cbcnx::{CBCNX_PROVIDER_DRIVER, is_openai_compatible_http_driver};
