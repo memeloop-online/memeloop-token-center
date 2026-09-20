@@ -14,9 +14,20 @@ pub(in crate::api) fn prepare_with_dialect(
     model: &str,
     request: &mut Value,
     dialect: ResponsesViaChatDialect,
+    // Upstream opt-in: translate Responses compaction requests into direct
+    // chat requests (compaction_trigger becomes a summarization
+    // instruction, and the upstream text answer is returned as an opaque
+    // compaction checkpoint). Without the opt-in a compaction_trigger
+    // item is rejected as unsupported.
+    translate_compaction: bool,
 ) -> Result<Context, AppError> {
     let context = Context::with_dialect(request, dialect);
-    *request = super::kimi_transport::responses_request::convert_with_dialect(request, dialect)?;
+    *request =
+        super::kimi_transport::responses_request::convert_with_dialect(
+            request,
+            dialect,
+            translate_compaction,
+        )?;
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;
@@ -42,7 +53,13 @@ mod tests {
     #[test]
     fn wire_model_normalization_is_dialect_driven() {
         let mut kimi = json!({"input":"hello"});
-        prepare_with_dialect("kimi-k3-256k", &mut kimi, ResponsesViaChatDialect::KimiV1).unwrap();
+        prepare_with_dialect(
+            "kimi-k3-256k",
+            &mut kimi,
+            ResponsesViaChatDialect::KimiV1,
+            false,
+        )
+        .unwrap();
         assert_eq!(kimi["model"], "k3-256k");
 
         let mut generic = json!({"input":"hello"});
@@ -50,6 +67,7 @@ mod tests {
             "kimi-k3-256k",
             &mut generic,
             ResponsesViaChatDialect::OpenAiChatV1,
+            false,
         )
         .unwrap();
         assert_eq!(generic["model"], "kimi-k3-256k");

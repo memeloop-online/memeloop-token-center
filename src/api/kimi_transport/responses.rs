@@ -14,6 +14,10 @@ pub(in crate::api) struct Context {
     model: String,
     tools: BTreeMap<String, ToolIdentity>,
     usage_dialect: ResponsesViaChatDialect,
+    /// The source request carried a compaction_trigger control, so the
+    /// upstream response must be wrapped as an opaque compaction checkpoint
+    /// item instead of ordinary message output.
+    compaction: bool,
 }
 
 impl Context {
@@ -38,11 +42,18 @@ impl Context {
                 .map(|(name, (identity, _))| (name, identity))
                 .collect(),
             usage_dialect,
+            compaction: request["input"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["type"] == "compaction_trigger")
+            }),
         }
     }
 
     pub(in crate::api) fn uses_kimi_dialect(&self) -> bool {
         self.usage_dialect == ResponsesViaChatDialect::KimiV1
+    }
+
+    pub(in crate::api) fn is_compaction(&self) -> bool {
+        self.compaction
     }
 
     fn tool_item(&self, call: &Value, id: &str) -> Value {
@@ -96,6 +107,21 @@ impl Context {
         }
         Ok(())
     }
+}
+
+/// Self-contained opaque checkpoint blob. The client stores it and echoes it
+/// back verbatim without inspecting it; the version prefix leaves room for a
+/// future readable mapping without invalidating checkpoints already stored.
+fn compaction_blob(text: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "mtc-compact-v1.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text.as_bytes())
+    )
+}
+
+pub(in crate::api) fn compaction_item(id: &str, text: &str) -> Value {
+    json!({"id":id,"type":"compaction","encrypted_content":compaction_blob(text)})
 }
 
 #[derive(Deserialize)]
@@ -303,6 +329,40 @@ fn validate_tool_items(items: &[Value]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Compaction responses carry exactly one opaque checkpoint item built from
+/// the upstream message text. Anything else (tool calls, truncated output,
+/// missing text) would corrupt the client-side history, so it fails the
+/// whole response instead of producing a partial checkpoint.
+fn buffered_compaction(
+    context: &Context,
+    id: &str,
+    value: &Value,
+    choice: &Value,
+) -> Result<Value, &'static str> {
+    if choice["finish_reason"] != "stop" {
+        return Err("compaction_finish_invalid");
+    }
+    let message = &choice["message"];
+    if message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
+        return Err("compaction_tool_call");
+    }
+    let text = message["content"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .ok_or("compaction_text_missing")?;
+    let item = compaction_item(&format!("cmp_{id}"), text);
+    Ok(terminal_envelope(
+        envelope(
+            context,
+            id,
+            value["created"].as_i64().unwrap_or(0),
+            vec![item],
+            usage(&value["usage"], context.usage_dialect)?,
+        ),
+        choice["finish_reason"].as_str(),
+    ))
+}
+
 pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value, &'static str> {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return Err("provider_error");
@@ -320,6 +380,9 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
     }
     let message = &choice["message"];
     let id = format!("resp_{}", Uuid::now_v7().simple());
+    if context.is_compaction() {
+        return buffered_compaction(context, &id, value, choice);
+    }
     let mut outputs = Vec::new();
     if let Some(reasoning) = message["reasoning_content"]
         .as_str()
@@ -384,6 +447,10 @@ pub(in crate::api) struct Stream {
     calls: BTreeMap<u64, (usize, Value)>,
     usage: Option<Value>,
     finish: Option<String>,
+    /// Assembled checkpoint text in compaction mode. Intermediate item and
+    /// delta events are suppressed; the single compaction item is emitted
+    /// only at finish, once the checkpoint text is complete.
+    compaction_text: String,
 }
 
 impl Stream {
@@ -402,6 +469,7 @@ impl Stream {
             calls: BTreeMap::new(),
             usage: None,
             finish: None,
+            compaction_text: String::new(),
         }
     }
 
@@ -471,6 +539,15 @@ impl Stream {
                 if self.bytes > MAX_ACCUMULATED_BYTES {
                     return Err("accumulation_limit");
                 }
+                if self.context.is_compaction() {
+                    if !reasoning {
+                        self.compaction_text.push_str(text);
+                    }
+                    // Intermediate item and delta events are suppressed in
+                    // compaction mode; the single checkpoint item is emitted
+                    // at finish, once the text is complete.
+                    continue;
+                }
                 let existing = if reasoning {
                     self.reasoning_index
                 } else {
@@ -523,6 +600,11 @@ impl Stream {
                 )?);
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
+                if self.context.is_compaction() {
+                    // Tool calls can never be part of a checkpoint; fail the
+                    // stream instead of assembling a partial compaction.
+                    return Err("compaction_tool_call");
+                }
                 for call in calls {
                     let call_index = call["index"].as_u64().ok_or("tool_index_invalid")?;
                     if !self.calls.contains_key(&call_index) {
@@ -590,6 +672,9 @@ impl Stream {
         }
         if !self.started {
             return Err("empty_stream");
+        }
+        if self.context.is_compaction() {
+            return self.finish_compaction();
         }
         if !matches!(
             self.finish.as_deref(),
@@ -667,11 +752,174 @@ impl Stream {
         )?);
         Ok(events)
     }
+
+    fn finish_compaction(&mut self) -> Result<Vec<Vec<u8>>, &'static str> {
+        if self.finish.as_deref() != Some("stop") {
+            return Err("compaction_finish_invalid");
+        }
+        if !self.calls.is_empty() {
+            return Err("compaction_tool_call");
+        }
+        let usage = self.usage.take().ok_or("usage_missing")?;
+        let text = std::mem::take(&mut self.compaction_text);
+        if text.is_empty() {
+            return Err("compaction_text_missing");
+        }
+        self.done = true;
+        let item = compaction_item(&format!("cmp_{}", self.id), &text);
+        let response = envelope(&self.context, &self.id, self.created, vec![item.clone()], usage);
+        let mut events = Vec::new();
+        events.push(self.event(
+            "response.output_item.added",
+            json!({"output_index":0,"item":item}),
+        )?);
+        events.push(self.event(
+            "response.output_item.done",
+            json!({"output_index":0,"item":item}),
+        )?);
+        events.push(self.event("response.completed", json!({"response":response}))?);
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compaction_context() -> Context {
+        Context::for_kimi(&json!({"model":"kimi-k3",
+            "input":[
+                {"role":"user","content":"earlier work"},
+                {"type":"compaction_trigger"}
+            ]}))
+    }
+
+    fn compaction_fixture(text: &str) -> Value {
+        json!({"created":1,
+            "choices":[{"finish_reason":"stop","message":{"content":text}}],
+            "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}})
+    }
+
+    fn decode_checkpoint(blob: &str) -> String {
+        use base64::Engine as _;
+        let encoded = blob.strip_prefix("mtc-compact-v1.").expect("versioned blob");
+        String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded.as_bytes())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn context_detects_compaction_trigger_from_source_request() {
+        assert!(compaction_context().is_compaction());
+        let plain = Context::for_kimi(&json!({"model":"kimi-k3",
+            "input":[{"role":"user","content":"hi"}]}));
+        assert!(!plain.is_compaction());
+    }
+
+    #[test]
+    fn buffered_compaction_wraps_text_as_opaque_checkpoint() {
+        let context = compaction_context();
+        let response = buffered(&context, &compaction_fixture("handoff summary")).unwrap();
+        assert_eq!(response["status"], "completed");
+        let output = &response["output"][0];
+        assert_eq!(output["type"], "compaction");
+        assert!(output["id"].as_str().unwrap().starts_with("cmp_"));
+        let blob = output["encrypted_content"].as_str().unwrap();
+        assert_eq!(decode_checkpoint(blob), "handoff summary");
+        assert_eq!(response["usage"]["input_tokens"], 9);
+    }
+
+    #[test]
+    fn buffered_compaction_rejects_tool_calls_and_truncation() {
+        let context = compaction_context();
+        let with_calls = json!({"choices":[{"finish_reason":"tool_calls",
+            "message":{"content":"","tool_calls":[{"id":"c","type":"function",
+                "function":{"name":"f","arguments":"{}"}}]}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        assert_eq!(buffered(&context, &with_calls), Err("compaction_tool_call"));
+        let truncated = json!({"choices":[{"finish_reason":"length",
+            "message":{"content":"partial"}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        assert_eq!(buffered(&context, &truncated), Err("compaction_finish_invalid"));
+        let empty = json!({"choices":[{"finish_reason":"stop","message":{"content":""}}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
+        assert_eq!(buffered(&context, &empty), Err("compaction_text_missing"));
+    }
+
+    #[test]
+    fn stream_compaction_emits_single_opaque_checkpoint() {
+        let mut stream = Stream::new(compaction_context());
+        let first = stream
+            .observe(&json!({"created":1,"choices":[{"index":0,
+                "delta":{"content":"handoff "},"finish_reason":null}],"usage":Value::Null}))
+            .unwrap();
+        // Only the response lifecycle events; no item or delta events leak.
+        let wire = String::from_utf8(first.concat()).unwrap();
+        assert!(wire.contains("response.created"));
+        assert!(wire.contains("response.in_progress"));
+        assert!(!wire.contains("output_item.added"));
+        assert!(!wire.contains("output_text.delta"));
+        let second = stream
+            .observe(&json!({"created":1,"choices":[{"index":0,
+                "delta":{"reasoning_content":"private","content":"summary"},
+                "finish_reason":null}],"usage":Value::Null}))
+            .unwrap();
+        assert!(second.is_empty());
+        stream
+            .observe(&json!({"created":1,"choices":[{"index":0,"delta":{},
+                "finish_reason":"stop"}],"usage":Value::Null}))
+            .unwrap();
+        let usage = stream
+            .observe(&json!({"created":1,"choices":[],
+                "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}))
+            .unwrap();
+        assert!(usage.is_empty());
+        let events = stream.finish().unwrap();
+        let wire = String::from_utf8(events.concat()).unwrap();
+        let names: Vec<&str> = wire
+            .split("event: ")
+            .skip(1)
+            .map(|frame| frame.lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        // Twice on the wire (added + done) plus once inside the completed
+        // envelope's output array.
+        assert_eq!(wire.matches("\"type\":\"compaction\"").count(), 3);
+        let done = wire
+            .split("event: response.output_item.done\ndata: ")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        let item: Value = serde_json::from_str(done).unwrap();
+        let blob = item["item"]["encrypted_content"].as_str().unwrap();
+        assert_eq!(decode_checkpoint(blob), "handoff summary");
+        assert!(wire.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn stream_compaction_rejects_tool_deltas() {
+        let mut stream = Stream::new(compaction_context());
+        stream
+            .observe(&json!({"created":1,"choices":[{"index":0,
+                "delta":{"content":"x"},"finish_reason":null}],"usage":Value::Null}))
+            .unwrap();
+        let error = stream.observe(&json!({"created":1,"choices":[{"index":0,
+            "delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"f"}}]},
+            "finish_reason":null}],"usage":Value::Null}));
+        assert_eq!(error, Err("compaction_tool_call"));
+    }
 
     #[test]
     fn buffered_documented_cache_alias_is_preserved_and_conflicts_fail() {

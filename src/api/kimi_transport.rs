@@ -79,6 +79,10 @@ pub(super) fn prepare_kimi_responses(
         &normalize_model(model),
         request,
         super::responses_via_chat::ResponsesViaChatDialect::KimiV1,
+        // The native managed-Kimi path has no per-account opt-in surface;
+        // compaction translation is configured on the routed upstream
+        // account and applied by the routing bridge instead.
+        false,
     )?;
     messages::repair(request);
     Ok(context)
