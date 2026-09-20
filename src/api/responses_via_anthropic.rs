@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 const MAX_ITEMS: usize = 512;
 const MAX_ACCUMULATED_BYTES: usize = 8 * 1024 * 1024;
+/// Anthropic Messages rejects requests without max_tokens, while Codex
+/// Responses requests routinely omit max_output_tokens.  8,192 stays within
+/// every Claude model output ceiling since Claude 3.5 without silently
+/// clipping typical agent turns; callers can always raise it explicitly.
+const DEFAULT_MAX_TOKENS: u64 = 8192;
 
 #[derive(Clone)]
 struct ToolIdentity {
@@ -23,6 +28,7 @@ struct ToolIdentity {
 pub(in crate::api) struct Context {
     model: String,
     tools: BTreeMap<String, ToolIdentity>,
+    created: i64,
 }
 
 impl Context {
@@ -92,6 +98,7 @@ pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Contex
     let context = Context {
         model: public_model,
         tools: identities,
+        created: unix_now(),
     };
     let mut system = Vec::new();
     if let Some(instructions) = request.get("instructions").and_then(Value::as_str)
@@ -117,17 +124,44 @@ pub(in crate::api) fn prepare(model: &str, request: &mut Value) -> Result<Contex
     if !tools.is_empty() {
         output["tools"] = Value::Array(tools);
     }
-    if let Some(limit) = request.get("max_output_tokens") {
-        output["max_tokens"] = limit.clone();
+    match request.get("max_output_tokens") {
+        Some(limit) => {
+            let limit = limit.as_u64().filter(|limit| *limit > 0).ok_or_else(|| {
+                AppError::BadRequest("max_output_tokens must be a positive integer".into())
+            })?;
+            output["max_tokens"] = limit.into();
+        }
+        None => output["max_tokens"] = DEFAULT_MAX_TOKENS.into(),
     }
-    for field in ["temperature", "top_p", "service_tier"] {
+    for field in ["temperature", "top_p"] {
         if let Some(value) = request.get(field) {
             output[field] = value.clone();
         }
     }
+    if let Some(tier) = request.get("service_tier") {
+        let tier = tier
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest("service_tier must be a string".into()))?;
+        // Anthropic accepts a smaller service_tier vocabulary than OpenAI;
+        // forwarding values like flex or priority would fail upstream with an
+        // opaque 400, so reject them at translation time instead.
+        if !matches!(tier, "auto" | "standard_only") {
+            return Err(AppError::BadRequest(format!(
+                "Responses-via-Anthropic supports service_tier auto or standard_only, not {tier}"
+            )));
+        }
+        output["service_tier"] = tier.into();
+    }
     apply_tool_choice(&mut output, request, &context.tools)?;
     *request = output;
     Ok(context)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn validate_top_level(request: &Value) -> Result<(), AppError> {
@@ -807,7 +841,7 @@ pub(in crate::api) fn buffered(context: &Context, value: &Value) -> Result<Value
     let mut response = envelope(
         context,
         &id,
-        0,
+        context.created,
         output,
         anthropic_usage(value.get("usage").ok_or("anthropic_usage_missing")?)?,
     );
@@ -842,7 +876,6 @@ struct BlockState {
 pub(in crate::api) struct Stream {
     context: Context,
     id: String,
-    created: i64,
     sequence: u64,
     started: bool,
     stopped: bool,
@@ -859,7 +892,6 @@ impl Stream {
         Self {
             context,
             id: format!("resp_{}", Uuid::now_v7().simple()),
-            created: 0,
             sequence: 0,
             started: false,
             stopped: false,
@@ -924,7 +956,7 @@ impl Stream {
         let mut response = envelope(
             &self.context,
             &self.id,
-            self.created,
+            self.context.created,
             Vec::new(),
             Value::Null,
         );
@@ -1202,7 +1234,7 @@ impl Stream {
         let mut response = envelope(
             &self.context,
             &self.id,
-            self.created,
+            self.context.created,
             self.output.clone(),
             usage,
         );
@@ -1442,7 +1474,7 @@ mod tests {
         );
         assert_eq!(
             request["messages"][3]["content"][0]["name"],
-            "followup_task"
+            "collaboration__followup_task"
         );
         assert!(
             request["tools"]
@@ -1493,5 +1525,39 @@ mod tests {
         assert!(wire.contains("\"namespace\":\"editor\""));
         assert!(wire.contains("\"name\":\"patch\""));
         assert!(wire.contains("\"input\":\"diff\""));
+    }
+
+    #[test]
+    fn missing_max_output_tokens_gets_a_safe_default_and_created_at_is_stamped() {
+        let mut request = json!({"model":"claude","input":"hello"});
+        let context = prepare("claude-upstream", &mut request).unwrap();
+        assert_eq!(request["max_tokens"], DEFAULT_MAX_TOKENS);
+        let response = buffered(
+            &context,
+            &json!({
+                "id":"msg_1","type":"message","role":"assistant","model":"claude",
+                "content":[{"type":"text","text":"ok"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":1,"output_tokens":1}
+            }),
+        )
+        .unwrap();
+        assert!(response["created_at"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn invalid_max_output_tokens_and_unsupported_service_tier_fail_before_dispatch() {
+        for mut request in [
+            json!({"model":"claude","input":"hello","max_output_tokens":"4096"}),
+            json!({"model":"claude","input":"hello","max_output_tokens":0}),
+            json!({"model":"claude","input":"hello","max_output_tokens":-1}),
+            json!({"model":"claude","input":"hello","service_tier":"flex"}),
+            json!({"model":"claude","input":"hello","service_tier":"priority"}),
+        ] {
+            assert!(prepare("claude", &mut request).is_err());
+        }
+        let mut request = json!({"model":"claude","input":"hello","service_tier":"standard_only"});
+        prepare("claude", &mut request).unwrap();
+        assert_eq!(request["service_tier"], "standard_only");
     }
 }
