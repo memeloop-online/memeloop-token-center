@@ -43,7 +43,9 @@ impl Context {
                 .collect(),
             usage_dialect,
             compaction: request["input"].as_array().is_some_and(|items| {
-                items.iter().any(|item| item["type"] == "compaction_trigger")
+                items
+                    .iter()
+                    .any(|item| item["type"] == "compaction_trigger")
             }),
         }
     }
@@ -343,7 +345,10 @@ fn buffered_compaction(
         return Err("compaction_finish_invalid");
     }
     let message = &choice["message"];
-    if message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
+    if message["tool_calls"]
+        .as_array()
+        .is_some_and(|calls| !calls.is_empty())
+    {
         return Err("compaction_tool_call");
     }
     let text = message["content"]
@@ -767,7 +772,13 @@ impl Stream {
         }
         self.done = true;
         let item = compaction_item(&format!("cmp_{}", self.id), &text);
-        let response = envelope(&self.context, &self.id, self.created, vec![item.clone()], usage);
+        let response = envelope(
+            &self.context,
+            &self.id,
+            self.created,
+            vec![item.clone()],
+            usage,
+        );
         let mut events = Vec::new();
         events.push(self.event(
             "response.output_item.added",
@@ -788,10 +799,10 @@ mod tests {
 
     fn compaction_context() -> Context {
         Context::for_kimi(&json!({"model":"kimi-k3",
-            "input":[
-                {"role":"user","content":"earlier work"},
-                {"type":"compaction_trigger"}
-            ]}))
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]}))
     }
 
     fn compaction_fixture(text: &str) -> Value {
@@ -802,7 +813,9 @@ mod tests {
 
     fn decode_checkpoint(blob: &str) -> String {
         use base64::Engine as _;
-        let encoded = blob.strip_prefix("mtc-compact-v1.").expect("versioned blob");
+        let encoded = blob
+            .strip_prefix("mtc-compact-v1.")
+            .expect("versioned blob");
         String::from_utf8(
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(encoded.as_bytes())
@@ -843,7 +856,10 @@ mod tests {
         let truncated = json!({"choices":[{"finish_reason":"length",
             "message":{"content":"partial"}}],
             "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
-        assert_eq!(buffered(&context, &truncated), Err("compaction_finish_invalid"));
+        assert_eq!(
+            buffered(&context, &truncated),
+            Err("compaction_finish_invalid")
+        );
         let empty = json!({"choices":[{"finish_reason":"stop","message":{"content":""}}],
             "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}});
         assert_eq!(buffered(&context, &empty), Err("compaction_text_missing"));

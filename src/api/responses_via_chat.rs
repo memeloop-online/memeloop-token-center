@@ -22,12 +22,11 @@ pub(in crate::api) fn prepare_with_dialect(
     translate_compaction: bool,
 ) -> Result<Context, AppError> {
     let context = Context::with_dialect(request, dialect);
-    *request =
-        super::kimi_transport::responses_request::convert_with_dialect(
-            request,
-            dialect,
-            translate_compaction,
-        )?;
+    *request = super::kimi_transport::responses_request::convert_with_dialect(
+        request,
+        dialect,
+        translate_compaction,
+    )?;
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;

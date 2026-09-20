@@ -564,12 +564,12 @@ mod tests {
     #[test]
     fn compaction_trigger_translates_to_instruction_and_drops_tools() {
         let request = json!({"model":"kimi-k3","stream":true,"instructions":"system",
-            "tools":[{"type":"function","name":"exec","parameters":{"type":"object"}}],
-            "tool_choice":"auto",
-            "input":[
-                {"role":"user","content":"earlier work"},
-                {"type":"compaction_trigger"}
-            ]});
+        "tools":[{"type":"function","name":"exec","parameters":{"type":"object"}}],
+        "tool_choice":"auto",
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]});
         let converted =
             convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, true).unwrap();
         let messages = converted["messages"].as_array().unwrap();
@@ -588,10 +588,10 @@ mod tests {
     #[test]
     fn compaction_trigger_rejected_without_translation_opt_in() {
         let request = json!({"model":"kimi-k3",
-            "input":[
-                {"role":"user","content":"earlier work"},
-                {"type":"compaction_trigger"}
-            ]});
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]});
         let error =
             convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap_err();
         assert!(
@@ -816,7 +816,8 @@ mod tests {
                 {"type":"additional_tools","tools":[{"type":"function","name":"other","parameters":{"type":"object"}}]}
             ],"max_output_tokens":400,"reasoning":{"effort":"high"},
             "text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"},"strict":true}}});
-        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
         assert_eq!(converted["messages"][0]["role"], "system");
         assert_eq!(
             converted["messages"][1]["tool_calls"][0]["function"]["name"],
@@ -943,7 +944,8 @@ mod tests {
             ]
         });
 
-        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
         let wire = converted.to_string();
         assert!(wire.contains("visible task"));
         assert!(wire.contains("visible summary"));
