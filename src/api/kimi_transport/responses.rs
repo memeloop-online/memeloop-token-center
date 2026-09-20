@@ -341,15 +341,15 @@ fn buffered_compaction(
     value: &Value,
     choice: &Value,
 ) -> Result<Value, &'static str> {
-    if choice["finish_reason"] != "stop" {
-        return Err("compaction_finish_invalid");
-    }
     let message = &choice["message"];
     if message["tool_calls"]
         .as_array()
         .is_some_and(|calls| !calls.is_empty())
     {
         return Err("compaction_tool_call");
+    }
+    if choice["finish_reason"] != "stop" {
+        return Err("compaction_finish_invalid");
     }
     let text = message["content"]
         .as_str()
