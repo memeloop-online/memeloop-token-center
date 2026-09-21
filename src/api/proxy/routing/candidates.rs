@@ -341,6 +341,7 @@ mod tests {
             codex_downstream_stream: false,
             codex_store_disabled: false,
             codex_session_id: None,
+            wire_shim_set_headers: None,
             component_request: Some((
                 PreparedProviderRequest {
                     method: reqwest::Method::POST,

@@ -63,7 +63,14 @@ const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
 const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_ENDPOINTS: usize = 32;
 const PLUGIN_SERVICE_DATA_COMPONENT_API: &str = "component-v1";
-const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
+const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.4.0";
+/// Post-serialization wire-shim hooks get their own budget: the base covers
+/// the component, and each body byte funds both the in-guest JSON parse and
+/// the final re-serialization (checksum work included).
+const WIRE_SHIM_FUEL_BASE: u64 = 8_000_000;
+const WIRE_SHIM_FUEL_PER_BODY_BYTE: u64 = 2;
+const WIRE_SHIM_MEMORY_BYTES: usize = 96 * 1024 * 1024;
+const WIRE_SHIM_RANDOM_BYTES_MAX: usize = 256;
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
 const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
@@ -113,6 +120,19 @@ mod service_data_component {
     });
 }
 
+/// 0.3.0 wire-shim ABI bindings. The host imports are deliberately NOT wired
+/// through the generated add_to_linker: register_wire_shim_host_imports links
+/// each function individually so random-bytes only exists for packages whose
+/// manifest declares the random capability.
+pub(crate) mod wire_shim_component {
+    wasmtime::component::bindgen!({
+        world: "memeloop:token-center/wire-shim-plugin@0.3.0",
+        // The frozen 0.2.0 package loads alongside so the combined authoring
+        // world can reference it; only the 0.3.0 wire-shim world is bound.
+        path: ["wit/token-center.wit", "wit/wire-shim.wit"],
+    });
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
@@ -154,6 +174,23 @@ pub struct PluginContributions {
     /// only call the core proxy route for one of these manifest entries.
     #[serde(default)]
     pub service_data: Vec<PluginServiceDataEndpoint>,
+    /// Post-serialization wire-format hook. Requires the wire-shim-plugin
+    /// world (WIT 0.3.0); a component and wit_version 0.3.0 are mandatory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_shim: Option<WireShimContribution>,
+}
+
+/// Post-serialization wire-format hook (wire-shim-plugin WIT world). The
+/// component rewrites the final serialized request body byte-exactly and may
+/// set allowlisted fingerprint headers for the declared driver/protocol
+/// pairs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireShimContribution {
+    /// Provider driver ids the hook applies to, e.g. ["anthropic-claude"].
+    pub drivers: Vec<String>,
+    /// Public protocol names the hook applies to: "openai" or "anthropic".
+    pub protocols: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -350,6 +387,9 @@ pub enum PluginCapability {
     Http {
         allowed_origins: Vec<String>,
     },
+    /// Bounded CSPRNG access (host random-bytes, at most 256 bytes per call).
+    /// Only linked for wire-shim components; call-time re-checked as well.
+    Random,
     /// Read-only candidate quota context for native-health group ordering.
     GroupRoutingQuota,
 }
@@ -359,6 +399,7 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
     routing_validator: Option<crate::schema::CompiledSchema>,
@@ -732,6 +773,39 @@ impl PluginRuntime {
                     provenance,
                 }
             };
+            let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
+                let component = component.as_ref().ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "plugin {} needs a component for its wire shim contribution",
+                        manifest.id
+                    ))
+                })?;
+                let has_random = manifest
+                    .capabilities
+                    .iter()
+                    .any(|capability| matches!(capability, PluginCapability::Random));
+                let mut linker = Linker::new(&engine);
+                register_wire_shim_host_imports(&mut linker, has_random)
+                    .map_err(|_| plugin_runtime_failure("wire_shim_linker_configuration"))?;
+                let instance_pre = linker.instantiate_pre(component).map_err(|_| {
+                    // An undeclared random-bytes import or an incompatible ABI
+                    // rejects the package here; neither ever reaches a request.
+                    AppError::BadRequest(format!(
+                        "plugin {} wire shim component has an incompatible ABI",
+                        manifest.id
+                    ))
+                })?;
+                Some(
+                    wire_shim_component::WireShimPluginPre::new(instance_pre).map_err(|_| {
+                        AppError::BadRequest(format!(
+                            "plugin {} wire shim component has an incompatible ABI",
+                            manifest.id
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
             let configuration_validator = manifest
                 .contributions
                 .configuration
@@ -748,6 +822,7 @@ impl PluginRuntime {
                 manifest,
                 component,
                 service_data_component,
+                wire_shim_component,
                 ui_modules,
                 configuration_validator,
                 routing_validator,
@@ -1433,6 +1508,150 @@ impl PluginRuntime {
     }
 }
 
+/// Verified result of one wire-shim finalize call. request_json is forwarded
+/// to the upstream byte-for-byte; set_headers still requires the closed
+/// allowlist validation before application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WireShimOutcome {
+    pub(crate) plugin_id: String,
+    pub(crate) request_json: String,
+    pub(crate) set_headers: Vec<(String, String)>,
+}
+
+impl PluginRuntime {
+    /// True when an enabled plugin declares a wire_shim contribution covering
+    /// this driver and public protocol name. Cheap manifest-only check used
+    /// at route-planning time.
+    pub(crate) fn wire_shim_matches(&self, driver: &str, protocol: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .wire_shim
+                .as_ref()
+                .is_some_and(|wire_shim| {
+                    wire_shim.drivers.iter().any(|declared| declared == driver)
+                        && wire_shim
+                            .protocols
+                            .iter()
+                            .any(|declared| declared == protocol)
+                })
+        })
+    }
+
+    /// Runs the wire-shim-v1 finalize hook for the matching plugin. The
+    /// returned request_json must be forwarded byte-for-byte. Any component
+    /// trap or reported error fails the whole request (fail-closed); a route
+    /// no plugin claims returns Ok(None).
+    pub(crate) fn finalize_wire_shim(
+        &self,
+        driver: &str,
+        protocol: &str,
+        mut context: types::RequestContext,
+        request_json: &str,
+        headers_json: &str,
+        configurations: &BTreeMap<String, Value>,
+    ) -> Result<Option<WireShimOutcome>, AppError> {
+        let Some(plugin) = self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .wire_shim
+                .as_ref()
+                .is_some_and(|wire_shim| {
+                    wire_shim.drivers.iter().any(|declared| declared == driver)
+                        && wire_shim
+                            .protocols
+                            .iter()
+                            .any(|declared| declared == protocol)
+                })
+        }) else {
+            return Ok(None);
+        };
+        let pre = plugin.wire_shim_component.as_ref().ok_or_else(|| {
+            AppError::Storage(format!(
+                "plugin {} wire shim is unavailable",
+                plugin.manifest.id
+            ))
+        })?;
+        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let http = self.http.as_ref().ok_or(AppError::Internal)?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let fuel = WIRE_SHIM_FUEL_BASE
+            .saturating_add((request_json.len() as u64).saturating_mul(WIRE_SHIM_FUEL_PER_BODY_BYTE));
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(WIRE_SHIM_MEMORY_BYTES)
+            .table_elements(PLUGIN_TABLE_ELEMENTS)
+            .instances(8)
+            .tables(2)
+            .memories(2)
+            .build();
+        let mut store = Store::new(
+            engine,
+            HostState {
+                plugin_id: plugin.manifest.id.clone(),
+                capabilities: plugin.manifest.capabilities.clone(),
+                http: http.clone(),
+                runtime: runtime.clone(),
+                kv: self.kv.clone(),
+                limits,
+                deadline: Instant::now() + self.execution_timeout,
+                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
+        store
+            .set_fuel(fuel)
+            .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
+        let bindings = pre
+            .instantiate(&mut store)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
+        // Reuses the same global-default-plus-tenant-override resolution the
+        // post-auth hook receives (5 s cached snapshot per tenant).
+        let configuration = configurations
+            .get(&plugin.manifest.id)
+            .cloned()
+            .or_else(|| {
+                plugin
+                    .manifest
+                    .contributions
+                    .configuration
+                    .as_ref()
+                    .map(|contribution| contribution.default.clone())
+            })
+            .unwrap_or_else(empty_json_object);
+        context.config_json =
+            serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
+        let context = wire_shim_component::memeloop::token_center0_3_0::types::RequestContext {
+            tenant_id: context.tenant_id,
+            principal_id: context.principal_id,
+            key_id: context.key_id,
+            protocol: context.protocol,
+            model: context.model,
+            config_json: context.config_json,
+        };
+        let result = bindings
+            .memeloop_token_center0_3_0_wire_shim_v1()
+            .call_finalize(&mut store, &context, request_json, headers_json)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
+            .map_err(|error| {
+                plugin_reported_error(&plugin.manifest.id, "wire-shim-finalize", &error)
+            })?;
+        if result.request_json.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES {
+            return Err(AppError::Upstream(format!(
+                "plugin {} finalized request exceeds the 16 MiB limit",
+                plugin.manifest.id
+            )));
+        }
+        Ok(Some(WireShimOutcome {
+            plugin_id: plugin.manifest.id.clone(),
+            request_json: result.request_json,
+            set_headers: result.set_headers,
+        }))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PluginRuntimeMetrics {
     pub loaded_plugins: usize,
@@ -1835,6 +2054,72 @@ impl memeloop::token_center::host::Host for HostState {
 
 impl memeloop::token_center::types::Host for HostState {}
 
+/// Host functions offered to wire-shim-plugin (0.3.0) components. Registered
+/// function-by-function so random-bytes is linked only when the manifest
+/// declares the random capability; a component importing it anyway fails
+/// instantiate_pre at load time.
+fn register_wire_shim_host_imports(
+    linker: &mut Linker<HostState>,
+    random_capability: bool,
+) -> Result<(), wasmtime::Error> {
+    use self::memeloop::token_center::host::Host as _;
+    let mut host = linker.instance("memeloop:token-center/host@0.3.0")?;
+    host.func_wrap(
+        "log",
+        |mut caller: wasmtime::StoreContextMut<'_, HostState>,
+         (level, message): (String, String)| {
+            caller.data_mut().log(level, message);
+            Ok(())
+        },
+    )?;
+    host.func_wrap(
+        "kv-get",
+        |mut caller: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+            Ok((caller.data_mut().kv_get(key),))
+        },
+    )?;
+    host.func_wrap(
+        "kv-put",
+        |mut caller: wasmtime::StoreContextMut<'_, HostState>,
+         (key, value): (String, Vec<u8>)| { Ok((caller.data_mut().kv_put(key, value),)) },
+    )?;
+    host.func_wrap(
+        "http-request",
+        |mut caller: wasmtime::StoreContextMut<'_, HostState>,
+         (method, url, headers_json, body): (String, String, String, Vec<u8>)| {
+            Ok((caller.data_mut().http_request(method, url, headers_json, body),))
+        },
+    )?;
+    if random_capability {
+        host.func_wrap(
+            "random-bytes",
+            |mut caller: wasmtime::StoreContextMut<'_, HostState>, (len,): (u32,)| {
+                Ok((caller.data_mut().host_random_bytes(len),))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+impl HostState {
+    fn host_random_bytes(&mut self, len: u32) -> Result<Vec<u8>, String> {
+        if !self
+            .capabilities
+            .iter()
+            .any(|capability| matches!(capability, PluginCapability::Random))
+        {
+            return Err("plugin did not declare the random capability".to_owned());
+        }
+        if len as usize > WIRE_SHIM_RANDOM_BYTES_MAX {
+            return Err("plugin random-bytes request exceeds 256 bytes".to_owned());
+        }
+        let mut bytes = vec![0_u8; len as usize];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| "plugin random source is unavailable".to_owned())?;
+        Ok(bytes)
+    }
+}
+
 /// Validates one unpacked plugin package with the same authoritative rules the
 /// runtime uses at startup. Distribution installers call this before making a
 /// staged package visible.
@@ -1934,6 +2219,48 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             "plugin {} needs a component for its executable provider adapter",
             manifest.id
         )));
+    }
+    if let Some(wire_shim) = &manifest.contributions.wire_shim {
+        let has_wire_abi = semver::Version::parse(&manifest.wit_version)
+            .is_ok_and(|version| version >= semver::Version::new(0, 3, 0));
+        if manifest.wasm.is_none() || !has_wire_abi {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} wire shim contribution needs a component and WIT 0.3.0",
+                manifest.id
+            )));
+        }
+        let mut drivers = BTreeSet::new();
+        if wire_shim.drivers.is_empty() || wire_shim.drivers.len() > MAX_PLUGIN_SERVICE_DATA_ENDPOINTS
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} wire shim contribution needs a bounded driver list",
+                manifest.id
+            )));
+        }
+        for driver in &wire_shim.drivers {
+            if !safe_plugin_token(driver, MAX_PLUGIN_ID_BYTES) || !drivers.insert(driver) {
+                return Err(AppError::BadRequest(format!(
+                    "plugin {} wire shim contribution has an invalid or duplicate driver",
+                    manifest.id
+                )));
+            }
+        }
+        let mut protocols = BTreeSet::new();
+        if wire_shim.protocols.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} wire shim contribution needs at least one protocol",
+                manifest.id
+            )));
+        }
+        for protocol in &wire_shim.protocols {
+            if !matches!(protocol.as_str(), "openai" | "anthropic") || !protocols.insert(protocol)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "plugin {} wire shim contribution has an invalid or duplicate protocol",
+                    manifest.id
+                )));
+            }
+        }
     }
     if let Some(configuration) = &manifest.contributions.configuration {
         if configuration.schema.get("type").and_then(Value::as_str) != Some("object") {
@@ -3225,5 +3552,216 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("not allowed"));
+    }
+
+    fn wire_shim_manifest(wit_version: &str, wasm: Option<&str>) -> PluginManifest {
+        PluginManifest {
+            id: "claude-code-wire".to_owned(),
+            version: "1.0.0".to_owned(),
+            wit_version: wit_version.to_owned(),
+            wasm: wasm.map(str::to_owned),
+            capabilities: vec![PluginCapability::Random],
+            contributions: PluginContributions {
+                wire_shim: Some(WireShimContribution {
+                    drivers: vec!["anthropic-claude".to_owned()],
+                    protocols: vec!["anthropic".to_owned()],
+                }),
+                configuration: Some(PluginConfigurationContribution {
+                    schema: serde_json::json!({"type": "object"}),
+                    default: serde_json::json!({}),
+                }),
+                ..PluginContributions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn wire_shim_manifest_requires_component_and_wit_030() {
+        assert!(validate_manifest(&wire_shim_manifest("0.3.0", Some("plugin.wasm"))).is_ok());
+        // A wire shim without a component or on the 0.2 ABI is fail-closed.
+        assert!(validate_manifest(&wire_shim_manifest("0.3.0", None)).is_err());
+        assert!(validate_manifest(&wire_shim_manifest("0.2.0", Some("plugin.wasm"))).is_err());
+        assert!(validate_manifest(&wire_shim_manifest("0.4.0", Some("plugin.wasm"))).is_err());
+    }
+
+    #[test]
+    fn wire_shim_contribution_rejects_unknown_fields_and_bad_values() {
+        // Unknown fields are rejected by serde deny_unknown_fields.
+        let manifest: Result<PluginManifest, _> = serde_json::from_value(serde_json::json!({
+            "id": "claude-code-wire",
+            "version": "1.0.0",
+            "wit_version": "0.3.0",
+            "wasm": "plugin.wasm",
+            "contributions": {
+                "wire_shim": {
+                    "drivers": ["anthropic-claude"],
+                    "protocols": ["anthropic"],
+                    "models": ["claude-opus"]
+                }
+            }
+        }));
+        assert!(manifest.is_err());
+
+        for (drivers, protocols) in [
+            (vec![], vec!["anthropic"]),
+            (vec!["anthropic-claude"], vec![]),
+            (vec!["anthropic-claude", "anthropic-claude"], vec!["anthropic"]),
+            (vec!["Anthropic-Claude"], vec!["anthropic"]),
+            (vec!["anthropic-claude"], vec!["messages"]),
+            (vec!["anthropic-claude"], vec!["anthropic", "anthropic"]),
+        ] {
+            let mut manifest = wire_shim_manifest("0.3.0", Some("plugin.wasm"));
+            manifest.contributions.wire_shim = Some(WireShimContribution {
+                drivers: drivers.into_iter().map(str::to_owned).collect(),
+                protocols: protocols.into_iter().map(str::to_owned).collect(),
+            });
+            assert!(
+                validate_manifest(&manifest).is_err(),
+                "drivers/protocols must be rejected"
+            );
+        }
+
+        let mut multi = wire_shim_manifest("0.3.0", Some("plugin.wasm"));
+        multi.contributions.wire_shim = Some(WireShimContribution {
+            drivers: vec!["anthropic-claude".to_owned()],
+            protocols: vec!["anthropic".to_owned(), "openai".to_owned()],
+        });
+        assert!(validate_manifest(&multi).is_ok());
+    }
+
+    #[test]
+    fn random_capability_parses_and_stays_optional() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "claude-code-wire",
+            "version": "1.0.0",
+            "wit_version": "0.3.0",
+            "wasm": "plugin.wasm",
+            "capabilities": [{"kind": "random"}],
+            "contributions": {
+                "wire_shim": {"drivers": ["anthropic-claude"], "protocols": ["anthropic"]}
+            }
+        }))
+        .expect("random capability manifest");
+        assert!(
+            manifest
+                .capabilities
+                .iter()
+                .any(|capability| matches!(capability, PluginCapability::Random))
+        );
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[tokio::test]
+    async fn random_bytes_host_function_is_bounded_and_capability_gated() {
+        let mut state = HostState {
+            plugin_id: "wire-shim".to_owned(),
+            capabilities: Vec::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            runtime: tokio::runtime::Handle::current(),
+            kv: None,
+            limits: StoreLimitsBuilder::new().build(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+        };
+        // No capability: call-time check refuses even though the function
+        // would not have been linked for this component in the first place.
+        assert!(state.host_random_bytes(16).is_err());
+
+        state.capabilities = vec![PluginCapability::Random];
+        assert!(state.host_random_bytes(257).is_err());
+        assert_eq!(
+            state.host_random_bytes(WIRE_SHIM_RANDOM_BYTES_MAX as u32).unwrap().len(),
+            WIRE_SHIM_RANDOM_BYTES_MAX
+        );
+        assert_eq!(state.host_random_bytes(0).unwrap().len(), 0);
+        let first = state.host_random_bytes(16).unwrap();
+        let second = state.host_random_bytes(16).unwrap();
+        assert_eq!(first.len(), 16);
+        assert_ne!(first, second);
+    }
+
+    /// Minimal runtime whose only plugin declares a wire_shim contribution.
+    /// The component is absent: manifest validation guarantees one exists,
+    /// so tests can exercise the fail-closed guard that enforces it.
+    fn wire_shim_runtime(drivers: &[&str], protocols: &[&str]) -> PluginRuntime {
+        let mut manifest = wire_shim_manifest("0.3.0", Some("plugin.wasm"));
+        manifest.contributions.wire_shim = Some(WireShimContribution {
+            drivers: drivers.iter().map(|driver| driver.to_string()).collect(),
+            protocols: protocols.iter().map(|protocol| protocol.to_string()).collect(),
+        });
+        PluginRuntime {
+            plugins: Arc::new(vec![LoadedPlugin {
+                manifest,
+                component: None,
+                service_data_component: None,
+                wire_shim_component: None,
+                ui_modules: BTreeMap::new(),
+                configuration_validator: None,
+                routing_validator: None,
+                routing_fingerprint: String::new(),
+                #[cfg(feature = "experimental-plugin-revisions")]
+                identity: PluginPackageIdentity {
+                    component_sha256: None,
+                    provenance: None,
+                },
+            }]),
+            ..PluginRuntime::default()
+        }
+    }
+
+    #[test]
+    fn wire_shim_matches_only_declared_driver_and_protocol_pairs() {
+        let runtime = wire_shim_runtime(&["anthropic-claude"], &["anthropic"]);
+        assert!(runtime.wire_shim_matches("anthropic-claude", "anthropic"));
+        // Misses: undeclared protocol, undeclared or similarly-named drivers.
+        assert!(!runtime.wire_shim_matches("anthropic-claude", "openai"));
+        assert!(!runtime.wire_shim_matches("anthropic", "anthropic"));
+        assert!(!runtime.wire_shim_matches("openai", "anthropic"));
+
+        let runtime = wire_shim_runtime(&["anthropic-claude"], &["anthropic", "openai"]);
+        assert!(runtime.wire_shim_matches("anthropic-claude", "openai"));
+    }
+
+    #[tokio::test]
+    async fn wire_shim_finalize_fails_closed_when_the_component_is_unavailable() {
+        // A matching route whose component failed to load must reject the
+        // request; the unshimmed body is never forwarded as a fallback.
+        let runtime = wire_shim_runtime(&["anthropic-claude"], &["anthropic"]);
+        let context = types::RequestContext {
+            tenant_id: Uuid::new_v4().to_string(),
+            principal_id: "principal".to_owned(),
+            key_id: Uuid::new_v4().to_string(),
+            protocol: "anthropic".to_owned(),
+            model: "claude-opus-4-7".to_owned(),
+            config_json: "{}".to_owned(),
+        };
+        let error = runtime
+            .finalize_wire_shim(
+                "anthropic-claude",
+                "anthropic",
+                context,
+                "{}",
+                "{}",
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, AppError::Storage(_)));
+
+        // A route no plugin claims returns None (no hook, request proceeds).
+        let context = types::RequestContext {
+            tenant_id: Uuid::new_v4().to_string(),
+            principal_id: "principal".to_owned(),
+            key_id: Uuid::new_v4().to_string(),
+            protocol: "openai".to_owned(),
+            model: "gpt-5".to_owned(),
+            config_json: "{}".to_owned(),
+        };
+        let outcome = runtime
+            .finalize_wire_shim("openai", "openai", context, "{}", "{}", &BTreeMap::new())
+            .unwrap();
+        assert!(outcome.is_none());
     }
 }

@@ -18,8 +18,8 @@
     },
     "wit_version": {
       "type": "string",
-      "pattern": "^0\\.2\\.(0|[1-9][0-9]*)$",
-      "description": "Compatible Token Center 0.2 WIT contract version."
+      "pattern": "^0\\.[23]\\.(0|[1-9][0-9]*)$",
+      "description": "Compatible Token Center WIT contract version. 0.3.0 is required for the wire_shim contribution and the random capability."
     },
     "wasm": {
       "type": ["string", "null"],
@@ -49,6 +49,13 @@
             "additionalProperties": false,
             "required": ["kind"],
             "properties": { "kind": { "const": "kv" } }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": { "kind": { "const": "random" } },
+            "description": "Bounded CSPRNG access (host random-bytes, at most 256 bytes per call). Only linked into wire-shim-plugin components that declare it."
           },
           {
             "type": "object",
@@ -95,6 +102,29 @@
           "type": "boolean",
           "default": false,
           "description": "Contributes bounded post-auth model, route, or canonical request rewriting through the WIT traffic-policy hook."
+        },
+        "wire_shim": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["drivers", "protocols"],
+          "description": "Post-serialization wire-shim-v1 finalize hook (wire-shim-plugin WIT world, requires wit_version 0.3.0 and a component). The component receives the final serialized body and a credential-free header snapshot; its returned body is forwarded byte-for-byte and its set-headers are applied under a closed allowlist.",
+          "properties": {
+            "drivers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "description": "Provider driver ids the hook applies to, e.g. [\"anthropic-claude\"]."
+            },
+            "protocols": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["openai", "anthropic"] },
+              "description": "Public protocol names the hook applies to."
+            }
+          }
         },
         "configuration": {
           "type": ["object", "null"],

@@ -3,6 +3,91 @@ use super::*;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
 
+/// Closed allowlist for wire-shim set-headers: client-fingerprint shaping
+/// only. Credential, authority, routing, and hop-by-hop headers can never be
+/// set by a plugin; the core writes them after these are applied, so the
+/// core value always wins for anthropic-version/anthropic-beta.
+const WIRE_SHIM_ALLOWED_HEADERS: &[&str] = &[
+    "user-agent",
+    "x-app",
+    "x-client-request-id",
+    "x-claude-code-session-id",
+    "anthropic-beta",
+    "anthropic-version",
+    "x-stainless-lang",
+    "x-stainless-package-version",
+    "x-stainless-os",
+    "x-stainless-arch",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+    "x-stainless-retry-count",
+    "x-stainless-timeout",
+];
+const WIRE_SHIM_MAX_SET_HEADERS: usize = 32;
+const WIRE_SHIM_MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
+/// Validates plugin-returned set-headers against the closed allowlist. Any
+/// violation rejects the whole request (fail-closed). Header names are
+/// normalized to lowercase before allowlist matching; values reject CR/LF
+/// and cap at 8 KiB each.
+pub(super) fn validate_wire_shim_set_headers(
+    plugin_id: &str,
+    headers: &[(String, String)],
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, AppError> {
+    if headers.len() > WIRE_SHIM_MAX_SET_HEADERS {
+        return Err(AppError::Upstream(format!(
+            "plugin {plugin_id} wire shim returned too many set-headers"
+        )));
+    }
+    let mut validated = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {plugin_id} wire shim returned an invalid header name"
+            ))
+        })?;
+        if !WIRE_SHIM_ALLOWED_HEADERS.contains(&name.as_str()) {
+            return Err(AppError::Upstream(format!(
+                "plugin {plugin_id} wire shim returned a forbidden set-header"
+            )));
+        }
+        if value.len() > WIRE_SHIM_MAX_HEADER_VALUE_BYTES
+            || value.bytes().any(|byte| byte == b'\r' || byte == b'\n')
+        {
+            return Err(AppError::Upstream(format!(
+                "plugin {plugin_id} wire shim returned an invalid header value"
+            )));
+        }
+        let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {plugin_id} wire shim returned an invalid header value"
+            ))
+        })?;
+        validated.push((name, value));
+    }
+    Ok(validated)
+}
+
+/// Applies allowlist-validated wire-shim set-headers to one outbound attempt.
+/// The hook runs once per client request, so the host rewrites
+/// x-stainless-retry-count to the zero-based attempt index on retries when
+/// (and only when) the plugin set that header; every other plugin header is
+/// replayed unchanged on every attempt.
+fn apply_wire_shim_set_headers(
+    mut request: reqwest::RequestBuilder,
+    set_headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+    outbound_attempt: usize,
+) -> reqwest::RequestBuilder {
+    for (name, value) in set_headers {
+        if name.as_str() == "x-stainless-retry-count" {
+            request = request.header(name, outbound_attempt.saturating_sub(1).to_string());
+        } else {
+            request = request.header(name, value);
+        }
+    }
+    request
+}
+
 /// `timeout_seconds` is a request-local transport policy. Read it once from
 /// the immutable route snapshot so a later candidate cannot refresh an
 /// already-dispatched attempt's deadline. Persisted configs are schema
@@ -23,6 +108,7 @@ pub(super) async fn send_reqwest_proxy_route(
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     // Start the route timeout before endpoint validation/DNS. The deadline is
     // local to this attempt; the caller's frozen outer attempt budget remains
@@ -94,6 +180,13 @@ pub(super) async fn send_reqwest_proxy_route(
     request = request
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, accept);
+    // Wire-shim set-headers apply before every core-owned header so the
+    // credential, the kimi/copilot fixups, and the anthropic-version/beta
+    // merge below still win. The headers were allowlist-validated when the
+    // hook result was ingested.
+    if let Some(set_headers) = &route.wire_shim_set_headers {
+        request = apply_wire_shim_set_headers(request, set_headers, outbound_attempt);
+    }
     let credential_now = credential_application_now();
     request = route
         .route
@@ -118,6 +211,11 @@ pub(super) async fn send_reqwest_proxy_route(
             request,
             headers,
             route.route.driver == crate::oauth::claude::PROVIDER_DRIVER,
+            // A wire-shimmed route never forwards client-supplied fingerprint
+            // headers (anthropic-*/x-claude-code-*); the plugin's validated
+            // set-headers above are the only source, and the core version/beta
+            // merge still applies after them.
+            route.wire_shim_set_headers.is_some(),
         );
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
@@ -200,6 +298,118 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn wire_shim_set_headers_allowlist_accepts_fingerprint_headers_only() {
+        // Every allowlisted fingerprint header is accepted.
+        let allowed: Vec<(String, String)> = WIRE_SHIM_ALLOWED_HEADERS
+            .iter()
+            .map(|name| (name.to_string(), "1".to_string()))
+            .collect();
+        assert_eq!(
+            validate_wire_shim_set_headers("wire", &allowed)
+                .unwrap()
+                .len(),
+            WIRE_SHIM_ALLOWED_HEADERS.len()
+        );
+
+        // Credential, authority, routing, hop-by-hop, and unknown headers are
+        // all rejected (fail-closed).
+        for forbidden in [
+            "authorization",
+            "x-api-key",
+            "host",
+            "content-length",
+            "cookie",
+            "connection",
+            "transfer-encoding",
+            "keep-alive",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "upgrade",
+            "te",
+            "trailer",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "forwarded",
+            "x-custom-fingerprint",
+            "anthropic-dangerous",
+        ] {
+            let headers = vec![(forbidden.to_owned(), "1".to_owned())];
+            assert!(
+                validate_wire_shim_set_headers("wire", &headers).is_err(),
+                "{forbidden} must be rejected"
+            );
+        }
+
+        // Header names are normalized to lowercase before allowlist matching.
+        let validated =
+            validate_wire_shim_set_headers("wire", &[("User-Agent".into(), "cli".into())])
+                .unwrap();
+        assert_eq!(validated[0].0.as_str(), "user-agent");
+    }
+
+    #[test]
+    fn wire_shim_set_headers_reject_malformed_names_values_and_excess() {
+        assert!(
+            validate_wire_shim_set_headers("wire", &[("bad header".into(), "1".into())]).is_err()
+        );
+        for value in ["a\rb", "a\nb"] {
+            assert!(
+                validate_wire_shim_set_headers("wire", &[("user-agent".into(), value.into())])
+                    .is_err()
+            );
+        }
+        let oversized = "a".repeat(WIRE_SHIM_MAX_HEADER_VALUE_BYTES + 1);
+        assert!(
+            validate_wire_shim_set_headers("wire", &[("user-agent".into(), oversized)]).is_err()
+        );
+        let at_limit = "a".repeat(WIRE_SHIM_MAX_HEADER_VALUE_BYTES);
+        assert!(
+            validate_wire_shim_set_headers("wire", &[("user-agent".into(), at_limit)]).is_ok()
+        );
+        let too_many: Vec<(String, String)> = (0..=WIRE_SHIM_MAX_SET_HEADERS)
+            .map(|_| ("user-agent".to_owned(), "1".to_owned()))
+            .collect();
+        assert!(validate_wire_shim_set_headers("wire", &too_many).is_err());
+    }
+
+    #[test]
+    fn wire_shim_retry_count_tracks_the_zero_based_attempt_index() {
+        let headers = validate_wire_shim_set_headers(
+            "wire",
+            &[
+                ("user-agent".into(), "claude-cli/2.1.258 (external, sdk-cli)".into()),
+                ("x-stainless-retry-count".into(), "0".into()),
+            ],
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+        for (attempt, expected) in [(1, "0"), (2, "1"), (5, "4")] {
+            let request = apply_wire_shim_set_headers(
+                client.post("http://localhost/messages"),
+                &headers,
+                attempt,
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.headers()["x-stainless-retry-count"], expected);
+            assert_eq!(
+                request.headers()["user-agent"],
+                "claude-cli/2.1.258 (external, sdk-cli)"
+            );
+        }
+
+        // Without a plugin-set retry-count the host never synthesizes one.
+        let headers =
+            validate_wire_shim_set_headers("wire", &[("user-agent".into(), "cli".into())])
+                .unwrap();
+        let request =
+            apply_wire_shim_set_headers(client.post("http://localhost/messages"), &headers, 3)
+                .build()
+                .unwrap();
+        assert!(request.headers().get("x-stainless-retry-count").is_none());
+    }
 
     #[test]
     fn configured_timeout_obeys_the_provider_schema_bounds() {

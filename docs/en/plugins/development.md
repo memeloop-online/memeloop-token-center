@@ -127,7 +127,7 @@ The Worker owns scheduling, lease fencing, timeout, persisted backoff and last-g
 
 Rules:
 
-- `id` / provider IDs are 1–64 lowercase letters, digits, or hyphens; `version` is SemVer; `wit_version` must be compatible with `0.2.x`; unknown manifest fields are rejected.
+- `id` / provider IDs are 1–64 lowercase letters, digits, or hyphens; `version` is SemVer; `wit_version` must satisfy `>=0.2.0, <0.4.0` (the `wire_shim` contribution requires `0.3.0`, declared in [wire-shim.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/wire-shim.wit)); unknown manifest fields are rejected.
 - A declarative-only Provider/OAuth package can set `"wasm": null`; a package declaring `traffic_policy` must include a component.
 - Configuration Schema uses a restricted declarative subset of Draft 2020-12: bounded local `#/*` references are allowed, remote/file references and `writeOnly` are forbidden, and size, depth, and node counts are bounded.
 - `http` host calls allow only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE`, and only declared origins; requests and responses are each bounded.

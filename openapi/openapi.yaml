@@ -7758,6 +7758,25 @@ components:
               maxItems: 32
               description: Worker-collected typed JSON feeds using a capability-audited HTTPS URL or signed component adapter.
               items: { $ref: '#/components/schemas/PluginServiceDataEndpoint' }
+            wire_shim:
+              type: [object, 'null']
+              additionalProperties: false
+              required: [drivers, protocols]
+              description: Post-serialization wire-shim-v1 finalize hook (wire-shim-plugin WIT world, requires wit_version 0.3.0 and a component). The component receives the final serialized body plus a credential-free header snapshot; its returned body is forwarded byte-for-byte and its set-headers are applied under a closed fingerprint-header allowlist. Any hook error rejects the request (fail-closed).
+              properties:
+                drivers:
+                  type: array
+                  minItems: 1
+                  maxItems: 32
+                  uniqueItems: true
+                  items: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z0-9-]+$' }
+                  description: Provider driver ids the hook applies to, e.g. ["anthropic-claude"].
+                protocols:
+                  type: array
+                  minItems: 1
+                  uniqueItems: true
+                  items: { type: string, enum: [openai, anthropic] }
+                  description: Public protocol names the hook applies to.
     PluginOperatorUiContribution:
       type: object
       additionalProperties: false

@@ -44,7 +44,7 @@ pub(super) use readiness::{
 pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxyRouteResponse, ProxySendError, TransportFailureKind,
+    ProxyRouteResponse, ProxySendError, TransportFailureKind, WireShimPlan,
 };
 
 pub(super) fn plan_proxy_route(
@@ -59,6 +59,7 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 request_id,
                 request_json,
+                headers,
                 codex_multi_agent_v2_request,
             },
         route,
@@ -152,6 +153,18 @@ pub(super) fn plan_proxy_route(
     let codex_store_disabled =
         codex_plan.is_some() && forwarded_json.get("store").and_then(Value::as_bool) == Some(false);
     let codex_session_id = codex_plan.map(|plan| plan.session_id);
+    let wire_shim = plan_wire_shim(
+        state,
+        headers,
+        &route.driver,
+        protocol,
+        key,
+        model,
+        upstream_stream,
+        responses_chat.is_some(),
+        is_codex,
+        component_context.is_some(),
+    )?;
     Ok(PlannedProxyRoute {
         route,
         forwarded_json,
@@ -162,7 +175,99 @@ pub(super) fn plan_proxy_route(
         codex_session_id,
         component_context,
         responses_chat,
+        wire_shim,
     })
+}
+
+/// The wire-shim hook applies to the generic reqwest HTTP path only: Codex
+/// transport and component providers replace the serialized body afterwards,
+/// so a byte-exact finalize would be silently dropped on those paths.
+#[allow(clippy::too_many_arguments)]
+fn plan_wire_shim(
+    state: &AppState,
+    headers: &HeaderMap,
+    driver: &str,
+    protocol: Protocol,
+    key: &AuthenticatedKey,
+    model: &str,
+    upstream_stream: bool,
+    responses_chat: bool,
+    is_codex: bool,
+    is_component: bool,
+) -> Result<Option<WireShimPlan>, AppError> {
+    if is_codex || is_component || !state.plugins.wire_shim_matches(driver, protocol.name()) {
+        return Ok(None);
+    }
+    let headers_json =
+        wire_shim_headers_snapshot(headers, driver, protocol, upstream_stream, responses_chat)?;
+    Ok(Some(WireShimPlan {
+        tenant_id: key.tenant_id,
+        context: RequestContext {
+            tenant_id: key.tenant_id.to_string(),
+            principal_id: key.principal_id.to_string(),
+            key_id: key.key_id.to_string(),
+            protocol: protocol.name().to_owned(),
+            model: model.to_owned(),
+            // Replaced with the resolved plugin configuration at
+            // materialization time (global default plus tenant override).
+            config_json: "{}".to_owned(),
+        },
+        driver: driver.to_owned(),
+        protocol: protocol.name().to_owned(),
+        headers_json,
+    }))
+}
+
+const MAX_WIRE_SHIM_HEADERS_SNAPSHOT_BYTES: usize = 128 * 1024;
+
+/// Snapshot of the non-sensitive headers the host is about to send upstream.
+/// Credential headers (authorization/x-api-key/cookie) never enter it; the
+/// core-owned content-type/accept reflect the effective outbound values.
+fn wire_shim_headers_snapshot(
+    headers: &HeaderMap,
+    driver: &str,
+    protocol: Protocol,
+    upstream_stream: bool,
+    responses_chat: bool,
+) -> Result<String, AppError> {
+    let accept = if (responses_chat && upstream_stream)
+        || (driver == crate::provider::CBCNX_PROVIDER_DRIVER
+            && matches!(protocol, Protocol::OpenAiResponses)
+            && upstream_stream)
+    {
+        "text/event-stream"
+    } else {
+        headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+    };
+    let mut snapshot: std::collections::BTreeMap<String, String> = Default::default();
+    for (name, value) in headers {
+        let name = name.as_str();
+        if matches!(name, "authorization" | "x-api-key" | "cookie") {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        snapshot
+            .entry(name.to_owned())
+            .and_modify(|existing: &mut String| {
+                existing.push_str(", ");
+                existing.push_str(value);
+            })
+            .or_insert_with(|| value.to_owned());
+    }
+    snapshot.insert("content-type".to_owned(), "application/json".to_owned());
+    snapshot.insert("accept".to_owned(), accept.to_owned());
+    let json = serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?;
+    if json.len() > MAX_WIRE_SHIM_HEADERS_SNAPSHOT_BYTES {
+        return Err(AppError::BadRequest(
+            "request headers exceed the wire-shim snapshot limit".into(),
+        ));
+    }
+    Ok(json)
 }
 
 pub(super) async fn materialize_proxy_route(
@@ -171,7 +276,7 @@ pub(super) async fn materialize_proxy_route(
 ) -> Result<PreparedProxyRoute, AppError> {
     let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
     // Allocate temporary serialization/adapter work before cloning any payload.
-    let temporary_bytes = if planned.component_context.is_some() {
+    let temporary_bytes = if planned.component_context.is_some() || planned.wire_shim.is_some() {
         64 * 1024 * 1024 + encoded_length.saturating_mul(6)
     } else {
         encoded_length.saturating_mul(2)
@@ -201,6 +306,51 @@ pub(super) async fn materialize_proxy_route(
     let mut forwarded_body = Vec::with_capacity(encoded_length);
     serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
         .map_err(|_| AppError::Internal)?;
+    // Post-serialization wire-shim hook. The returned body replaces the
+    // serialized request byte-for-byte; the host never parses or re-encodes
+    // it again. Any plugin error or allowlist violation rejects the request
+    // (fail-closed). The hook ran once here, so retries of this prepared
+    // route reuse the same body and plugin headers (a plugin-set
+    // x-client-request-id stays stable across attempts).
+    // Archive/idempotency ordering (design note): the archived request body
+    // is frozen from the pre-hook canonical body during archive admission in
+    // proxy.rs, which runs before materialization, so the shimmed bytes are
+    // upstream-only and never alter archive or dedup semantics.
+    let mut wire_shim_set_headers = None;
+    if let Some(plan) = planned.wire_shim {
+        let configurations = state
+            .plugins
+            .resolved_traffic_configurations(plan.tenant_id)
+            .await?;
+        let body = String::from_utf8(forwarded_body).map_err(|_| AppError::Internal)?;
+        let plugins = state.plugins.clone();
+        let outcome = crate::api::plugin_execution::run(
+            state.metrics.clone(),
+            crate::api::plugin_execution::Phase::WireShimFinalize,
+            move || {
+                plugins.finalize_wire_shim(
+                    &plan.driver,
+                    &plan.protocol,
+                    plan.context,
+                    &body,
+                    &plan.headers_json,
+                    &configurations,
+                )
+            },
+        )
+        .await?;
+        let Some(outcome) = outcome else {
+            // The matched-plugin set is frozen at load time, so a plan implies
+            // a hook; guard anyway rather than silently sending unshimmed.
+            return Err(AppError::Internal);
+        };
+        let validated = http::validate_wire_shim_set_headers(
+            &outcome.plugin_id,
+            &outcome.set_headers,
+        )?;
+        wire_shim_set_headers = Some(validated);
+        forwarded_body = outcome.request_json.into_bytes();
+    }
     Ok(PreparedProxyRoute {
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
@@ -210,6 +360,7 @@ pub(super) async fn materialize_proxy_route(
         codex_session_id: planned.codex_session_id,
         component_request,
         responses_chat: planned.responses_chat,
+        wire_shim_set_headers,
     })
 }
 
@@ -240,7 +391,8 @@ pub(super) async fn send_proxy_route(
         )
         .await;
     }
-    http::send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
+    http::send_reqwest_proxy_route(state, headers, protocol, request_id, route, outbound_attempt)
+        .await
 }
 
 pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {

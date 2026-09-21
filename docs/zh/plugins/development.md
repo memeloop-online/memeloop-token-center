@@ -127,7 +127,7 @@ Worker 负责调度、租约隔离、超时、持久退避和 last-good 存储�
 
 规则要点：
 
-- `id` / provider id 为 1–64 位小写字母、数字或连字符；`version` 为 SemVer；`wit_version` 必须与 `0.2.x` 兼容；未知清单字段会被拒绝。
+- `id` / provider id 为 1–64 位小写字母、数字或连字符；`version` 为 SemVer；`wit_version` 须满足 `>=0.2.0, <0.4.0`（`wire_shim` contribution 要求 `0.3.0`，定义见 [wire-shim.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/wire-shim.wit)）；未知清单字段会被拒绝。
 - 纯声明式 Provider/OAuth 包可设 `"wasm": null`；声明了 `traffic_policy` 必须包含组件。
 - 配置 Schema 使用 Draft 2020-12 的受限声明子集：允许有界本地 `#/*` 引用，禁止远程/文件引用与 `writeOnly`，大小、深度与节点数有上限。
 - `http` host 调用只允许 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，仅访问声明的 origin，请求与响应各有界。

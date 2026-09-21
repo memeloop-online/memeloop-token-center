@@ -1024,6 +1024,7 @@ async fn proxy_with_identity_and_conversation_spool(
         protocol,
         request_id,
         request_json: &request_json,
+        headers: &headers,
         codex_multi_agent_v2_request,
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
@@ -1060,6 +1061,7 @@ async fn proxy_with_identity_and_conversation_spool(
                     protocol,
                     request_id,
                     request_json: &request_json,
+                    headers: &headers,
                     codex_multi_agent_v2_request,
                 },
                 original_body_length: body.len(),
@@ -1075,6 +1077,7 @@ async fn proxy_with_identity_and_conversation_spool(
         protocol,
         request_id,
         request_json: &request_json,
+        headers: &headers,
         codex_multi_agent_v2_request,
     };
     let primary = route_plan.primary_route();

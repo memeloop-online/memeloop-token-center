@@ -20,15 +20,23 @@ pub(super) fn apply_request_headers(
     mut request: RequestBuilder,
     inbound: &HeaderMap,
     requires_oauth_capability: bool,
+    strip_client_fingerprints: bool,
 ) -> RequestBuilder {
-    for (name, value) in inbound {
-        let name = name.as_str();
-        let forward = (name.starts_with("anthropic-")
-            && name != "anthropic-version"
-            && name != "anthropic-beta")
-            || name.starts_with("x-claude-code-");
-        if forward {
-            request = request.header(name, value);
+    // Wire-shimmed routes strip every client-supplied fingerprint header
+    // (anthropic-* extras and x-claude-code-*): the upstream must see only
+    // what the validated plugin set-headers and the core merge produce.
+    // user-agent, x-app, x-client-request-id, x-stainless-* and x-api-key are
+    // never forwarded by this transport in the first place.
+    if !strip_client_fingerprints {
+        for (name, value) in inbound {
+            let name = name.as_str();
+            let forward = (name.starts_with("anthropic-")
+                && name != "anthropic-version"
+                && name != "anthropic-beta")
+                || name.starts_with("x-claude-code-");
+            if forward {
+                request = request.header(name, value);
+            }
         }
     }
 
@@ -128,6 +136,7 @@ mod tests {
             reqwest::Client::new().post("http://localhost/messages"),
             &headers,
             true,
+            false,
         )
         .build()
         .unwrap();
@@ -138,6 +147,39 @@ mod tests {
         );
         assert_eq!(request.headers()["x-claude-code-agent-id"], "agent-a");
         assert!(request.headers().get("x-other").is_none());
+    }
+
+    #[test]
+    fn wire_shimmed_routes_strip_client_fingerprint_headers_but_keep_core_merge() {
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        headers.insert("anthropic-dangerous", HeaderValue::from_static("spoofed"));
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("client-claimed"),
+        );
+        headers.insert("x-anthropic-custom", HeaderValue::from_static("spoofed"));
+
+        let request = apply_request_headers(
+            reqwest::Client::new().post("http://localhost/messages"),
+            &headers,
+            true,
+            true,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+        assert_eq!(
+            request.headers()["anthropic-beta"],
+            "prompt-caching-2024-07-31,oauth-2025-04-20"
+        );
+        assert!(request.headers().get("anthropic-dangerous").is_none());
+        assert!(request.headers().get("x-claude-code-session-id").is_none());
+        assert!(request.headers().get("x-anthropic-custom").is_none());
     }
 
     #[test]

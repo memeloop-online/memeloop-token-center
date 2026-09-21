@@ -9,6 +9,23 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    /// Allowlist-validated wire-shim set-headers. When present, a wire-shim
+    /// hook rewrote this route's body and the send path strips inbound client
+    /// fingerprint headers before applying these.
+    pub(super) wire_shim_set_headers:
+        Option<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>>,
+}
+
+/// Frozen wire-shim hook input for one planned route. Captured once at
+/// planning so a later candidate refresh cannot change what the component
+/// sees; the hook itself runs exactly once when the route is materialized.
+pub(in crate::api::proxy) struct WireShimPlan {
+    pub(super) tenant_id: Uuid,
+    pub(super) context: RequestContext,
+    pub(super) driver: String,
+    pub(super) protocol: String,
+    /// JSON object snapshot of the non-sensitive outbound headers.
+    pub(super) headers_json: String,
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
@@ -21,6 +38,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(super) component_context: Option<RequestContext>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    pub(super) wire_shim: Option<WireShimPlan>,
 }
 
 impl PlannedProxyRoute {
@@ -57,6 +75,9 @@ pub(in crate::api::proxy) struct ProxyRequestContext<'a> {
     pub(in crate::api::proxy) protocol: Protocol,
     pub(in crate::api::proxy) request_id: Uuid,
     pub(in crate::api::proxy) request_json: &'a Value,
+    /// Downstream client headers. Used only to build the credential-free
+    /// snapshot handed to a wire-shim finalize hook.
+    pub(in crate::api::proxy) headers: &'a HeaderMap,
     /// Computed once after policy rewriting: official Codex client plus an
     /// actual MultiAgentV2 collaboration shape.
     pub(in crate::api::proxy) codex_multi_agent_v2_request: bool,

@@ -302,6 +302,7 @@ mod tests {
                 manifest,
                 component: None,
                 service_data_component: None,
+                wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: Some(validator),
                 routing_validator: None,
