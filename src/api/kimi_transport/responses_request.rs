@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// compaction concept, so the bridge must ask for the checkpoint summary in
 /// plain task language. Wording mirrors the client-side compaction prompt so
 /// the model produces a handoff summary the client can resume from.
-pub(in crate::api) const COMPACTION_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Review the conversation history above and create a handoff summary for another LLM that will resume the task. Include: current progress and key decisions made; important context, constraints, or user preferences; what remains to be done (clear next steps); any critical data, examples, or references needed to continue. Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Output only the summary text itself, with no preamble, headings commentary, or tool calls.";
+pub(in crate::api) const COMPACTION_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Review the conversation history above and create a handoff summary for another LLM that will resume the task. Include: current progress and key decisions made; important context, constraints, or user preferences; what remains to be done (clear next steps); any critical data, examples, or references needed to continue. Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Output only the summary text itself, with no preamble, headings, commentary, or tool calls.";
 
 #[derive(Clone)]
 pub(in crate::api) struct ToolIdentity {
