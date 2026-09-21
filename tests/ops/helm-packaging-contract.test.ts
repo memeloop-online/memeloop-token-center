@@ -158,7 +158,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const valuesSchema = JSON.parse(read('charts/memeloop-token-center/values.schema.json'));
     assert.equal(valuesSchema.properties.migration.properties.schemaVersion.const, sqlite);
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
-    count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:v0.1.2"', 4);
+    count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:v0.1.3"', 4);
     count('digest', `image: "ghcr.io/memeloop-online/memeloop-token-center@${reviewed}"`, 4); lacks('digest', 'must-not-render');
     for (const deployment of parseAllDocuments(output.retainedWorker!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
