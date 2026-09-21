@@ -340,6 +340,34 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     assert!(!catalog.supports_responses_via_chat_v1("openai-codex"));
     assert!(!catalog.supports_codex_multi_agent_v2("http-json"));
 
+    let claude = catalog.get("anthropic-claude").expect("Claude provider");
+    assert!(claude.protocols.iter().any(|protocol| protocol == "openai"));
+    assert!(
+        claude
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "anthropic")
+    );
+    assert!(catalog.supports_responses_via_anthropic_messages_v1("anthropic-claude"));
+    assert!(catalog.supports_codex_multi_agent_v2("anthropic-claude"));
+    let claude_capabilities = claude
+        .codex_model_capabilities
+        .as_ref()
+        .expect("Claude Codex model capabilities");
+    assert_eq!(
+        claude_capabilities.apply_patch_tool_type.as_deref(),
+        Some("freeform")
+    );
+    assert_eq!(
+        claude_capabilities.input_modalities,
+        vec!["text".to_owned(), "image".to_owned()]
+    );
+    assert!(claude_capabilities.supported_reasoning_levels.is_empty());
+    assert_eq!(claude_capabilities.default_reasoning_level, None);
+    assert!(!claude_capabilities.include_skills_usage_instructions);
+    assert!(!claude_capabilities.include_plugin_usage_instructions);
+    assert!(!claude_capabilities.include_apps_usage_instructions);
+
     let mut strict_chat = catalog.get("kimi-oauth").unwrap().clone();
     strict_chat.id = "strict-chat-agent".to_owned();
     strict_chat.request_compatibility.responses_via_chat_dialect =
