@@ -1,0 +1,74 @@
+// token-center WIT 0.3.0: wire-shim ABI. The 0.2.0 package in
+// token-center.wit is frozen so components built against it keep linking
+// byte-for-byte; this package adds the bounded random-bytes host function
+// and the post-serialization wire-shim-v1 finalize hook. Load this file
+// together with token-center.wit (the combined world references the frozen
+// 0.2.0 interfaces).
+package memeloop:token-center@0.3.0;
+
+interface types {
+    /// Same shape as the 0.2.0 request-context; redeclared so the wire-shim
+    /// ABI is self-contained within this package.
+    record request-context {
+        tenant-id: string,
+        principal-id: string,
+        key-id: string,
+        protocol: string,
+        model: string,
+        config-json: string,
+    }
+
+    /// Result of the wire-shim finalize hook. The host forwards
+    /// request-json to the upstream byte-for-byte; it is never parsed or
+    /// re-serialized by the host after this call returns.
+    record finalize-result {
+        request-json: string,
+        set-headers: list<tuple<string, string>>,
+    }
+}
+
+interface host {
+    log: func(level: string, message: string);
+    kv-get: func(key: string) -> result<option<list<u8>>, string>;
+    kv-put: func(key: string, value: list<u8>) -> result<_, string>;
+    http-request: func(method: string, url: string, headers-json: string, body: list<u8>) -> result<list<u8>, string>;
+    /// Bounded CSPRNG bytes for request shaping (UUIDs, nonces). len is
+    /// capped at 256 bytes. The host only links this function when the
+    /// package manifest declares the {"kind":"random"} capability;
+    /// importing it without the declaration fails component instantiation.
+    random-bytes: func(len: u32) -> result<list<u8>, string>;
+}
+
+/// Post-serialization wire-format hook. The host invokes finalize once per
+/// admitted route after the core finished all body rewriting and final
+/// serialization, and before the request is sent. request-json is the final
+/// serialized body text; headers-json is a JSON object snapshot of the
+/// non-sensitive headers the host is about to send (credential headers such
+/// as authorization/x-api-key/cookie are never included).
+///
+/// Fail-closed contract: a trap or an error result rejects the whole client
+/// request; the host never falls back to sending the unfinalized body.
+/// set-headers is validated against a closed allowlist (fingerprint headers
+/// only) before being applied on the send path; credential and hop-by-hop
+/// headers are rejected and reject the request.
+interface wire-shim-v1 {
+    use types.{request-context, finalize-result};
+
+    finalize: func(context: request-context, request-json: string, headers-json: string) -> result<finalize-result, string>;
+}
+
+world wire-shim-plugin {
+    import host;
+    export wire-shim-v1;
+}
+
+/// Authoring world for one package that contributes every hook family. The
+/// host still links only the interface each execution path calls.
+world combined-plugin {
+    import host;
+    export memeloop:token-center/traffic-policy@0.2.0;
+    export memeloop:token-center/upstream-provider@0.2.0;
+    export memeloop:token-center/service-data-v1@0.2.0;
+    export wire-shim-v1;
+}
+
