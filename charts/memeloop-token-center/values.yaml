@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/memeloop-online/memeloop-token-center
-  tag: "v0.1.2"
+  tag: "v0.1.3"
   # When non-empty, digest takes precedence over tag and all workloads render
   # repository@digest. Keep tag populated as the explicit fallback for local
   # development and registries that do not provide a reviewed digest.
