@@ -1,0 +1,63 @@
+{
+  "id": "claude-code-wire",
+  "version": "1.0.0",
+  "wit_version": "0.3.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [
+    { "kind": "random" }
+  ],
+  "contributions": {
+    "wire_shim": {
+      "drivers": ["anthropic-claude"],
+      "protocols": ["anthropic"]
+    },
+    "configuration": {
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "title": "Enable wire shim",
+            "description": "Fail-closed: disabling rejects anthropic-claude requests instead of sending them unrewritten."
+          },
+          "claude_code_version": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+            "default": "2.1.258",
+            "title": "Claude Code version",
+            "description": "Version string embedded in the user-agent and cc_version billing fingerprint."
+          },
+          "entrypoint": {
+            "type": "string",
+            "default": "sdk-cli",
+            "title": "Entrypoint",
+            "description": "cc_entrypoint billing value and user-agent entrypoint segment."
+          },
+          "device_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Device ID (optional)",
+            "description": "64 lowercase hex characters, matching the Claude account's ~/.claude.json userID. Written into metadata.user_id together with account_uuid."
+          },
+          "account_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Account UUID (optional)",
+            "description": "The Claude account UUID. Must be configured together with device_id."
+          },
+          "stainless_lang": { "type": "string", "default": "js", "title": "x-stainless-lang" },
+          "stainless_package_version": { "type": "string", "default": "0.60.0", "title": "x-stainless-package-version", "description": "Anthropic TypeScript SDK version bundled by the pinned Claude Code release." },
+          "stainless_os": { "type": "string", "default": "MacOS", "title": "x-stainless-os" },
+          "stainless_arch": { "type": "string", "default": "arm64", "title": "x-stainless-arch" },
+          "stainless_runtime": { "type": "string", "default": "node", "title": "x-stainless-runtime" },
+          "stainless_runtime_version": { "type": "string", "default": "v22.14.0", "title": "x-stainless-runtime-version" },
+          "stainless_timeout": { "type": "string", "default": "600", "title": "x-stainless-timeout" }
+        }
+      },
+      "default": {}
+    }
+  }
+}

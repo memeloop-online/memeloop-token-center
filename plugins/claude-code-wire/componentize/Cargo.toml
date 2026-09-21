@@ -1,0 +1,12 @@
+[package]
+name = "componentize"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+# Standalone helper: turns the wasm32-unknown-unknown core module (which
+# carries the wit-bindgen component-type section) into a component binary.
+[workspace]
+
+[dependencies]
+wit-component = "=0.247.0"

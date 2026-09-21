@@ -24,7 +24,6 @@
 //! Fail-closed: any input that cannot be rewritten safely (missing
 //! model/max_tokens, unsupported system shape, invalid configuration)
 //! returns Err and the host rejects the request.
-
 wit_bindgen::generate!({
     world: "memeloop:token-center/wire-shim-plugin@0.3.0",
     // Plugin-local copy: two versions of the memeloop:token-center package
@@ -33,6 +32,11 @@ wit_bindgen::generate!({
     path: "wit",
 });
 
+use std::borrow::ToOwned;
+use std::format;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
 use exports::memeloop::token_center0_3_0::wire_shim_v1::FinalizeResult;
 #[cfg(target_arch = "wasm32")]
 use exports::memeloop::token_center0_3_0::wire_shim_v1::Guest;

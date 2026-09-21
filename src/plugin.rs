@@ -3764,4 +3764,91 @@ mod tests {
             .unwrap();
         assert!(outcome.is_none());
     }
+
+    /// End-to-end: load the checked-in claude-code-wire component and verify
+    /// the exact wire format it produces for an anthropic-claude route.
+    #[tokio::test]
+    async fn wire_shim_real_component_emits_claude_code_wire_format() {
+        let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/claude-code-wire");
+        let wasm = package.join("plugin.wasm");
+        if !wasm.exists() {
+            eprintln!("skipping: plugins/claude-code-wire/plugin.wasm not built (run build.sh)");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("plugin.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let plugin_dir = directory.path().join("claude-code-wire");
+        fs::create_dir(&plugin_dir).unwrap();
+        fs::copy(package.join("plugin.json"), plugin_dir.join("plugin.json")).unwrap();
+        fs::copy(&wasm, plugin_dir.join("plugin.wasm")).unwrap();
+        let runtime = PluginRuntime::load(directory.path().to_str(), database).unwrap();
+
+        let request = r#"{"model":"claude-sonnet-4-5","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"custom system prompt"}],"messages":[{"role":"user","content":"hello world, this is a prompt"}]}"#;
+        let run = |tenant: &str, key: &str| {
+            let context = types::RequestContext {
+                tenant_id: tenant.to_owned(),
+                principal_id: "principal".to_owned(),
+                key_id: key.to_owned(),
+                protocol: "anthropic".to_owned(),
+                model: "claude-sonnet-4-5".to_owned(),
+                config_json: "{}".to_owned(),
+            };
+            runtime
+                .finalize_wire_shim("anthropic-claude", "anthropic", context, request, "{}", &BTreeMap::new())
+                .unwrap()
+                .expect("wire shim applies to anthropic-claude")
+        };
+        let outcome = run("tenant-a", "key-a");
+        let body: Value = serde_json::from_str(&outcome.request_json).unwrap();
+        let system = body["system"].as_array().unwrap();
+        let billing = system[0]["text"].as_str().unwrap();
+        // The fingerprint 2d2 belongs to the prompt "hello world, this is a
+        // prompt" under version 2.1.258 (cross-validated against pi-black).
+        assert!(
+            billing.starts_with("x-anthropic-billing-header: cc_version=2.1.258.2d2; cc_entrypoint=sdk-cli; cch="),
+            "unexpected billing block: {billing}"
+        );
+        assert!(!billing.contains("cch=00000"), "cch placeholder must be patched");
+        assert_eq!(
+            system[1]["text"].as_str().unwrap(),
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+        );
+        assert_eq!(system[2]["text"].as_str().unwrap(), "custom system prompt");
+        assert_eq!(body["max_tokens"], serde_json::json!(1024));
+        assert_eq!(body["stream"], serde_json::json!(true));
+
+        let headers: BTreeMap<_, _> = outcome.set_headers.iter().cloned().collect();
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("claude-cli/2.1.258 (external, sdk-cli)")
+        );
+        assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
+        assert_eq!(headers.get("x-stainless-lang").map(String::as_str), Some("js"));
+        Uuid::parse_str(headers.get("x-client-request-id").unwrap()).unwrap();
+        let session = headers.get("x-claude-code-session-id").unwrap().clone();
+        Uuid::parse_str(&session).unwrap();
+
+        // The billing block (incl. cch) and the session are deterministic per
+        // key; the per-request client id is not.
+        let again = run("tenant-a", "key-a");
+        let body_again: Value = serde_json::from_str(&again.request_json).unwrap();
+        assert_eq!(body_again["system"][0]["text"], body["system"][0]["text"]);
+        let headers_again: BTreeMap<_, _> = again.set_headers.iter().cloned().collect();
+        assert_eq!(headers_again.get("x-claude-code-session-id"), Some(&session));
+        assert_ne!(
+            headers_again.get("x-client-request-id"),
+            headers.get("x-client-request-id")
+        );
+
+        let other = run("tenant-a", "key-b");
+        let headers_other: BTreeMap<_, _> = other.set_headers.iter().cloned().collect();
+        assert_ne!(headers_other.get("x-claude-code-session-id"), Some(&session));
+    }
 }
