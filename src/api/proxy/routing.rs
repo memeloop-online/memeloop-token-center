@@ -182,6 +182,18 @@ pub(super) fn plan_proxy_route(
 /// The wire-shim hook applies to the generic reqwest HTTP path only: Codex
 /// transport and component providers replace the serialized body afterwards,
 /// so a byte-exact finalize would be silently dropped on those paths.
+/// Effective wire-shim runtime for this request. When the
+/// experimental-plugin-revisions pin taken at proxy entry carries an
+/// application-plugin snapshot, the hook set and plugin configuration resolve
+/// against that snapshot; otherwise the load-time baseline is used.
+fn wire_shim_runtime(state: &AppState) -> crate::plugin::PluginRuntime {
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(snapshot) = &state.pinned_application_plugins {
+        return snapshot.runtime.runtime().clone();
+    }
+    state.plugins.clone()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_wire_shim(
     state: &AppState,
@@ -195,7 +207,10 @@ fn plan_wire_shim(
     is_codex: bool,
     is_component: bool,
 ) -> Result<Option<WireShimPlan>, AppError> {
-    if is_codex || is_component || !state.plugins.wire_shim_matches(driver, protocol.name()) {
+    if is_codex
+        || is_component
+        || !wire_shim_runtime(state).wire_shim_matches(driver, protocol.name())
+    {
         return Ok(None);
     }
     let headers_json =
@@ -318,12 +333,14 @@ pub(super) async fn materialize_proxy_route(
     // upstream-only and never alter archive or dedup semantics.
     let mut wire_shim_set_headers = None;
     if let Some(plan) = planned.wire_shim {
-        let configurations = state
-            .plugins
+        // Run the hook and resolve configuration against the same runtime
+        // that matched at plan time (pinned snapshot when revisions are
+        // pinned, baseline otherwise), so a request never mixes revisions.
+        let plugins = wire_shim_runtime(state);
+        let configurations = plugins
             .resolved_traffic_configurations(plan.tenant_id)
             .await?;
         let body = String::from_utf8(forwarded_body).map_err(|_| AppError::Internal)?;
-        let plugins = state.plugins.clone();
         let outcome = crate::api::plugin_execution::run(
             state.metrics.clone(),
             crate::api::plugin_execution::Phase::WireShimFinalize,
@@ -400,4 +417,128 @@ pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
     ) || status.is_server_error()
+}
+
+#[cfg(all(test, feature = "experimental-plugin-revisions"))]
+mod wire_shim_revision_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::plugin::application::{
+        ApplicationPlugins, PreinstalledInventory, PublishApplicationPlugin,
+    };
+    use crate::plugin::lifecycle::{PluginGrant, manifest_digest};
+    use crate::plugin::{PluginRuntime, memeloop::token_center::types::RequestContext};
+    use std::collections::BTreeMap;
+
+    /// The baseline runtime carries no plugins while the pinned application
+    /// snapshot carries the real claude-code-wire component: matching,
+    /// configuration resolution and the finalize hook must all come from the
+    /// snapshot, so a published revision takes effect without a restart.
+    #[tokio::test]
+    async fn wire_shim_uses_pinned_application_snapshot_when_baseline_is_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("claude-code-wire");
+        std::fs::create_dir(&package).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude-code-wire");
+        std::fs::copy(fixture.join("plugin.json"), package.join("plugin.json")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), package.join("plugin.wasm")).unwrap();
+        // Test-only host-approved provenance receipt, the same pattern the
+        // application-authority tests use; no production verifier is bypassed.
+        std::fs::write(
+            package.join(".mtc-oci-install.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "format_version": 1,
+                "source": "ghcr.io/example/test-inventory",
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "signature_policy": "cosign-public-key"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("wire-shim.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .unwrap();
+        // Baseline has no wire-shim plugin: planning must not match.
+        assert!(!wire_shim_runtime(&state).wire_shim_matches("anthropic-claude", "anthropic"));
+
+        let runtime = PluginRuntime::load(directory.path().to_str(), state.db.clone()).unwrap();
+        let identities = runtime.package_identities();
+        let grants = runtime
+            .manifests()
+            .into_iter()
+            .map(|manifest| {
+                let grant = PluginGrant {
+                    version: manifest.version.clone(),
+                    capabilities: manifest.capabilities.clone(),
+                    manifest_digest: manifest_digest(&manifest).unwrap(),
+                    identity: identities[&manifest.id].clone(),
+                };
+                (manifest.id, vec![grant])
+            })
+            .collect();
+        let authority = std::sync::Arc::new(
+            ApplicationPlugins::new(
+                state.db.clone(),
+                BTreeMap::from([(
+                    "wire".to_owned(),
+                    PreinstalledInventory {
+                        root: directory.path().to_path_buf(),
+                        grants,
+                    },
+                )]),
+                &state.plugins,
+            )
+            .unwrap(),
+        );
+        authority
+            .publish(
+                PublishApplicationPlugin {
+                    inventory_id: "wire".into(),
+                    expected_revision: 0,
+                },
+                "wire-shim-pin",
+            )
+            .await
+            .unwrap();
+        let pinned = state
+            .clone()
+            .with_pinned_application_plugins(authority.pin().await.unwrap());
+
+        let plugins = wire_shim_runtime(&pinned);
+        assert!(plugins.wire_shim_matches("anthropic-claude", "anthropic"));
+        assert!(!plugins.wire_shim_matches("anthropic-claude", "openai"));
+
+        // Configuration resolves against the pinned snapshot's runtime and
+        // the finalize hook emits the Claude Code wire format.
+        let configurations = plugins
+            .resolved_traffic_configurations(uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        let context = RequestContext {
+            tenant_id: "tenant".to_owned(),
+            principal_id: "principal".to_owned(),
+            key_id: "key".to_owned(),
+            protocol: "anthropic".to_owned(),
+            model: "claude-sonnet-4-5".to_owned(),
+            config_json: "{}".to_owned(),
+        };
+        let outcome = plugins
+            .finalize_wire_shim(
+                "anthropic-claude",
+                "anthropic",
+                context,
+                r#"{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"hello world, this is a prompt"}]}"#,
+                "{}",
+                &configurations,
+            )
+            .unwrap()
+            .expect("pinned snapshot applies the wire shim");
+        assert!(outcome.request_json.contains("x-anthropic-billing-header"));
+    }
 }
