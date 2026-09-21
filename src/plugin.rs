@@ -3765,17 +3765,19 @@ mod tests {
         assert!(outcome.is_none());
     }
 
-    /// End-to-end: load the checked-in claude-code-wire component and verify
-    /// the exact wire format it produces for an anthropic-claude route.
+    /// End-to-end: load the checked-in claude-code-wire fixture component and
+    /// verify the exact wire format it produces for an anthropic-claude route.
+    /// The plugin source lives in the memeloop-online/claude-code-wire
+    /// repository; tests/fixtures/claude-code-wire pins a built copy.
     #[tokio::test]
     async fn wire_shim_real_component_emits_claude_code_wire_format() {
         let package = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("plugins/claude-code-wire");
+            .join("tests/fixtures/claude-code-wire");
         let wasm = package.join("plugin.wasm");
-        if !wasm.exists() {
-            eprintln!("skipping: plugins/claude-code-wire/plugin.wasm not built (run build.sh)");
-            return;
-        }
+        assert!(
+            wasm.exists(),
+            "tests/fixtures/claude-code-wire/plugin.wasm must be checked in"
+        );
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
