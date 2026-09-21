@@ -37,10 +37,18 @@ pub(super) fn prepare_forwarded_request(
     if matches!(protocol, Protocol::OpenAiResponses)
         && let Some(dialect) = responses_via_chat_dialect
     {
+        // Operator opt-in on the upstream account: compaction requests
+        // become direct summarization requests the Chat upstream can serve.
+        let translate_compaction = route
+            .config
+            .get(crate::provider::RESPONSES_VIA_CHAT_COMPACTION_CONFIG)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let context = crate::api::responses_via_chat::prepare_with_dialect(
             &route.upstream_model,
             &mut forwarded,
             dialect,
+            translate_compaction,
         )?;
         crate::api::kimi_transport::repair_responses_messages(dialect, &mut forwarded);
         return Ok((forwarded, Some(context)));
@@ -431,6 +439,58 @@ mod tests {
             .await
             .unwrap();
         (server, response)
+    }
+
+    #[test]
+    fn compaction_translation_is_an_upstream_config_opt_in() {
+        let request = json!({"model":"public-model","stream":true,
+        "tools":[{"type":"function","name":"exec","parameters":{"type":"object"}}],
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]});
+        let dialect = Some(crate::provider::ResponsesViaChatDialect::KimiV1);
+
+        // A driver with a declared Responses-via-Chat dialect, distinct from
+        // the managed Kimi OAuth driver (whose fixed base URL and credential
+        // shape this test does not need).
+        let dialect_driver = "responses-chat-custom";
+        let mut opted = route(dialect_driver);
+        opted.config = json!({"responses_via_chat_compaction": true});
+        let (forwarded, _) = prepare_forwarded_request(
+            &opted,
+            Protocol::OpenAiResponses,
+            &request,
+            false,
+            false,
+            dialect,
+        )
+        .unwrap();
+        let messages = forwarded["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "earlier work");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONTEXT CHECKPOINT COMPACTION")
+        );
+        assert_eq!(messages.len(), 2);
+        assert!(forwarded.get("tools").is_none());
+
+        let plain = route(dialect_driver);
+        assert!(
+            prepare_forwarded_request(
+                &plain,
+                Protocol::OpenAiResponses,
+                &request,
+                false,
+                false,
+                dialect,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

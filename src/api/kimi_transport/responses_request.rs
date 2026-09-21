@@ -3,6 +3,13 @@ use crate::provider::ResponsesViaChatDialect;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Instruction substituted for a Responses compaction_trigger item when an
+/// upstream opts into compaction translation. Chat upstreams have no native
+/// compaction concept, so the bridge must ask for the checkpoint summary in
+/// plain task language. Wording mirrors the client-side compaction prompt so
+/// the model produces a handoff summary the client can resume from.
+pub(in crate::api) const COMPACTION_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Review the conversation history above and create a handoff summary for another LLM that will resume the task. Include: current progress and key decisions made; important context, constraints, or user preferences; what remains to be done (clear next steps); any critical data, examples, or references needed to continue. Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Output only the summary text itself, with no preamble, headings, commentary, or tool calls.";
+
 #[derive(Clone)]
 pub(in crate::api) struct ToolIdentity {
     pub name: String,
@@ -319,12 +326,13 @@ fn agent_message(item: &Value) -> Result<Value, AppError> {
 /// messages occur in the input timeline.
 #[cfg(test)]
 pub(in crate::api) fn convert(request: &Value) -> Result<Value, AppError> {
-    convert_with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1)
+    convert_with_dialect(request, ResponsesViaChatDialect::OpenAiChatV1, false)
 }
 
 pub(in crate::api) fn convert_with_dialect(
     request: &Value,
     dialect: ResponsesViaChatDialect,
+    translate_compaction: bool,
 ) -> Result<Value, AppError> {
     validate_bridge_features(request)?;
     if request
@@ -364,6 +372,7 @@ pub(in crate::api) fn convert_with_dialect(
     let mut deferred = Vec::new();
     let mut reasoning = String::new();
     let preserve_reasoning = dialect == ResponsesViaChatDialect::KimiV1;
+    let mut compaction_trigger = false;
     for item in &input {
         let normalized;
         let item = if item["type"] == "agent_message" {
@@ -373,6 +382,13 @@ pub(in crate::api) fn convert_with_dialect(
             item
         };
         match item["type"].as_str().unwrap_or("message") {
+            // A request control, not durable history. With translation
+            // enabled the trigger is replaced by a trailing summarization
+            // instruction after the loop; tools are dropped so the upstream
+            // cannot answer an instruction-only task with tool calls.
+            "compaction_trigger" if translate_compaction => {
+                compaction_trigger = true;
+            }
             "reasoning" => {
                 if !preserve_reasoning {
                     continue;
@@ -484,6 +500,9 @@ pub(in crate::api) fn convert_with_dialect(
         }
     }
     messages.append(&mut deferred);
+    if compaction_trigger {
+        messages.push(json!({"role":"user","content":COMPACTION_INSTRUCTION}));
+    }
     if preserve_reasoning && !reasoning.is_empty() {
         messages.push(json!({"role":"assistant","content":"","reasoning_content":reasoning}));
     }
@@ -516,7 +535,14 @@ pub(in crate::api) fn convert_with_dialect(
             format.clone()
         };
     }
-    let declarations = tools(request);
+    // A compaction request is an instruction-only summarization task; tool
+    // declarations and tool_choice must not cross the boundary or the
+    // upstream may answer with calls the bridge would have to reject.
+    let declarations = if compaction_trigger {
+        BTreeMap::new()
+    } else {
+        tools(request)
+    };
     if !declarations.is_empty() {
         output["tools"] = Value::Array(declarations.into_values().map(|(_, tool)| tool).collect());
         if let Some(choice) = request.get("tool_choice") {
@@ -534,6 +560,46 @@ pub(in crate::api) fn convert_with_dialect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_trigger_translates_to_instruction_and_drops_tools() {
+        let request = json!({"model":"kimi-k3","stream":true,"instructions":"system",
+        "tools":[{"type":"function","name":"exec","parameters":{"type":"object"}}],
+        "tool_choice":"auto",
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]});
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, true).unwrap();
+        let messages = converted["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "earlier work");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], COMPACTION_INSTRUCTION);
+        assert_eq!(messages.len(), 3);
+        assert!(converted.get("tools").is_none());
+        assert!(converted.get("tool_choice").is_none());
+        assert_eq!(converted["stream"], true);
+    }
+
+    #[test]
+    fn compaction_trigger_rejected_without_translation_opt_in() {
+        let request = json!({"model":"kimi-k3",
+        "input":[
+            {"role":"user","content":"earlier work"},
+            {"type":"compaction_trigger"}
+        ]});
+        let error =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Responses input item for Responses-via-Chat")
+        );
+    }
 
     #[test]
     fn readable_agent_messages_preserve_content_without_privilege_escalation() {
@@ -750,7 +816,8 @@ mod tests {
                 {"type":"additional_tools","tools":[{"type":"function","name":"other","parameters":{"type":"object"}}]}
             ],"max_output_tokens":400,"reasoning":{"effort":"high"},
             "text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"},"strict":true}}});
-        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
         assert_eq!(converted["messages"][0]["role"], "system");
         assert_eq!(
             converted["messages"][1]["tool_calls"][0]["function"]["name"],
@@ -775,11 +842,11 @@ mod tests {
             "reasoning":{"effort":"high"}
         });
         let converted =
-            convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1).unwrap();
+            convert_with_dialect(&request, ResponsesViaChatDialect::OpenAiChatV1, false).unwrap();
         assert!(converted.to_string().contains("answer"));
         assert!(!converted.to_string().contains("reasoning_content"));
         assert!(!converted.to_string().contains("reasoning_effort"));
-        let kimi = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        let kimi = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
         assert_eq!(kimi["reasoning_effort"], "high");
         assert!(kimi.to_string().contains("reasoning_content"));
     }
@@ -877,7 +944,8 @@ mod tests {
             ]
         });
 
-        let converted = convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1).unwrap();
+        let converted =
+            convert_with_dialect(&request, ResponsesViaChatDialect::KimiV1, false).unwrap();
         let wire = converted.to_string();
         assert!(wire.contains("visible task"));
         assert!(wire.contains("visible summary"));

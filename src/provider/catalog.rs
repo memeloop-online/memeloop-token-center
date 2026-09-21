@@ -165,6 +165,12 @@ pub enum ResponsesViaChatDialect {
     KimiV1,
 }
 
+/// Upstream account config key that opts a Responses-via-Chat upstream into
+/// compaction translation. Declared in the managed provider's config_schema
+/// (so the operator form renders it with an explanatory description) and read
+/// by the routing bridge when converting Responses requests.
+pub const RESPONSES_VIA_CHAT_COMPACTION_CONFIG: &str = "responses_via_chat_compaction";
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestCompatibility {
@@ -680,6 +686,11 @@ impl ProviderCatalog {
             responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
             codex_multi_agent_v2: true,
         };
+        kimi.config_schema["properties"][RESPONSES_VIA_CHAT_COMPACTION_CONFIG] = json!({
+            "type": "boolean",
+            "default": false,
+            "description": "Translate OpenAI Responses context-compaction requests into direct chat requests for this upstream. Enable only when Codex clients use remote compaction against this upstream: the compaction trigger is rewritten as a plain 'summarize this conversation' instruction, and the model's answer is returned to the client as an opaque compaction checkpoint (the summary text is stored by the client and is not shown to the model again on later turns). If the upstream cannot reliably produce a concise structured summary, leave this off — compaction requests will then fail with a clear unsupported-item error instead of corrupting client history. / 仅当 Codex 客户端会对该上游发起远程上下文压缩(remote compaction)时开启：网关会把压缩请求转换成普通对话请求——compaction_trigger 被改写为一条“总结上述对话”的指令，模型输出的摘要作为不透明检查点返回给客户端保存，之后的对话不会再次把摘要展示给模型。若上游模型无法稳定输出简洁的结构化摘要，请保持关闭，否则压缩请求会失败并提示不支持的输入项。"
+        });
         kimi.codex_model_capabilities = Some(CodexModelCapabilities {
             version: CODEX_MODEL_CAPABILITIES_VERSION.to_owned(),
             agent_instructions_template: CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1.to_owned(),
