@@ -198,9 +198,9 @@ impl RequestCompatibility {
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
-        // Third-party MultiAgentV2 is executable only through an explicitly
-        // declared Responses-via-Chat transport. Native Codex has its own
-        // upstream Responses transport and does not use this predicate.
+        // This predicate is only the Responses-via-Chat dialect path (Kimi,
+        // declared plugins). Native Codex and OpenAI-compatible HTTP drivers
+        // already speak `/v1/responses` and do not use this flag.
         self.third_party
             && self.codex_multi_agent_v2
             && self.responses_via_chat_v1

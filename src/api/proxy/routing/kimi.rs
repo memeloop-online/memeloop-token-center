@@ -606,6 +606,44 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_http_keeps_responses_and_rewrites_readable_agent_message() {
+        let request = json!({
+            "model": "public-model",
+            "tools": [{"type":"namespace","name":"collaboration","tools":[{
+                "type":"function","name":"spawn_agent","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":true}}
+                }
+            }]}],
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+                {"type":"agent_message","role":"system","content":[
+                    {"type":"input_text","text":"delegated task"}
+                ]}
+            ]
+        });
+        let (forwarded, chat) = prepare_forwarded_request(
+            &route("http-json"),
+            Protocol::OpenAiResponses,
+            &request,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(chat.is_none());
+        assert!(forwarded.get("messages").is_none());
+        assert_eq!(forwarded["model"], "upstream-model");
+        assert!(
+            forwarded["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+        assert_eq!(forwarded["input"][1]["type"], "message");
+        assert_eq!(forwarded["input"][1]["role"], "user");
+    }
+
+    #[test]
     fn direct_and_resume_requests_bypass_collaboration_schema_rewrite() {
         for request in [
             json!({"model":"public-model","input":"direct request"}),

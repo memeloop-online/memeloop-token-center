@@ -86,14 +86,19 @@ pub(super) fn plan_proxy_route(
         codex::validate_route(&route, protocol)?;
     }
     let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
+    let openai_compatible_http = crate::provider::is_openai_compatible_http_driver(&route.driver);
+    let multi_agent_responses =
+        matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
+    let normalize_multi_agent = multi_agent_responses
+        && (openai_compatible_http || state.providers.supports_codex_multi_agent_v2(&route.driver));
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
         request_json,
-        matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request,
-        matches!(protocol, Protocol::OpenAiResponses)
-            && codex_multi_agent_v2_request
-            && state.providers.supports_codex_multi_agent_v2(&route.driver),
+        // Normalization already rewrites collaboration tools. Native Codex
+        // still needs the plaintext-only pass without agent_message downgrade.
+        multi_agent_responses && !normalize_multi_agent,
+        normalize_multi_agent,
         responses_via_chat_dialect,
     )?;
     let codex_plan = if is_codex {
