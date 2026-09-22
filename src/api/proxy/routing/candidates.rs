@@ -31,7 +31,14 @@ fn candidate_allowed_for_multi_agent_request(
     multi_agent_request: bool,
     supports_multi_agent: bool,
 ) -> bool {
-    !multi_agent_request || codex_transport::is_driver(driver) || supports_multi_agent
+    // OpenAI-compatible HTTP already posts the downstream Responses envelope
+    // to `/v1/responses`. Collaboration tools ride that same path, so these
+    // drivers must not be skipped while waiting for a Responses-via-Chat
+    // dialect that they do not use.
+    !multi_agent_request
+        || codex_transport::is_driver(driver)
+        || crate::provider::is_openai_compatible_http_driver(driver)
+        || supports_multi_agent
 }
 
 pub(in crate::api::proxy) fn candidate_reservation_bounds(
@@ -311,8 +318,16 @@ mod tests {
             true,
             true
         ));
-        assert!(!candidate_allowed_for_multi_agent_request(
+        assert!(candidate_allowed_for_multi_agent_request(
             "http-json",
+            true,
+            false
+        ));
+        assert!(candidate_allowed_for_multi_agent_request(
+            "cbcnx", true, false
+        ));
+        assert!(!candidate_allowed_for_multi_agent_request(
+            "volcengine-seedance",
             true,
             false
         ));

@@ -86,6 +86,7 @@ pub(super) fn plan_proxy_route(
         codex::validate_route(&route, protocol)?;
     }
     let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
+    let native_http_multi_agent = crate::provider::is_openai_compatible_http_driver(&route.driver);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
@@ -93,7 +94,8 @@ pub(super) fn plan_proxy_route(
         matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request,
         matches!(protocol, Protocol::OpenAiResponses)
             && codex_multi_agent_v2_request
-            && state.providers.supports_codex_multi_agent_v2(&route.driver),
+            && (native_http_multi_agent
+                || state.providers.supports_codex_multi_agent_v2(&route.driver)),
         responses_via_chat_dialect,
     )?;
     let codex_plan = if is_codex {
