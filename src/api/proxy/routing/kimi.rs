@@ -606,9 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_http_keeps_responses_and_rewrites_readable_agent_message() {
+    fn http_json_forwards_codex_responses_envelope_unchanged() {
         let request = json!({
             "model": "public-model",
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
             "tools": [{"type":"namespace","name":"collaboration","tools":[{
                 "type":"function","name":"spawn_agent","parameters":{
                     "type":"object","properties":{"message":{"type":"string","encrypted":true}}
@@ -618,15 +620,18 @@ mod tests {
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
                 {"type":"agent_message","role":"system","content":[
                     {"type":"input_text","text":"delegated task"}
-                ]}
+                ]},
+                {"type":"additional_tools","tools":[{"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"send_message","parameters":{"type":"object"}}
+                ]}]}
             ]
         });
         let (forwarded, chat) = prepare_forwarded_request(
             &route("http-json"),
             Protocol::OpenAiResponses,
             &request,
-            true,
-            true,
+            false,
+            false,
             None,
         )
         .unwrap();
@@ -634,13 +639,11 @@ mod tests {
         assert!(chat.is_none());
         assert!(forwarded.get("messages").is_none());
         assert_eq!(forwarded["model"], "upstream-model");
-        assert!(
-            forwarded["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
-                .get("encrypted")
-                .is_none()
-        );
-        assert_eq!(forwarded["input"][1]["type"], "message");
-        assert_eq!(forwarded["input"][1]["role"], "user");
+        assert_eq!(forwarded["store"], false);
+        assert_eq!(forwarded["include"], request["include"]);
+        assert_eq!(forwarded["tools"], request["tools"]);
+        assert_eq!(forwarded["input"], request["input"]);
+        assert!(forwarded.get("max_output_tokens").is_none());
     }
 
     #[test]

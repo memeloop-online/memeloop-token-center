@@ -199,13 +199,25 @@ impl RequestCompatibility {
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
         // This predicate is only the Responses-via-Chat dialect path (Kimi,
-        // declared plugins). Native Codex and OpenAI-compatible HTTP drivers
-        // already speak `/v1/responses` and do not use this flag.
+        // declared plugins). Native Codex and http-json already speak
+        // `/v1/responses` and do not use this flag.
         self.third_party
             && self.codex_multi_agent_v2
             && self.responses_via_chat_v1
             && self.responses_via_chat_dialect.is_some()
     }
+}
+
+/// Retired CBCNX accounts use the generic HTTP JSON upstream.
+pub fn canonicalize_provider_driver(driver: &str) -> &str {
+    match driver {
+        "cbcnx" => "http-json",
+        other => other,
+    }
+}
+
+pub fn is_openai_compatible_http_driver(driver: &str) -> bool {
+    canonicalize_provider_driver(driver) == "http-json"
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -415,9 +427,6 @@ impl ProviderCatalog {
             codex_model_capabilities: None,
             source: "builtin".to_owned(),
         }];
-        types.push(crate::provider::cbcnx::provider_type(
-            credential_schema.clone(),
-        ));
         types.push(ProviderType {
             id: "volcengine-seedance".to_owned(),
             display_name: "Volcengine Seedance".to_owned(),
@@ -765,6 +774,7 @@ impl ProviderCatalog {
     /// Public provider types are the only drivers accepted for new accounts,
     /// OAuth sessions, and proxy routing.
     pub fn is_public(&self, driver: &str) -> bool {
+        let driver = canonicalize_provider_driver(driver);
         self.types.iter().any(|provider| provider.id == driver)
     }
 
@@ -816,6 +826,7 @@ impl ProviderCatalog {
     }
 
     pub fn get(&self, driver: &str) -> Option<&ProviderType> {
+        let driver = canonicalize_provider_driver(driver);
         self.types.iter().find(|provider| provider.id == driver)
     }
 

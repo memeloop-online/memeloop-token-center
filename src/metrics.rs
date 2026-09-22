@@ -1362,9 +1362,8 @@ fn bounded_route(route: &str) -> String {
 }
 
 fn bounded_provider(provider: &str) -> &'static str {
-    match provider {
+    match crate::provider::canonicalize_provider_driver(provider) {
         "http-json" => "http-json",
-        "cbcnx" => "cbcnx",
         "comfyui" => "comfyui",
         "volcengine-seedance" => "volcengine-seedance",
         "legacy" => "legacy",

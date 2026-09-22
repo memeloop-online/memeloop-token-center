@@ -337,14 +337,10 @@ mod tests {
     }
 
     #[test]
-    fn cbcnx_health_uses_the_bounded_openai_model_catalog_endpoint() {
+    fn http_json_health_uses_the_bounded_openai_model_catalog_endpoint() {
         assert_eq!(
-            upstream_health_probe_url(
-                crate::provider::CBCNX_PROVIDER_DRIVER,
-                &json!({}),
-                "https://cbcnx.example.test/v1/",
-            ),
-            "https://cbcnx.example.test/v1/models",
+            upstream_health_probe_url("http-json", &json!({}), "https://upstream.example.test/v1/",),
+            "https://upstream.example.test/v1/models",
         );
     }
 }

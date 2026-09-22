@@ -1061,16 +1061,5 @@ mod tests {
             downstream_modalities("openai", "http-json", "text-model", "{}", &advertised),
             vec!["text", "embedding"]
         );
-        assert_eq!(
-            downstream_modalities(
-                "generation",
-                crate::provider::CBCNX_PROVIDER_DRIVER,
-                "candidate-video-model",
-                "{}",
-                &advertised,
-            ),
-            vec!["image"],
-            "CBCNX video candidates must not be advertised before a reviewed job adapter exists",
-        );
     }
 }

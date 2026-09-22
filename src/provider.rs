@@ -1,6 +1,5 @@
 pub mod antigravity;
 mod catalog;
-mod cbcnx;
 mod codex_agent_profile;
 mod credential;
 mod transport_policy;
@@ -14,10 +13,9 @@ pub use catalog::{
     CodexModelCapabilities, CodexReasoningLevel, ComponentAdapterContribution,
     GenerationAdapterContribution, OAuthAdapterContribution, OAuthFlowKind, ProviderCatalog,
     ProviderType, RESPONSES_VIA_CHAT_COMPACTION_CONFIG, RequestCompatibility,
-    ResponsesViaChatDialect,
+    ResponsesViaChatDialect, canonicalize_provider_driver, is_openai_compatible_http_driver,
 };
 pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
-pub use cbcnx::{CBCNX_PROVIDER_DRIVER, is_openai_compatible_http_driver};
 pub(crate) use codex_agent_profile::CODEX_GENERIC_AGENT_INSTRUCTIONS_V1;
 pub use credential::{
     UpstreamCredential, open_credential, seal_credential, validate_adapter_state, validate_config,
