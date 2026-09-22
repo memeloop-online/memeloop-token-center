@@ -75,12 +75,10 @@ pub(super) async fn send_reqwest_proxy_route(
         // reads, so no phase can restart the configured attempt budget.
         .timeout(timeout)
         .body(route.forwarded_body.clone());
-    // For a CBCNX Responses call that has opted into streaming, pin the
-    // upstream representation to SSE instead of inheriting a downstream
-    // `Accept: application/json` default. Keep generic compatible routes
-    // transparent.
+    // Streaming Responses on HTTP JSON (including retired CBCNX rows) must
+    // negotiate SSE even when the client sent `Accept: application/json`.
     let accept = if (route.responses_chat.is_some() && route.upstream_stream)
-        || (route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
+        || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
     {

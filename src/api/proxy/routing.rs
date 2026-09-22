@@ -86,18 +86,18 @@ pub(super) fn plan_proxy_route(
         codex::validate_route(&route, protocol)?;
     }
     let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
-    let openai_compatible_http = crate::provider::is_openai_compatible_http_driver(&route.driver);
+    let http_json = crate::provider::is_openai_compatible_http_driver(&route.driver);
     let multi_agent_responses =
         matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
-    let normalize_multi_agent = multi_agent_responses
-        && (openai_compatible_http || state.providers.supports_codex_multi_agent_v2(&route.driver));
+    // Kimi still rewrites MultiAgent into Chat. http-json posts `/v1/responses`
+    // as-is; do not reuse the Kimi rewrite for it.
+    let normalize_multi_agent =
+        multi_agent_responses && state.providers.supports_codex_multi_agent_v2(&route.driver);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
         request_json,
-        // Normalization already rewrites collaboration tools. Native Codex
-        // still needs the plaintext-only pass without agent_message downgrade.
-        multi_agent_responses && !normalize_multi_agent,
+        multi_agent_responses && !normalize_multi_agent && !http_json,
         normalize_multi_agent,
         responses_via_chat_dialect,
     )?;
@@ -114,6 +114,11 @@ pub(super) fn plan_proxy_route(
     };
     let output_token_ceiling = match codex_plan.as_ref() {
         Some(plan) => plan.output_token_ceiling,
+        None if http_json && multi_agent_responses => forwarded_json
+            .get("max_output_tokens")
+            .and_then(Value::as_i64)
+            .filter(|ceiling| *ceiling >= 0)
+            .unwrap_or(4_096),
         None => inject_controlled_output_ceiling(
             if responses_chat.is_some() {
                 Protocol::OpenAiChat

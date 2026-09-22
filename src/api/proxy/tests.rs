@@ -93,12 +93,11 @@ fn trusted_input_overhead_is_limited_to_reviewed_openai_compatible_http_drivers(
     );
     assert_eq!(
         trusted_input_token_overhead_ceiling(
-            Some(crate::provider::CBCNX_PROVIDER_DRIVER),
+            Some("http-json"),
             Some(&json!({"input_token_overhead_ceiling": 512})),
         )
         .unwrap(),
-        512,
-        "CBCNX must reserve its reviewed upstream-only input allowance"
+        512
     );
     assert_eq!(
         trusted_input_token_overhead_ceiling(
@@ -211,20 +210,20 @@ fn pinned_internal_request_envelope_rejects_every_traffic_rewrite() {
 }
 
 #[test]
-fn cbcnx_chat_usage_contract_is_held_to_the_same_terminal_usage_boundary() {
+fn http_json_chat_usage_contract_is_held_to_the_same_terminal_usage_boundary() {
     let request = json!({
         "stream": true,
         "stream_options": {"include_usage": true}
     });
     assert!(requires_strict_openai_chat_usage(
         Protocol::OpenAiChat,
-        crate::provider::CBCNX_PROVIDER_DRIVER,
+        "http-json",
         &json!({"stream_usage_contract": "openai-chat-usage-only"}),
         &request,
     ));
     assert!(!requires_strict_openai_chat_usage(
         Protocol::OpenAiChat,
-        crate::provider::CBCNX_PROVIDER_DRIVER,
+        "http-json",
         &json!({"stream_usage_contract": "openai-chat-usage-only"}),
         &json!({"stream": true}),
     ));
@@ -1110,7 +1109,7 @@ async fn send_chat_usage_request(fixture: &CodexRouteFixture, body: &Value) -> R
 }
 
 #[tokio::test]
-async fn unpriced_cbcnx_route_is_rejected_before_any_upstream_request() {
+async fn unpriced_http_json_route_is_rejected_before_any_upstream_request() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -1122,11 +1121,11 @@ async fn unpriced_cbcnx_route_is_rejected_before_any_upstream_request() {
         .mount(&upstream)
         .await;
     let fixture = response_usage_fixture_with_uri_contract_and_driver(
-        "cbcnx-unpriced",
+        "http-json-unpriced",
         upstream.uri(),
         0,
         Some("openai-chat-usage-only"),
-        crate::provider::CBCNX_PROVIDER_DRIVER,
+        "http-json",
     )
     .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -5133,7 +5132,7 @@ fn completed_response_with_usage(input_tokens: i64, output_tokens: i64) -> Value
 }
 
 #[tokio::test]
-async fn cbcnx_streaming_responses_request_negotiates_sse_without_rewriting_stream_options() {
+async fn http_json_streaming_responses_request_negotiates_sse_without_rewriting_stream_options() {
     let upstream = MockServer::start().await;
     let completed = completed_response_with_usage(309, 7);
     let sse = format!(
@@ -5159,11 +5158,11 @@ async fn cbcnx_streaming_responses_request_negotiates_sse_without_rewriting_stre
         .mount(&upstream)
         .await;
     let fixture = response_usage_fixture_with_uri_contract_and_driver(
-        "cbcnx-responses-sse-accept",
+        "http-json-responses-sse-accept",
         upstream.uri(),
         256,
         Some("openai-chat-usage-only"),
-        crate::provider::CBCNX_PROVIDER_DRIVER,
+        "http-json",
     )
     .await;
     let request = json!({
