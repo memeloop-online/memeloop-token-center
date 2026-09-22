@@ -609,9 +609,11 @@ mod tests {
     fn openai_compatible_http_keeps_responses_and_rewrites_readable_agent_message() {
         let request = json!({
             "model": "public-model",
-            "tools": [{"type":"function","name":"spawn_agent","parameters":{
-                "type":"object","properties":{"message":{"type":"string","encrypted":true}}
-            }}],
+            "tools": [{"type":"namespace","name":"collaboration","tools":[{
+                "type":"function","name":"spawn_agent","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":true}}
+                }
+            }]}],
             "input": [
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
                 {"type":"agent_message","role":"system","content":[
@@ -633,7 +635,7 @@ mod tests {
         assert!(forwarded.get("messages").is_none());
         assert_eq!(forwarded["model"], "upstream-model");
         assert!(
-            forwarded["tools"][0]["parameters"]["properties"]["message"]
+            forwarded["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
