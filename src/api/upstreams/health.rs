@@ -339,11 +339,7 @@ mod tests {
     #[test]
     fn http_json_health_uses_the_bounded_openai_model_catalog_endpoint() {
         assert_eq!(
-            upstream_health_probe_url(
-                "http-json",
-                &json!({}),
-                "https://upstream.example.test/v1/",
-            ),
+            upstream_health_probe_url("http-json", &json!({}), "https://upstream.example.test/v1/",),
             "https://upstream.example.test/v1/models",
         );
     }

@@ -414,7 +414,9 @@ fn retired_cbcnx_accounts_use_http_json() {
     assert_eq!(canonicalize_provider_driver("cbcnx"), "http-json");
     assert!(is_openai_compatible_http_driver("cbcnx"));
     assert!(!catalog.list().iter().any(|provider| provider.id == "cbcnx"));
-    let http_json = catalog.get("cbcnx").expect("retired CBCNX maps to http-json");
+    let http_json = catalog
+        .get("cbcnx")
+        .expect("retired CBCNX maps to http-json");
     assert_eq!(http_json.id, "http-json");
     assert!(catalog.is_public("cbcnx"));
 }
