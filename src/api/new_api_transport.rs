@@ -12,11 +12,8 @@ use serde_json::{Value, json};
 
 const COMPACT_PATH: &str = "/v1/responses/compact";
 const ALPHA_SEARCH_PATH: &str = "/v1/alpha/search";
+#[cfg(test)]
 const GEMINI_GENERATE_PATH_PREFIX: &str = "/v1beta/models/";
-
-pub(in crate::api) fn is_driver(driver: &str) -> bool {
-    driver == "new-api"
-}
 
 pub(in crate::api) fn compact_path() -> &'static str {
     COMPACT_PATH
@@ -225,7 +222,6 @@ mod tests {
 
     #[test]
     fn driver_and_paths_match_new_api_sidebar() {
-        assert!(is_driver("new-api"));
         assert_eq!(compact_path(), "/v1/responses/compact");
         assert_eq!(alpha_search_path(), "/v1/alpha/search");
         assert_eq!(
