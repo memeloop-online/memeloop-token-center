@@ -35,6 +35,11 @@ pub struct StagedArchiveObject {
 
 impl ArchiveStore {
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
+        if super::path::is_any_v1_cas_location(location) {
+            return Err(AppError::BadRequest(
+                "archive CAS objects are immutable".into(),
+            ));
+        }
         let staging = archive_path(location)?;
         let upload = self.inner.put_multipart(&staging).await?;
         Ok(ArchiveWriter {
@@ -54,10 +59,7 @@ impl ArchiveStore {
 
     /// Opt-in text archive format. The suffix is part of the durable locator;
     /// callers must bind the returned locator, not the original staging name.
-    pub(crate) async fn start_compressed_writer(
-        &self,
-        location: &str,
-    ) -> Result<ArchiveWriter, AppError> {
+    pub async fn start_compressed_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
         if location.ends_with(super::compressed::SUFFIX) {
             return Err(AppError::BadRequest(
                 "compressed archive staging name already has a format suffix".into(),

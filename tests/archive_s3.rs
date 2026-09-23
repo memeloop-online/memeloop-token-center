@@ -172,6 +172,52 @@ async fn minio_multipart_writer_publishes_only_the_content_address() {
 }
 
 #[tokio::test]
+async fn minio_tenant_cas_create_if_absent_is_atomic_and_replayable() {
+    let Some(config) = s3_config() else {
+        return;
+    };
+    let store = ArchiveStore::from_config(&config)
+        .await
+        .expect("construct MinIO archive store");
+    let tenant_id = Uuid::from_u128(0x8c93_e9e1_f936_4c84_a7d6_84ab_8f38_97ad);
+    let body = Bytes::from("minio exact CAS body ".repeat(5_000));
+    let first_staging = format!("staging/s3-cas/{}/first", Uuid::now_v7());
+    let mut first = store
+        .start_compressed_writer(&first_staging)
+        .await
+        .expect("start first compressed staging object");
+    first.write(body.clone()).await.expect("write first body");
+    let first = first.finish_staged().await.expect("finish first staging");
+    let second_staging = format!("staging/s3-cas/{}/second", Uuid::now_v7());
+    let mut second = store
+        .start_compressed_writer(&second_staging)
+        .await
+        .expect("start second compressed staging object");
+    second.write(body.clone()).await.expect("write second body");
+    let second = second.finish_staged().await.expect("finish second staging");
+
+    let (left, right) = tokio::join!(
+        store.promote_staged_text_to_cas(tenant_id, &first),
+        store.promote_staged_text_to_cas(tenant_id, &second),
+    );
+    let left = left.expect("first conditional CAS publish");
+    let right = right.expect("concurrent CAS replay");
+    assert_eq!(left, right);
+    assert_eq!(store.get(&left.object_locator).await.unwrap(), body);
+    assert!(store.get(&first.object_locator).await.is_ok());
+    assert!(store.get(&second.object_locator).await.is_ok());
+
+    store
+        .delete_prefix(&first.object_locator)
+        .await
+        .expect("remove first staging fixture");
+    store
+        .delete_prefix(&second.object_locator)
+        .await
+        .expect("remove second staging fixture");
+}
+
+#[tokio::test]
 async fn minio_delete_prefix_is_segment_exact_and_rejects_unsafe_input() {
     let Some(config) = s3_config() else {
         return;

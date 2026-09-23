@@ -1597,7 +1597,7 @@ async fn proxy_with_identity_and_conversation_spool(
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_buffered_request(
+                return finish_local_buffered_error(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
                     Bytes::from_static(
@@ -1722,7 +1722,7 @@ async fn proxy_with_identity_and_conversation_spool(
             return result;
         }
         drop(upstream);
-        let result = finish_buffered_request(
+        let result = finish_local_buffered_error(
             &buffered_request,
             status,
             Bytes::from_static(

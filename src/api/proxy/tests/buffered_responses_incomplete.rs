@@ -163,11 +163,7 @@ async fn buffered_incomplete_keeps_502_and_settles_only_valid_actual_usage_once(
             .unwrap();
         let locator = refs.response_object.unwrap();
         if valid {
-            assert!(!locator.starts_with("gap://"));
-            assert_eq!(
-                fixture.state.archive.get(&locator).await.unwrap(),
-                delivered.as_ref()
-            );
+            assert_eq!(locator, format!("gap://{}/response", row.request_id));
         } else {
             let inline = locator
                 .strip_prefix("inline-json:")

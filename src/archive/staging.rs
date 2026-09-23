@@ -21,6 +21,11 @@ pub trait ArchiveStagingObjectStore: Send + Sync {
 
 impl ArchiveStore {
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+        if super::path::is_any_v1_cas_location(prefix) {
+            return Err(AppError::BadRequest(
+                "archive CAS objects are immutable".into(),
+            ));
+        }
         let prefix = archive_path(prefix)?;
         self.delete_segment_prefix(prefix).await
     }
@@ -78,7 +83,8 @@ impl ArchiveStore {
             .try_filter(move |metadata| {
                 futures_util::future::ready(
                     metadata.location != listed_prefix
-                        && metadata.location.prefix_matches(&listed_prefix),
+                        && metadata.location.prefix_matches(&listed_prefix)
+                        && !super::path::is_any_v1_cas_location(metadata.location.as_ref()),
                 )
             })
             .map_ok(|metadata| metadata.location)

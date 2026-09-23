@@ -13,7 +13,7 @@ use memeloop_token_center::{
     AppState, api,
     archive_staging::{
         ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
-        ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingState, BeginArchiveStagingInput,
+        ArchiveStagingOwner, ArchiveStagingPurpose, BeginArchiveStagingInput,
         BeginArchiveStagingResult,
     },
     config::Config,
@@ -7281,30 +7281,15 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .request_archive_refs(world.stable_key_id.expect("key id"), request_uuid)
         .await
         .expect("proxy archive references");
-    let request_prefix = format!("staging/proxy/{request_id}/request/");
-    let response_prefix = format!("staging/proxy/{request_id}/response/");
-    assert!(refs.request_object.starts_with(&request_prefix));
-    assert!(refs.request_object.ends_with("/body"));
+    let key = state
+        .db
+        .authenticate_key(&world.current_key, state.config.key_pepper.as_bytes())
+        .await
+        .expect("authenticate test key");
+    let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
+    assert!(refs.request_object.starts_with(&cas_prefix));
     let response_object = refs.response_object.expect("response object");
-    assert!(response_object.starts_with(&response_prefix));
-    assert!(response_object.ends_with("/body"));
-    for locator in [&refs.request_object, &response_object] {
-        let attempt_id = locator
-            .strip_suffix("/body")
-            .and_then(|prefix| prefix.rsplit('/').next())
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .expect("canonical proxy attempt UUID");
-        assert_eq!(
-            state
-                .db
-                .archive_staging_attempt(attempt_id)
-                .await
-                .expect("staging attempt query")
-                .expect("staging attempt")
-                .state,
-            ArchiveStagingState::Bound
-        );
-    }
+    assert!(response_object.starts_with(&cas_prefix));
 }
 
 #[when("the bootstrap service creates a tenant scoped service token")]
