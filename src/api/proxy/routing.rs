@@ -87,20 +87,45 @@ pub(super) fn plan_proxy_route(
     }
     let responses_via_chat_dialect = state.providers.responses_via_chat_dialect(&route.driver);
     let http_json = crate::provider::is_openai_compatible_http_driver(&route.driver);
+    let new_api = crate::provider::is_new_api_driver(&route.driver);
+    let passthrough_responses = http_json || new_api;
     let multi_agent_responses =
         matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
-    // Kimi still rewrites MultiAgent into Chat. http-json posts `/v1/responses`
-    // as-is; do not reuse the Kimi rewrite for it.
+    // Kimi still rewrites MultiAgent into Chat. http-json and New API post
+    // `/v1/responses` as-is; do not reuse the Kimi rewrite for them.
     let normalize_multi_agent =
         multi_agent_responses && state.providers.supports_codex_multi_agent_v2(&route.driver);
+    let compact_v2_bridge = passthrough_responses
+        && matches!(protocol, Protocol::OpenAiResponses)
+        && crate::api::new_api_transport::has_compaction_trigger(request_json);
+    let wrap_compact_as_sse =
+        compact_v2_bridge && request_json.get("stream").and_then(Value::as_bool) == Some(true);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
         request_json,
-        multi_agent_responses && !normalize_multi_agent && !http_json,
+        multi_agent_responses && !normalize_multi_agent && !passthrough_responses,
         normalize_multi_agent,
         responses_via_chat_dialect,
     )?;
+    if passthrough_responses
+        && (compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact))
+    {
+        forwarded_json = crate::api::new_api_transport::prepare_compact_request(
+            &forwarded_json,
+            &route.upstream_model,
+        )?;
+    }
+    let upstream_path = if compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact)
+    {
+        crate::api::new_api_transport::compact_path()
+    } else if matches!(protocol, Protocol::OpenAiAlphaSearch) {
+        crate::api::new_api_transport::alpha_search_path()
+    } else if responses_chat.is_some() {
+        Protocol::OpenAiChat.path()
+    } else {
+        protocol.path()
+    };
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,
@@ -114,11 +139,26 @@ pub(super) fn plan_proxy_route(
     };
     let output_token_ceiling = match codex_plan.as_ref() {
         Some(plan) => plan.output_token_ceiling,
-        None if http_json && multi_agent_responses => forwarded_json
-            .get("max_output_tokens")
-            .and_then(Value::as_i64)
-            .filter(|ceiling| *ceiling >= 0)
-            .unwrap_or(4_096),
+        None if compact_v2_bridge
+            || matches!(
+                protocol,
+                Protocol::OpenAiResponsesCompact | Protocol::OpenAiAlphaSearch
+            )
+            || (http_json && multi_agent_responses)
+            || (new_api
+                && matches!(
+                    protocol,
+                    Protocol::OpenAiResponses
+                        | Protocol::OpenAiResponsesCompact
+                        | Protocol::OpenAiAlphaSearch
+                )) =>
+        {
+            forwarded_json
+                .get("max_output_tokens")
+                .and_then(Value::as_i64)
+                .filter(|ceiling| *ceiling >= 0)
+                .unwrap_or(4_096)
+        }
         None => inject_controlled_output_ceiling(
             if responses_chat.is_some() {
                 Protocol::OpenAiChat
@@ -128,7 +168,8 @@ pub(super) fn plan_proxy_route(
             &mut forwarded_json,
         )?,
     };
-    let upstream_stream = forwarded_json.get("stream").and_then(Value::as_bool) == Some(true);
+    let upstream_stream =
+        forwarded_json.get("stream").and_then(Value::as_bool) == Some(true) && !compact_v2_bridge;
     let component_adapter = state
         .providers
         .get(&route.driver)
@@ -172,6 +213,9 @@ pub(super) fn plan_proxy_route(
         codex_session_id,
         component_context,
         responses_chat,
+        upstream_path,
+        compact_v2_bridge,
+        wrap_compact_as_sse,
     })
 }
 
@@ -220,6 +264,9 @@ pub(super) async fn materialize_proxy_route(
         codex_session_id: planned.codex_session_id,
         component_request,
         responses_chat: planned.responses_chat,
+        upstream_path: planned.upstream_path,
+        compact_v2_bridge: planned.compact_v2_bridge,
+        wrap_compact_as_sse: planned.wrap_compact_as_sse,
     })
 }
 

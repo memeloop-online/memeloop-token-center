@@ -8,7 +8,7 @@ Set the client's service URL to the MTC address provided by your deployment, suc
 
 MTC supports these client protocols:
 
-- OpenAI-compatible: `/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`
+- OpenAI-compatible: `/v1/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/responses/compact`, `/v1/alpha/search`, `/v1/embeddings`, `/v1/audio/transcriptions`
 - Anthropic-compatible: `/v1/messages`, `/v1/messages/count_tokens`
 - Generation jobs: `/v1/images/generations`, `/v1/videos/generations`, `/v1/generations`
 

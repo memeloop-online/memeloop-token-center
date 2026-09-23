@@ -204,7 +204,9 @@ fn uses_proxy_memory_budget(path: &str) -> bool {
     matches!(
         path,
         "/v1/responses"
+            | "/v1/responses/compact"
             | "/v1/chat/completions"
+            | "/v1/alpha/search"
             | "/v1/embeddings"
             | "/v1/messages"
             | "/v1/messages/count_tokens"
@@ -361,7 +363,7 @@ fn gateway_body_limit(
     audio_maximum: usize,
 ) -> (usize, GatewayBodyRouteClass) {
     match path {
-        "/v1/responses" => (
+        "/v1/responses" | "/v1/responses/compact" => (
             responses_maximum.min(crate::config::MAX_RESPONSES_BODY_MAX_BYTES as usize),
             GatewayBodyRouteClass::Responses,
         ),
@@ -615,6 +617,7 @@ mod tests {
         for (path, maximum) in [
             ("/v1/chat/completions", MAX_DEFAULT_BODY),
             ("/v1/responses", responses_maximum),
+            ("/v1/responses/compact", responses_maximum),
             ("/v1/images/generations", MAX_IMAGE_BODY),
         ] {
             let exact = Request::post(path)

@@ -39,7 +39,7 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
     for (path, authorized, body, expected) in [
         ("/v1/responses", false, "{}", StatusCode::UNAUTHORIZED),
         ("/v1/responses", true, "not-json", StatusCode::BAD_REQUEST),
-        ("/v1/responses/compact", true, "{}", StatusCode::NOT_FOUND),
+        ("/v1/responses/compact", true, "{}", StatusCode::BAD_REQUEST),
         (
             "/v1/responses",
             true,

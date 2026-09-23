@@ -422,6 +422,17 @@ fn retired_cbcnx_accounts_use_http_json() {
 }
 
 #[test]
+fn new_api_provider_is_a_codex_compatible_openai_relay() {
+    let catalog = ProviderCatalog::builtins();
+    let provider = catalog.get("new-api").expect("built-in new-api");
+    assert_eq!(provider.id, NEW_API_PROVIDER_DRIVER);
+    assert_eq!(provider.protocols, vec!["openai", "anthropic"]);
+    assert_eq!(provider.modalities, vec!["text"]);
+    assert!(is_new_api_driver("new-api"));
+    assert!(!is_openai_compatible_http_driver("new-api"));
+}
+
+#[test]
 fn builtin_codex_routes_openai_and_verified_image_generation() {
     let catalog = ProviderCatalog::builtins();
     let codex = catalog.get("openai-codex").unwrap();
@@ -509,6 +520,7 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
         .map(|provider| provider.id.as_str())
         .collect::<Vec<_>>();
     assert!(public_ids.contains(&"openai-codex"));
+    assert!(public_ids.contains(&"new-api"));
     assert!(!public_ids.iter().any(|driver| driver.starts_with("cpa-")));
     assert!(catalog.get("cpa-codex-oauth").is_none());
     assert!(catalog.get("cpa-subscription-bridge").is_none());

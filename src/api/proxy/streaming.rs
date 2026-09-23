@@ -296,7 +296,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 _ => ResponsesSseCapture::for_delivery_with_limits(sse_framing_limits),
             });
             let mut responses_streaming_sanitizer = (is_sse
-                && (is_codex_route || matches!(protocol, Protocol::OpenAiResponses)))
+                && (is_codex_route
+                    || matches!(
+                        protocol,
+                        Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact
+                    )))
             .then(|| crate::api::sse::ResponsesStreamingSanitizer::with_limits(sse_framing_limits));
             let codex_responses_progress_heartbeat =
                 is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);

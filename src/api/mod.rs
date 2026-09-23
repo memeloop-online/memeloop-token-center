@@ -50,6 +50,7 @@ mod limits;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
+mod new_api_transport;
 pub(crate) mod plugin_execution;
 mod plugins;
 mod proxy;
@@ -130,8 +131,8 @@ use traffic::{
     authorize_applied_traffic_policy, component_provider_timeout, component_provider_url,
     inject_controlled_output_ceiling, negotiate_openai_responses_websocket,
     normalize_component_provider, prepare_component_provider, proxy_anthropic,
-    proxy_anthropic_count_tokens, proxy_openai_chat, proxy_openai_embeddings,
-    proxy_openai_responses,
+    proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
+    proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
 use upstreams::*;
 use web::{operator_index, portal_index, web_asset};

@@ -43,8 +43,14 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
                 .post(proxy_openai_responses)
                 .layer(DefaultBodyLimit::max(MAX_RESPONSES_REQUEST_BODY)),
         )
+        .route(
+            "/v1/responses/compact",
+            post(proxy_openai_responses_compact)
+                .layer(DefaultBodyLimit::max(MAX_RESPONSES_REQUEST_BODY)),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(proxy_openai_chat))
+        .route("/v1/alpha/search", post(proxy_openai_alpha_search))
         .route("/v1/embeddings", post(proxy_openai_embeddings))
         .route(
             "/v1/audio/transcriptions",

@@ -50,7 +50,10 @@ fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> St
                 crate::oauth::managed::codex::CLIENT_VERSION
             )
         }
-        driver if crate::provider::is_openai_compatible_http_driver(driver) => {
+        driver
+            if crate::provider::is_openai_compatible_http_driver(driver)
+                || crate::provider::is_new_api_driver(driver) =>
+        {
             if base.ends_with("/v1") {
                 format!("{base}/models")
             } else {
@@ -341,6 +344,14 @@ mod tests {
         assert_eq!(
             upstream_health_probe_url("http-json", &json!({}), "https://upstream.example.test/v1/",),
             "https://upstream.example.test/v1/models",
+        );
+    }
+
+    #[test]
+    fn new_api_health_uses_the_bounded_openai_model_catalog_endpoint() {
+        assert_eq!(
+            upstream_health_probe_url("new-api", &json!({}), "https://zero.cat/"),
+            "https://zero.cat/v1/models",
         );
     }
 }

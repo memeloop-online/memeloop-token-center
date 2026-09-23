@@ -8,7 +8,7 @@ Memeloop Token Center（MTC）为文本、图片、音频和视频请求提供�
 
 MTC 支持以下客户端协议：
 
-- OpenAI 兼容：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`、`/v1/audio/transcriptions`
+- OpenAI 兼容：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/embeddings`、`/v1/audio/transcriptions`
 - Anthropic 兼容：`/v1/messages`、`/v1/messages/count_tokens`
 - 生成任务：`/v1/images/generations`、`/v1/videos/generations`、`/v1/generations`
 

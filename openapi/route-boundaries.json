@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "minimum_openapi_paths": 71,
-  "minimum_openapi_operations": 81,
+  "minimum_openapi_paths": 73,
+  "minimum_openapi_operations": 83,
   "rules": [
     {
       "name": "shared-health-probes",

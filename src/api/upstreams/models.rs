@@ -653,7 +653,9 @@ async fn discover_models(
         }
         return Ok(("kimi_builtin", crate::api::kimi_transport::catalog()));
     }
-    if !crate::provider::is_openai_compatible_http_driver(&account.driver) {
+    if !crate::provider::is_openai_compatible_http_driver(&account.driver)
+        && !crate::provider::is_new_api_driver(&account.driver)
+    {
         return Err("unsupported");
     }
     credential
