@@ -29,7 +29,10 @@ pub(in crate::api::proxy) fn candidate_compatibility(
     route: &ResolvedUpstream,
 ) -> CandidateCompatibility {
     if (codex_transport::is_driver(&route.driver)
-        && !matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses))
+        && !matches!(
+            protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact
+        ))
         || (route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
             && !crate::api::kimi_transport::supports(protocol))
     {

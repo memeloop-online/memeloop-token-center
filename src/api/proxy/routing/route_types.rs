@@ -9,6 +9,9 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    pub(super) upstream_path: &'static str,
+    pub(super) compact_v2_bridge: bool,
+    pub(super) wrap_compact_as_sse: bool,
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
@@ -21,6 +24,9 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) codex_session_id: Option<String>,
     pub(super) component_context: Option<RequestContext>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
+    pub(super) upstream_path: &'static str,
+    pub(super) compact_v2_bridge: bool,
+    pub(super) wrap_compact_as_sse: bool,
 }
 
 impl PlannedProxyRoute {

@@ -78,7 +78,64 @@ pub(super) async fn proxy_openai_responses(
         );
         AppError::Overloaded
     })?;
-    super::proxy::proxy_spooled_responses(state, headers, body, memory, spool).await
+    super::proxy::proxy_spooled_responses(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::OpenAiResponses,
+    )
+    .await
+}
+
+pub(super) async fn proxy_openai_responses_compact(
+    State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !memory.try_grow(
+        spool.len(),
+        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+    ) {
+        state
+            .metrics
+            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
+        return Err(AppError::Overloaded);
+    }
+    let body = spool.read_all().await.map_err(|_| {
+        tracing::error!(
+            stage = "request_spool_read",
+            bytes = spool.len(),
+            "authenticated Responses compact request spool could not be replayed"
+        );
+        AppError::Overloaded
+    })?;
+    super::proxy::proxy_spooled_responses(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::OpenAiResponsesCompact,
+    )
+    .await
+}
+
+pub(super) async fn proxy_openai_alpha_search(
+    State(state): State<AppState>,
+    axum::Extension(memory): axum::Extension<
+        std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    >,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    super::proxy::proxy(state, headers, body, Protocol::OpenAiAlphaSearch, memory).await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
@@ -139,6 +196,8 @@ pub(super) async fn proxy_anthropic_count_tokens(
 pub(super) enum Protocol {
     OpenAiChat,
     OpenAiResponses,
+    OpenAiResponsesCompact,
+    OpenAiAlphaSearch,
     OpenAiEmbeddings,
     AnthropicMessages,
     AnthropicCountTokens,
@@ -151,7 +210,11 @@ impl Protocol {
 
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::OpenAiChat | Self::OpenAiResponses | Self::OpenAiEmbeddings => "openai",
+            Self::OpenAiChat
+            | Self::OpenAiResponses
+            | Self::OpenAiResponsesCompact
+            | Self::OpenAiAlphaSearch
+            | Self::OpenAiEmbeddings => "openai",
             Self::AnthropicMessages | Self::AnthropicCountTokens => "anthropic",
         }
     }
@@ -160,6 +223,8 @@ impl Protocol {
         match self {
             Self::OpenAiChat => "/v1/chat/completions",
             Self::OpenAiResponses => "/v1/responses",
+            Self::OpenAiResponsesCompact => crate::api::new_api_transport::compact_path(),
+            Self::OpenAiAlphaSearch => crate::api::new_api_transport::alpha_search_path(),
             Self::OpenAiEmbeddings => "/v1/embeddings",
             Self::AnthropicMessages => "/v1/messages",
             Self::AnthropicCountTokens => "/v1/messages/count_tokens",
@@ -182,7 +247,10 @@ pub(super) fn inject_controlled_output_ceiling(
         ),
         Protocol::OpenAiResponses => (&["max_output_tokens"][..], Some("max_output_tokens"), 4_096),
         Protocol::AnthropicMessages => (&["max_tokens"][..], Some("max_tokens"), 4_096),
-        Protocol::OpenAiEmbeddings | Protocol::AnthropicCountTokens => (&[][..], None, 0),
+        Protocol::OpenAiEmbeddings
+        | Protocol::AnthropicCountTokens
+        | Protocol::OpenAiResponsesCompact
+        | Protocol::OpenAiAlphaSearch => (&[][..], None, 0),
     };
     if matches!(protocol, Protocol::OpenAiChat)
         && object.contains_key("max_completion_tokens")

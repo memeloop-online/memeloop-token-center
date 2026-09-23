@@ -58,12 +58,13 @@ impl Context {
     }
 }
 
-/// Only exact supported paths (and the explicitly unsupported compact path)
-/// become labels. Query strings and arbitrary path segments never enter logs.
+/// Only exact supported paths become labels. Query strings and arbitrary
+/// path segments never enter logs.
 pub(super) fn route_class(path: &str) -> Option<&'static str> {
     match path {
         "/v1/responses" => Some("responses"),
         "/v1/responses/compact" => Some("responses_compact"),
+        "/v1/alpha/search" => Some("alpha_search"),
         "/v1/chat/completions" => Some("chat"),
         "/v1/messages" => Some("messages"),
         "/v1/messages/count_tokens" => Some("count_tokens"),
@@ -285,6 +286,7 @@ mod tests {
             route_class("/v1/responses/compact"),
             Some("responses_compact")
         );
+        assert_eq!(route_class("/v1/alpha/search"), Some("alpha_search"));
         assert_eq!(route_class("/v1/responses/SECRET_CANARY"), None);
         assert_eq!(route_class("/v1/responses?api_key=SECRET_CANARY"), None);
         assert_eq!(ingress_request_id(Some("SECRET_CANARY")), None);

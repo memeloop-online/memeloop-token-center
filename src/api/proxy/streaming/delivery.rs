@@ -186,7 +186,9 @@ impl Default for TerminalFrames {
 
 pub(super) fn invalid_terminal_failure(protocol: Protocol) -> Bytes {
     match protocol {
-        Protocol::OpenAiResponses => crate::api::sse::safe_failure_event(),
+        Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact => {
+            crate::api::sse::safe_failure_event()
+        }
         Protocol::AnthropicMessages => Bytes::from_static(
             b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
         ),
@@ -206,7 +208,12 @@ pub(super) fn downstream_stream_failure(
     // Body::from_stream resets the HTTP body. Responses clients surface that
     // as a transport/body-decode failure instead of a terminal API error.
     // Keep other streaming protocols' existing error behavior unchanged.
-    if is_sse && matches!(protocol, Protocol::OpenAiResponses) {
+    if is_sse
+        && matches!(
+            protocol,
+            Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact
+        )
+    {
         if sanitizer.is_some_and(crate::api::sse::ResponsesStreamingSanitizer::has_failed_terminal)
         {
             Ok(Bytes::new())

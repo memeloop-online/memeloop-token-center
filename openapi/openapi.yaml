@@ -5744,6 +5744,50 @@ paths:
         '429': { $ref: '#/components/responses/UsageRejected' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /v1/responses/compact:
+    post:
+      tags: [OpenAI compatible]
+      operationId: compactResponse
+      summary: Proxy an OpenAI-compatible Responses compact request
+      description: |
+        Forwards `POST /v1/responses/compact` to New API and other OpenAI-compatible
+        relays. Codex compact v2 (`compaction_trigger` on `POST /v1/responses`) is
+        bridged onto this upstream path for `http-json` and `new-api` accounts.
+      security: [{ clientBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/alpha/search:
+    post:
+      tags: [OpenAI compatible]
+      operationId: createAlphaSearch
+      summary: Proxy a New API openai-alpha-search request
+      security: [{ clientBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenAIAlphaSearchRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /v1/embeddings:
     post:
       tags: [OpenAI compatible]
@@ -10336,6 +10380,12 @@ components:
             upstream response `id` on the prior logical-conversation observation, so a
             later request can use this value as direct parent evidence even when the
             client does not send Token Center-specific turn headers.
+    OpenAIAlphaSearchRequest:
+      type: object
+      required: [model]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1 }
     OpenAIEmbeddingRequest:
       type: object
       required: [model, input]

@@ -170,6 +170,7 @@ pub enum ResponsesViaChatDialect {
 /// (so the operator form renders it with an explanatory description) and read
 /// by the routing bridge when converting Responses requests.
 pub const RESPONSES_VIA_CHAT_COMPACTION_CONFIG: &str = "responses_via_chat_compaction";
+pub const NEW_API_PROVIDER_DRIVER: &str = "new-api";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +219,10 @@ pub fn canonicalize_provider_driver(driver: &str) -> &str {
 
 pub fn is_openai_compatible_http_driver(driver: &str) -> bool {
     canonicalize_provider_driver(driver) == "http-json"
+}
+
+pub fn is_new_api_driver(driver: &str) -> bool {
+    canonicalize_provider_driver(driver) == NEW_API_PROVIDER_DRIVER
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -414,7 +419,7 @@ impl ProviderCatalog {
                 "image".to_owned(),
                 "video".to_owned(),
             ],
-            config_schema,
+            config_schema: config_schema.clone(),
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
             component_adapter: None,
@@ -427,6 +432,20 @@ impl ProviderCatalog {
             codex_model_capabilities: None,
             source: "builtin".to_owned(),
         }];
+        types.push(ProviderType {
+            id: NEW_API_PROVIDER_DRIVER.to_owned(),
+            display_name: "New API".to_owned(),
+            protocols: vec!["openai".to_owned(), "anthropic".to_owned()],
+            modalities: vec!["text".to_owned()],
+            config_schema: config_schema.clone(),
+            credential_schema: credential_schema.clone(),
+            oauth_adapter: None,
+            component_adapter: None,
+            generation_adapter: None,
+            request_compatibility: Default::default(),
+            codex_model_capabilities: None,
+            source: "builtin".to_owned(),
+        });
         types.push(ProviderType {
             id: "volcengine-seedance".to_owned(),
             display_name: "Volcengine Seedance".to_owned(),

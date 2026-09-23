@@ -599,7 +599,9 @@ async fn finish_non_sse_proxy_response(
     );
     let validation = match protocol {
         Protocol::OpenAiChat => validate_buffered_chat_success(&response_body),
-        Protocol::OpenAiResponses => validate_buffered_responses_success(&response_body),
+        Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact => {
+            validate_buffered_responses_success(&response_body)
+        }
         _ => Ok(()),
     };
     if let Err(error_code) = validation {
@@ -876,13 +878,14 @@ pub(super) async fn proxy_spooled_responses(
     body: Bytes,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    protocol: Protocol,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     proxy_with_identity_and_conversation_spool(
         state,
         headers,
         body,
-        Protocol::OpenAiResponses,
+        protocol,
         key,
         None,
         memory,
@@ -1111,7 +1114,11 @@ async fn proxy_with_identity_and_conversation_spool(
         && !route_plan.primary.is_component()
         && matches!(
             protocol,
-            Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+            Protocol::OpenAiChat
+                | Protocol::OpenAiResponses
+                | Protocol::OpenAiResponsesCompact
+                | Protocol::OpenAiAlphaSearch
+                | Protocol::AnthropicMessages
         );
     let price_lookup = proxy_diagnostics::Phase::new(diagnostic_context, "model_price_lookup");
     let price = state.db.model_price(&model, &key.currency).await?;
@@ -1204,7 +1211,10 @@ async fn proxy_with_identity_and_conversation_spool(
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
-        Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+        Protocol::OpenAiChat
+            | Protocol::OpenAiResponses
+            | Protocol::OpenAiResponsesCompact
+            | Protocol::AnthropicMessages
     )
     .then(|| ProxyConversation {
         key: key.clone(),

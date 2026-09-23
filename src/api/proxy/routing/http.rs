@@ -1,4 +1,5 @@
 use super::*;
+use bytes::Bytes;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
@@ -60,14 +61,7 @@ pub(super) async fn send_reqwest_proxy_route(
         Err(_) => return Err(ProxySendError::RetryableConnection("dns")),
         Ok(Err(_)) => return Err(ProxySendError::CandidateUnavailable),
     };
-    let target_url = network::upstream_api_url(
-        &outbound_base_url,
-        if route.responses_chat.is_some() {
-            Protocol::OpenAiChat.path()
-        } else {
-            protocol.path()
-        },
-    );
+    let target_url = network::upstream_api_url(&outbound_base_url, route.upstream_path);
     let mut request = outbound_http
         .post(target_url)
         // Reqwest's per-request timeout covers connection/header acquisition;
@@ -79,6 +73,9 @@ pub(super) async fn send_reqwest_proxy_route(
     // negotiate SSE even when the client sent `Accept: application/json`.
     let accept = if (route.responses_chat.is_some() && route.upstream_stream)
         || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
+            && matches!(protocol, Protocol::OpenAiResponses)
+            && route.upstream_stream)
+        || (crate::provider::is_new_api_driver(&route.route.driver)
             && matches!(protocol, Protocol::OpenAiResponses)
             && route.upstream_stream)
     {
@@ -136,6 +133,8 @@ pub(super) async fn send_reqwest_proxy_route(
                     route.upstream_stream,
                     sse_framing_limits,
                 )?
+            } else if route.compact_v2_bridge {
+                translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
             } else {
                 UpstreamResponse::Reqwest(response)
             };
@@ -191,6 +190,66 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
         TransportFailureKind::Other
     };
     ProxySendError::NonRetryableTransport(kind)
+}
+
+async fn translate_new_api_compact_v2(
+    response: reqwest::Response,
+    wrap_as_sse: bool,
+) -> Result<UpstreamResponse, ProxySendError> {
+    let status = response.status();
+    let version = response.version();
+    let mut headers = response.headers().clone();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(ProxySendError::AmbiguousResponse(
+            "upstream_invalid_response",
+        ));
+    }
+    if !status.is_success() {
+        let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
+            Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
+        return Ok(UpstreamResponse::Prefetched {
+            status,
+            headers,
+            version,
+            content_length: None,
+            stream,
+        });
+    }
+    let value = crate::api::sse::parse_unique_json(&bytes)
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let responses = crate::api::new_api_transport::compact_to_responses(&value)
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+    let (content_type, body) = if wrap_as_sse {
+        (
+            HeaderValue::from_static("text/event-stream"),
+            crate::api::new_api_transport::responses_to_sse(&responses)
+                .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
+        )
+    } else {
+        (
+            HeaderValue::from_static("application/json"),
+            Bytes::from(
+                serde_json::to_vec(&responses)
+                    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
+            ),
+        )
+    };
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::CONTENT_ENCODING);
+    headers.insert(header::CONTENT_TYPE, content_type);
+    let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
+        Box::pin(futures_util::stream::once(async move { Ok(body) }));
+    Ok(UpstreamResponse::Prefetched {
+        status,
+        headers,
+        version,
+        content_length: None,
+        stream,
+    })
 }
 
 #[cfg(test)]

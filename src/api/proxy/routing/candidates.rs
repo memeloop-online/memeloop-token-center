@@ -34,6 +34,7 @@ fn candidate_allowed_for_multi_agent_request(
     !multi_agent_request
         || codex_transport::is_driver(driver)
         || crate::provider::is_openai_compatible_http_driver(driver)
+        || crate::provider::is_new_api_driver(driver)
         || supports_multi_agent
 }
 
@@ -319,6 +320,9 @@ mod tests {
             true,
             false
         ));
+        assert!(candidate_allowed_for_multi_agent_request(
+            "new-api", true, false
+        ));
         assert!(!candidate_allowed_for_multi_agent_request(
             "volcengine-seedance",
             true,
@@ -366,6 +370,9 @@ mod tests {
                 },
             )),
             responses_chat: None,
+            upstream_path: "/v1/responses",
+            compact_v2_bridge: false,
+            wrap_compact_as_sse: false,
         };
 
         let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();

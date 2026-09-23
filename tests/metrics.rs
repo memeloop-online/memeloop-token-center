@@ -350,6 +350,8 @@ async fn gateway_and_control_roles_return_404_for_every_opposite_operation_famil
         (Method::GET, "/v1/models"),
         (Method::POST, "/v1/chat/completions"),
         (Method::POST, "/v1/responses"),
+        (Method::POST, "/v1/responses/compact"),
+        (Method::POST, "/v1/alpha/search"),
         (Method::POST, "/v1/embeddings"),
         (Method::POST, "/v1/messages"),
         (Method::POST, "/v1/generations"),
