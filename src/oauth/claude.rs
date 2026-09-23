@@ -31,8 +31,8 @@ pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback"
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const FLOW_KIND: &str = "claude_manual_pkce";
-const SESSION_AAD: &[u8] = b"memeloop-token-center/claude-manual-login/v1";
-const STATE_AAD: &[u8] = b"memeloop-token-center/claude-manual-state/v1";
+pub(crate) const SESSION_AAD: &[u8] = b"memeloop-token-center/claude-manual-login/v1";
+pub(crate) const STATE_AAD: &[u8] = b"memeloop-token-center/claude-manual-state/v1";
 const READY_AAD: &[u8] = b"memeloop-token-center/claude-manual-ready/v1";
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
