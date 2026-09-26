@@ -957,6 +957,121 @@ async fn codex_proxy_rotation_cannot_clone_a_dispatched_refresh_token() {
     assert_eq!(proxy_url.as_deref(), Some(replacement_proxy));
 }
 
+#[tokio::test]
+async fn codex_reauthorization_replaces_dispatched_refresh_generation_and_proxy() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-reauth-proxy.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let old_proxy = "socks5h://100.64.0.5:1080";
+    let new_proxy = "socks5h://100.64.0.16:1080";
+    let credential = |token: &str, proxy: &str| UpstreamCredential::OAuth {
+        access_token: token.into(),
+        refresh_token: Some(format!("refresh-{token}")),
+        expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: Some(json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "same-codex-account"
+        })),
+        proxy_url: Some(proxy.into()),
+        proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+    };
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-reauth-proxy".into(),
+                name: "Codex reauthorization".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: credential("old", old_proxy),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let refresh_key = "dispatched-before-device-login";
+    assert!(matches!(
+        state
+            .db
+            .claim_upstream_oauth_refresh(account.id, refresh_key, pepper)
+            .await
+            .unwrap(),
+        ClaimUpstreamOAuthRefreshResult::Claimed(_)
+    ));
+    state
+        .db
+        .mark_upstream_oauth_refresh_request_started(account.id, refresh_key)
+        .await
+        .unwrap();
+    let session = Uuid::now_v7();
+    let reauthorized = state
+        .db
+        .reauthorize_upstream_account(
+            account.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "codex-reauth-proxy".into(),
+                expected_updated_at: account.updated_at,
+                expected_credential_generation: account.credential_generation,
+                driver: "openai-codex".into(),
+                oauth_session_id: session,
+                oauth_driver: "openai_codex_device".into(),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+                provider_config: None,
+                credential: credential("new", new_proxy),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reauthorized.credential_generation,
+        account.credential_generation + 1
+    );
+    let (_, installed, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(
+        installed.proxy(),
+        Some((
+            new_proxy,
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+    let UpstreamCredential::OAuth { refresh_token, .. } = installed else {
+        panic!("reauthorization must install OAuth credentials");
+    };
+    assert_eq!(refresh_token.as_deref(), Some("refresh-new"));
+    assert!(
+        state
+            .db
+            .finish_upstream_oauth_refresh(
+                account.id,
+                credential("stale", old_proxy),
+                refresh_key,
+                pepper
+            )
+            .await
+            .is_err()
+    );
+}
+
 fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
 }

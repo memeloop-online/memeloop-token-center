@@ -113,10 +113,7 @@ pub(in crate::api) async fn start_codex_oauth(
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
-        return Err(AppError::BadRequest(
-            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
-                .into(),
-        ));
+        require_global_service(&service)?;
     }
     let (provider_config, session_proxy_url, reauthorize) =
         if let Some(account_id) = body.upstream_account_id {
@@ -140,7 +137,10 @@ pub(in crate::api) async fn start_codex_oauth(
                     .into(),
             ));
             }
-            let proxy_url = credential.proxy().map(|(url, _)| url.to_owned());
+            let proxy_url = body
+                .proxy_url
+                .clone()
+                .or_else(|| credential.proxy().map(|(url, _)| url.to_owned()));
             let target = OAuthReauthorizationTarget {
                 account_id,
                 expected_updated_at: account.updated_at,
