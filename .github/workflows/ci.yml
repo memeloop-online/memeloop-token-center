@@ -266,7 +266,7 @@ jobs:
             --tmpfs /data:rw,size=2g \
             --env MINIO_ROOT_USER=token-center-test \
             --env MINIO_ROOT_PASSWORD=token-center-test-secret \
-            quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e server /data
+            ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
               break
@@ -279,12 +279,13 @@ jobs:
           done
           docker run --rm --network host --entrypoint sh \
             --volume "$PWD/tests/fixtures/minio-list-only-policy.json:/tmp/minio-list-only-policy.json:ro" \
-            quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3 \
-            -ec 'mc alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret \
-              && mc mb --ignore-existing test/memeloop-token-center-test \
-              && mc admin user add test mtc-list-only mtc-list-only-secret \
-              && mc admin policy create test mtc-list-only /tmp/minio-list-only-policy.json \
-              && mc admin policy attach test mtc-list-only --user mtc-list-only'
+            public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 \
+            -ec 'apk add --no-cache minio-client=0.20250521.015954-r5 \
+              && mcli alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret \
+              && mcli mb --ignore-existing test/memeloop-token-center-test \
+              && mcli admin user add test mtc-list-only mtc-list-only-secret \
+              && mcli admin policy create test mtc-list-only /tmp/minio-list-only-policy.json \
+              && mcli admin policy attach test mtc-list-only --user mtc-list-only'
       - run: cargo fmt --all -- --check
       - name: Build the fixed preferred-account guest for real host acceptance
         run: |
