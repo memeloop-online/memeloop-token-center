@@ -13,10 +13,10 @@ use crate::{error::AppError, network, provider::UpstreamCredential};
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 /// Fixed native Codex catalog protocol profile. This is independent from the
 /// MemeLoop package version and is shared by health and catalog discovery.
-pub(crate) const CLIENT_VERSION: &str = "0.146.0";
+pub(crate) const CLIENT_VERSION: &str = "0.155.0";
 pub(crate) const ORIGINATOR: &str = "codex-tui";
 pub(crate) const USER_AGENT: &str =
-    "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
+    "codex-tui/0.155.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.155.0)";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const NATIVE_ADAPTER_SCHEMA: &str = "openai-codex-oauth-v1";
 const RESPONSE_LIMIT: usize = 1024 * 1024;

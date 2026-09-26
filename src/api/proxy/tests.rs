@@ -2911,7 +2911,7 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert!(request.headers.get(header::CONNECTION).is_none());
     assert_eq!(
         request.headers[header::USER_AGENT],
-        "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
+        "codex-tui/0.155.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.155.0)"
     );
     assert_eq!(request.headers["originator"], "codex-tui");
     assert_eq!(request.headers["chatgpt-account-id"], "account-123");
