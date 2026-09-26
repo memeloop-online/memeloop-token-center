@@ -10,6 +10,7 @@ use crate::db::{
 };
 
 const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
+const CODEX_MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MODEL_CATALOG_BODY: usize = 2 * 1024 * 1024;
 const MAX_MODEL_COUNT: usize = 10_000;
 const MAX_MODEL_ID_BYTES: usize = 500;
@@ -69,7 +70,7 @@ fn codex_catalog_budget(config: &Value) -> Result<CatalogBudget, &'static str> {
     let total = if value.is_some_and(|p| p.get("request_timeout_millis").is_some()) {
         Duration::from_millis(policy.request_timeout_millis)
     } else {
-        MODEL_CATALOG_TIMEOUT
+        CODEX_MODEL_CATALOG_TIMEOUT
     };
     let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
         Duration::from_millis(policy.read_timeout_millis).min(total)
@@ -1327,8 +1328,8 @@ mod tests {
             assert_eq!(
                 codex_catalog_budget(&config).unwrap(),
                 CatalogBudget {
-                    total: Duration::from_secs(8),
-                    read: Duration::from_secs(8)
+                    total: Duration::from_secs(30),
+                    read: Duration::from_secs(30)
                 }
             );
         }

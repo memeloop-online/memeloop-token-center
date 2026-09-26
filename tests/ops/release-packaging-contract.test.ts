@@ -14,8 +14,10 @@ type Workflow = {
 test('release contains only runtime images and no retired migration delivery surface', () => {
   const dockerfile = read('Dockerfile');
   const compose = read('compose.yaml');
-  const minioImage = 'quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e';
-  const minioClientImage = 'quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3';
+  const composeMinioImage = 'quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e';
+  const composeMinioClientImage = 'quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3';
+  const ciMinioImage = 'ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e';
+  const ciMinioClientImage = 'public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8';
   assert.ok(!dockerfile.includes('memeloop-token-center-importer'));
   contains('Dockerfile.plugin-installer.release', 'FROM ${RUNTIME_IMAGE}');
   assert.ok(!read('Dockerfile.plugin-installer.release').includes('cargo build'));
@@ -43,10 +45,10 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.match(manualMatrix, /Dockerfile\.release/);
   assert.match(manualMatrix, /Dockerfile\.plugin-installer\.release/);
   assert.doesNotMatch(manualMatrix, /"Dockerfile"|"Dockerfile\.plugin-installer"/);
-  assert.equal(occurrences(workflow, minioImage), 1);
-  assert.equal(occurrences(compose, minioImage), 1);
-  assert.equal(occurrences(workflow, minioClientImage), 1);
-  assert.equal(occurrences(compose, minioClientImage), 1);
+  assert.equal(occurrences(workflow, ciMinioImage), 1);
+  assert.equal(occurrences(workflow, ciMinioClientImage), 1);
+  assert.equal(occurrences(compose, composeMinioImage), 1);
+  assert.equal(occurrences(compose, composeMinioClientImage), 1);
   assert.ok(!workflow.includes('minio/minio:'));
   assert.ok(!compose.includes('minio/minio:'));
   assert.ok(!workflow.includes('minio/mc:'));
