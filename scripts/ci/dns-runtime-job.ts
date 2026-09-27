@@ -52,6 +52,7 @@ export function renderJob(image: string, nodeImage: string, suite: "dns" | "comp
                   MTC_SERVICE_TOKEN: token, MTC_ALLOW_OAUTH_LOOPBACK: "true",
                   MTC_LISTEN: "127.0.0.1:8080", MTC_ARCHIVE_BACKEND: "filesystem",
                   MTC_ARCHIVE_PATH: "/data/archive", MTC_RUN_MIGRATIONS_ON_START: "true",
+                  MTC_RESPONSES_REQUEST_SPOOL_PATH: "/data/request-spool",
                   MTC_PROXY_MEMORY_BUDGET_BYTES: "268435456",
                 }).map(([name, value]) => ({ name, value })),
               }],
