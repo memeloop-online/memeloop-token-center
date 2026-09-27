@@ -201,7 +201,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     let status_code = i64::from(status.as_u16());
     let BufferedRequest {
         reservation,
-        started,
         input_token_ceiling,
         output_token_ceiling,
         requested_service_tier,
@@ -244,7 +243,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let deadline_metrics = background_state.metrics.clone();
         let deadline_reservation = reservation.clone();
         let deadline_tenant_id = tenant_id;
-        let deadline_started = started;
         let lifecycle = async move {
             let stream_phase = proxy_diagnostics::Phase::account(
                 diagnostic_context,
@@ -990,7 +988,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 upstream_attempt,
                 request_id,
                 reservation,
-                started,
+                diagnostic_context,
                 input_token_ceiling,
                 output_token_ceiling,
                 requested_service_tier,
@@ -1027,7 +1025,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     request_id,
                     deadline_tenant_id,
                     &deadline_reservation,
-                    deadline_started.elapsed().as_millis() as i64,
+                    diagnostic_context.elapsed_millis_at(Instant::now()),
                 )
                 .await
             {

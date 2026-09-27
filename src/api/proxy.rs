@@ -2177,6 +2177,8 @@ struct BufferedRequest<'a> {
     state: &'a AppState,
     reservation: crate::model::UsageReservation,
     request_id: Uuid,
+    // Admission/resource budget clock; persisted latency uses the ingress
+    // diagnostic context instead. Moving this clock would change deadlines.
     started: Instant,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
@@ -2835,7 +2837,8 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         output_token_ceiling: request.output_token_ceiling,
         requested_service_tier: request.requested_service_tier.as_deref(),
         status_code: i64::from(status.as_u16()),
-        duration_ms: request.started.elapsed().as_millis() as i64,
+        duration_ms: proxy_diagnostics::Context::for_request(request_id)
+            .elapsed_millis_at(Instant::now()),
         usage,
         usage_basis: Some(usage_basis),
         error_code: error_code.as_deref(),
