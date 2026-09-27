@@ -277,15 +277,22 @@ jobs:
             fi
             sleep 1
           done
-          docker run --rm --network host --entrypoint sh \
-            --volume "$PWD/tests/fixtures/minio-list-only-policy.json:/tmp/minio-list-only-policy.json:ro" \
-            public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 \
-            -ec 'apk add --no-cache minio-client=0.20250521.015954-r5 \
-              && mcli alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret \
-              && mcli mb --ignore-existing test/memeloop-token-center-test \
-              && mcli admin user add test mtc-list-only mtc-list-only-secret \
-              && mcli admin policy create test mtc-list-only /tmp/minio-list-only-policy.json \
-              && mcli admin policy attach test mtc-list-only --user mtc-list-only'
+          # The unrelated public ECR Alpine helper can exhaust its transfer
+          # quota before Rust tests start. Use the official fixed mc release
+          # directly, with a reviewed checksum verified before execution.
+          mc_dir="$(mktemp -d "$RUNNER_TEMP/mtc-minio-client.XXXXXX")"
+          mc_binary="$mc_dir/mc"
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z \
+            --output "$mc_binary"
+          echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  $mc_binary" | sha256sum --check --strict
+          chmod 0500 "$mc_binary"
+          export MC_CONFIG_DIR="$mc_dir/config"
+          "$mc_binary" alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret
+          "$mc_binary" mb --ignore-existing test/memeloop-token-center-test
+          "$mc_binary" admin user add test mtc-list-only mtc-list-only-secret
+          "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
+          "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
       - name: Build the fixed preferred-account guest for real host acceptance
         run: |

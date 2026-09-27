@@ -17,7 +17,7 @@ test('release contains only runtime images and no retired migration delivery sur
   const composeMinioImage = 'quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e';
   const composeMinioClientImage = 'quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3';
   const ciMinioImage = 'ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e';
-  const ciMinioClientImage = 'public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8';
+  const ciMinioClientAsset = 'https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z';
   assert.ok(!dockerfile.includes('memeloop-token-center-importer'));
   contains('Dockerfile.plugin-installer.release', 'FROM ${RUNTIME_IMAGE}');
   assert.ok(!read('Dockerfile.plugin-installer.release').includes('cargo build'));
@@ -46,7 +46,26 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.match(manualMatrix, /Dockerfile\.plugin-installer\.release/);
   assert.doesNotMatch(manualMatrix, /"Dockerfile"|"Dockerfile\.plugin-installer"/);
   assert.equal(occurrences(workflow, ciMinioImage), 1);
-  assert.equal(occurrences(workflow, ciMinioClientImage), 1);
+  assert.equal(occurrences(workflow, ciMinioClientAsset), 1);
+  const minioSetup = (parse(workflow) as Workflow).jobs?.rust?.steps
+    ?.find(step => step.name === 'Start MinIO and create integration-test bucket')?.run ?? '';
+  assert.ok(!minioSetup.includes('public.ecr.aws'));
+  assert.ok(!minioSetup.includes('apk add'));
+  const checkedHash = '01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891';
+  assert.ok(minioSetup.includes(checkedHash));
+  const verifyIndex = minioSetup.indexOf('sha256sum --check --strict');
+  const chmodIndex = minioSetup.indexOf('chmod 0500 "$mc_binary"');
+  const runIndex = minioSetup.indexOf('"$mc_binary" alias set');
+  assert.ok(verifyIndex > 0 && chmodIndex > verifyIndex && runIndex > chmodIndex,
+    'pinned client must be verified before becoming executable or running');
+  assert.ok(minioSetup.includes('export MC_CONFIG_DIR="$mc_dir/config"'));
+  for (const command of [
+    'alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret',
+    'mb --ignore-existing test/memeloop-token-center-test',
+    'admin user add test mtc-list-only mtc-list-only-secret',
+    'admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"',
+    'admin policy attach test mtc-list-only --user mtc-list-only',
+  ]) assert.ok(minioSetup.includes(`"$mc_binary" ${command}`), `missing MinIO fixture setup: ${command}`);
   assert.equal(occurrences(compose, composeMinioImage), 1);
   assert.equal(occurrences(compose, composeMinioClientImage), 1);
   assert.ok(!workflow.includes('minio/minio:'));

@@ -4,8 +4,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { CANARY } from "./dns-runtime-probe.ts";
 import { verifyCompactEvidence } from "./compact-runtime-probe.ts";
+import { verifyUsageEvidence } from "./usage-runtime-probe.ts";
 
-export function renderJob(image: string, nodeImage: string, suite: "dns" | "compact" = "dns") {
+export function renderJob(image: string, nodeImage: string, suite: "dns" | "compact" | "usage" = "dns") {
   assert.match(image, /^ghcr\.io\/memeloop-online\/memeloop-token-center(?::[^@]+)?@sha256:[a-f0-9]{64}$/);
   assert.match(nodeImage, /@sha256:[a-f0-9]{64}$/);
   const name = `mtc-${suite}-runtime-probe`;
@@ -106,15 +107,17 @@ export function verifyLogs(mtcText: string, probeText: string) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [action, first, second] = process.argv.slice(2);
-  if (action === "verify-compact") {
-    assert.ok(first && process.argv.length === 4, "usage: verify-compact PROBE_LOG");
-    verifyCompactEvidence(readFileSync(first, "utf8"));
-    console.log("synthetic compact transport verified");
+  if (action === "verify-compact" || action === "verify-usage") {
+    assert.ok(first && process.argv.length === 4, "usage: verify-compact|verify-usage PROBE_LOG");
+    const verify = action === "verify-compact" ? verifyCompactEvidence : verifyUsageEvidence;
+    verify(readFileSync(first, "utf8"));
+    console.log(`synthetic ${action === "verify-compact" ? "compact" : "usage"} transport verified`);
   } else {
     assert.ok(first && second && process.argv.length === 5,
-      "usage: render|render-compact MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
-    if (action === "render" || action === "render-compact") {
-      console.log(JSON.stringify(renderJob(first, second, action === "render" ? "dns" : "compact"), null, 2));
+      "usage: render|render-compact|render-usage MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
+    if (action === "render" || action === "render-compact" || action === "render-usage") {
+      const suite = action === "render" ? "dns" : action === "render-compact" ? "compact" : "usage";
+      console.log(JSON.stringify(renderJob(first, second, suite), null, 2));
     } else if (action === "verify-logs") {
       verifyLogs(readFileSync(first, "utf8"), readFileSync(second, "utf8"));
       console.log("synthetic DNS transport and diagnostics verified");
