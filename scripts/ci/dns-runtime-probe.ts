@@ -31,7 +31,7 @@ export function dnsReply(query: Buffer, mode: Mode): Buffer | undefined {
   const labels: string[] = [];
   while (offset < query.length && query[offset] !== 0) {
     const length = query[offset++];
-    if (length > 63 || offset + length >= query.length) return;
+    if (length === undefined || length > 63 || offset + length >= query.length) return;
     labels.push(query.subarray(offset, offset + length).toString("ascii"));
     offset += length;
   }

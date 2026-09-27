@@ -102,6 +102,8 @@ export function verifyLogs(mtcText: string, probeText: string) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [action, first, second] = process.argv.slice(2);
+  assert.ok(first && second && process.argv.length === 5,
+    "usage: render MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
   if (action === "render") {
     console.log(JSON.stringify(renderJob(first, second), null, 2));
   } else if (action === "verify-logs") {

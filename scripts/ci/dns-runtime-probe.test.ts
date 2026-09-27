@@ -6,6 +6,18 @@ import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+test("CLI rejects missing render arguments before generating resources", () => {
+  const result = spawnSync(process.execPath, [
+    "--experimental-strip-types",
+    fileURLToPath(new URL("./dns-runtime-job.ts", import.meta.url)),
+    "render",
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /usage: render/);
+});
 
 test("projected ConfigMap symlink entry still runs main without opening ports", () => {
   const directory = mkdtempSync(join(tmpdir(), "mtc-dns-entry-"));
