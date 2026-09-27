@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CHECKPOINT, HISTORY, PHASES, inputForPhase, normalResponse, toSse,
+  CHECKPOINT, HISTORY, PHASES, configForPhase, inputForPhase, normalResponse, toSse,
   validateAttempt, validateDownstream, verifyCompactEvidence,
 } from "./compact-runtime-probe.ts";
 import { renderJob } from "./dns-runtime-job.ts";
@@ -27,6 +27,21 @@ test("both HTTP-json and New API cover normal, compact JSON, and compact SSE", (
       assert.throws(() => validateAttempt(phase, [{ ...attempt, body: { ...body, tools: [] } }]));
     }
   }
+});
+
+test("only HTTP-json compact probes opt in at account scope", () => {
+  const actual = PHASES.map(phase => [
+    phase.name,
+    configForPhase(phase).responses_compact_v2_bridge ?? null,
+  ]);
+  assert.deepEqual(actual, [
+    ["http_json_responses", null],
+    ["http_json_compact_json", true],
+    ["http_json_compact_sse", true],
+    ["new_api_responses", null],
+    ["new_api_compact_json", null],
+    ["new_api_compact_sse", null],
+  ]);
 });
 
 test("complete downstream Responses preserve the opaque compact checkpoint", () => {

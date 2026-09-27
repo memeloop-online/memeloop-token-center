@@ -1,10 +1,9 @@
-//! New API / ZeroCat relay: map Codex traffic onto the documented endpoints.
+//! New API and opted-in HTTP JSON relays: map Codex traffic onto compact endpoints.
 //!
-//! Sidebar types on ZeroCat (`openai`, `openai-response`,
-//! `openai-response-compact`, `anthropic`, `openai-alpha-search`) correspond to
-//! these upstream paths. Compact v2 (`compaction_trigger` on `/v1/responses`)
-//! is bridged to `POST /v1/responses/compact` with Responses `input`, then
-//! wrapped back into a Responses envelope Codex can consume.
+//! Compact v2 (`compaction_trigger` on `/v1/responses`) is bridged to
+//! `POST /v1/responses/compact` with Responses `input`, then wrapped back into
+//! a Responses envelope. Generic HTTP JSON accounts need an explicit
+//! `responses_compact_v2_bridge` opt-in; New API keeps its built-in contract.
 use super::AppError;
 use crate::api::kimi_transport::responses::compaction_item;
 use bytes::Bytes;

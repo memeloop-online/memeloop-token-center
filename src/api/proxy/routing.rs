@@ -91,8 +91,8 @@ pub(super) fn plan_proxy_route(
     let passthrough_responses = http_json || new_api;
     let multi_agent_responses =
         matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
-    // Kimi still rewrites MultiAgent into Chat. http-json and New API post
-    // `/v1/responses` as-is; do not reuse the Kimi rewrite for them.
+    // Kimi still rewrites MultiAgent into Chat. http-json and New API keep
+    // native Responses semantics; do not reuse the Kimi rewrite for them.
     let normalize_multi_agent =
         multi_agent_responses && state.providers.supports_codex_multi_agent_v2(&route.driver);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
@@ -274,6 +274,7 @@ fn upstream_path_for(
         Protocol::OpenAiChat.path()
     } else {
         protocol.path()
+    }
 }
 
 pub(super) async fn materialize_proxy_route(
