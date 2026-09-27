@@ -218,7 +218,15 @@ pub(super) fn passthrough_output_reservation_bound(
     // Pass-through envelopes cannot assume an output cap that was never sent
     // to the supplier. Reserve a trusted per-model bound before dispatch;
     // actual usage still must fit the reservation at settlement.
-    if config.get("reservation_token_bounds").is_some() {
+    if let Some(bounds) = config.get("reservation_token_bounds") {
+        let bounds = bounds.as_object().ok_or_else(|| {
+            AppError::Upstream("compatible upstream reservation metadata must be an object".into())
+        })?;
+        // Generic accounts can opt in one model at a time. An absent entry
+        // preserves that model's legacy admission; native Codex remains strict.
+        if !bounds.contains_key(upstream_model) {
+            return Ok(4_096);
+        }
         return codex_transport::trusted_reservation_token_bound(config, upstream_model).map_err(
             |_| {
                 AppError::Upstream(
