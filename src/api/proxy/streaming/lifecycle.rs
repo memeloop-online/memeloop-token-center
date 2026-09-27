@@ -13,7 +13,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) upstream_attempt: UpstreamAttemptGuard,
     pub(super) request_id: Uuid,
     pub(super) reservation: crate::model::UsageReservation,
-    pub(super) started: Instant,
+    pub(super) diagnostic_context: proxy_diagnostics::Context,
     pub(super) input_token_ceiling: i64,
     pub(super) output_token_ceiling: i64,
     pub(super) requested_service_tier: Option<String>,
@@ -164,7 +164,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         mut upstream_attempt,
         request_id,
         reservation,
-        started,
+        diagnostic_context,
         input_token_ceiling,
         output_token_ceiling,
         requested_service_tier,
@@ -323,13 +323,16 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } else {
         None
     };
-    let (first_output_ms, generation_duration_ms) = output_timing.finish(
-        error_code.is_none()
-            && sse_summary.as_ref().is_some_and(|summary| {
-                matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
-                    || mapped_chat_incomplete
-            }),
-    );
+    let (duration_ms, first_output_ms, generation_duration_ms) = output_timing
+        .finish_with_duration(
+            error_code.is_none()
+                && sse_summary.as_ref().is_some_and(|summary| {
+                    matches!(summary.outcome, ResponsesSseOutcome::Completed { .. })
+                        || mapped_chat_incomplete
+                }),
+            diagnostic_context,
+            Instant::now(),
+        );
     let terminal_result = finish_proxy_request_with_archive_fallback(
         &state.db,
         FinishProxyRequest {
@@ -343,7 +346,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             output_token_ceiling,
             requested_service_tier: requested_service_tier.as_deref(),
             status_code: terminal_status,
-            duration_ms: started.elapsed().as_millis() as i64,
+            duration_ms,
             usage,
             error_code,
             response_object: &stored_response,

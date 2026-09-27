@@ -9,6 +9,18 @@ pub(super) struct OutputTiming {
 }
 
 impl OutputTiming {
+    /// Use the ingress clock for both persisted latency and output observations.
+    /// The separate admission clock still owns resource/deadline budgets.
+    pub(super) fn finish_with_duration(
+        &self,
+        succeeded: bool,
+        context: crate::api::proxy_diagnostics::Context,
+        now: std::time::Instant,
+    ) -> (i64, Option<i64>, Option<i64>) {
+        let (first, generation) = self.finish(succeeded);
+        (context.elapsed_millis_at(now), first, generation)
+    }
+
     pub(super) fn observe(&mut self, frame: &[u8], terminal: bool, elapsed_ms: i64) {
         if self.terminal.is_some() {
             return;
@@ -91,6 +103,41 @@ fn has_output_delta(frame: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_duration_includes_time_before_admission_without_changing_generation() {
+        use std::time::{Duration, Instant};
+        let ingress = Instant::now();
+        let context = crate::api::proxy_diagnostics::Context::with_started_for_test(
+            uuid::Uuid::nil(),
+            ingress,
+        );
+        // Body ingestion/admission took 500 ms before the budget clock began.
+        // Finalizing at 900 ms using that later clock would report 400 ms,
+        // less than the 700 ms first-output observation.
+        let admission = ingress + Duration::from_millis(500);
+        let mut timing = OutputTiming::default();
+        timing.observe(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n",
+            false,
+            context.elapsed_millis_at(ingress + Duration::from_millis(700)),
+        );
+        timing.observe(
+            b"data: {}\n\n",
+            true,
+            context.elapsed_millis_at(ingress + Duration::from_millis(800)),
+        );
+        let finalized = ingress + Duration::from_millis(900);
+        assert_eq!(
+            timing.finish_with_duration(true, context, finalized),
+            (900, Some(700), Some(100))
+        );
+        assert_eq!(
+            timing.finish_with_duration(false, context, finalized),
+            (900, Some(700), None)
+        );
+        assert_eq!(finalized.duration_since(admission).as_millis(), 400);
+    }
 
     #[test]
     fn only_output_starts_clock_and_terminal_freezes_it() {
