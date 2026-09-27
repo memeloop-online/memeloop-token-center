@@ -5,11 +5,12 @@ import { renderJob } from "./dns-runtime-job.ts";
 
 test("account bound reserves per upstream model without imposing an undeclared generation cap", () => {
   assert.deepEqual(accountConfig().reservation_token_bounds, { "gpt-6-astra": 65536 });
+  assert.deepEqual(accountConfig("partial_model_map").reservation_token_bounds, { other_model: 65536 });
   for (const phase of PHASES) {
     const body = { ...inputForPhase(phase), model: "gpt-6-astra" };
     const attempts = phase.kind === "insufficient_balance" ? [] : [{ path: "/v1/responses", body }];
     validateForwarded(phase, attempts);
-    if (phase.kind === "uncapped") {
+    if (phase.kind === "uncapped" || phase.kind === "partial_model_map") {
       assert.throws(() => validateForwarded(phase, [{
         path: "/v1/responses", body: { ...body, max_output_tokens: 65536 },
       }]));
@@ -26,7 +27,9 @@ test("account bound reserves per upstream model without imposing an undeclared g
 
 test("settlement metadata catches streamed 200 that actually failed usage validation", () => {
   for (const phase of PHASES.filter(value => value.kind !== "insufficient_balance")) {
-    const metadata = phase.kind === "uncapped"
+    const metadata = phase.kind === "partial_model_map"
+      ? { status_code: 200, input_tokens: 3, output_tokens: 5, cost: "0.000008" }
+      : phase.kind === "uncapped"
       ? { status_code: 200, input_tokens: 3, output_tokens: 5000, cost: "0.005003" }
       : { status_code: 502, error_code: "upstream_invalid_usage", usage_basis: "not_observed", output_tokens: 0, cost: "0" };
     validateMetadata(phase, metadata);
@@ -38,21 +41,31 @@ test("settlement metadata catches streamed 200 that actually failed usage valida
   }
 });
 
-test("runtime evidence requires all six phases and four total upstream POSTs", () => {
+test("runtime evidence requires original six phases plus two partial-map phases and six total POSTs", () => {
+  assert.deepEqual(PHASES.slice(0, 6).map(phase => phase.name), [
+    "http-json-uncapped", "http-json-explicit_cap", "http-json-insufficient_balance",
+    "new-api-uncapped", "new-api-explicit_cap", "new-api-insufficient_balance",
+  ]);
+  assert.deepEqual(PHASES.slice(6).map(phase => phase.name), [
+    "http-json-partial_model_map", "new-api-partial_model_map",
+  ]);
   const records = PHASES.map(phase => ({
     phase: phase.name,
-    ...(phase.kind === "uncapped"
+    ...(phase.kind === "partial_model_map"
+      ? { status: 200, input_tokens: 3, output_tokens: 5, cost: 0.000008, posts: 1 }
+      : phase.kind === "uncapped"
       ? { status: 200, input_tokens: 3, output_tokens: 5000, cost: 0.005003, posts: 1 }
       : phase.kind === "explicit_cap"
         ? { status: 502, output_tokens: 0, cost: 0, error_code: "upstream_invalid_usage", posts: 1 }
         : { status: 429, error_code: "balance_exhausted", posts: 0 }),
   }));
-  const evidence = [...records, { usage_checks: "passed", phases: 6, posts: 4 }]
+  const evidence = [...records, { usage_checks: "passed", phases: 8, posts: 6 }]
     .map(record => JSON.stringify(record)).join("\n");
   verifyUsageEvidence(evidence);
   assert.throws(() => verifyUsageEvidence(""));
   assert.throws(() => verifyUsageEvidence(evidence.replace('"posts":0', '"posts":1')));
   assert.throws(() => verifyUsageEvidence(evidence.split("\n").slice(0, -1).join("\n")));
+  assert.throws(() => verifyUsageEvidence(evidence.replace('"output_tokens":5,', '"output_tokens":5000,')));
 });
 
 test("usage Job has isolated name, synthetic credentials, ephemeral DB and writable Responses spool", () => {
