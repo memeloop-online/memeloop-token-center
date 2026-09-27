@@ -143,19 +143,52 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
 }
 
 #[test]
-fn passthrough_bounds_fail_closed_on_invalid_or_missing_trusted_model_metadata() {
+fn passthrough_bounds_fail_closed_on_invalid_present_metadata() {
     let bound = super::super::routing::passthrough_output_reservation_bound;
     assert_eq!(bound(&json!({}), &json!({}), "model").unwrap(), 4096);
     for config in [
         json!({"reservation_token_bounds": {"model": -1}}),
         json!({"reservation_token_bounds": {"model": 1_000_000_001_i64}}),
-        json!({"reservation_token_bounds": {"other-model": 65536}}),
+        json!({"reservation_token_bounds": {"model": null}}),
+        json!({"reservation_token_bounds": {"model": "65536"}}),
+        json!({"reservation_token_bounds": null}),
+        json!({"reservation_token_bounds": []}),
     ] {
         assert!(bound(&json!({}), &config, "model").is_err());
     }
     for limit in [json!(-1), json!(1.5), json!("65536"), Value::Null] {
         assert!(bound(&json!({"max_output_tokens": limit}), &json!({}), "model").is_err());
     }
+}
+
+#[test]
+fn optional_passthrough_bounds_only_change_listed_models_and_keep_native_codex_strict() {
+    let bound = super::super::routing::passthrough_output_reservation_bound;
+    let config = json!({"reservation_token_bounds": {"listed-model": 65536}});
+    assert_eq!(bound(&json!({}), &config, "listed-model").unwrap(), 65536);
+    assert_eq!(bound(&json!({}), &config, "unlisted-model").unwrap(), 4096);
+    assert_eq!(
+        bound(
+            &json!({}),
+            &json!({"reservation_token_bounds": {}}),
+            "unlisted-model"
+        )
+        .unwrap(),
+        4096
+    );
+    for model in ["listed-model", "unlisted-model"] {
+        assert_eq!(
+            bound(&json!({"max_output_tokens": 123}), &config, model).unwrap(),
+            123
+        );
+    }
+    // This fallback is restricted to generic pass-through accounts. Native
+    // Codex must still reject a route without synchronized model metadata.
+    assert!(codex_transport::trusted_reservation_token_bound(&config, "unlisted-model").is_err());
+    assert_eq!(
+        codex_transport::trusted_reservation_token_bound(&config, "listed-model").unwrap(),
+        65536
+    );
 }
 
 #[tokio::test]
