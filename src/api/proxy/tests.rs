@@ -2151,7 +2151,7 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
 
 #[tokio::test]
 async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
-    for (label, body, sensitive) in [
+    for (label, body, sensitive, content_type) in [
         (
             "oversized-400",
             format!(
@@ -2160,20 +2160,42 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
             )
             .into_bytes(),
             "oversized private upstream detail",
+            "application/json",
         ),
         (
             "malformed-400",
             b"{\"error\": {\"type\": \"temporarily_unavailable\", \"message\": \"malformed private upstream detail\""
                 .to_vec(),
             "malformed private upstream detail",
+            "application/json",
+        ),
+        (
+            "plaintext-transient-400",
+            br#"{"error":{"type":"temporarily_unavailable","message":"private diagnostic canary"}}"#.to_vec(),
+            "private diagnostic canary",
+            "text/plain",
+        ),
+        (
+            "html-400",
+            b"<html>Invalid input private diagnostic canary</html>".to_vec(),
+            "private diagnostic canary",
+            "text/html",
         ),
     ] {
         let fixture = codex_route_fixture(label).await;
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))
-            .respond_with(ResponseTemplate::new(400).set_body_raw(body, "application/json"))
+            .and(header_matcher("chatgpt-account-id", "account-123"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(body, content_type))
             .expect(1)
+            .mount(&upstream)
+            .await;
+        add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
+        Mock::given(method("POST"))
+            .and(header_matcher("chatgpt-account-id", "account-456"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
             .mount(&upstream)
             .await;
 

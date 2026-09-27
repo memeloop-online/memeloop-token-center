@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 use super::super::upstream_response::UpstreamResponse;
 
+#[path = "bad_request/non_json.rs"]
+mod non_json;
+
 const MAX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
 const MAX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -35,6 +38,14 @@ pub(in crate::api) async fn classify_bad_request(
     response: UpstreamResponse,
     request_id: Uuid,
 ) -> BadRequestDisposition {
+    if response.status() == http::StatusCode::BAD_REQUEST
+        && !has_single_json_content_type(&response)
+    {
+        // Sniffing is diagnostic only: even a JSON-looking transient error
+        // without the required content type must never gain replay authority.
+        non_json::observe(response, request_id).await;
+        return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
+    }
     let disposition = inspect_bad_request(response, request_id).await;
     // Ordinary JSON errors already emit their bounded diagnostic below. All
     // other exits must also be attributable to the request, without recording
@@ -408,6 +419,130 @@ mod tests {
 
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    async fn non_json_diagnostic(response: UpstreamResponse) -> Value {
+        let capture = Capture::default();
+        let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let disposition = classify_bad_request(response, Uuid::nil())
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(
+            disposition,
+            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType)
+        );
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.lines().count(), 1);
+        assert!(!logged.contains("private-canary"), "{logged}");
+        let event: Value = serde_json::from_str(logged.trim()).unwrap();
+        assert_eq!(
+            event["fields"]["upstream_error_classification"],
+            "unclassifiable"
+        );
+        assert_eq!(event["fields"]["upstream_error_reason"], "content_type");
+        event["fields"].clone()
+    }
+
+    #[tokio::test]
+    async fn non_json_body_semantics_never_grant_replay_or_log_provider_bytes() {
+        for (content_types, body, content_class, reason) in [
+            (
+                vec!["text/plain; private-canary"],
+                br#"{"error":{"type":"temporarily_unavailable","message":"private-canary"}}"#
+                    .as_slice(),
+                "text_plain",
+                "unknown",
+            ),
+            (
+                vec![],
+                br#"{"error":{"code":"invalid_encrypted_content","message":"private-canary"}}"#
+                    .as_slice(),
+                "missing",
+                "encrypted_content_rejected",
+            ),
+            (
+                vec!["text/html"],
+                b"<html>Invalid input private-canary https://private-canary.invalid</html>"
+                    .as_slice(),
+                "text_html",
+                "input_shape_invalid",
+            ),
+            (
+                vec!["application/json", "text/plain; private-canary"],
+                b"invalid encrypted content private-canary".as_slice(),
+                "multiple",
+                "encrypted_content_rejected",
+            ),
+            (
+                vec!["application/octet-stream"],
+                b"\xffprivate-canary".as_slice(),
+                "octet_stream",
+                "unknown",
+            ),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            for value in content_types {
+                headers.append(header::CONTENT_TYPE, http::HeaderValue::from_static(value));
+            }
+            let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
+                status: http::StatusCode::BAD_REQUEST,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                    body,
+                ))])),
+            })
+            .await;
+            assert_eq!(fields["upstream_content_type_class"], content_class);
+            assert_eq!(fields["upstream_diagnostic_read"], "complete");
+            assert_eq!(fields["upstream_body_reason"], reason);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_json_diagnostic_obeys_byte_and_time_limits_without_promoting_partial_body() {
+        for case in ["declared_large", "chunk_large", "read_failed", "timed_out"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/plain"),
+            );
+            let stream: super::super::super::upstream_response::UpstreamByteStream = match case {
+                "declared_large" | "timed_out" => Box::pin(futures_util::stream::pending()),
+                "chunk_large" => Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from(
+                    vec![b'x'; MAX_RETRYABLE_ERROR_BYTES + 1],
+                ))])),
+                _ => Box::pin(futures_util::stream::iter([
+                    Ok(bytes::Bytes::from_static(
+                        b"invalid encrypted content private-canary",
+                    )),
+                    Err("private-canary transport error"),
+                ])),
+            };
+            let started = tokio::time::Instant::now();
+            let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
+                status: http::StatusCode::BAD_REQUEST,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: (case == "declared_large")
+                    .then_some(MAX_RETRYABLE_ERROR_BYTES as u64 + 1),
+                stream,
+            })
+            .await;
+            let expected = match case {
+                "declared_large" | "chunk_large" => "too_large",
+                _ => case,
+            };
+            assert_eq!(fields["upstream_diagnostic_read"], expected);
+            assert_eq!(fields["upstream_body_reason"], "unknown");
+            assert!(started.elapsed() <= std::time::Duration::from_secs(1));
         }
     }
 
