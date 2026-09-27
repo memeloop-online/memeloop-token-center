@@ -656,22 +656,47 @@ pub(crate) fn upstream_api_url(base_url: &str, api_path: &str) -> String {
     format!("{base}{suffix}")
 }
 
+const DNS_TIMEOUT_MESSAGE: &str = "outbound DNS lookup timed out";
+const DNS_RESOLUTION_MESSAGE: &str = "outbound host could not be resolved";
+const DNS_EMPTY_MESSAGE: &str = "outbound host returned no addresses";
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Only fixed labels may cross the outbound-preparation log boundary. In
+/// particular, never forward AppError's free-text payload or Display output:
+/// they may contain a destination URL, proxy credentials, or resolver details.
+pub(crate) fn preparation_failure_category(error: &AppError) -> &'static str {
+    match error {
+        AppError::BadRequest(message) if message == DNS_TIMEOUT_MESSAGE => "dns_timeout",
+        AppError::BadRequest(message)
+            if message == DNS_RESOLUTION_MESSAGE || message == DNS_EMPTY_MESSAGE =>
+        {
+            "dns_resolution"
+        }
+        AppError::BadRequest(_) => "destination_rejected",
+        AppError::Internal => "client_build",
+        _ => "preparation_failed",
+    }
+}
+
 async fn resolve_once(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
-    let resolved = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| AppError::BadRequest("outbound DNS lookup timed out".into()))?
-    .map_err(|_| AppError::BadRequest("outbound host could not be resolved".into()))?;
+    resolve_with_timeout(tokio::net::lookup_host((host, port))).await
+}
+
+async fn resolve_with_timeout<F, I>(lookup: F) -> Result<Vec<SocketAddr>, AppError>
+where
+    F: std::future::Future<Output = std::io::Result<I>>,
+    I: Iterator<Item = SocketAddr>,
+{
+    let resolved = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup)
+        .await
+        .map_err(|_| AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()))?
+        .map_err(|_| AppError::BadRequest(DNS_RESOLUTION_MESSAGE.into()))?;
     let addresses = resolved
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     if addresses.is_empty() {
-        return Err(AppError::BadRequest(
-            "outbound host returned no addresses".into(),
-        ));
+        return Err(AppError::BadRequest(DNS_EMPTY_MESSAGE.into()));
     }
     Ok(addresses)
 }
@@ -786,6 +811,69 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_dns_lookup_expires_at_existing_three_second_budget() {
+        let started = tokio::time::Instant::now();
+        let error = resolve_with_timeout(std::future::pending::<
+            std::io::Result<std::vec::IntoIter<SocketAddr>>,
+        >())
+        .await
+        .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(preparation_failure_category(&error), "dns_timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_success_deduplicates_answers_without_weakening_validation() {
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let private: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let addresses = resolve_with_timeout(std::future::ready(Ok(
+            vec![public, private, public].into_iter()
+        )))
+        .await
+        .unwrap();
+        assert_eq!(addresses, vec![public, private]);
+        assert!(validate_addresses(&addresses, OutboundScope::Public, false).is_err());
+        assert!(validate_addresses(&addresses, OutboundScope::Private, false).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_errors_and_empty_answers_are_safely_classified() {
+        let error = resolve_with_timeout(std::future::ready(Err::<
+            std::vec::IntoIter<SocketAddr>,
+            _,
+        >(std::io::Error::other(
+            "https://user:secret@example.test/?token=secret",
+        ))))
+        .await
+        .unwrap_err();
+        assert_eq!(preparation_failure_category(&error), "dns_resolution");
+        assert!(!error.to_string().contains("secret"));
+        let empty = resolve_with_timeout(std::future::ready(Ok(Vec::new().into_iter())))
+            .await
+            .unwrap_err();
+        assert_eq!(preparation_failure_category(&empty), "dns_resolution");
+    }
+
+    #[test]
+    fn preparation_labels_never_include_free_text() {
+        let secret = "https://user:secret@example.test/?token=secret";
+        for (error, expected) in [
+            (AppError::BadRequest(secret.into()), "destination_rejected"),
+            (AppError::Upstream(secret.into()), "preparation_failed"),
+            (AppError::Storage(secret.into()), "preparation_failed"),
+            (AppError::Internal, "client_build"),
+            (
+                AppError::BadRequest(format!("{DNS_TIMEOUT_MESSAGE}: {secret}")),
+                "destination_rejected",
+            ),
+        ] {
+            let category = preparation_failure_category(&error);
+            assert_eq!(category, expected);
+            assert!(!category.contains("secret"));
+        }
+    }
 
     #[test]
     fn upstream_api_url_accepts_origin_and_versioned_api_bases() {
