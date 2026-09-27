@@ -277,6 +277,16 @@ impl ProviderCatalog {
                     "description": "Private destinations require a global operator credential."
                 },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
+                "reservation_token_bounds": {
+                    "type": "object",
+                    "propertyNames": {"minLength": 1, "maxLength": 500},
+                    "additionalProperties": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000000000
+                    },
+                    "description": "Trusted token reservation bounds keyed by exact upstream model for pass-through Responses requests without max_output_tokens. These reserve credit before dispatch and do not alter the forwarded request or advertise provider output limits. Unconfigured accounts retain the legacy 4096 reservation."
+                },
                 "input_token_overhead_ceiling": {
                     "title": "Input token overhead ceiling",
                     "type": "integer",

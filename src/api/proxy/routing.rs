@@ -153,11 +153,11 @@ pub(super) fn plan_proxy_route(
                         | Protocol::OpenAiAlphaSearch
                 )) =>
         {
-            forwarded_json
-                .get("max_output_tokens")
-                .and_then(Value::as_i64)
-                .filter(|ceiling| *ceiling >= 0)
-                .unwrap_or(4_096)
+            passthrough_output_reservation_bound(
+                &forwarded_json,
+                &route.config,
+                &route.upstream_model,
+            )?
         }
         None => inject_controlled_output_ceiling(
             if responses_chat.is_some() {
@@ -217,6 +217,34 @@ pub(super) fn plan_proxy_route(
         compact_v2_bridge,
         wrap_compact_as_sse,
     })
+}
+
+pub(super) fn passthrough_output_reservation_bound(
+    request: &Value,
+    config: &Value,
+    upstream_model: &str,
+) -> Result<i64, AppError> {
+    if let Some(limit) = request.get("max_output_tokens") {
+        return limit
+            .as_i64()
+            .filter(|limit| (0..=MAX_REPORTED_TOKENS).contains(limit))
+            .ok_or_else(|| AppError::BadRequest("max_output_tokens is invalid".into()));
+    }
+    // Pass-through envelopes cannot assume an output cap that was never sent
+    // to the supplier. Reserve a trusted per-model bound before dispatch;
+    // actual usage still must fit the reservation at settlement.
+    if config.get("reservation_token_bounds").is_some() {
+        return codex_transport::trusted_reservation_token_bound(config, upstream_model).map_err(
+            |_| {
+                AppError::Upstream(
+                    "compatible upstream requires valid reservation metadata for its model".into(),
+                )
+            },
+        );
+    }
+    // Preserve existing admission for accounts not yet configured with
+    // trusted metadata. Their historical bound is not a supplier output cap.
+    Ok(4_096)
 }
 
 pub(super) async fn materialize_proxy_route(
