@@ -6,16 +6,19 @@ import { fileURLToPath } from "node:url";
 
 const MODEL = "gpt-6-astra";
 type Json = Record<string, any>;
-type Case = "uncapped" | "explicit_cap" | "insufficient_balance";
+type Case = "uncapped" | "explicit_cap" | "insufficient_balance" | "partial_model_map";
 type Phase = { name: string; driver: string; kind: Case };
-export const PHASES: Phase[] = ["http-json", "new-api"].flatMap(driver =>
+export const PHASES: Phase[] = [...["http-json", "new-api"].flatMap(driver =>
   (["uncapped", "explicit_cap", "insufficient_balance"] as const)
-    .map(kind => ({ name: `${driver}-${kind}`, driver, kind })));
+    .map(kind => ({ name: `${driver}-${kind}`, driver, kind }))),
+  ...["http-json", "new-api"].map(driver => ({
+    name: `${driver}-partial_model_map`, driver, kind: "partial_model_map" as const,
+  }))];
 
-export function accountConfig(): Json {
+export function accountConfig(kind: Case = "uncapped"): Json {
   return {
     base_url: "http://127.0.0.1:18080", timeout_seconds: 15,
-    reservation_token_bounds: { [MODEL]: 65536 },
+    reservation_token_bounds: { [kind === "partial_model_map" ? "other_model" : MODEL]: 65536 },
   };
 }
 
@@ -45,11 +48,11 @@ export function validateForwarded(phase: Phase, attempts: Json[]) {
 }
 
 export function validateMetadata(phase: Phase, metadata: Json) {
-  if (phase.kind === "uncapped") {
+  if (phase.kind === "uncapped" || phase.kind === "partial_model_map") {
     assert.equal(metadata.status_code, 200);
     assert.equal(metadata.input_tokens, 3);
-    assert.equal(metadata.output_tokens, 5000);
-    assert.equal(Number(metadata.cost), 0.005003);
+    assert.equal(metadata.output_tokens, phase.kind === "partial_model_map" ? 5 : 5000);
+    assert.equal(Number(metadata.cost), phase.kind === "partial_model_map" ? 0.000008 : 0.005003);
   } else if (phase.kind === "explicit_cap") {
     assert.equal(metadata.status_code, 502);
     assert.equal(metadata.error_code, "upstream_invalid_usage");
@@ -63,17 +66,19 @@ export function verifyUsageEvidence(text: string) {
   const records = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as Json);
   assert.equal(records.length, PHASES.length + 1);
   PHASES.forEach((phase, index) => {
-    const expected = phase.kind === "uncapped"
+    const expected = phase.kind === "partial_model_map"
+      ? { status: 200, input_tokens: 3, output_tokens: 5, cost: 0.000008, posts: 1 }
+      : phase.kind === "uncapped"
       ? { status: 200, input_tokens: 3, output_tokens: 5000, cost: 0.005003, posts: 1 }
       : phase.kind === "explicit_cap"
         ? { status: 502, output_tokens: 0, cost: 0, error_code: "upstream_invalid_usage", posts: 1 }
         : { status: 429, error_code: "balance_exhausted", posts: 0 };
     assert.deepEqual(records[index], { phase: phase.name, ...expected });
   });
-  assert.deepEqual(records.at(-1), { usage_checks: "passed", phases: 6, posts: 4 });
+  assert.deepEqual(records.at(-1), { usage_checks: "passed", phases: 8, posts: 6 });
 }
 
-function responseSse(): string {
+function responseSse(outputTokens: number): string {
   const response = {
     id: "resp_synthetic_usage", object: "response", status: "completed", error: null,
     model: MODEL, output: [{
@@ -82,7 +87,7 @@ function responseSse(): string {
     }],
     usage: {
       input_tokens: 3, input_tokens_details: { cached_tokens: 0 },
-      output_tokens: 5000, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 5003,
+      output_tokens: outputTokens, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: outputTokens + 3,
     },
   };
   const events = [
@@ -99,6 +104,7 @@ async function run() {
   assert.ok(token && token.length >= 32);
   const attempts: Json[] = [];
   let mockFailure = false;
+  let mockOutputTokens = 5000;
   const mock = http.createServer(async (request, response) => {
     try {
       if (request.method !== "POST") {
@@ -117,7 +123,7 @@ async function run() {
       }
       attempts.push({ path: request.url, body: JSON.parse(Buffer.concat(chunks).toString()) });
       response.setHeader("content-type", "text/event-stream");
-      response.end(responseSse());
+      response.end(responseSse(mockOutputTokens));
     } catch {
       mockFailure = true;
       response.statusCode = 500;
@@ -145,9 +151,10 @@ async function run() {
     }
     assert.ok(ready);
     for (const phase of PHASES) {
+      mockOutputTokens = phase.kind === "partial_model_map" ? 5 : 5000;
       stage = `configure_${phase.name}`;
       const account = await control("/internal/v1/upstreams", {
-        name: phase.name, driver: phase.driver, config: accountConfig(),
+        name: phase.name, driver: phase.driver, config: accountConfig(phase.kind),
         credential: { type: "api_key", value: "MTC_USAGE_SYNTHETIC_CREDENTIAL" },
       });
       const route = await control("/internal/v1/model-routes", {
@@ -192,8 +199,8 @@ async function run() {
         const records = await response.json() as Json[];
         assert.ok(Array.isArray(records) && records.length <= 1);
         const record = records[0];
-        if (record && (phase.kind === "uncapped"
-          ? record.status_code === 200 && record.output_tokens === 5000
+        if (record && (phase.kind === "uncapped" || phase.kind === "partial_model_map"
+          ? record.status_code === 200 && record.output_tokens === mockOutputTokens
           : record.status_code === 502 && record.error_code === "upstream_invalid_usage")) {
           metadata = record;
           break;
@@ -202,13 +209,13 @@ async function run() {
       }
       assert.ok(metadata, "request did not settle to the expected terminal metadata");
       validateMetadata(phase, metadata);
-      if (phase.kind === "uncapped") {
+      if (phase.kind === "uncapped" || phase.kind === "partial_model_map") {
         const events = text.split(/\r?\n/).filter(line => line.startsWith("data:"))
           .map(line => line.slice(5).trim()).filter(value => value !== "[DONE]")
           .map(value => JSON.parse(value) as Json);
         const completed = events.filter(event => event.type === "response.completed");
         assert.equal(completed.length, 1);
-        assert.equal(completed[0]!.response.usage.output_tokens, 5000);
+        assert.equal(completed[0]!.response.usage.output_tokens, mockOutputTokens);
         console.log(JSON.stringify({
           phase: phase.name, status: 200, input_tokens: metadata.input_tokens,
           output_tokens: metadata.output_tokens, cost: Number(metadata.cost), posts: 1,
@@ -220,7 +227,7 @@ async function run() {
         }));
       }
     }
-    assert.equal(attempts.length, 4);
+    assert.equal(attempts.length, 6);
     console.log(JSON.stringify({ usage_checks: "passed", phases: PHASES.length, posts: attempts.length }));
   } finally {
     mock.close();
