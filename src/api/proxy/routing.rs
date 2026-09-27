@@ -91,15 +91,10 @@ pub(super) fn plan_proxy_route(
     let passthrough_responses = http_json || new_api;
     let multi_agent_responses =
         matches!(protocol, Protocol::OpenAiResponses) && codex_multi_agent_v2_request;
-    // Kimi still rewrites MultiAgent into Chat. http-json and New API post
-    // `/v1/responses` as-is; do not reuse the Kimi rewrite for them.
+    // Kimi still rewrites MultiAgent into Chat. http-json and New API keep
+    // native Responses semantics; do not reuse the Kimi rewrite for them.
     let normalize_multi_agent =
         multi_agent_responses && state.providers.supports_codex_multi_agent_v2(&route.driver);
-    let compact_v2_bridge = passthrough_responses
-        && matches!(protocol, Protocol::OpenAiResponses)
-        && crate::api::new_api_transport::has_compaction_trigger(request_json);
-    let wrap_compact_as_sse =
-        compact_v2_bridge && request_json.get("stream").and_then(Value::as_bool) == Some(true);
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
@@ -108,24 +103,14 @@ pub(super) fn plan_proxy_route(
         normalize_multi_agent,
         responses_via_chat_dialect,
     )?;
-    if passthrough_responses
-        && (compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact))
-    {
-        forwarded_json = crate::api::new_api_transport::prepare_compact_request(
-            &forwarded_json,
-            &route.upstream_model,
-        )?;
-    }
-    let upstream_path = if compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact)
-    {
-        crate::api::new_api_transport::compact_path()
-    } else if matches!(protocol, Protocol::OpenAiAlphaSearch) {
-        crate::api::new_api_transport::alpha_search_path()
-    } else if responses_chat.is_some() {
-        Protocol::OpenAiChat.path()
-    } else {
-        protocol.path()
-    };
+    let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
+        &route,
+        protocol,
+        request_json,
+        passthrough_responses,
+        &mut forwarded_json,
+    )?;
+    let upstream_path = upstream_path_for(protocol, compact_v2_bridge, responses_chat.is_some());
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,
@@ -247,6 +232,51 @@ pub(super) fn passthrough_output_reservation_bound(
     Ok(4_096)
 }
 
+fn prepare_compact_bridge(
+    route: &ResolvedUpstream,
+    protocol: Protocol,
+    request_json: &Value,
+    passthrough_responses: bool,
+    forwarded_json: &mut Value,
+) -> Result<(bool, bool), AppError> {
+    let compact_v2_bridge = matches!(protocol, Protocol::OpenAiResponses)
+        && crate::api::new_api_transport::has_compaction_trigger(request_json)
+        && (crate::provider::is_new_api_driver(&route.driver)
+            || (crate::provider::is_openai_compatible_http_driver(&route.driver)
+                && route
+                    .config
+                    .get("responses_compact_v2_bridge")
+                    .and_then(Value::as_bool)
+                    == Some(true)));
+    let wrap_compact_as_sse =
+        compact_v2_bridge && request_json.get("stream").and_then(Value::as_bool) == Some(true);
+    if passthrough_responses
+        && (compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact))
+    {
+        *forwarded_json = crate::api::new_api_transport::prepare_compact_request(
+            forwarded_json,
+            &route.upstream_model,
+        )?;
+    }
+    Ok((compact_v2_bridge, wrap_compact_as_sse))
+}
+
+fn upstream_path_for(
+    protocol: Protocol,
+    compact_v2_bridge: bool,
+    responses_chat: bool,
+) -> &'static str {
+    if compact_v2_bridge || matches!(protocol, Protocol::OpenAiResponsesCompact) {
+        crate::api::new_api_transport::compact_path()
+    } else if matches!(protocol, Protocol::OpenAiAlphaSearch) {
+        crate::api::new_api_transport::alpha_search_path()
+    } else if responses_chat {
+        Protocol::OpenAiChat.path()
+    } else {
+        protocol.path()
+    }
+}
+
 pub(super) async fn materialize_proxy_route(
     state: &AppState,
     planned: PlannedProxyRoute,
@@ -333,4 +363,113 @@ pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
     ) || status.is_server_error()
+}
+
+#[cfg(test)]
+mod compact_bridge_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn route(driver: &str, config: Value) -> ResolvedUpstream {
+        ResolvedUpstream {
+            route_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            transport_revision: 1,
+            credential_generation: 1,
+            driver: driver.into(),
+            base_url: "https://upstream.invalid".into(),
+            config,
+            upstream_model: "upstream-model".into(),
+            credential: crate::provider::UpstreamCredential::None,
+        }
+    }
+
+    #[test]
+    fn http_json_compaction_bridge_requires_account_opt_in() {
+        let request = json!({
+            "model": "public-model",
+            "stream": true,
+            "tools": [{"type": "function", "name": "exec"}],
+            "input": [
+                {"type": "message", "role": "user", "content": "earlier"},
+                {"type": "compaction_trigger"}
+            ]
+        });
+        for (driver, config, expected_bridge) in [
+            ("http-json", json!({}), false),
+            (
+                "http-json",
+                json!({"responses_compact_v2_bridge": false}),
+                false,
+            ),
+            ("cbcnx", json!({}), false),
+            (
+                "http-json",
+                json!({"responses_compact_v2_bridge": true}),
+                true,
+            ),
+            ("new-api", json!({}), true),
+        ] {
+            let route = route(driver, config);
+            let (mut forwarded, context) = kimi::prepare_forwarded_request(
+                &route,
+                Protocol::OpenAiResponses,
+                &request,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(context.is_none());
+            let (bridge, wrap_sse) = prepare_compact_bridge(
+                &route,
+                Protocol::OpenAiResponses,
+                &request,
+                true,
+                &mut forwarded,
+            )
+            .unwrap();
+            assert_eq!(bridge, expected_bridge, "{driver}");
+            assert_eq!(wrap_sse, expected_bridge, "{driver}");
+            assert_eq!(
+                upstream_path_for(Protocol::OpenAiResponses, bridge, false),
+                if expected_bridge {
+                    "/v1/responses/compact"
+                } else {
+                    "/v1/responses"
+                },
+                "{driver}"
+            );
+            if expected_bridge {
+                assert_eq!(forwarded["stream"], false);
+                assert_eq!(forwarded["input"].as_array().unwrap().len(), 1);
+                assert!(forwarded.get("tools").is_none());
+            } else {
+                let mut original = request.clone();
+                original["model"] = json!("upstream-model");
+                assert_eq!(forwarded, original, "{driver}: unchanged request body");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_compact_protocol_keeps_its_existing_path() {
+        let route = route("http-json", json!({}));
+        let mut forwarded = json!({"model": "upstream-model", "input": "history"});
+        let (bridge, wrap_sse) = prepare_compact_bridge(
+            &route,
+            Protocol::OpenAiResponsesCompact,
+            &forwarded.clone(),
+            true,
+            &mut forwarded,
+        )
+        .unwrap();
+        assert!(!bridge);
+        assert!(!wrap_sse);
+        assert_eq!(
+            upstream_path_for(Protocol::OpenAiResponsesCompact, bridge, false),
+            "/v1/responses/compact"
+        );
+        assert_eq!(forwarded["input"][0]["content"], "history");
+    }
 }

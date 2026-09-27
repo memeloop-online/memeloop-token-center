@@ -409,6 +409,41 @@ fn http_json_provider_schema_accepts_exact_generation_result_origins() {
 }
 
 #[test]
+fn http_json_compact_bridge_is_an_optional_account_capability() {
+    let catalog = ProviderCatalog::builtins();
+    let http_json = catalog.get("http-json").unwrap();
+    let field = &http_json.config_schema["properties"]["responses_compact_v2_bridge"];
+    assert_eq!(field["type"], "boolean");
+    assert_eq!(field["default"], false);
+    for config in [
+        json!({"base_url": "https://upstream.example"}),
+        json!({"base_url": "https://upstream.example", "responses_compact_v2_bridge": false}),
+        json!({"base_url": "https://upstream.example", "responses_compact_v2_bridge": true}),
+    ] {
+        crate::schema::validate_instance(&http_json.config_schema, &config).unwrap();
+    }
+    assert!(
+        crate::schema::validate_instance(
+            &http_json.config_schema,
+            &json!({
+                "base_url": "https://upstream.example",
+                "responses_compact_v2_bridge": "true"
+            }),
+        )
+        .is_err()
+    );
+    assert!(
+        catalog
+            .get("new-api")
+            .unwrap()
+            .config_schema
+            .pointer("/properties/responses_compact_v2_bridge")
+            .is_none(),
+        "New API retains its driver-level compact bridge"
+    );
+}
+
+#[test]
 fn retired_cbcnx_accounts_use_http_json() {
     let catalog = ProviderCatalog::builtins();
     assert_eq!(canonicalize_provider_driver("cbcnx"), "http-json");

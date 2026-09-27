@@ -26,6 +26,14 @@ export const PHASES: Phase[] = [
   { name: "new_api_compact_sse", driver: "new-api", compact: true, stream: true },
 ];
 
+export function configForPhase(phase: Phase): Json {
+  return {
+    base_url: "http://127.0.0.1:18080",
+    timeout_seconds: 15,
+    ...(phase.driver === "http-json" && phase.compact ? { responses_compact_v2_bridge: true } : {}),
+  };
+}
+
 export function verifyCompactEvidence(text: string) {
   const records = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as Json);
   assert.equal(records.length, PHASES.length + 1, "require every phase and terminal evidence");
@@ -196,7 +204,7 @@ async function run() {
       stage = `configure_${phase.name}`;
       const account = await control("/internal/v1/upstreams", {
         name: phase.name, driver: phase.driver,
-        config: { base_url: "http://127.0.0.1:18080", timeout_seconds: 15 },
+        config: configForPhase(phase),
         credential: { type: "api_key", value: "MTC_COMPACT_SYNTHETIC_CREDENTIAL" },
       });
       const route = await control("/internal/v1/model-routes", {

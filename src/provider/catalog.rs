@@ -413,6 +413,13 @@ impl ProviderCatalog {
                 }
             ]
         });
+        let mut http_json_config_schema = config_schema.clone();
+        http_json_config_schema["properties"]["responses_compact_v2_bridge"] = json!({
+            "title": "Responses compact v2 bridge",
+            "type": "boolean",
+            "default": false,
+            "description": "Only enable when this account supports POST /v1/responses/compact. Converts Responses compaction_trigger into that endpoint and wraps the result as Responses SSE when requested."
+        });
         let mut types = vec![ProviderType {
             id: "http-json".to_owned(),
             display_name: "HTTP JSON upstream".to_owned(),
@@ -429,7 +436,7 @@ impl ProviderCatalog {
                 "image".to_owned(),
                 "video".to_owned(),
             ],
-            config_schema: config_schema.clone(),
+            config_schema: http_json_config_schema,
             credential_schema: credential_schema.clone(),
             oauth_adapter: None,
             component_adapter: None,
