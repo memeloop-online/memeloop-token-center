@@ -34,6 +34,7 @@ mod ha_policy;
 mod kimi;
 mod memory_admission;
 mod memory_metrics;
+mod passthrough_reservation;
 mod phase_diagnostics;
 mod postgres_attempt_deadline;
 mod recovery_wait;
