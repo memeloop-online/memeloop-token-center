@@ -4,6 +4,20 @@ use bytes::Bytes;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
 
+fn log_preparation_failure(request_id: Uuid, account_id: Uuid, error: Option<&AppError>) {
+    let failure_category = error
+        .map(network::preparation_failure_category)
+        .unwrap_or("preparation_timeout");
+    tracing::warn!(
+        %request_id,
+        upstream_account_id = %account_id,
+        stage = "http_json_preparation",
+        failure_category,
+        dispatched = false,
+        "upstream preparation failed"
+    );
+}
+
 /// `timeout_seconds` is a request-local transport policy. Read it once from
 /// the immutable route snapshot so a later candidate cannot refresh an
 /// already-dispatched attempt's deadline. Persisted configs are schema
@@ -58,8 +72,14 @@ pub(super) async fn send_reqwest_proxy_route(
         Ok(Ok(client)) => client,
         // Endpoint validation and DNS happen before the POST leaves this
         // process, so a route-budget expiry here is safe to fail over.
-        Err(_) => return Err(ProxySendError::RetryableConnection("dns")),
-        Ok(Err(_)) => return Err(ProxySendError::CandidateUnavailable),
+        Err(_) => {
+            log_preparation_failure(request_id, route.route.account_id, None);
+            return Err(ProxySendError::RetryableConnection("dns"));
+        }
+        Ok(Err(error)) => {
+            log_preparation_failure(request_id, route.route.account_id, Some(&error));
+            return Err(ProxySendError::CandidateUnavailable);
+        }
     };
     let target_url = network::upstream_api_url(&outbound_base_url, route.upstream_path);
     let mut request = outbound_http
@@ -257,6 +277,59 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn preparation_logs_only_fixed_categories_and_dispatch_state() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Writer(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_preparation_failure(
+                Uuid::nil(),
+                Uuid::nil(),
+                Some(&AppError::BadRequest(
+                    "https://user:secret@example.test/?token=secret".into(),
+                )),
+            );
+            log_preparation_failure(Uuid::nil(), Uuid::nil(), None);
+        });
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("example.test"));
+        let events: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["fields"]["failure_category"],
+            "destination_rejected"
+        );
+        assert_eq!(
+            events[1]["fields"]["failure_category"],
+            "preparation_timeout"
+        );
+        for event in events {
+            assert_eq!(event["fields"]["dispatched"], false);
+            assert_eq!(event["fields"]["stage"], "http_json_preparation");
+        }
+    }
 
     #[test]
     fn configured_timeout_obeys_the_provider_schema_bounds() {
