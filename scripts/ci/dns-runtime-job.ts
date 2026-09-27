@@ -3,11 +3,12 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { CANARY } from "./dns-runtime-probe.ts";
+import { verifyCompactEvidence } from "./compact-runtime-probe.ts";
 
-export function renderJob(image: string, nodeImage: string) {
+export function renderJob(image: string, nodeImage: string, suite: "dns" | "compact" = "dns") {
   assert.match(image, /^ghcr\.io\/memeloop-online\/memeloop-token-center(?::[^@]+)?@sha256:[a-f0-9]{64}$/);
   assert.match(nodeImage, /@sha256:[a-f0-9]{64}$/);
-  const name = "mtc-dns-runtime-probe";
+  const name = `mtc-${suite}-runtime-probe`;
   const namespace = "memeloop-token-center-cloud-test";
   const token = randomBytes(32).toString("hex");
   const labels = { "app.kubernetes.io/name": name };
@@ -21,7 +22,7 @@ export function renderJob(image: string, nodeImage: string) {
     apiVersion: "v1", kind: "List", items: [
       {
         apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace },
-        data: { "probe.ts": readFileSync(new URL("./dns-runtime-probe.ts", import.meta.url), "utf8") },
+        data: { "probe.ts": readFileSync(new URL(`./${suite}-runtime-probe.ts`, import.meta.url), "utf8") },
       },
       {
         apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
@@ -57,7 +58,9 @@ export function renderJob(image: string, nodeImage: string) {
               containers: [{
                 name: "probe", image: nodeImage,
                 command: ["node", "--experimental-strip-types", "/probe/probe.ts"],
-                securityContext: { ...security, capabilities: { drop: ["ALL"], add: ["NET_BIND_SERVICE"] } },
+                securityContext: suite === "dns"
+                  ? { ...security, capabilities: { drop: ["ALL"], add: ["NET_BIND_SERVICE"] } }
+                  : security,
                 resources: { requests: { cpu: "25m", memory: "64Mi" }, limits: { cpu: "250m", memory: "128Mi" } },
                 env: [{ name: "MTC_PROBE_SERVICE_TOKEN", value: token }],
                 volumeMounts: [{ name: "script", mountPath: "/probe", readOnly: true }],
@@ -102,14 +105,20 @@ export function verifyLogs(mtcText: string, probeText: string) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [action, first, second] = process.argv.slice(2);
-  assert.ok(first && second && process.argv.length === 5,
-    "usage: render MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
-  if (action === "render") {
-    console.log(JSON.stringify(renderJob(first, second), null, 2));
-  } else if (action === "verify-logs") {
-    verifyLogs(readFileSync(first, "utf8"), readFileSync(second, "utf8"));
-    console.log("synthetic DNS transport and diagnostics verified");
+  if (action === "verify-compact") {
+    assert.ok(first && process.argv.length === 4, "usage: verify-compact PROBE_LOG");
+    verifyCompactEvidence(readFileSync(first, "utf8"));
+    console.log("synthetic compact transport verified");
   } else {
-    throw new Error("usage: render MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
+    assert.ok(first && second && process.argv.length === 5,
+      "usage: render|render-compact MTC_IMAGE_DIGEST NODE22_IMAGE_DIGEST | verify-logs MTC_LOG PROBE_LOG");
+    if (action === "render" || action === "render-compact") {
+      console.log(JSON.stringify(renderJob(first, second, action === "render" ? "dns" : "compact"), null, 2));
+    } else if (action === "verify-logs") {
+      verifyLogs(readFileSync(first, "utf8"), readFileSync(second, "utf8"));
+      console.log("synthetic DNS transport and diagnostics verified");
+    } else {
+      throw new Error("unknown runtime probe action");
+    }
   }
 }
