@@ -35,6 +35,45 @@ pub(in crate::api) async fn classify_bad_request(
     response: UpstreamResponse,
     request_id: Uuid,
 ) -> BadRequestDisposition {
+    let disposition = inspect_bad_request(response, request_id).await;
+    // Ordinary JSON errors already emit their bounded diagnostic below. All
+    // other exits must also be attributable to the request, without recording
+    // untrusted headers, error bodies, or transport error strings.
+    if let Some((classification, reason)) = classification_diagnostic(disposition) {
+        tracing::warn!(
+            %request_id,
+            stage = "codex_upstream_bad_request",
+            upstream_error_classification = classification,
+            upstream_error_reason = reason,
+            "Codex upstream rejected the request"
+        );
+    }
+    disposition
+}
+
+fn classification_diagnostic(
+    disposition: BadRequestDisposition,
+) -> Option<(&'static str, &'static str)> {
+    Some(match disposition {
+        BadRequestDisposition::DefiniteOrdinary => return None,
+        BadRequestDisposition::DefiniteTransient => ("transient", "known_transient"),
+        BadRequestDisposition::Unclassifiable(reason) => (
+            "unclassifiable",
+            match reason {
+                BadRequestUnclassifiableReason::ContentType => "content_type",
+                BadRequestUnclassifiableReason::TooLarge => "too_large",
+                BadRequestUnclassifiableReason::TimedOut => "timed_out",
+                BadRequestUnclassifiableReason::ReadFailed => "read_failed",
+                BadRequestUnclassifiableReason::InvalidJson => "invalid_json",
+            },
+        ),
+    })
+}
+
+async fn inspect_bad_request(
+    response: UpstreamResponse,
+    request_id: Uuid,
+) -> BadRequestDisposition {
     if response.status() != http::StatusCode::BAD_REQUEST {
         return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
     }
@@ -82,6 +121,7 @@ fn observe_ordinary_bad_request(request_id: Uuid, value: &Value) {
     tracing::warn!(
         %request_id,
         stage = "codex_upstream_bad_request",
+        upstream_error_classification = "ordinary",
         upstream_error_type = diagnostic.error_type,
         upstream_error_code = diagnostic.error_code,
         upstream_error_param = diagnostic.error_param,
@@ -110,6 +150,18 @@ fn bad_request_diagnostic(value: &Value) -> BadRequestDiagnostic {
                 .and_then(Value::as_str)
         });
     let error_param = diagnostic_param(raw_param);
+    let error_code = diagnostic_machine_value(
+        error.get("code"),
+        &[
+            "invalid_value",
+            "invalid_type",
+            "missing_required_parameter",
+            "model_not_found",
+            "unsupported_parameter",
+            "invalid_request_error",
+            "invalid_encrypted_content",
+        ],
+    );
     BadRequestDiagnostic {
         error_type: diagnostic_machine_value(
             error
@@ -125,19 +177,13 @@ fn bad_request_diagnostic(value: &Value) -> BadRequestDiagnostic {
                 "json_invalid",
             ],
         ),
-        error_code: diagnostic_machine_value(
-            error.get("code"),
-            &[
-                "invalid_value",
-                "invalid_type",
-                "missing_required_parameter",
-                "model_not_found",
-                "unsupported_parameter",
-                "invalid_request_error",
-            ],
-        ),
+        error_code,
         error_param,
-        reason: diagnostic_reason(message, error_param),
+        reason: if error_code == Some("invalid_encrypted_content") {
+            "encrypted_content_rejected"
+        } else {
+            diagnostic_reason(message, error_param)
+        },
     }
 }
 
@@ -164,6 +210,23 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
         }
         _ => return Some("unknown"),
     }
+    // Match explicit path components before the legacy broad shape buckets:
+    // encrypted_content and tool_choice must not disappear into content/unknown.
+    for known in [
+        "client_metadata",
+        "tool_choice",
+        "encrypted_content",
+        "include",
+        "compaction_trigger",
+    ] {
+        if fields.iter().any(|field| {
+            field
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|component| component == known)
+        }) {
+            return Some(known);
+        }
+    }
     if fields.iter().any(|field| field.contains("instruction")) {
         Some("instructions")
     } else if fields.iter().any(|field| field.contains("content")) {
@@ -187,7 +250,22 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
 }
 
 fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str {
+    match param {
+        Some("client_metadata") => return "client_metadata_rejected",
+        Some("tool_choice") => return "tool_choice_rejected",
+        Some("encrypted_content") => return "encrypted_content_rejected",
+        Some("include") => return "include_rejected",
+        Some("compaction_trigger") => return "compaction_trigger_rejected",
+        _ => {}
+    }
     let lower = message.unwrap_or_default().to_ascii_lowercase();
+    if lower.contains("encrypted")
+        && ["invalid", "decrypt", "verify", "verified", "mismatch"]
+            .iter()
+            .any(|term| lower.contains(term))
+    {
+        return "encrypted_content_rejected";
+    }
     let structural_rejection = ["invalid", "unsupported", "expected", "required", "missing"]
         .iter()
         .any(|term| lower.contains(term));
@@ -308,6 +386,152 @@ fn is_known_high_demand_message(message: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_unclassifiable_exit_emits_one_safe_request_diagnostic() {
+        use BadRequestUnclassifiableReason::*;
+        for (reason, label) in [
+            (ContentType, "content_type"),
+            (TooLarge, "too_large"),
+            (TimedOut, "timed_out"),
+            (ReadFailed, "read_failed"),
+            (InvalidJson, "invalid_json"),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static(if reason == ContentType {
+                    "text/html; private-header-canary"
+                } else {
+                    "application/json"
+                }),
+            );
+            let stream: super::super::super::upstream_response::UpstreamByteStream =
+                if reason == TimedOut {
+                    Box::pin(futures_util::stream::pending())
+                } else if reason == ReadFailed {
+                    Box::pin(futures_util::stream::iter([Err(
+                        "private-transport-canary",
+                    )]))
+                } else {
+                    Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                        b"private-body-canary not json",
+                    ))]))
+                };
+            let response = UpstreamResponse::Prefetched {
+                status: http::StatusCode::BAD_REQUEST,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: (reason == TooLarge)
+                    .then_some(MAX_RETRYABLE_ERROR_BYTES as u64 + 1),
+                stream,
+            };
+            let capture = Capture::default();
+            let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_writer(capture.clone())
+                .finish();
+            let request_id = Uuid::now_v7();
+            let disposition = classify_bad_request(response, request_id)
+                .with_subscriber(subscriber)
+                .await;
+            assert_eq!(disposition, BadRequestDisposition::Unclassifiable(reason));
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logged.lines().count(), 1, "{reason:?}: {logged}");
+            assert!(!logged.contains("canary"), "{logged}");
+            let event: Value = serde_json::from_str(logged.trim()).unwrap();
+            assert_eq!(event["fields"]["request_id"], request_id.to_string());
+            assert_eq!(event["fields"]["stage"], "codex_upstream_bad_request");
+            assert_eq!(
+                event["fields"]["upstream_error_classification"],
+                "unclassifiable"
+            );
+            assert_eq!(event["fields"]["upstream_error_reason"], label);
+        }
+    }
+
+    #[test]
+    fn complex_request_parameters_keep_fixed_non_sensitive_diagnostics() {
+        for (param, expected_param, reason) in [
+            (
+                "client_metadata",
+                "client_metadata",
+                "client_metadata_rejected",
+            ),
+            ("tool_choice", "tool_choice", "tool_choice_rejected"),
+            (
+                "input[0].encrypted_content",
+                "encrypted_content",
+                "encrypted_content_rejected",
+            ),
+            ("include[0]", "include", "include_rejected"),
+            (
+                "input[2].compaction_trigger",
+                "compaction_trigger",
+                "compaction_trigger_rejected",
+            ),
+        ] {
+            for location in [json!(param), json!(["body", param])] {
+                let diagnostic = bad_request_diagnostic(&json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "unsupported_parameter",
+                        "param": location,
+                        "message": "Invalid input: private-body-canary https://private.invalid token=private-token"
+                    }
+                }));
+                assert_eq!(diagnostic.error_param, Some(expected_param));
+                assert_eq!(diagnostic.reason, reason);
+                assert!(!format!("{diagnostic:?}").contains("private"));
+            }
+        }
+        assert_eq!(
+            diagnostic_param(Some(&json!("secret_tool_choice_secret"))),
+            Some("unknown")
+        );
+    }
+
+    #[test]
+    fn encrypted_history_rejection_keeps_code_without_retaining_ciphertext() {
+        for error in [
+            json!({"code": "invalid_encrypted_content"}),
+            json!({"message": "The encrypted content private-ciphertext could not be verified."}),
+            json!({"param": "input[2].encrypted_content", "message": "private-ciphertext"}),
+        ] {
+            let diagnostic = bad_request_diagnostic(&json!({"error": error}));
+            assert_eq!(diagnostic.reason, "encrypted_content_rejected");
+            assert!(!format!("{diagnostic:?}").contains("private-ciphertext"));
+            if error.get("code").is_some() {
+                assert_eq!(diagnostic.error_code, Some("invalid_encrypted_content"));
+            }
+        }
+    }
 
     #[test]
     fn ordinary_error_diagnostic_keeps_only_known_machine_fields_and_fixed_reason() {
