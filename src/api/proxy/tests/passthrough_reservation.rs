@@ -111,7 +111,11 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
         .and(path("/v1/responses"))
         .and(body_partial_json(json!({"max_output_tokens": 4096})))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
-            format!("data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n"),
+            format!(
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\"}}}}\n\n\
+                 data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n\
+                 data: [DONE]\n\n"
+            ),
             "text/event-stream",
         ))
         .expect(1)
