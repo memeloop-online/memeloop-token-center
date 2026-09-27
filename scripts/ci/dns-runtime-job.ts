@@ -75,6 +75,17 @@ export function verifyLogs(mtcText: string, probeText: string) {
   assert.ok(!mtcText.includes(CANARY), "synthetic secret leaked into MTC log");
   assert.ok(!mtcText.includes("http://mtc-dns-probe.localhost"), "destination URL leaked");
   const phases = probeText.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(phases.length, 4, "require exactly three phase results and terminal evidence");
+  assert.deepEqual(phases.slice(0, 3).map(item => item.phase), ["healthy", "drop", "nxdomain"]);
+  assert.deepEqual(phases[3], { transport_checks: "passed", log_verification: "required" });
+  assert.equal(new Set(phases.slice(0, 3).map(item => item.account_id)).size, 3,
+    "phases must use independent synthetic accounts");
+  for (const phase of phases.slice(0, 3)) {
+    assert.equal(typeof phase.account_id, "string");
+    assert.ok(phase.account_id.length > 0);
+    assert.ok(Number.isInteger(phase.dns_queries) && phase.dns_queries > 0,
+      "each phase must observe DNS rather than an NSS shortcut");
+  }
   const events = mtcText.split(/\r?\n/).filter(line => line.startsWith("{"))
     .map(line => JSON.parse(line));
   for (const [phase, category] of [["drop", "dns_timeout"], ["nxdomain", "dns_resolution"]]) {

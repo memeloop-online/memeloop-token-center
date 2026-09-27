@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import dgram from "node:dgram";
 import http from "node:http";
 import net from "node:net";
+import { realpathSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +10,12 @@ export const HOST = "mtc-dns-probe.localhost";
 export const CANARY = "MTC_SYNTHETIC_DNS_SECRET_9d487";
 type Mode = "healthy" | "drop" | "nxdomain";
 let stage = "bootstrap";
+
+// ConfigMap projected files and Node's import URL can name different symlink
+// paths to the same script. Compare canonical paths without executing the probe.
+export function isMain(moduleUrl: string, entry: string | undefined): boolean {
+  return Boolean(entry && realpathSync(entry) === realpathSync(fileURLToPath(moduleUrl)));
+}
 
 function isProbeQuery(query: Buffer): boolean {
   const name = Buffer.concat(HOST.split(".").map(label =>
@@ -182,7 +189,7 @@ async function run() {
   }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isMain(import.meta.url, process.argv[1])) {
   run().catch(() => {
     // fetch/assert exceptions can contain tokens or URLs; never print them.
     console.error(JSON.stringify({ error: "synthetic DNS runtime probe failed", stage }));
