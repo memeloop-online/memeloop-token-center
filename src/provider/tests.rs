@@ -444,6 +444,13 @@ fn http_json_compact_bridge_is_an_optional_account_capability() {
 }
 
 #[test]
+fn http_json_uses_openai_compatible_display_name_without_changing_driver_id() {
+    let provider = ProviderCatalog::builtins().get("http-json").unwrap();
+    assert_eq!(provider.id, "http-json");
+    assert_eq!(provider.display_name, "OpenAI Compatible");
+}
+
+#[test]
 fn retired_cbcnx_accounts_use_http_json() {
     let catalog = ProviderCatalog::builtins();
     assert_eq!(canonicalize_provider_driver("cbcnx"), "http-json");

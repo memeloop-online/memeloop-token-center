@@ -111,7 +111,10 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
         let id = compact["id"].as_str().unwrap_or("compact");
         compaction_items.push(compaction_item(&format!("cmp_{id}"), text));
     } else if compaction_items.len() > 1 {
-        compaction_items = vec![compaction_items.pop().ok_or("compaction_item_missing")?];
+        // The Responses envelope can carry one compact checkpoint through the
+        // current SSE adapter. Dropping earlier checkpoints would corrupt the
+        // conversation, so reject the ambiguous provider response instead.
+        return Err("multiple_compaction_items");
     }
     let id = compact
         .get("id")
@@ -217,6 +220,18 @@ mod tests {
         let sse = String::from_utf8(responses_to_sse(&response).unwrap().to_vec()).unwrap();
         assert!(sse.contains("response.output_item.done"));
         assert!(sse.contains("compaction"));
+    }
+
+    #[test]
+    fn compact_to_responses_rejects_multiple_checkpoints_without_dropping_one() {
+        let compact = json!({
+            "id": "cmp_1",
+            "output": [
+                {"id":"c1","type":"compaction","encrypted_content":"first"},
+                {"id":"c2","type":"compaction","encrypted_content":"second"}
+            ]
+        });
+        assert_eq!(compact_to_responses(&compact), Err("multiple_compaction_items"));
     }
 
     #[test]
