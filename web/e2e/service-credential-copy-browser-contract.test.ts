@@ -22,6 +22,12 @@ test('service credential copying uses original values and explains every unavail
       if (mode === 'suspended' || mode === 'revoked') await page.getByRole('button', { name: 'Show inactive (1)', exact: true }).click();
       const copy = page.locator('.managed-resource').getByRole('button', { name: 'Copy credential', exact: true });
       await copy.waitFor();
+      const row = page.locator('.managed-resource');
+      assert.equal(await row.locator('button.secondary').count(), 0, 'service credential row actions use Fluent buttons');
+      const rotate = row.getByRole('button', { name: 'Rotate service credential', exact: true });
+      assert.equal(await rotate.count(), 1);
+      const status = mode === 'revoked' ? undefined : row.getByRole('button', { name: mode === 'suspended' ? 'Resume service credential' : 'Suspend service credential', exact: true });
+      if (status) assert.equal(await status.count(), 1);
       assert.equal(await page.getByText('Not billed', { exact: true }).count(), 1);
       assert.equal(await page.getByText('service-existing', { exact: true }).count(), 0, 'technical service identifiers stay in the tooltip');
       const disabledReason = mode === 'missing-original'
@@ -35,6 +41,11 @@ test('service credential copying uses original values and explains every unavail
         assert.equal(await copy.isDisabled(), true);
         await copy.locator('..').focus();
         await page.getByRole('tooltip').filter({ hasText: disabledReason }).waitFor();
+        if (mode === 'revoked') {
+          assert.equal(await rotate.isDisabled(), true);
+          await rotate.locator('..').focus();
+          await page.getByRole('tooltip').filter({ hasText: 'This credential has been revoked.' }).waitFor();
+        }
       } else {
         await copy.click();
       }

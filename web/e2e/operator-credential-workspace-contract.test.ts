@@ -226,7 +226,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await plaintext.goto(fixture('service-plaintext'));
     await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
-    await plaintext.locator('details.create-resource > summary').click();
+    await plaintext.getByRole('button', { name: 'Create service credential', exact: true }).first().click();
     const plaintextForm = plaintext.locator('form.service-credential-create');
     await plaintextForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Plaintext integration');
     assert.equal(await plaintextForm.getByRole('textbox', { name: 'Tenant scope', exact: true }).inputValue(), 'tenant-a');
@@ -263,7 +263,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await aba.goto(fixture('service-scope-aba'));
     await aba.getByText('Existing service credential', { exact: true }).waitFor();
-    await aba.locator('details.create-resource > summary').click();
+    await aba.getByRole('button', { name: 'Create service credential', exact: true }).first().click();
     const abaForm = aba.locator('form.service-credential-create');
     await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Scoped integration');
     await abaForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();

@@ -87,19 +87,53 @@ test('service credential creation validates the draft and issues only a read-onl
     valid: { name: 'analytics', scopes: ['metrics:read', 'requests:read'], tenant_external_id: 'tenant-a' },
   });
 
-  await page.locator('details.create-resource > summary').click();
+  const createPanel = page.locator('section.create-resource');
+  assert.equal(await createPanel.locator('details, summary').count(), 0, 'service credential creation uses Fluent disclosure primitives');
+  const disclosure = createPanel.getByRole('button', { name: '创建服务凭据', exact: true }).first();
+  await disclosure.focus();
+  await page.keyboard.press('Enter');
+  assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
   const form = page.locator('form.service-credential-create');
   const name = form.getByRole('textbox', { name: '名称', exact: true });
   const tenant = form.getByRole('textbox', { name: '租户范围', exact: true });
   assert.equal(await tenant.inputValue(), 'tenant-a');
   assert.equal(await tenant.isEditable(), false);
+  const metrics = form.getByRole('checkbox', { name: '读取诊断指标 (metrics:read)' });
+  const requests = form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' });
+  await metrics.check();
+  await requests.check();
+  assert.equal(await metrics.isChecked(), true);
+  assert.equal(await requests.isChecked(), true);
+  await metrics.uncheck();
+  assert.equal(await metrics.isChecked(), false, 'a manually selected scope can be cancelled');
+  await metrics.check();
+  await requests.uncheck();
+  await requests.check();
   await form.getByRole('button', { name: '仅选择只读统计权限' }).click();
-  assert.equal(await form.getByRole('checkbox', { name: '读取诊断指标 (metrics:read)' }).isChecked(), true);
-  assert.equal(await form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' }).isChecked(), true);
+  assert.equal(await metrics.isChecked(), true);
+  assert.equal(await requests.isChecked(), true);
   assert.equal(await form.getByRole('checkbox', { name: '管理客户端凭据 (keys:write)' }).isChecked(), false);
+  const scopeHints = form.locator('.service-credential-scope-option > span[aria-label]');
+  assert.ok(await scopeHints.count() > 20, 'each supported permission has a supplemental explanation');
+  for (let index = 0; index < await scopeHints.count(); index += 1) {
+    await scopeHints.nth(index).focus();
+    await page.getByRole('tooltip').waitFor();
+  }
   await form.locator('[aria-label^="requests:read:"]').focus();
   await page.getByRole('tooltip').filter({ hasText: '读取请求记录、监控快照和用量分析' }).waitFor();
 
+  await metrics.uncheck();
+  await requests.uncheck();
+  await form.getByRole('button', { name: '创建服务凭据' }).click();
+  await page.getByText('至少选择一项权限。', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'POST').length), 0);
+
+  await disclosure.focus();
+  await page.keyboard.press('Space');
+  assert.equal(await disclosure.getAttribute('aria-expanded'), 'false');
+  await page.keyboard.press('Space');
+  assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
+  await form.getByRole('button', { name: '仅选择只读统计权限' }).click();
   await form.getByRole('button', { name: '创建服务凭据' }).click();
   await page.getByText('请输入服务凭据名称。', { exact: true }).waitFor();
   assert.equal(await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'POST').length), 0);
