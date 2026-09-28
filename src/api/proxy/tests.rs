@@ -1131,18 +1131,21 @@ async fn unpriced_http_json_route_is_rejected_before_any_upstream_request() {
     )
     .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    sqlx::query("DELETE FROM model_price_tiers WHERE model = $1 AND currency = $2")
-        .bind(&fixture.model)
-        .bind("USD")
+    let actual_upstream_model = "http-json-unpriced-actual";
+    sqlx::query("UPDATE model_routes SET upstream_model = $1 WHERE id = $2")
+        .bind(actual_upstream_model)
+        .bind(fixture.route_id.to_string())
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM model_prices WHERE model = $1 AND currency = $2")
-        .bind(&fixture.model)
-        .bind("USD")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE model_route_upstream_accounts SET upstream_model = $1 WHERE model_route_id = $2",
+    )
+    .bind(actual_upstream_model)
+    .bind(fixture.route_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
 
     let response = send_chat_usage_request(

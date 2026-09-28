@@ -2820,7 +2820,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
         .await
         .unwrap();
     let failover = sqlx::query(
-        "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = $1",
+        "SELECT upstream_account_id, model_route_id, price_snapshot_json FROM request_records WHERE id = $1",
     )
     .bind(failover_request.to_string())
     .fetch_one(&database.pool)
@@ -2834,4 +2834,9 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
         failover.get::<Option<String>, _>("model_route_id"),
         Some(dispatched_route.to_string())
     );
+    let stored_price: crate::model::ModelPrice = serde_json::from_str(
+        &failover.get::<String, _>("price_snapshot_json"),
+    )
+    .unwrap();
+    assert_eq!(stored_price.id, price.id);
 }

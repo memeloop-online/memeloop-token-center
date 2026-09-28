@@ -1120,9 +1120,10 @@ impl Database {
             }
 
             let reservation_row = sqlx::query(
-            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, reserved_units, billing_unit, micros_per_unit, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
+            "SELECT reservation.account_id, reservation.key_id, reservation.enforcement_mode, reservation.reserved_micros, reservation.reserved_tokens, reservation.reserved_units, reservation.billing_unit, reservation.micros_per_unit, reservation.rate_window_start, reservation.status, reservation.actual_micros, reservation.price_snapshot_json, request.price_snapshot_json AS request_price_snapshot_json FROM usage_reservations reservation LEFT JOIN request_records request ON request.id = $2 AND request.reservation_id = reservation.id WHERE reservation.id = $1",
         )
         .bind(&reservation_id)
+        .bind(&request_id)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -1145,8 +1146,9 @@ impl Database {
                     "request reservation ceiling mismatch".into(),
                 ));
             }
-            let price_snapshot_json: Option<String> =
-                reservation_row.try_get("price_snapshot_json")?;
+            let price_snapshot_json = reservation_row
+                .try_get::<Option<String>, _>("request_price_snapshot_json")?
+                .or(reservation_row.try_get("price_snapshot_json")?);
             let (input_micros_per_million, output_micros_per_million, price_tiers) =
                 if metered.is_some() {
                     (0, 0, Vec::new())
