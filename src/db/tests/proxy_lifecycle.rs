@@ -2838,3 +2838,125 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
         serde_json::from_str(&failover.get::<String, _>("price_snapshot_json")).unwrap();
     assert_eq!(stored_price.id, price.id);
 }
+
+#[tokio::test]
+async fn historical_billing_reads_the_admission_price_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("billing-snapshot.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"billing snapshot test pepper value";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "billing-snapshot".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "billing-snapshot".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("billing-snapshot-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 5,
+            protocol: "openai",
+            model: "billing-snapshot-model",
+            request_object: "gap://billing-snapshot/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let changed_price = database
+        .upsert_model_price(
+            "billing-snapshot-model",
+            "USD",
+            Decimal::from(1000),
+            Decimal::from(1000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        changed_price.input_micros_per_million,
+        price.input_micros_per_million
+    );
+    sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2")
+        .bind(serde_json::to_string(&changed_price).unwrap())
+        .bind(reservation.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: Some(crate::model::RequestUsageBasis::Observed),
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 10,
+            output_token_ceiling: 5,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..TokenUsage::default()
+            },
+            error_code: None,
+            response_object: "gap://billing-snapshot/response",
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        })
+        .await
+        .unwrap();
+    let stored =
+        sqlx::query("SELECT cost_micros, price_snapshot_json FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let stored_price: ModelPrice =
+        serde_json::from_str(&stored.get::<String, _>("price_snapshot_json")).unwrap();
+    assert_eq!(stored_price.id, price.id);
+    assert_eq!(
+        stored_price.input_micros_per_million,
+        price.input_micros_per_million
+    );
+    assert_eq!(
+        stored_price.output_micros_per_million,
+        price.output_micros_per_million
+    );
+    let views = database.list_requests(key.key_id, 10).await.unwrap();
+    let view = views
+        .iter()
+        .find(|view| view.request_id == request_id)
+        .unwrap();
+    assert_eq!(
+        view.cost,
+        crate::model::micros_to_decimal_string(stored.get::<i64, _>("cost_micros"))
+    );
+}
