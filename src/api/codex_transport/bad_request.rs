@@ -317,7 +317,13 @@ fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str
 /// Keep exact not-enabled wording separate from unsupported/not-available.
 fn tool_rejection_reason(message: &str) -> Option<&'static str> {
     let words: Vec<_> = message
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        // Diagnostic keywords must not come from URL hostnames (e.g. .invalid)
+        // or key=value payloads appended to an otherwise explicit error.
+        .split_whitespace()
+        .filter(|part| !part.contains("://") && !part.contains('='))
+        .flat_map(|part| {
+            part.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        })
         .filter(|word| !word.is_empty())
         .collect();
     let collaboration = words.contains(&"collaboration");
