@@ -270,10 +270,7 @@ async fn tenant_raw_cas_remains_plaintext_ranged_and_immutable() {
     let store = memory_store();
     let tenant_id = Uuid::now_v7();
     let body = Bytes::from_static(b"raw tenant CAS body");
-    let mut writer = store
-        .start_writer("staging/test/raw-cas")
-        .await
-        .unwrap();
+    let mut writer = store.start_writer("staging/test/raw-cas").await.unwrap();
     writer.write(body.clone()).await.unwrap();
     let staged = writer.finish_staged().await.unwrap();
     let cas = store
