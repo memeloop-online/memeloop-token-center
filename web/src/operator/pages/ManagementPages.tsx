@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber, formatPercent } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
@@ -51,7 +51,7 @@ import { credentialFormTemplates } from '../CredentialFormTemplates';
 import { CredentialRouteAuthorization } from '../CredentialRouteAuthorization';
 import { RouteListSource } from '../RouteListSource';
 import { credentialRouteOptions } from '../credentialRouteOptions';
-import { Button, Checkbox, Combobox, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
+import { Button, Checkbox, Combobox, Field, Input, Option, Select, DetailTooltip, Disclosure, FormSection } from '../../design-system';
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
 import { CreateJourney } from '../CreateJourney';
@@ -1570,8 +1570,58 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   </section>{writeTenant && <section className="credential-group-workspace"><Disclosure title={t('groups.credential.title')}><GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></Disclosure></section>}</>;
 }
 
-function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schema }: { token: string; tenant: string; writeTenant?: string; schema?: Record<string, unknown> }) {
+const serviceCredentialScopeGroups = [
+  { title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
+    { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
+    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
+  ] },
+  { title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
+    { value: 'keys:read', label: '读取客户端凭据', labelEn: 'Read client credentials', hint: '查看客户端凭据及其配置。', hintEn: 'View client credentials and their configuration.' },
+    { value: 'keys:write', label: '管理客户端凭据', labelEn: 'Manage client credentials', hint: '创建、更新或撤销客户端凭据。', hintEn: 'Create, update, or revoke client credentials.' },
+    { value: 'credits:read', label: '读取额度', labelEn: 'Read credits', hint: '查看额度账户与余额。', hintEn: 'View credit accounts and balances.' },
+    { value: 'credits:write', label: '管理额度', labelEn: 'Manage credits', hint: '修改额度与账户余额。', hintEn: 'Modify credits and account balances.' },
+    { value: 'entitlements:read', label: '读取授权权益', labelEn: 'Read entitlements', hint: '查看租户授权权益。', hintEn: 'View tenant entitlements.' },
+    { value: 'entitlements:write', label: '管理授权权益', labelEn: 'Manage entitlements', hint: '修改租户授权权益。', hintEn: 'Modify tenant entitlements.' },
+  ] },
+  { title: '平台配置', titleEn: 'Platform configuration', scopes: [
+    { value: 'providers:read', label: '读取提供商', labelEn: 'Read providers', hint: '查看提供商配置。', hintEn: 'View provider configuration.' },
+    { value: 'providers:write', label: '管理提供商', labelEn: 'Manage providers', hint: '创建或修改提供商配置。', hintEn: 'Create or modify provider configuration.' },
+    { value: 'plugins:read', label: '读取插件', labelEn: 'Read plugins', hint: '查看插件与其配置。', hintEn: 'View plugins and their configuration.' },
+    { value: 'plugins:write', label: '管理插件', labelEn: 'Manage plugins', hint: '修改插件配置或生命周期。', hintEn: 'Modify plugin configuration or lifecycle.' },
+    { value: 'routes:read', label: '读取模型路由', labelEn: 'Read model routes', hint: '查看模型路由配置。', hintEn: 'View model route configuration.' },
+    { value: 'routes:write', label: '管理模型路由', labelEn: 'Manage model routes', hint: '创建或修改模型路由。', hintEn: 'Create or modify model routes.' },
+    { value: 'prices:read', label: '读取价格', labelEn: 'Read prices', hint: '查看模型价格配置。', hintEn: 'View model pricing configuration.' },
+    { value: 'prices:write', label: '管理价格', labelEn: 'Manage prices', hint: '修改模型价格配置。', hintEn: 'Modify model pricing configuration.' },
+    { value: 'schemas:read', label: '读取配置 Schema', labelEn: 'Read configuration schemas', hint: '读取平台公开的配置 Schema。', hintEn: 'Read configuration schemas exposed by the platform.' },
+    { value: 'upstreams:import:write', label: '导入上游账号', labelEn: 'Import upstream accounts', hint: '导入上游账号配置。', hintEn: 'Import upstream account configuration.' },
+  ] },
+  { title: '系统与运维', titleEn: 'System and operations', scopes: [
+    { value: 'generations:write', label: '创建生成任务', labelEn: 'Create generation jobs', hint: '提交图片或视频生成任务。', hintEn: 'Submit image or video generation jobs.' },
+    { value: 'generations:quarantine:read', label: '读取隔离任务', labelEn: 'Read quarantined jobs', hint: '查看被隔离的生成任务。', hintEn: 'View quarantined generation jobs.' },
+    { value: 'generations:reconcile', label: '对账生成任务', labelEn: 'Reconcile generation jobs', hint: '执行生成任务状态对账。', hintEn: 'Reconcile generation job status.' },
+    { value: 'filter_assistant:execute', label: '运行筛选助手', labelEn: 'Run filter assistant', hint: '调用模型执行筛选，可能产生计费用量。', hintEn: 'Invoke models for filtering; this may incur billable usage.' },
+    { value: 'oauth:write', label: '管理 OAuth 授权', labelEn: 'Manage OAuth authorization', hint: '发起或管理 OAuth 授权流程。', hintEn: 'Start or manage OAuth authorization flows.' },
+    { value: 'service_tokens:read', label: '读取服务凭据', labelEn: 'Read service credentials', hint: '列出服务凭据及其权限范围。', hintEn: 'List service credentials and their scopes.' },
+    { value: 'service_tokens:write', label: '管理服务凭据', labelEn: 'Manage service credentials', hint: '创建、复制、轮换或暂停服务凭据。', hintEn: 'Create, copy, rotate, or suspend service credentials.' },
+    { value: 'tenants:read', label: '读取租户', labelEn: 'Read tenants', hint: '查看租户信息。', hintEn: 'View tenant information.' },
+    { value: 'tenants:write', label: '管理租户', labelEn: 'Manage tenants', hint: '创建或修改租户。', hintEn: 'Create or modify tenants.' },
+    { value: 'settlements:adjust', label: '调整结算记录', labelEn: 'Adjust settlements', hint: '执行结算记录调整。', hintEn: 'Adjust settlement records.' },
+  ] },
+] as const;
+
+const serviceCredentialStatisticsScopes = ['metrics:read', 'requests:read'];
+const supportedServiceCredentialScopes = new Set<string>(serviceCredentialScopeGroups.flatMap((group) => group.scopes.map((scope) => scope.value)));
+
+export function serviceCredentialCreatePayload(name: string, scopes: string[], tenant: string) {
+  const normalizedName = name.trim();
+  const uniqueScopes = [...new Set(scopes)];
+  if (!tenant || !normalizedName || new TextEncoder().encode(normalizedName).length > 120 || uniqueScopes.length === 0 || uniqueScopes.some((scope) => !supportedServiceCredentialScopes.has(scope))) return undefined;
+  return { name: normalizedName, scopes: uniqueScopes, tenant_external_id: tenant };
+}
+
+function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { token: string; tenant: string; writeTenant?: string }) {
   const { locale, t } = useI18n();
+  const zh = locale === 'zh-CN';
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const renderScope = useRef({ token, tenant, writeTenant, generation: 0 });
   if (renderScope.current.token !== token || renderScope.current.tenant !== tenant || renderScope.current.writeTenant !== writeTenant) {
@@ -1582,6 +1632,9 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [createName, setCreateName] = useState('');
+  const [createScopes, setCreateScopes] = useState<string[]>([]);
+  const [createAttempted, setCreateAttempted] = useState(false);
   const loadSequence = useRef(0);
   const secretRequest = useRef<AbortController | undefined>(undefined);
   const secretOperation = useRef<symbol | undefined>(undefined);
@@ -1607,7 +1660,8 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
   };
   useEffect(() => {
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
-    loadSequence.current += 1; setValues([]); setSecret(undefined); setBusy(''); setMessage(''); setError(''); void load();
+    loadSequence.current += 1; setValues([]); setSecret(undefined); setBusy(''); setMessage(''); setError('');
+    setCreateName(''); setCreateScopes([]); setCreateAttempted(false); void load();
     return () => { secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('service-credentials', tenant, values, (value) => (value.status ?? 'active') === 'active');
@@ -1679,17 +1733,19 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
     }
   };
-  const createServiceCredential = async (formData: unknown) => {
-    if (!writeTenant) return;
+  const createServiceCredential = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setCreateAttempted(true);
+    const payload = serviceCredentialCreatePayload(createName, createScopes, writeTenant);
+    if (!payload) return;
     const operation = beginSecretOperation();
     if (!operation) return;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
     const controller = new AbortController();
     secretRequest.current?.abort(); secretRequest.current = controller;
     setBusy('create-service-credential'); setError(''); setMessage('');
-    const fields = formData && typeof formData === 'object' ? formData : {};
     try {
-      const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...fields, tenant_external_id: operationWriteTenant }), signal: controller.signal });
+      const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify(payload), signal: controller.signal });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       showSecret(created.token, 'issued'); setMessage(t('services.created')); await load();
     } catch (reason) {
@@ -1719,7 +1775,32 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
               : undefined;
       return <div className="managed-resource credential-compact-row" key={value.service_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.name}</b><div className="credential-row-summary"><span className="credential-budget" title={t('services.notBilledHint')}>{t('services.notBilled')}</span><span className="credential-group-summary">{tenantDisplayName(value.tenant_external_id ?? t('services.globalScope'), locale)} · {value.scopes.join(' · ') || t('common.none')}</span></div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions credential-row-actions"><DetailTooltip content={copyReason ?? t('credentials.copy')}><span tabIndex={copyReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(copyReason) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>;
     })}</div></article>
-    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => { void createServiceCredential(formData); }}><button type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><form className="create-resource-body form-panel service-credential-create" noValidate onSubmit={(event) => void createServiceCredential(event)}>
+      <Field label={zh ? '名称' : 'Name'} required validationState={createAttempted && (!createName.trim() || new TextEncoder().encode(createName.trim()).length > 120) ? 'error' : 'none'} validationMessage={createAttempted && !createName.trim() ? (zh ? '请输入服务凭据名称。' : 'Enter a service credential name.') : createAttempted && new TextEncoder().encode(createName.trim()).length > 120 ? (zh ? '名称不能超过 120 个 UTF-8 字节。' : 'Name must be 120 UTF-8 bytes or fewer.') : undefined}>
+        <Input value={createName} onChange={(event) => setCreateName(event.target.value)} placeholder={zh ? '例如：只读统计集成' : 'e.g. Read-only analytics integration'} />
+      </Field>
+      <Field label={zh ? '租户范围' : 'Tenant scope'} required validationState={!writeTenant && createAttempted ? 'error' : 'none'} validationMessage={!writeTenant && createAttempted ? (zh ? '请先选择有写入权限的租户。' : 'Select a tenant with write access first.') : undefined}>
+        <Input readOnly value={writeTenant} placeholder={zh ? '尚未选择租户' : 'No tenant selected'} />
+      </Field>
+      <fieldset className="service-credential-scopes">
+        <legend>{zh ? '权限范围' : 'Permission scopes'} <span aria-hidden="true">*</span></legend>
+        <div className="service-credential-scope-groups" style={{ display: 'grid', gap: 20, gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))' }}>
+          {serviceCredentialScopeGroups.map((group) => <section key={group.title} aria-label={zh ? group.title : group.titleEn} style={{ minWidth: 0 }}>
+            <h3 style={{ margin: '0 0 10px', fontSize: 14 }}>{zh ? group.title : group.titleEn}</h3>
+            {group.title === '统计与请求' && <Button appearance="secondary" type="button" onClick={() => setCreateScopes([...serviceCredentialStatisticsScopes])}>{zh ? '仅选择只读统计权限' : 'Select read-only statistics only'}</Button>}
+            <div className="service-credential-scope-options" style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+              {group.scopes.map((scope) => <div className="service-credential-scope-option" key={scope.value}>
+                <DetailTooltip content={zh ? scope.hint : scope.hintEn}><span tabIndex={0} aria-label={`${scope.value}: ${zh ? scope.hint : scope.hintEn}`}>
+                  <Checkbox label={<>{zh ? scope.label : scope.labelEn} <code>{scope.value}</code></>} aria-label={`${zh ? scope.label : scope.labelEn} (${scope.value})`} checked={createScopes.includes(scope.value)} onChange={(_, data) => setCreateScopes((current) => data.checked === true ? [...new Set([...current, scope.value])] : current.filter((value) => value !== scope.value))} />
+                </span></DetailTooltip>
+              </div>)}
+            </div>
+          </section>)}
+        </div>
+        {createAttempted && createScopes.length === 0 && <p className="field-error" role="alert">{zh ? '至少选择一项权限。' : 'Choose at least one permission scope.'}</p>}
+      </fieldset>
+      <Button appearance="primary" type="submit" disabled={!writeTenant || Boolean(busy) || Boolean(visibleSecret)}>{busy === 'create-service-credential' ? t('common.loading') : t('services.create')}</Button>
+    </form></details>
   </section></>;
 }
 
@@ -1848,13 +1929,5 @@ export function CredentialsPage({ token, tenant, writeTenant }: OperatorPageProp
 }
 
 export function ServiceCredentialsPage({ token, tenant, writeTenant }: OperatorPageProps) {
-  const { t } = useI18n();
-  const resource = useOperatorResource(
-    Boolean(token), token,
-    () => api<ConfigurationSchemas>('/internal/v1/schemas', token),
-    t('common.requestFailed'),
-  );
-  return <ResourceBoundary resource={resource.state} scopeKey={token}>{(schemas) =>
-    <ServiceCredentialWorkspace token={token} tenant={tenant} writeTenant={writeTenant} schema={schemas.service_token} />
-  }</ResourceBoundary>;
+  return <ServiceCredentialWorkspace token={token} tenant={tenant} writeTenant={writeTenant} />;
 }
