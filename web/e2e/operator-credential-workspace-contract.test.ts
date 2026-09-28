@@ -233,7 +233,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await plaintextForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
     assert.equal(await plaintextForm.getByRole('checkbox', { name: 'Read requests and usage (requests:read)', exact: true }).isChecked(), true);
     assert.equal(await plaintextForm.getByRole('checkbox', { name: 'Manage client credentials (keys:write)', exact: true }).isChecked(), false);
-    const create = plaintext.getByRole('button', { name: 'Create service credential', exact: true });
+    const create = plaintextForm.getByRole('button', { name: 'Create service credential', exact: true });
     await create.evaluate((button) => {
       (button as HTMLButtonElement).click();
       (button as HTMLButtonElement).click();
@@ -267,7 +267,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     const abaForm = aba.locator('form.service-credential-create');
     await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Scoped integration');
     await abaForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
-    const abaCreate = aba.getByRole('button', { name: 'Create service credential', exact: true });
+    const abaCreate = abaForm.getByRole('button', { name: 'Create service credential', exact: true });
     await abaCreate.click();
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
     await aba.getByRole('button', { name: 'Switch tenant', exact: true }).click();
