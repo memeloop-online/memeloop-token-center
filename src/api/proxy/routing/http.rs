@@ -3,6 +3,7 @@ use bytes::Bytes;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
+const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 fn log_preparation_failure(request_id: Uuid, account_id: Uuid, error: Option<&AppError>) {
     let failure_category = error
@@ -219,15 +220,27 @@ async fn translate_new_api_compact_v2(
     let status = response.status();
     let version = response.version();
     let mut headers = response.headers().clone();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    if bytes.len() > 64 * 1024 * 1024 {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_COMPACT_RESPONSE_BYTES as u64)
+    {
         return Err(ProxySendError::AmbiguousResponse(
             "upstream_invalid_response",
         ));
     }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+        if chunk.len() > MAX_COMPACT_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(ProxySendError::AmbiguousResponse(
+                "upstream_invalid_response",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let bytes = Bytes::from(bytes);
     if !status.is_success() {
         let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
             Box::pin(futures_util::stream::once(async move { Ok(bytes) }));

@@ -39,11 +39,25 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
         });
         sender
     });
-    let _ = sender.try_send(Diagnostic {
+    if sender
+        .try_send(Diagnostic {
         request_id,
         content_type,
         dispatch: tracing::dispatcher::get_default(Clone::clone),
-    });
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            %request_id,
+            stage = "codex_upstream_bad_request",
+            upstream_error_classification = "unclassifiable",
+            upstream_error_reason = "content_type",
+            upstream_content_type_class = content_type,
+            upstream_diagnostic_read = "not_attempted",
+            upstream_diagnostic_enqueue = "dropped_queue_full",
+            "Codex upstream diagnostic was dropped after bounded queue admission"
+        );
+    }
 }
 
 fn content_type_class(headers: &http::HeaderMap) -> &'static str {

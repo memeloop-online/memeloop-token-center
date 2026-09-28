@@ -84,6 +84,9 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
     if compact.get("error").is_some_and(|error| !error.is_null()) {
         return Err("provider_error");
     }
+    if compact.get("status").and_then(Value::as_str) == Some("failed") {
+        return Err("provider_failed");
+    }
     let output = compact
         .get("output")
         .and_then(Value::as_array)
@@ -97,9 +100,19 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
         if compaction_items.len() != 1 || output.len() != 1 {
             return Err("compaction_output_must_be_single_item");
         }
+        if compaction_items[0]
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err("compaction_item_malformed");
+        }
     } else {
         if output.len() != 1 {
             return Err("multiple_output_items_not_representable");
+        }
+        if output[0]["type"] != "message" {
+            return Err("output_item_not_message");
         }
         let text = output[0]["content"]
             .as_array()
@@ -256,6 +269,29 @@ mod tests {
         assert_eq!(
             compact_to_responses(&compact),
             Err("compaction_output_must_be_single_item")
+        );
+    }
+
+    #[test]
+    fn compact_to_responses_rejects_failed_malformed_and_non_message_results() {
+        assert_eq!(
+            compact_to_responses(&json!({
+                "status": "failed",
+                "output": [{"type":"compaction","encrypted_content":"opaque"}]
+            })),
+            Err("provider_failed")
+        );
+        assert_eq!(
+            compact_to_responses(&json!({
+                "output": [{"type":"compaction","encrypted_content":""}]
+            })),
+            Err("compaction_item_malformed")
+        );
+        assert_eq!(
+            compact_to_responses(&json!({
+                "output": [{"type":"tool_call","content":"not a message"}]
+            })),
+            Err("output_item_not_message")
         );
     }
 
