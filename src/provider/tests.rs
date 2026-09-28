@@ -445,7 +445,8 @@ fn http_json_compact_bridge_is_an_optional_account_capability() {
 
 #[test]
 fn http_json_uses_openai_compatible_display_name_without_changing_driver_id() {
-    let provider = ProviderCatalog::builtins().get("http-json").unwrap();
+    let catalog = ProviderCatalog::builtins();
+    let provider = catalog.get("http-json").unwrap();
     assert_eq!(provider.id, "http-json");
     assert_eq!(provider.display_name, "OpenAI Compatible");
 }
