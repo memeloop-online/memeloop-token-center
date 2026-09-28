@@ -229,7 +229,7 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_v1_and_marks_v2_messages_plaintext_on_the_wire() {
+async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the_wire() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
     Mock::given(method("POST"))
@@ -284,6 +284,10 @@ async fn native_codex_responses_preserves_v1_and_marks_v2_messages_plaintext_on_
     assert!(!v1_namespace.to_string().contains("encrypted"));
 
     let forwarded: Value = requests[1].body_json().unwrap();
+    let expected_v2: Value = serde_json::from_str(include_str!(
+        "../../kimi_transport/fixtures/codex-multi-agent-v2.json"
+    ))
+    .unwrap();
     assert_eq!(
         requests[1].headers["originator"].to_str().unwrap(),
         "codex_exec"
@@ -292,37 +296,21 @@ async fn native_codex_responses_preserves_v1_and_marks_v2_messages_plaintext_on_
         requests[1].headers[header::USER_AGENT].to_str().unwrap(),
         "codex_exec/0.154.0"
     );
-    {
-        let namespaces = forwarded["tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(
-                forwarded["input"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|item| item["type"] == "additional_tools")
-                    .flat_map(|item| item["tools"].as_array().into_iter().flatten()),
-            )
-            .filter(|tool| tool["type"] == "namespace" && tool["name"] == "collaboration")
-            .collect::<Vec<_>>();
-        assert!(!namespaces.is_empty());
-        for namespace in namespaces {
-            assert_eq!(namespace["name"], "collaboration");
-            for tool in namespace["tools"].as_array().unwrap() {
-                let message = tool.pointer("/parameters/properties/message");
-                if matches!(
-                    tool["name"].as_str(),
-                    Some("spawn_agent" | "send_message" | "followup_task")
-                ) {
-                    assert!(message.is_some_and(|message| message.get("encrypted").is_none()));
-                } else if let Some(message) = message {
-                    assert!(message.get("encrypted").is_some());
-                }
-            }
-        }
+    assert_eq!(forwarded["tools"][0], expected_v2["tools"][0]);
+    for tool in [
+        &forwarded["tools"][0]["tools"][0],
+        &forwarded["tools"][0]["tools"][1],
+        &forwarded["input"][0]["tools"][0]["tools"][0],
+    ] {
+        assert!(
+            tool["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
+        );
     }
+    let mut expected_input = expected_v2["input"].clone();
+    expected_input[1]["role"] = json!("developer");
+    assert_eq!(forwarded["input"], expected_input);
     upstream.verify().await;
 }
 

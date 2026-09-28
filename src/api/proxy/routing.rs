@@ -99,8 +99,8 @@ pub(super) fn plan_proxy_route(
         &route,
         protocol,
         request_json,
-        multi_agent_responses && !normalize_multi_agent && !passthrough_responses,
-        normalize_multi_agent,
+        multi_agent_responses && !normalize_multi_agent && !passthrough_responses && !is_codex,
+        normalize_multi_agent && !is_codex,
         responses_via_chat_dialect,
     )?;
     let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
