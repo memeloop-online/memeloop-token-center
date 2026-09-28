@@ -110,6 +110,7 @@ pub(crate) struct SwitchProxyCandidateInput<'a> {
     pub reservation: &'a UsageReservation,
     pub input_token_ceiling: i64,
     pub output_token_ceiling: i64,
+    pub upstream_model: &'a str,
     pub expected_assignment: (Uuid, Uuid),
     pub next_assignment: (Uuid, Uuid),
 }
@@ -200,7 +201,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None)
+        self.start_proxy_request_inner(input, None, None)
             .await
             .map(|started| started.reservation)
     }
@@ -261,9 +262,31 @@ impl Database {
         pepper: &[u8],
         compression_enabled: bool,
     ) -> Result<StartedProxyRequest, AppError> {
+        self.start_proxy_request_with_archive_compression_and_upstream_model(
+            input,
+            body,
+            pepper,
+            compression_enabled,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_proxy_request_with_archive_compression_and_upstream_model(
+        &self,
+        input: StartProxyRequest<'_>,
+        body: &bytes::Bytes,
+        pepper: &[u8],
+        compression_enabled: bool,
+        upstream_model: Option<&str>,
+    ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)))
+            .start_proxy_request_inner(
+                input,
+                Some((body, pepper, compression_enabled)),
+                upstream_model,
+            )
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -284,6 +307,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
+        upstream_model: Option<&str>,
     ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
@@ -357,6 +381,8 @@ impl Database {
         )
         .instrument(reservation_span)
         .await?;
+        let price_snapshot_json =
+            serde_json::to_string(input.price).map_err(|_| AppError::Internal)?;
         BudgetHold::set_phase(&mut hold, "request_record");
         let started_request = NewRequest {
             request_id: input.request_id,
@@ -369,9 +395,14 @@ impl Database {
             upstream_account_id: input.upstream_account_id,
             model_route_id: input.model_route_id,
         };
-        if let Err(error) =
-            insert_request_started_record_in_transaction(&mut transaction, &started_request, now)
-                .await
+        if let Err(error) = insert_request_started_record_with_snapshots_in_transaction(
+            &mut transaction,
+            &started_request,
+            now,
+            upstream_model,
+            Some(&price_snapshot_json),
+        )
+        .await
         {
             BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
@@ -519,15 +550,19 @@ impl Database {
         let mut transaction = self.begin_write_transaction().await?;
         let (expected_upstream_account_id, expected_model_route_id) = input.expected_assignment;
         let (next_upstream_account_id, next_model_route_id) = input.next_assignment;
+        let price_snapshot_json =
+            serde_json::to_string(input.price).map_err(|_| AppError::Internal)?;
         let updated = sqlx::query(
             "UPDATE request_records
-             SET upstream_account_id = $1, model_route_id = $2
-             WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6
-               AND upstream_account_id = $7 AND model_route_id = $8
+             SET upstream_account_id = $1, model_route_id = $2, upstream_model = $3, price_snapshot_json = $4
+             WHERE id = $5 AND tenant_id = $6 AND key_id = $7 AND reservation_id = $8
+               AND upstream_account_id = $9 AND model_route_id = $10
                AND completed_at IS NULL AND error_code IS NULL",
         )
         .bind(next_upstream_account_id.to_string())
         .bind(next_model_route_id.to_string())
+        .bind(input.upstream_model)
+        .bind(price_snapshot_json)
         .bind(input.request_id.to_string())
         .bind(input.tenant_id.to_string())
         .bind(input.key.key_id.to_string())
@@ -1822,6 +1857,23 @@ async fn insert_request_started_record_in_transaction(
     request: &NewRequest,
     now: i64,
 ) -> Result<(), AppError> {
+    insert_request_started_record_with_snapshots_in_transaction(
+        transaction,
+        request,
+        now,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn insert_request_started_record_with_snapshots_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &NewRequest,
+    now: i64,
+    upstream_model: Option<&str>,
+    price_snapshot_json: Option<&str>,
+) -> Result<(), AppError> {
     let request_id = request.request_id.to_string();
     let tenant_id = request.tenant_id.to_string();
     let key_id = request.key_id.to_string();
@@ -1836,7 +1888,7 @@ async fn insert_request_started_record_in_transaction(
         ));
     }
     sqlx::query(
-        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, upstream_model, price_snapshot_json, currency, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, COALESCE((SELECT account.currency FROM usage_reservations reservation JOIN credit_accounts account ON account.id = reservation.account_id WHERE reservation.id = $8 AND reservation.key_id = $3), (SELECT currency FROM key_records WHERE id = $3), ''), 0, 0, 0)",
     )
     .bind(&request_id)
     .bind(&tenant_id)
@@ -1848,6 +1900,8 @@ async fn insert_request_started_record_in_transaction(
     .bind(&reservation_id)
     .bind(&upstream_account_id)
     .bind(&model_route_id)
+    .bind(upstream_model)
+    .bind(price_snapshot_json)
     .execute(&mut **transaction)
     .await?;
     Ok(())
