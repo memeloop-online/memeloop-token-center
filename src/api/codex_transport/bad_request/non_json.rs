@@ -28,7 +28,10 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
     };
     let enqueue_result = {
         let mut sender = queue.lock().expect("diagnostic queue lock poisoned");
-        if sender.as_ref().is_none_or(tokio::sync::mpsc::Sender::is_closed) {
+        if sender
+            .as_ref()
+            .is_none_or(tokio::sync::mpsc::Sender::is_closed)
+        {
             let (new_sender, mut receiver) =
                 tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
             tokio::spawn(async move {
@@ -48,12 +51,17 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
             });
             *sender = Some(new_sender);
         }
-        sender.as_ref().expect("diagnostic sender initialized").try_send(diagnostic)
+        sender
+            .as_ref()
+            .expect("diagnostic sender initialized")
+            .try_send(diagnostic)
     };
     if enqueue_result.is_err() {
         let queue_closed = {
             let sender = queue.lock().expect("diagnostic queue lock poisoned");
-            sender.as_ref().is_none_or(tokio::sync::mpsc::Sender::is_closed)
+            sender
+                .as_ref()
+                .is_none_or(tokio::sync::mpsc::Sender::is_closed)
         };
         if queue_closed {
             observe(response, request_id);
