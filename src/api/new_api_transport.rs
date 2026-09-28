@@ -231,7 +231,10 @@ mod tests {
                 {"id":"c2","type":"compaction","encrypted_content":"second"}
             ]
         });
-        assert_eq!(compact_to_responses(&compact), Err("multiple_compaction_items"));
+        assert_eq!(
+            compact_to_responses(&compact),
+            Err("multiple_compaction_items")
+        );
     }
 
     #[test]
