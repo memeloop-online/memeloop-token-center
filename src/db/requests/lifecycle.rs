@@ -255,23 +255,6 @@ impl Database {
             .await
     }
 
-    pub(crate) async fn start_proxy_request_with_archive_compression(
-        &self,
-        input: StartProxyRequest<'_>,
-        body: &bytes::Bytes,
-        pepper: &[u8],
-        compression_enabled: bool,
-    ) -> Result<StartedProxyRequest, AppError> {
-        self.start_proxy_request_with_archive_compression_and_upstream_model(
-            input,
-            body,
-            pepper,
-            compression_enabled,
-            None,
-        )
-        .await
-    }
-
     pub(crate) async fn start_proxy_request_with_archive_compression_and_upstream_model(
         &self,
         input: StartProxyRequest<'_>,
