@@ -89,10 +89,11 @@ test('service credential creation validates the draft and issues only a read-onl
 
   const createPanel = page.locator('section.create-resource');
   assert.equal(await createPanel.locator('details, summary').count(), 0, 'service credential creation uses Fluent disclosure primitives');
-  const disclosure = createPanel.getByRole('button', { name: '创建服务凭据', exact: true }).first();
+  const disclosure = createPanel.getByRole('button', { name: '创建服务凭据表单', exact: true });
   await disclosure.focus();
   await page.keyboard.press('Enter');
   assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
+  assert.equal(await page.getByRole('button', { name: '创建服务凭据', exact: true }).count(), 1, 'the submit button keeps its exact accessible name');
   const form = page.locator('form.service-credential-create');
   const name = form.getByRole('textbox', { name: '名称', exact: true });
   const tenant = form.getByRole('textbox', { name: '租户范围', exact: true });
