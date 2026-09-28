@@ -19,7 +19,8 @@ static DIAGNOSTIC_QUEUE: OnceLock<tokio::sync::mpsc::Sender<Diagnostic>> = OnceL
 pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
     let content_type = content_type_class(response.headers());
     let sender = DIAGNOSTIC_QUEUE.get_or_init(|| {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(DIAGNOSTIC_QUEUE_CAPACITY);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
         tokio::spawn(async move {
             while let Some(diagnostic) = receiver.recv().await {
                 tracing::warn!(
