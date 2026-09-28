@@ -512,6 +512,12 @@ mod tests {
         let disposition = classify_bad_request(response, Uuid::nil())
             .with_subscriber(subscriber)
             .await;
+        for _ in 0..16 {
+            if !capture.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             disposition,
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType)

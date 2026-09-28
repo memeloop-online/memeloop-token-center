@@ -87,35 +87,44 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
     let output = compact
         .get("output")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut compaction_items: Vec<Value> = output
+        .ok_or("output_missing")?;
+    let compaction_items: Vec<Value> = output
         .iter()
         .filter(|item| item["type"] == "compaction")
         .cloned()
         .collect();
-    if compaction_items.is_empty() {
-        let text = output
-            .iter()
-            .filter_map(|item| {
-                item["content"]
-                    .as_array()
-                    .and_then(|parts| parts.last())
-                    .and_then(|part| part["text"].as_str())
-                    .or_else(|| item["content"].as_str())
+    if !compaction_items.is_empty() {
+        if compaction_items.len() != 1 || output.len() != 1 {
+            return Err("compaction_output_must_be_single_item");
+        }
+    } else {
+        if output.len() != 1 {
+            return Err("multiple_output_items_not_representable");
+        }
+        let text = output[0]["content"]
+            .as_array()
+            .and_then(|parts| {
+                let mut text = String::new();
+                for part in parts {
+                    let Some(part_text) = part["text"].as_str() else {
+                        return None;
+                    };
+                    text.push_str(part_text);
+                }
+                (!text.is_empty()).then_some(text)
             })
-            .find(|text| !text.is_empty());
+            .or_else(|| output[0]["content"].as_str().map(str::to_owned));
         let Some(text) = text else {
             return Err("compaction_item_missing");
         };
         let id = compact["id"].as_str().unwrap_or("compact");
-        compaction_items.push(compaction_item(&format!("cmp_{id}"), text));
-    } else if compaction_items.len() > 1 {
-        // The Responses envelope can carry one compact checkpoint through the
-        // current SSE adapter. Dropping earlier checkpoints would corrupt the
-        // conversation, so reject the ambiguous provider response instead.
-        return Err("multiple_compaction_items");
+        let compaction_items = compaction_item(&format!("cmp_{id}"), &text);
+        return Ok(build_compact_response(compact, vec![compaction_items]));
     }
+    Ok(build_compact_response(compact, compaction_items))
+}
+
+fn build_compact_response(compact: &Value, output: Vec<Value>) -> Value {
     let id = compact
         .get("id")
         .and_then(Value::as_str)
@@ -125,12 +134,12 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
         "object": "response",
         "status": "completed",
         "error": null,
-        "output": compaction_items,
+        "output": output,
     });
     if let Some(usage) = compact.get("usage") {
         response["usage"] = usage.clone();
     }
-    Ok(response)
+    response
 }
 
 pub(in crate::api) fn responses_to_sse(response: &Value) -> Result<Bytes, &'static str> {
@@ -180,6 +189,7 @@ fn push_sse(body: &mut Vec<u8>, event: &str, data: Value) -> Result<(), &'static
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn compact_request_drops_trigger_and_tools() {
@@ -233,8 +243,54 @@ mod tests {
         });
         assert_eq!(
             compact_to_responses(&compact),
-            Err("multiple_compaction_items")
+            Err("compaction_output_must_be_single_item")
         );
+    }
+
+    #[test]
+    fn compact_to_responses_rejects_compaction_mixed_with_other_output() {
+        let compact = json!({
+            "output": [
+                {"type":"compaction","encrypted_content":"checkpoint"},
+                {"type":"message","content":"extra"}
+            ]
+        });
+        assert_eq!(
+            compact_to_responses(&compact),
+            Err("compaction_output_must_be_single_item")
+        );
+    }
+
+    #[test]
+    fn compact_to_responses_rejects_multiple_text_outputs_instead_of_dropping_one() {
+        let compact = json!({
+            "output": [
+                {"type":"message","content":"first"},
+                {"type":"message","content":"second"}
+            ]
+        });
+        assert_eq!(
+            compact_to_responses(&compact),
+            Err("multiple_output_items_not_representable")
+        );
+    }
+
+    #[test]
+    fn compact_to_responses_preserves_all_text_parts_for_legacy_output() {
+        let response = compact_to_responses(&json!({
+            "output": [{"type":"message","content":[
+                {"type":"output_text","text":"first"},
+                {"type":"output_text","text":" second"}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(response["output"][0]["type"], "compaction");
+        let encrypted = response["output"][0]["encrypted_content"].as_str().unwrap();
+        let encoded = encrypted.strip_prefix("mtc-compact-v1.").unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded, b"first second");
     }
 
     #[test]
