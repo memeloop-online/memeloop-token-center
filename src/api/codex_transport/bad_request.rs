@@ -698,6 +698,12 @@ mod tests {
                 .with_subscriber(subscriber)
                 .await;
             assert_eq!(disposition, BadRequestDisposition::Unclassifiable(reason));
+            for _ in 0..16 {
+                if !capture.0.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
             assert_eq!(logged.lines().count(), 1, "{reason:?}: {logged}");
             assert!(!logged.contains("canary"), "{logged}");

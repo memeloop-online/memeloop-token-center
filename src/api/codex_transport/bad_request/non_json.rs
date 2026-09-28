@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const DIAGNOSTIC_QUEUE_CAPACITY: usize = 64;
 
@@ -10,7 +10,8 @@ struct Diagnostic {
     dispatch: tracing::Dispatch,
 }
 
-static DIAGNOSTIC_QUEUE: OnceLock<tokio::sync::mpsc::Sender<Diagnostic>> = OnceLock::new();
+static DIAGNOSTIC_QUEUE: OnceLock<Mutex<Option<tokio::sync::mpsc::Sender<Diagnostic>>>> =
+    OnceLock::new();
 
 /// Record only response metadata. The current response abstraction cannot
 /// safely tee an untrusted body without retaining it in the request path, so
@@ -19,34 +20,47 @@ static DIAGNOSTIC_QUEUE: OnceLock<tokio::sync::mpsc::Sender<Diagnostic>> = OnceL
 /// classification decisions.
 pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
     let content_type = content_type_class(response.headers());
-    let sender = DIAGNOSTIC_QUEUE.get_or_init(|| {
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
-        tokio::spawn(async move {
-            while let Some(diagnostic) = receiver.recv().await {
-                tracing::dispatcher::with_default(&diagnostic.dispatch, || {
-                    tracing::warn!(
-                        request_id = %diagnostic.request_id,
-                        stage = "codex_upstream_bad_request",
-                        upstream_error_classification = "unclassifiable",
-                        upstream_error_reason = "content_type",
-                        upstream_content_type_class = diagnostic.content_type,
-                        upstream_diagnostic_read = "not_attempted",
-                        "Codex upstream rejected the request"
-                    );
-                });
-            }
-        });
-        sender
-    });
-    if sender
-        .try_send(Diagnostic {
-            request_id,
-            content_type,
-            dispatch: tracing::dispatcher::get_default(Clone::clone),
-        })
-        .is_err()
-    {
+    let queue = DIAGNOSTIC_QUEUE.get_or_init(|| Mutex::new(None));
+    let diagnostic = Diagnostic {
+        request_id,
+        content_type,
+        dispatch: tracing::dispatcher::get_default(Clone::clone),
+    };
+    let enqueue_result = {
+        let mut sender = queue.lock().expect("diagnostic queue lock poisoned");
+        if sender.as_ref().is_none_or(tokio::sync::mpsc::Sender::is_closed) {
+            let (new_sender, mut receiver) =
+                tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
+            tokio::spawn(async move {
+                while let Some(diagnostic) = receiver.recv().await {
+                    tracing::dispatcher::with_default(&diagnostic.dispatch, || {
+                        tracing::warn!(
+                            request_id = %diagnostic.request_id,
+                            stage = "codex_upstream_bad_request",
+                            upstream_error_classification = "unclassifiable",
+                            upstream_error_reason = "content_type",
+                            upstream_content_type_class = diagnostic.content_type,
+                            upstream_diagnostic_read = "not_attempted",
+                            "Codex upstream rejected the request"
+                        );
+                    });
+                }
+            });
+            *sender = Some(new_sender);
+        }
+        sender.as_ref().expect("diagnostic sender initialized").try_send(diagnostic)
+    };
+    if enqueue_result.is_err() {
+        let queue_closed = {
+            let sender = queue.lock().expect("diagnostic queue lock poisoned");
+            sender.as_ref().is_none_or(tokio::sync::mpsc::Sender::is_closed)
+        };
+        if queue_closed {
+            observe(response, request_id);
+            return;
+        }
+    }
+    if enqueue_result.is_err() {
         tracing::warn!(
             %request_id,
             stage = "codex_upstream_bad_request",
