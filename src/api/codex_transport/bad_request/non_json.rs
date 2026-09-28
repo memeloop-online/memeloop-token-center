@@ -41,9 +41,9 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
     });
     if sender
         .try_send(Diagnostic {
-        request_id,
-        content_type,
-        dispatch: tracing::dispatcher::get_default(Clone::clone),
+            request_id,
+            content_type,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
         })
         .is_err()
     {
