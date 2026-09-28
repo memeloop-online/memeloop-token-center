@@ -501,7 +501,7 @@ mod tests {
         }
     }
 
-    async fn non_json_diagnostic(response: &UpstreamResponse) -> Value {
+    async fn non_json_diagnostic(response: UpstreamResponse) -> Value {
         let capture = Capture::default();
         let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
         let subscriber = tracing_subscriber::fmt()
@@ -627,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_json_diagnostic_does_not_read_untrusted_body() {
-        let fields = non_json_diagnostic(&UpstreamResponse::Prefetched {
+        let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
             status: http::StatusCode::BAD_REQUEST,
             headers: http::HeaderMap::new(),
             version: http::Version::HTTP_2,
