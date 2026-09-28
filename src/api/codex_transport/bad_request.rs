@@ -241,8 +241,9 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
     if fields.iter().any(|field| {
         field
             .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .any(|component| matches!(component, "tools" | "namespace" | "parameters" | "strict"))
-    }) {
+            .any(|component| matches!(component, "tools" | "namespace" | "parameters"))
+    }) || fields.as_slice() == ["strict"]
+    {
         return Some("tool_schema");
     }
     if fields.iter().any(|field| field.contains("instruction")) {
@@ -539,6 +540,16 @@ mod tests {
             diagnostic_param(Some(&json!("private_namespace_canary"))),
             Some("unknown")
         );
+        assert_eq!(
+            diagnostic_param(Some(&json!("strict"))),
+            Some("tool_schema")
+        );
+        for param in [
+            json!("response_format.json_schema.strict"),
+            json!(["body", "text", "format", "strict"]),
+        ] {
+            assert_ne!(diagnostic_param(Some(&param)), Some("tool_schema"));
+        }
         for (message, expected) in [
             ("Collaboration is not enabled", "collaboration_not_enabled"),
             (
