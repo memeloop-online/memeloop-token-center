@@ -277,7 +277,8 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_stale'));
     await nextPaint(aba);
     assert.equal(await aba.getByText('mts_service_secret_stale', { exact: true }).count(), 0, 'an old response cannot reappear after an A-B-A scope transition');
-    await aba.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Create service credential' && !button.disabled));
+    await aba.getByRole('button', { name: 'Create service credential', exact: true }).first().click();
+    await abaForm.getByRole('button', { name: 'Create service credential', exact: true }).waitFor();
     assert.equal(await abaCreate.isDisabled(), false, 'scope cleanup releases the stale operation guard');
     await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Current integration');
     await abaForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
