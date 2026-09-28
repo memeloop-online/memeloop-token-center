@@ -71,7 +71,8 @@ test('service credential creation validates the draft and issues only a read-onl
   await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-credential-workspace.html?scenario=service-plaintext`);
   await page.getByText('Existing service credential', { exact: true }).waitFor();
   const payloadResults = await page.evaluate(async () => {
-    const { serviceCredentialCreatePayload } = await import('/src/operator/pages/ManagementPages.tsx');
+    const modulePath = '/src/operator/pages/ManagementPages.tsx';
+    const { serviceCredentialCreatePayload } = await import(modulePath);
     return {
       emptyName: serviceCredentialCreatePayload('  ', ['metrics:read'], 'tenant-a') ?? null,
       emptyScopes: serviceCredentialCreatePayload('analytics', [], 'tenant-a') ?? null,
