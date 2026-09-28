@@ -238,6 +238,14 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
             return Some(known);
         }
     }
+    if fields.iter().any(|field| {
+        field
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|component| matches!(component, "tools" | "namespace" | "parameters"))
+    }) || fields.as_slice() == ["strict"]
+    {
+        return Some("tool_schema");
+    }
     if fields.iter().any(|field| field.contains("instruction")) {
         Some("instructions")
     } else if fields.iter().any(|field| field.contains("content")) {
@@ -270,6 +278,12 @@ fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str
         _ => {}
     }
     let lower = message.unwrap_or_default().to_ascii_lowercase();
+    if let Some(reason) = tool_rejection_reason(&lower) {
+        return reason;
+    }
+    if param == Some("tool_schema") {
+        return "tool_schema_rejected";
+    }
     if lower.contains("encrypted")
         && ["invalid", "decrypt", "verify", "verified", "mismatch"]
             .iter()
@@ -297,6 +311,71 @@ fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str
             _ => "unknown",
         }
     }
+}
+
+/// These categories describe provider wording, never infer account entitlement.
+/// Keep exact not-enabled wording separate from unsupported/not-available.
+fn tool_rejection_reason(message: &str) -> Option<&'static str> {
+    let words: Vec<_> = message
+        // Diagnostic keywords must not come from URL hostnames (e.g. .invalid)
+        // or key=value payloads appended to an otherwise explicit error.
+        .split_whitespace()
+        .filter(|part| !part.contains("://") && !part.contains('='))
+        .flat_map(|part| {
+            part.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let collaboration = words.contains(&"collaboration");
+    let namespace = words.contains(&"namespace");
+    if !collaboration && !namespace {
+        return None;
+    }
+    let exact_not_enabled = [
+        &["collaboration", "is", "not", "enabled"][..],
+        &["collaboration", "not", "enabled"][..],
+        &["namespace", "is", "not", "enabled"][..],
+        &["namespace", "not", "enabled"][..],
+    ]
+    .iter()
+    .any(|phrase| words.windows(phrase.len()).any(|window| window == *phrase));
+    // Structural wording wins when an error also mentions an enablement rule.
+    if words
+        .iter()
+        .any(|word| matches!(*word, "invalid" | "required" | "missing"))
+    {
+        return Some(if collaboration {
+            "collaboration_schema_invalid"
+        } else {
+            "tool_namespace_schema_invalid"
+        });
+    }
+    if exact_not_enabled {
+        return Some(if collaboration {
+            "collaboration_not_enabled"
+        } else {
+            "tool_namespace_not_enabled"
+        });
+    }
+    if words
+        .iter()
+        .any(|word| matches!(*word, "unsupported" | "reserved"))
+        || [
+            ["not", "supported"],
+            ["not", "available"],
+            ["not", "allowed"],
+            ["only", "allowed"],
+        ]
+        .iter()
+        .any(|phrase| words.windows(phrase.len()).any(|window| window == phrase))
+    {
+        return Some(if collaboration {
+            "collaboration_unsupported"
+        } else {
+            "tool_namespace_unsupported"
+        });
+    }
+    None
 }
 
 enum BoundedBadRequestBody {
@@ -447,6 +526,119 @@ mod tests {
         );
         assert_eq!(event["fields"]["upstream_error_reason"], "content_type");
         event["fields"].clone()
+    }
+
+    #[test]
+    fn tool_schema_parameters_and_provider_wording_are_fixed_private_categories() {
+        for param in [
+            json!("tools[0].namespace"),
+            json!("input[0].tools[1].parameters.private-canary"),
+            json!(["body", "tools", 0, "strict"]),
+        ] {
+            let diagnostic = bad_request_diagnostic(&json!({
+                "error": {"param": param, "message": "private-canary model rejected"}
+            }));
+            assert_eq!(diagnostic.error_param, Some("tool_schema"));
+            assert_eq!(diagnostic.reason, "tool_schema_rejected");
+            assert!(!format!("{diagnostic:?}").contains("private-canary"));
+        }
+        assert_eq!(
+            diagnostic_param(Some(&json!("private_namespace_canary"))),
+            Some("unknown")
+        );
+        assert_eq!(
+            diagnostic_param(Some(&json!("strict"))),
+            Some("tool_schema")
+        );
+        for param in [
+            json!("response_format.json_schema.strict"),
+            json!(["body", "text", "format", "strict"]),
+        ] {
+            assert_ne!(diagnostic_param(Some(&param)), Some("tool_schema"));
+        }
+        for (message, expected) in [
+            ("Collaboration is not enabled", "collaboration_not_enabled"),
+            (
+                "Namespace 'collaboration' is not enabled",
+                "collaboration_not_enabled",
+            ),
+            (
+                "Collaboration is not available for this model",
+                "collaboration_unsupported",
+            ),
+            (
+                "Collaboration is not supported",
+                "collaboration_unsupported",
+            ),
+            (
+                "Collaboration is only allowed in a different mode",
+                "collaboration_unsupported",
+            ),
+            ("Collaboration is reserved", "collaboration_unsupported"),
+            (
+                "Invalid collaboration parameters",
+                "collaboration_schema_invalid",
+            ),
+            (
+                "Required collaboration field missing; namespace is not enabled",
+                "collaboration_schema_invalid",
+            ),
+            (
+                "Tool namespace is not enabled",
+                "tool_namespace_not_enabled",
+            ),
+            ("Unsupported tool namespace", "tool_namespace_unsupported"),
+            ("Invalid tool namespace", "tool_namespace_schema_invalid"),
+            ("Collaboration request rejected", "unknown"),
+            (
+                "Collaboration denied; another feature is not enabled",
+                "unknown",
+            ),
+            ("A private_collaboration field was rejected", "unknown"),
+        ] {
+            let capture = Capture::default();
+            let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_writer(capture.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                observe_ordinary_bad_request(
+                    Uuid::nil(),
+                    &json!({
+                        "error": {
+                            "message": format!("{message}; private-canary https://private-canary.invalid token=private-canary"),
+                            "type": "private-canary",
+                            "code": "private-canary",
+                        }
+                    }),
+                );
+            });
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(!logged.contains("private-canary"));
+            let event: Value = serde_json::from_str(logged.trim()).unwrap();
+            assert_eq!(
+                event["fields"]["upstream_error_reason"], expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_json_tool_reason_does_not_change_content_type_disposition() {
+        let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
+            status: http::StatusCode::BAD_REQUEST,
+            headers: http::HeaderMap::new(),
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                b"Collaboration is not enabled; private-canary",
+            ))])),
+        })
+        .await;
+        assert_eq!(fields["upstream_body_reason"], "collaboration_not_enabled");
+        assert_eq!(fields["upstream_diagnostic_read"], "complete");
     }
 
     #[tokio::test]
