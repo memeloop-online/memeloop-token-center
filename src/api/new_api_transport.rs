@@ -106,9 +106,7 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
             .and_then(|parts| {
                 let mut text = String::new();
                 for part in parts {
-                    let Some(part_text) = part["text"].as_str() else {
-                        return None;
-                    };
+                    let part_text = part["text"].as_str()?;
                     text.push_str(part_text);
                 }
                 (!text.is_empty()).then_some(text)
