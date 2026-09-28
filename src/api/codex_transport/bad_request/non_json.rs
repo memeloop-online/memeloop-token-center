@@ -7,6 +7,7 @@ const DIAGNOSTIC_QUEUE_CAPACITY: usize = 64;
 struct Diagnostic {
     request_id: Uuid,
     content_type: &'static str,
+    dispatch: tracing::Dispatch,
 }
 
 static DIAGNOSTIC_QUEUE: OnceLock<tokio::sync::mpsc::Sender<Diagnostic>> = OnceLock::new();
@@ -23,15 +24,17 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
             tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
         tokio::spawn(async move {
             while let Some(diagnostic) = receiver.recv().await {
-                tracing::warn!(
-                    request_id = %diagnostic.request_id,
-                    stage = "codex_upstream_bad_request",
-                    upstream_error_classification = "unclassifiable",
-                    upstream_error_reason = "content_type",
-                    upstream_content_type_class = diagnostic.content_type,
-                    upstream_diagnostic_read = "not_attempted",
-                    "Codex upstream rejected the request"
-                );
+                tracing::dispatcher::with_default(&diagnostic.dispatch, || {
+                    tracing::warn!(
+                        request_id = %diagnostic.request_id,
+                        stage = "codex_upstream_bad_request",
+                        upstream_error_classification = "unclassifiable",
+                        upstream_error_reason = "content_type",
+                        upstream_content_type_class = diagnostic.content_type,
+                        upstream_diagnostic_read = "not_attempted",
+                        "Codex upstream rejected the request"
+                    );
+                });
             }
         });
         sender
@@ -39,6 +42,7 @@ pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
     let _ = sender.try_send(Diagnostic {
         request_id,
         content_type,
+        dispatch: tracing::dispatcher::get_default(Clone::clone),
     });
 }
 
