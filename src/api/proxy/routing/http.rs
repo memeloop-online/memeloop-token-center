@@ -231,8 +231,8 @@ async fn translate_new_api_compact_v2(
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+        let chunk =
+            chunk.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
         if chunk.len() > MAX_COMPACT_RESPONSE_BYTES.saturating_sub(bytes.len()) {
             return Err(ProxySendError::AmbiguousResponse(
                 "upstream_invalid_response",
