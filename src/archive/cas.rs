@@ -26,6 +26,12 @@ impl ArchiveStore {
         let source = path::archive_path(&staged.object_locator)?;
         let destination = path::archive_path(&locator)?;
 
+        self.verify_exact_object(
+            &staged.object_locator,
+            staged.size_bytes,
+            &staged.blake3_digest,
+        )
+        .await?;
         match self.inner.copy_if_not_exists(&source, &destination).await {
             Ok(()) | Err(object_store::Error::AlreadyExists { .. }) => {}
             Err(error) => return Err(error.into()),

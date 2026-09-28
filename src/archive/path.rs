@@ -79,6 +79,14 @@ pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
     )
 }
 
+pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
+    let mut segments = location.split('/');
+    if segments.next() != Some("tenants") || segments.next().is_none() {
+        return false;
+    }
+    matches!(segments.next(), None | Some("cas"))
+}
+
 pub(super) fn archive_path(location: &str) -> Result<Path, AppError> {
     // Object locations are internal identifiers, not filesystem paths or URLs. Keeping
     // their alphabet deliberately small gives every backend (especially the local test

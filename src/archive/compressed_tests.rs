@@ -256,11 +256,39 @@ async fn tenant_cas_is_concurrent_replayable_and_plaintext_ranged() {
     assert_eq!(store.get(&first.object_locator).await.unwrap(), body);
     assert_eq!(store.get(&second.object_locator).await.unwrap(), body);
     assert!(store.delete(&left.object_locator).await.is_err());
-    store
-        .delete_prefix(&format!("tenants/{tenant_id}"))
+    assert!(
+        store
+            .delete_prefix(&format!("tenants/{tenant_id}"))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.get(&left.object_locator).await.unwrap(), body);
+}
+
+#[tokio::test]
+async fn tenant_raw_cas_remains_plaintext_ranged_and_immutable() {
+    let store = memory_store();
+    let tenant_id = Uuid::now_v7();
+    let body = Bytes::from_static(b"raw tenant CAS body");
+    let mut writer = store
+        .start_writer("staging/test/raw-cas")
         .await
         .unwrap();
-    assert_eq!(store.get(&left.object_locator).await.unwrap(), body);
+    writer.write(body.clone()).await.unwrap();
+    let staged = writer.finish_staged().await.unwrap();
+    let cas = store
+        .promote_staged_text_to_cas(tenant_id, &staged)
+        .await
+        .unwrap();
+
+    let download = store
+        .open_stream(&cas.object_locator, Some(5..11))
+        .await
+        .unwrap();
+    assert_eq!(download.object_size, body.len() as u64);
+    assert_eq!(download.range, 5..11);
+    assert_eq!(download.stream.try_collect::<Vec<_>>().await.unwrap().concat(), b"tenant");
+    assert!(store.delete(&cas.object_locator).await.is_err());
 }
 
 #[tokio::test]
@@ -360,6 +388,36 @@ async fn already_existing_cas_must_match_length_and_digest() {
             .is_err()
     );
     assert!(store.get(&staged.object_locator).await.is_ok());
+}
+
+#[tokio::test]
+async fn corrupt_staging_is_rejected_before_cas_creation() {
+    let store = memory_store();
+    let tenant_id = Uuid::now_v7();
+    let mut writer = store
+        .start_compressed_writer("staging/test/corrupt-source")
+        .await
+        .unwrap();
+    writer.write(Bytes::from_static(b"expected source")).await.unwrap();
+    let staged = writer.finish_staged().await.unwrap();
+    store
+        .inner
+        .put(
+            &archive_path(&staged.object_locator).unwrap(),
+            PutPayload::from_bytes(Bytes::from_static(b"corrupt source")),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .promote_staged_text_to_cas(tenant_id, &staged)
+            .await
+            .is_err()
+    );
+    let cas_locator =
+        super::path::tenant_cas_location(tenant_id, &staged.blake3_digest, true).unwrap();
+    assert!(store.get(&cas_locator).await.is_err());
 }
 
 #[tokio::test]

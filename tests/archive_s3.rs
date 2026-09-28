@@ -49,7 +49,7 @@ async fn minio_put_get_list_missing_and_read_limit() {
     // readiness_check exercises a signed ListObjectsV2 call, including bucket access.
     store.readiness_check().await.expect("list MinIO bucket");
     store
-        .delete_prefix("tenants/test-tenant")
+        .delete_prefix("tenants/test-tenant/objects")
         .await
         .expect("remove fixtures left by an interrupted earlier test");
 
@@ -101,7 +101,7 @@ async fn minio_put_get_list_missing_and_read_limit() {
     assert!(!error.to_string().contains(&unsafe_location));
 
     store
-        .delete_prefix("tenants/test-tenant")
+        .delete_prefix("tenants/test-tenant/objects")
         .await
         .expect("remove tenant integration fixtures");
 }
