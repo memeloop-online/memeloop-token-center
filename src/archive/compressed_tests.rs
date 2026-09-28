@@ -287,7 +287,15 @@ async fn tenant_raw_cas_remains_plaintext_ranged_and_immutable() {
         .unwrap();
     assert_eq!(download.object_size, body.len() as u64);
     assert_eq!(download.range, 5..11);
-    assert_eq!(download.stream.try_collect::<Vec<_>>().await.unwrap().concat(), b"tenant");
+    assert_eq!(
+        download
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .concat(),
+        b"tenant"
+    );
     assert!(store.delete(&cas.object_locator).await.is_err());
 }
 
@@ -398,7 +406,10 @@ async fn corrupt_staging_is_rejected_before_cas_creation() {
         .start_compressed_writer("staging/test/corrupt-source")
         .await
         .unwrap();
-    writer.write(Bytes::from_static(b"expected source")).await.unwrap();
+    writer
+        .write(Bytes::from_static(b"expected source"))
+        .await
+        .unwrap();
     let staged = writer.finish_staged().await.unwrap();
     store
         .inner
