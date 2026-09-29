@@ -1248,7 +1248,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             .await
             .unwrap();
 
-        let pause_gate = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pause_gate = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let pause_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&pause_gate.pool)
             .await
@@ -1259,7 +1259,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             .await
             .unwrap();
 
-        let pending_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pending_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let pending_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&pending_database.pool)
             .await
@@ -1308,7 +1308,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         )
         .await;
 
-        let contender_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let contender_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let contender_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&contender_database.pool)
             .await
@@ -1398,7 +1398,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .await
         .unwrap();
 
-    let stats_first_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let stats_first_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
     let stats_first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&stats_first_database.pool)
         .await

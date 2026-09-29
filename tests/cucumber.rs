@@ -2570,7 +2570,7 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
     forbidden: &[&str],
 ) {
     let job_id = world.generation_job_id.expect("generation job id");
-    for _ in 0..30 {
+    for _ in 0..120 {
         let value = world
             .client
             .get(format!(
@@ -2584,7 +2584,22 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
             .json::<Value>()
             .await
             .expect("assetless generation status JSON");
+        world.response = value.clone();
         if value["status"] == "failed" {
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after assetless generation")
+                .json::<Value>()
+                .await
+                .expect("key after assetless generation JSON");
+            if key["available_balance"] != "10" {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
             assert_eq!(value["billed_units"], 0);
             assert_eq!(value["cost"], "0");
             assert_eq!(value["error_code"], expected_error_code);
@@ -2603,16 +2618,6 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
                 .await
                 .expect("stored assetless generation");
             assert_eq!(stored.result, None);
-            let key = world
-                .client
-                .get(format!("{}/self/v1/key", world.service_url))
-                .bearer_auth(&world.current_key)
-                .send()
-                .await
-                .expect("key after assetless generation")
-                .json::<Value>()
-                .await
-                .expect("key after assetless generation JSON");
             assert_eq!(key["available_balance"], "10");
             world.response = value;
             return;
