@@ -442,9 +442,9 @@ mod tests {
     };
 
     use super::{
-        build_codex_http_client, build_explicit_proxy_http_client, build_http_client,
-        build_pinned_http_client, codex_http2_options, CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
-        CODEX_HTTP2_KEEP_ALIVE_TIMEOUT,
+        CODEX_HTTP2_KEEP_ALIVE_INTERVAL, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT, build_codex_http_client,
+        build_explicit_proxy_http_client, build_http_client, build_pinned_http_client,
+        codex_http2_options,
     };
 
     #[test]
