@@ -1570,8 +1570,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   </section>{writeTenant && <section className="credential-group-workspace"><Disclosure title={t('groups.credential.title')}><GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></Disclosure></section>}</>;
 }
 
+const serviceCredentialStatisticsGroupId = 'statistics-and-requests';
 const serviceCredentialScopeGroups = [
-  { id: 'statistics-and-requests', title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
+  { id: serviceCredentialStatisticsGroupId, title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
     { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
     { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
   ] },
@@ -1737,8 +1738,8 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { t
   };
   const createServiceCredential = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setCreateAttempted(true);
     setError(''); setMessage('');
+    setCreateAttempted(true);
     const payload = serviceCredentialCreatePayload(createName, createScopes, writeTenant);
     if (!payload) return;
     const operation = beginSecretOperation();
@@ -1746,7 +1747,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { t
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
     const controller = new AbortController();
     secretRequest.current?.abort(); secretRequest.current = controller;
-    setBusy('create-service-credential'); setError(''); setMessage('');
+    setBusy('create-service-credential');
     try {
       const created = await api<{ token: string }>('/internal/v1/service-tokens', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify(payload), signal: controller.signal });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
@@ -1795,7 +1796,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { t
         <div className="service-credential-scope-groups" style={{ display: 'grid', gap: 20, gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))' }}>
           {serviceCredentialScopeGroups.map((group) => <section key={group.title} aria-label={zh ? group.title : group.titleEn} style={{ minWidth: 0 }}>
             <h3 style={{ margin: '0 0 10px', fontSize: 14 }}>{zh ? group.title : group.titleEn}</h3>
-            {group.id === 'statistics-and-requests' && <Button appearance="secondary" type="button" onClick={() => setCreateScopes([...serviceCredentialStatisticsScopes])}>{zh ? '仅选择只读统计权限' : 'Select read-only statistics only'}</Button>}
+            {group.id === serviceCredentialStatisticsGroupId && <Button appearance="secondary" type="button" onClick={() => setCreateScopes([...serviceCredentialStatisticsScopes])}>{zh ? '仅选择只读统计权限' : 'Select read-only statistics only'}</Button>}
             <div className="service-credential-scope-options" style={{ display: 'grid', gap: 8, marginTop: 10 }}>
               {group.scopes.map((scope) => <div className="service-credential-scope-option" key={scope.value}>
                 <DetailTooltip content={zh ? scope.hint : scope.hintEn}><span tabIndex={0} aria-label={`${scope.value}: ${zh ? scope.hint : scope.hintEn}`}>
