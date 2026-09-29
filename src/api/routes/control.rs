@@ -392,6 +392,18 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_settlement_correction_previews),
         )
         .route(
+            "/internal/v1/ledger/resource-route-switches/plan",
+            post(super::super::ledger_resource_routes::plan_ledger_resource_route_switch),
+        )
+        .route(
+            "/internal/v1/ledger/resource-route-switches/{operation_id}/apply",
+            post(super::super::ledger_resource_routes::apply_ledger_resource_route_switch),
+        )
+        .route(
+            "/internal/v1/ledger/resource-route-switches/{operation_id}/rollback",
+            post(super::super::ledger_resource_routes::rollback_ledger_resource_route_switch),
+        )
+        .route(
             "/internal/v1/accounts/{account_id}/settlements/{settlement_id}/adjustments",
             put(reconcile_settlement_adjustment),
         )

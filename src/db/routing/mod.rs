@@ -8,6 +8,7 @@ mod input;
 mod list;
 mod managed_models;
 mod resolver;
+mod resource_switch;
 mod routes;
 mod types;
 
