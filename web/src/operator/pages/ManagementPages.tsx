@@ -1571,11 +1571,11 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
 }
 
 const serviceCredentialScopeGroups = [
-  { title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
+  { id: 'statistics-and-requests', title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
     { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
     { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
   ] },
-  { title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
+  { id: 'credentials-and-credits', title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
     { value: 'keys:read', label: '读取客户端凭据', labelEn: 'Read client credentials', hint: '查看客户端凭据及其配置。', hintEn: 'View client credentials and their configuration.' },
     { value: 'keys:write', label: '管理客户端凭据', labelEn: 'Manage client credentials', hint: '创建、更新或撤销客户端凭据。', hintEn: 'Create, update, or revoke client credentials.' },
     { value: 'credits:read', label: '读取额度', labelEn: 'Read credits', hint: '查看额度账户与余额。', hintEn: 'View credit accounts and balances.' },
@@ -1583,7 +1583,7 @@ const serviceCredentialScopeGroups = [
     { value: 'entitlements:read', label: '读取授权权益', labelEn: 'Read entitlements', hint: '查看租户授权权益。', hintEn: 'View tenant entitlements.' },
     { value: 'entitlements:write', label: '管理授权权益', labelEn: 'Manage entitlements', hint: '修改租户授权权益。', hintEn: 'Modify tenant entitlements.' },
   ] },
-  { title: '平台配置', titleEn: 'Platform configuration', scopes: [
+  { id: 'platform-configuration', title: '平台配置', titleEn: 'Platform configuration', scopes: [
     { value: 'providers:read', label: '读取提供商', labelEn: 'Read providers', hint: '查看提供商配置。', hintEn: 'View provider configuration.' },
     { value: 'providers:write', label: '管理提供商', labelEn: 'Manage providers', hint: '创建或修改提供商配置。', hintEn: 'Create or modify provider configuration.' },
     { value: 'plugins:read', label: '读取插件', labelEn: 'Read plugins', hint: '查看插件与其配置。', hintEn: 'View plugins and their configuration.' },
@@ -1595,7 +1595,7 @@ const serviceCredentialScopeGroups = [
     { value: 'schemas:read', label: '读取配置 Schema', labelEn: 'Read configuration schemas', hint: '读取平台公开的配置 Schema。', hintEn: 'Read configuration schemas exposed by the platform.' },
     { value: 'upstreams:import:write', label: '导入上游账号', labelEn: 'Import upstream accounts', hint: '导入上游账号配置。', hintEn: 'Import upstream account configuration.' },
   ] },
-  { title: '系统与运维', titleEn: 'System and operations', scopes: [
+  { id: 'system-and-operations', title: '系统与运维', titleEn: 'System and operations', scopes: [
     { value: 'generations:write', label: '创建生成任务', labelEn: 'Create generation jobs', hint: '提交图片或视频生成任务。', hintEn: 'Submit image or video generation jobs.' },
     { value: 'generations:quarantine:read', label: '读取隔离任务', labelEn: 'Read quarantined jobs', hint: '查看被隔离的生成任务。', hintEn: 'View quarantined generation jobs.' },
     { value: 'generations:reconcile', label: '对账生成任务', labelEn: 'Reconcile generation jobs', hint: '执行生成任务状态对账。', hintEn: 'Reconcile generation job status.' },
@@ -1738,6 +1738,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { t
   const createServiceCredential = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setCreateAttempted(true);
+    setError(''); setMessage('');
     const payload = serviceCredentialCreatePayload(createName, createScopes, writeTenant);
     if (!payload) return;
     const operation = beginSecretOperation();
@@ -1794,7 +1795,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant }: { t
         <div className="service-credential-scope-groups" style={{ display: 'grid', gap: 20, gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))' }}>
           {serviceCredentialScopeGroups.map((group) => <section key={group.title} aria-label={zh ? group.title : group.titleEn} style={{ minWidth: 0 }}>
             <h3 style={{ margin: '0 0 10px', fontSize: 14 }}>{zh ? group.title : group.titleEn}</h3>
-            {group.title === '统计与请求' && <Button appearance="secondary" type="button" onClick={() => setCreateScopes([...serviceCredentialStatisticsScopes])}>{zh ? '仅选择只读统计权限' : 'Select read-only statistics only'}</Button>}
+            {group.id === 'statistics-and-requests' && <Button appearance="secondary" type="button" onClick={() => setCreateScopes([...serviceCredentialStatisticsScopes])}>{zh ? '仅选择只读统计权限' : 'Select read-only statistics only'}</Button>}
             <div className="service-credential-scope-options" style={{ display: 'grid', gap: 8, marginTop: 10 }}>
               {group.scopes.map((scope) => <div className="service-credential-scope-option" key={scope.value}>
                 <DetailTooltip content={zh ? scope.hint : scope.hintEn}><span tabIndex={0} aria-label={`${scope.value}: ${zh ? scope.hint : scope.hintEn}`}>
