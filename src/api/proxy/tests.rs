@@ -355,12 +355,7 @@ async fn add_codex_standby_route(
     fixture
         .state
         .db
-        .upsert_model_price(
-            &fixture.upstream_model,
-            "USD",
-            Decimal::ONE,
-            Decimal::ONE,
-        )
+        .upsert_model_price(&fixture.upstream_model, "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
