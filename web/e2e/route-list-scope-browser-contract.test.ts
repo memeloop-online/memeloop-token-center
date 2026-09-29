@@ -23,6 +23,11 @@ test('route list exposes group-only candidate scope and readable models without 
       await tooltip.waitFor({ state: 'visible' });
       const tooltipId = await tooltip.getAttribute('id');
       assert.ok(tooltipId, 'visible tooltip must expose an id for its accessible description');
+      const element = await trigger.elementHandle();
+      assert.ok(element);
+      await page.waitForFunction(({ element: currentTrigger, id }) =>
+        (currentTrigger.getAttribute('aria-describedby') ?? '').split(/\s+/).includes(id),
+      { element, id: tooltipId });
       const describedBy = (await trigger.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
       assert.ok(describedBy.includes(tooltipId), 'visible tooltip must be referenced by its trigger accessible description');
       return tooltip;
