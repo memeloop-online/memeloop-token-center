@@ -2909,7 +2909,7 @@ async fn historical_billing_reads_the_admission_price_snapshot() {
         .unwrap();
     database
         .finish_proxy_request(FinishProxyRequest {
-            usage_basis: Some(crate::model::RequestUsageBasis::Observed),
+            usage_basis: Some(crate::model::RequestUsageBasis::ProviderReported),
             first_output_ms: None,
             generation_duration_ms: None,
             request_id,

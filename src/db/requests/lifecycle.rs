@@ -251,8 +251,10 @@ impl Database {
         body: &bytes::Bytes,
         pepper: &[u8],
     ) -> Result<StartedProxyRequest, AppError> {
-        self.start_proxy_request_with_archive_compression(input, body, pepper, false)
-            .await
+        self.start_proxy_request_with_archive_compression_and_upstream_model(
+            input, body, pepper, false, None,
+        )
+        .await
     }
 
     pub(crate) async fn start_proxy_request_with_archive_compression_and_upstream_model(
