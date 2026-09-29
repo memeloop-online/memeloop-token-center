@@ -159,6 +159,12 @@ async fn local_codex_chat_protocol_keeps_priority_over_native_candidate() {
         })
         .await
         .unwrap();
+    fixture
+        .state
+        .db
+        .upsert_model_price("compatible-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
         "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)

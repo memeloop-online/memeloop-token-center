@@ -352,6 +352,17 @@ async fn add_codex_standby_route(
         })
         .await
         .unwrap();
+    fixture
+        .state
+        .db
+        .upsert_model_price(
+            &fixture.upstream_model,
+            "USD",
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .await
+        .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
         .bind(fixture.key_id.to_string())
@@ -407,6 +418,12 @@ async fn add_native_chat_standby_route(
             protocol: "openai".to_owned(),
             priority: 10,
         })
+        .await
+        .unwrap();
+    fixture
+        .state
+        .db
+        .upsert_model_price("native-chat-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -642,6 +659,11 @@ async fn codex_route_fixture_with_archive_directory(
     state
         .db
         .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price(&upstream_model, "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
     CodexRouteFixture {
@@ -1241,6 +1263,16 @@ async fn resilient_route_fixture(
             .unwrap();
         accounts.push(account.id);
         routes.push(route.id);
+        state
+            .db
+            .upsert_model_price(
+                &format!("upstream-{index}"),
+                "USD",
+                Decimal::ONE,
+                Decimal::ONE,
+            )
+            .await
+            .unwrap();
     }
     let issued = state
         .db
@@ -1655,7 +1687,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .state
         .db
         .upsert_model_price(
-            &fixture.model,
+            &fixture.upstream_model,
             "USD",
             Decimal::new(1, 4),
             Decimal::new(1, 4),
@@ -2475,6 +2507,11 @@ async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
         .upsert_model_price(rewritten_model, "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
+    state
+        .db
+        .upsert_model_price("upstream-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let request = Request::post("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
@@ -3062,7 +3099,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
         .state
         .db
         .upsert_model_price_tier(
-            &fixture.model,
+            &fixture.upstream_model,
             "USD",
             "flex",
             Decimal::ONE,
@@ -3257,7 +3294,7 @@ async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
         .state
         .db
         .upsert_model_price_tier(
-            &fixture.model,
+            &fixture.upstream_model,
             "USD",
             "flex",
             Decimal::ONE,
