@@ -1125,7 +1125,19 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    sqlx::any::install_default_drivers();
+    let admin = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let schema = format!("proxy_lifecycle_lock_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated_url = url::Url::parse(&database_url).unwrap();
+    isolated_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-c search_path={schema}"));
+    let isolated_url = isolated_url.to_string();
+    let database = Database::connect_with_max(&isolated_url, 8).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
     let pepper = b"online projection shared lock ordering pepper";
@@ -1418,6 +1430,12 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .expect("key-budget/stats writers exceeded the deadline or returned 55P03")
         .expect("stats-first task panicked")
         .expect("stats-first writer returned 40P01 or 55P03");
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]

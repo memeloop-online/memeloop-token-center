@@ -421,6 +421,21 @@ async fn add_native_chat_standby_route(
         .upsert_model_price("native-chat-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
+    fixture
+        .state
+        .db
+        .upsert_model_price_tier(
+            "native-chat-model",
+            "USD",
+            "flex",
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            Decimal::ONE,
+            false,
+        )
+        .await
+        .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
         .bind(fixture.key_id.to_string())
