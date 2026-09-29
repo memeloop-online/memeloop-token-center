@@ -58,6 +58,8 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+const CODEX_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const CODEX_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive
 // writers so one gateway cannot multiply that buffer by all active lifecycles.
@@ -354,6 +356,15 @@ fn build_codex_http_client_with_policy(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
+        .http2_options(codex_http2_options())
+        .build()
+}
+
+fn codex_http2_options() -> wreq::http2::Http2Options {
+    wreq::http2::Http2Options::builder()
+        .keep_alive_interval(CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(CODEX_HTTP2_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(false)
         .build()
 }
 
@@ -432,8 +443,20 @@ mod tests {
 
     use super::{
         build_codex_http_client, build_explicit_proxy_http_client, build_http_client,
-        build_pinned_http_client,
+        build_pinned_http_client, codex_http2_options, CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+        CODEX_HTTP2_KEEP_ALIVE_TIMEOUT,
     };
+
+    #[test]
+    fn codex_http2_keep_alive_is_enabled_without_provider_or_credential_data() {
+        let options = codex_http2_options();
+        assert_eq!(
+            options.keep_alive_interval,
+            Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
+        );
+        assert_eq!(options.keep_alive_timeout, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT);
+        assert!(!options.keep_alive_while_idle);
+    }
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {
