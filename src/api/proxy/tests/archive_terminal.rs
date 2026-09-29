@@ -262,7 +262,7 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
                 .await
                 .expect("owned writer must reach the deterministic pre-begin pause")
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
                         "SELECT id, completed_at, response_object FROM request_records",

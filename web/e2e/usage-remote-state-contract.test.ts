@@ -15,7 +15,7 @@ test('operator data is scoped to the exact token, tenant, and applied selection'
 test('refresh re-fetches applied filters without silently applying the draft model', () => {
   const applied: UsageSelection = {
     preset: 'custom', granularity: 'hour', customFrom: '2026-08-29T00:00', customTo: '2026-08-30T00:00',
-    filters: { model: 'applied-model', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
+    filters: { model: 'applied-model', keyId: '', keyAlias: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
   };
   const draft = { ...applied, filters: { ...applied.filters, model: 'unsubmitted-draft' } };
   const refreshQuery = statsQuery('tenant-a', applied);
@@ -23,6 +23,15 @@ test('refresh re-fetches applied filters without silently applying the draft mod
   assert.doesNotMatch(refreshQuery ?? '', /unsubmitted-draft/);
   assert.equal(draft.filters.model, 'unsubmitted-draft');
   assert.match(operatorSource, /onClick=\{\(\) => setRefresh\(\(value\) => value \+ 1\)\}/);
+});
+
+test('usage key alias filters are exposed and serialized', () => {
+  const query = statsQuery('tenant-a', {
+    preset: '24h', granularity: 'hour', customFrom: '', customTo: '',
+    filters: { model: '', keyId: '', keyAlias: 'primary-key', upstreamId: '', protocol: '', status: '', errorCode: '' },
+  });
+  assert.equal(new URLSearchParams(query?.slice(1)).get('key_alias'), 'primary-key');
+  assert.match(operatorSource, /key_alias/);
 });
 
 test('usage tabs implement roving keyboard focus and linked tab panels', () => {

@@ -156,7 +156,13 @@ test('service credential creation validates the draft and issues only a read-onl
   });
   await page.evaluate(() => window.credentialFixture.releaseIssue('mts_local_fixture_secret'));
   await page.getByText('mts_local_fixture_secret', { exact: true }).waitFor();
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await name.fill('');
+  await form.getByRole('button', { name: '创建服务凭据' }).click();
+  await page.getByText('请输入服务凭据名称。', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('status').filter({ hasText: '服务凭据已创建并保存' }).count(), 0, 'a rejected draft clears the previous success message');
   const writes = await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method !== 'GET'));
-  assert.deepEqual(writes.map((request) => request.path), ['/internal/v1/service-tokens']);
+  assert.deepEqual(writes.map((request) => request.path), ['/internal/v1/service-tokens'], 'invalid drafts never issue a second request');
   await page.close();
 });
