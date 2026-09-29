@@ -5084,14 +5084,20 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
     assert!(!response_object.contains("provider-secret"));
     assert!(!response_object.contains("secret-token"));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let gap_spools: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'gap') + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'gap')",
+    let (request_gap_spools, response_spools): (i64, i64) = sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'gap'), \
+            (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1)",
     )
     .bind(rows[0].request_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(gap_spools, 2);
+    assert_eq!(request_gap_spools, 1);
+    assert_eq!(
+        response_spools, 0,
+        "an inline sanitized failure summary must not create a response spool"
+    );
     assert!(!crate::response_archive_spool::process_one_for_test(&fixture.state).await);
     let retained_cipher_bytes: i64 = sqlx::query_scalar(
         "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
