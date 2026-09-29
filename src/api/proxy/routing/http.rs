@@ -89,13 +89,6 @@ pub(super) async fn send_reqwest_proxy_route(
         // reads, so no phase can restart the configured attempt budget.
         .timeout(timeout)
         .body(route.forwarded_body.clone());
-    // Streaming Responses on HTTP JSON (including retired CBCNX rows) must
-    // negotiate SSE even when the client sent `Accept: application/json`.
-    let accept = if (route.responses_chat.is_some() && route.upstream_stream)
-        || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
-            && matches!(protocol, Protocol::OpenAiResponses)
-            && route.upstream_stream)
-        || (crate::provider::is_new_api_driver(&route.route.driver)
     let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
         && route.upstream_stream)
         || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
