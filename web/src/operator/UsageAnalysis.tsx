@@ -21,10 +21,10 @@ import { localDateTimeInput, nextUsageTab, statsQuery, usageTabs, type Granulari
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
 type Dimension = 'models' | 'keys' | 'sessions' | 'upstreams' | 'protocols' | 'statuses' | 'errors';
-interface UsageFilters { model: string; keyId: string; upstreamId: string; protocol: string; status: string; errorCode: string }
+interface UsageFilters { model: string; keyId: string; keyAlias: string; upstreamId: string; protocol: string; status: string; errorCode: string }
 const dimensions: Dimension[] = ['models', 'keys', 'sessions', 'upstreams', 'protocols', 'statuses', 'errors'];
 const presets: Preset[] = ['24h', 'today', 'yesterday', '7d', '30d', 'custom'];
-const emptyFilters: UsageFilters = { model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' };
+const emptyFilters: UsageFilters = { model: '', keyId: '', keyAlias: '', upstreamId: '', protocol: '', status: '', errorCode: '' };
 const localCopy = {
   'zh-CN': {
     dimensions: '维度分析', filters: '筛选条件', charts: '图表数据', throughput: '请求吞吐', latency: '响应延迟', costTrend: '费用趋势',
@@ -46,6 +46,7 @@ function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst):
       preset = 'custom'; customFrom = localDateTimeInput(condition.value.value); customTo = localDateTimeInput(condition.upper.value);
     } else if (condition.operator === 'equals' && condition.field === 'model' && condition.value.type === 'model') filters.model = condition.value.value;
     else if (condition.operator === 'equals' && condition.field === 'key_id' && condition.value.type === 'uuid') filters.keyId = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'key_alias' && condition.value.type === 'text') filters.keyAlias = condition.value.value;
     else if (condition.operator === 'equals' && condition.field === 'upstream_account_id' && condition.value.type === 'uuid') filters.upstreamId = condition.value.value;
     else if (condition.operator === 'equals' && condition.field === 'protocol' && condition.value.type === 'protocol') filters.protocol = condition.value.value;
     else if (condition.operator === 'equals' && condition.field === 'status' && condition.value.type === 'status' && condition.value.value !== 'pending') filters.status = condition.value.value;
@@ -55,12 +56,13 @@ function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst):
 }
 
 const typedFieldForUsageFilter: Record<keyof UsageFilters, TypedFilterCondition['field']> = {
-  model: 'model', keyId: 'key_id', upstreamId: 'upstream_account_id', protocol: 'protocol', status: 'status', errorCode: 'error_code',
+  model: 'model', keyId: 'key_id', keyAlias: 'key_alias', upstreamId: 'upstream_account_id', protocol: 'protocol', status: 'status', errorCode: 'error_code',
 };
 
 function typedUsageCondition(filter: keyof UsageFilters, bucket: UsageAnalysisBucket): TypedFilterCondition | undefined {
   if (filter === 'model') return { field: 'model', operator: 'equals', value: { type: 'model', value: bucket.id } };
   if (filter === 'keyId') return { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
+  if (filter === 'keyAlias') return { field: 'key_alias', operator: 'equals', value: { type: 'text', value: bucket.id } };
   // `unassigned` is a read-only analytics sentinel, not a UUID accepted by
   // the reusable typed-filter AST.  Its drilldown still uses the documented
   // usage API query parameter below.

@@ -1,8 +1,9 @@
 export type UsageTab = 'overview' | 'trend' | 'dimensions' | 'heatmap';
 export type Preset = '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom';
 export type Granularity = 'auto' | 'hour' | 'day';
-export interface UsageFilters { model: string; keyId: string; upstreamId: string; protocol: string; status: string; errorCode: string }
+export interface UsageFilters { model: string; keyId: string; keyAlias: string; upstreamId: string; protocol: string; status: string; errorCode: string }
 export interface UsageSelection { preset: Preset; granularity: Granularity; customFrom: string; customTo: string; filters: UsageFilters }
+type UsageQuerySelection = Omit<UsageSelection, 'filters'> & { filters: Omit<UsageFilters, 'keyAlias'> & Partial<Pick<UsageFilters, 'keyAlias'>> };
 
 export const usageTabs: UsageTab[] = ['overview', 'trend', 'dimensions', 'heatmap'];
 
@@ -33,12 +34,14 @@ function rangeFor(selection: UsageSelection, now = Date.now()) {
   return { from, to };
 }
 
-export function statsQuery(tenant: string, selection: UsageSelection) {
+export function statsQuery(tenant: string, selection: UsageQuerySelection) {
   const range = rangeFor(selection); if (!range) return undefined;
   const params = new URLSearchParams({ from_created_at: String(range.from), to_created_at: String(range.to), granularity: selection.granularity });
   if (tenant) params.set('tenant_external_id', tenant);
   if (selection.filters.model.trim()) params.set('model', selection.filters.model.trim());
   if (selection.filters.keyId.trim()) params.set('key_id', selection.filters.keyId.trim());
+  const keyAlias = selection.filters.keyAlias?.trim();
+  if (keyAlias) params.set('key_alias', keyAlias);
   if (selection.filters.upstreamId) params.set('upstream_account_id', selection.filters.upstreamId);
   if (selection.filters.protocol) params.set('protocol', selection.filters.protocol);
   if (selection.filters.status) params.set('status', selection.filters.status);

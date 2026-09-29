@@ -30,7 +30,7 @@ const fields: FieldDefinition[] = [
   { id: 'route_id', type: 'uuid', usage: false },
   { id: 'duration_ms', type: 'integer', usage: false },
   { id: 'cost_micros', type: 'money_micros', usage: false },
-  { id: 'key_alias', type: 'text', usage: false },
+  { id: 'key_alias', type: 'text', usage: true },
   { id: 'principal', type: 'text', usage: false },
 ];
 
