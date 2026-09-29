@@ -78,6 +78,8 @@ pub(in crate::api::proxy) struct ProxyRoutePlanInput<'a> {
 pub(in crate::api::proxy) enum TransportFailureKind {
     Timeout,
     ConnectionReset,
+    Http2Reset,
+    Http2GoAway,
     Body,
     Decode,
     Request,
@@ -89,6 +91,8 @@ impl TransportFailureKind {
         match self {
             Self::Timeout => "request_timeout",
             Self::ConnectionReset => "response_connection_reset",
+            Self::Http2Reset => "response_http2_reset",
+            Self::Http2GoAway => "response_http2_goaway",
             Self::Body => "response_body",
             Self::Decode => "response_decode",
             Self::Request => "request",
@@ -100,6 +104,8 @@ impl TransportFailureKind {
         match self {
             Self::Timeout => "transport_timeout_delivery_unknown",
             Self::ConnectionReset => "transport_connection_reset_delivery_unknown",
+            Self::Http2Reset => "transport_http2_reset_delivery_unknown",
+            Self::Http2GoAway => "transport_http2_goaway_delivery_unknown",
             Self::Body => "transport_body_delivery_unknown",
             Self::Decode => "transport_decode_delivery_unknown",
             Self::Request => "transport_request_delivery_unknown",
@@ -111,6 +117,8 @@ impl TransportFailureKind {
         match self {
             Self::Timeout => "upstream_transport_timeout",
             Self::ConnectionReset => "upstream_transport_connection_reset",
+            Self::Http2Reset => "upstream_transport_http2_reset",
+            Self::Http2GoAway => "upstream_transport_http2_goaway",
             Self::Body => "upstream_transport_body",
             Self::Decode => "upstream_transport_decode",
             Self::Request => "upstream_transport_request",

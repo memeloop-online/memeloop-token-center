@@ -2540,6 +2540,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "http",
+ "http2",
  "hyper",
  "hyper-util",
  "jsonschema",
