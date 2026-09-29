@@ -638,7 +638,7 @@ async fn operator_api_enforces_scopes_tenant_cursor_and_control_role() {
     assert_eq!(first["data"].as_array().expect("first page").len(), 1);
     assert_eq!(
         first["data"][0]["sources"][0]["provider"]["label"],
-        "HTTP JSON upstream"
+        "OpenAI Compatible"
     );
     assert_eq!(
         first["data"][0]["sources"][0]["passive_health"]["status"],
