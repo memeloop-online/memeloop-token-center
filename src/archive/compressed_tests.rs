@@ -278,12 +278,13 @@ async fn tenant_raw_cas_remains_plaintext_ranged_and_immutable() {
         .await
         .unwrap();
 
+    let range = 4..10;
     let download = store
-        .open_stream(&cas.object_locator, Some(5..11))
+        .open_stream(&cas.object_locator, Some(range.clone()))
         .await
         .unwrap();
     assert_eq!(download.object_size, body.len() as u64);
-    assert_eq!(download.range, 5..11);
+    assert_eq!(download.range, range);
     assert_eq!(
         download
             .stream
