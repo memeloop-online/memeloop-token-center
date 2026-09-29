@@ -471,6 +471,7 @@ pub(in crate::api) async fn start_cursor_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    body.provider_driver = crate::provider::canonicalize_provider_driver(&body.provider_driver).to_owned();
     if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
         return Err(AppError::BadRequest(
             "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
@@ -582,6 +583,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    body.provider_driver = crate::provider::canonicalize_provider_driver(&body.provider_driver).to_owned();
     if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
         return Err(AppError::BadRequest(
             "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"

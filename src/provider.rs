@@ -11,7 +11,8 @@ pub(crate) use catalog::{
 };
 pub use catalog::{
     CodexModelCapabilities, CodexReasoningLevel, ComponentAdapterContribution,
-    GenerationAdapterContribution, NEW_API_PROVIDER_DRIVER, OAuthAdapterContribution,
+    GenerationAdapterContribution, HTTP_JSON_PROVIDER_DRIVER, NEW_API_PROVIDER_DRIVER,
+    ONE_API_PROVIDER_ALIAS, OAuthAdapterContribution,
     OAuthFlowKind, ProviderCatalog, ProviderType, RESPONSES_VIA_CHAT_COMPACTION_CONFIG,
     RequestCompatibility, ResponsesViaChatDialect, canonicalize_provider_driver, is_new_api_driver,
     is_openai_compatible_http_driver,
