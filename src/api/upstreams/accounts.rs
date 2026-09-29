@@ -51,15 +51,7 @@ pub(in crate::api) async fn create_upstream(
     }
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     credential.validate(unix_millis())?;
-    validate_upstream_proxy(
-        &driver,
-        &body.config,
-        &credential,
-        &service,
-        &state,
-        true,
-    )
-    .await?;
+    validate_upstream_proxy(&driver, &body.config, &credential, &service, &state, true).await?;
     let mut account = state
         .db
         .create_upstream_account(

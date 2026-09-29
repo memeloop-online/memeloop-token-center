@@ -558,7 +558,10 @@ fn http_json_compact_bridge_is_an_optional_account_capability() {
 fn retired_cbcnx_accounts_use_http_json() {
     let catalog = ProviderCatalog::builtins();
     assert_eq!(canonicalize_provider_driver("cbcnx"), "http-json");
-    assert_eq!(canonicalize_provider_driver("openai-compatible"), "http-json");
+    assert_eq!(
+        canonicalize_provider_driver("openai-compatible"),
+        "http-json"
+    );
     assert!(is_openai_compatible_http_driver("cbcnx"));
     assert!(!catalog.list().iter().any(|provider| provider.id == "cbcnx"));
     let http_json = catalog
