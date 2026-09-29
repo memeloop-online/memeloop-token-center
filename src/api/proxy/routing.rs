@@ -105,12 +105,11 @@ pub(super) fn plan_proxy_route(
         && state
             .providers
             .supports_responses_via_anthropic_messages_v1(&route.driver);
-    let (mut forwarded_json, responses_chat, responses_anthropic) =
-        if responses_via_anthropic {
-            let (forwarded, context) =
-                anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
-            (forwarded, None, Some(context))
-        } else {
+    let (mut forwarded_json, responses_chat, responses_anthropic) = if responses_via_anthropic {
+        let (forwarded, context) =
+            anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
+        (forwarded, None, Some(context))
+    } else {
             let (forwarded, context) = kimi::prepare_forwarded_request(
                 &route,
                 protocol,
