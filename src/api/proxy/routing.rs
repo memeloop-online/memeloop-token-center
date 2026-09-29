@@ -103,7 +103,7 @@ pub(super) fn plan_proxy_route(
             .supports_codex_multi_agent_v2(&route.driver, &route.config);
     let prepare_plaintext_collaboration = matches!(protocol, Protocol::OpenAiResponses)
         && codex_multi_agent_v2_request
-        && (is_codex || bridge_multi_agent);
+        && bridge_multi_agent;
     let (mut forwarded_json, responses_chat) = kimi::prepare_forwarded_request(
         &route,
         protocol,
