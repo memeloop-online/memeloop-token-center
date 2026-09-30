@@ -186,10 +186,20 @@ fn validate_top_level(request: &Value) -> Result<(), AppError> {
         }
     }
     for field in ["background", "store"] {
-        if request.get(field).and_then(Value::as_bool) == Some(true) {
-            return Err(AppError::BadRequest(format!(
-                "Responses-via-Anthropic requires {field} = false"
-            )));
+        if let Some(value) = request.get(field) {
+            match value {
+                Value::Bool(false) => {}
+                Value::Bool(true) => {
+                    return Err(AppError::BadRequest(format!(
+                        "Responses-via-Anthropic requires {field} = false"
+                    )));
+                }
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "Responses-via-Anthropic requires {field} to be a boolean"
+                    )));
+                }
+            }
         }
     }
     if request.get("reasoning").is_some_and(|value| {
@@ -200,14 +210,15 @@ fn validate_top_level(request: &Value) -> Result<(), AppError> {
                 .into(),
         ));
     }
-    if request
-        .get("include")
-        .and_then(Value::as_array)
-        .is_some_and(|values| !values.is_empty())
-    {
-        return Err(AppError::BadRequest(
-            "Responses-via-Anthropic cannot preserve requested response expansions".into(),
-        ));
+    if let Some(value) = request.get("include") {
+        let values = value.as_array().ok_or_else(|| {
+            AppError::BadRequest("Responses-via-Anthropic include must be an array".into())
+        })?;
+        if !values.is_empty() {
+            return Err(AppError::BadRequest(
+                "Responses-via-Anthropic cannot preserve requested response expansions".into(),
+            ));
+        }
     }
     if let Some(format) = request.pointer("/text/format")
         && format.get("type").and_then(Value::as_str) != Some("text")
@@ -1352,9 +1363,12 @@ mod tests {
             json!({"model":"claude","input":[{"type":"compaction","encrypted_content":"opaque"}]}),
             json!({"model":"claude","input":"hello","tools":[{"type":"web_search"}]}),
             json!({"model":"claude","input":"hello","store":true}),
+            json!({"model":"claude","input":"hello","store":"false"}),
+            json!({"model":"claude","input":"hello","background":null}),
             json!({"model":"claude","input":"hello","reasoning":{"effort":"high"}}),
             json!({"model":"claude","input":"hello","reasoning":{"summary":"auto"}}),
             json!({"model":"claude","input":"hello","include":["reasoning.encrypted_content"]}),
+            json!({"model":"claude","input":"hello","include":""}),
             json!({"model":"claude","input":[
                 {"role":"user","content":"hello"},{"role":"developer","content":"late policy"}
             ]}),
@@ -1363,6 +1377,19 @@ mod tests {
         ] {
             assert!(prepare("claude", &mut request).is_err());
         }
+    }
+
+    #[test]
+    fn neutral_background_store_and_include_values_are_preserved() {
+        let mut request = json!({
+            "model":"claude",
+            "input":"hello",
+            "background":false,
+            "store":false,
+            "include":[]
+        });
+        prepare("claude", &mut request).unwrap();
+        assert_eq!(request["stream"], false);
     }
 
     #[test]
