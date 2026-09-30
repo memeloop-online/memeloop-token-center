@@ -117,7 +117,7 @@ async fn staged_login_recovery(stale_account: bool) {
         reauthorize: Some(OAuthReauthorizationTarget {
             account_id: original.id,
             expected_updated_at: if stale_account {
-                original.updated_at.saturating_sub(1)
+                -1
             } else {
                 original.updated_at
             },
