@@ -120,14 +120,32 @@ async fn staged_login_recovery(stale_account: bool) {
         credential: credential("synthetic-replacement"),
         reauthorize: Some(OAuthReauthorizationTarget {
             account_id: original.id,
-            expected_updated_at: if stale_account {
-                -1
-            } else {
-                original.updated_at
-            },
+            expected_updated_at: original.updated_at,
             expected_credential_generation: original.credential_generation,
         }),
     };
+    if stale_account {
+        let active = state
+            .db
+            .set_upstream_account_status(
+                original.id,
+                "device-worker-fixture",
+                "active",
+                original.updated_at,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set_upstream_account_status(
+                original.id,
+                "device-worker-fixture",
+                "disabled",
+                active.updated_at,
+            )
+            .await
+            .unwrap();
+    }
     state
         .db
         .stage_oauth_login_ready(
