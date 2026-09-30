@@ -306,6 +306,7 @@ mod tests {
                 configuration_validator: Some(validator),
                 routing_validator: None,
                 routing_fingerprint: String::new(),
+                #[cfg(feature = "experimental-plugin-revisions")]
                 identity: super::super::PluginPackageIdentity {
                     component_sha256: None,
                     provenance: None,

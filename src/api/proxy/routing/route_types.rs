@@ -12,6 +12,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(super) upstream_path: &'static str,
     pub(super) compact_v2_bridge: bool,
     pub(super) wrap_compact_as_sse: bool,
+    pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
 }
 
 pub(in crate::api::proxy) struct PlannedProxyRoute {
@@ -27,6 +28,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) upstream_path: &'static str,
     pub(super) compact_v2_bridge: bool,
     pub(super) wrap_compact_as_sse: bool,
+    pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
 }
 
 impl PlannedProxyRoute {
@@ -48,10 +50,15 @@ impl PreparedProxyRoute {
     pub(in crate::api::proxy) fn release_request_buffers(&mut self) {
         self.forwarded_body = Bytes::new();
         self.responses_chat = None;
+        self.responses_anthropic = None;
     }
 
     pub(in crate::api::proxy) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
+    }
+
+    pub(in crate::api::proxy) fn is_responses_via_anthropic(&self) -> bool {
+        self.responses_anthropic.is_some()
     }
 }
 

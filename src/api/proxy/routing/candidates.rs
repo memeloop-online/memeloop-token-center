@@ -373,6 +373,7 @@ mod tests {
             upstream_path: "/v1/responses",
             compact_v2_bridge: false,
             wrap_compact_as_sse: false,
+            responses_anthropic: None,
         };
 
         let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();
