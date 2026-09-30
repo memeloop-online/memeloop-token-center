@@ -775,11 +775,13 @@ async fn response_usage_fixture_with_uri_contract_driver_model_and_config(
         stream_usage_contract,
         driver,
         public_model,
-        extra_upstream_config,
-        UpstreamCredential::ApiKey {
-            value: "compatibility-upstream-secret".to_owned(),
-            header: "authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
+        ResponseUsageFixtureOptions {
+            extra_upstream_config,
+            credential: UpstreamCredential::ApiKey {
+                value: "compatibility-upstream-secret".to_owned(),
+                header: "authorization".to_owned(),
+                prefix: "Bearer ".to_owned(),
+            },
         },
     )
     .await
@@ -801,10 +803,17 @@ async fn response_usage_fixture_with_uri_contract_driver_model_and_credential(
         stream_usage_contract,
         driver,
         public_model,
-        json!({}),
-        credential,
+        ResponseUsageFixtureOptions {
+            extra_upstream_config: json!({}),
+            credential,
+        },
     )
     .await
+}
+
+struct ResponseUsageFixtureOptions {
+    extra_upstream_config: Value,
+    credential: UpstreamCredential,
 }
 
 async fn response_usage_fixture_with_uri_contract_driver_model_config_and_credential(
@@ -814,8 +823,7 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
     stream_usage_contract: Option<&str>,
     driver: &str,
     public_model: &str,
-    extra_upstream_config: Value,
-    credential: UpstreamCredential,
+    options: ResponseUsageFixtureOptions,
 ) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
@@ -840,7 +848,7 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
     if let Some(stream_usage_contract) = stream_usage_contract {
         upstream_config["stream_usage_contract"] = json!(stream_usage_contract);
     }
-    if let Some(extra) = extra_upstream_config.as_object() {
+    if let Some(extra) = options.extra_upstream_config.as_object() {
         upstream_config
             .as_object_mut()
             .expect("fixture upstream config is an object")
@@ -854,7 +862,7 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
                 name: format!("compatibility-{label}"),
                 driver: driver.to_owned(),
                 config: upstream_config,
-                credential,
+                credential: options.credential,
                 oauth_session_id: None,
                 oauth_driver: None,
                 oauth_refresh_url: None,
