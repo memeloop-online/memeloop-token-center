@@ -688,9 +688,10 @@ mod tests {
             "sqlite://{}?mode=rwc",
             directory.path().join("worker-oauth-claim.db").display()
         );
-        let state = AppState::initialize(Config::for_test(database_url))
+        let state = AppState::initialize(Config::for_test(database_url.clone()))
             .await
             .unwrap();
+        let test_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/refresh"))
@@ -741,7 +742,7 @@ mod tests {
             "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
         )
         .bind(account.id.to_string())
-        .execute(&state.db.pool)
+        .execute(&test_pool)
         .await
         .unwrap();
         let blocking = BlockingTasks::new();
@@ -782,7 +783,7 @@ mod tests {
             "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
         )
         .bind(uncertain.id.to_string())
-        .execute(&state.db.pool)
+        .execute(&test_pool)
         .await
         .unwrap();
         assert!(matches!(
