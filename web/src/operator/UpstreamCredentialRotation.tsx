@@ -31,6 +31,21 @@ function RotationText({ id, value, required, disabled, readonly, onChange, onBlu
     onChange={(_, data) => onChange(data.value || undefined)} onBlur={() => onBlur(id, value)} onFocus={() => onFocus(id, value)} />;
 }
 
+function RotationNumber({ id, value, required, disabled, readonly, onChange, onBlur, onFocus, rawErrors }: WidgetProps) {
+  return <Input id={id} type="number" value={value == null ? '' : String(value)} required={required} disabled={disabled} readOnly={readonly}
+    aria-describedby={ariaDescribedByIds(id)} aria-invalid={Boolean(rawErrors?.length)}
+    onChange={(_, data) => {
+      if (data.value === '') { onChange(undefined); return; }
+      const parsed = Number(data.value);
+      onChange(Number.isNaN(parsed) ? undefined : parsed);
+    }} onBlur={() => onBlur(id, value)} onFocus={() => onFocus(id, value)} />;
+}
+
+function RotationField(props: WidgetProps) {
+  const types = Array.isArray(props.schema.type) ? props.schema.type : [props.schema.type];
+  return types.includes('integer') || types.includes('number') ? <RotationNumber {...props} /> : <RotationText {...props} />;
+}
+
 export function UpstreamCredentialRotation({ account, provider, token, allowed, onBack, onSaved }: {
   account: UpstreamAccount; provider: ProviderType; token: string; allowed: boolean;
   onBack: () => void; onSaved: (account: UpstreamAccount) => void;
@@ -89,8 +104,8 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
         <RjsfForm key={locale} idPrefix={`${id}-credential`} schema={prepared.schema} validator={safeValidator}
           formContext={{ fluentSecrets: true }}
           uiSchema={upstreamRotationUiSchema(locale)} fields={{ SchemaField: SecureSchemaField }}
-          templates={schemaFormTemplates} widgets={{ TextWidget: RotationText, SelectWidget: RotationSelect }}
-          disabled={!canSubmit || busy} noHtml5Validate showErrorList={false}
+          templates={schemaFormTemplates} widgets={{ TextWidget: RotationField, UpDownWidget: RotationField, SelectWidget: RotationSelect }}
+          disabled={!canSubmit || busy} noHtml5Validate showErrorList={false} omitExtraData liveOmit
           experimental_defaultFormStateBehavior={{ emptyObjectFields: 'skipEmptyDefaults' }}
           onError={() => { setError('required'); feedback.current?.focus(); }}
           onSubmit={({ formData }) => void submit(formData)}>

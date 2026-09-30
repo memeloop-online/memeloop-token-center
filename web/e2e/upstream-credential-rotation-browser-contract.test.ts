@@ -6,8 +6,8 @@ import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 const labels = {
-  'zh-CN': { details: '查看详情', manage: '账号设置与授权操作', rotate: '轮换接入凭据', title: '轮换 rotation@example.org 的接入凭据', back: '返回上一级', close: '关闭并返回上一级', key: '新 API 密钥', submit: '保存并替换凭据', acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '但这里不会在提供商端撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌' },
-  en: { details: 'View details', manage: 'Account settings and authorization', rotate: 'Rotate access credential', title: 'Rotate access credential for rotation@example.org', back: 'Back to previous page', close: 'Close and return to previous page', key: 'New API key', submit: 'Save and replace credential', acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token' },
+  'zh-CN': { details: '查看详情', manage: '账号设置与授权操作', rotate: '轮换接入凭据', title: '轮换 rotation@example.org 的接入凭据', back: '返回上一级', close: '关闭并返回上一级', key: '新 API 密钥', submit: '保存并替换凭据', acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '但这里不会在提供商端撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
+  en: { details: 'View details', manage: 'Account settings and authorization', rotate: 'Rotate access credential', title: 'Rotate access credential for rotation@example.org', back: 'Back to previous page', close: 'Close and return to previous page', key: 'New API key', submit: 'Save and replace credential', acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
 };
 
 test('rotation explains replacement, uses Fluent controls, restores its parent and validates only mocked credentials', { timeout: 120_000 }, async () => {
@@ -57,6 +57,10 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await selector.selectOption({ label: copy.oauth });
       await form.getByLabel(copy.token, { exact: false }).first().waitFor();
       assert.equal(await form.locator('input[type="password"]').count(), 2);
+      await form.getByLabel(copy.token, { exact: false }).first().fill('synthetic-stale-access-token');
+      const expiry = form.getByLabel(copy.expiry, { exact: false });
+      assert.equal(await expiry.evaluate(input => input.closest('.fui-Input') !== null && input.getAttribute('type') === 'number'), true, 'expiry uses the shared Fluent number input');
+      await expiry.fill('1893456000000');
       await selector.selectOption({ index: 1 });
       const secret = form.locator('input[type="password"]').first();
       await form.getByRole('checkbox', { name: copy.acknowledge }).focus(); await page.keyboard.press('Space');
@@ -72,8 +76,9 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 1000 });
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-        const buttonHeights = await form.locator('.journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
+        const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
         assert.equal(new Set(buttonHeights).size, 1);
+        assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), 'rotation close and action buttons share the journey touch target');
         const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
         await mkdir(screenshotRoot, { recursive: true });
         await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png` });
