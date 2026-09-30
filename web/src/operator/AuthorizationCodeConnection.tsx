@@ -17,9 +17,10 @@ import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentity
 import { fluentFormWidgets } from './FluentFormWidgets';
 
 /** Key by credential, tenant and provider at the call site; no browser persistence. */
-export function AuthorizationCodeConnection({ token, tenant, provider, existing, onChanged, onLock }: {
+export function AuthorizationCodeConnection({ token, tenant, provider, existing, onChanged, onLock, connectionEditing = false }: {
   token: string; tenant: string; provider: ProviderType; existing?: UpstreamAccount;
-  onChanged: () => Promise<void>; onLock: (locked: boolean) => void;
+  onChanged: (account?: UpstreamAccount) => Promise<void>; onLock: (locked: boolean) => void;
+  connectionEditing?: boolean;
 }) {
   const { locale, t } = useI18n();
   const copy = authorizationCodeCopy(locale, provider.id, Boolean(existing));
@@ -34,6 +35,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const saved = useRef(false);
+  const savedAccount = useRef<UpstreamAccount | undefined>(undefined);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const inFlight = useRef(false);
@@ -44,7 +46,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   if (existing && !canReauthorizeAccount(existing, provider)) return <p role="status">{copy.reauthorize}</p>;
 
   async function start(providerConfig: Record<string, unknown>) {
-    if (!token || !tenant || !name.trim() || inFlight.current || session || (useProxy && !isGenericProxyUrlInput(proxy.trim()))) return;
+    if (!token || !tenant || !name.trim() || connectionEditing || inFlight.current || session || (useProxy && !isGenericProxyUrlInput(proxy.trim()))) return;
     inFlight.current = true; setBusy(true); setError(''); setNotice('');
     try {
       const result = await api<AuthorizationCodeSession>('/internal/v1/oauth/authorization-code/start', token, {
@@ -73,9 +75,9 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       });
       if (!live.current) return;
       if ('id' in result) {
-        saved.current = true; setSession(undefined); setNotice(existing ? copy.reauthorized : copy.saved);
+        saved.current = true; savedAccount.current = result; setSession(undefined); setNotice(existing ? copy.reauthorized : copy.saved);
         // Account persistence succeeded. A list-read failure is not an OAuth failure.
-        try { await onChanged(); }
+        try { await onChanged(result); }
         catch { if (live.current) setError(copy.savedButReadFailed); }
       }
       else setNotice(copy.pending);
@@ -94,7 +96,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenantDisplayName(tenant, locale)}</p>
     <label>{t('providers.name')}<Input required maxLength={200} disabled={Boolean(existing) || busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
     <p>{copy.network}: {existing ? copy.retainedNetwork : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
-    {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
+    {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy || connectionEditing} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
     {!existing && !session && !submitted && <>
       <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
       {useProxy && <ProxyInput generic required value={proxy} onChange={setProxy} disabled={busy} hint={t('connection.oauthProxyHint')} />}
@@ -116,7 +118,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     {submitted && <Button type="button" appearance="secondary" disabled={busy} onClick={async () => {
       if (inFlight.current) return;
       inFlight.current = true; setBusy(true); setError('');
-      try { await onChanged(); }
+      try { await onChanged(savedAccount.current); }
       catch { if (live.current) setError(saved.current ? copy.savedButReadFailed : t('common.requestFailed')); }
       finally { inFlight.current = false; if (live.current) setBusy(false); }
     }}>{copy.check}</Button>}

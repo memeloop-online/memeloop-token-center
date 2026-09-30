@@ -118,6 +118,8 @@ fn streaming_upstream_evidence(
         Some(
             "upstream_stream"
                 | "upstream_stream_read_error"
+                | "upstream_http2_reset"
+                | "upstream_http2_goaway"
                 | "upstream_timeout"
                 | "upstream_read_timeout"
                 | "upstream_request_timeout"
@@ -476,10 +478,26 @@ mod tests {
     #[test]
     fn ambiguous_transport_dominates_its_derived_incomplete_capture_state() {
         let incomplete = summary(ResponsesSseOutcome::Incomplete, false, true);
-        for error in ["upstream_stream", "upstream_stream_read_error"] {
+        for error in [
+            "upstream_stream",
+            "upstream_stream_read_error",
+            "upstream_http2_reset",
+            "upstream_http2_goaway",
+        ] {
             assert_eq!(
                 streaming_upstream_evidence(false, Some(error), Some(&incomplete), Some(error)),
                 StreamingUpstreamEvidence::Inconclusive
+            );
+            let terminal = classify_streaming_terminal(
+                200,
+                Protocol::OpenAiResponses,
+                true,
+                Some(error),
+                Some(&incomplete),
+            );
+            assert_eq!(
+                (terminal.status_code, terminal.error_code),
+                (502, Some(error))
             );
         }
     }

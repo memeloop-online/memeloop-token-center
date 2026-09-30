@@ -6,6 +6,8 @@ export interface UsageSelection { preset: Preset; granularity: Granularity; cust
 type UsageQuerySelection = Omit<UsageSelection, 'filters'> & { filters: Omit<UsageFilters, 'keyAlias'> & Partial<Pick<UsageFilters, 'keyAlias'>> };
 
 export const usageTabs: UsageTab[] = ['overview', 'trend', 'dimensions', 'heatmap'];
+export const usagePresets: Preset[] = ['24h', 'today', 'yesterday', '7d', '30d', 'custom'];
+export const emptyUsageFilters: UsageFilters = { model: '', keyId: '', keyAlias: '', upstreamId: '', protocol: '', status: '', errorCode: '' };
 
 export function nextUsageTab(current: UsageTab, key: string) {
   const index = usageTabs.indexOf(current);
@@ -16,9 +18,19 @@ export function nextUsageTab(current: UsageTab, key: string) {
   return undefined;
 }
 
-export function localDateTimeInput(epoch: number) {
+export function localDateTimeInput(epoch: number, precision: 'minute' | 'milliseconds' = 'milliseconds') {
   const date = new Date(epoch);
-  return new Date(epoch - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 23);
+  return new Date(epoch - date.getTimezoneOffset() * 60_000).toISOString().slice(0, precision === 'minute' ? 16 : 23);
+}
+
+export function defaultUsageSelection(now = Date.now()): UsageSelection {
+  return {
+    preset: '24h',
+    granularity: 'auto',
+    customFrom: localDateTimeInput(now - 86_400_000),
+    customTo: localDateTimeInput(now),
+    filters: { ...emptyUsageFilters },
+  };
 }
 
 function rangeFor(selection: Pick<UsageSelection, 'preset' | 'customFrom' | 'customTo'>, now = Date.now()) {

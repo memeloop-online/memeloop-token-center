@@ -4,12 +4,13 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{StreamExt, stream};
 use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
 
 use crate::{
     AppState, api, archive_reaper::ArchiveReaper, archive_staging::ArchiveStagingLeaseOwner,
-    generation, metrics::BackgroundProjectionKind,
+    error::AppError, generation, metrics::BackgroundProjectionKind,
 };
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -20,6 +21,38 @@ const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const PLUGIN_SERVICE_DATA_INTERVAL: Duration = Duration::from_secs(5);
 const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
+
+async fn refresh_expiring_oauth(
+    state: &AppState,
+    account_id: Uuid,
+    generation: i64,
+    blocking: &BlockingTasks,
+) -> Result<(), AppError> {
+    let recovery_key = format!("oauth-worker-{account_id}-generation-{generation}");
+    let result =
+        api::refresh_managed_upstream_oauth_for_worker(state, account_id, &recovery_key, blocking)
+            .await;
+    match result {
+        Err(AppError::Conflict(message))
+            if message == "OAuth refresh is already in progress for this Idempotency-Key" =>
+        {
+            let takeover_key = format!("oauth-worker-{account_id}-{}", Uuid::now_v7());
+            state
+                .db
+                .abort_expired_undispatched_upstream_oauth_refresh(account_id, &recovery_key)
+                .await?;
+            api::refresh_managed_upstream_oauth_for_worker(
+                state,
+                account_id,
+                &takeover_key,
+                blocking,
+            )
+            .await?;
+            Ok(())
+        }
+        result => result.map(|_| ()),
+    }
+}
 
 pub async fn run(state: AppState) {
     let (shutdown_sender, shutdown) = watch::channel(false);
@@ -271,6 +304,28 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         }
     );
     periodic!(
+        "oauth_device_login",
+        Duration::from_secs(1),
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            match state
+                .db
+                .due_codex_login_sessions(crate::db::unix_millis(), 16)
+                .await
+            {
+                Ok(sessions) => {
+                    stream::iter(sessions).for_each_concurrent(4, |session_id| async move {
+                        if *shutdown.borrow() { return; }
+                        if api::poll_codex_oauth_for_worker(state, session_id).await.is_err() {
+                            let _ = state.db.defer_codex_login_worker(session_id, crate::db::unix_millis()).await;
+                            tracing::warn!(%session_id, "device login continuation deferred or stopped");
+                        }
+                    }).await;
+                }
+                Err(_) => tracing::error!("worker failed to list pending device logins"),
+            }
+        }
+    );
+    periodic!(
         "oauth_refresh",
         OAUTH_REFRESH_INTERVAL,
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
@@ -286,15 +341,9 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                         if *shutdown.borrow() {
                             break;
                         }
-                        let idempotency_key =
-                            format!("oauth-worker-{}-generation-{}", account_id, generation);
-                        if let Err(error) = api::refresh_managed_upstream_oauth_for_worker(
-                            state,
-                            account_id,
-                            &idempotency_key,
-                            &oauth_blocking,
-                        )
-                        .await
+                        if let Err(error) =
+                            refresh_expiring_oauth(state, account_id, generation, &oauth_blocking)
+                                .await
                         {
                             tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
                         }
@@ -642,13 +691,135 @@ mod supervision_tests;
 mod tests {
     use crate::{
         config::Config,
-        db::{CreateKeyInput, FinishProxyRequest, StartProxyRequest},
+        db::{CreateKeyInput, CreateUpstreamAccountInput, FinishProxyRequest, StartProxyRequest},
         metrics::RuntimeMetrics,
         model::{EnforcementMode, KeyPolicy, TokenUsage},
+        provider::UpstreamCredential,
     };
     use rust_decimal::Decimal;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_worker_reclaims_stale_undispatched_claim_but_not_unknown_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("worker-oauth-claim.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url.clone()))
+            .await
+            .unwrap();
+        let test_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "fresh-access"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let make_account = |name: &str| CreateUpstreamAccountInput {
+            tenant_external_id: "worker-oauth-claim".into(),
+            name: name.into(),
+            driver: "http-json".into(),
+            config: json!({"base_url": "https://api.example.test"}),
+            credential: UpstreamCredential::OAuth {
+                access_token: "expired-access".into(),
+                refresh_token: Some("refresh-token".into()),
+                expires_at: Some(1),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            },
+            oauth_session_id: Some(Uuid::now_v7()),
+            oauth_driver: Some("cursor".into()),
+            oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+        };
+        let account = state
+            .db
+            .create_upstream_account(
+                make_account("undispatched"),
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let recovery_key = format!("oauth-worker-{}-generation-1", account.id);
+        state
+            .db
+            .claim_upstream_oauth_refresh(
+                account.id,
+                &recovery_key,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let blocking = BlockingTasks::new();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, account.id, 1, &blocking).await,
+            Err(AppError::Conflict(_))
+        ));
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&test_pool)
+        .await
+        .unwrap();
+        refresh_expiring_oauth(&state, account.id, 1, &blocking)
+            .await
+            .unwrap();
+        let refreshed = state
+            .db
+            .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.0.credential_generation, 2);
+
+        let uncertain = state
+            .db
+            .create_upstream_account(
+                make_account("dispatched"),
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let uncertain_key = format!("oauth-worker-{}-generation-1", uncertain.id);
+        state
+            .db
+            .claim_upstream_oauth_refresh(
+                uncertain.id,
+                &uncertain_key,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .mark_upstream_oauth_refresh_request_started(uncertain.id, &uncertain_key)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(uncertain.id.to_string())
+        .execute(&test_pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, uncertain.id, 1, &blocking).await,
+            Err(AppError::Conflict(message)) if message.contains("outcome is unknown")
+        ));
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn projection_tick_drains_metered_usage_and_records_a_fixed_metric() {

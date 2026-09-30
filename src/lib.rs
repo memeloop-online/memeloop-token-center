@@ -58,6 +58,8 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+const CODEX_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const CODEX_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive
 // writers so one gateway cannot multiply that buffer by all active lifecycles.
@@ -333,16 +335,24 @@ fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
 fn build_codex_http_client_with_policy(
     policy: provider::CodexTransportPolicy,
 ) -> Result<wreq::Client, wreq::Error> {
+    use wreq::IntoEmulation;
     use wreq_util::{Emulation, Platform, Profile};
 
-    let emulation = Emulation::builder()
+    let emulation: wreq::Emulation = Emulation::builder()
         .profile(Profile::Chrome133)
         .platform(Platform::Linux)
         .http2(true)
         // The browser profile supplies only the TLS and HTTP/2 fingerprint.
         // Product-controlled Codex headers remain the complete HTTP identity.
         .headers(false)
-        .build();
+        .build()
+        .into_emulation();
+    let http2_options = codex_http2_options(
+        emulation
+            .http2_options
+            .clone()
+            .expect("Chrome133 HTTP/2 profile must include HTTP/2 options"),
+    );
     wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
@@ -354,7 +364,15 @@ fn build_codex_http_client_with_policy(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
+        .http2_options(http2_options)
         .build()
+}
+
+fn codex_http2_options(mut options: wreq::http2::Http2Options) -> wreq::http2::Http2Options {
+    options.keep_alive_interval = Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL);
+    options.keep_alive_timeout = CODEX_HTTP2_KEEP_ALIVE_TIMEOUT;
+    options.keep_alive_while_idle = false;
+    options
 }
 
 fn base_http_client_builder() -> reqwest::ClientBuilder {
@@ -431,9 +449,56 @@ mod tests {
     };
 
     use super::{
-        build_codex_http_client, build_explicit_proxy_http_client, build_http_client,
-        build_pinned_http_client,
+        CODEX_HTTP2_KEEP_ALIVE_INTERVAL, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT, build_codex_http_client,
+        build_explicit_proxy_http_client, build_http_client, build_pinned_http_client,
+        codex_http2_options,
     };
+
+    #[test]
+    fn codex_http2_keep_alive_preserves_chrome_profile_without_provider_data() {
+        use wreq::IntoEmulation;
+        use wreq_util::{Emulation, Platform, Profile};
+
+        let profile: wreq::Emulation = Emulation::builder()
+            .profile(Profile::Chrome133)
+            .platform(Platform::Linux)
+            .http2(true)
+            .headers(false)
+            .build()
+            .into_emulation();
+        let original = profile.http2_options.unwrap();
+        let options = codex_http2_options(original.clone());
+        assert_eq!(
+            options.keep_alive_interval,
+            Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
+        );
+        assert_eq!(options.keep_alive_timeout, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT);
+        assert!(!options.keep_alive_while_idle);
+        assert_eq!(options.initial_window_size, original.initial_window_size);
+        assert_eq!(
+            options.initial_conn_window_size,
+            original.initial_conn_window_size
+        );
+        assert_eq!(options.header_table_size, original.header_table_size);
+        assert_eq!(options.max_header_list_size, original.max_header_list_size);
+        assert_eq!(
+            options.max_concurrent_streams,
+            original.max_concurrent_streams
+        );
+        assert_eq!(options.enable_push, original.enable_push);
+        assert_eq!(
+            format!("{:?}", options.settings_order),
+            format!("{:?}", original.settings_order)
+        );
+        assert_eq!(
+            format!("{:?}", options.headers_pseudo_order),
+            format!("{:?}", original.headers_pseudo_order)
+        );
+        assert_eq!(
+            format!("{:?}", options.headers_stream_dependency),
+            format!("{:?}", original.headers_stream_dependency)
+        );
+    }
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {

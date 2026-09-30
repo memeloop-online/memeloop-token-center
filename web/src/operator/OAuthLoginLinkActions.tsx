@@ -1,5 +1,6 @@
 import { CopyButton } from '../CopyButton';
 import { useI18n } from '../i18n';
+import { Button } from '../design-system';
 
 /**
  * A login URL may need to be opened in another browser that has the selected
@@ -9,7 +10,7 @@ export function OAuthLoginLinkActions({ url }: { url?: string }) {
   const { t } = useI18n();
   if (!url) return null;
   return <div className="button-row oauth-login-link-actions">
-    <CopyButton value={url} label={t('common.copyAuthorizationUrl')} />
-    <a className="button secondary" href={url} target="_blank" rel="noopener noreferrer">{t('common.openAuthorization')}</a>
+    <CopyButton fluent value={url} label={t('common.copyAuthorizationUrl')} />
+    <Button as="a" appearance="secondary" href={url} target="_blank" rel="noopener noreferrer">{t('common.openAuthorization')}</Button>
   </div>;
 }

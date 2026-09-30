@@ -40,7 +40,6 @@
 .operator-monitoring .monitoring-cost-lines > span { white-space: nowrap; }
 .operator-monitoring .status { border: 0; border-radius: 4px; background: color-mix(in srgb, currentColor 8%, transparent); }
 .usage-page .usage-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.usage-page .usage-filter-disclosure { background: transparent; border: 0; border-bottom: 1px solid #27373c; }
 .usage-page .usage-overview-chart-grid > .panel,
 .operator-overview-dashboard .overview-trend-card { padding: 16px 0; }
 .analytics-p95-note { color: #81949c; font-size: 12px; margin: 8px 0 16px; line-height: 1.6; }

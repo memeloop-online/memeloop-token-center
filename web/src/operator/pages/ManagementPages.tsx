@@ -55,10 +55,16 @@ import { Button, Checkbox, Combobox, Field, Input, Option, Select, DetailTooltip
 import { JourneyDisclosure as AdvancedFormSection } from '../JourneyDisclosure';
 import { formJourneyCopy } from '../formJourneyCopy';
 import { CreateJourney } from '../CreateJourney';
+import { UpstreamCredentialRotation } from '../UpstreamCredentialRotation';
+import { upstreamRotationCopy } from '../upstreamRotationCopy';
+import { authorizationJourneyCopy } from '../authorizationJourneyCopy';
+import { DeviceAuthorizationCode } from '../DeviceAuthorizationCode';
+import { clearDeviceLoginRecovery, readDeviceLoginRecovery, saveDeviceLoginRecovery } from '../deviceLoginRecovery';
 import { CredentialActionMenu } from '../CredentialActionMenu';
 import { credentialBudgetPresentation } from '../credentialListPresentation';
 import { fluentFormWidgets } from '../FluentFormWidgets';
 import '../formJourney.css';
+import '../authorizationJourney.css';
 import '../providerEditLayout.css';
 import '../providerDirectory.css';
 import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
@@ -166,6 +172,10 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
   const [rotating, setRotating] = useState<UpstreamAccount>();
+  const rotationOrigin = useRef<'details' | 'settings'>('details');
+  const rotationReturnFocus = useRef<string | undefined>(undefined);
+  const reauthorizationOrigin = useRef<'details' | 'settings'>('details');
+  const reauthorizationReturnFocus = useRef<string | undefined>(undefined);
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
@@ -236,10 +246,67 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setRouteCacheRevisions({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
+  const recoveryScope = useRef('');
+  useEffect(() => {
+    const scope = `${token}\0${tenant}\0${writeTenant}`;
+    if (recoveryScope.current === scope) return;
+    recoveryScope.current = scope;
+    const recovery = readDeviceLoginRecovery(writeTenant);
+    if (!recovery) return;
+    const account = values.find(value => value.id === recovery.account_id && value.driver === 'openai-codex' && value.can_reauthorize);
+    if (account) { reauthorizationOrigin.current = 'details'; setProviderDetail(account.id); setReauthorizing(account); }
+    else if (!recovery.account_id) { setMethod('authorization'); setProviderWorkspaceOpen(true); }
+  }, [token, tenant, writeTenant, values]);
 
   const statusFilter = useResourceListStatusFilter('upstreams', tenant, values, (value) => value.status === 'active');
 
   const canManage = (value: UpstreamAccount) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
+
+  function openRotation(account: UpstreamAccount, origin: 'details' | 'settings') {
+    rotationOrigin.current = origin;
+    setError(''); setMessage('');
+    setRotating(account); setEditing(undefined);
+  }
+
+  function returnFromRotation(account = rotating) {
+    if (!account) return;
+    rotationReturnFocus.current = account.id;
+    setRotating(undefined);
+    if (rotationOrigin.current === 'settings') setEditing(account);
+    else { setProviderWorkspaceOpen(false); setProviderDetail(account.id); }
+  }
+
+  function openReauthorization(account: UpstreamAccount, origin: 'details' | 'settings') {
+    reauthorizationOrigin.current = origin;
+    setError(''); setMessage('');
+    setReauthorizing(account); setEditing(undefined);
+  }
+
+  function returnFromReauthorization(account = reauthorizing) {
+    if (!account) return;
+    reauthorizationReturnFocus.current = account.id;
+    if (reauthorizationOrigin.current === 'settings') setEditing(account);
+    else { setProviderWorkspaceOpen(false); setProviderDetail(account.id); }
+    setReauthorizing(undefined);
+  }
+
+  useLayoutEffect(() => {
+    if (reauthorizing || !reauthorizationReturnFocus.current) return;
+    const accountId = reauthorizationReturnFocus.current;
+    reauthorizationReturnFocus.current = undefined;
+    providerList.current?.querySelectorAll<HTMLButtonElement>('[data-reauthorization-trigger]').forEach(button => {
+      if (button.dataset.reauthorizationTrigger === accountId && button.getClientRects().length) button.focus();
+    });
+  }, [reauthorizing, editing, providerDetail]);
+
+  useLayoutEffect(() => {
+    if (rotating || !rotationReturnFocus.current) return;
+    const accountId = rotationReturnFocus.current;
+    rotationReturnFocus.current = undefined;
+    providerList.current?.querySelectorAll<HTMLButtonElement>('[data-rotation-trigger]').forEach(button => {
+      if (button.dataset.rotationTrigger === accountId && button.getClientRects().length) button.focus();
+    });
+  }, [rotating, editing, providerDetail]);
 
   const openCatalogRouteAction = (account: UpstreamAccount, action: CatalogRouteAction) => {
     const target = account.tenant_external_id ?? writeTenant;
@@ -345,8 +412,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       <span>{editProvider?.display_name ?? t('providerDirectory.other')} · {editing.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', editing.connection_method)}</span>
       {editing.credential_expires_at && <p>{t('providers.expires')}: {new Date(editing.credential_expires_at).toLocaleString(locale)}</p>}
       <div className="row-actions">
-        {canReauthorizeAccount(editing, providers.find(provider => provider.id === editing.driver)) && <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => { setReauthorizing(editing); setEditing(undefined); })}>{t('providers.reauthorize')}</Button>}
-        {editing.can_rotate && <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => { setRotating(editing); setEditing(undefined); })}>{t('providers.rotateCredential')}</Button>}
+        {canReauthorizeAccount(editing, providers.find(provider => provider.id === editing.driver)) && <Button data-reauthorization-trigger={editing.id} appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => openReauthorization(editing, 'settings'))}>{t('providers.reauthorize')}</Button>}
+        {editing.can_rotate && <Button data-rotation-trigger={editing.id} appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => openRotation(editing, 'settings'))}>{t('providers.rotateCredential')}</Button>}
       </div>
     </FormSection>,
     providerRouting: <FormSection title={connectionCopy.routing}>
@@ -357,7 +424,6 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   } : undefined;
   const providerEditors = <>
       {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} formContext={providerFormContext} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={providerEditDraft ?? { name: editing.name, config: editing.config }} onChange={({ formData }) => setProviderEditDraft(formData)} validator={validator} widgets={providerFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!formData || proxyEditorOpen || busy) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
-      {rotating && rotateProvider && <div className="inline-editor"><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setProviderWorkspaceOpen(false); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
   </>;
   const providerWorkspaceActive = providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing);
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
@@ -411,12 +477,12 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
-            <Disclosure title={t('connection.manageAccount')}><div className="row-actions">
+            <Disclosure title={t('connection.manageAccount')} defaultOpen={reauthorizing?.id === value.id}><div className="row-actions">
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
                 {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
-                {canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setReauthorizing(value); }}>{t('providers.reauthorize')}</Button>}
-                {value.can_rotate && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderDetail(undefined); setRotating(value); }}>{t('providers.rotateCredential')}</Button>}
+                {canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value, 'details')}>{t('providers.reauthorize')}</Button>}
+                {value.can_rotate && <Button data-rotation-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openRotation(value, 'details')}>{t('providers.rotateCredential')}</Button>}
               </>}
             </div></Disclosure>
             <Disclosure title={t('connection.dangerZone')}><p>{t('connection.dangerHint')}</p><div className="row-actions">
@@ -429,28 +495,36 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         </div>;
       })}</div>
     </article>
-    <CreateJourney className={editing ? 'provider-edit-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : rotating ? t('providers.rotateFor', { name: rotating.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); setReauthorizing(undefined); } }}>
+    {rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
+      returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
+      void onChanged().catch(() => setMessage(upstreamRotationCopy(locale).reloadFailed));
+    }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); } }}>
+      {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && <div className="notice error" role="alert">{error}</div>}
       {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
       {editing || rotating ? providerEditors : reauthorizing ? <>
-      <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { await onChanged(); setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); }} />
+      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onConnectionChanged={onChanged} onAccountSaved={updated => setReauthorizing(updated)} onEditingChange={setProxyEditorOpen} onChanged={async updated => { await onChanged(); returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
+      <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnFromReauthorization()}>{authorizationJourneyCopy(locale).back}</Button>
     </> : <>
-      <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
+      <div className="segmented" role="group" aria-label={t('providers.method')}><Button appearance="secondary" type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</Button><Button appearance="secondary" type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</Button></div>
       {method === 'direct' ? <>
         <ModelPicker label={t('providers.provider')} value={provider?.id ?? ''} onChange={setDriver} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={directProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
-        {schema ? <Form key={`${provider.id}-${locale}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderCreateGeneration(generation => generation + 1); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${provider.id}-${locale}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderCreateGeneration(generation => generation + 1); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><Button appearance="primary" type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</Button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}
-    </CreateJourney>
+    </CreateJourney>}
   </section></>;
 }
 
-type NativeAuthorizationSession = { login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number };
+type NativeAuthorizationSession = { login_url?: string; verification_url?: string; user_code?: string; session_token?: string; session_id?: string; resumed?: boolean; expires_at?: number; poll_after_seconds?: number };
 
-function AuthorizationConnection({ token, tenant, providers, existing, onChanged }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: () => Promise<void> }) {
+function AuthorizationConnection({ token, tenant, providers, existing, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: (account?: UpstreamAccount) => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
   const { locale, t } = useI18n();
+  const journeyCopy = authorizationJourneyCopy(locale);
+  const [connectionEditing, setConnectionEditing] = useState(false);
+  useEffect(() => { onEditingChange?.(connectionEditing); }, [connectionEditing, onEditingChange]);
   const oauthProviders = providers.filter((provider) => provider.oauth_adapter);
   const existingOAuthProvider = oauthProviders.find((provider) => provider.id === existing?.driver);
-  const initialProvider = existingOAuthProvider ?? oauthProviders[0];
+  const initialProvider = existingOAuthProvider ?? (readDeviceLoginRecovery(tenant) ? oauthProviders.find(provider => provider.id === 'openai-codex') : undefined) ?? oauthProviders[0];
   const [providerChoice, setProviderChoice] = useState(initialProvider?.id ?? '');
   const [nativeLocked, setNativeLocked] = useState(false);
   useEffect(() => { setNativeLocked(false); }, [token, tenant]);
@@ -465,35 +539,48 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const proxyValid = !needsProxy || isPrivateProxyUrl(proxyUrl.trim());
   const [authorizing, setAuthorizing] = useState(false);
   const [polling, setPolling] = useState(false);
+  const [pollStopped, setPollStopped] = useState(false);
+  const pollLock = useRef(false);
+  const pollRequest = useRef<AbortController | undefined>(undefined);
   const [nextPollAt, setNextPollAt] = useState(0);
   const [now, setNow] = useState(Date.now);
   const [listRetry, setListRetry] = useState(false);
   const [listLoading, setListLoading] = useState(false);
+  const savedAccount = useRef<UpstreamAccount | undefined>(undefined);
   const scopeVersion = useRef(0);
-  useEffect(() => () => { scopeVersion.current += 1; }, [token, tenant]);
+  useEffect(() => () => { scopeVersion.current += 1; pollRequest.current?.abort(); }, [token, tenant]);
   const isKimi = isKimiDeviceProvider(selectedProvider);
-  const expired = Boolean(isKimi && session?.expires_at && now >= session.expires_at);
-  const waitSeconds = isKimi ? Math.max(0, Math.ceil((nextPollAt - now) / 1000)) : 0;
+  const expired = Boolean(!session?.resumed && (!session?.session_id || pollStopped) && session?.expires_at && now >= session.expires_at);
   useEffect(() => {
-    if (!isKimi || !session) return;
+    if (!session) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [isKimi, session]);
+  }, [session]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setListLoading(false); setAuthorizing(false); setPolling(false); };
-  useEffect(() => { reset(); }, [token, tenant]);
+  const reset = () => { scopeVersion.current += 1; pollRequest.current?.abort(); pollLock.current = false; setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setListLoading(false); setAuthorizing(false); setPolling(false); setPollStopped(false); };
+  useEffect(() => {
+    reset();
+    const recovery = readDeviceLoginRecovery(tenant);
+    if (selectedProvider?.id === 'openai-codex' && recovery && recovery.account_id === existing?.id) {
+      setSession({ session_id: recovery.session_id, expires_at: recovery.expires_at, resumed: true });
+      setNextPollAt(Date.now());
+    }
+  }, [token, tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant || !selectedProvider || !name.trim() || authorizing || polling || listLoading || listRetry || session || !proxyValid) return;
+    if (!tenant || !selectedProvider || !name.trim() || connectionEditing || authorizing || polling || listLoading || listRetry || session || !proxyValid) return;
     setAuthorizing(true);
     const attempt = scopeVersion.current;
     const begin = async (request: Promise<NativeAuthorizationSession>) => {
       const result = await request;
       if (scopeVersion.current === attempt) {
         setNow(Date.now());
-        if (isKimi) setNextPollAt(Date.now() + (result.poll_after_seconds ?? 0) * 1000);
+        setNextPollAt(Date.now() + Math.max(1, result.poll_after_seconds ?? 5) * 1000);
         setSession(result);
+        if (selectedProvider.id === 'openai-codex' && result.session_id && result.expires_at) {
+          saveDeviceLoginRecovery({ session_id: result.session_id, tenant, account_id: existing?.id, expires_at: result.expires_at });
+        }
       }
     };
     try {
@@ -522,12 +609,12 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     if (listLoading) return;
     setListLoading(true);
     const attempt = scopeVersion.current;
-    try { await onChanged(); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
+    try { await onChanged(savedAccount.current); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
     catch { if (scopeVersion.current === attempt) { setListRetry(true); setError(t('providers.savedListUnavailable')); } }
     finally { if (scopeVersion.current === attempt) setListLoading(false); }
   };
   const poll = async () => {
-    if (!session || polling || expired || (isKimi && (Date.now() < nextPollAt || (session.expires_at !== undefined && Date.now() >= session.expires_at)))) return;
+    if (!session || pollLock.current || polling || pollStopped || expired || Date.now() < nextPollAt || (!session.session_id && !session.resumed && session.expires_at !== undefined && Date.now() >= session.expires_at)) return;
     if (!selectedProvider) return;
     const flow = selectedProvider.oauth_adapter?.flow_kind;
     const path = flow === 'openai_device' ? '/internal/v1/oauth/codex/poll'
@@ -535,51 +622,72 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       : isKimi ? '/internal/v1/oauth/kimi/poll'
       : flow === 'cursor_pkce' && selectedProvider.source === 'builtin' ? '/internal/v1/oauth/cursor/poll'
       : '/internal/v1/oauth/provider-adapter/poll';
+    pollLock.current = true;
+    const request = new AbortController(); pollRequest.current = request;
     setPolling(true); setError('');
     const attempt = scopeVersion.current;
     try {
-      const result = await api<UpstreamAccount | { status: string; message?: string; retry_after_seconds?: number }>(path, token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token }) });
+      const result = await api<UpstreamAccount | { status: string; message?: string; retry_after_seconds?: number }>(path, token, { method: 'POST', body: JSON.stringify(session.session_id ? { session_id: session.session_id } : { session_token: session.session_token }), signal: AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]) });
       if (scopeVersion.current !== attempt) return;
-      if ('id' in result) { setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await reloadList(); }
+      if ('id' in result) { savedAccount.current = result; clearDeviceLoginRecovery(session.session_id); setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await reloadList(); }
       else {
-        if (isKimi) { setNextPollAt(Date.now() + (result.retry_after_seconds ?? session.poll_after_seconds ?? 5) * 1000); setNow(Date.now()); }
-        setMessage(result.message ?? t('providers.waiting'));
+        setNextPollAt(Date.now() + Math.max(1, result.retry_after_seconds ?? session.poll_after_seconds ?? 5) * 1000); setNow(Date.now());
+        setMessage(journeyCopy.automatic);
       }
-    } catch (reason) { if (scopeVersion.current === attempt) setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { if (scopeVersion.current === attempt) setPolling(false); }
+    } catch (reason) { if (scopeVersion.current === attempt) {
+      const stopped = reason instanceof ApiError && [400, 401, 403, 404, 409, 410, 422].includes(reason.status);
+      setPollStopped(stopped); setError(stopped ? journeyCopy.stopped : journeyCopy.retrying);
+      if (stopped) {
+        clearDeviceLoginRecovery(session.session_id);
+        if (session.expires_at && Date.now() >= session.expires_at) { setSession({ ...session, resumed: false }); setError(t('providers.deviceLoginExpired')); }
+      }
+      setNextPollAt(Date.now() + 15_000);
+    } }
+    finally { if (scopeVersion.current === attempt) { pollLock.current = false; setPolling(false); } }
   };
+  const pollAction = useRef(poll);
+  pollAction.current = poll;
+  useEffect(() => {
+    if (!session || polling || pollStopped || expired || selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce') return;
+    const timer = window.setTimeout(() => void pollAction.current(), Math.max(0, nextPollAt - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [session, polling, pollStopped, expired, nextPollAt, selectedProvider?.oauth_adapter?.flow_kind]);
   const complete = async () => {
     if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce') return;
     try {
       const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }) });
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
-      setSession(undefined); setManualCode(''); await onChanged();
+      savedAccount.current = result; setSession(undefined); setManualCode(''); await reloadList();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
-  return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
+  return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
+    {existing && <>
+      <p>{journeyCopy.network}</p>
+      <UpstreamConnection key={`${existing.id}-${existing.credential_generation}`} account={existing} token={token} tenant={tenant} readOnOpen
+        disabled={authorizing || Boolean(session) || nativeLocked || listLoading} onChanged={onConnectionChanged} onSaved={onAccountSaved} onEditingChange={setConnectionEditing} />
+    </>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || polling || listLoading || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
-    {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
+    {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} connectionEditing={connectionEditing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
     <label>{t('providers.name')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || polling || listLoading || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {proxyMode !== 'none' && !session && <section className="upstream-connection">
+    {proxyMode !== 'none' && !existing && !session && <section className="upstream-connection">
       <h3>{t('connection.title')}</h3>
       {!existing && <Checkbox checked={useProxy} disabled={authorizing} label={t('connection.useAccountProxy')} onChange={(_, data) => { setUseProxy(data.checked === true); setProxyUrl(''); }} />}
       {needsProxy && <ProxyInput required value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} hint={t('connection.oauthProxyHint')} />}
-      {existing && <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.directEgress')} · {locale.startsWith('zh') ? '重新授权沿用当前账号连接设置；可在账号编辑页调整。' : 'Reauthorization reuses this account’s connection settings; change them in the account editor.'}</p>}
       {!existing && !useProxy && <p className="field-hint">{t('connection.directEgress')}</p>}
     </section>}
-    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing || !proxyValid}>{t('common.startLogin')}</button></Form> : <div className="button-row">
-      <Button appearance="primary" type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || polling || listLoading || Boolean(session) || listRetry || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</Button>
+    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData)}><Button appearance="primary" type="submit" disabled={!tenant || authorizing || connectionEditing || listRetry || !proxyValid}>{t('common.startLogin')}</Button></Form> : <div className="button-row">
+      <Button appearance="primary" type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || connectionEditing || authorizing || polling || listLoading || Boolean(session) || listRetry || !proxyValid}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</Button>
       {session && !expired && <>
         <OAuthLoginLinkActions url={session.verification_url ?? session.login_url} />
-        {selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <Button appearance="secondary" type="button" disabled={polling || waitSeconds > 0} onClick={() => void poll()}>{polling ? t('common.loading') : waitSeconds > 0 ? t('common.checkAuthorizationIn', { seconds: waitSeconds }) : t('common.checkAuthorization')}</Button>}
+        {selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && !pollStopped && <p role="status">{polling ? journeyCopy.checking : journeyCopy.automatic}</p>}
       </>}
-      {expired && <Button appearance="secondary" type="button" disabled={polling} onClick={reset}>{t('providers.backToLoginSetup')}</Button>}
+      {(expired || pollStopped) && <Button appearance="secondary" type="button" disabled={polling} onClick={reset}>{t('providers.backToLoginSetup')}</Button>}
       {listRetry && <Button appearance="secondary" type="button" disabled={listLoading} onClick={() => void reloadList()}>{t('providers.reloadAccountList')}</Button>}
     </div>}
-    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
-    {session?.user_code && !expired && <div className="device-authorization" role="status"><p>{selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' ? t('providers.codexSecurity') : t('providers.deviceSecurity', { provider: selectedProvider?.display_name ?? '' })}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
+    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<Input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><Button appearance="primary" type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button></div>}
+    {session?.user_code && !expired && <div className="device-authorization"><p>{selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' ? t('providers.codexSecurity') : t('providers.deviceSecurity', { provider: selectedProvider?.display_name ?? '' })}</p><DeviceAuthorizationCode key={session.user_code} value={session.user_code} /></div>}
     {isKimi && session && selectedProvider && <p role="status">{expired
       ? t('providers.deviceLoginExpired')
       : t('providers.deviceLoginHint', { provider: selectedProvider.display_name }) + (session.expires_at ? ` ${t('providers.deviceLoginValidUntil', { time: new Date(session.expires_at).toLocaleTimeString(locale) })}` : '')}</p>}

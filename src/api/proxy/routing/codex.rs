@@ -413,7 +413,13 @@ async fn send_codex_attempt_once(
 }
 
 fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
-    if error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls() {
+    if let Some(http2_failure) = upstream_response::codex_http2_failure(&error) {
+        let kind = match http2_failure {
+            upstream_response::CodexHttp2Failure::Reset => TransportFailureKind::Http2Reset,
+            upstream_response::CodexHttp2Failure::GoAway => TransportFailureKind::Http2GoAway,
+        };
+        ProxySendError::NonRetryableTransport(kind)
+    } else if error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls() {
         let stage = if error.is_proxy_connect() {
             "proxy_connect"
         } else if error.is_dns() {

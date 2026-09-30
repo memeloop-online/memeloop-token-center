@@ -11,7 +11,7 @@ const copy = {
     method: '账户授权', reauthorize: '重新授权', backToSetup: '返回登录设置', reload: '重新读取账号列表',
     savedListUnavailable: '账号已保存。重新读取列表即可查看。',
     expired: '本次登录已过期。请返回登录设置后重新开始。',
-    hint: '请在 Kimi 页面完成确认，然后检查授权结果。', validUntil: /有效期至/,
+    hint: '请在 Kimi 页面完成确认，系统会自动检测授权结果。', validUntil: /有效期至/,
     security: '在 Kimi 页面确认本次登录', openaiSecurity: /在 OpenAI 页面确认本次登录/,
   },
   en: {
@@ -19,7 +19,7 @@ const copy = {
     method: 'Account authorization', reauthorize: 'Authorize again', backToSetup: 'Back to login setup', reload: 'Reload account list',
     savedListUnavailable: 'Account saved. Reload the list to view it.',
     expired: 'This login expired. Return to login setup to start again.',
-    hint: 'Confirm on Kimi, then check authorization.', validUntil: /Valid until/,
+    hint: 'Confirm on Kimi. The system checks authorization automatically.', validUntil: /Valid until/,
     security: 'Confirm this login on Kimi', openaiSecurity: /Confirm this login on OpenAI/,
   },
 } as const;
@@ -93,17 +93,16 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       assert.match(await page.getByText(text.security, { exact: false }).first().textContent() ?? '', /Kimi/);
       await page.getByText(text.hint, { exact: false }).waitFor();
       assert.equal(await page.getByText(text.validUntil).count(), 1, 'an advertised expiry is shown as a local time');
-      assert.equal(await page.getByRole('button', { name: text.countdown }).isDisabled(), true);
+      assert.equal(await page.getByRole('button', { name: text.check, exact: true }).count(), 0);
+      const firstPoll = page.waitForResponse(response => response.url().endsWith('/oauth/kimi/poll'));
       await page.clock.fastForward(6_000);
-      assert.equal(state.polls, 0, 'time passing never polls or approves automatically');
-      await page.getByRole('button', { name: text.check, exact: true }).click();
-      await page.getByRole('button', { name: '10 秒后可检查', exact: true }).waitFor();
+      await firstPoll;
+      await page.getByText('请在提供商页面完成登录；系统会自动检测结果，成功后返回账号页面，无需手动检查。', { exact: true }).first().waitFor();
       assert.equal(state.polls, 1);
       await page.clock.fastForward(9_000);
-      assert.equal(await page.getByRole('button', { name: text.countdown }).isDisabled(), true, 'the server slow-down interval is honored');
-      await page.clock.fastForward(1_000);
+      assert.equal(state.polls, 1, 'the server slow-down interval is honored');
       state.failList = true;
-      await page.getByRole('button', { name: text.check, exact: true }).click();
+      await page.clock.fastForward(1_000);
       await page.getByText(text.savedListUnavailable, { exact: true }).waitFor();
       assert.equal(state.polls, 2); assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1);
       state.failList = false;
@@ -146,14 +145,14 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     await english.page.getByText(english.text.hint, { exact: false }).waitFor();
     assert.equal(await english.page.getByText(english.text.validUntil).count(), 0, 'a missing expires_at never renders a validity time');
     assert.equal(await english.page.getByText(/Invalid Date/).count(), 0, 'a missing expires_at never renders an invalid date');
-    assert.equal(await english.page.getByRole('button', { name: 'Check in 5s', exact: true }).isDisabled(), true, 'poll_after_seconds is honored without an expiry');
+    assert.equal(english.state.polls, 0, 'poll_after_seconds is honored without an expiry');
+    const englishFirstPoll = english.page.waitForResponse(response => response.url().endsWith('/oauth/kimi/poll'));
     await english.page.clock.fastForward(300_000);
+    await englishFirstPoll;
+    await english.page.getByText('Finish signing in on the provider page. The system checks automatically and returns to the account page on success; no manual check is needed.', { exact: true }).first().waitFor();
     assert.equal(await english.page.getByText(english.text.expired).count(), 0, 'a missing expires_at never expires the login');
     assert.equal(await english.page.getByText('MOCK-KIMI', { exact: true }).count(), 1);
-    await english.page.getByRole('button', { name: english.text.check, exact: true }).click();
-    await english.page.getByRole('button', { name: 'Check in 10s', exact: true }).waitFor();
     await english.page.clock.fastForward(10_000);
-    await english.page.getByRole('button', { name: english.text.check, exact: true }).click();
     await english.page.getByText('Upstream original-kimi is ready', { exact: true }).waitFor();
     assert.equal(english.state.polls, 2);
     await english.page.close();

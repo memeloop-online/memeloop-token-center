@@ -5,7 +5,7 @@ import { ariaDescribedByIds, ErrorSchemaBuilder } from '@rjsf/utils';
 import { SecretInput } from './SecretInput';
 import { useI18n } from './i18n';
 
-function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, onFocus, disabled, readonly, required, autofocus, rawErrors, errorSchema }: FieldProps) {
+function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, onFocus, disabled, readonly, required, autofocus, rawErrors, errorSchema, registry }: FieldProps) {
   const { t } = useI18n();
   const id = fieldPathId.$id;
   const label = typeof schema.title === 'string' ? schema.title : String(fieldPathId.path.at(-1) ?? t('secret.value'));
@@ -29,7 +29,7 @@ function SecretSchemaValue({ schema, formData, fieldPathId, onChange, onBlur, on
   }
   return <div className="schema-secret-field">
     <label htmlFor={id}>{label}{required ? ' *' : ''}</label>
-    <SecretInput id={id} label={label} value={text} onChange={(event) => update(event.target.value)} disabled={disabled} readOnly={readonly} required={required} autoFocus={autofocus} aria-invalid={invalid || validationError} aria-describedby={`${ariaDescribedByIds(id)}${invalid || validationError ? ` ${id}-secret-error` : ''}`} onBlur={() => onBlur(id, formData)} onFocus={() => onFocus(id, formData)} />
+    <SecretInput fluent={registry.formContext?.fluentSecrets === true} id={id} label={label} value={text} onChange={(event) => update(event.target.value)} disabled={disabled} readOnly={readonly} required={required} autoFocus={autofocus} aria-invalid={invalid || validationError} aria-describedby={`${ariaDescribedByIds(id)}${invalid || validationError ? ` ${id}-secret-error` : ''}`} onBlur={() => onBlur(id, formData)} onFocus={() => onFocus(id, formData)} />
     {(invalid || validationError) && <p id={`${id}-secret-error`} className="schema-field-error" role="alert">{t(invalid ? 'secret.invalidJson' : 'schemaError.invalidField')}</p>}
   </div>;
 }

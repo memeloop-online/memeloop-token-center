@@ -29,6 +29,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
     const account = { id: 'existing-account', tenant_external_id: 'fixture-a', driver: profile.id, name: 'Existing account', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, updated_at: 3, route_count: 0, config: profile.source === 'plugin' ? { workspace: 'existing-workspace' } : { base_url: 'https://example.invalid' }, can_reauthorize: true, can_update_transport_proxy: true, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true };
     await page.route('**/internal/v1/**', async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
+      if (path.endsWith('/poll')) return route.fulfill({ status: 202, json: { status: 'pending', retry_after_seconds: 60 } });
       if (request.method() !== 'GET') {
         assert.equal(request.method(), 'POST'); assert.equal(path, `/internal/v1/oauth/${profile.endpoint}/start`);
         posts.push({ path, body: request.postDataJSON() });
