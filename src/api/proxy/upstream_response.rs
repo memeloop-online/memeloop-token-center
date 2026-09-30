@@ -41,6 +41,13 @@ pub(super) fn codex_http2_failure(
                 return Some(CodexHttp2Failure::GoAway);
             }
         }
+        if let Some(inner) = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            source = Some(inner);
+            continue;
+        }
         source = current.source();
     }
     None
