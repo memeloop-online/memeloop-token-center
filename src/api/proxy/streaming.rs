@@ -229,13 +229,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
-        let (archive_settlement_sender, archive_settlement_receiver) =
-            tokio::sync::oneshot::channel();
-        let archive_eof_owner = tokio::spawn(hold_response_eof_until_archive_settles(
-            archive_settlement_receiver,
-            body_sender.clone(),
-            diagnostic_context,
-        ));
         // The bounded lifecycle below owns these values. Keep exact copies for
         // the timeout convergence path, which must not infer delivery from a
         // task that Tokio has just cancelled.
@@ -846,13 +839,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(spool) => spool.seal(),
                 None => None,
             };
-            if let Err(unowned) = archive_settlement_sender.send(archive_settlement)
-                && let Some(settlement) = unowned
-            {
-                // The EOF owner contains no fallible work before receiving, so
-                // this is defensive. Retain ownership locally if it exited.
-                settlement.wait().await;
-            }
+            drop(archive_settlement);
             // A spawned writer exclusively fences its failed/abandoned
             // capture, including a begin that commits after cancellation.
             // No writer means memory admission failed before any spool SQL;
@@ -922,6 +909,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // before routing publication or request settlement can block on
             // database work.
             drop(_sse_streaming_memory.take());
+            drop(body_sender);
             let routing_terminal_observed_at = conversation
                 .as_ref()
                 .and_then(|conversation| conversation.hints.session_id.as_ref())
@@ -965,7 +953,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     ),
                 }
             }
-            drop(body_sender);
             terminal_delivery_phase.finish(
                 transport_error.unwrap_or("returned"),
                 Some(status.as_u16()),
@@ -1059,13 +1046,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // concurrency past that boundary.
         drop(_proxy_lifecycle_permit);
         drop(_dispatch_permit);
-        if let Err(error) = archive_eof_owner.await {
-            tracing::error!(
-                task_cancelled = error.is_cancelled(),
-                task_panicked = error.is_panic(),
-                "response archive EOF owner failed"
-            );
-        }
         stream_owner.finish("returned", Some(status.as_u16()), None);
     });
     let mut response = Response::builder()
@@ -1096,24 +1076,5 @@ fn chat_usage_capture_with_limits(
         ResponsesSseCapture::for_kimi_chat_usage_with_limits(limits)
     } else {
         ResponsesSseCapture::for_openai_chat_usage_with_limits(limits)
-    }
-}
-
-async fn hold_response_eof_until_archive_settles(
-    settlement: tokio::sync::oneshot::Receiver<
-        Option<crate::response_archive_spool::ResponseArchiveSettlement>,
-    >,
-    _body_sender: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    diagnostic_context: proxy_diagnostics::Context,
-) {
-    let handoff = proxy_diagnostics::Phase::new(diagnostic_context, "archive_terminal_handoff");
-    if let Ok(Some(settlement)) = settlement.await {
-        handoff.finish("accepted", None, None);
-        let drain = proxy_diagnostics::Phase::new(diagnostic_context, "archive_eof_drain");
-        settlement.wait().await;
-        // wait() reports writer errors separately. Never label this success.
-        drain.finish("returned", None, None);
-    } else {
-        handoff.finish("no_settlement", None, None);
     }
 }

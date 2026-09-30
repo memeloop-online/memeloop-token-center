@@ -88,7 +88,6 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
          WHERE EXISTS (
              SELECT 1 FROM request_records
              WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3
-               AND completed_at IS NULL
          )",
     )
     .bind(identity.request_id.to_string())
@@ -107,6 +106,61 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn capture_deferred_archive(
+        &self,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<bool, AppError> {
+        let prepared = archive.prepare_first_batch().await?;
+        let reservation = self.reserve_buffered_archive_capacity(archive).await?;
+        let Some(reservation) = reservation else {
+            if archive.purpose() == BufferedArchivePurpose::Request {
+                let mut transaction = self.begin_write_transaction().await?;
+                insert_request_archive_gap_in_transaction(
+                    &mut transaction,
+                    super::unix_millis(),
+                    archive.identity(),
+                    archive.body(),
+                    "capacity",
+                )
+                .await?;
+                transaction.commit().await?;
+            }
+            return Ok(false);
+        };
+        let (mut transaction, now, hold) = self
+            .reserved_spool_transaction(&reservation, "deferred_capture")
+            .await?;
+        let captured = self
+            .capture_reserved_buffered_archive_body_in_transaction(
+                &mut transaction,
+                now,
+                archive,
+                Some(prepared),
+                Some(&reservation),
+            )
+            .await?;
+        BudgetHold::commit_optional(transaction, Some(hold)).await?;
+        reservation.release().await;
+        Ok(captured)
+    }
+
+    pub(crate) async fn record_deferred_request_retention_gap(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        body: &bytes::Bytes,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        insert_request_archive_gap_in_transaction(
+            &mut transaction,
+            super::unix_millis(),
+            identity,
+            body,
+            "retention_limit",
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
     /// Atomic buffered capture: no partially captured row is ever visible.
     /// The global budget serializes admission for both archive purposes.
     #[cfg(test)]
@@ -159,7 +213,7 @@ impl Database {
         if bytes > PLAIN_LIMIT || accounted > CIPHER_LIMIT {
             return Ok(false);
         }
-        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
+        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
         if valid != 1 {
@@ -300,7 +354,7 @@ impl Database {
             }
         }
         let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
-        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
+        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
         if valid != 1 {

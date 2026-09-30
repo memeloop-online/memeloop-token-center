@@ -120,15 +120,18 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
 }
 
 #[tokio::test]
-async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admission() {
+async fn request_capture_failure_does_not_reject_forwarding_or_duplicate_billing() {
     let fixture = codex_route_fixture("request-capture-admission-failure").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("CREATE TRIGGER reject_request_capture BEFORE INSERT ON request_archive_spools BEGIN SELECT RAISE(ABORT, 'fixture capture rejection'); END")
         .execute(&pool).await.unwrap();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("archive failure is isolated"),
+            "text/event-stream",
+        ))
+        .expect(1)
         .mount(&upstream)
         .await;
     let response = send_codex_route(
@@ -136,12 +139,19 @@ async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admissio
         &upstream,
         "/v1/responses",
         json!({
-            "model": fixture.model, "input": "must be durable before dispatch", "stream": false
+            "model": fixture.model, "input": "billing must commit before dispatch", "stream": false
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(response.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("archive failure is isolated")
+    );
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
@@ -150,7 +160,14 @@ async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admissio
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!((requests, reservations), (0, 0));
+    assert_eq!((requests, reservations), (1, 1));
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
     pool.close().await;
 }

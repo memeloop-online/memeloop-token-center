@@ -6,6 +6,7 @@ const ENCRYPTED_FIELD: &str = "encrypted_content";
 /// Preserve the exact body when no retention rule applies. This keeps legacy
 /// request byte archives stable while ensuring inline media and explicitly
 /// encrypted protocol fields never enter the durable archive.
+#[cfg(test)]
 pub(super) fn prepare_request_json(mut retained: Value) -> Option<Value> {
     sanitize_value(&mut retained, true, false).then_some(retained)
 }
@@ -28,10 +29,6 @@ pub(super) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
         return None;
     }
     Some(retained)
-}
-
-pub(super) fn encoded_json_len(retained: &Value) -> usize {
-    retained_size(retained)
 }
 
 #[cfg(test)]

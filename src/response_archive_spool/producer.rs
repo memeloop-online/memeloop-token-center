@@ -459,6 +459,11 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
         memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Option<Self> {
+        let archive_permit = state
+            .proxy_archive_stream_permits
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
         if !memory.try_grow(
             super::CAPTURE_MEMORY_BYTES,
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
@@ -477,10 +482,12 @@ impl ResponseArchiveProducer {
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
         let failure_active = active.clone();
-        let writer_state = state.clone();
+        let mut writer_state = state.clone();
+        writer_state.db = state.persistence_db.clone();
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
+                let _archive_permit = archive_permit;
                 let _queue_memory = writer_memory;
                 let _capture_metrics = writer_state.metrics.memory_usage(
                     crate::metrics::MemoryComponent::StreamCapture,

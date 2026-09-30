@@ -12,15 +12,16 @@ pub use conversations::{ConversationDetailFilter, ConversationListFilter};
 pub(crate) use conversations::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
+#[cfg(test)]
+pub(crate) use lifecycle::RequestArchiveAdmission;
 pub use lifecycle::{
     AttachProxyArchiveResult, FinishMeteredSynchronousRequest, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput,
     StartMeteredSynchronousRequest, StartProxyRequest,
 };
 pub(crate) use lifecycle::{
-    ProxyRequestUpstreamAttribution, RequestArchiveAdmission, SwitchProxyCandidateInput,
-    allocate_request_event_cursor, record_request_finished_in_transaction,
-    record_request_started_in_transaction,
+    ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{

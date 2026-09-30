@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
+async fn postgres_archive_budget_lock_does_not_block_dispatch_or_buffered_delivery() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL unset; skipping PostgreSQL attempt deadline contract");
         return;
@@ -151,30 +151,18 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
             .fetch_one(&admin)
             .await
             .unwrap();
-            if waiting == 1 {
+            if waiting >= 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("request admission must wait at the PostgreSQL spool budget barrier");
-    assert!(
-        upstream.received_requests().await.unwrap().is_empty(),
-        "durable admission must complete before upstream dispatch"
-    );
-
-    // Advance the request clock past the configured one-second attempt window
-    // while PostgreSQL proves admission is still blocked. No wall-clock sleep
-    // participates in the ordering assertion.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    budget_holder.commit().await.unwrap();
-    tokio::time::resume();
+    .expect("background archive writer must reach the PostgreSQL spool budget barrier");
 
     let response = tokio::time::timeout(Duration::from_secs(5), request)
         .await
-        .expect("request must complete after the admission barrier is released")
+        .expect("request must complete while the archive budget lock is still held")
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -185,6 +173,7 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
         "admitted exactly once"
     );
     upstream.verify().await;
+    budget_holder.commit().await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
