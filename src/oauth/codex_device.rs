@@ -42,6 +42,9 @@ const MIN_POLL_SECONDS: u64 = 1;
 const MAX_POLL_SECONDS: u64 = 60;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 365 * 24 * 60 * 60;
 
+#[cfg(test)]
+mod durable_tests;
+
 #[derive(Clone)]
 pub struct StartCodexDeviceLogin {
     pub tenant_external_id: String,
@@ -54,6 +57,7 @@ pub struct StartCodexDeviceLogin {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CodexDeviceLoginStart {
+    pub session_id: Uuid,
     pub driver: &'static str,
     pub verification_url: &'static str,
     pub user_code: String,
@@ -109,6 +113,12 @@ struct CodexDeviceLoginState {
     not_before: i64,
     expires_at: i64,
     reauthorize: Option<OAuthReauthorizationTarget>,
+    #[serde(default)]
+    device_token: Option<DeviceTokenResponse>,
+    #[serde(default)]
+    exchange_dispatched: bool,
+    #[serde(default)]
+    issued_token: Option<OAuthTokenResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,14 +195,14 @@ struct DeviceTokenRequest<'a> {
     user_code: &'a str,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct DeviceTokenResponse {
     authorization_code: String,
     code_verifier: String,
     code_challenge: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
     refresh_token: String,
@@ -284,6 +294,9 @@ async fn start_codex_device_login_at(
         not_before,
         expires_at,
         reauthorize: input.reauthorize,
+        device_token: None,
+        exchange_dispatched: false,
+        issued_token: None,
     };
     let session = CodexDeviceSessionToken {
         session_id,
@@ -304,6 +317,7 @@ async fn start_codex_device_login_at(
     .await?;
     let verification_url = exact_verification_url(&endpoints.verification_url)?;
     Ok(CodexDeviceLoginStart {
+        session_id,
         driver: PROVIDER_DRIVER,
         verification_url,
         user_code,
@@ -338,6 +352,41 @@ pub async fn poll_codex_device_login(
     .await
 }
 
+pub async fn recover_codex_device_session_token(
+    db: &Database,
+    session_id: Uuid,
+    key_material: &[u8],
+    scope: CodexDevicePollScope<'_>,
+) -> Result<String, AppError> {
+    let (reference, ciphertext) = db.codex_login_session_reference(session_id).await?;
+    if reference.operator_service_id != scope.operator_service_id
+        || scope
+            .required_tenant
+            .is_some_and(|tenant| tenant != reference.tenant_external_id)
+    {
+        return Err(AppError::Forbidden);
+    }
+    let state: CodexDeviceLoginState = open_private_json(&ciphertext, key_material, STATE_AAD)?;
+    if state.session_id != reference.session_id
+        || state.tenant_external_id != reference.tenant_external_id
+        || state.operator_service_id != reference.operator_service_id
+        || state.expires_at != reference.expires_at
+    {
+        return Err(AppError::Forbidden);
+    }
+    seal_private_json(
+        &CodexDeviceSessionToken {
+            session_id,
+            tenant_external_id: state.tenant_external_id,
+            operator_service_id: state.operator_service_id,
+            poll_interval_seconds: state.poll_interval_seconds,
+            expires_at: state.expires_at,
+        },
+        key_material,
+        SESSION_AAD,
+    )
+}
+
 async fn poll_codex_device_login_at(
     http: &reqwest::Client,
     db: &Database,
@@ -361,9 +410,6 @@ async fn poll_codex_device_login_at(
     {
         return Err(AppError::Forbidden);
     }
-    if session.expires_at <= now {
-        return Err(AppError::BadRequest("OAuth login session expired".into()));
-    }
     let reference = OAuthLoginSessionReference {
         session_id: session.session_id,
         flow_kind: "openai_codex_device".to_owned(),
@@ -371,8 +417,8 @@ async fn poll_codex_device_login_at(
         operator_service_id: session.operator_service_id,
         expires_at: session.expires_at,
     };
-    let (lease_owner, state) = match db
-        .claim_oauth_login_poll(&reference, now, session.poll_interval_seconds)
+    let (lease_owner, mut state) = match db
+        .claim_codex_login_poll(&reference, now, session.poll_interval_seconds)
         .await?
     {
         OAuthLoginClaim::Pending {
@@ -408,52 +454,95 @@ async fn poll_codex_device_login_at(
         }
     };
 
-    let response = post_json(
-        http,
-        &endpoints.device_token,
-        &DeviceTokenRequest {
-            device_auth_id: &state.device_auth_id,
-            user_code: &state.user_code,
-        },
-        state.proxy_url.as_deref(),
-        allow_test_loopback,
-    )
-    .await?;
-    if matches!(response.status().as_u16(), 403 | 404) {
-        drop(response);
-        db.release_oauth_login_poll(state.session_id, lease_owner, now)
+    if state.exchange_dispatched && state.issued_token.is_none() {
+        db.fail_oauth_login_poll(state.session_id, lease_owner, now)
             .await?;
-        return Ok(CodexDevicePollResult::Pending {
-            retry_after_seconds: state.poll_interval_seconds,
-        });
+        return Err(AppError::Conflict(
+            "OAuth token exchange outcome is unknown; it will not be replayed".into(),
+        ));
     }
-    if !response.status().is_success() {
-        let _ = db
-            .release_oauth_login_poll(state.session_id, lease_owner, now)
-            .await;
-        return Err(device_error());
+    if state.device_token.is_none() {
+        let response = post_json(
+            http,
+            &endpoints.device_token,
+            &DeviceTokenRequest {
+                device_auth_id: &state.device_auth_id,
+                user_code: &state.user_code,
+            },
+            state.proxy_url.as_deref(),
+            allow_test_loopback,
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(reason) => {
+                db.release_oauth_login_poll(state.session_id, lease_owner, now)
+                    .await?;
+                return Err(reason);
+            }
+        };
+        if matches!(response.status().as_u16(), 403 | 404) {
+            drop(response);
+            db.release_oauth_login_poll(state.session_id, lease_owner, now)
+                .await?;
+            return Ok(CodexDevicePollResult::Pending {
+                retry_after_seconds: state.poll_interval_seconds,
+            });
+        }
+        if !response.status().is_success() {
+            let _ = db
+                .release_oauth_login_poll(state.session_id, lease_owner, now)
+                .await;
+            return Err(device_error());
+        }
+        let body = bounded_body(response).await.map_err(|_| device_error())?;
+        let device_token: DeviceTokenResponse =
+            serde_json::from_slice(&body).map_err(|_| device_error())?;
+        validate_secret_text(&device_token.authorization_code)?;
+        validate_secret_text(&device_token.code_verifier)?;
+        validate_secret_text(&device_token.code_challenge)?;
+        let expected_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(device_token.code_verifier.as_bytes()));
+        if expected_challenge != device_token.code_challenge {
+            return Err(device_error());
+        }
+        state.device_token = Some(device_token);
+        db.replace_oauth_login_poll_state(
+            state.session_id,
+            lease_owner,
+            seal_private_json(&state, key_material, STATE_AAD)?,
+        )
+        .await?;
     }
-    let body = bounded_body(response).await.map_err(|_| device_error())?;
-    let device_token: DeviceTokenResponse =
-        serde_json::from_slice(&body).map_err(|_| device_error())?;
-    validate_secret_text(&device_token.authorization_code)?;
-    validate_secret_text(&device_token.code_verifier)?;
-    validate_secret_text(&device_token.code_challenge)?;
-    let expected_challenge =
-        URL_SAFE_NO_PAD.encode(Sha256::digest(device_token.code_verifier.as_bytes()));
-    if expected_challenge != device_token.code_challenge {
-        return Err(device_error());
-    }
-
-    let token = exchange_authorization_code(
-        http,
-        &device_token.authorization_code,
-        &device_token.code_verifier,
-        state.proxy_url.as_deref(),
-        allow_test_loopback,
-        endpoints,
-    )
-    .await?;
+    let token = if let Some(token) = state.issued_token.clone() {
+        token
+    } else {
+        let device_token = state.device_token.as_ref().ok_or(AppError::Internal)?;
+        state.exchange_dispatched = true;
+        db.replace_oauth_login_poll_state(
+            state.session_id,
+            lease_owner,
+            seal_private_json(&state, key_material, STATE_AAD)?,
+        )
+        .await?;
+        let token = exchange_authorization_code(
+            http,
+            &device_token.authorization_code,
+            &device_token.code_verifier,
+            state.proxy_url.as_deref(),
+            allow_test_loopback,
+            endpoints,
+        )
+        .await?;
+        state.issued_token = Some(token.clone());
+        db.replace_oauth_login_poll_state(
+            state.session_id,
+            lease_owner,
+            seal_private_json(&state, key_material, STATE_AAD)?,
+        )
+        .await?;
+        token
+    };
     let claims = verify_id_token(
         http,
         &token.id_token,
@@ -501,7 +590,7 @@ async fn poll_codex_device_login_at(
     db.stage_oauth_login_ready(state.session_id, lease_owner, ready_ciphertext, now)
         .await?;
     match db
-        .claim_oauth_login_poll(&reference, now, session.poll_interval_seconds)
+        .claim_codex_login_poll(&reference, now, session.poll_interval_seconds)
         .await?
     {
         OAuthLoginClaim::Ready {

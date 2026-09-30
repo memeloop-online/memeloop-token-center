@@ -193,17 +193,73 @@ pub(in crate::api) async fn start_codex_oauth(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct PollCodexOAuthRequest {
+    session_token: Option<String>,
+    session_id: Option<Uuid>,
+}
+
 pub(in crate::api) async fn poll_codex_oauth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<PollCursorOAuthRequest>,
+    Json(body): Json<PollCodexOAuthRequest>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     let state = state.pin_application_plugins().await?;
+    let session_token = match (body.session_token, body.session_id) {
+        (Some(token), None) => token,
+        (None, Some(session_id)) => {
+            crate::oauth::codex_device::recover_codex_device_session_token(
+                &state.db,
+                session_id,
+                state.config.key_pepper.as_bytes(),
+                CodexDevicePollScope {
+                    required_tenant: service.tenant_external_id.as_deref(),
+                    operator_service_id: service.service_id,
+                },
+            )
+            .await?
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "provide exactly one session token or session ID".into(),
+            ));
+        }
+    };
+    poll_codex_oauth_impl(state, service, &session_token).await
+}
+
+pub(crate) async fn poll_codex_oauth_for_worker(
+    state: &AppState,
+    session_id: Uuid,
+) -> Result<(), AppError> {
+    let state = state.clone().pin_application_plugins().await?;
+    let (reference, _) = state.db.codex_login_session_reference(session_id).await?;
+    let service = state.db.oauth_login_worker_authority(&reference).await?;
+    let token = crate::oauth::codex_device::recover_codex_device_session_token(
+        &state.db,
+        session_id,
+        state.config.key_pepper.as_bytes(),
+        CodexDevicePollScope {
+            required_tenant: service.tenant_external_id.as_deref(),
+            operator_service_id: service.service_id,
+        },
+    )
+    .await?;
+    poll_codex_oauth_impl(state, service, &token).await?;
+    Ok(())
+}
+
+async fn poll_codex_oauth_impl(
+    state: AppState,
+    service: AuthenticatedService,
+    session_token: &str,
+) -> Result<Response, AppError> {
     match poll_codex_device_login(
         &state.db,
         &state.http,
-        &body.session_token,
+        session_token,
         state.config.key_pepper.as_bytes(),
         unix_millis(),
         CodexDevicePollScope {

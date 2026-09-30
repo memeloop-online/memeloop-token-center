@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{StreamExt, stream};
 use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
 
@@ -268,6 +269,28 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             process_conversation_projection_batch(state, projection_owner).await;
+        }
+    );
+    periodic!(
+        "oauth_device_login",
+        Duration::from_secs(1),
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            match state
+                .db
+                .due_codex_login_sessions(crate::db::unix_millis(), 16)
+                .await
+            {
+                Ok(sessions) => {
+                    stream::iter(sessions).for_each_concurrent(4, |session_id| async move {
+                        if *shutdown.borrow() { return; }
+                        if api::poll_codex_oauth_for_worker(state, session_id).await.is_err() {
+                            let _ = state.db.defer_codex_login_worker(session_id, crate::db::unix_millis()).await;
+                            tracing::warn!(%session_id, "device login continuation deferred or stopped");
+                        }
+                    }).await;
+                }
+                Err(_) => tracing::error!("worker failed to list pending device logins"),
+            }
         }
     );
     periodic!(

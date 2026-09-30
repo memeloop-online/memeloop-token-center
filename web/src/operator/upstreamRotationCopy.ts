@@ -1,0 +1,67 @@
+import type { Locale } from '../i18n';
+
+const zh = {
+  purpose: '更新系统连接此上游账号时使用的密钥或令牌。请先在提供商处取得有效的新凭据，再在这里替换。',
+  impactTitle: '保存后会发生什么',
+  impact: '保存成功后，系统将使用新凭据连接此账号；依赖此账号的模型请求可能受影响。填错、过期或权限不足的凭据会导致请求失败。此操作不会更改客户端或服务凭据。',
+  oldCredential: '旧凭据会被替换，系统不再将其用于后续认证；但这里不会在提供商端撤销旧密钥或令牌。旧凭据在其他应用中是否仍可用，取决于提供商的到期和撤销规则。如因泄露而更换，请同时在提供商处撤销旧凭据。',
+  permission: '需要当前账号所属租户的提供商管理权限（providers:write）。新凭据本身可访问哪些模型、额度和功能，由提供商的授权决定；本表单不会扩大这些权限。',
+  denied: '当前没有此账号的管理权限。请切换到账号所属租户，并使用具有提供商管理权限的服务凭据。',
+  fields: '新的接入凭据',
+  options: '选择与提供商要求一致的认证方式。密钥用于 API 访问；OAuth 令牌来自账号授权。无认证仅适用于明确允许匿名访问的上游，会移除系统保存的认证信息。',
+  acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。',
+  submit: '保存并替换凭据',
+  saving: '正在替换凭据…',
+  back: '返回上一级',
+  close: '关闭并返回上一级',
+  failed: '未能确认替换结果。请检查网络和账号状态后再重试。',
+  invalid: '请检查新凭据的内容、有效期及认证方式。',
+  forbidden: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。',
+  conflict: '账号已被其他操作更新。请返回上一级，重新打开表单后再试。',
+  saved: '新凭据已保存。系统后续将使用新凭据连接此账号。',
+  reloadFailed: '新凭据已保存，但账号列表暂时未能刷新。请稍后刷新页面，不要重复提交。',
+  required: '请填写所有必填项，并检查标记出的字段。',
+  select: '请选择',
+  types: { none: '无认证', api_key: 'API 密钥', api_key_proxy: 'API 密钥（通过账号代理）', oauth: 'OAuth 授权令牌', private: '私有网络' },
+};
+
+const en: typeof zh = {
+  purpose: 'Update the key or token this system uses to connect to this upstream account. Obtain a valid replacement from the provider before saving it here.',
+  impactTitle: 'What changes after saving',
+  impact: 'After a successful save, the system uses the new credential for this account. Model requests using this account may be affected: incorrect, expired, or insufficiently authorized credentials can cause failures. Client and service credentials are unchanged.',
+  oldCredential: 'The stored credential is replaced and is no longer used for subsequent authentication here. This does not revoke the old key or token at the provider. Whether it still works in other apps depends on the provider’s expiry and revocation rules. If it was exposed, also revoke it at the provider.',
+  permission: 'You need provider management permission (providers:write) for this account’s tenant. The provider determines which models, budgets, and features the new credential can access; this form cannot expand those permissions.',
+  denied: 'You cannot manage this account in the current scope. Select its tenant and use a service credential with provider management permission.',
+  fields: 'New access credential',
+  options: 'Choose the authentication method required by the provider. API keys enable API access; OAuth tokens come from account authorization. No authentication is only for upstreams that explicitly allow anonymous access and removes the stored authentication information.',
+  acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.',
+  submit: 'Save and replace credential',
+  saving: 'Replacing credential…',
+  back: 'Back to previous page',
+  close: 'Close and return to previous page',
+  failed: 'Could not confirm the replacement. Check the connection and account status before retrying.',
+  invalid: 'Check the new credential, its expiry, and the authentication method.',
+  forbidden: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.',
+  conflict: 'Another operation updated this account. Go back and reopen this form before trying again.',
+  saved: 'The new credential is saved. The system will use it for subsequent connections to this account.',
+  reloadFailed: 'The new credential is saved, but the account list could not refresh. Refresh the page later; do not submit again.',
+  required: 'Complete all required fields and check the highlighted fields.',
+  select: 'Choose an option',
+  types: { none: 'No authentication', api_key: 'API key', api_key_proxy: 'API key through an account proxy', oauth: 'OAuth token', private: 'Private network' },
+};
+
+export function upstreamRotationCopy(locale: Locale) { return locale === 'zh-CN' ? zh : en; }
+
+export const rotationFieldCopy: Record<string, [string, string, string, string]> = {
+  type: ['凭据类型', 'Credential type', '应与提供商要求的认证方式一致。', 'Match the authentication method required by the provider.'],
+  value: ['新 API 密钥', 'New API key', '粘贴提供商签发的新密钥，不要填写账号密码。', 'Paste a new key issued by the provider, not your account password.'],
+  access_token: ['访问令牌', 'Access token', '粘贴授权流程取得的有效访问令牌。', 'Paste a valid access token from the authorization flow.'],
+  refresh_token: ['刷新令牌', 'Refresh token', '用于访问令牌到期后续期。请填写与新访问令牌配套的刷新令牌；留空不会保留旧刷新令牌。', 'Used to renew an expired access token. Supply the matching refresh token; leaving this blank does not retain the old refresh token.'],
+  expires_at: ['到期时间（Unix 毫秒）', 'Expiry (Unix milliseconds)', '填写提供商给出的到期时间戳，单位为毫秒，不是秒；可选时留空表示未知。', 'Use the provider’s expiry timestamp in milliseconds, not seconds. If optional, leave blank when unknown.'],
+  header: ['认证请求头', 'Authentication header', '通常使用 authorization；仅在提供商要求时修改。', 'Usually authorization; change only if the provider requires it.'],
+  prefix: ['认证前缀', 'Authentication prefix', '通常为 Bearer 加一个空格。尾部空格会原样保留。', 'Usually Bearer followed by a space. Trailing spaces are preserved.'],
+  proxy_url: ['账号代理地址', 'Account proxy URL', '仅在提供商支持时填写。留空沿用当前代理；Codex 的代理需在账号连接设置中修改。', 'Use only when supported by the provider. Omission retains the current proxy; change Codex proxies in account connection settings.'],
+  proxy_network_scope: ['代理网络范围', 'Proxy network scope', '私有网络代理需要相应的代理管理权限；不能使用此选项绕过网络访问限制。', 'Private proxies require the applicable proxy management permission; this option cannot bypass network restrictions.'],
+  adapter_state: ['授权附加数据', 'Authorization metadata', '这是提供商授权流程生成的敏感数据。若没有完整数据，请返回并使用账号重新授权。', 'Sensitive data produced by the provider authorization flow. If unavailable, go back and reauthorize the account.'],
+  scopes: ['提供商权限范围', 'Provider scopes', '使用提供商实际授予的权限；填写权限名称不会获得额外授权。', 'Use scopes actually granted by the provider; entering a scope does not grant it.'],
+};
