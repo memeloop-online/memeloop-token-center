@@ -31,6 +31,48 @@ fn tool_response() -> String {
 }
 
 #[tokio::test]
+async fn workbuddy_agent_authentication_and_credit_admission_are_required() {
+    let fixture = codex_route_fixture("workbuddy-admission").await;
+    let upstream = MockServer::start().await;
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&agent_request(&fixture.model, false)).unwrap(),
+        ))
+        .unwrap();
+    let response = codex_transport::with_test_endpoint(
+        upstream.uri(),
+        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE credit_accounts SET available_micros = 0 WHERE id = $1")
+        .bind(fixture.credit_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/chat/completions",
+        agent_request(&fixture.model, false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn workbuddy_agent_tool_round_trip_streaming_and_buffered_settles_once_per_turn() {
     for stream in [false, true] {
         let fixture = codex_route_fixture(&format!("workbuddy-{stream}")).await;

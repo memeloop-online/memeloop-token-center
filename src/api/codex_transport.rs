@@ -27,9 +27,12 @@ use crate::{
 
 #[path = "codex_transport/bad_request.rs"]
 mod bad_request;
+#[path = "codex_transport/chat_request.rs"]
 mod chat_request;
 #[cfg(test)]
+#[path = "codex_transport/chat_tests.rs"]
 mod chat_tests;
+#[path = "codex_transport/chat_tools.rs"]
 mod chat_tools;
 #[cfg(test)]
 use bad_request::codex_transient_error;
@@ -537,7 +540,7 @@ fn translate_chat_request(
         })?;
         chat_request::validate_message(message, role)?;
         if role == "tool" {
-            input.push(chat_request::tool_result(message)?);
+            input.push(chat_request::tool_result(message, &input)?);
             conversation_started = true;
             continue;
         }
@@ -548,6 +551,17 @@ fn translate_chat_request(
             continue;
         }
         let calls = chat_request::assistant_calls(message, role)?;
+        if let Some(refusal) = message.get("refusal").filter(|value| !value.is_null()) {
+            let mut content = Vec::new();
+            if let Some(text) = message.get("content").filter(|value| !value.is_null()) {
+                content.push(json!({"type": "output_text", "text": chat_text_content(text)?}));
+            }
+            content.push(json!({"type": "refusal", "refusal": refusal}));
+            input.push(json!({"type": "message", "role": role, "content": content}));
+            input.extend(calls);
+            conversation_started = true;
+            continue;
+        }
         let content = match message.get("content") {
             None | Some(Value::Null) if !calls.is_empty() => None,
             Some(content) => Some(chat_text_content(content)?),
@@ -685,6 +699,9 @@ fn validate_chat_stop(value: Option<&Value>, strict: bool) -> Result<(), AppErro
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(());
     };
+    if value.as_array().is_some_and(Vec::is_empty) {
+        return Ok(());
+    }
     let valid = match value {
         Value::String(value) => bounded_chat_stop(value),
         Value::Array(values) => {
@@ -710,7 +727,7 @@ fn validate_chat_stop(value: Option<&Value>, strict: bool) -> Result<(), AppErro
 }
 
 fn bounded_chat_stop(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control)
+    !value.is_empty() && value.len() <= 1_024
 }
 
 fn chat_output_limit(value: Option<&Value>, field: &str) -> Result<Option<i64>, AppError> {
@@ -1332,6 +1349,7 @@ pub(super) struct CodexChatStreamTranslator {
     include_usage: bool,
     text_delta: String,
     tools: BTreeMap<usize, chat_tools::StreamingTool>,
+    retained_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1364,6 +1382,7 @@ impl CodexChatStreamTranslator {
             include_usage,
             text_delta: String::new(),
             tools: BTreeMap::new(),
+            retained_bytes: 0,
         }
     }
 
@@ -1397,9 +1416,7 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Text)?;
-                if self.text_delta.len().saturating_add(delta.len()) > MAX_PROXY_RESPONSE_BODY {
-                    return Err("upstream_response_too_large");
-                }
+                self.retain_bytes(delta.len())?;
                 self.text_delta.push_str(delta);
                 Ok(Some(self.text_delta_chunk(delta)?))
             }
@@ -1413,6 +1430,7 @@ impl CodexChatStreamTranslator {
                     .filter(|delta| !delta.is_empty())
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
+                self.retain_bytes(delta.len())?;
                 self.refusal_delta.push_str(delta);
                 Ok(Some(self.refusal_delta_chunk(delta)?))
             }
@@ -1610,6 +1628,14 @@ impl CodexChatStreamTranslator {
             .ok_or("upstream_invalid_response")?;
         if !remaining.is_empty() || !self.started {
             output.extend_from_slice(&self.text_delta_chunk(remaining)?);
+        }
+        Ok(())
+    }
+
+    fn retain_bytes(&mut self, additional: usize) -> Result<(), &'static str> {
+        self.retained_bytes = self.retained_bytes.saturating_add(additional);
+        if self.retained_bytes > MAX_PROXY_RESPONSE_BODY {
+            return Err("upstream_response_too_large");
         }
         Ok(())
     }

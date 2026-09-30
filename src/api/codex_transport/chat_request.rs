@@ -177,12 +177,22 @@ fn translate_tool(value: &Value) -> Result<Value, AppError> {
 }
 
 pub(super) fn validate_message(message: &Map<String, Value>, role: &str) -> Result<(), AppError> {
-    for field in ["function_call", "audio", "refusal", "name"] {
+    for field in ["function_call", "audio"] {
         if non_null(message, field).is_some() {
             return Err(invalid(&format!(
                 "cannot preserve message.{field} semantics on this route"
             )));
         }
+    }
+    if non_null(message, "name").is_some() && role != "tool" {
+        return Err(invalid(
+            "cannot preserve named message participants on this route",
+        ));
+    }
+    if let Some(refusal) = non_null(message, "refusal")
+        && (role != "assistant" || !refusal.is_string())
+    {
+        return Err(invalid("refusal requires assistant text"));
     }
     if role != "assistant" && non_null(message, "tool_calls").is_some() {
         return Err(invalid("tool_calls requires the assistant role"));
@@ -234,8 +244,22 @@ pub(super) fn assistant_calls(
         .collect()
 }
 
-pub(super) fn tool_result(message: &Map<String, Value>) -> Result<Value, AppError> {
+pub(super) fn tool_result(
+    message: &Map<String, Value>,
+    input: &[Value],
+) -> Result<Value, AppError> {
     let call_id = required_string(message, "tool_call_id")?;
+    if let Some(name) = non_null(message, "name") {
+        let call = input
+            .iter()
+            .rev()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == call_id);
+        if !name.is_string() || call.is_none_or(|call| &call["name"] != name) {
+            return Err(invalid(
+                "tool result name must match its preceding tool call",
+            ));
+        }
+    }
     let content = message
         .get("content")
         .ok_or_else(|| invalid("tool result requires content"))?;

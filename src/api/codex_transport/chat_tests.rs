@@ -208,6 +208,49 @@ fn workbuddy_chat_sampling_limits_remain_operator_controlled() {
 }
 
 #[test]
+fn workbuddy_chat_refusal_history_named_tool_results_and_empty_stop_are_preserved() {
+    let mut body = request();
+    body["stop"] = json!([]);
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role": "assistant", "content": null, "refusal": "Cannot do that"}),
+        json!({"role": "assistant", "content": null, "tool_calls": [{"type": "function", "id": "call_1", "function": {"name": "lookup", "arguments": "{}"}}]}),
+        json!({"role": "tool", "tool_call_id": "call_1", "name": "lookup", "content": "ok"}),
+    ]);
+    let mut mismatched = body.clone();
+    mismatched["messages"][3]["name"] = json!("different");
+    assert!(prepare(&mut mismatched, "strict").is_err());
+    prepare(&mut body, "strict").unwrap();
+    assert_eq!(
+        body["input"][1]["content"][0],
+        json!({"type": "refusal", "refusal": "Cannot do that"})
+    );
+    assert_eq!(
+        body["input"][3],
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"})
+    );
+    let mut body = request();
+    body["stop"] = json!(["\n\n"]);
+    assert!(prepare(&mut body.clone(), "strict").is_err());
+    prepare(&mut body, "provider_default").unwrap();
+}
+
+#[test]
+fn workbuddy_chat_stream_bounds_total_retained_tool_arguments() {
+    let mut translator = CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), false);
+    translator
+        .translate_frame(&frame(
+            &json!({"type": "response.output_item.added", "output_index": 0, "item": call(0, "")}),
+        ))
+        .unwrap();
+    translator.retained_bytes = MAX_PROXY_RESPONSE_BODY;
+    let event = json!({"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_0", "delta": "{"});
+    assert_eq!(
+        translator.translate_frame(&frame(&event)),
+        Err("upstream_response_too_large")
+    );
+}
+
+#[test]
 fn workbuddy_chat_tool_stream_matches_buffered_with_interleaved_arguments() {
     let first = call(0, "{\"key\":\"A\"}");
     let second = call(1, "{\"key\":\"B\"}");

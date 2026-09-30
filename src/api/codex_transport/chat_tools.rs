@@ -73,6 +73,7 @@ impl CodexChatStreamTranslator {
             tool.arguments = arguments.to_owned();
             tool.done = true;
             let index = tool.index;
+            self.retain_bytes(remaining.len())?;
             return if remaining.is_empty() {
                 Ok(None)
             } else {
@@ -89,6 +90,13 @@ impl CodexChatStreamTranslator {
             return Err("upstream_invalid_response");
         }
         let index = self.tools.len();
+        self.retain_bytes(
+            item_id
+                .len()
+                .saturating_add(identity(item, "call_id")?.len())
+                .saturating_add(identity(item, "name")?.len())
+                .saturating_add(arguments.len()),
+        )?;
         self.tools.insert(
             position,
             StreamingTool {
@@ -137,6 +145,7 @@ impl CodexChatStreamTranslator {
         tool.arguments.push_str(&delta);
         tool.done = done;
         let index = tool.index;
+        self.retain_bytes(delta.len())?;
         if delta.is_empty() {
             return Ok(None);
         }
