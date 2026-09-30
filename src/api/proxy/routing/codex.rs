@@ -278,7 +278,7 @@ async fn send_codex_attempt(
             Some(route.route.credential_generation),
         );
         let result = send_codex_attempt_once(
-            state, headers, target_url, route, session_id, client, deadline, request_id,
+            state, headers, target_url, route, session_id, client, context,
         )
         .await;
         phase.finish(
@@ -362,9 +362,13 @@ async fn send_codex_attempt_once(
     route: &PreparedProxyRoute,
     session_id: &str,
     client: &wreq::Client,
-    deadline: CodexRequestDeadline,
-    request_id: Uuid,
+    context: CodexAttemptContext,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+    let CodexAttemptContext {
+        request_id,
+        deadline,
+        ..
+    } = context;
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
         .try_with(|remaining| {

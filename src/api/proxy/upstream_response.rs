@@ -46,10 +46,10 @@ pub(super) fn codex_http2_error<'a>(
 ) -> Option<&'a http2::Error> {
     let mut source = Some(error);
     while let Some(current) = source {
-        if let Some(http2) = current.downcast_ref::<http2::Error>() {
-            if http2.is_reset() || http2.is_go_away() {
-                return Some(http2);
-            }
+        if let Some(http2) = current.downcast_ref::<http2::Error>()
+            && (http2.is_reset() || http2.is_go_away())
+        {
+            return Some(http2);
         }
         if let Some(inner) = current
             .downcast_ref::<std::io::Error>()
