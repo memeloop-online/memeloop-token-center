@@ -162,10 +162,11 @@ async fn staged_login_recovery(stale_account: bool) {
         .await
         .unwrap();
     if stale_account {
-        assert!(matches!(
-            poll_codex_oauth_for_worker(&state, session_id).await,
-            Err(crate::error::AppError::Conflict(_))
-        ));
+        let result = poll_codex_oauth_for_worker(&state, session_id).await;
+        assert!(
+            matches!(result, Err(crate::error::AppError::Conflict(_))),
+            "unexpected stale worker result: {result:?}"
+        );
         assert!(
             state
                 .db
