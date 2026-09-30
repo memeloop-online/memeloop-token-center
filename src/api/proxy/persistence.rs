@@ -108,6 +108,7 @@ pub(super) fn capture(
                 tracing::warn!(request_id = %identity.request_id, stage = "deferred_started_event", error_category = error.diagnostic_category(), "request event publication failed");
             }
             if body.len() > 16 * 1024 * 1024 {
+                background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit);
                 return db.record_deferred_request_retention_gap(identity, &body).await;
             }
         }

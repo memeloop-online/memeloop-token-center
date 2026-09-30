@@ -40,7 +40,8 @@ change in the original dirty tree still needs independent integration review.
    three body copies, 256 bytes per scanned JSON node and 4 MiB of batch overhead.
    Over-budget input is rejected for archival before cloning/parsing a JSON tree.
    This is an allocation model, not an RSS upper bound.
-4. Background capture uses a separate two-connection pool. Native stream archive
+4. Background capture uses a separate two-connection pool with lazy connection
+   establishment, so its availability is not a new startup gate. Native stream archive
    writers have at most four owners and a separate 4 MiB memory budget. The
    existing per-stream queue is three complete 64 KiB chunks; producer/writer
    permits bound complete chunks together, plus one partial chunk.

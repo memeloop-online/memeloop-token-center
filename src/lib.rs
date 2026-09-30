@@ -145,9 +145,7 @@ impl AppState {
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
-        let persistence_db = Database::connect_with_max(&config.database_url, 2)
-            .await
-            .map_err(|_| InitializationError::Database)?;
+        let persistence_db = db.independent_persistence_pool();
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins

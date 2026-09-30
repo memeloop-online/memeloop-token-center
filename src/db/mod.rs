@@ -470,6 +470,21 @@ impl Database {
             .await
     }
 
+    pub(crate) fn independent_persistence_pool(&self) -> Self {
+        Self {
+            pool: self
+                .pool
+                .options()
+                .clone()
+                .min_connections(0)
+                .max_connections(2)
+                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            backend: self.backend,
+            #[cfg(test)]
+            oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
     pub async fn require_account_tenant(
         &self,
         account_id: Uuid,
