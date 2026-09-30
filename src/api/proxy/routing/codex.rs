@@ -278,7 +278,7 @@ async fn send_codex_attempt(
             Some(route.route.credential_generation),
         );
         let result = send_codex_attempt_once(
-            state, headers, target_url, route, session_id, client, deadline,
+            state, headers, target_url, route, session_id, client, deadline, request_id,
         )
         .await;
         phase.finish(
@@ -363,6 +363,7 @@ async fn send_codex_attempt_once(
     session_id: &str,
     client: &wreq::Client,
     deadline: CodexRequestDeadline,
+    request_id: Uuid,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
@@ -396,7 +397,24 @@ async fn send_codex_attempt_once(
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = send_until_request_deadline(deadline.request, async {
-        request.send().await.map_err(classify_wreq_send_error)
+        request.send().await.map_err(|error| {
+            if let Some(http2) = upstream_response::codex_http2_error(&error) {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %route.route.account_id,
+                    transport_revision = route.route.transport_revision,
+                    account_proxy = route.route.credential.proxy().is_some(),
+                    stage = "codex_http2_before_response_headers",
+                    http2_reset = http2.is_reset(),
+                    http2_goaway = http2.is_go_away(),
+                    http2_remote = http2.is_remote(),
+                    http2_library = http2.is_library(),
+                    http2_reason = ?http2.reason().map(u32::from),
+                    "Codex HTTP/2 failure origin evidence"
+                );
+            }
+            classify_wreq_send_error(error)
+        })
     })
     .await;
     record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
