@@ -355,9 +355,10 @@ impl Database {
             }
         }
         let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
-        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
+        let gap_locator = format!("gap://{}/{}", identity.request_id, purpose.as_str());
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
+            .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut **tx).await?;
         if valid != 1 {
             return Err(AppError::Internal);
         }

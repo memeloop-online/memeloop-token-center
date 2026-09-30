@@ -362,7 +362,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 const successfulGaps = reader.prepare("SELECT COALESCE(SUM(CASE WHEN request_object LIKE 'gap:%' THEN 1 ELSE 0 END + CASE WHEN response_object IS NULL OR response_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS count FROM request_records WHERE status_code = 200").get();
                 const persistence = deferredPersistenceEvidence(metricsText);
                 assert(persistence.failed === 0, "healthy archive storage must not report capture failures");
-                assert(Number(successfulGaps?.count) <= persistence.capacity, "archive gaps must be accounted for by explicit bounded capacity rejection");
+                const rejected = persistence.capacity;
+                assert(rejected !== undefined, "capacity rejection counter must be present");
+                assert(Number(successfulGaps?.count) <= rejected, "archive gaps must be accounted for by explicit bounded capacity rejection");
                 const processMemoryEvidence = processMemory(service!.pid!);
                 return { ...row, permits: gauges, persistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
               }
