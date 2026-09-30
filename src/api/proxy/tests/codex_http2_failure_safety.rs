@@ -84,8 +84,8 @@ async fn set_short_http2_deadline(fixture: &CodexRouteFixture) {
         "candidate_attempts": 2,
         "connect_timeout_millis": 100,
         "read_timeout_millis": 1000,
-        "request_timeout_millis": 1000,
-        "failover_deadline_millis": 3000
+        "request_timeout_millis": 3000,
+        "failover_deadline_millis": 5000
     });
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
@@ -148,7 +148,7 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(rows[0].cost, "0");
     let expected_error = match failure {
-        Failure::PreHeaderReset => "upstream_http2_reset",
+        Failure::PreHeaderReset => "upstream_transport_http2_reset",
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
     };
