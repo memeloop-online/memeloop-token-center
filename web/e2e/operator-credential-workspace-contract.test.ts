@@ -226,7 +226,13 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await plaintext.goto(fixture('service-plaintext'));
     await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
-    await plaintext.locator('details.create-resource > summary').click();
+    await plaintext.getByRole('button', { name: 'Create service credential form', exact: true }).click();
+    const plaintextForm = plaintext.locator('form.service-credential-create');
+    await plaintextForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Plaintext integration');
+    assert.equal(await plaintextForm.getByRole('textbox', { name: 'Tenant scope', exact: true }).inputValue(), 'tenant-a');
+    await plaintextForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
+    assert.equal(await plaintextForm.getByRole('checkbox', { name: 'Read requests and usage (requests:read)', exact: true }).isChecked(), true);
+    assert.equal(await plaintextForm.getByRole('checkbox', { name: 'Manage client credentials (keys:write)', exact: true }).isChecked(), false);
     const create = plaintext.getByRole('button', { name: 'Create service credential', exact: true });
     await create.evaluate((button) => {
       (button as HTMLButtonElement).click();
@@ -257,7 +263,10 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await aba.goto(fixture('service-scope-aba'));
     await aba.getByText('Existing service credential', { exact: true }).waitFor();
-    await aba.locator('details.create-resource > summary').click();
+    await aba.getByRole('button', { name: 'Create service credential form', exact: true }).click();
+    const abaForm = aba.locator('form.service-credential-create');
+    await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Scoped integration');
+    await abaForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
     const abaCreate = aba.getByRole('button', { name: 'Create service credential', exact: true });
     await abaCreate.click();
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
@@ -268,8 +277,11 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_stale'));
     await nextPaint(aba);
     assert.equal(await aba.getByText('mts_service_secret_stale', { exact: true }).count(), 0, 'an old response cannot reappear after an A-B-A scope transition');
-    await aba.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Create service credential' && !button.disabled));
+    await aba.getByRole('button', { name: 'Create service credential form', exact: true }).click();
+    await aba.getByRole('button', { name: 'Create service credential', exact: true }).waitFor();
     assert.equal(await abaCreate.isDisabled(), false, 'scope cleanup releases the stale operation guard');
+    await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Current integration');
+    await abaForm.getByRole('button', { name: 'Select read-only statistics only', exact: true }).click();
     await abaCreate.click();
     await aba.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 2);
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_current'));
