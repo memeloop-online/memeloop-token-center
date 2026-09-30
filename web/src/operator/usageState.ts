@@ -33,7 +33,7 @@ export function defaultUsageSelection(now = Date.now()): UsageSelection {
   };
 }
 
-function rangeFor(selection: UsageSelection, now = Date.now()) {
+function rangeFor(selection: Pick<UsageSelection, 'preset' | 'customFrom' | 'customTo'>, now = Date.now()) {
   const end = now;
   if (selection.preset === '24h') return { from: end - 86_400_000, to: end };
   if (selection.preset === '7d') return { from: end - 7 * 86_400_000, to: end };
