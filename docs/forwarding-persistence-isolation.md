@@ -62,9 +62,11 @@ review, formatting and `git diff --check`.
 
 - `deferred_persistence_normal_failure_and_saturation_preserve_forwarding`:
   real gateway, buffered and streaming output, SQL archive failure, all four
-  background slots occupied; one upstream invocation and one settlement.
+  background slots occupied, all persistence connections held, and a closed
+  persistence pool; one upstream invocation and one settlement.
 - `pending_response_archive_begin_does_not_hold_first_byte_or_eof`: archive begin
-  latch remains closed until a complete HTTP body is received.
+  latch remains closed until a complete HTTP body is received and the forwarding
+  memory budget returns to zero; archive memory remains independently charged.
 - `postgres_archive_budget_lock_does_not_block_dispatch_or_buffered_delivery`:
   a real PostgreSQL transaction holds the shared budget row while dispatch and
   the entire buffered response complete.

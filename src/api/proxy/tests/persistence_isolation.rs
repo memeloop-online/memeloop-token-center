@@ -2,12 +2,30 @@ use super::*;
 
 #[tokio::test]
 async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding() {
-    for mode in ["normal", "failure", "saturation"] {
+    for mode in [
+        "normal",
+        "failure",
+        "saturation",
+        "pool_starvation",
+        "pool_closed",
+    ] {
         for stream in [false, true] {
             let fixture = codex_route_fixture(&format!("persistence-{mode}-{stream}")).await;
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
             let release = std::sync::Arc::new(tokio::sync::Notify::new());
             let mut held = Vec::new();
+            let pool_holders = if mode == "pool_starvation" {
+                fixture
+                    .state
+                    .persistence_db
+                    .hold_group_snapshot_pool_for_tests()
+                    .await
+            } else {
+                Vec::new()
+            };
+            if mode == "pool_closed" {
+                fixture.state.persistence_db.close().await;
+            }
             if mode == "failure" {
                 for table in ["request_archive_spools", "response_archive_spools"] {
                     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -68,6 +86,7 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 );
             }
             release.notify_waiters();
+            drop(pool_holders);
             wait_for_request_settlement(&fixture, 1).await;
             let rows = fixture
                 .state
@@ -118,7 +137,15 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
             .unwrap()
             .contains("complete while archive is paused")
     );
-    release.send(()).unwrap();
     wait_for_request_settlement(&fixture, 1).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.state.proxy_memory_budget.snapshot().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("paused archive must not retain forwarding memory");
+    assert!(fixture.state.persistence.stream_memory.snapshot().0 > 0);
+    release.send(()).unwrap();
     upstream.verify().await;
 }
