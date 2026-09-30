@@ -50,6 +50,8 @@ struct MetricsInner {
     codex_bad_request_classifications: Mutex<BTreeMap<CodexBadRequestClassification, u64>>,
     codex_bad_request_retries: Mutex<BTreeMap<CodexBadRequestRetry, u64>>,
     codex_dispatch: Mutex<BTreeMap<&'static str, u64>>,
+    codex_egress_send_failures:
+        [[AtomicU64; CodexEgressFailureStage::COUNT]; CodexEgressPath::COUNT],
     active_http_requests: AtomicI64,
     active_streams: [AtomicI64; ActiveStreamKind::COUNT],
     active_upstreams: Mutex<BTreeMap<UpstreamActivityLabels, i64>>,
@@ -78,6 +80,9 @@ impl Default for MetricsInner {
             codex_bad_request_classifications: Mutex::default(),
             codex_bad_request_retries: Mutex::default(),
             codex_dispatch: Mutex::default(),
+            codex_egress_send_failures: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
             active_http_requests: AtomicI64::new(0),
             active_streams: std::array::from_fn(|_| AtomicI64::new(0)),
             active_upstreams: Mutex::default(),
@@ -144,6 +149,83 @@ impl ProxyMemoryRejectionStage {
             Self::Route => "route",
             Self::Plugin => "plugin",
             Self::Response => "response",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexEgressPath {
+    Direct,
+    AccountProxy,
+}
+
+impl CodexEgressPath {
+    const COUNT: usize = 2;
+    const ALL: [Self; Self::COUNT] = [Self::Direct, Self::AccountProxy];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::AccountProxy => "account_proxy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexEgressFailureStage {
+    ProxyConnect,
+    Dns,
+    Tls,
+    Connect,
+    Timeout,
+    ConnectionReset,
+    Http2Reset,
+    Http2GoAway,
+    Body,
+    Decode,
+    Request,
+    Other,
+}
+
+impl CodexEgressFailureStage {
+    const COUNT: usize = 12;
+    const ALL: [Self; Self::COUNT] = [
+        Self::ProxyConnect,
+        Self::Dns,
+        Self::Tls,
+        Self::Connect,
+        Self::Timeout,
+        Self::ConnectionReset,
+        Self::Http2Reset,
+        Self::Http2GoAway,
+        Self::Body,
+        Self::Decode,
+        Self::Request,
+        Self::Other,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ProxyConnect => "proxy_connect",
+            Self::Dns => "dns",
+            Self::Tls => "tls",
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::ConnectionReset => "connection_reset",
+            Self::Http2Reset => "http2_reset",
+            Self::Http2GoAway => "http2_goaway",
+            Self::Body => "body",
+            Self::Decode => "decode",
+            Self::Request => "request",
+            Self::Other => "other",
         }
     }
 }
@@ -451,6 +533,15 @@ impl Metrics {
         self.inner.request_archive_gaps[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_codex_egress_send_failure(
+        &self,
+        path: CodexEgressPath,
+        stage: CodexEgressFailureStage,
+    ) {
+        self.inner.codex_egress_send_failures[path.index()][stage.index()]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn proxy_memory_wait(
         &self,
         stage: memory_admission::Stage,
@@ -649,6 +740,7 @@ impl Metrics {
             .clone();
         let mut output = String::with_capacity(16 * 1024);
         self.render_codex_dispatch(&mut output);
+        render_codex_egress_send_failures(&mut output, &self.inner);
         self.inner.memory_admission.render(&mut output);
         self.inner.plugin_execution.render(&mut output);
         output.push_str("# HELP memeloop_token_center_proxy_memory_rejections_total Capacity rejections by fixed admission stage.\n");
@@ -714,6 +806,23 @@ impl Metrics {
         render_process(&mut output, &self.inner);
         render_allocator(&mut output);
         output
+    }
+}
+
+fn render_codex_egress_send_failures(output: &mut String, inner: &MetricsInner) {
+    output.push_str("# HELP memeloop_token_center_codex_egress_send_failures_total Codex send attempt failures, including absolute request deadlines, by fixed outbound path and failure stage.\n");
+    output.push_str("# TYPE memeloop_token_center_codex_egress_send_failures_total counter\n");
+    for path in CodexEgressPath::ALL {
+        for stage in CodexEgressFailureStage::ALL {
+            let value = inner.codex_egress_send_failures[path.index()][stage.index()]
+                .load(Ordering::Relaxed);
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_codex_egress_send_failures_total{{path=\"{}\",stage=\"{}\"}} {value}",
+                path.label(),
+                stage.label(),
+            );
+        }
     }
 }
 
@@ -1509,6 +1618,49 @@ mod tests {
         assert!(rendered.contains(
             "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
         ));
+    }
+
+    #[test]
+    fn codex_egress_send_failures_have_only_fixed_labels_and_count_each_failure() {
+        let metrics = Metrics::default();
+        for path in CodexEgressPath::ALL {
+            for stage in CodexEgressFailureStage::ALL {
+                metrics.record_codex_egress_send_failure(path, stage);
+            }
+        }
+        metrics.record_codex_egress_send_failure(
+            CodexEgressPath::AccountProxy,
+            CodexEgressFailureStage::ProxyConnect,
+        );
+
+        let rendered = metrics.render(&RuntimeMetrics::default());
+        let series = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("memeloop_token_center_codex_egress_send_failures_total{")
+            })
+            .collect::<Vec<_>>();
+        let expected = CodexEgressPath::ALL
+            .into_iter()
+            .flat_map(|path| {
+                CodexEgressFailureStage::ALL.into_iter().map(move |stage| {
+                    let count = if path == CodexEgressPath::AccountProxy
+                        && stage == CodexEgressFailureStage::ProxyConnect
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    format!(
+                        "memeloop_token_center_codex_egress_send_failures_total{{path=\"{}\",stage=\"{}\"}} {count}",
+                        path.label(),
+                        stage.label(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(series, expected);
+        assert_eq!(series.len(), 24);
     }
 
     #[tokio::test]
