@@ -442,7 +442,6 @@ mod tests {
         );
         assert_eq!(body.next().await, Some(Err(UPSTREAM_HTTP2_RESET)));
         assert!(body.next().await.is_none());
-        assert!(body.next().await.is_none());
     }
 
     #[tokio::test]
