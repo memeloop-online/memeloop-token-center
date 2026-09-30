@@ -211,9 +211,8 @@ impl RequestCompatibility {
     }
 
     pub fn supports_codex_multi_agent_v2(&self) -> bool {
-        // This predicate is only the Responses-via-Chat dialect path (Kimi,
-        // declared plugins). Native Codex and http-json already speak
-        // `/v1/responses` and do not use this flag.
+        // Native Codex and http-json already speak `/v1/responses` and do not
+        // use this flag unless a declared translation adapter is selected.
         self.third_party
             && self.codex_multi_agent_v2
             && ((self.responses_via_chat_v1 && self.responses_via_chat_dialect.is_some())
@@ -469,6 +468,7 @@ impl ProviderCatalog {
                 responses_via_chat_v1: true,
                 responses_via_chat_dialect: Some(ResponsesViaChatDialect::OpenAiChatV1),
                 responses_transport_configurable: true,
+                responses_via_anthropic_messages_v1: false,
                 codex_multi_agent_v2: true,
             },
             codex_model_capabilities: None,
