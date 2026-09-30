@@ -69,6 +69,8 @@ record metering {
 
 Provider 可以声明 `oauth_adapter`（`api_version: "oauth-adapter-v1"`，`flow_kind: "cursor_pkce"`，提供 `login_url`、`poll_url`、`refresh_url`），由核心执行版本化 PKCE 协议；也可以声明 `authorization_code_pkce` 使用通用授权码流程。两种方式下 token 都只进入核心加密凭证表，组件与插件 KV 不接触 token。
 
+OpenAI 兼容 Provider 可以声明带版本的 `openai_chat_v1` Responses 桥接。仅提供 Chat 的 Provider 设置 `responses_via_chat_v1`；账号可能提供两种传输时，再设置 `responses_transport_configurable`，并在配置 Schema 中声明只允许 `native_responses`、`chat_completions` 的 `responses_transport` 字段。账号选择是唯一协议信号，与主机名、模型名相互独立。
+
 ## 后台服务数据（`component-v1`）
 
 Operator 页签和卡片可读取 `contributions.service_data` 的类型化快照。URL 端点使用内置 HTTPS JSON 采集器；可执行端点声明签名组件中的 collector 与 normalizer：
