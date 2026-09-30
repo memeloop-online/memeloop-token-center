@@ -210,16 +210,30 @@ pub(in crate::api) async fn poll_codex_oauth(
     let session_token = match (body.session_token, body.session_id) {
         (Some(token), None) => token,
         (None, Some(session_id)) => {
-            crate::oauth::codex_device::recover_codex_device_session_token(
-                &state.db,
-                session_id,
-                state.config.key_pepper.as_bytes(),
-                CodexDevicePollScope {
-                    required_tenant: service.tenant_external_id.as_deref(),
-                    operator_service_id: service.service_id,
+            let (reference, _) = state.db.codex_login_session_reference(session_id).await?;
+            require_service_tenant(&service, &reference.tenant_external_id)?;
+            if reference.operator_service_id != service.service_id {
+                return Err(AppError::Forbidden);
+            }
+            let progress = match state
+                .db
+                .codex_login_progress(&reference, unix_millis())
+                .await?
+            {
+                crate::db::OAuthLoginClaim::Pending {
+                    retry_after_seconds,
+                } => CodexDevicePollResult::Pending {
+                    retry_after_seconds,
                 },
-            )
-            .await?
+                crate::db::OAuthLoginClaim::Consumed { account_id } => {
+                    CodexDevicePollResult::Consumed {
+                        account_id,
+                        tenant_external_id: reference.tenant_external_id,
+                    }
+                }
+                _ => return Err(AppError::Internal),
+            };
+            return codex_oauth_response(state, service, progress).await;
         }
         _ => {
             return Err(AppError::BadRequest(
@@ -256,7 +270,7 @@ async fn poll_codex_oauth_impl(
     service: AuthenticatedService,
     session_token: &str,
 ) -> Result<Response, AppError> {
-    match poll_codex_device_login(
+    let result = poll_codex_device_login(
         &state.db,
         &state.http,
         session_token,
@@ -268,8 +282,16 @@ async fn poll_codex_oauth_impl(
         },
         state.config.codex_test_loopback,
     )
-    .await?
-    {
+    .await?;
+    codex_oauth_response(state, service, result).await
+}
+
+async fn codex_oauth_response(
+    state: AppState,
+    service: AuthenticatedService,
+    result: CodexDevicePollResult,
+) -> Result<Response, AppError> {
+    match result {
         CodexDevicePollResult::Pending {
             retry_after_seconds,
         } => Ok((

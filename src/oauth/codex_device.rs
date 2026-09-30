@@ -119,6 +119,8 @@ struct CodexDeviceLoginState {
     exchange_dispatched: bool,
     #[serde(default)]
     issued_token: Option<OAuthTokenResponse>,
+    #[serde(default)]
+    token_received_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,6 +299,7 @@ async fn start_codex_device_login_at(
         device_token: None,
         exchange_dispatched: false,
         issued_token: None,
+        token_received_at: None,
     };
     let session = CodexDeviceSessionToken {
         session_id,
@@ -535,6 +538,7 @@ async fn poll_codex_device_login_at(
         )
         .await?;
         state.issued_token = Some(token.clone());
+        state.token_received_at = Some(now);
         db.replace_oauth_login_poll_state(
             state.session_id,
             lease_owner,
@@ -558,7 +562,9 @@ async fn poll_codex_device_login_at(
     if !(1..=MAX_TOKEN_LIFETIME_SECONDS).contains(&token.expires_in) {
         return Err(device_error());
     }
-    let expires_at = now
+    let expires_at = state
+        .token_received_at
+        .unwrap_or(now)
         .checked_add(
             token
                 .expires_in

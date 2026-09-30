@@ -33,6 +33,7 @@ async fn interrupted_exchange_is_not_replayed_after_worker_restart() {
         }),
         exchange_dispatched: true,
         issued_token: None,
+        token_received_at: None,
     };
     database
         .begin_oauth_login_session(BeginOAuthLoginSession {

@@ -7761,7 +7761,7 @@ components:
         - required: [session_id]
       properties:
         session_token: { type: string, writeOnly: true }
-        session_id: { type: string, format: uuid, description: Resume the original session after a browser refresh without issuing another device code. }
+        session_id: { type: string, format: uuid, description: Read the original session status after refresh. This form only observes; the background worker owns polling and exchange. }
     OAuthPollRequest:
       type: object
       required: [session_token]

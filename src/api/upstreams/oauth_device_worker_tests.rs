@@ -126,6 +126,21 @@ async fn worker_recovers_staged_login_after_browser_loss_and_expiry_without_crea
         )
         .await
         .unwrap();
+    let observe = || async {
+        let headers = axum::http::HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", state.config.service_token))
+                .unwrap(),
+        )]);
+        super::oauth::poll_codex_oauth(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::Json(serde_json::from_value(json!({"session_id":session_id})).unwrap()),
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(observe().await.status(), axum::http::StatusCode::ACCEPTED);
     assert_eq!(
         state.db.due_codex_login_sessions(now, 16).await.unwrap(),
         vec![session_id]
@@ -139,6 +154,12 @@ async fn worker_recovers_staged_login_after_browser_loss_and_expiry_without_crea
     poll_codex_oauth_for_worker(&state, session_id)
         .await
         .unwrap();
+    let observed = observe().await;
+    assert_eq!(observed.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(observed.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("synthetic-replacement"));
     let accounts = state
         .db
         .list_upstream_accounts("device-worker-fixture")

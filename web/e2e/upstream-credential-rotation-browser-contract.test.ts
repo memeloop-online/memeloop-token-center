@@ -21,13 +21,14 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       const copy = labels[locale];
       const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-      const account = { id: 'rotation-fixture', name: 'rotation@example.org', tenant_external_id: 'fixture-a', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, status: 'active', can_rotate: true, can_refresh: false, can_reauthorize: false, route_count: 0, config: { base_url: 'https://provider.example.invalid' }, created_at: 1, updated_at: 2 };
+      const account = { id: 'rotation-fixture', name: 'rotation@example.org', tenant_external_id: 'fixture-a', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: true, can_refresh: false, can_reauthorize: false, route_count: 0, config: { base_url: 'https://provider.example.invalid' }, created_at: 1, updated_at: 2 };
       const writes: { path: string; method: string; body: unknown; idempotency?: string }[] = [];
       let responseStatus = 503;
       await page.route('**/*', async route => {
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'the fixture must never contact a real provider');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
+        if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } });
         if (request.method() !== 'GET') {
           writes.push({ path: url.pathname, method: request.method(), body: request.postDataJSON(), idempotency: request.headers()['idempotency-key'] });
           assert.equal(url.pathname, '/internal/v1/upstreams/rotation-fixture/credential');

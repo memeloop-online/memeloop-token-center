@@ -50,7 +50,8 @@ test('host flow is catalog selected and has no replay, storage, or raw error dis
   assert.match(component, /widgets=\{fluentFormWidgets\}/);
   assert.doesNotMatch(component, /<input\b|<select\b/);
   assert.match(component, /saved\.current = true/);
-  assert.match(component, /try \{ await onChanged\(\); \}/);
+  assert.match(component, /try \{ await onChanged\(result\); \}/);
+  assert.match(component, /await onChanged\(savedAccount\.current\)/);
   assert.match(component, /copy\.savedButReadFailed/);
   assert.match(component, /setRecoveryDeadline\(result\.recovery_expires_at\)/);
   assert.match(component, /proxy_network_scope: 'private'/);

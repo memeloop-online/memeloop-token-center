@@ -282,11 +282,11 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     setReauthorizing(account); setEditing(undefined);
   }
 
-  function returnFromReauthorization() {
-    if (!reauthorizing) return;
-    reauthorizationReturnFocus.current = reauthorizing.id;
-    if (reauthorizationOrigin.current === 'settings') setEditing(reauthorizing);
-    else { setProviderWorkspaceOpen(false); setProviderDetail(reauthorizing.id); }
+  function returnFromReauthorization(account = reauthorizing) {
+    if (!account) return;
+    reauthorizationReturnFocus.current = account.id;
+    if (reauthorizationOrigin.current === 'settings') setEditing(account);
+    else { setProviderWorkspaceOpen(false); setProviderDetail(account.id); }
     setReauthorizing(undefined);
   }
 
@@ -503,8 +503,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       {error && <div className="notice error" role="alert">{error}</div>}
       {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
       {editing || rotating ? providerEditors : reauthorizing ? <>
-      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onConnectionChanged={onChanged} onAccountSaved={updated => setReauthorizing(updated)} onEditingChange={setProxyEditorOpen} onChanged={async () => { await onChanged(); returnFromReauthorization(); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
-      <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={returnFromReauthorization}>{authorizationJourneyCopy(locale).back}</Button>
+      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onConnectionChanged={onChanged} onAccountSaved={updated => setReauthorizing(updated)} onEditingChange={setProxyEditorOpen} onChanged={async updated => { await onChanged(); returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
+      <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnFromReauthorization()}>{authorizationJourneyCopy(locale).back}</Button>
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
@@ -517,7 +517,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
 
 type NativeAuthorizationSession = { login_url?: string; verification_url?: string; user_code?: string; session_token?: string; session_id?: string; resumed?: boolean; expires_at?: number; poll_after_seconds?: number };
 
-function AuthorizationConnection({ token, tenant, providers, existing, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: () => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
+function AuthorizationConnection({ token, tenant, providers, existing, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: (account?: UpstreamAccount) => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
   const { locale, t } = useI18n();
   const journeyCopy = authorizationJourneyCopy(locale);
   const [connectionEditing, setConnectionEditing] = useState(false);
@@ -546,6 +546,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [now, setNow] = useState(Date.now);
   const [listRetry, setListRetry] = useState(false);
   const [listLoading, setListLoading] = useState(false);
+  const savedAccount = useRef<UpstreamAccount | undefined>(undefined);
   const scopeVersion = useRef(0);
   useEffect(() => () => { scopeVersion.current += 1; pollRequest.current?.abort(); }, [token, tenant]);
   const isKimi = isKimiDeviceProvider(selectedProvider);
@@ -608,7 +609,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     if (listLoading) return;
     setListLoading(true);
     const attempt = scopeVersion.current;
-    try { await onChanged(); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
+    try { await onChanged(savedAccount.current); if (scopeVersion.current === attempt) { setListRetry(false); setError(''); } }
     catch { if (scopeVersion.current === attempt) { setListRetry(true); setError(t('providers.savedListUnavailable')); } }
     finally { if (scopeVersion.current === attempt) setListLoading(false); }
   };
@@ -628,7 +629,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     try {
       const result = await api<UpstreamAccount | { status: string; message?: string; retry_after_seconds?: number }>(path, token, { method: 'POST', body: JSON.stringify(session.session_id ? { session_id: session.session_id } : { session_token: session.session_token }), signal: AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]) });
       if (scopeVersion.current !== attempt) return;
-      if ('id' in result) { clearDeviceLoginRecovery(session.session_id); setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await reloadList(); }
+      if ('id' in result) { savedAccount.current = result; clearDeviceLoginRecovery(session.session_id); setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await reloadList(); }
       else {
         setNextPollAt(Date.now() + Math.max(1, result.retry_after_seconds ?? session.poll_after_seconds ?? 5) * 1000); setNow(Date.now());
         setMessage(journeyCopy.automatic);
@@ -656,7 +657,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     try {
       const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }) });
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
-      setSession(undefined); setManualCode(''); await onChanged();
+      savedAccount.current = result; setSession(undefined); setManualCode(''); await reloadList();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
   return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>

@@ -16,7 +16,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await page.clock.install();
       await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-      let account = { id: 'reauthorization-fixture', name: 'reauthorize@example.org', tenant_external_id: 'fixture-a', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, updated_at: 3, route_count: 0, config: { base_url: 'https://provider.example.invalid' }, can_reauthorize: true, can_update_transport_proxy: true, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true };
+      let account = { id: 'reauthorization-fixture', name: 'reauthorize@example.org', tenant_external_id: 'fixture-a', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, updated_at: 3, route_count: 0, config: { base_url: 'https://provider.example.invalid' }, can_reauthorize: true, can_update_transport_proxy: true, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true };
       let proxy = 'socks5h://10.0.0.8:1080';
       let pollCount = 0;
       let failPoll = true;
@@ -26,6 +26,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
         assert.equal(url.origin, origin, 'no live OAuth or external account traffic');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
         if (request.method() === 'GET') {
+          if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } });
           if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'openai-codex', display_name: 'Fixture Codex', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'openai_device' } }] });
           if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: [account] });
           if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy } });
@@ -76,7 +77,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       const copyCode = workspace.getByRole('button', { name: chinese ? '复制设备验证码' : 'Copy device code', exact: true });
       await copyCode.focus(); await page.keyboard.press('Space');
       assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'FIXTURE-CODE');
-      await page.evaluate(() => { Object.defineProperty(navigator.clipboard, 'writeText', { configurable: true, value: () => Promise.reject(new Error('fixture-denied')) }); });
+      await page.evaluate("Object.defineProperty(navigator.clipboard, 'writeText', { configurable: true, value: () => Promise.reject(new Error('fixture-denied')) })");
       await copyCode.click();
       await workspace.getByText(chinese ? '复制失败，请选择验证码后手动复制。' : 'Copy failed. Select the device code and copy it manually.').waitFor();
       assert.equal(await workspace.getByRole('button', { name: chinese ? '检查授权结果' : 'Check authorization', exact: true }).count(), 0);
