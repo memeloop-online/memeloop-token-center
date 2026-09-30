@@ -47,6 +47,7 @@ mod health;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
+mod ledger_resource_routes;
 mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;

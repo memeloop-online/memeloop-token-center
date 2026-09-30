@@ -3947,6 +3947,99 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/ledger/resource-route-switches/plan:
+    post:
+      tags: [Credits, Routes and pricing]
+      operationId: planLedgerResourceRouteSwitch
+      summary: Persist a dry-run plan for an explicit tenant resource route switch
+      description: |
+        Requires both `credits:write` and `routes:write`. The plan creates an operation
+        ID and persists exact before/after route-candidate snapshots without changing
+        routing. Tenant, route, source and target are explicit; wildcard tenant/model/
+        protocol selectors are rejected. Both resources must belong to the same tenant
+        and be active. The route must have one direct candidate and no provider-group
+        expansion, so the cutover cannot retain another provider path. Apply rechecks
+        route timestamp, full candidate set, resource
+        timestamps, and grant revision in one transaction. No credentials are read or
+        returned. Use the operation ID for apply and CAS rollback.
+      security: [{ serviceBearer: [] }]
+      x-required-scopes: [credits:write, routes:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchPlanRequest' }
+      responses:
+        '200':
+          description: Persisted dry-run plan and exact before/after snapshots.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchOperation' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/ledger/resource-route-switches/{operation_id}/apply:
+    post:
+      tags: [Credits, Routes and pricing]
+      operationId: applyLedgerResourceRouteSwitch
+      summary: Apply a persisted ledger resource route switch plan
+      security: [{ serviceBearer: [] }]
+      x-required-scopes: [credits:write, routes:write]
+      parameters:
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchTenantRequest' }
+      responses:
+        '200':
+          description: Applied operation, with durable before/after snapshots.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchOperation' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/ledger/resource-route-switches/{operation_id}/rollback:
+    post:
+      tags: [Credits, Routes and pricing]
+      operationId: rollbackLedgerResourceRouteSwitch
+      summary: Roll back an applied route switch using compare-and-swap
+      description: Rollback succeeds only while the complete live route snapshot still equals the operation's after snapshot and both supplied CAS values match.
+      security: [{ serviceBearer: [] }]
+      x-required-scopes: [credits:write, routes:write]
+      parameters:
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchRollbackRequest' }
+      responses:
+        '200':
+          description: Rolled-back operation, retaining the original before/after snapshots.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerResourceRouteSwitchOperation' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/accounts/{account_id}/settlements:
     get:
       tags: [Credits]
@@ -8754,6 +8847,42 @@ components:
       properties:
         amount: { $ref: '#/components/schemas/NonNegativeMoney' }
         source: { type: string, minLength: 1, maxLength: 200 }
+    LedgerResourceRouteSwitchPlanRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, route_id, source_upstream_account_id, target_upstream_account_id, expected_route_updated_at, expected_source_updated_at, expected_target_updated_at, expected_grant_revision]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, not: { const: '*' } }
+        route_id: { type: string, format: uuid }
+        source_upstream_account_id: { type: string, format: uuid }
+        target_upstream_account_id: { type: string, format: uuid }
+        expected_route_updated_at: { type: integer, format: int64, minimum: 0 }
+        expected_source_updated_at: { type: integer, format: int64, minimum: 0 }
+        expected_target_updated_at: { type: integer, format: int64, minimum: 0 }
+        expected_grant_revision: { type: integer, format: int64, minimum: 0 }
+    LedgerResourceRouteSwitchTenantRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, not: { const: '*' } }
+    LedgerResourceRouteSwitchRollbackRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, expected_route_updated_at, expected_grant_revision]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, not: { const: '*' } }
+        expected_route_updated_at: { type: integer, format: int64, minimum: 0 }
+        expected_grant_revision: { type: integer, format: int64, minimum: 0 }
+    LedgerResourceRouteSwitchOperation:
+      type: object
+      additionalProperties: false
+      required: [operation_id, status, before_snapshot, after_snapshot]
+      properties:
+        operation_id: { type: string, format: uuid }
+        status: { type: string, enum: [planned, applied, rolled_back] }
+        before_snapshot: { type: object }
+        after_snapshot: { type: object }
     GrantReversalRequest:
       type: object
       required: [grant_idempotency_key, source]
