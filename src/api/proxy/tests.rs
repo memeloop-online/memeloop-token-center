@@ -4311,12 +4311,15 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
         response.headers()[header::CONTENT_TYPE],
         "text/event-stream"
     );
+    let request_id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap())
+        .expect("stream response must carry a server request ID");
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .expect("a post-admission upstream failure must not reset the downstream body");
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("resp-truncated"));
-    assert!(rendered.contains("upstream request failed"));
+    assert_eq!(rendered.matches("event: response.failed").count(), 1);
+    assert_eq!(rendered.matches("upstream request failed").count(), 1);
 
     accepted.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
@@ -4326,6 +4329,8 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, request_id);
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(
         rows[0].error_code.as_deref(),

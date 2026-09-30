@@ -8,8 +8,50 @@ pub(super) type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, &'static str>> + Send + 'static>>;
 
 pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_read_error";
+pub(super) const UPSTREAM_HTTP2_RESET: &str = "upstream_http2_reset";
+pub(super) const UPSTREAM_HTTP2_GOAWAY: &str = "upstream_http2_goaway";
 pub(super) const UPSTREAM_READ_TIMEOUT: &str = "upstream_read_timeout";
 pub(super) const UPSTREAM_REQUEST_TIMEOUT: &str = "upstream_request_timeout";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CodexHttp2Failure {
+    Reset,
+    GoAway,
+}
+
+impl CodexHttp2Failure {
+    pub(super) const fn error_code(self) -> &'static str {
+        match self {
+            Self::Reset => UPSTREAM_HTTP2_RESET,
+            Self::GoAway => UPSTREAM_HTTP2_GOAWAY,
+        }
+    }
+}
+
+pub(super) fn codex_http2_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<CodexHttp2Failure> {
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(http2) = current.downcast_ref::<http2::Error>() {
+            if http2.is_reset() {
+                return Some(CodexHttp2Failure::Reset);
+            }
+            if http2.is_go_away() {
+                return Some(CodexHttp2Failure::GoAway);
+            }
+        }
+        if let Some(inner) = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            source = Some(inner);
+            continue;
+        }
+        source = current.source();
+    }
+    None
+}
 
 pub(super) struct UpstreamResponseParts {
     pub(super) status: StatusCode,
@@ -188,11 +230,12 @@ impl UpstreamResponse {
                     .bytes_stream()
                     .map(|chunk| chunk.map_err(|_| UPSTREAM_STREAM_ERROR)),
             ),
-            Self::Codex(response) => Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(|_| UPSTREAM_STREAM_ERROR)),
-            ),
+            Self::Codex(response) => Box::pin(response.bytes_stream().map(|chunk| {
+                chunk.map_err(|error| {
+                    codex_http2_failure(&error)
+                        .map_or(UPSTREAM_STREAM_ERROR, CodexHttp2Failure::error_code)
+                })
+            })),
             Self::Prefetched { stream, .. } => stream,
         }
     }
@@ -227,6 +270,104 @@ mod tests {
 
     struct PendingBody {
         _probe: DropProbe,
+    }
+
+    #[tokio::test]
+    async fn http2_reset_is_classified_from_a_real_in_memory_frame() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = http2::server::handshake(server_io).await.unwrap();
+            let (_, mut response) = connection.accept().await.unwrap().unwrap();
+            response.send_reset(http2::Reason::CANCEL);
+            let _ = connection.accept().await;
+        });
+        let (sender, connection) = http2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let request = http::Request::post("https://example.test/v1/responses")
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(request, true).unwrap();
+        let error = match tokio::time::timeout(std::time::Duration::from_secs(3), response)
+            .await
+            .expect("RST_STREAM response must terminate")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("RST_STREAM must reject the response"),
+        };
+        assert!(error.is_reset());
+        assert!(error.is_remote());
+        assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
+        assert_eq!(
+            codex_http2_failure(&std::io::Error::other(error)),
+            Some(CodexHttp2Failure::Reset)
+        );
+        driver.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http2_goaway_is_classified_from_a_real_in_memory_frame() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = http2::server::handshake(server_io).await.unwrap();
+            connection.abrupt_shutdown(http2::Reason::INTERNAL_ERROR);
+            let _ = connection.accept().await;
+        });
+        let (sender, connection) = http2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let request = http::Request::post("https://example.test/v1/responses")
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(request, true).unwrap();
+        let error = match tokio::time::timeout(std::time::Duration::from_secs(3), response)
+            .await
+            .expect("GOAWAY response must terminate")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("GOAWAY must reject the response"),
+        };
+        assert!(error.is_go_away());
+        assert!(error.is_remote());
+        assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::GoAway));
+        driver.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn simulated_http2_stream_error_keeps_one_static_terminal_code() {
+        assert_eq!(CodexHttp2Failure::Reset.error_code(), UPSTREAM_HTTP2_RESET);
+        assert_eq!(
+            CodexHttp2Failure::GoAway.error_code(),
+            UPSTREAM_HTTP2_GOAWAY
+        );
+        for error_code in [UPSTREAM_HTTP2_RESET, UPSTREAM_HTTP2_GOAWAY] {
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(stream::iter([
+                    Ok(Bytes::from_static(
+                        b"data: {\"type\":\"response.created\"}\n\n",
+                    )),
+                    Err(error_code),
+                ])),
+            }
+            .with_body_timeouts(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(1),
+            );
+            let mut stream = response.bytes_stream();
+            assert!(stream.next().await.unwrap().is_ok());
+            assert_eq!(stream.next().await, Some(Err(error_code)));
+            assert!(stream.next().await.is_none());
+        }
     }
 
     impl Stream for PendingBody {

@@ -1,9 +1,10 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useState, type ReactNode } from 'react';
 import { api } from '../api';
 import { useI18n } from '../i18n';
 import { ModelPicker } from '../ModelPicker';
 import { useAnchoredPopover } from '../useAnchoredPopover';
 import { routeModelOptions } from './modelCatalog';
+import { localDateTimeInput } from './usageState';
 import type {
   FilterAssistantPlan, FilterAssistantSettings, FilterPresetState, RequestListCursor,
   ModelRouteView, TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterOperator, TypedFilterValue,
@@ -85,11 +86,6 @@ function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterO
   return exactOperators;
 }
 
-function localDateTime(epoch: number) {
-  const date = new Date(epoch);
-  return new Date(epoch - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-}
-
 function conditionLabel(condition: TypedFilterCondition, t: (key: string) => string) {
   const value = typeof condition.value.value === 'number'
     ? (condition.value.type === 'timestamp' ? new Date(condition.value.value).toLocaleString() : String(condition.value.value))
@@ -140,7 +136,7 @@ function CatalogModelPicker({ disabled, onSelect, tenant, token, value, upstream
   </div>;
 }
 
-export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant, upstreams, externalChips = [], disabled = false }: {
+export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant, upstreams, externalChips = [], panelControls, panelActive = false, disabled = false }: {
   ast: TypedFilterAst;
   onApply: (ast: TypedFilterAst) => void;
   onClear: () => void;
@@ -150,6 +146,8 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   upstreams: UpstreamAccount[];
   /** Read-only API filters that cannot be represented by the UUID-only AST. */
   externalChips?: Array<{ id: string; label: string }>;
+  panelControls?: ReactNode;
+  panelActive?: boolean;
   disabled?: boolean;
 }) {
   const { t } = useI18n();
@@ -166,7 +164,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const visibleFields = scope === 'usage' ? fields.filter((field) => field.usage) : fields;
-  const hasActiveFilters = ast.conditions.length > 0 || externalChips.length > 0;
+  const hasActiveFilters = ast.conditions.length > 0 || externalChips.length > 0 || panelActive;
   useEffect(() => { setOpen(false); setAssistantPlan(undefined); }, [tenant, token]);
 
   // The editor is a draft.  Synchronizing it in a passive effect while it is
@@ -229,7 +227,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
     if (value.type === 'protocol') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'protocol', value: event.target.value as 'openai' | 'anthropic' | 'openai-image' | 'audio-transcription' | 'generation' })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openai-image">OpenAI Images</option><option value="audio-transcription">OpenAI Audio</option><option value="generation">{t('routes.generation')}</option></select>;
     if (value.type === 'status') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'status', value: event.target.value as 'success' | 'error' | 'pending' })}><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option><option value="pending">{t('common.running')}</option></select>;
     if (condition.field === 'upstream_account_id') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'uuid', value: event.target.value })}><option value="">{t('common.select')}</option>{upstreams.filter((account) => account.status === 'active').map((account) => <option value={account.id} key={account.id}>{account.name}</option>)}</select>;
-    if (value.type === 'timestamp') return <input type="datetime-local" value={localDateTime(value.value)} disabled={disabled} onChange={(event) => { const next = Date.parse(event.target.value); if (Number.isFinite(next)) setValue(index, side, { type: 'timestamp', value: next }); }} />;
+    if (value.type === 'timestamp') return <input type="datetime-local" value={localDateTimeInput(value.value, 'minute')} disabled={disabled} onChange={(event) => { const next = Date.parse(event.target.value); if (Number.isFinite(next)) setValue(index, side, { type: 'timestamp', value: next }); }} />;
     if (value.type === 'integer' || value.type === 'money_micros') return <input type="number" step="1" value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: value.type, value: Number(event.target.value) })} />;
     return <input value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: value.type, value: event.target.value } as TypedFilterValue)} placeholder={value.type === 'uuid' ? '019f…' : undefined} />;
   };
@@ -240,10 +238,11 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
       {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
       {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>
-    <div className="typed-filter-actions"><button ref={anchor} type="button" className="secondary" disabled={disabled} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} onClick={() => open ? setOpen(false) : openEditor()}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
+    <div className="typed-filter-actions"><button ref={anchor} type="button" className="secondary" disabled={disabled} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} onClick={() => open ? setOpen(false) : openEditor()}>{t('filter.open')}</button>{!panelControls && hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
     {open && <section ref={panel} id={popoverId} popover="auto" style={position} className="typed-filter-dialog" role="dialog" aria-label={t('filter.title')} onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setOpen(false); anchor.current?.focus(); } }} onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false); }}>
       <div className="panel-title"><div><h2>{t('filter.title')}</h2><p className="muted">{t('filter.description')}</p></div><button autoFocus type="button" className="secondary" onClick={() => { setOpen(false); anchor.current?.focus(); }}>{t('common.close')}</button></div>
       {error && <div className="notice error" role="alert">{error}</div>}
+      {panelControls && <section className="typed-filter-panel-controls">{panelControls}</section>}
       <div className="typed-filter-rows">{draft.conditions.map((condition, index) => {
         const field = fieldDefinition(condition.field); const operators = operatorsFor(field, scope);
         // Field selection replaces only the value editor. Keeping the row
@@ -257,7 +256,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
           <div className="typed-filter-row-actions"><button type="button" className="secondary" disabled={disabled || index === 0} aria-label={t('common.moveUp')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index - 1], conditions[index]] = [conditions[index], conditions[index - 1]]; return { ...current, conditions }; })}>↑</button><button type="button" className="secondary" disabled={disabled || index + 1 === draft.conditions.length} aria-label={t('common.moveDown')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index], conditions[index + 1]] = [conditions[index + 1], conditions[index]]; return { ...current, conditions }; })}>↓</button><button type="button" className="secondary" disabled={disabled} aria-label={t('common.remove')} onClick={() => setDraft((current) => ({ ...current, conditions: current.conditions.filter((_, itemIndex) => itemIndex !== index) }))}>×</button></div>
         </div>;
       })}</div>
-      <div className="typed-filter-footer"><button type="button" className="secondary" disabled={disabled || draft.conditions.length >= 12} onClick={() => setDraft((current) => ({ ...current, conditions: [...current.conditions, blankCondition(scope)] }))}>{t('filter.addCondition')}</button><button type="button" disabled={disabled} onClick={apply}>{t('filter.apply')}</button></div>
+      <div className="typed-filter-footer"><button type="button" className="secondary" disabled={disabled || draft.conditions.length >= 12} onClick={() => setDraft((current) => ({ ...current, conditions: [...current.conditions, blankCondition(scope)] }))}>{t('filter.addCondition')}</button><div className="typed-filter-footer-actions">{panelControls && <button type="button" className="secondary" disabled={disabled || !hasActiveFilters} onClick={() => { onClear(); setOpen(false); anchor.current?.focus(); }}>{t('filter.clear')}</button>}<button type="button" disabled={disabled} onClick={apply}>{t('filter.apply')}</button></div></div>
       <section className="typed-filter-presets"><h3>{t('filter.saved')}</h3><div className="typed-filter-preset-list">{presets.named.map((preset) => <button type="button" className="secondary" key={preset.name} onClick={() => setDraft(preset.ast)}>{preset.name}</button>)}{presets.recent.map((recent, index) => <button type="button" className="secondary" key={`recent-${index}`} onClick={() => setDraft(recent)}>{t('filter.recent')} {index + 1}</button>)}</div><div className="typed-filter-save"><input value={presetName} maxLength={80} onChange={(event) => setPresetName(event.target.value)} placeholder={t('filter.namePlaceholder')} /><button type="button" className="secondary" disabled={busy || !presetName.trim()} onClick={() => void saveNamed()}>{t('filter.save')}</button></div></section>
       {scope === 'requests' && <section className="typed-filter-assistant"><h3>{t('filter.assistant')}</h3>{!tenant ? <div className="empty">{t('filter.assistantTenantRequired')}</div> : assistantSettings === undefined ? <div className="muted">{t('common.loading')}</div> : assistantSettings === null ? <div className="empty">{t('filter.assistantNotConfigured')}</div> : <><label>{t('filter.assistantPrompt')}<input value={assistantPrompt} maxLength={2000} onChange={(event) => setAssistantPrompt(event.target.value)} placeholder={t('filter.assistantPlaceholder')} /><small>{t('filter.assistantExecutionHint')}</small></label><button type="button" className="secondary" disabled={busy || !assistantPrompt.trim()} onClick={() => void planWithAssistant()}>{t('filter.createPreview')}</button>{assistantPlan && <div className="typed-filter-preview"><b>{t('filter.preview')}</b><div className="typed-filter-chips">{assistantPlan.ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}</div><button type="button" onClick={() => { setDraft(assistantPlan.ast); setAssistantPlan(undefined); }}>{t('filter.usePreview')}</button></div>}</>}</section>}
     </section>}

@@ -194,9 +194,12 @@ mod tests {
                 TransportFailureKind::ConnectionReset,
                 "response_connection_reset",
             ),
+            (TransportFailureKind::Http2Reset, "response_http2_reset"),
+            (TransportFailureKind::Http2GoAway, "response_http2_goaway"),
             (TransportFailureKind::Request, "request"),
             (TransportFailureKind::Timeout, "request_timeout"),
         ] {
+            let expected_code = kind.error_code();
             let result = Err(ProxySendError::NonRetryableTransport(kind));
             assert_eq!(
                 classify_attempt_failure(&result, None),
@@ -210,6 +213,12 @@ mod tests {
                 FailoverDisposition::Stop
             );
             assert_eq!(attempt_failure_stage(&result), stage);
+            match result {
+                Err(ProxySendError::NonRetryableTransport(actual)) => {
+                    assert_eq!(actual.error_code(), expected_code);
+                }
+                _ => panic!("transport errors must remain non-retryable"),
+            }
         }
     }
 }

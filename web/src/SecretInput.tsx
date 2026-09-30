@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type InputHTMLAttributes } from 'react';
 import { useI18n } from './i18n';
+import { Button } from './design-system';
 import './secretInput.css';
 
-type Props = Omit<InputHTMLAttributes<HTMLInputElement>, 'type' | 'defaultValue' | 'value'> & { label: string; value?: string };
+type Props = Omit<InputHTMLAttributes<HTMLInputElement>, 'type' | 'defaultValue' | 'value'> & { label: string; value?: string; fluent?: boolean };
 
 /** Never copies, persists, logs or renders the value outside its input. */
-export function SecretInput({ label, value = '', autoComplete = 'new-password', ...props }: Props) {
+export function SecretInput({ label, value = '', autoComplete = 'new-password', fluent = false, ...props }: Props) {
   const { t } = useI18n();
   const [visible, setVisible] = useState(false);
   const input = useRef<HTMLInputElement>(null);
@@ -32,6 +33,7 @@ export function SecretInput({ label, value = '', autoComplete = 'new-password', 
     if (event.key === 'Escape' && visible) { hide(); event.stopPropagation(); }
   }}>
     <input {...props} ref={input} type={visible && !props.disabled && !props.readOnly ? 'text' : 'password'} autoComplete={autoComplete} autoCapitalize="none" spellCheck={false} />
-    <button type="button" className="secondary secret-input-toggle" aria-controls={props.id} aria-label={t(visible ? 'secret.hideField' : 'secret.showField', { field: label })} aria-pressed={visible} disabled={props.disabled || props.readOnly} onClick={() => setVisible((value) => !value)}>{t(visible ? 'secret.hide' : 'secret.show')}</button>
+    {fluent ? <Button type="button" appearance="secondary" className="secret-input-toggle" aria-controls={props.id} aria-label={t(visible ? 'secret.hideField' : 'secret.showField', { field: label })} aria-pressed={visible} disabled={props.disabled || props.readOnly} onClick={() => setVisible((value) => !value)}>{t(visible ? 'secret.hide' : 'secret.show')}</Button>
+      : <button type="button" className="secondary secret-input-toggle" aria-controls={props.id} aria-label={t(visible ? 'secret.hideField' : 'secret.showField', { field: label })} aria-pressed={visible} disabled={props.disabled || props.readOnly} onClick={() => setVisible((value) => !value)}>{t(visible ? 'secret.hide' : 'secret.show')}</button>}
   </div>;
 }

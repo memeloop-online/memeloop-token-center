@@ -9,6 +9,8 @@ pub(super) enum BoundedUpstreamError {
     RequestTimeout,
     ResponseTooLarge,
     Stream,
+    Http2Reset,
+    Http2GoAway,
 }
 
 impl BoundedUpstreamError {
@@ -21,6 +23,8 @@ impl BoundedUpstreamError {
             Self::RequestTimeout => upstream_response::UPSTREAM_REQUEST_TIMEOUT,
             Self::ResponseTooLarge => "upstream_response_too_large",
             Self::Stream => "upstream_stream",
+            Self::Http2Reset => upstream_response::UPSTREAM_HTTP2_RESET,
+            Self::Http2GoAway => upstream_response::UPSTREAM_HTTP2_GOAWAY,
         }
     }
 
@@ -28,6 +32,8 @@ impl BoundedUpstreamError {
         match error {
             upstream_response::UPSTREAM_READ_TIMEOUT => Self::ReadTimeout,
             upstream_response::UPSTREAM_REQUEST_TIMEOUT => Self::RequestTimeout,
+            upstream_response::UPSTREAM_HTTP2_RESET => Self::Http2Reset,
+            upstream_response::UPSTREAM_HTTP2_GOAWAY => Self::Http2GoAway,
             _ => Self::Stream,
         }
     }
@@ -42,6 +48,8 @@ pub(super) fn upstream_error_health_terminal(error_code: &str) -> UpstreamAttemp
                 | "upstream_request_timeout"
                 | "upstream_stream"
                 | "upstream_stream_read_error"
+                | "upstream_http2_reset"
+                | "upstream_http2_goaway"
         )
     {
         UpstreamAttemptTerminal::Inconclusive
@@ -216,6 +224,14 @@ mod tests {
             (
                 upstream_response::UPSTREAM_REQUEST_TIMEOUT,
                 "upstream_request_timeout",
+            ),
+            (
+                upstream_response::UPSTREAM_HTTP2_RESET,
+                "upstream_http2_reset",
+            ),
+            (
+                upstream_response::UPSTREAM_HTTP2_GOAWAY,
+                "upstream_http2_goaway",
             ),
             ("SECRET_PROVIDER_ERROR_CANARY", "upstream_stream"),
         ] {

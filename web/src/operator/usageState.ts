@@ -1,10 +1,13 @@
 export type UsageTab = 'overview' | 'trend' | 'dimensions' | 'heatmap';
 export type Preset = '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom';
 export type Granularity = 'auto' | 'hour' | 'day';
-export interface UsageFilters { model: string; keyId: string; upstreamId: string; protocol: string; status: string; errorCode: string }
+export interface UsageFilters { model: string; keyId: string; keyAlias: string; upstreamId: string; protocol: string; status: string; errorCode: string }
 export interface UsageSelection { preset: Preset; granularity: Granularity; customFrom: string; customTo: string; filters: UsageFilters }
+type UsageQuerySelection = Omit<UsageSelection, 'filters'> & { filters: Omit<UsageFilters, 'keyAlias'> & Partial<Pick<UsageFilters, 'keyAlias'>> };
 
 export const usageTabs: UsageTab[] = ['overview', 'trend', 'dimensions', 'heatmap'];
+export const usagePresets: Preset[] = ['24h', 'today', 'yesterday', '7d', '30d', 'custom'];
+export const emptyUsageFilters: UsageFilters = { model: '', keyId: '', keyAlias: '', upstreamId: '', protocol: '', status: '', errorCode: '' };
 
 export function nextUsageTab(current: UsageTab, key: string) {
   const index = usageTabs.indexOf(current);
@@ -15,12 +18,22 @@ export function nextUsageTab(current: UsageTab, key: string) {
   return undefined;
 }
 
-export function localDateTimeInput(epoch: number) {
+export function localDateTimeInput(epoch: number, precision: 'minute' | 'milliseconds' = 'milliseconds') {
   const date = new Date(epoch);
-  return new Date(epoch - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 23);
+  return new Date(epoch - date.getTimezoneOffset() * 60_000).toISOString().slice(0, precision === 'minute' ? 16 : 23);
 }
 
-function rangeFor(selection: UsageSelection, now = Date.now()) {
+export function defaultUsageSelection(now = Date.now()): UsageSelection {
+  return {
+    preset: '24h',
+    granularity: 'auto',
+    customFrom: localDateTimeInput(now - 86_400_000),
+    customTo: localDateTimeInput(now),
+    filters: { ...emptyUsageFilters },
+  };
+}
+
+function rangeFor(selection: Pick<UsageSelection, 'preset' | 'customFrom' | 'customTo'>, now = Date.now()) {
   const end = now;
   if (selection.preset === '24h') return { from: end - 86_400_000, to: end };
   if (selection.preset === '7d') return { from: end - 7 * 86_400_000, to: end };
@@ -33,12 +46,14 @@ function rangeFor(selection: UsageSelection, now = Date.now()) {
   return { from, to };
 }
 
-export function statsQuery(tenant: string, selection: UsageSelection) {
+export function statsQuery(tenant: string, selection: UsageQuerySelection) {
   const range = rangeFor(selection); if (!range) return undefined;
   const params = new URLSearchParams({ from_created_at: String(range.from), to_created_at: String(range.to), granularity: selection.granularity });
   if (tenant) params.set('tenant_external_id', tenant);
   if (selection.filters.model.trim()) params.set('model', selection.filters.model.trim());
   if (selection.filters.keyId.trim()) params.set('key_id', selection.filters.keyId.trim());
+  const keyAlias = selection.filters.keyAlias?.trim();
+  if (keyAlias) params.set('key_alias', keyAlias);
   if (selection.filters.upstreamId) params.set('upstream_account_id', selection.filters.upstreamId);
   if (selection.filters.protocol) params.set('protocol', selection.filters.protocol);
   if (selection.filters.status) params.set('status', selection.filters.status);

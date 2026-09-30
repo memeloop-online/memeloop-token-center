@@ -1,0 +1,19 @@
+.authorization-form { min-width: 0; overflow-wrap: anywhere; }
+.provider-reauthorization-workspace .journey-heading { flex-wrap: wrap; align-items: flex-start; }
+.provider-reauthorization-workspace .journey-heading h2 { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.device-code-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.device-code-actions code { user-select: all; overflow-wrap: anywhere; white-space: normal; }
+.authorization-form :is(.fui-Button, .copy-control button),
+.provider-layout :is(.upstream-connection, .provider-config-value) :is(.fui-Button, .copy-control button),
+.provider-reauthorization-workspace > .journey-heading .fui-Button { min-height: 40px; font-size: 14px; font-family: inherit; }
+.authorization-form .fui-Button { white-space: normal; }
+.authorization-form :is(.button-row, .oauth-login-link-actions) { align-items: center; }
+.authorization-form .upstream-connection :is(p, dt) { font-size: 14px; }
+@media (max-width: 600px) {
+  .authorization-form :is(.fui-Button, .copy-control button),
+  .provider-layout :is(.upstream-connection, .provider-config-value) :is(.fui-Button, .copy-control button),
+  .provider-reauthorization-workspace > .journey-heading .fui-Button,
+  .upstream-credential-rotation .fui-Button { min-height: 44px; }
+  .authorization-form :is(.button-row, .oauth-login-link-actions) { align-items: stretch; }
+  .authorization-form .copy-control > button { width: 100%; }
+}

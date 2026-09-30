@@ -82,6 +82,8 @@ fn observed_downstream_close_keeps_cancellation_attribution() {
     for error in [
         "upstream_stream",
         "upstream_stream_read_error",
+        "upstream_http2_reset",
+        "upstream_http2_goaway",
         "upstream_timeout",
         "upstream_invalid_response",
         "upstream_incomplete_response",

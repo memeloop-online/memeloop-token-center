@@ -32,7 +32,7 @@ function ProxyValue({ value, onChange, disabled = false, id, invalid = false, de
   return <div className="provider-proxy-value" onKeyDown={event => { if (event.key === 'Escape' && visible) { setVisible(false); event.stopPropagation(); } }}>
     <input ref={input} id={id} type={visible ? 'text' : 'password'} readOnly={!onChange} required={required} disabled={disabled} aria-invalid={invalid} aria-describedby={describedBy} aria-label={t('connection.proxyUrl')} autoComplete="off" spellCheck={false} onChange={event => onChange?.(event.target.value)} />
     <Button type="button" appearance="secondary" disabled={disabled} aria-pressed={visible} onClick={() => setVisible(current => !current)}>{visible ? copy.hideProxy : copy.viewProxy}</Button>
-    {value && !disabled && <CopyButton value={value} label={copy.copyProxy} />}
+    {value && !disabled && <CopyButton fluent value={value} label={copy.copyProxy} />}
     {actions}
   </div>;
 }
@@ -43,7 +43,7 @@ export function ProxyInput({ value, onChange, disabled = false, generic = false,
   const invalid = Boolean(value && !(generic ? isGenericProxyUrlInput(value.trim()) : isPrivateProxyUrl(value.trim())));
   return <div className="upstream-proxy-editor">
     <label htmlFor={id}>{t('connection.proxyUrl')}{required ? ` · ${t('connection.required')}` : ''}</label>
-    {plaintext ? <ProxyValue id={id} value={value} onChange={onChange} disabled={disabled} invalid={invalid} describedBy={`${id}-hint${invalid ? ` ${id}-error` : ''}`} required={required} /> : <SecretInput id={id} label={t('connection.proxyUrl')} required={required} aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />}
+    {plaintext ? <ProxyValue id={id} value={value} onChange={onChange} disabled={disabled} invalid={invalid} describedBy={`${id}-hint${invalid ? ` ${id}-error` : ''}`} required={required} /> : <SecretInput fluent id={id} label={t('connection.proxyUrl')} required={required} aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" />}
     <p id={`${id}-hint`}>{hint ?? t(generic ? 'connection.genericProxyHint' : 'connection.proxyHint')}</p>
     {invalid && <p id={`${id}-error`} role="alert">{t(generic ? 'connection.genericProxyHint' : 'connection.proxyInvalid')}</p>}
   </div>;
@@ -131,7 +131,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     {!embedded && <h3>{t('connection.title')}</h3>}
     <dl>
-      {(!embedded || codex) && <div><dt>{!embedded ? <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip> : t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
+      {(!embedded || codex) && <div><dt>{!embedded ? <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip> : t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton fluent value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
       {!readableProxy && !editing && <div><dt>{!codex ? <DetailTooltip content={proxyHint}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip> : t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>}
     </dl>
     {!canEditProxy && account.has_proxy && <p>{t('connection.proxyAdminOnly')}</p>}

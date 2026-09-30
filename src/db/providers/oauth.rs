@@ -1211,6 +1211,35 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+
+    pub async fn abort_expired_undispatched_upstream_oauth_refresh(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Abort)
+            .await?;
+        let now = unix_millis();
+        sqlx::query(
+            "DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2 AND lease_expires_at <= $3 AND pending_credential_ciphertext IS NULL AND request_started_at IS NULL",
+        )
+        .bind(account_id.to_string())
+        .bind(idempotency_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM credential_rotation_replays WHERE idempotency_key = $1 AND resource_kind = $2 AND resource_id = $3 AND response_ciphertext IS NULL AND NOT EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l WHERE l.account_id = $3 AND l.idempotency_key = $1)",
+        )
+        .bind(idempotency_key)
+        .bind(UPSTREAM_OAUTH_REFRESH_RESOURCE)
+        .bind(account_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     /// Returns core-owned OAuth lifecycle metadata. The config fallback is
     /// read-only compatibility for accounts created before schema v32.
     pub async fn upstream_oauth_lifecycle(

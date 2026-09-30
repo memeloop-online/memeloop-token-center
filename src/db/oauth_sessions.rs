@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 use super::*;
 
+mod device_worker;
+
 const CLAIM_LEASE_MILLIS: i64 = 30_000;
 
 #[derive(Clone, Debug)]
@@ -79,8 +81,14 @@ impl Database {
         now: i64,
         poll_interval_seconds: u64,
     ) -> Result<OAuthLoginClaim, AppError> {
-        self.claim_oauth_login_poll_impl(reference, now, poll_interval_seconds, false)
-            .await
+        self.claim_oauth_login_poll_impl(
+            reference,
+            now,
+            poll_interval_seconds,
+            false,
+            CLAIM_LEASE_MILLIS,
+        )
+        .await
     }
 
     /// Only already-issued code-flow results may recover during the existing
@@ -95,7 +103,7 @@ impl Database {
         {
             return Err(AppError::BadRequest("OAuth login recovery expired".into()));
         }
-        self.claim_oauth_login_poll_impl(reference, now, 1, true)
+        self.claim_oauth_login_poll_impl(reference, now, 1, true, CLAIM_LEASE_MILLIS)
             .await
     }
 
@@ -105,6 +113,7 @@ impl Database {
         now: i64,
         poll_interval_seconds: u64,
         allow_ready_recovery: bool,
+        lease_millis: i64,
     ) -> Result<OAuthLoginClaim, AppError> {
         if poll_interval_seconds == 0 {
             return Err(AppError::BadRequest(
@@ -116,7 +125,7 @@ impl Database {
             .checked_mul(1_000)
             .ok_or_else(|| AppError::BadRequest("OAuth login poll interval is too large".into()))?;
         let lease_owner = Uuid::now_v7();
-        let lease_expires_at = now.saturating_add(CLAIM_LEASE_MILLIS);
+        let lease_expires_at = now.saturating_add(lease_millis);
         let next_poll_at = now.saturating_add(interval_millis);
         let operator_id = reference.operator_service_id.map(|id| id.to_string());
         let changed = sqlx::query(
