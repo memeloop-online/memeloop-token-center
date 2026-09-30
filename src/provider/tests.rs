@@ -405,7 +405,7 @@ fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
             .any(|protocol| protocol == "anthropic")
     );
     assert!(catalog.supports_responses_via_anthropic_messages_v1("anthropic-claude"));
-    assert!(catalog.supports_codex_multi_agent_v2("anthropic-claude"));
+    assert!(catalog.supports_codex_multi_agent_v2("anthropic-claude", &json!({})));
     let claude_capabilities = claude
         .codex_model_capabilities
         .as_ref()
