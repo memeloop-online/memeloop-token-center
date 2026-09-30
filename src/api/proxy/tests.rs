@@ -4168,6 +4168,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4579,6 +4580,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(body.as_ref(), sse.as_bytes());
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4612,9 +4614,6 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         crate::model::RequestArchiveState::Pending
     );
 
-    // HTTP completion publishes only placeholder locators while both exact
-    // bodies remain recoverable from the encrypted database spool. Object
-    // storage and its worker may be unavailable without losing either body.
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     for (spools, chunks, plaintext, expected_bytes) in [
         (
