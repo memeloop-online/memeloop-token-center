@@ -12,9 +12,14 @@ pub(crate) struct ArchiveBudgetReservation {
     identity: ArchiveSpoolIdentity,
     purpose: BufferedArchivePurpose,
     released: std::sync::atomic::AtomicBool,
+    retry_on_drop: bool,
 }
 
 impl ArchiveBudgetReservation {
+    pub(crate) fn use_durable_cleanup_on_drop(&mut self) {
+        self.retry_on_drop = false;
+    }
+
     pub(super) async fn consume(
         &self,
         tx: &mut Transaction<'_, Any>,
@@ -66,7 +71,7 @@ impl ArchiveBudgetReservation {
 
 impl Drop for ArchiveBudgetReservation {
     fn drop(&mut self) {
-        if self.released.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.retry_on_drop || self.released.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         // Cancellation must not leak capacity until the full TTL. The durable
@@ -174,6 +179,7 @@ impl Database {
             identity: archive.identity(),
             purpose: archive.purpose(),
             released: std::sync::atomic::AtomicBool::new(false),
+            retry_on_drop: true,
         };
         tx.commit().await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;

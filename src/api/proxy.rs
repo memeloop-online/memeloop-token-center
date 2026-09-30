@@ -1159,7 +1159,7 @@ async fn proxy_with_identity_and_conversation_spool(
     );
     let started_request = match state
         .db
-        .start_proxy_request_with_archive_compression(
+        .start_proxy_request_with_deferred_archive(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -1190,7 +1190,8 @@ async fn proxy_with_identity_and_conversation_spool(
         }
     };
     match started_request.archive_admission {
-        crate::db::RequestArchiveAdmission::Captured => {}
+        crate::db::RequestArchiveAdmission::Captured
+        | crate::db::RequestArchiveAdmission::Queued => {}
         crate::db::RequestArchiveAdmission::GapCapacity => state
             .metrics
             .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity),

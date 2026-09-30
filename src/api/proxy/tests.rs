@@ -31,6 +31,7 @@ mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
 mod filter_assistant;
+mod gateway_persistence;
 mod group_routing;
 mod ha_policy;
 mod kimi;
@@ -2796,6 +2797,7 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
 }
 
 async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
@@ -4763,6 +4765,7 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let gap = sqlx::query(
         "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
                 cleaned_at

@@ -88,7 +88,7 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
          WHERE EXISTS (
              SELECT 1 FROM request_records
              WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3
-               AND completed_at IS NULL
+               AND (completed_at IS NULL OR request_object = 'gap://' || $1 || '/request')
          )",
     )
     .bind(identity.request_id.to_string())
@@ -300,9 +300,13 @@ impl Database {
             }
         }
         let byte_count = i64::try_from(body.len()).map_err(|_| AppError::Internal)?;
-        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
+        let completed_request_locator = match purpose {
+            BufferedArchivePurpose::Request => format!("gap://{}/request", identity.request_id),
+            BufferedArchivePurpose::Response => String::new(),
+        };
+        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR ($4 <> '' AND request_object = $4))")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
-            .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
+            .bind(identity.reservation_id.to_string()).bind(completed_request_locator).fetch_one(&mut **tx).await?;
         if valid != 1 {
             return Err(AppError::Internal);
         }

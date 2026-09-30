@@ -50,6 +50,7 @@ use crate::{
 
 mod archive_spool;
 mod archive_staging;
+mod gateway_persistence;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 mod billing;
@@ -214,6 +215,7 @@ pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 pub struct Database {
     pool: AnyPool,
     backend: DatabaseBackend,
+    gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
     #[cfg(test)]
     pub(crate) oauth_refresh_write_phase_seam:
         std::sync::Arc<tokio::sync::Mutex<Option<OAuthRefreshWritePhaseSeam>>>,
@@ -365,6 +367,7 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
+        self.gateway_persistence.pool.close().await;
         self.pool.close().await;
     }
 
@@ -444,6 +447,10 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
+                database_url,
+                backend,
+            )?),
             pool,
             backend,
             #[cfg(test)]
