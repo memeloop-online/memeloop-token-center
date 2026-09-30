@@ -77,7 +77,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
         await page.setViewportSize({ width, height: 1000 });
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
-        assert.equal(new Set(buttonHeights).size, 1);
+        assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
         assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
         const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
         await mkdir(screenshotRoot, { recursive: true });
