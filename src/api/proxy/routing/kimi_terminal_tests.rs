@@ -46,7 +46,9 @@ fn state(chunks: Vec<Result<Bytes, &'static str>>) -> StreamState {
         framer: BoundedSseFramer::default(),
         usage: ChatSseUsageState::for_kimi(),
         translator: responses_via_chat::Stream::new(responses_via_chat::Context::for_kimi(
-            &json!({"model":"kimi-k3"}),
+            &json!({"model":"kimi-k3","tools":[{
+                "type":"function","name":"tool","parameters":{"type":"object"}
+            }]}),
         )),
         pending: VecDeque::new(),
         terminal: false,
