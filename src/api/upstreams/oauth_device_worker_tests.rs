@@ -34,6 +34,15 @@ fn credential(value: &str) -> UpstreamCredential {
 #[tokio::test]
 async fn worker_recovers_staged_login_after_browser_loss_and_expiry_without_creating_another_account()
  {
+    staged_login_recovery(false).await;
+}
+
+#[tokio::test]
+async fn worker_reports_stale_account_conflict_without_replacing_or_creating_an_account() {
+    staged_login_recovery(true).await;
+}
+
+async fn staged_login_recovery(stale_account: bool) {
     let (state, _directory) = test_state().await;
     let key = state.config.key_pepper.as_bytes();
     let config = json!({"base_url":"https://chatgpt.com/backend-api/codex","network_scope":"public","reservation_token_bounds":{}});
@@ -107,7 +116,11 @@ async fn worker_recovers_staged_login_after_browser_loss_and_expiry_without_crea
         credential: credential("synthetic-replacement"),
         reauthorize: Some(OAuthReauthorizationTarget {
             account_id: original.id,
-            expected_updated_at: original.updated_at,
+            expected_updated_at: if stale_account {
+                original.updated_at - 1
+            } else {
+                original.updated_at
+            },
             expected_credential_generation: original.credential_generation,
         }),
     };
@@ -145,6 +158,39 @@ async fn worker_recovers_staged_login_after_browser_loss_and_expiry_without_crea
         state.db.due_codex_login_sessions(now, 16).await.unwrap(),
         vec![session_id]
     );
+    if stale_account {
+        assert!(matches!(
+            poll_codex_oauth_for_worker(&state, session_id).await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+        assert!(
+            state
+                .db
+                .codex_login_progress(&reference, now)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .db
+                .due_codex_login_sessions(now, 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let accounts = state
+            .db
+            .list_upstream_accounts("device-worker-fixture")
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, original.id);
+        assert_eq!(
+            accounts[0].credential_generation,
+            original.credential_generation
+        );
+        return;
+    }
     let (first, second) = tokio::join!(
         poll_codex_oauth_for_worker(&state, session_id),
         poll_codex_oauth_for_worker(&state, session_id)

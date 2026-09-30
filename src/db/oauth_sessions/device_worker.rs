@@ -1,6 +1,17 @@
 use super::*;
 
 impl Database {
+    pub async fn fail_codex_login_finalization(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        now: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND flow_kind = 'openai_codex_device' AND status = 'finalizing' AND lease_owner = $3 AND result_account_id IS NULL AND NOT EXISTS (SELECT 1 FROM upstream_accounts WHERE oauth_session_id = $2)")
+            .bind(now).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn codex_login_progress(
         &self,
         reference: &OAuthLoginSessionReference,
