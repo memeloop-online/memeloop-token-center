@@ -813,7 +813,7 @@ impl PgFixture {
         } else {
             // Same request columns exercised by the production spool API; there is
             // deliberately no FK to billing tables, matching request_records.
-            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
+            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, request_object TEXT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
             .execute(&db.pool).await.unwrap();
             // This focused fixture intentionally omits the production request
             // projection tables. Keeping the locator table empty exercises the
