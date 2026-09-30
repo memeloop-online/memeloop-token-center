@@ -460,11 +460,17 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
         memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Option<Self> {
-        let archive_permit = state
+        let archive_permit = match state
             .proxy_archive_stream_permits
             .clone()
             .try_acquire_owned()
-            .ok()?;
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(request_id = %identity.request_id, stage = "response_spool_admission", outcome = "capacity", "proxy archive gap");
+                return None;
+            }
+        };
         if !memory.try_grow(
             super::CAPTURE_MEMORY_BYTES,
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,

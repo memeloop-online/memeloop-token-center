@@ -1915,7 +1915,7 @@ async fn insert_request_started_event_in_transaction(
     let event =
         allocate_request_event_cursor(transaction, now, &tenant_id, &key_id, &request_id).await?;
     sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) SELECT $1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0 WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)",
     )
     .bind(&event.event_id)
     .bind(&tenant_id)

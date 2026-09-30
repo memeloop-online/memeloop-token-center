@@ -217,12 +217,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             Some(upstream_account_id),
             Some(credential_generation),
         );
-        // Streaming responses outlive the handler response. Keep the workload
-        // permit until proxy finalization or timeout reconciliation; accepted
-        // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _dispatch_permit = dispatch_permit;
-        let archive_memory = memory.clone();
+        let archive_memory = background_state.persistence.stream_memory.reservation();
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
@@ -1040,10 +1037,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
         }
-        // The absolute proxy lifecycle ends after normal finalization or
-        // timeout reconciliation. A slow archive tail remains memory-bounded
-        // and connection-drain-owned, but must not retain scarce admission
-        // concurrency past that boundary.
         drop(_proxy_lifecycle_permit);
         drop(_dispatch_permit);
         stream_owner.finish("returned", Some(status.as_u16()), None);

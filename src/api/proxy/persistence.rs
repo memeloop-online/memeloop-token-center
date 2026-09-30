@@ -8,6 +8,7 @@ const JOBS: usize = 4;
 const BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) struct Persistence {
+    pub(crate) stream_memory: crate::gateway_body::memory::ProxyMemoryBudget,
     jobs: Arc<tokio::sync::Semaphore>,
     bytes: Arc<tokio::sync::Semaphore>,
     accepted: AtomicU64,
@@ -18,6 +19,7 @@ pub(crate) struct Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Self {
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
             accepted: AtomicU64::new(0),
@@ -69,14 +71,20 @@ impl Persistence {
     }
 
     pub(crate) fn render(&self) -> String {
-        format!(
+        let (stream_used, stream_limit, _, _) = self.stream_memory.snapshot();
+        let mut output = format!(
             "# TYPE memeloop_token_center_deferred_persistence_jobs gauge\nmemeloop_token_center_deferred_persistence_jobs {}\n# TYPE memeloop_token_center_deferred_persistence_bytes gauge\nmemeloop_token_center_deferred_persistence_bytes {}\n# TYPE memeloop_token_center_deferred_persistence_total counter\nmemeloop_token_center_deferred_persistence_total{{outcome=\"accepted\"}} {}\nmemeloop_token_center_deferred_persistence_total{{outcome=\"capacity\"}} {}\nmemeloop_token_center_deferred_persistence_total{{outcome=\"failed\"}} {}\n",
             JOBS - self.jobs.available_permits(),
             BYTES - self.bytes.available_permits(),
             self.accepted.load(Ordering::Relaxed),
             self.rejected.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
-        )
+        );
+        output.push_str(&format!(
+            "# TYPE memeloop_token_center_deferred_stream_memory_bytes gauge\nmemeloop_token_center_deferred_stream_memory_bytes {}\n# TYPE memeloop_token_center_deferred_stream_memory_limit_bytes gauge\nmemeloop_token_center_deferred_stream_memory_limit_bytes {}\n",
+            stream_used, stream_limit,
+        ));
+        output
     }
 }
 
@@ -90,7 +98,7 @@ pub(super) fn capture(
     let nodes = crate::gateway_body::memory::JsonMemoryScanner::default().observe(&body);
     let charge = body
         .len()
-        .saturating_mul(8)
+        .saturating_mul(3)
         .saturating_add(nodes.saturating_mul(256))
         .saturating_add(4 * 1024 * 1024);
     state.persistence.submit(charge, async move {
@@ -112,7 +120,8 @@ pub(super) fn capture(
             identity, purpose, &body, background.config.key_pepper.as_bytes(),
             background.config.archive_spool_compression_enabled,
         )?;
-        if !db.capture_deferred_archive(&archive).await? {
+        if !db.capture_deferred_archive(&archive).await?
+            && purpose == crate::response_archive_spool::BufferedArchivePurpose::Request {
             background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
         }
         Ok(())

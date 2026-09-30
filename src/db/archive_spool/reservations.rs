@@ -15,6 +15,11 @@ pub(crate) struct ArchiveBudgetReservation {
 }
 
 impl ArchiveBudgetReservation {
+    pub(super) fn recover_refund_on_expiry(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) async fn consume(
         &self,
         tx: &mut Transaction<'_, Any>,

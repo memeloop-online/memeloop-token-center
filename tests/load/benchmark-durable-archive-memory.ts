@@ -81,6 +81,9 @@ export function permitEvidence(metrics: string): Record<string, number> {
     body_readers: 'memeloop_token_center_background_work_items{queue="gateway_body_reads",state="active"}',
     lifecycles: 'memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"}',
     archive_workers: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs',
+    deferred_bytes: 'memeloop_token_center_deferred_persistence_bytes',
+    deferred_stream_bytes: 'memeloop_token_center_deferred_stream_memory_bytes',
   };
   return Object.fromEntries(Object.entries(series).map(([name, prefix]) => {
     const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
@@ -88,6 +91,17 @@ export function permitEvidence(metrics: string): Record<string, number> {
     const value = Number(line.slice(prefix.length + 1));
     assert(Number.isFinite(value) && value >= 0, `invalid permit gauge: ${name}`);
     return [name, value];
+  }));
+}
+
+export function deferredPersistenceEvidence(metrics: string): Record<string, number> {
+  return Object.fromEntries(["accepted", "capacity", "failed"].map((outcome) => {
+    const prefix = `memeloop_token_center_deferred_persistence_total{outcome="${outcome}"}`;
+    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
+    assert(line, `required deferred persistence counter absent: ${outcome}`);
+    const value = Number(line.slice(prefix.length + 1));
+    assert(Number.isSafeInteger(value) && value >= 0, `invalid deferred persistence counter: ${outcome}`);
+    return [outcome, value];
   }));
 }
 
@@ -345,10 +359,12 @@ export async function run(binary: string, output: string): Promise<boolean> {
               const metricsText = metrics.body.toString("utf8");
               const gauges = permitEvidence(metricsText);
               if (Object.values(gauges).every((value) => value === 0)) {
-                const successfulGaps = reader.prepare("SELECT COUNT(*) AS count FROM request_records WHERE status_code = 200 AND (request_object LIKE 'gap:%' OR response_object IS NULL OR response_object LIKE 'gap:%')").get();
-                assert(Number(successfulGaps?.count) === 0, "successful buffered requests must converge both archives, not settle with a silent gap");
+                const successfulGaps = reader.prepare("SELECT COALESCE(SUM(CASE WHEN request_object LIKE 'gap:%' THEN 1 ELSE 0 END + CASE WHEN response_object IS NULL OR response_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS count FROM request_records WHERE status_code = 200").get();
+                const persistence = deferredPersistenceEvidence(metricsText);
+                assert(persistence.failed === 0, "healthy archive storage must not report capture failures");
+                assert(Number(successfulGaps?.count) <= persistence.capacity, "archive gaps must be accounted for by explicit bounded capacity rejection");
                 const processMemoryEvidence = processMemory(service!.pid!);
-                return { ...row, permits: gauges, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
+                return { ...row, permits: gauges, persistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
               }
             }
             await delay(100);

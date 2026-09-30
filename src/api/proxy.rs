@@ -1174,9 +1174,6 @@ async fn proxy_with_identity_and_conversation_spool(
         body.clone(),
     );
     admission.finish("completed", None, Some(body.len()));
-    // Freeze policy before admission, but start its absolute network clock only
-    // after the durable request transaction has positively committed. Waiting
-    // for the global archive budget must never consume the candidate budget.
     attempt_budget.arm();
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
@@ -1217,8 +1214,6 @@ async fn proxy_with_identity_and_conversation_spool(
         tenant_id: key.tenant_id,
         memory,
     };
-    // Admission ACK includes reservation, request record, and encrypted sealed
-    // request spool in one transaction. No upstream work starts before it.
     // Native streams and source-backed Responses retain their charged request
     // under the process-wide budget without occupying buffered-response
     // headroom while waiting for headers. An unexpected JSON response must
@@ -2771,7 +2766,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     };
     let terminal_phase = proxy_diagnostics::Phase::new(
         proxy_diagnostics::Context::for_request(request_id),
-        "buffered_archive_settlement",
+        "buffered_billing_settlement",
     );
     let result =
         finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)

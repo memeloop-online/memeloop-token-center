@@ -127,6 +127,7 @@ impl Database {
             }
             return Ok(false);
         };
+        reservation.recover_refund_on_expiry();
         let (mut transaction, now, hold) = self
             .reserved_spool_transaction(&reservation, "deferred_capture")
             .await?;
@@ -213,7 +214,7 @@ impl Database {
         if bytes > PLAIN_LIMIT || accounted > CIPHER_LIMIT {
             return Ok(false);
         }
-        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
+        let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
         if valid != 1 {
