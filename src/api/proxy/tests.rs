@@ -27,6 +27,7 @@ mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
 mod codex_quota;
+mod codex_workbuddy;
 mod cursor;
 mod filter_assistant;
 mod group_routing;
@@ -3110,7 +3111,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
             json!({
                 "model": fixture.model,
                 "messages": [{"role": "user", "content": "hello"}],
-                "tools": [{"type": "function", "function": {"name": "lookup"}}]
+                "tools": [{"type": "function", "function": {"name": null}}]
             }),
             None,
         ),
@@ -3120,7 +3121,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
                 "model": fixture.model,
                 "messages": [{
                     "role": "user",
-                    "content": [{"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]
+                    "content": [{"type": "input_audio", "input_audio": {"data": "synthetic", "format": "wav"}}]
                 }]
             }),
             None,
