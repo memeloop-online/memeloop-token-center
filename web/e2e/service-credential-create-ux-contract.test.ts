@@ -117,8 +117,10 @@ test('service credential creation validates the draft and issues only a read-onl
   const scopeHints = form.locator('.service-credential-scope-option > span[aria-label]');
   assert.ok(await scopeHints.count() > 20, 'each supported permission has a supplemental explanation');
   for (let index = 0; index < await scopeHints.count(); index += 1) {
+    const hint = (await scopeHints.nth(index).getAttribute('aria-label'))?.replace(/^\S+: /, '');
+    assert.ok(hint);
     await scopeHints.nth(index).focus();
-    await page.getByRole('tooltip').waitFor();
+    await page.getByRole('tooltip', { name: hint, exact: true }).waitFor();
   }
   await form.locator('[aria-label^="requests:read:"]').focus();
   await page.getByRole('tooltip').filter({ hasText: '读取请求记录、监控快照和用量分析' }).waitFor();
