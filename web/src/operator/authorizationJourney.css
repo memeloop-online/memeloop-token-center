@@ -14,7 +14,7 @@
   .authorization-form :is(.fui-Button, .copy-control button),
   .provider-layout :is(.upstream-connection, .provider-config-value) :is(.fui-Button, .copy-control button),
   .provider-reauthorization-workspace > .journey-heading .fui-Button,
-  .upstream-credential-rotation .fui-Button { min-height: 44px; }
+  .upstream-credential-rotation :is(.fui-Button, .copy-control button) { min-height: 44px; }
   .authorization-form :is(.button-row, .oauth-login-link-actions) { align-items: stretch; }
   .authorization-form .copy-control > button { width: 100%; }
 }
