@@ -35,14 +35,15 @@ async fn refresh_expiring_oauth(
         Err(AppError::Conflict(message))
             if message == "OAuth refresh is already in progress for this Idempotency-Key" =>
         {
+            let takeover_key = format!("oauth-worker-{account_id}-{}", Uuid::now_v7());
             state
                 .db
-                .abort_upstream_oauth_refresh(account_id, &recovery_key)
+                .abort_expired_undispatched_upstream_oauth_refresh(account_id, &recovery_key)
                 .await?;
             api::refresh_managed_upstream_oauth_for_worker(
                 state,
                 account_id,
-                &recovery_key,
+                &takeover_key,
                 blocking,
             )
             .await?;
@@ -738,6 +739,11 @@ mod tests {
             )
             .await
             .unwrap();
+        let blocking = BlockingTasks::new();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, account.id, 1, &blocking).await,
+            Err(AppError::Conflict(_))
+        ));
         sqlx::query(
             "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
         )
@@ -745,7 +751,6 @@ mod tests {
         .execute(&test_pool)
         .await
         .unwrap();
-        let blocking = BlockingTasks::new();
         refresh_expiring_oauth(&state, account.id, 1, &blocking)
             .await
             .unwrap();
