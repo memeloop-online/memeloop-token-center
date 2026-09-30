@@ -80,7 +80,7 @@ async fn staged_login_recovery(stale_account: bool) {
         flow_kind: "openai_codex_device".into(),
         tenant_external_id: "device-worker-fixture".into(),
         operator_service_id: None,
-        expires_at: now - 1000,
+        expires_at: if stale_account { now + 60_000 } else { now - 1000 },
     };
     let encrypted = seal_private_json(&json!({
         "session_id":session_id,"tenant_external_id":reference.tenant_external_id,"account_name":"Synthetic account",
