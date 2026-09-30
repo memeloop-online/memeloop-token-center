@@ -27,6 +27,10 @@ use crate::{
 
 #[path = "codex_transport/bad_request.rs"]
 mod bad_request;
+mod chat_request;
+#[cfg(test)]
+mod chat_tests;
+mod chat_tools;
 #[cfg(test)]
 use bad_request::codex_transient_error;
 pub(super) use bad_request::{
@@ -100,24 +104,6 @@ const PASSTHROUGH_HEADERS: &[&str] = &[
 ];
 const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
 const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
-const CHAT_ALLOWED_FIELDS: &[&str] = &[
-    "model",
-    "messages",
-    "stream",
-    "stream_options",
-    "service_tier",
-    "n",
-    "max_tokens",
-    "max_completion_tokens",
-    "temperature",
-    "top_p",
-    "presence_penalty",
-    "frequency_penalty",
-    "stop",
-    "user",
-    "seed",
-    "response_format",
-];
 
 struct ChatRequestControls {
     output_limit: Option<i64>,
@@ -422,7 +408,9 @@ pub(super) fn prepare_request_with_id(
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty())
     {
-        object.insert("parallel_tool_calls".to_owned(), Value::Bool(true));
+        if matches!(protocol, Protocol::OpenAiResponses) {
+            object.insert("parallel_tool_calls".to_owned(), Value::Bool(true));
+        }
     } else {
         object.remove("parallel_tool_calls");
     }
@@ -459,16 +447,9 @@ fn translate_chat_request(
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
-    if object
-        .keys()
-        .any(|field| !CHAT_ALLOWED_FIELDS.contains(&field.as_str()))
-    {
-        return Err(AppError::BadRequest(
-            "Codex text Chat Completions request contains an unsupported field".into(),
-        ));
-    }
+    chat_request::translate_controls(object)?;
     match object.get("n") {
-        None => {}
+        None | Some(Value::Null) => {}
         Some(Value::Number(number)) if number.as_i64() == Some(1) => {}
         Some(_) => {
             return Err(AppError::BadRequest(
@@ -485,7 +466,10 @@ fn translate_chat_request(
             ));
         }
     };
-    if let Some(options) = object.get("stream_options") {
+    if let Some(options) = object
+        .get("stream_options")
+        .filter(|value| !value.is_null())
+    {
         if !stream {
             return Err(AppError::BadRequest(
                 "Codex text Chat stream_options requires stream=true".into(),
@@ -494,12 +478,12 @@ fn translate_chat_request(
         let options = options.as_object().ok_or_else(|| {
             AppError::BadRequest("Codex text Chat stream_options must be an object".into())
         })?;
-        if options
-            .iter()
-            .any(|(field, value)| field != "include_usage" || !value.is_boolean())
-        {
+        if options.iter().any(|(field, value)| {
+            !matches!(field.as_str(), "include_usage" | "include_obfuscation")
+                || !value.is_boolean()
+        }) {
             return Err(AppError::BadRequest(
-                "Codex text Chat Completions supports only stream_options.include_usage".into(),
+                "Codex text Chat stream_options values must be supported booleans".into(),
             ));
         }
     }
@@ -517,7 +501,6 @@ fn translate_chat_request(
     validate_chat_user(object.get("user"))?;
     validate_chat_seed(object.get("seed"), strict)?;
     validate_chat_stop(object.get("stop"), strict)?;
-    validate_chat_response_format(object.get("response_format"))?;
     let legacy_limit = chat_output_limit(object.get("max_tokens"), "max_tokens")?;
     let completion_limit =
         chat_output_limit(object.get("max_completion_tokens"), "max_completion_tokens")?;
@@ -549,34 +532,50 @@ fn translate_chat_request(
         let message = message.as_object().ok_or_else(|| {
             AppError::BadRequest("Codex text Chat each message must be an object".into())
         })?;
-        if message.len() != 2 || !message.contains_key("role") || !message.contains_key("content") {
-            return Err(AppError::BadRequest(
-                "Codex text Chat messages support only role and text content".into(),
-            ));
-        }
         let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
             AppError::BadRequest("Codex text Chat message role must be a string".into())
         })?;
-        let content = chat_text_content(message.get("content").unwrap())?;
-        match role {
-            "system" | "developer" if !conversation_started => instructions.push(content),
-            "system" | "developer" => {
+        chat_request::validate_message(message, role)?;
+        if role == "tool" {
+            input.push(chat_request::tool_result(message)?);
+            conversation_started = true;
+            continue;
+        }
+        if role == "user" {
+            input.push(json!({"type": "message", "role": role,
+                "content": chat_request::user_content(message.get("content"))?}));
+            conversation_started = true;
+            continue;
+        }
+        let calls = chat_request::assistant_calls(message, role)?;
+        let content = match message.get("content") {
+            None | Some(Value::Null) if !calls.is_empty() => None,
+            Some(content) => Some(chat_text_content(content)?),
+            None => {
                 return Err(AppError::BadRequest(
-                    "Codex text Chat system messages must precede conversational messages".into(),
+                    "Codex text Chat message requires content or tool_calls".into(),
                 ));
             }
-            "user" | "assistant" => {
+        };
+        match role {
+            "system" | "developer" if !conversation_started => {
+                instructions.push(content.unwrap_or_default())
+            }
+            "system" | "developer" | "user" | "assistant" => {
                 conversation_started = true;
                 let content_type = if role == "assistant" {
                     "output_text"
                 } else {
                     "input_text"
                 };
-                input.push(json!({
+                if let Some(content) = content {
+                    input.push(json!({
                     "type": "message",
                     "role": role,
                     "content": [{"type": content_type, "text": content}]
-                }));
+                    }));
+                }
+                input.extend(calls);
             }
             _ => {
                 return Err(AppError::BadRequest(
@@ -714,21 +713,6 @@ fn bounded_chat_stop(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control)
 }
 
-fn validate_chat_response_format(value: Option<&Value>) -> Result<(), AppError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    if value
-        .as_object()
-        .is_some_and(|format| format.len() == 1 && format.get("type") == Some(&json!("text")))
-    {
-        return Ok(());
-    }
-    Err(AppError::BadRequest(
-        "Codex text Chat supports only response_format.type=text".into(),
-    ))
-}
-
 fn chat_output_limit(value: Option<&Value>, field: &str) -> Result<Option<i64>, AppError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -753,8 +737,7 @@ fn chat_text_content(content: &Value) -> Result<String, AppError> {
                 let part = part.as_object().ok_or_else(|| {
                     AppError::BadRequest("Codex text Chat content parts must be objects".into())
                 })?;
-                if part.len() != 2
-                    || part.get("type").and_then(Value::as_str) != Some("text")
+                if part.get("type").and_then(Value::as_str) != Some("text")
                     || part.get("text").and_then(Value::as_str).is_none()
                 {
                     return Err(AppError::BadRequest(
@@ -1287,7 +1270,7 @@ pub(super) fn translate_buffered_chat_response(
 ) -> Result<BufferedCodexResponse, &'static str> {
     let responses: Value =
         serde_json::from_slice(&response.body).map_err(|_| "upstream_invalid_response")?;
-    let (finish_reason, allow_empty_output) = match response.terminal {
+    let (mut finish_reason, allow_empty_output) = match response.terminal {
         BufferedCodexTerminal::Completed => ("stop", false),
         BufferedCodexTerminal::Incomplete {
             content_filtered: true,
@@ -1305,6 +1288,12 @@ pub(super) fn translate_buffered_chat_response(
             json!({"role": "assistant", "content": null, "refusal": refusal})
         }
         ChatResponseContent::Empty => json!({"role": "assistant", "content": ""}),
+        ChatResponseContent::Tools { content, calls } => {
+            if finish_reason == "stop" {
+                finish_reason = "tool_calls";
+            }
+            json!({"role": "assistant", "content": content, "tool_calls": calls})
+        }
     };
     let mut chat = json!({
         "id": chat_completion_id(request_id),
@@ -1341,6 +1330,8 @@ pub(super) struct CodexChatStreamTranslator {
     started: bool,
     terminal: bool,
     include_usage: bool,
+    text_delta: String,
+    tools: BTreeMap<usize, chat_tools::StreamingTool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1353,6 +1344,10 @@ enum ChatResponseContent {
     Text(String),
     Refusal(String),
     Empty,
+    Tools {
+        content: Option<String>,
+        calls: Vec<Value>,
+    },
 }
 
 impl CodexChatStreamTranslator {
@@ -1367,6 +1362,8 @@ impl CodexChatStreamTranslator {
             started: false,
             terminal: false,
             include_usage,
+            text_delta: String::new(),
+            tools: BTreeMap::new(),
         }
     }
 
@@ -1386,6 +1383,9 @@ impl CodexChatStreamTranslator {
             .get("type")
             .and_then(Value::as_str)
             .ok_or("upstream_invalid_response")?;
+        if self.terminal {
+            return Err("upstream_invalid_response");
+        }
         match kind {
             "response.created" | "response.queued" | "response.in_progress" => Ok(None),
             "response.output_text.delta" => {
@@ -1397,6 +1397,10 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Text)?;
+                if self.text_delta.len().saturating_add(delta.len()) > MAX_PROXY_RESPONSE_BODY {
+                    return Err("upstream_response_too_large");
+                }
+                self.text_delta.push_str(delta);
                 Ok(Some(self.text_delta_chunk(delta)?))
             }
             "response.refusal.delta" => {
@@ -1429,9 +1433,16 @@ impl CodexChatStreamTranslator {
                 let item = value.get("item").ok_or("upstream_invalid_response")?;
                 match item.get("type").and_then(Value::as_str) {
                     Some("message" | "reasoning") => Ok(None),
+                    Some("function_call") => {
+                        self.translate_tool_item(&value, kind == "response.output_item.done")
+                    }
                     _ => Err("upstream_unsupported_chat_output"),
                 }
             }
+            "response.function_call_arguments.delta" => {
+                self.translate_tool_arguments(&value, false)
+            }
+            "response.function_call_arguments.done" => self.translate_tool_arguments(&value, true),
             "response.content_part.added" | "response.content_part.done" => {
                 let part = value.get("part").ok_or("upstream_invalid_response")?;
                 match part.get("type").and_then(Value::as_str) {
@@ -1473,6 +1484,9 @@ impl CodexChatStreamTranslator {
     }
 
     fn observe_output_kind(&mut self, kind: ChatOutputKind) -> Result<(), &'static str> {
+        if kind == ChatOutputKind::Refusal && !self.tools.is_empty() {
+            return Err("upstream_unsupported_chat_output");
+        }
         match self.output_kind {
             None => self.output_kind = Some(kind),
             Some(current) if current == kind => {}
@@ -1530,9 +1544,7 @@ impl CodexChatStreamTranslator {
         match completed {
             ChatResponseContent::Text(completed) => {
                 self.observe_output_kind(ChatOutputKind::Text)?;
-                if !self.started {
-                    output.extend_from_slice(&self.text_delta_chunk(&completed)?);
-                }
+                self.complete_text(&completed, &mut output)?;
             }
             ChatResponseContent::Refusal(completed) => {
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
@@ -1551,12 +1563,26 @@ impl CodexChatStreamTranslator {
                 }
             }
             ChatResponseContent::Empty => {
-                if self.output_kind.is_some() {
+                if self.output_kind.is_some() || !self.tools.is_empty() {
                     return Err("upstream_invalid_response");
                 }
                 output.extend_from_slice(&self.text_delta_chunk("")?);
             }
+            ChatResponseContent::Tools { content, .. } => {
+                if let Some(content) = content {
+                    self.observe_output_kind(ChatOutputKind::Text)?;
+                    self.complete_text(&content, &mut output)?;
+                } else if self.output_kind.is_some() {
+                    return Err("upstream_invalid_response");
+                }
+            }
         }
+        self.complete_tools(response, &mut output)?;
+        let finish_reason = if finish_reason == "stop" && !self.tools.is_empty() {
+            "tool_calls"
+        } else {
+            finish_reason
+        };
         output.extend_from_slice(&chat_sse_chunk(
             &self.id,
             &self.model,
@@ -1576,6 +1602,16 @@ impl CodexChatStreamTranslator {
         output.extend_from_slice(b"data: [DONE]\n\n");
         self.terminal = true;
         Ok(Bytes::from(output))
+    }
+
+    fn complete_text(&mut self, completed: &str, output: &mut Vec<u8>) -> Result<(), &'static str> {
+        let remaining = completed
+            .strip_prefix(&self.text_delta)
+            .ok_or("upstream_invalid_response")?;
+        if !remaining.is_empty() || !self.started {
+            output.extend_from_slice(&self.text_delta_chunk(remaining)?);
+        }
+        Ok(())
     }
 }
 
@@ -1671,14 +1707,20 @@ fn response_chat_content(
     let mut refusal = None::<String>;
     let mut saw_text_part = false;
     let mut messages = 0_usize;
+    let mut calls = Vec::new();
+    let mut call_ids = BTreeSet::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => continue,
+            Some("function_call") => {
+                let call = chat_tools::chat_call(item)?;
+                if !call_ids.insert(call["id"].as_str().unwrap().to_owned()) {
+                    return Err("upstream_invalid_response");
+                }
+                calls.push(call);
+            }
             Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
                 messages = messages.saturating_add(1);
-                if messages != 1 {
-                    return Err("upstream_unsupported_chat_output");
-                }
                 let content = item
                     .get("content")
                     .and_then(Value::as_array)
@@ -1709,9 +1751,18 @@ fn response_chat_content(
             _ => return Err("upstream_unsupported_chat_output"),
         }
     }
+    if !calls.is_empty() {
+        if refusal.is_some() {
+            return Err("upstream_unsupported_chat_output");
+        }
+        return Ok(ChatResponseContent::Tools {
+            content: saw_text_part.then_some(text),
+            calls,
+        });
+    }
     match (messages, refusal) {
         (1, Some(refusal)) => Ok(ChatResponseContent::Refusal(refusal)),
-        (1, None) => Ok(ChatResponseContent::Text(text)),
+        (1.., None) => Ok(ChatResponseContent::Text(text)),
         (0, None) if allow_empty_output => Ok(ChatResponseContent::Empty),
         _ => Err("upstream_unsupported_chat_output"),
     }
