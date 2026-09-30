@@ -260,7 +260,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(onboarding.getByRole('heading', { name: '新增上游', exact: true }));
-  await assertContains(onboarding, '连接并管理模型服务。');
+  await assertContains(onboarding, '修改连接或凭据会影响使用该账号的模型请求。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await onboarding.getByLabel('服务提供商').click();
   await assertVisible(onboarding.getByRole('option', { name: /Browser dual method/ }));
@@ -301,9 +301,8 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   const popup = await popupPromise;
   await popup.waitForURL(/token-center-icon-32\.png\?oauth-login=1$/);
   await popup.close();
-  await assertVisible(onboarding.getByRole('button', { name: '检查授权结果', exact: true }));
+  await assertNoCount(onboarding.getByRole('button', { name: '检查授权结果', exact: true }));
   const polledCodex = page.waitForResponse((response) => response.url().endsWith('/internal/v1/oauth/codex/poll') && response.request().method() === 'POST');
-  await onboarding.getByRole('button', { name: '检查授权结果', exact: true }).click();
   assert.equal((await polledCodex).status(), 200);
   await assertNotContains(page.locator('body'), 'CPA');
   await assertNotContains(page.locator('body'), 'Bridge');
@@ -313,7 +312,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertVisible(onboarding.getByRole('heading', { name: 'Add upstream', exact: true }));
-  await assertContains(onboarding, 'Connect and manage model services.');
+  await assertContains(onboarding, 'Connection or credential changes affect model requests using that account.');
   await assertVisible(onboarding.getByRole('button', { name: 'API credential', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
   await assertVisible(onboarding.getByLabel('Service provider'));

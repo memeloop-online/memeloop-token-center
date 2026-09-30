@@ -2399,14 +2399,14 @@ paths:
     post:
       tags: [Upstream providers]
       operationId: pollOpenAiCodexOAuth
-      summary: Poll native OpenAI Codex authorization and create the upstream when ready
+      summary: Observe or continue a durable OpenAI Codex login; background workers also complete it without an open browser
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+            schema: { $ref: '#/components/schemas/CodexOAuthPollRequest' }
       responses:
         '200':
           description: Existing stable upstream reauthorized or a completed session replayed.
@@ -7735,6 +7735,7 @@ components:
       additionalProperties: false
       required: [driver, verification_url, user_code, session_token, expires_at, poll_after_seconds, security_notice]
       properties:
+        session_id: { type: string, format: uuid, description: Non-secret recovery reference. Reading it still requires the original operator and tenant authority. }
         driver: { const: openai-codex }
         verification_url: { type: string, format: uri }
         user_code: { type: string, minLength: 1 }
@@ -7752,6 +7753,15 @@ components:
         session_token: { type: string, writeOnly: true, description: "Authenticated, encrypted login state." }
         expires_at: { type: integer, format: int64 }
         poll_after_seconds: { type: integer, format: int64, minimum: 0 }
+    CodexOAuthPollRequest:
+      type: object
+      additionalProperties: false
+      oneOf:
+        - required: [session_token]
+        - required: [session_id]
+      properties:
+        session_token: { type: string, writeOnly: true }
+        session_id: { type: string, format: uuid, description: Read the original session status after refresh. This form only observes; the background worker owns polling and exchange. }
     OAuthPollRequest:
       type: object
       required: [session_token]
