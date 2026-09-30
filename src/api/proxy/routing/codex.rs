@@ -396,16 +396,10 @@ async fn send_codex_attempt_once(
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = send_until_request_deadline(deadline.request, async {
-        request.send().await.map_err(|error| {
-            let classified = classify_wreq_send_error(error);
-            state.metrics.record_codex_egress_send_failure(
-                egress_path,
-                codex_egress_failure_stage(&classified),
-            );
-            classified
-        })
+        request.send().await.map_err(classify_wreq_send_error)
     })
     .await;
+    record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -474,6 +468,12 @@ fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage
         ProxySendError::NonRetryableTransport(TransportFailureKind::ConnectionReset) => {
             CodexEgressFailureStage::ConnectionReset
         }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset) => {
+            CodexEgressFailureStage::Http2Reset
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Http2GoAway) => {
+            CodexEgressFailureStage::Http2GoAway
+        }
         ProxySendError::NonRetryableTransport(TransportFailureKind::Body) => {
             CodexEgressFailureStage::Body
         }
@@ -483,7 +483,20 @@ fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage
         ProxySendError::NonRetryableTransport(TransportFailureKind::Request) => {
             CodexEgressFailureStage::Request
         }
+        ProxySendError::AmbiguousResponse(upstream_response::UPSTREAM_REQUEST_TIMEOUT) => {
+            CodexEgressFailureStage::Timeout
+        }
         _ => CodexEgressFailureStage::Other,
+    }
+}
+
+fn record_codex_send_attempt_failure<T>(
+    metrics: &crate::metrics::Metrics,
+    path: CodexEgressPath,
+    result: &Result<T, ProxySendError>,
+) {
+    if let Err(error) = result {
+        metrics.record_codex_egress_send_failure(path, codex_egress_failure_stage(error));
     }
 }
 
@@ -553,10 +566,20 @@ mod timeout_tests {
             ),
             (
                 ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset),
-                CodexEgressFailureStage::Other,
+                CodexEgressFailureStage::Http2Reset,
             ),
             (
                 ProxySendError::NonRetryableTransport(TransportFailureKind::Http2GoAway),
+                CodexEgressFailureStage::Http2GoAway,
+            ),
+            (
+                ProxySendError::AmbiguousResponse(
+                    super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT,
+                ),
+                CodexEgressFailureStage::Timeout,
+            ),
+            (
+                ProxySendError::AmbiguousResponse("response_admission_failed"),
                 CodexEgressFailureStage::Other,
             ),
             (
@@ -570,6 +593,36 @@ mod timeout_tests {
         ] {
             assert_eq!(codex_egress_failure_stage(&error), stage);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_send_deadline_counts_once_without_changing_disposition() {
+        let metrics = crate::metrics::Metrics::default();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = send_until_request_deadline(
+            deadline,
+            std::future::pending::<Result<(), ProxySendError>>(),
+        )
+        .await;
+        record_codex_send_attempt_failure(&metrics, CodexEgressPath::AccountProxy, &result);
+
+        assert!(matches!(
+            result,
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
+        ));
+        assert_eq!(
+            failover_disposition(None, result.as_ref().err()),
+            FailoverDisposition::Stop
+        );
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(rendered.contains(
+            "memeloop_token_center_codex_egress_send_failures_total{path=\"account_proxy\",stage=\"timeout\"} 1"
+        ));
+        assert!(rendered.contains(
+            "memeloop_token_center_codex_egress_send_failures_total{path=\"direct\",stage=\"timeout\"} 0"
+        ));
     }
 
     #[test]

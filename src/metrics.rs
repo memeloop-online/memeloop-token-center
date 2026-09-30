@@ -183,6 +183,8 @@ pub(crate) enum CodexEgressFailureStage {
     Connect,
     Timeout,
     ConnectionReset,
+    Http2Reset,
+    Http2GoAway,
     Body,
     Decode,
     Request,
@@ -190,7 +192,7 @@ pub(crate) enum CodexEgressFailureStage {
 }
 
 impl CodexEgressFailureStage {
-    const COUNT: usize = 10;
+    const COUNT: usize = 12;
     const ALL: [Self; Self::COUNT] = [
         Self::ProxyConnect,
         Self::Dns,
@@ -198,6 +200,8 @@ impl CodexEgressFailureStage {
         Self::Connect,
         Self::Timeout,
         Self::ConnectionReset,
+        Self::Http2Reset,
+        Self::Http2GoAway,
         Self::Body,
         Self::Decode,
         Self::Request,
@@ -216,6 +220,8 @@ impl CodexEgressFailureStage {
             Self::Connect => "connect",
             Self::Timeout => "timeout",
             Self::ConnectionReset => "connection_reset",
+            Self::Http2Reset => "http2_reset",
+            Self::Http2GoAway => "http2_goaway",
             Self::Body => "body",
             Self::Decode => "decode",
             Self::Request => "request",
@@ -804,7 +810,7 @@ impl Metrics {
 }
 
 fn render_codex_egress_send_failures(output: &mut String, inner: &MetricsInner) {
-    output.push_str("# HELP memeloop_token_center_codex_egress_send_failures_total Codex wreq send failures by fixed outbound path and failure stage.\n");
+    output.push_str("# HELP memeloop_token_center_codex_egress_send_failures_total Codex send attempt failures, including absolute request deadlines, by fixed outbound path and failure stage.\n");
     output.push_str("# TYPE memeloop_token_center_codex_egress_send_failures_total counter\n");
     for path in CodexEgressPath::ALL {
         for stage in CodexEgressFailureStage::ALL {
@@ -1654,7 +1660,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(series, expected);
-        assert_eq!(series.len(), 20);
+        assert_eq!(series.len(), 24);
     }
 
     #[tokio::test]
