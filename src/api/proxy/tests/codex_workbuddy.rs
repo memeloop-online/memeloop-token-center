@@ -7,7 +7,7 @@ fn agent_request(model: &str, stream: bool) -> Value {
         "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {"key": {"type": "string"}}}}}],
         "tool_choice": "auto", "parallel_tool_calls": false, "reasoning_effort": "medium",
         "metadata": {"fixture": "workbuddy"}, "logprobs": false,
-        "temperature": 1, "top_p": 1, "max_completion_tokens": 64
+        "temperature": 1, "top_p": 1, "max_tokens": 16
     });
     if stream {
         request["stream_options"] = json!({"include_usage": true});
@@ -33,6 +33,7 @@ fn tool_response() -> String {
 #[tokio::test]
 async fn workbuddy_agent_authentication_and_credit_admission_are_required() {
     let fixture = codex_route_fixture("workbuddy-admission").await;
+    codex_output_limits::enable_provider_default_limits(&fixture).await;
     let upstream = MockServer::start().await;
     let request = Request::post("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
@@ -76,6 +77,7 @@ async fn workbuddy_agent_authentication_and_credit_admission_are_required() {
 async fn workbuddy_agent_tool_round_trip_streaming_and_buffered_settles_once_per_turn() {
     for stream in [false, true] {
         let fixture = codex_route_fixture(&format!("workbuddy-{stream}")).await;
+        codex_output_limits::enable_provider_default_limits(&fixture).await;
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))
@@ -147,6 +149,7 @@ async fn workbuddy_agent_tool_round_trip_streaming_and_buffered_settles_once_per
         assert_eq!(wire["tools"][0]["strict"], false);
         assert_eq!(wire["store"], false);
         assert_eq!(wire["model"], fixture.upstream_model);
+        assert!(wire.get("max_tokens").is_none());
         wait_for_request_settlement(&fixture, 1).await;
         upstream.verify().await;
         upstream.reset().await;
