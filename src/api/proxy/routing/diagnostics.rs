@@ -92,6 +92,24 @@ mod tests {
                 Some(StatusCode::SERVICE_UNAVAILABLE),
                 None,
             );
+            emit(
+                Uuid::nil(),
+                1,
+                1,
+                None,
+                Some(&ProxySendError::NonRetryableTransport(
+                    TransportFailureKind::Http2Reset,
+                )),
+            );
+            emit(
+                Uuid::nil(),
+                1,
+                1,
+                None,
+                Some(&ProxySendError::NonRetryableTransport(
+                    TransportFailureKind::Http2GoAway,
+                )),
+            );
         });
         let bytes = writer.0.lock().unwrap();
         let logs = std::str::from_utf8(&bytes).unwrap();
@@ -100,7 +118,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 4);
         for event in &events {
             for field in event["fields"].as_object().unwrap().keys() {
                 assert!(
@@ -118,10 +136,19 @@ mod tests {
                 );
             }
             assert_eq!(event["fields"]["disposition"], "no_replay_evidence");
+            assert_eq!(event["fields"]["request_id"], Uuid::nil().to_string());
         }
         assert_eq!(events[0]["fields"]["outcome"], "response_delivery_unknown");
         assert_eq!(events[1]["fields"]["status"], 503);
         assert_eq!(events[1]["fields"]["outcome"], "upstream_http_status");
+        assert_eq!(
+            events[2]["fields"]["outcome"],
+            "transport_http2_reset_delivery_unknown"
+        );
+        assert_eq!(
+            events[3]["fields"]["outcome"],
+            "transport_http2_goaway_delivery_unknown"
+        );
     }
 
     #[test]
@@ -139,6 +166,14 @@ mod tests {
             (
                 ProxySendError::NonRetryableTransport(TransportFailureKind::ConnectionReset),
                 "transport_connection_reset_delivery_unknown",
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset),
+                "transport_http2_reset_delivery_unknown",
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Http2GoAway),
+                "transport_http2_goaway_delivery_unknown",
             ),
             (
                 ProxySendError::OuterDeadline,
@@ -178,6 +213,16 @@ mod tests {
                 "upstream_transport_connection_reset",
             ),
             (
+                TransportFailureKind::Http2Reset,
+                "transport_http2_reset_delivery_unknown",
+                "upstream_transport_http2_reset",
+            ),
+            (
+                TransportFailureKind::Http2GoAway,
+                "transport_http2_goaway_delivery_unknown",
+                "upstream_transport_http2_goaway",
+            ),
+            (
                 TransportFailureKind::Body,
                 "transport_body_delivery_unknown",
                 "upstream_transport_body",
@@ -200,8 +245,8 @@ mod tests {
         ] {
             assert_eq!(kind.diagnostic_outcome(), outcome);
             assert_eq!(kind.error_code(), error_code);
-            assert!(!outcome.contains("http"));
-            assert!(!error_code.contains("http"));
+            assert!(!outcome.contains("SECRET_CANARY"));
+            assert!(!error_code.contains("SECRET_CANARY"));
         }
     }
 }
