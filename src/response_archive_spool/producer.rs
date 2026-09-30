@@ -365,12 +365,13 @@ struct QueuedArchiveChunk {
 }
 
 pub(crate) struct ResponseArchiveSettlement {
-    writer: super::OwnedTask<()>,
+    _writer: super::OwnedTask<()>,
 }
 
 impl ResponseArchiveSettlement {
+    #[cfg(test)]
     pub(crate) async fn wait(mut self) {
-        if let Some(Err(error)) = self.writer.wait().await {
+        if let Some(Err(error)) = self._writer.wait().await {
             tracing::warn!(
                 stage = "response_spool_writer",
                 error_category = error.diagnostic_category(),
@@ -382,7 +383,7 @@ impl ResponseArchiveSettlement {
     #[cfg(test)]
     pub(crate) fn pending_for_test(released: tokio::sync::oneshot::Receiver<()>) -> Self {
         Self {
-            writer: super::OwnedTask::spawn(
+            _writer: super::OwnedTask::spawn(
                 async move {
                     released.await.map_err(|_| AppError::Internal)?;
                     Ok(())
@@ -629,7 +630,7 @@ impl ResponseArchiveProducer {
         }
         sender.take();
         writer.continue_on_drop();
-        Some(ResponseArchiveSettlement { writer })
+        Some(ResponseArchiveSettlement { _writer: writer })
     }
 }
 

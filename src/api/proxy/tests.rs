@@ -35,6 +35,7 @@ mod kimi;
 mod memory_admission;
 mod memory_metrics;
 mod passthrough_reservation;
+mod persistence_isolation;
 mod phase_diagnostics;
 mod postgres_attempt_deadline;
 mod recovery_wait;
