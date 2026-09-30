@@ -20,6 +20,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       let proxy = 'socks5h://10.0.0.8:1080';
       let pollCount = 0;
       let failPoll = true;
+      let expiredRecovery = false;
       const writes: { path: string; body: Record<string, unknown> }[] = [];
       await page.route('**/*', async route => {
         const request = route.request(); const url = new URL(request.url());
@@ -49,6 +50,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
         assert.equal(url.pathname, '/internal/v1/oauth/codex/poll');
         assert.deepEqual(body, { session_id: '00000000-0000-4000-8000-000000000001' });
         pollCount += 1;
+        if (expiredRecovery) return route.fulfill({ status: 400, json: { error: { message: 'OAuth login expired or failed' } } });
         if (failPoll) { failPoll = false; return route.fulfill({ status: 503, json: { error: { message: 'do-not-display-raw-provider-error' } } }); }
         if (pollCount === 2) return route.fulfill({ status: 202, json: { status: 'pending', retry_after_seconds: 10 } });
         account = { ...account, credential_generation: 4, updated_at: 5 };
@@ -110,6 +112,15 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
       assert.equal(await reauthorize.evaluate(element => element === document.activeElement), true);
       assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1, 'reopening and closing never repeats login');
+      expiredRecovery = true;
+      await page.evaluate(() => sessionStorage.setItem('mtc-codex-device-recovery', JSON.stringify({ session_id: '00000000-0000-4000-8000-000000000001', tenant: 'fixture-a', account_id: 'reauthorization-fixture', expires_at: Date.now() - 1000 })));
+      await page.reload();
+      await workspace.getByText(chinese ? '本次登录已过期。请返回登录设置后重新开始。' : 'This login expired. Return to login setup to start again.', { exact: true }).waitFor();
+      const expiredPolls = pollCount;
+      await page.clock.fastForward(60_000);
+      assert.equal(pollCount, expiredPolls, 'an expired pending session stops status polling');
+      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1, 'expiry never starts another OAuth session');
+      assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-codex-device-recovery')), null);
       await page.close();
     }
   } finally { await browser.close(); await server.close(); }

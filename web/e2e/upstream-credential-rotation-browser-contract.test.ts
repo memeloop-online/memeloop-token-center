@@ -64,6 +64,8 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await form.getByRole('alert').filter({ hasText: copy.invalid }).waitFor();
       assert.equal(writes.length, 0);
       await secret.fill('synthetic-rotation-secret');
+      await form.getByLabel(locale === 'zh-CN' ? '认证请求头' : 'Authentication header', { exact: true }).fill('authorization');
+      await form.getByLabel(locale === 'zh-CN' ? '认证前缀' : 'Authentication prefix', { exact: true }).fill('Bearer ');
       assert.ok(await secret.getAttribute('aria-describedby'));
       const describedBy = (await secret.getAttribute('aria-describedby'))!.split(' ');
       assert.equal(await page.evaluate(ids => ids.some(id => document.getElementById(id)?.textContent?.includes('API') || document.getElementById(id)?.textContent?.includes('provider') || document.getElementById(id)?.textContent?.includes('提供商')), describedBy), true);

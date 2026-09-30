@@ -264,3 +264,47 @@ async fn expired_pending_login_is_not_selected_or_restarted_by_worker() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn background_device_login_stops_when_the_initiating_service_is_revoked() {
+    let (state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_service_token(
+            crate::db::CreateServiceTokenInput {
+                name: "Synthetic device worker operator".into(),
+                scopes: vec!["oauth:write".into()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let reference = OAuthLoginSessionReference {
+        session_id: Uuid::now_v7(),
+        flow_kind: "openai_codex_device".into(),
+        tenant_external_id: "synthetic-scope".into(),
+        operator_service_id: Some(issued.service_id),
+        expires_at: unix_millis() + 60_000,
+    };
+    assert!(
+        state
+            .db
+            .oauth_login_worker_authority(&reference)
+            .await
+            .unwrap()
+            .allows("oauth:write")
+    );
+    state
+        .db
+        .set_service_token_status(issued.service_id, "revoked")
+        .await
+        .unwrap();
+    assert!(
+        state
+            .db
+            .oauth_login_worker_authority(&reference)
+            .await
+            .is_err()
+    );
+}

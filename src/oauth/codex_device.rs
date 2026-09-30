@@ -1005,10 +1005,36 @@ mod tests {
             "only_continue_if_you_started_this_login"
         );
 
+        let restarted_database = Database::connect(&database_url).await.unwrap();
+        assert!(
+            restarted_database
+                .due_codex_login_sessions(now, 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            restarted_database
+                .due_codex_login_sessions(now + 1000, 16)
+                .await
+                .unwrap(),
+            vec![started.session_id]
+        );
+        let recovered_token = recover_codex_device_session_token(
+            &restarted_database,
+            started.session_id,
+            key_material,
+            CodexDevicePollScope {
+                required_tenant: Some("codex-device-test"),
+                operator_service_id: None,
+            },
+        )
+        .await
+        .unwrap();
         let result = poll_codex_device_login_at(
             &crate::build_http_client().expect("HTTP client"),
-            &database,
-            &started.session_token,
+            &restarted_database,
+            &recovered_token,
             CodexDevicePollRuntime {
                 key_material,
                 now: now + 1_000,

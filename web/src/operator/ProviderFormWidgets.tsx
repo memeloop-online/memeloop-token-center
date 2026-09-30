@@ -7,7 +7,7 @@ function ProviderTextWidget(props: WidgetProps) {
   const TextWidget = fluentFormWidgets.TextWidget;
   return <div className="provider-config-value">
     <TextWidget {...props} />
-    {typeof props.value === 'string' && props.value && !props.disabled && <CopyButton value={props.value} />}
+    {typeof props.value === 'string' && props.value && !props.disabled && <CopyButton fluent value={props.value} />}
   </div>;
 }
 

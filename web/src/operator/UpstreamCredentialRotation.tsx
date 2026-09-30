@@ -87,6 +87,7 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
       <div ref={feedback} tabIndex={-1} role={error ? 'alert' : undefined}>{error && copy[error]}</div>
       <FormSection title={copy.fields} description={copy.options}>
         <RjsfForm key={locale} idPrefix={`${id}-credential`} schema={prepared.schema} validator={safeValidator}
+          formContext={{ fluentSecrets: true }}
           uiSchema={upstreamRotationUiSchema(locale)} fields={{ SchemaField: SecureSchemaField }}
           templates={schemaFormTemplates} widgets={{ TextWidget: RotationText, SelectWidget: RotationSelect }}
           disabled={!canSubmit || busy} noHtml5Validate showErrorList={false}
