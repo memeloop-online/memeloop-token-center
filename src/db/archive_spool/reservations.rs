@@ -16,10 +16,6 @@ pub(crate) struct ArchiveBudgetReservation {
 }
 
 impl ArchiveBudgetReservation {
-    pub(crate) fn use_durable_cleanup_on_drop(&mut self) {
-        self.retry_on_drop = false;
-    }
-
     pub(super) async fn consume(
         &self,
         tx: &mut Transaction<'_, Any>,
@@ -96,6 +92,23 @@ impl Database {
     pub(crate) async fn reserve_buffered_archive_capacity(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<Option<ArchiveBudgetReservation>, AppError> {
+        self.reserve_buffered_archive_capacity_inner(archive, true)
+            .await
+    }
+
+    pub(crate) async fn reserve_deferred_archive_capacity(
+        &self,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<Option<ArchiveBudgetReservation>, AppError> {
+        self.reserve_buffered_archive_capacity_inner(archive, false)
+            .await
+    }
+
+    async fn reserve_buffered_archive_capacity_inner(
+        &self,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+        retry_on_drop: bool,
     ) -> Result<Option<ArchiveBudgetReservation>, AppError> {
         if archive.body().len() > PLAIN_LIMIT as usize {
             return Ok(None);
@@ -179,7 +192,7 @@ impl Database {
             identity: archive.identity(),
             purpose: archive.purpose(),
             released: std::sync::atomic::AtomicBool::new(false),
-            retry_on_drop: true,
+            retry_on_drop,
         };
         tx.commit().await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;

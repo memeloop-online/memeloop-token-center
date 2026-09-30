@@ -158,8 +158,8 @@ impl Database {
             compression_enabled,
         )?;
         let prepared = archive.prepare_first_batch().await?;
-        let capacity = self.reserve_buffered_archive_capacity(&archive).await?;
-        let Some(mut capacity) = capacity else {
+        let capacity = self.reserve_deferred_archive_capacity(&archive).await?;
+        let Some(capacity) = capacity else {
             let mut transaction = self.begin_write_transaction().await?;
             super::archive_spool::insert_request_archive_gap_in_transaction(
                 &mut transaction,
@@ -172,7 +172,6 @@ impl Database {
             transaction.commit().await?;
             return Ok(());
         };
-        capacity.use_durable_cleanup_on_drop();
         let (mut transaction, now, hold) = self
             .reserved_spool_transaction(&capacity, "deferred_request_archive")
             .await?;
