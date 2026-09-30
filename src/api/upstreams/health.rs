@@ -12,11 +12,15 @@ fn health_probe_error(driver: &str, status: StatusCode) -> Option<&'static str> 
     }
 }
 
-fn health_probe_transport_error(proxy_configured: bool) -> &'static str {
-    if proxy_configured {
-        "proxy_connection_failed"
-    } else {
+fn health_probe_transport_error(
+    is_connect: bool,
+    is_timeout: bool,
+    proxy_configured: bool,
+) -> &'static str {
+    if is_connect && !is_timeout && !proxy_configured {
         "connection_failed"
+    } else {
+        "upstream_unavailable"
     }
 }
 
@@ -270,10 +274,14 @@ pub(in crate::api) async fn probe_upstream_health(
                 "checked_at": checked_at
             })))
         }
-        Err(_) => Ok(Json(json!({
+        Err(error) => Ok(Json(json!({
             "account_id": account_id,
             "status": "unhealthy",
-            "error_code": health_probe_transport_error(proxy_configured),
+            "error_code": health_probe_transport_error(
+                error.is_connect(),
+                error.is_timeout(),
+                proxy_configured,
+            ),
             "latency_ms": latency_ms,
             "checked_at": checked_at
         }))),
@@ -287,12 +295,25 @@ mod tests {
     use super::{health_probe_transport_error, upstream_health_probe_url};
 
     #[test]
-    fn probe_transport_errors_keep_proxy_and_direct_paths_distinct() {
-        assert_eq!(health_probe_transport_error(false), "connection_failed");
+    fn probe_transport_error_only_reports_verified_direct_connection_failures() {
         assert_eq!(
-            health_probe_transport_error(true),
-            "proxy_connection_failed"
+            health_probe_transport_error(true, false, false),
+            "connection_failed"
         );
+        for (is_connect, is_timeout, proxy_configured) in [
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+            (false, true, false),
+            (false, true, true),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                health_probe_transport_error(is_connect, is_timeout, proxy_configured),
+                "upstream_unavailable"
+            );
+        }
     }
 
     #[test]
