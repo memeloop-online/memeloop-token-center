@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { nextUsageTab, statsQuery, type UsageSelection } from '../src/operator/usageState.js';
+import { defaultUsageSelection, localDateTimeInput, nextUsageTab, statsQuery, type UsageSelection } from '../src/operator/usageState.js';
 
 const operatorSource = await readFile(new URL('../src/operator/UsageAnalysis.tsx', import.meta.url), 'utf8');
 const selfSource = await readFile(new URL('../src/self/UsagePage.tsx', import.meta.url), 'utf8');
@@ -32,6 +32,24 @@ test('usage key alias filters are exposed and serialized', () => {
   });
   assert.equal(new URLSearchParams(query?.slice(1)).get('key_alias'), 'primary-key');
   assert.match(operatorSource, /key_alias/);
+});
+
+test('usage filters use one shared panel with presets, explicit ranges, and credential choices', () => {
+  assert.match(operatorSource, /<TypedFilterBuilder[^>]+panelControls=/);
+  assert.doesNotMatch(operatorSource, /<details className="usage-filter-disclosure"/);
+  assert.match(operatorSource, /usagePresets\.map/);
+  assert.match(operatorSource, /UsageCredentialAliasSelect/);
+  assert.match(operatorSource, /internal\/v1\/keys\?\$\{params\}/);
+  assert.match(operatorSource, /credential\.alias/);
+  assert.match(operatorSource, /onClear=\{\(\) => \{ const next = defaultUsageSelection\(\);/);
+});
+
+test('shared local date conversion preserves milliseconds and supports minute inputs', () => {
+  const epoch = Date.parse('2026-09-30T12:34:56.789Z');
+  assert.equal(localDateTimeInput(epoch, 'milliseconds'), '2026-09-30T12:34:56.789');
+  assert.equal(localDateTimeInput(epoch, 'minute'), '2026-09-30T12:34');
+  assert.equal(defaultUsageSelection(epoch).preset, '24h');
+  assert.equal(defaultUsageSelection(epoch).granularity, 'auto');
 });
 
 test('usage tabs implement roving keyboard focus and linked tab panels', () => {

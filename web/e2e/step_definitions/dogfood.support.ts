@@ -341,13 +341,13 @@ export async function applyUsageTypedFilter(
 
 export async function clearUsageFilters(page: Page): Promise<void> {
   const builder = usageFilterBuilder(page);
-  await assertVisible(builder.getByRole('button', { name: '清除', exact: true }));
+  const dialog = await openTypedFilterDialog(builder);
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
     const query = new URL(response.url()).searchParams;
     return !query.has('model') && !query.has('key_id') && !query.has('upstream_account_id') && !query.has('status');
   });
-  await builder.getByRole('button', { name: '清除', exact: true }).click();
+  await dialog.getByRole('button', { name: '清除', exact: true }).click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await assertUsageTotalTokens(page, response);
@@ -378,8 +378,8 @@ export async function clearStrictUsageFilters(world: DogfoodWorld, expectedTotal
   const observation = requireStrictUsageObservation(world);
   const previousCount = observation.requestUrls.length;
   const builder = usageFilterBuilder(page);
-  await assertVisible(builder.getByRole('button', { name: '清除', exact: true }));
-  await builder.getByRole('button', { name: '清除', exact: true }).click();
+  const dialog = await openTypedFilterDialog(builder);
+  await dialog.getByRole('button', { name: '清除', exact: true }).click();
   const requestUrl = await nextStrictUsageUrl(observation, previousCount);
   assert.equal(requestUrl.searchParams.has('status'), false);
   assert.equal(requestUrl.searchParams.has('upstream_account_id'), false);

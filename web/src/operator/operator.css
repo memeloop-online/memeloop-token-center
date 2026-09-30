@@ -179,6 +179,9 @@
 .typed-filter-dialog h3 { margin: 0; }
 .typed-filter-dialog h3 { font-size: 14px; margin-bottom: 9px; }
 
+.typed-filter-panel-controls { border-bottom: 1px solid var(--picker-border); margin-bottom: 16px; padding-bottom: 2px; }
+.typed-filter-panel-controls .usage-controls { background: transparent; border: 0; margin: 0; padding: 0; }
+
 .typed-filter-rows { display: grid; gap: 9px; margin: 16px 0; }
 
 .typed-filter-row {
@@ -211,6 +214,7 @@
 .typed-filter-row-actions { justify-content: end; }
 .typed-filter-row-actions button { font-size: 13px; min-width: 30px; padding: 6px; }
 .typed-filter-footer { display: flex; gap: 8px; justify-content: space-between; }
+.typed-filter-footer-actions { display: flex; gap: 8px; }
 .typed-filter-presets,
 .typed-filter-assistant {
   border-top: 1px solid var(--picker-border);

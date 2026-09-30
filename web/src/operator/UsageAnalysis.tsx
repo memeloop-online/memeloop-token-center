@@ -12,19 +12,16 @@ import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel 
 import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { UsageSummaryMetrics } from './UsageSummaryMetrics';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis, TypedFilterAst, TypedFilterCondition, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
+import type { KeyView, OperatorUsageAnalysis, TypedFilterAst, TypedFilterCondition, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
 import { TypedFilterBuilder } from './TypedFilterBuilder';
 import { emptyTypedFilterAst } from './traffic/requestTraffic';
-import { localDateTimeInput, nextUsageTab, statsQuery, usageTabs, type Granularity, type Preset, type UsageSelection, type UsageTab } from './usageState';
+import { defaultUsageSelection, emptyUsageFilters, localDateTimeInput, nextUsageTab, statsQuery, usagePresets, usageTabs, type Preset, type UsageFilters, type UsageSelection, type UsageTab } from './usageState';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
 type Dimension = 'models' | 'keys' | 'sessions' | 'upstreams' | 'protocols' | 'statuses' | 'errors';
-interface UsageFilters { model: string; keyId: string; keyAlias: string; upstreamId: string; protocol: string; status: string; errorCode: string }
 const dimensions: Dimension[] = ['models', 'keys', 'sessions', 'upstreams', 'protocols', 'statuses', 'errors'];
-const presets: Preset[] = ['24h', 'today', 'yesterday', '7d', '30d', 'custom'];
-const emptyFilters: UsageFilters = { model: '', keyId: '', keyAlias: '', upstreamId: '', protocol: '', status: '', errorCode: '' };
 const localCopy = {
   'zh-CN': {
     dimensions: '维度分析', filters: '筛选条件', charts: '图表数据', throughput: '请求吞吐', latency: '响应延迟', costTrend: '费用趋势',
@@ -39,7 +36,7 @@ const localCopy = {
 } as const;
 
 function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst): UsageSelection {
-  const filters = { ...emptyFilters };
+  const filters = { ...emptyUsageFilters, keyAlias: current.filters.keyAlias };
   let customFrom = current.customFrom; let customTo = current.customTo; let preset: Preset = current.preset;
   for (const condition of ast.conditions) {
     if (condition.field === 'created_at' && condition.operator === 'between' && condition.value.type === 'timestamp' && condition.upper?.type === 'timestamp') {
@@ -77,6 +74,23 @@ function replaceTypedUsageCondition(ast: TypedFilterAst, filter: keyof UsageFilt
   const conditions = ast.conditions.filter((condition) => condition.field !== field);
   const condition = typedUsageCondition(filter, bucket);
   return condition ? { ...ast, conditions: [...conditions, condition] } : { ...ast, conditions };
+}
+
+function UsageCredentialAliasSelect({ disabled, onChange, tenant, token, value }: { disabled: boolean; onChange: (value: string) => void; tenant: string; token: string; value: string }) {
+  const { t } = useI18n();
+  const [credentials, setCredentials] = useState<KeyView[]>([]);
+  useEffect(() => {
+    if (!token.trim()) { setCredentials([]); return; }
+    const controller = new AbortController();
+    const params = new URLSearchParams({ limit: '100' });
+    if (tenant) params.set('tenant_external_id', tenant);
+    void api<KeyView[]>(`/internal/v1/keys?${params}`, token.trim(), { signal: controller.signal })
+      .then((values) => { if (!controller.signal.aborted) setCredentials(Array.isArray(values) ? values : []); })
+      .catch(() => { if (!controller.signal.aborted) setCredentials([]); });
+    return () => controller.abort();
+  }, [tenant, token]);
+  const aliases = [...new Set(credentials.map((credential) => credential.alias.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+  return <label>{t('usage.clientCredential')}<select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}><option value="">{t('common.all')}</option>{aliases.map((alias) => <option key={alias} value={alias}>{alias}</option>)}</select></label>;
 }
 
 const formatCurrency = (value: string | number, currency: string, locale: 'en' | 'zh-CN') => formatCurrencyDisplay(value, currency, locale).text;
@@ -128,10 +142,10 @@ function LazyChart({ children }: { children: ReactNode }) {
 }
 
 export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { token: string; tenant: string; upstreams: UpstreamAccount[]; onOpenSession: (session: UsageAnalysisSessionBucket) => void }) {
-  const { locale, t } = useI18n(); const copy = localCopy[locale]; const now = Date.now();
+  const { locale, t } = useI18n(); const copy = localCopy[locale];
   const [tab, setTab] = useState<UsageTab>('overview'); const [dimension, setDimension] = useState<Dimension>('models');
   const [heatMetric, setHeatMetric] = useState<HeatmapMetric>('requests'); const [heatCurrency, setHeatCurrency] = useState(''); const [selectedHeatHour, setSelectedHeatHour] = useState<number>();
-  const [selection, setSelection] = useState<UsageSelection>({ preset: '24h', granularity: 'auto', customFrom: localDateTimeInput(now - 86_400_000), customTo: localDateTimeInput(now), filters: emptyFilters });
+  const [selection, setSelection] = useState<UsageSelection>(() => defaultUsageSelection());
   const [typedFilters, setTypedFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [applied, setApplied] = useState(selection); const [refresh, setRefresh] = useState(0); const scope = useMemo(() => ({}), [token, tenant, applied, refresh]);
   const [remote, setRemote] = useState<{ scope: object; status: 'loading' } | { scope: object; status: 'ready'; value: OperatorUsageAnalysis } | { scope: object; status: 'error'; message: string }>(); const requestSequence = useRef(0);
@@ -174,15 +188,10 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const currencies = stats ? costCurrencies(stats.heatmap) : []; const effectiveHeatCurrency = currencies.includes(heatCurrency) ? heatCurrency : (currencies[0] ?? 'USD');
   const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale === 'en' ? 'en-US' : 'zh-CN', { weekday: 'short', timeZone: stats?.time_zone ?? 'UTC' })), [locale, stats?.time_zone]);
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], heatMetric, effectiveHeatCurrency, weekdays, t('usage.heatmapLabel'), chartFormatters), [stats?.heatmap, heatMetric, effectiveHeatCurrency, weekdays, t, chartFormatters]);
-  const activeFilters = new Set([
-    ...typedFilters.conditions.map((condition) => condition.field),
-    ...(applied.filters.model ? ['model'] : []), ...(applied.filters.keyId ? ['key_id'] : []),
-    ...(applied.filters.upstreamId ? ['upstream_account_id'] : []), ...(applied.filters.protocol ? ['protocol'] : []),
-    ...(applied.filters.status ? ['status'] : []), ...(applied.filters.errorCode ? ['error_code'] : []),
-  ]).size;
-  const externalFilterChips = applied.filters.upstreamId === 'unassigned'
-    ? [{ id: 'usage-upstream-unassigned', label: `${t('filter.field.upstream_account_id')} ${t('filter.operator.equals')} ${t('usage.unassigned')}` }]
-    : [];
+  const externalFilterChips = [
+    ...(applied.filters.upstreamId === 'unassigned' ? [{ id: 'usage-upstream-unassigned', label: `${t('filter.field.upstream_account_id')} ${t('filter.operator.equals')} ${t('usage.unassigned')}` }] : []),
+    ...(applied.filters.keyAlias ? [{ id: 'usage-key-alias', label: `${t('usage.clientCredential')} ${t('filter.operator.equals')} ${applied.filters.keyAlias}` }] : []),
+  ];
   const heatMetricLabel = heatMetric === 'requests' ? copy.requests : heatMetric === 'tokens' ? copy.tokens : heatMetric === 'cost' ? localSettlementLabel(locale) : copy.failureRate;
   const selectedHeatCell = stats?.heatmap.find((value) => value.hour_of_week === selectedHeatHour);
 
@@ -202,12 +211,11 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
     : undefined;
 
   return <div className="usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p>{stats && <span className="usage-time-zone" title={reportedRange}>{bucketTimeZoneNote(locale, stats.time_zone)}</span>}</div><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => setRefresh((value) => value + 1)}>{loading ? t('common.loading') : t('usage.refresh')}</button></div>
-    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} externalChips={externalFilterChips} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
-    <details className="usage-filter-disclosure"><summary>{copy.filters}{activeFilters > 0 && <span className="usage-filter-count">{activeFilters} {copy.filtersActive}</span>}</summary><form className="usage-controls" onSubmit={(event) => { event.preventDefault(); setApplied({ ...selection }); }}>
-      <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{presets.map((preset) => <button type="button" className={selection.preset === preset ? 'active' : 'secondary'} aria-pressed={selection.preset === preset} key={preset} onClick={() => { const next = { ...selection, preset }; setSelection(next); if (preset !== 'custom') setApplied(next); }}>{t(`usage.preset.${preset}`)}</button>)}</div></fieldset>
+    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} externalChips={externalFilterChips} panelActive={Object.values(selection.filters).some(Boolean) || selection.preset !== '24h' || selection.granularity !== 'auto'} panelControls={<div className="usage-controls">
+      <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{usagePresets.map((preset) => <button type="button" className={selection.preset === preset ? 'active' : 'secondary'} aria-pressed={selection.preset === preset} key={preset} onClick={() => setSelection({ ...selection, preset })}>{t(`usage.preset.${preset}`)}</button>)}</div></fieldset>
       {selection.preset === 'custom' && <div className="usage-custom-range"><label>{t('traffic.from')}<input type="datetime-local" step="0.001" value={selection.customFrom} onChange={(event) => setSelection({ ...selection, customFrom: event.target.value })} /></label><label>{t('traffic.to')}<input type="datetime-local" step="0.001" value={selection.customTo} onChange={(event) => setSelection({ ...selection, customTo: event.target.value })} /></label></div>}
-      <div className="usage-filter-grid"><label>{t('usage.granularity')}<select value={selection.granularity} onChange={(event) => setSelection({ ...selection, granularity: event.target.value as Granularity })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></select></label><div className="filter-actions"><button type="submit" disabled={loading || !token.trim()}>{t('usage.apply')}</button><button type="button" className="secondary" disabled={loading || (!Object.values(selection.filters).some(Boolean) && typedFilters.conditions.length === 0)} onClick={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }}>{t('usage.clearFilters')}</button></div></div>
-    </form></details>
+      <div className="usage-filter-grid"><label>{t('usage.granularity')}<select value={selection.granularity} onChange={(event) => setSelection({ ...selection, granularity: event.target.value as UsageSelection['granularity'] })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></select></label><UsageCredentialAliasSelect disabled={Boolean(loading) || !token.trim()} token={token} tenant={tenant} value={selection.filters.keyAlias} onChange={(keyAlias) => setSelection({ ...selection, filters: { ...selection.filters, keyAlias } })} /></div>
+    </div>} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = defaultUsageSelection(); setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
     {!token.trim() && <div className="notice warning" role="status">{t('usage.connectPrompt')}</div>}{loading && <div className="notice" role="status">{t('common.loading')}</div>}{error && <div className="notice error" role="alert">{error}</div>}
     <nav className="usage-tabs" role="tablist" aria-label={t('usage.sections')}>{usageTabs.map((id) => <button type="button" role="tab" id={`usage-tab-${id}`} aria-controls={`usage-panel-${id}`} aria-selected={tab === id} tabIndex={tab === id ? 0 : -1} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)} onKeyDown={(event) => { const next = nextUsageTab(id, event.key); if (!next) return; event.preventDefault(); setTab(next); requestAnimationFrame(() => document.getElementById(`usage-tab-${next}`)?.focus()); }}>{id === 'dimensions' ? copy.dimensions : t(`usage.tab.${id}`)}</button>)}</nav>
     {stats && <section className="usage-tab-panel" role="tabpanel" id={`usage-panel-${tab}`} aria-labelledby={`usage-tab-${tab}`}><p className="analytics-settlement-note"><LocalSettlementNotice /></p>{tab === 'overview' && <><UsageSummaryMetrics stats={stats} /><p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95 按直方图区间上界展示；超出范围及早期无法确定的值留空。' : 'P95 uses histogram upper bounds. Out-of-range and ambiguous earlier values leave gaps.'}</p><GenerationBreakdown stats={stats} /><div className="usage-overview-chart-grid"><ChartCard className="usage-chart-primary" title={copy.throughput} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.throughput} locale={locale} option={throughput} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={copy.latency} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.latency} locale={locale} option={latency} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={localSettlementTrendLabel(locale)} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={localSettlementTrendLabel(locale)} locale={locale} option={costs} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard></div></>}
