@@ -114,6 +114,95 @@ mod tests {
     use super::*;
     use crate::provider::UpstreamCredential;
 
+    #[tokio::test]
+    async fn http2_reset_never_replays_post_direct_or_through_socks5h() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for use_proxy in [false, true] {
+            for reason in [http2::Reason::CANCEL, http2::Reason::REFUSED_STREAM] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let connections = Arc::new(AtomicUsize::new(0));
+                let requests = Arc::new(AtomicUsize::new(0));
+                let connection_count = connections.clone();
+                let request_count = requests.clone();
+                let server = tokio::spawn(async move {
+                    let mut handlers = tokio::task::JoinSet::new();
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        connection_count.fetch_add(1, Ordering::SeqCst);
+                        let request_count = request_count.clone();
+                        handlers.spawn(async move {
+                            if use_proxy {
+                                let mut greeting = [0; 2];
+                                socket.read_exact(&mut greeting).await.unwrap();
+                                assert_eq!(greeting[0], 5);
+                                let mut methods = vec![0; usize::from(greeting[1])];
+                                socket.read_exact(&mut methods).await.unwrap();
+                                socket.write_all(&[5, 0]).await.unwrap();
+                                let mut connect = [0; 4];
+                                socket.read_exact(&mut connect).await.unwrap();
+                                assert_eq!(connect, [5, 1, 0, 3]);
+                                let length = socket.read_u8().await.unwrap();
+                                let mut destination = vec![0; usize::from(length)];
+                                socket.read_exact(&mut destination).await.unwrap();
+                                assert_eq!(destination, b"reset.example.test");
+                                assert_eq!(socket.read_u16().await.unwrap(), 80);
+                                socket
+                                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                                    .await
+                                    .unwrap();
+                            }
+                            let mut connection = http2::server::handshake(socket).await.unwrap();
+                            while let Some(Ok((request, mut response))) = connection.accept().await
+                            {
+                                assert_eq!(request.method(), http::Method::POST);
+                                request_count.fetch_add(1, Ordering::SeqCst);
+                                response.send_reset(reason);
+                            }
+                        });
+                    }
+                });
+                let client =
+                    crate::build_codex_http_client_with_policy(CodexTransportPolicy::default())
+                        .unwrap();
+                let target = if use_proxy {
+                    "http://reset.example.test/v1/responses".to_owned()
+                } else {
+                    format!("http://{address}/v1/responses")
+                };
+                let mut request = client
+                    .post(target)
+                    .version(http::Version::HTTP_2)
+                    .body("synthetic generation");
+                if use_proxy {
+                    request =
+                        request.proxy(wreq::Proxy::all(format!("socks5h://{address}")).unwrap());
+                }
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
+                server.abort();
+                let error = result.expect("reset must terminate promptly").unwrap_err();
+                let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                let mut observed = None;
+                while let Some(current) = source {
+                    if let Some(http2) = current.downcast_ref::<http2::Error>() {
+                        observed = Some((http2.is_reset(), http2.is_remote(), http2.reason()));
+                        break;
+                    }
+                    source = current.source();
+                }
+                assert_eq!(observed, Some((true, true, Some(reason))));
+                assert_eq!(connections.load(Ordering::SeqCst), 1);
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
     #[test]
     fn sixty_fifth_client_evicts_only_the_least_recently_used_entry() {
         let clients = CodexClients::default();
