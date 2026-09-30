@@ -633,6 +633,12 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
             .pointer("/properties/transport_policy/properties/chat_controls/default"),
         Some(&json!("strict"))
     );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/responses_output_limits/default"),
+        Some(&json!("strict"))
+    );
     for (field, bound, expected) in [
         ("version", "enum", json!([1])),
         ("candidate_attempts", "minimum", json!(1)),

@@ -45,6 +45,14 @@ pub(crate) enum CodexChatControlPolicy {
     Strict,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodexResponsesOutputLimitPolicy {
+    ProviderDefault,
+    #[default]
+    Strict,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CodexTransportPolicy {
@@ -67,6 +75,7 @@ pub(crate) struct CodexTransportPolicy {
     pub max_sse_framed_bytes: usize,
     pub max_sse_terminal_hold_bytes: usize,
     pub chat_controls: CodexChatControlPolicy,
+    pub responses_output_limits: CodexResponsesOutputLimitPolicy,
 }
 
 impl Default for CodexTransportPolicy {
@@ -89,6 +98,7 @@ impl Default for CodexTransportPolicy {
             max_sse_framed_bytes: SseFramingLimits::DEFAULT_FRAMED_BYTES,
             max_sse_terminal_hold_bytes: SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES,
             chat_controls: CodexChatControlPolicy::Strict,
+            responses_output_limits: CodexResponsesOutputLimitPolicy::Strict,
         }
     }
 }
@@ -168,13 +178,21 @@ mod tests {
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
         assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
         assert_eq!(policy.chat_controls, CodexChatControlPolicy::Strict);
+        assert_eq!(
+            policy.responses_output_limits,
+            CodexResponsesOutputLimitPolicy::Strict
+        );
         let provider_default = CodexTransportPolicy::parse(Some(&json!({
-            "chat_controls": "provider_default"
+            "chat_controls": "provider_default", "responses_output_limits": "provider_default"
         })))
         .unwrap();
         assert_eq!(
             provider_default.chat_controls,
             CodexChatControlPolicy::ProviderDefault
+        );
+        assert_eq!(
+            provider_default.responses_output_limits,
+            CodexResponsesOutputLimitPolicy::ProviderDefault
         );
         let independent_phases = CodexTransportPolicy::parse(Some(&json!({
             "connect_timeout_millis": 5_000,
@@ -216,6 +234,7 @@ mod tests {
             json!({"shared_probe_attempts": 5}),
             json!({"shared_probe_attempts": null}),
             json!({"chat_controls": "unknown"}),
+            json!({"responses_output_limits": "unknown"}),
             json!({"account_hint": "untrusted"}),
             json!({"retry_503": true}),
             json!({"plugin": "untrusted"}),

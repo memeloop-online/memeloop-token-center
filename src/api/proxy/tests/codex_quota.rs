@@ -55,6 +55,7 @@ async fn codex_quota_exhaustion_fails_over_once_and_future_request_skips_until_r
 #[tokio::test]
 async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
     let fixture = codex_route_fixture("quota-sse-unknown").await;
+    codex_output_limits::enable_provider_default_limits(&fixture).await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -80,7 +81,8 @@ async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
         &fixture,
         &upstream,
         "/v1/responses",
-        json!({"model":fixture.model,"input":"fixture","stream":true}),
+        json!({"model":fixture.model,"input":"fixture","stream":true,
+            "max_output_tokens":16}),
     )
     .await;
     if let Ok(body) = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY).await {

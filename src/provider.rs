@@ -26,7 +26,9 @@ pub(crate) use credential::{
     validate_oauth_remote_dns_proxy_url, validate_provider_adapter_secret_patch,
     validate_proxy_url,
 };
-pub(crate) use transport_policy::{CodexChatControlPolicy, CodexTransportPolicy, SseFramingLimits};
+pub(crate) use transport_policy::{
+    CodexChatControlPolicy, CodexResponsesOutputLimitPolicy, CodexTransportPolicy, SseFramingLimits,
+};
 pub use types::{
     AuthorizedUpstreamCandidate, ModelRouteView, ResolvedUpstream, UpstreamAccountView,
     UpstreamDeletionReadiness,
