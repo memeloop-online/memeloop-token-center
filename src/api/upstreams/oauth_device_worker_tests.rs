@@ -143,25 +143,6 @@ async fn staged_login_recovery(stale_account: bool) {
         )
         .await
         .unwrap();
-    let observe = || async {
-        let headers = axum::http::HeaderMap::from_iter([(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_str(&format!("Bearer {}", state.config.service_token))
-                .unwrap(),
-        )]);
-        super::oauth::poll_codex_oauth(
-            axum::extract::State(state.clone()),
-            headers,
-            axum::Json(serde_json::from_value(json!({"session_id":session_id})).unwrap()),
-        )
-        .await
-        .unwrap()
-    };
-    assert_eq!(observe().await.status(), axum::http::StatusCode::ACCEPTED);
-    assert_eq!(
-        state.db.due_codex_login_sessions(now, 16).await.unwrap(),
-        vec![session_id]
-    );
     if stale_account {
         assert!(matches!(
             poll_codex_oauth_for_worker(&state, session_id).await,
@@ -195,6 +176,25 @@ async fn staged_login_recovery(stale_account: bool) {
         );
         return;
     }
+    let observe = || async {
+        let headers = axum::http::HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", state.config.service_token))
+                .unwrap(),
+        )]);
+        super::oauth::poll_codex_oauth(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::Json(serde_json::from_value(json!({"session_id":session_id})).unwrap()),
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(observe().await.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(
+        state.db.due_codex_login_sessions(now, 16).await.unwrap(),
+        vec![session_id]
+    );
     let (first, second) = tokio::join!(
         poll_codex_oauth_for_worker(&state, session_id),
         poll_codex_oauth_for_worker(&state, session_id)
