@@ -99,7 +99,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       assert.equal(await trigger.isVisible(), true);
       await page.locator('[data-inline-edit-trigger="rotation-fixture"]').click();
       await trigger.click();
-      await form.getByRole('button', { name: copy.back }).focus(); await page.keyboard.press('Enter');
+      await form.getByRole('button', { name: copy.back, exact: true }).focus(); await page.keyboard.press('Enter');
       await page.getByRole('heading', { name: copy.settings, exact: true }).waitFor();
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
       assert.equal(writes.length, 3, 'back and close never write credentials or start OAuth');
