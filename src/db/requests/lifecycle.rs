@@ -66,6 +66,7 @@ pub struct StartProxyRequest<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestArchiveAdmission {
     Captured,
+    Queued,
     GapCapacity,
     GapRetentionLimit,
 }
@@ -254,6 +255,7 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_proxy_request_with_archive_compression(
         &self,
         input: StartProxyRequest<'_>,
@@ -411,7 +413,9 @@ impl Database {
             let reason = match archive_admission {
                 RequestArchiveAdmission::GapCapacity => "capacity",
                 RequestArchiveAdmission::GapRetentionLimit => "retention_limit",
-                RequestArchiveAdmission::Captured => return Err(AppError::Internal),
+                RequestArchiveAdmission::Captured | RequestArchiveAdmission::Queued => {
+                    return Err(AppError::Internal);
+                }
             };
             super::super::archive_spool::insert_request_archive_gap_in_transaction(
                 &mut transaction,

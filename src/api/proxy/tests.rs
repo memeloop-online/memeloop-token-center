@@ -32,6 +32,7 @@ mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
 mod filter_assistant;
+mod gateway_persistence;
 mod group_routing;
 mod ha_policy;
 mod kimi;
@@ -2797,6 +2798,7 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
 }
 
 async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
@@ -4169,6 +4171,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4580,6 +4583,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(body.as_ref(), sse.as_bytes());
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4613,9 +4617,6 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         crate::model::RequestArchiveState::Pending
     );
 
-    // HTTP completion publishes only placeholder locators while both exact
-    // bodies remain recoverable from the encrypted database spool. Object
-    // storage and its worker may be unavailable without losing either body.
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     for (spools, chunks, plaintext, expected_bytes) in [
         (
@@ -4766,6 +4767,7 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let gap = sqlx::query(
         "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
                 cleaned_at
