@@ -447,7 +447,17 @@ async fn hint_routing_fixture_with_database(
         .unwrap();
     initial_state
         .db
-        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .upsert_model_price("upstream-preferred", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    initial_state
+        .db
+        .upsert_model_price("upstream-standby", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    initial_state
+        .db
+        .upsert_model_price("upstream-unauthorized", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
     let preferred_account_id = account_ids[0];

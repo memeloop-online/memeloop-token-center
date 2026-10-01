@@ -602,6 +602,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable plugin service data snapshots",
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
     },
+    Migration {
+        version: 114,
+        name: "request routing and price snapshots",
+        sql: include_str!("../../../migrations/common/0114_request_routing_price_snapshots.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1187,6 +1192,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 113,
         name: "durable plugin service data snapshots",
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
+    },
+    Migration {
+        version: 114,
+        name: "request routing and price snapshots",
+        sql: include_str!("../../../migrations/common/0114_request_routing_price_snapshots.sql"),
     },
 ];
 

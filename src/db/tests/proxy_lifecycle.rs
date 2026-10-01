@@ -1125,7 +1125,19 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    sqlx::any::install_default_drivers();
+    let admin = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let schema = format!("proxy_lifecycle_lock_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated_url = url::Url::parse(&database_url).unwrap();
+    isolated_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-c search_path={schema}"));
+    let isolated_url = isolated_url.to_string();
+    let database = Database::connect_with_max(&isolated_url, 8).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
     let pepper = b"online projection shared lock ordering pepper";
@@ -1236,7 +1248,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             .await
             .unwrap();
 
-        let pause_gate = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pause_gate = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let pause_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&pause_gate.pool)
             .await
@@ -1247,7 +1259,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             .await
             .unwrap();
 
-        let pending_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let pending_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let pending_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&pending_database.pool)
             .await
@@ -1296,7 +1308,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         )
         .await;
 
-        let contender_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let contender_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
         let contender_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&contender_database.pool)
             .await
@@ -1386,7 +1398,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .await
         .unwrap();
 
-    let stats_first_database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let stats_first_database = Database::connect_with_max(&isolated_url, 1).await.unwrap();
     let stats_first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&stats_first_database.pool)
         .await
@@ -1418,6 +1430,12 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .expect("key-budget/stats writers exceeded the deadline or returned 55P03")
         .expect("stats-first task panicked")
         .expect("stats-first writer returned 40P01 or 55P03");
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]
@@ -2820,7 +2838,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
         .await
         .unwrap();
     let failover = sqlx::query(
-        "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = $1",
+        "SELECT upstream_account_id, model_route_id, price_snapshot_json FROM request_records WHERE id = $1",
     )
     .bind(failover_request.to_string())
     .fetch_one(&database.pool)
@@ -2833,5 +2851,130 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
     assert_eq!(
         failover.get::<Option<String>, _>("model_route_id"),
         Some(dispatched_route.to_string())
+    );
+    let stored_price: crate::model::ModelPrice =
+        serde_json::from_str(&failover.get::<String, _>("price_snapshot_json")).unwrap();
+    assert_eq!(stored_price.id, price.id);
+}
+
+#[tokio::test]
+async fn historical_billing_reads_the_admission_price_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("billing-snapshot.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"billing snapshot test pepper value";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "billing-snapshot".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "billing-snapshot".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("billing-snapshot-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 5,
+            protocol: "openai",
+            model: "billing-snapshot-model",
+            request_object: "gap://billing-snapshot/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let changed_price = database
+        .upsert_model_price(
+            "billing-snapshot-model",
+            "USD",
+            Decimal::from(1000),
+            Decimal::from(1000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        changed_price.input_micros_per_million,
+        price.input_micros_per_million
+    );
+    sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2")
+        .bind(serde_json::to_string(&changed_price).unwrap())
+        .bind(reservation.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            usage_basis: Some(crate::model::RequestUsageBasis::ProviderReported),
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 10,
+            output_token_ceiling: 5,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..TokenUsage::default()
+            },
+            error_code: None,
+            response_object: "gap://billing-snapshot/response",
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        })
+        .await
+        .unwrap();
+    let stored =
+        sqlx::query("SELECT cost_micros, price_snapshot_json FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let stored_price: ModelPrice =
+        serde_json::from_str(&stored.get::<String, _>("price_snapshot_json")).unwrap();
+    assert_eq!(stored_price.id, price.id);
+    assert_eq!(
+        stored_price.input_micros_per_million,
+        price.input_micros_per_million
+    );
+    assert_eq!(
+        stored_price.output_micros_per_million,
+        price.output_micros_per_million
+    );
+    let views = database.list_requests(key.key_id, 10).await.unwrap();
+    let view = views
+        .iter()
+        .find(|view| view.request_id == request_id)
+        .unwrap();
+    assert_eq!(
+        view.cost,
+        crate::model::micros_to_decimal_string(stored.get::<i64, _>("cost_micros"))
     );
 }

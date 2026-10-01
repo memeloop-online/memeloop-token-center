@@ -2570,7 +2570,7 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
     forbidden: &[&str],
 ) {
     let job_id = world.generation_job_id.expect("generation job id");
-    for _ in 0..30 {
+    for _ in 0..120 {
         let value = world
             .client
             .get(format!(
@@ -2584,7 +2584,22 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
             .json::<Value>()
             .await
             .expect("assetless generation status JSON");
+        world.response = value.clone();
         if value["status"] == "failed" {
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after assetless generation")
+                .json::<Value>()
+                .await
+                .expect("key after assetless generation JSON");
+            if key["available_balance"] != "10" {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
             assert_eq!(value["billed_units"], 0);
             assert_eq!(value["cost"], "0");
             assert_eq!(value["error_code"], expected_error_code);
@@ -2603,16 +2618,6 @@ async fn assert_generation_failure_is_sanitized_and_refunded(
                 .await
                 .expect("stored assetless generation");
             assert_eq!(stored.result, None);
-            let key = world
-                .client
-                .get(format!("{}/self/v1/key", world.service_url))
-                .bearer_auth(&world.current_key)
-                .send()
-                .await
-                .expect("key after assetless generation")
-                .json::<Value>()
-                .await
-                .expect("key after assetless generation JSON");
             assert_eq!(key["available_balance"], "10");
             world.response = value;
             return;
@@ -6021,6 +6026,20 @@ async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
             .expect("create routed model price");
         assert_eq!(response.status(), StatusCode::OK);
     }
+    for model in ["api-upstream", "oauth-upstream"] {
+        let response = world
+            .client
+            .post(format!(
+                "{}/internal/v1/prices/USD/{model}",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+            .send()
+            .await
+            .expect("create routed upstream model price");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))
@@ -6505,6 +6524,23 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
         .await
         .expect("create model price");
     assert_eq!(price_response.status(), StatusCode::OK);
+    if model == "cursor-public" {
+        let upstream_price = world
+            .client
+            .post(format!(
+                "{}/internal/v1/prices/USD/cursor-upstream",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({
+                "input_per_million": "1.00",
+                "output_per_million": "1.00"
+            }))
+            .send()
+            .await
+            .expect("create Cursor upstream model price");
+        assert_eq!(upstream_price.status(), StatusCode::OK);
+    }
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))

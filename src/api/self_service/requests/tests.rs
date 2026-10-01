@@ -15,6 +15,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             lifecycle_state: crate::model::RequestLifecycleState::Succeeded,
             protocol: "openai".to_owned(),
             model: "request-detail-test".to_owned(),
+            upstream_model: None,
             upstream_account_id: Some(Uuid::nil()),
             route_id: Some(Uuid::nil()),
             status_code: Some(200),

@@ -30,6 +30,7 @@ struct SessionAccumulator {
     key_id: String,
     key_alias: String,
     model: String,
+    upstream_model: Option<String>,
     protocol: String,
     last_status: String,
     last_activity_at: i64,
@@ -209,8 +210,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
              FROM recent
             WHERE recent.session_id = 'unlinked:' || recent.key_id
        ), recent_activity AS (
-           SELECT recent.key_id, recent.session_id, request.model,
-                  request.protocol, request.status_code, request.created_at,
+           SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
+                          request.protocol, request.status_code, request.created_at,
                   request.id, 1 AS live, observation.session_name,
                   observation.task_kind
              FROM latest_ids recent
@@ -223,8 +224,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                ON observation.request_id = request.id
               AND observation.key_id = request.key_id
            UNION ALL
-           SELECT recent.key_id, recent.session_id, request.model,
-                  request.protocol, request.status_code, request.created_at,
+           SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
+                          request.protocol, request.status_code, request.created_at,
                   request.id, 1, observation.session_name,
                   observation.task_kind
              FROM latest_ids recent
@@ -237,8 +238,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                ON observation.request_id = request.id
               AND observation.key_id = request.key_id
            UNION ALL
-           SELECT recent.key_id, recent.session_id, archive.model,
-                  archive.protocol, archive.status_code,
+           SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
+                          archive.protocol, archive.status_code,
                   archive.source_started_at, archive.archive_request_id, 0,
                   observation.session_name, observation.task_kind
              FROM latest_ids recent
@@ -250,8 +251,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
                ON observation.request_id = archive.archive_request_id
               AND observation.key_id = archive.key_id
            UNION ALL
-           SELECT recent.key_id, recent.session_id, archive.model,
-                  archive.protocol, archive.status_code,
+           SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
+                          archive.protocol, archive.status_code,
                   archive.source_started_at, archive.archive_request_id, 0,
                   observation.session_name, observation.task_kind
              FROM latest_ids recent
@@ -289,6 +290,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
               COALESCE(archived.duration_sum_ms, 0) AS archived_only_duration_sum_ms,
               COALESCE(active.active_requests, 0) AS active_requests,
               COALESCE(latest_activity.model, '') AS model,
+              latest_activity.upstream_model AS upstream_model,
               COALESCE(latest_activity.protocol, '') AS protocol,
               latest_activity.session_name,
               latest_activity.task_kind,
@@ -649,7 +651,7 @@ impl Database {
                      FROM recent
                     WHERE recent.session_id = 'unlinked:' || recent.key_id
                ), recent_activity AS (
-                   SELECT recent.key_id, recent.session_id, request.model,
+                   SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1 AS live, observation.session_name,
                           observation.task_kind
@@ -663,7 +665,7 @@ impl Database {
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, request.model,
+                   SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1, observation.session_name,
                           observation.task_kind
@@ -677,7 +679,7 @@ impl Database {
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, archive.model,
+                   SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
@@ -690,7 +692,7 @@ impl Database {
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, archive.model,
+                   SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
@@ -729,6 +731,7 @@ impl Database {
                       COALESCE(archived.duration_sum_ms, 0) AS archived_only_duration_sum_ms,
                       COALESCE(active.active_requests, 0) AS active_requests,
                       COALESCE(latest_activity.model, '') AS model,
+                      latest_activity.upstream_model AS upstream_model,
                       COALESCE(latest_activity.protocol, '') AS protocol,
                       latest_activity.session_name,
                       latest_activity.task_kind,
@@ -949,7 +952,7 @@ impl Database {
                      FROM recent
                     WHERE recent.session_id = 'unlinked:' || recent.key_id
                ), recent_activity AS (
-                   SELECT recent.key_id, recent.session_id, request.model,
+                   SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1 AS live, observation.session_name,
                           observation.task_kind
@@ -963,7 +966,7 @@ impl Database {
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, request.model,
+                   SELECT recent.key_id, recent.session_id, request.model, request.upstream_model,
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1, observation.session_name,
                           observation.task_kind
@@ -977,7 +980,7 @@ impl Database {
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, archive.model,
+                   SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
@@ -990,7 +993,7 @@ impl Database {
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id
                    UNION ALL
-                   SELECT recent.key_id, recent.session_id, archive.model,
+                   SELECT recent.key_id, recent.session_id, archive.model, CAST(NULL AS TEXT),
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
@@ -1028,6 +1031,7 @@ impl Database {
                       COALESCE(archived.duration_sum_ms, 0) AS archived_only_duration_sum_ms,
                       COALESCE(active.active_requests, 0) AS active_requests,
                       COALESCE(latest_activity.model, '') AS model,
+                      latest_activity.upstream_model AS upstream_model,
                       COALESCE(latest_activity.protocol, '') AS protocol,
                       latest_activity.session_name,
                       latest_activity.task_kind,
@@ -1088,12 +1092,12 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1108,7 +1112,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model,
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -1133,12 +1137,12 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, status_code, duration_ms, first_output_ms, generation_duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1153,7 +1157,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model,
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -1243,6 +1247,7 @@ impl Database {
                         },
                         protocol,
                         model: row.try_get("model")?,
+                        upstream_model: row.try_get("upstream_model")?,
                         upstream_account_id: None,
                         route_id: None,
                         status_code,
@@ -1335,6 +1340,7 @@ fn session_summaries_from_rows(
             accumulator.key_id = row_key_id;
             accumulator.key_alias = row.try_get("key_alias")?;
             accumulator.model = row.try_get("model")?;
+            accumulator.upstream_model = row.try_get("upstream_model")?;
             accumulator.protocol = row.try_get("protocol")?;
             accumulator.last_status = row.try_get("last_status")?;
             accumulator.last_activity_at = row.try_get("last_activity_at")?;
@@ -1395,6 +1401,7 @@ impl SessionAccumulator {
             key_id: parse_uuid(self.key_id)?,
             key_alias: self.key_alias,
             model: self.model,
+            upstream_model: self.upstream_model,
             protocol: self.protocol,
             last_status: self.last_status,
             last_activity_at: self.last_activity_at,
