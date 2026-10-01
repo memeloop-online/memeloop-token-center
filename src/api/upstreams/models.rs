@@ -375,7 +375,7 @@ pub(crate) fn trigger_upstream_model_sync(state: AppState, account_id: Uuid) {
     });
 }
 
-pub(super) async fn sync_upstream_models_after_refresh(
+pub(crate) async fn sync_upstream_models_after_refresh(
     state: &AppState,
     account_id: Uuid,
     blocking: Option<&crate::worker::BlockingTasks>,

@@ -136,6 +136,7 @@ use traffic::{
     proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
 use upstreams::*;
+pub(crate) use upstreams::sync_upstream_models_after_refresh;
 use web::{operator_index, portal_index, web_asset};
 
 pub(crate) use upstreams::{
