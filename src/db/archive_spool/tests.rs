@@ -811,7 +811,7 @@ async fn terminal_gap_event_is_atomic_idempotent_and_preserves_snapshot_facts() 
 }
 
 async fn terminal(db: &Database, id: ArchiveSpoolIdentity) {
-    sqlx::query("UPDATE request_records SET completed_at = 2, response_object = $1 WHERE id = $2")
+    sqlx::query("UPDATE request_records SET completed_at = 2, status_code = 200, error_code = NULL, response_object = $1 WHERE id = $2")
         .bind(format!("gap://{}/response", id.request_id))
         .bind(id.request_id.to_string())
         .execute(&db.pool)

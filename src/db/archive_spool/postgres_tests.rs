@@ -471,8 +471,15 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
             .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
+    let archive_state: String =
+        sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(archive_state, "gap");
     // Also exercise a real server-side connection loss, not only caller
     // cancellation. Terminate only this isolated fixture's COMMIT backend.
     let disconnected_id = Uuid::new_v4();
@@ -813,7 +820,7 @@ impl PgFixture {
         } else {
             // Same request columns exercised by the production spool API; there is
             // deliberately no FK to billing tables, matching request_records.
-            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
+            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, error_code TEXT, cost_micros BIGINT NOT NULL DEFAULT 123)")
             .execute(&db.pool).await.unwrap();
             // This focused fixture intentionally omits the production request
             // projection tables. Keeping the locator table empty exercises the
@@ -880,7 +887,7 @@ impl PgFixture {
 
     async fn terminal(&self) {
         sqlx::query(
-            "UPDATE request_records SET completed_at = 2, response_object = $1 WHERE id = $2",
+            "UPDATE request_records SET completed_at = 2, status_code = 200, error_code = NULL, response_object = $1 WHERE id = $2",
         )
         .bind(format!("gap://{}/response", self.id.request_id))
         .bind(self.id.request_id.to_string())

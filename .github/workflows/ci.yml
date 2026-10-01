@@ -323,6 +323,8 @@ jobs:
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run tenant CAS archive contract tests
+        run: cargo test --locked --all-features --lib archive::compressed_tests -- --nocapture
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test

@@ -1,4 +1,4 @@
-use super::super::archive_spool::BudgetHold;
+use super::super::archive_spool::{BudgetHold, gap_failed_archive_spools_in_transaction};
 use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
 use super::conversations::{
@@ -1967,6 +1967,21 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .await?;
     if updated.rows_affected() == 0 {
         return Ok(false);
+    }
+    if !(200..400).contains(&request.status_code)
+        || request
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !code.is_empty())
+    {
+        // Failed terminal requests retain their request/route/usage facts, but
+        // their captured bodies are not successful text archives. Fence both
+        // spool purposes in this same terminal transaction and make their
+        // bounded ciphertext immediately eligible for the existing GC path.
+        // A worker can therefore never promote a 4xx/5xx/client-abort body to
+        // immutable CAS, even across a crash between settlement and cleanup.
+        gap_failed_archive_spools_in_transaction(tx, request.request_id, &tenant_id, completed_at)
+            .await?;
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
     if project_aggregates {
