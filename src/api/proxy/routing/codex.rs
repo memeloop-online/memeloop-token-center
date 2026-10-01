@@ -652,7 +652,10 @@ mod timeout_tests {
             })),
         };
         assert_eq!(sanitized_error_source_cause(&unrelated), None);
-        assert!(!exact_error_label(&unrelated, "keep-alive timed out private endpoint"));
+        assert!(!exact_error_label(
+            &unrelated,
+            "keep-alive timed out private endpoint"
+        ));
     }
 
     #[test]
