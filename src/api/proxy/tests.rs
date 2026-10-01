@@ -27,6 +27,7 @@ mod buffered_responses_incomplete;
 mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
+mod codex_output_limits;
 mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
@@ -3434,6 +3435,7 @@ async fn codex_specific_chat_limits_skip_to_a_compatible_native_candidate() {
 #[tokio::test]
 async fn codex_buffered_chat_translates_request_and_response_and_settles_once() {
     let fixture = codex_route_fixture("buffered-chat").await;
+    set_codex_chat_control_policy(&fixture, "provider_default").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -3537,6 +3539,7 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
 #[tokio::test]
 async fn codex_streaming_chat_emits_only_chat_chunks_with_terminal_usage() {
     let fixture = codex_route_fixture("streaming-chat").await;
+    set_codex_chat_control_policy(&fixture, "provider_default").await;
     let upstream = MockServer::start().await;
     let sse = streaming_codex_sse("Bonjour monde", "Bonjour ", "monde");
     Mock::given(method("POST"))

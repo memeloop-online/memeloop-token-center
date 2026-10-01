@@ -165,13 +165,15 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
 #[tokio::test]
 async fn dropping_downstream_body_records_client_cancelled_without_poisoning_upstream() {
     let fixture = codex_route_fixture("downstream-client-cancelled").await;
+    codex_output_limits::enable_provider_default_limits(&fixture).await;
     let (endpoint, release_body, upstream) =
         gated_sse_upstream(completed_codex_sse("never consumed").into_bytes()).await;
     let response = send_codex_route_to_endpoint(
         &fixture,
         endpoint,
         "/v1/responses",
-        json!({"model": fixture.model, "input": "disconnect", "stream": true}),
+        json!({"model": fixture.model, "input": "disconnect", "stream": true,
+            "max_output_tokens": 16}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

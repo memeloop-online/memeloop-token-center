@@ -194,6 +194,7 @@ fn workbuddy_chat_sampling_limits_remain_operator_controlled() {
         json!({"stop": ["END"]}),
         json!({"seed": 42}),
         json!({"max_tokens": 16}),
+        json!({"max_output_tokens": 16}),
     ] {
         let mut body = request();
         body.as_object_mut()
@@ -205,6 +206,26 @@ fn workbuddy_chat_sampling_limits_remain_operator_controlled() {
             assert!(body.get(field).is_none());
         }
     }
+}
+
+#[test]
+fn chat_output_limit_hint_rejects_invalid_and_conflicting_values() {
+    for bad in [
+        Value::Null,
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("16"),
+        json!(MAX_REPORTED_TOKENS + 1),
+    ] {
+        let mut body = request();
+        body["max_output_tokens"] = bad;
+        assert!(prepare(&mut body, "provider_default").is_err());
+    }
+    let mut body = request();
+    body["max_output_tokens"] = json!(16);
+    body["max_completion_tokens"] = json!(16);
+    assert!(prepare(&mut body, "provider_default").is_err());
 }
 
 #[test]

@@ -20,7 +20,7 @@ use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS, Protocol, TokenUsage,
     upstream_response::UpstreamResponse,
 };
-use crate::provider::CodexChatControlPolicy;
+use crate::provider::{CodexChatControlPolicy, CodexResponsesOutputLimitPolicy};
 use crate::{
     error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
 };
@@ -76,13 +76,8 @@ tokio::task_local! {
     static TEST_ENDPOINT: String;
 }
 
-const CLIENT_OUTPUT_LIMIT_FIELDS: &[&str] = &[
-    "max_output_tokens",
-    "max_completion_tokens",
-    "max_tokens",
-    "output_token_limits",
-    "reservation_token_bounds",
-];
+const SCALAR_OUTPUT_LIMIT_FIELDS: &[&str] =
+    &["max_output_tokens", "max_completion_tokens", "max_tokens"];
 
 const UNSUPPORTED_FIELDS: &[&str] = &[
     "temperature",
@@ -357,16 +352,16 @@ pub(super) fn prepare_request_with_id(
     protocol: Protocol,
 ) -> Result<PreparedCodexRequest, AppError> {
     validate_route_config(config)?;
-    let chat_control_policy =
-        crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
-            .map_err(|_| {
-                AppError::BadRequest(
-                    "OpenAI Codex account has invalid fixed transport configuration".into(),
-                )
-            })?
-            .chat_controls;
+    let transport_policy = crate::provider::CodexTransportPolicy::parse(
+        config.get("transport_policy"),
+    )
+    .map_err(|_| {
+        AppError::BadRequest(
+            "OpenAI Codex account has invalid fixed transport configuration".into(),
+        )
+    })?;
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
-        .then(|| translate_chat_request(request, chat_control_policy))
+        .then(|| translate_chat_request(request, transport_policy.chat_controls))
         .transpose()?;
     let object = request
         .as_object_mut()
@@ -376,24 +371,33 @@ pub(super) fn prepare_request_with_id(
         Some(Value::Bool(stream)) => *stream,
         Some(_) => return Err(AppError::BadRequest("stream must be a boolean".into())),
     };
-    if CLIENT_OUTPUT_LIMIT_FIELDS
-        .iter()
-        .any(|field| object.contains_key(*field))
-    {
-        return Err(AppError::BadRequest(
-            "Codex OAuth routes do not accept client output-token limits".into(),
-        ));
-    }
+    let response_limit = if matches!(protocol, Protocol::OpenAiResponses) {
+        take_scalar_output_limit(object)?
+    } else {
+        if object.contains_key("output_token_limits")
+            || object.contains_key("reservation_token_bounds")
+        {
+            return Err(AppError::BadRequest(
+                "Codex OAuth routes do not accept client reservation metadata".into(),
+            ));
+        }
+        None
+    };
     validate_service_tier(object.get("service_tier"), protocol)?;
     let output_token_ceiling = trusted_reservation_token_bound(config, upstream_model)?;
-    if let Some(controls) = chat_controls.as_ref()
-        && controls.enforce_output_limit
-        && controls
-            .output_limit
-            .is_some_and(|limit| limit < output_token_ceiling)
+    if let Some((field, _)) = response_limit
+        && transport_policy.responses_output_limits == CodexResponsesOutputLimitPolicy::Strict
     {
         return Err(AppError::BadRequest(format!(
-            "Codex text Chat cannot guarantee {} below the route's trusted output ceiling",
+            "Codex Responses cannot guarantee the requested {field} hard limit on this OAuth route"
+        )));
+    }
+    if let Some(controls) = chat_controls.as_ref()
+        && controls.enforce_output_limit
+        && controls.output_limit.is_some()
+    {
+        return Err(AppError::BadRequest(format!(
+            "Codex text Chat cannot guarantee the requested {} hard limit on this OAuth route",
             controls
                 .output_limit_field
                 .unwrap_or("the requested Chat output limit")
@@ -441,6 +445,37 @@ pub(super) fn prepare_request_with_id(
         output_token_ceiling,
         session_id,
     })
+}
+
+fn take_scalar_output_limit(
+    object: &mut Map<String, Value>,
+) -> Result<Option<(&'static str, i64)>, AppError> {
+    if object.contains_key("output_token_limits") || object.contains_key("reservation_token_bounds")
+    {
+        return Err(AppError::BadRequest(
+            "Codex OAuth routes do not accept client reservation metadata".into(),
+        ));
+    }
+    let mut selected = None;
+    for field in SCALAR_OUTPUT_LIMIT_FIELDS {
+        if let Some(value) = object.remove(*field) {
+            let limit = value
+                .as_i64()
+                .filter(|limit| (1..=MAX_REPORTED_TOKENS).contains(limit))
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "Codex Responses {field} must be a positive bounded integer"
+                    ))
+                })?;
+            if selected.is_some() {
+                return Err(AppError::BadRequest(
+                    "Codex Responses accepts only one output-token limit field".into(),
+                ));
+            }
+            selected = Some((*field, limit));
+        }
+    }
+    Ok(selected)
 }
 
 fn translate_chat_request(
@@ -504,15 +539,23 @@ fn translate_chat_request(
     validate_chat_user(object.get("user"))?;
     validate_chat_seed(object.get("seed"), strict)?;
     validate_chat_stop(object.get("stop"), strict)?;
+    let generic_limit = chat_output_limit(object.get("max_output_tokens"), "max_output_tokens")?;
     let legacy_limit = chat_output_limit(object.get("max_tokens"), "max_tokens")?;
     let completion_limit =
         chat_output_limit(object.get("max_completion_tokens"), "max_completion_tokens")?;
-    if legacy_limit.is_some() && completion_limit.is_some() {
+    if [generic_limit, legacy_limit, completion_limit]
+        .iter()
+        .flatten()
+        .count()
+        > 1
+    {
         return Err(AppError::BadRequest(
             "Codex text Chat accepts only one output-token limit field".into(),
         ));
     }
-    let (output_limit, output_limit_field) = if let Some(limit) = completion_limit {
+    let (output_limit, output_limit_field) = if let Some(limit) = generic_limit {
+        (Some(limit), Some("max_output_tokens"))
+    } else if let Some(limit) = completion_limit {
         (Some(limit), Some("max_completion_tokens"))
     } else if let Some(limit) = legacy_limit {
         (Some(limit), Some("max_tokens"))
@@ -608,6 +651,7 @@ fn translate_chat_request(
     object.remove("stream_options");
     object.remove("max_tokens");
     object.remove("max_completion_tokens");
+    object.remove("max_output_tokens");
     object.remove("temperature");
     object.remove("top_p");
     object.remove("presence_penalty");
@@ -731,7 +775,7 @@ fn bounded_chat_stop(value: &str) -> bool {
 }
 
 fn chat_output_limit(value: Option<&Value>, field: &str) -> Result<Option<i64>, AppError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
+    let Some(value) = value else {
         return Ok(None);
     };
     value
@@ -2342,7 +2386,7 @@ mod tests {
                 Uuid::nil(),
                 Protocol::OpenAiChat,
             ),
-            Err(AppError::BadRequest(message)) if message.contains("cannot guarantee max_tokens")
+            Err(AppError::BadRequest(message)) if message.contains("cannot guarantee the requested max_tokens hard limit")
         ));
     }
 
@@ -2412,7 +2456,13 @@ mod tests {
                 bound
             );
         }
-        for field in CLIENT_OUTPUT_LIMIT_FIELDS {
+        for field in [
+            "max_output_tokens",
+            "max_completion_tokens",
+            "max_tokens",
+            "output_token_limits",
+            "reservation_token_bounds",
+        ] {
             let mut request = json!({"model": "public", "input": []});
             request
                 .as_object_mut()
@@ -2448,6 +2498,45 @@ mod tests {
             let mut request = json!({"model": "public", "input": [], "service_tier": tier});
             assert!(prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).is_ok());
             assert_eq!(request["service_tier"], tier);
+        }
+    }
+
+    #[test]
+    fn responses_output_limit_hint_requires_explicit_policy_and_never_changes_reservation() {
+        let mut route = config("gpt-codex", 64);
+        route["transport_policy"] = json!({"responses_output_limits": "provider_default"});
+        for field in SCALAR_OUTPUT_LIMIT_FIELDS {
+            let mut request = json!({"model": "public", "input": "synthetic", "stream": false});
+            request[*field] = json!(16);
+            let plan = prepare_request(&mut request, "gpt-codex", &route).unwrap();
+            assert_eq!(plan.output_token_ceiling, 64);
+            assert!(!plan.downstream_stream);
+            assert!(request.get(*field).is_none());
+        }
+        for bad in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("16"),
+            json!(MAX_REPORTED_TOKENS + 1),
+        ] {
+            let mut request =
+                json!({"model": "public", "input": "synthetic", "max_output_tokens": bad});
+            assert!(prepare_request(&mut request, "gpt-codex", &route).is_err());
+        }
+        for conflict in [
+            json!({"max_output_tokens":16,"max_tokens":16}),
+            json!({"max_output_tokens":16,"max_completion_tokens":32}),
+            json!({"max_output_tokens":16,"reservation_token_bounds":{"gpt-codex":1}}),
+            json!({"output_token_limits":{"gpt-codex":1}}),
+        ] {
+            let mut request = json!({"model":"public","input":"synthetic"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(conflict.as_object().unwrap().clone());
+            assert!(prepare_request(&mut request, "gpt-codex", &route).is_err());
         }
     }
 

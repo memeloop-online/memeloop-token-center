@@ -1,5 +1,5 @@
 use super::*;
-use crate::metrics::CodexBadRequestRetry;
+use crate::metrics::{CodexBadRequestRetry, CodexEgressFailureStage, CodexEgressPath};
 
 pub(super) mod quota;
 #[path = "codex/retry.rs"]
@@ -376,11 +376,14 @@ async fn send_codex_attempt_once(
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
     let mut request = client.post(target_url).body(route.forwarded_body.clone());
-    if let Some((proxy_url, _)) = route.route.credential.proxy() {
+    let egress_path = if let Some((proxy_url, _)) = route.route.credential.proxy() {
         let proxy =
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
         request = request.proxy(proxy);
-    }
+        CodexEgressPath::AccountProxy
+    } else {
+        CodexEgressPath::Direct
+    };
     let credential_now = credential_application_now();
     let request = codex_transport::apply_wreq_wire_headers(
         request,
@@ -396,6 +399,7 @@ async fn send_codex_attempt_once(
         request.send().await.map_err(classify_wreq_send_error)
     })
     .await;
+    record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -450,6 +454,52 @@ fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
     }
 }
 
+fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage {
+    match error {
+        ProxySendError::RetryableConnection("proxy_connect") => {
+            CodexEgressFailureStage::ProxyConnect
+        }
+        ProxySendError::RetryableConnection("dns") => CodexEgressFailureStage::Dns,
+        ProxySendError::RetryableConnection("tls") => CodexEgressFailureStage::Tls,
+        ProxySendError::RetryableConnection("connect") => CodexEgressFailureStage::Connect,
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout) => {
+            CodexEgressFailureStage::Timeout
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::ConnectionReset) => {
+            CodexEgressFailureStage::ConnectionReset
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset) => {
+            CodexEgressFailureStage::Http2Reset
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Http2GoAway) => {
+            CodexEgressFailureStage::Http2GoAway
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Body) => {
+            CodexEgressFailureStage::Body
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Decode) => {
+            CodexEgressFailureStage::Decode
+        }
+        ProxySendError::NonRetryableTransport(TransportFailureKind::Request) => {
+            CodexEgressFailureStage::Request
+        }
+        ProxySendError::AmbiguousResponse(upstream_response::UPSTREAM_REQUEST_TIMEOUT) => {
+            CodexEgressFailureStage::Timeout
+        }
+        _ => CodexEgressFailureStage::Other,
+    }
+}
+
+fn record_codex_send_attempt_failure<T>(
+    metrics: &crate::metrics::Metrics,
+    path: CodexEgressPath,
+    result: &Result<T, ProxySendError>,
+) {
+    if let Err(error) = result {
+        metrics.record_codex_egress_send_failure(path, codex_egress_failure_stage(error));
+    }
+}
+
 async fn send_until_request_deadline<T, F>(
     deadline: tokio::time::Instant,
     send: F,
@@ -474,6 +524,106 @@ mod timeout_tests {
     use super::super::outcome::FailoverDisposition;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn send_failure_stage_projects_existing_classification_without_replay_changes() {
+        for (error, stage) in [
+            (
+                ProxySendError::RetryableConnection("proxy_connect"),
+                CodexEgressFailureStage::ProxyConnect,
+            ),
+            (
+                ProxySendError::RetryableConnection("dns"),
+                CodexEgressFailureStage::Dns,
+            ),
+            (
+                ProxySendError::RetryableConnection("tls"),
+                CodexEgressFailureStage::Tls,
+            ),
+            (
+                ProxySendError::RetryableConnection("connect"),
+                CodexEgressFailureStage::Connect,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout),
+                CodexEgressFailureStage::Timeout,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::ConnectionReset),
+                CodexEgressFailureStage::ConnectionReset,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Body),
+                CodexEgressFailureStage::Body,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Decode),
+                CodexEgressFailureStage::Decode,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Request),
+                CodexEgressFailureStage::Request,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset),
+                CodexEgressFailureStage::Http2Reset,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Http2GoAway),
+                CodexEgressFailureStage::Http2GoAway,
+            ),
+            (
+                ProxySendError::AmbiguousResponse(
+                    super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT,
+                ),
+                CodexEgressFailureStage::Timeout,
+            ),
+            (
+                ProxySendError::AmbiguousResponse("response_admission_failed"),
+                CodexEgressFailureStage::Other,
+            ),
+            (
+                ProxySendError::NonRetryableTransport(TransportFailureKind::Other),
+                CodexEgressFailureStage::Other,
+            ),
+            (
+                ProxySendError::RetryableConnection("test_injected"),
+                CodexEgressFailureStage::Other,
+            ),
+        ] {
+            assert_eq!(codex_egress_failure_stage(&error), stage);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_send_deadline_counts_once_without_changing_disposition() {
+        let metrics = crate::metrics::Metrics::default();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = send_until_request_deadline(
+            deadline,
+            std::future::pending::<Result<(), ProxySendError>>(),
+        )
+        .await;
+        record_codex_send_attempt_failure(&metrics, CodexEgressPath::AccountProxy, &result);
+
+        assert!(matches!(
+            result,
+            Err(ProxySendError::AmbiguousResponse(
+                super::super::upstream_response::UPSTREAM_REQUEST_TIMEOUT
+            ))
+        ));
+        assert_eq!(
+            failover_disposition(None, result.as_ref().err()),
+            FailoverDisposition::Stop
+        );
+        let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
+        assert!(rendered.contains(
+            "memeloop_token_center_codex_egress_send_failures_total{path=\"account_proxy\",stage=\"timeout\"} 1"
+        ));
+        assert!(rendered.contains(
+            "memeloop_token_center_codex_egress_send_failures_total{path=\"direct\",stage=\"timeout\"} 0"
+        ));
+    }
 
     #[test]
     fn runtime_policy_snapshots_current_sse_limits_per_request() {
