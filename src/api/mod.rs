@@ -135,8 +135,8 @@ use traffic::{
     proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
     proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
-use upstreams::*;
 pub(crate) use upstreams::sync_upstream_models_after_refresh;
+use upstreams::*;
 use web::{operator_index, portal_index, web_asset};
 
 pub(crate) use upstreams::{
