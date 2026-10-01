@@ -65,10 +65,12 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       assert.equal(writes.length, 0, 'opening an already-authorized account never starts OAuth');
       await workspace.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).click();
       assert.equal(await start.isDisabled(), true);
+      await workspace.getByText(chinese ? '正在编辑网络代理。请先保存或取消代理编辑，再开始登录。' : 'You are editing the network proxy. Save or cancel proxy editing before starting login.', { exact: true }).waitFor();
       const proxyInput = workspace.locator('.upstream-proxy-editor input');
       await proxyInput.fill('socks5h://10.0.0.9:1080');
       await proxyInput.press('Enter');
       await workspace.locator('.provider-readable-proxy input').waitFor();
+      assert.equal(await workspace.getByText(chinese ? '正在编辑网络代理。' : 'You are editing the network proxy.', { exact: false }).count(), 0, 'proxy editing hint clears once the proxy is saved');
       assert.equal(await workspace.locator('.provider-readable-proxy input').inputValue(), 'socks5h://10.0.0.9:1080');
       assert.equal(writes.length, 1, 'proxy save is immediate and does not start login');
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();

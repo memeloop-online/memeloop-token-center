@@ -666,6 +666,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       <p>{journeyCopy.network}</p>
       <UpstreamConnection key={`${existing.id}-${existing.credential_generation}`} account={existing} token={token} tenant={tenant} readOnOpen
         disabled={authorizing || Boolean(session) || nativeLocked || listLoading} onChanged={onConnectionChanged} onSaved={onAccountSaved} onEditingChange={setConnectionEditing} />
+      {connectionEditing && <p role="status">{journeyCopy.proxyEditing}</p>}
     </>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || polling || listLoading || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
