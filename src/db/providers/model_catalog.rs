@@ -73,6 +73,34 @@ pub enum ReplaceModelCatalogResult {
 }
 
 impl Database {
+    pub async fn list_codex_model_catalog_refresh_candidates(
+        &self,
+        retry_before: i64,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT account.id FROM upstream_accounts account \
+             LEFT JOIN upstream_model_catalog_state catalog ON catalog.upstream_account_id = account.id \
+             WHERE account.driver = 'openai-codex' AND account.status = 'active' \
+               AND (catalog.upstream_account_id IS NULL OR catalog.credential_generation <> account.credential_generation \
+                    OR catalog.expires_at IS NULL OR catalog.expires_at <= $1 \
+                    OR catalog.last_success_at IS NULL OR catalog.last_success_at <= $2 \
+                    OR catalog.status IN ('stale', 'error')) \
+               AND (catalog.last_attempt_at IS NULL OR catalog.last_attempt_at <= $2) \
+               AND (catalog.sync_lease_expires_at IS NULL OR catalog.sync_lease_expires_at <= $1) \
+             ORDER BY catalog.last_attempt_at ASC, account.id ASC LIMIT $3",
+        )
+        .bind(now)
+        .bind(retry_before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|id| id.parse().map_err(|_| AppError::Internal))
+            .collect()
+    }
+
     /// Explicit account/model associations include disabled routes: discovery
     /// must be able to repair their metadata before they can be enabled.
     pub async fn configured_upstream_model_ids(
