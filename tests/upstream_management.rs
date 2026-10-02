@@ -931,7 +931,10 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
         .await
         .unwrap();
     assert!(!changed);
-    assert_eq!(unchanged.credential_generation, account.credential_generation);
+    assert_eq!(
+        unchanged.credential_generation,
+        account.credential_generation
+    );
 
     if expire_refresh {
         let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
