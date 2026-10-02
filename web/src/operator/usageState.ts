@@ -1,4 +1,4 @@
-import type { TypedFilterAst, TypedFilterCondition } from '../types';
+import type { TypedFilterAst, TypedFilterCondition } from '../types.js';
 
 export type UsageTab = 'overview' | 'trend' | 'dimensions' | 'heatmap';
 export type Preset = '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom';
