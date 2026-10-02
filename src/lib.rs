@@ -59,7 +59,6 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 const CODEX_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const CODEX_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive
 // writers so one gateway cannot multiply that buffer by all active lifecycles.
@@ -335,6 +334,23 @@ fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
 fn build_codex_http_client_with_policy(
     policy: provider::CodexTransportPolicy,
 ) -> Result<wreq::Client, wreq::Error> {
+    codex_http_client_builder(policy, CODEX_HTTP2_KEEP_ALIVE_INTERVAL).build()
+}
+
+#[cfg(test)]
+fn build_codex_http2_test_client(
+    policy: provider::CodexTransportPolicy,
+    keep_alive_interval: Duration,
+) -> Result<wreq::Client, wreq::Error> {
+    codex_http_client_builder(policy, keep_alive_interval)
+        .http2_only()
+        .build()
+}
+
+fn codex_http_client_builder(
+    policy: provider::CodexTransportPolicy,
+    keep_alive_interval: Duration,
+) -> wreq::ClientBuilder {
     use wreq::IntoEmulation;
     use wreq_util::{Emulation, Platform, Profile};
 
@@ -352,6 +368,8 @@ fn build_codex_http_client_with_policy(
             .http2_options
             .clone()
             .expect("Chrome133 HTTP/2 profile must include HTTP/2 options"),
+        policy,
+        keep_alive_interval,
     );
     wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
@@ -365,12 +383,15 @@ fn build_codex_http_client_with_policy(
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
         .http2_options(http2_options)
-        .build()
 }
 
-fn codex_http2_options(mut options: wreq::http2::Http2Options) -> wreq::http2::Http2Options {
-    options.keep_alive_interval = Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL);
-    options.keep_alive_timeout = CODEX_HTTP2_KEEP_ALIVE_TIMEOUT;
+fn codex_http2_options(
+    mut options: wreq::http2::Http2Options,
+    policy: provider::CodexTransportPolicy,
+    keep_alive_interval: Duration,
+) -> wreq::http2::Http2Options {
+    options.keep_alive_interval = Some(keep_alive_interval);
+    options.keep_alive_timeout = Duration::from_millis(policy.request_timeout_millis);
     options.keep_alive_while_idle = false;
     options
 }
@@ -435,8 +456,14 @@ pub(crate) fn build_explicit_proxy_http_client(
 }
 
 #[cfg(test)]
+mod http2_keepalive_tests;
+
+#[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, SocketAddr};
+    use std::{
+        net::{IpAddr, SocketAddr},
+        time::Duration,
+    };
 
     use reqwest::StatusCode;
     use tokio::{
@@ -449,9 +476,8 @@ mod tests {
     };
 
     use super::{
-        CODEX_HTTP2_KEEP_ALIVE_INTERVAL, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT, build_codex_http_client,
-        build_explicit_proxy_http_client, build_http_client, build_pinned_http_client,
-        codex_http2_options,
+        CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_explicit_proxy_http_client,
+        build_http_client, build_pinned_http_client, codex_http2_options,
     };
 
     #[test]
@@ -467,12 +493,17 @@ mod tests {
             .build()
             .into_emulation();
         let original = profile.http2_options.unwrap();
-        let options = codex_http2_options(original.clone());
+        let policy = crate::provider::CodexTransportPolicy::default();
+        let options =
+            codex_http2_options(original.clone(), policy, CODEX_HTTP2_KEEP_ALIVE_INTERVAL);
         assert_eq!(
             options.keep_alive_interval,
             Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
         );
-        assert_eq!(options.keep_alive_timeout, CODEX_HTTP2_KEEP_ALIVE_TIMEOUT);
+        assert_eq!(
+            options.keep_alive_timeout,
+            Duration::from_millis(policy.request_timeout_millis)
+        );
         assert!(!options.keep_alive_while_idle);
         assert_eq!(options.initial_window_size, original.initial_window_size);
         assert_eq!(
