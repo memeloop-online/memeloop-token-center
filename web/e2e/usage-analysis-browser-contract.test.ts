@@ -145,6 +145,8 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage();
+    const runtimeErrors: string[] = [];
+    page.on('pageerror', (error) => runtimeErrors.push(error.message));
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     const saved: Array<{ name: string; ast: unknown; updated_at: number }> = [];
     await page.route('**/internal/v1/filter-presets*', async (route) => {
@@ -159,6 +161,8 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.locator('.usage-metrics').waitFor();
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
     await filter.click();
+    assert.equal(runtimeErrors.length, 0, `filter render errors: ${runtimeErrors.join('; ')}`);
+    assert.equal(await page.locator('.typed-filter-actions button').count(), 1, `filter actions remain mounted at ${page.url()}`);
     assert.equal(await filter.getAttribute('aria-expanded'), 'true', 'filter remains expanded after opening');
     const dialog = page.getByRole('dialog');
     const panelMarkup = await page.locator('.typed-filter-dialog').evaluate((panel) => ({ html: panel.innerHTML, open: panel.matches(':popover-open') }));
