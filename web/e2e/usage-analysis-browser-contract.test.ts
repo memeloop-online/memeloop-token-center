@@ -131,3 +131,76 @@ test('Usage analysis publishes completed data while the lazy chart module is pau
     await server.close();
   }
 });
+
+test('usage filter period, credential, saved AST, drilldown, and clear stay synchronized', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage filter assertions');
+    return test.skip('a local Chromium runtime is required for usage filter assertions');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const saved: Array<{ name: string; ast: unknown; updated_at: number }> = [];
+    await page.route('**/internal/v1/filter-presets*', async (route) => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON() as { name?: string; ast: unknown };
+        if (body.name) saved.push({ name: body.name, ast: body.ast, updated_at: Date.now() });
+      }
+      await route.fulfill({ json: { named: saved, recent: [] } });
+    });
+    await page.route('**/internal/v1/keys*', (route) => route.fulfill({ json: [{ alias: 'client-a' }] }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    const filter = page.getByRole('button', { name: 'Filter', exact: true });
+    await filter.click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: 'Last 7 days' }).click();
+    await dialog.getByLabel('Client credential').selectOption('client-a');
+    await dialog.getByRole('button', { name: 'Add condition' }).click();
+    await dialog.locator('.typed-filter-row select').first().selectOption('protocol');
+    await dialog.locator('.typed-filter-row [data-filter-field="protocol"] select').selectOption('anthropic');
+    await dialog.getByPlaceholder('Filter name').fill('week-client');
+    await dialog.getByRole('button', { name: 'Save filter' }).click();
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    const calls = () => page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/usage-analysis?')));
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 2);
+    const presetQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    assert.equal(presetQuery.get('key_alias'), 'client-a');
+    assert.equal(presetQuery.get('protocol'), 'anthropic');
+    assert.equal(Number(presetQuery.get('to_created_at')) - Number(presetQuery.get('from_created_at')), 7 * 86_400_000);
+    assert.equal((saved[0].ast as { conditions: Array<{ field: string }> }).conditions.filter((condition) => condition.field === 'created_at').length, 1);
+    await filter.click();
+    await dialog.getByRole('button', { name: 'Custom' }).click();
+    await dialog.locator('.usage-custom-range input').first().fill('2026-09-01T00:00');
+    await dialog.locator('.usage-custom-range input').last().fill('2026-09-02T00:00');
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 3);
+    await filter.click();
+    await dialog.getByRole('button', { name: 'week-client' }).click();
+    assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await dialog.getByLabel('Client credential').inputValue(), 'client-a');
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 4);
+    const reopenedQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    assert.equal(reopenedQuery.get('from_created_at'), presetQuery.get('from_created_at'));
+    assert.equal(reopenedQuery.get('to_created_at'), presetQuery.get('to_created_at'));
+    assert.equal(reopenedQuery.get('protocol'), 'anthropic');
+    await page.locator('.usage-overview-chart-grid .usage-chart-card').first().getByRole('tab', { name: 'Data' }).click();
+    await page.locator('.usage-overview-chart-grid .usage-chart-card').first().locator('.usage-chart-table button').first().click();
+    await filter.click();
+    assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
+    await dialog.getByRole('button', { name: 'Clear' }).click();
+    await filter.click();
+    assert.equal(await dialog.getByRole('button', { name: 'Last 24 hours' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await dialog.getByLabel('Client credential').inputValue(), '');
+    assert.equal(await dialog.locator('.typed-filter-row').count(), 0);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
