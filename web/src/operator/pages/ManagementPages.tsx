@@ -602,7 +602,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       }
       if (scopeVersion.current !== attempt) return;
       setProxyUrl(''); setMessage(''); setError('');
-    } catch (reason) { if (scopeVersion.current === attempt) setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (scopeVersion.current === attempt) setError(reason instanceof TypeError || reason instanceof ApiError && [502, 503, 504].includes(reason.status) ? journeyCopy.startTransportFailed : messageOf(reason, t('common.requestFailed'))); }
     finally { if (scopeVersion.current === attempt) setAuthorizing(false); }
   };
   const reloadList = async () => {
@@ -636,7 +636,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       }
     } catch (reason) { if (scopeVersion.current === attempt) {
       const stopped = reason instanceof ApiError && [400, 401, 403, 404, 409, 410, 422].includes(reason.status);
-      setPollStopped(stopped); setError(stopped ? journeyCopy.stopped : journeyCopy.retrying);
+      setPollStopped(stopped); setError(stopped ? journeyCopy.stopped : reason instanceof TypeError || reason instanceof ApiError && [502, 503, 504].includes(reason.status) ? journeyCopy.transportRetrying : journeyCopy.retrying);
       if (stopped) {
         clearDeviceLoginRecovery(session.session_id);
         if (session.expires_at && Date.now() >= session.expires_at) { setSession({ ...session, resumed: false }); setError(t('providers.deviceLoginExpired')); }
