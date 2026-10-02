@@ -27,6 +27,7 @@ pub const AUTHORIZE_ENDPOINT: &str = "https://claude.com/cai/oauth/authorize";
 pub const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 pub const REVOKE_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token/revoke";
 pub const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
+pub const MODEL_ENDPOINT: &str = "https://api.anthropic.com/v1/models";
 pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 

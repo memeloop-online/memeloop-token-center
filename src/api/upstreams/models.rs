@@ -597,6 +597,9 @@ async fn discover_models(
         .await?;
         return crate::cursor_native::models::decode(&body).map(|models| ("cursor_native", models));
     }
+    if account.driver == crate::oauth::claude::PROVIDER_DRIVER {
+        return discover_claude_models(state, account, credential).await;
+    }
     let plugins = state.plugins.clone();
     let driver = account.driver.clone();
     let config = account.config.clone();
@@ -741,6 +744,169 @@ async fn discover_models(
     }
     let data = value.get("data").ok_or("invalid_response")?;
     parse_model_array(data).map(|models| ("openai_v1", models))
+}
+
+async fn discover_claude_models(
+    state: &AppState,
+    account: &crate::provider::UpstreamAccountView,
+    credential: &UpstreamCredential,
+) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    credential
+        .validate(unix_millis())
+        .map_err(|_| "credential_invalid")?;
+    crate::oauth::claude::claude_account_id(credential).map_err(|_| "credential_invalid")?;
+    let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
+    if base_url != "https://api.anthropic.com" && base_url != "https://api.anthropic.com/v1" {
+        return Err("destination_invalid");
+    }
+    let endpoint = crate::oauth::claude::MODEL_ENDPOINT;
+    let client = network::client_for_oauth_url_no_retry(
+        &state.http,
+        endpoint,
+        credential.proxy(),
+        state.config.allow_oauth_loopback,
+    )
+    .await
+    .map_err(|_| "destination_invalid")?;
+    let started = std::time::Instant::now();
+    let discovery = async {
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        loop {
+            let mut url = url::Url::parse(endpoint).map_err(|_| "destination_invalid")?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", "100");
+                if let Some(cursor) = cursor.as_deref() {
+                    query.append_pair("after_id", cursor);
+                }
+            }
+            let request = credential
+                .apply(
+                    client
+                        .get(url)
+                        .header(header::ACCEPT, "application/json")
+                        .header("anthropic-version", "2023-06-01")
+                        .header("anthropic-beta", crate::oauth::claude::OAUTH_BETA_HEADER)
+                        .timeout(MODEL_CATALOG_TIMEOUT),
+                    unix_millis(),
+                )
+                .map_err(|_| "credential_invalid")?;
+            let response = request.send().await.map_err(|error| {
+                let failure =
+                    CatalogFailure::transport("send", error.is_timeout(), error.is_connect());
+                log_catalog_failure(account, &failure, started);
+                failure.code
+            })?;
+            let status = response.status();
+            if status.is_redirection() {
+                return Err("redirect_rejected");
+            }
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Err("authentication_failed");
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err("rate_limited");
+            }
+            if !status.is_success() {
+                return Err("upstream_unavailable");
+            }
+            if status == StatusCode::PARTIAL_CONTENT
+                || response.headers().contains_key(header::CONTENT_RANGE)
+                || response.headers().contains_key(header::LINK)
+            {
+                return Err("partial_catalog");
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_MODEL_CATALOG_BODY as u64)
+            {
+                return Err("response_too_large");
+            }
+            let mut body = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| {
+                    let failure =
+                        CatalogFailure::transport("body", error.is_timeout(), error.is_connect());
+                    log_catalog_failure(account, &failure, started);
+                    failure.code
+                })?;
+                if body.len().saturating_add(chunk.len()) > MAX_MODEL_CATALOG_BODY {
+                    return Err("response_too_large");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let value: Value = serde_json::from_slice(&body).map_err(|_| "invalid_response")?;
+            let (page, next) = parse_claude_model_page(&value)?;
+            if models.len().saturating_add(page.len()) > MAX_MODEL_COUNT {
+                return Err("invalid_response");
+            }
+            models.extend(page);
+            match next {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err("partial_catalog"),
+                None => break,
+            }
+        }
+        if models.is_empty() {
+            return Err("empty_catalog_protected");
+        }
+        parse_discovered_models(models).map(|models| ("claude_models", models))
+    };
+    tokio::time::timeout(MODEL_CATALOG_TIMEOUT, discovery)
+        .await
+        .unwrap_or(Err("connection_failed"))
+}
+
+fn parse_claude_model_page(
+    value: &Value,
+) -> Result<(Vec<DiscoveredUpstreamModel>, Option<String>), &'static str> {
+    if value.get("error").is_some() {
+        return Err("partial_catalog");
+    }
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or("invalid_response")?;
+    let has_more = value
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or("partial_catalog")?;
+    if data.len() > MAX_MODEL_COUNT {
+        return Err("invalid_response");
+    }
+    let models = data
+        .iter()
+        .map(|item| {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("invalid_response")?;
+            validate_model_id(id)?;
+            Ok(DiscoveredUpstreamModel {
+                model_id: id.to_owned(),
+                protocol: "anthropic".to_owned(),
+                context_window: None,
+                reservation_token_bound: None,
+                reservation_bound_source: None,
+            })
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    let next = if has_more {
+        let last_id = value
+            .get("last_id")
+            .and_then(Value::as_str)
+            .ok_or("partial_catalog")?;
+        if models.last().is_none_or(|model| model.model_id != last_id) {
+            return Err("partial_catalog");
+        }
+        Some(last_id.to_owned())
+    } else {
+        None
+    };
+    Ok((models, next))
 }
 
 async fn discover_codex_models(
@@ -1468,6 +1634,34 @@ mod tests {
             parse_component_model_catalog(&value, false).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn claude_catalog_requires_explicit_complete_pages() {
+        let (models, cursor) = parse_claude_model_page(&json!({
+            "data": [{"id": "claude-a"}], "has_more": true, "last_id": "claude-a"
+        }))
+        .unwrap();
+        assert_eq!(models[0].model_id, "claude-a");
+        assert_eq!(models[0].protocol, "anthropic");
+        assert_eq!(cursor.as_deref(), Some("claude-a"));
+        assert!(
+            parse_claude_model_page(&json!({
+                "data": [{"id": "claude-b"}], "has_more": false, "last_id": "claude-b"
+            }))
+            .unwrap()
+            .1
+            .is_none()
+        );
+        for invalid in [
+            json!({"data": [{"id": "claude-a"}]}),
+            json!({"data": [{"id": "claude-a"}], "has_more": true}),
+            json!({"data": [{"id": "claude-a"}], "has_more": true, "last_id": "other"}),
+            json!({"data": [{"id": "bad\nmodel"}], "has_more": false}),
+            json!({"error": {"type": "error"}, "data": [], "has_more": false}),
+        ] {
+            assert!(parse_claude_model_page(&invalid).is_err());
+        }
     }
 
     #[test]
