@@ -666,10 +666,13 @@ async fn discover_models(
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
-    let client = network::client_for_config_url(
+    if base_url != "https://api.anthropic.com" && base_url != "https://api.anthropic.com/v1" {
+        return Err("destination_invalid");
+    }
+    let endpoint = crate::oauth::claude::MODEL_ENDPOINT;
+    let client = network::client_for_oauth_url_no_retry(
         &state.http,
-        &base_url,
-        &account.config,
+        endpoint,
         credential.proxy(),
         state.config.allow_oauth_loopback,
     )
@@ -765,18 +768,13 @@ async fn discover_claude_models(
     )
     .await
     .map_err(|_| "destination_invalid")?;
-    let endpoint = if base_url.ends_with("/v1") {
-        format!("{base_url}/models")
-    } else {
-        format!("{base_url}/v1/models")
-    };
     let started = std::time::Instant::now();
     let discovery = async {
         let mut models = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = std::collections::HashSet::new();
         loop {
-            let mut url = url::Url::parse(&endpoint).map_err(|_| "destination_invalid")?;
+            let mut url = url::Url::parse(endpoint).map_err(|_| "destination_invalid")?;
             {
                 let mut query = url.query_pairs_mut();
                 query.append_pair("limit", "100");
