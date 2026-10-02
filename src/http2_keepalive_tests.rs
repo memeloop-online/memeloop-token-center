@@ -99,13 +99,11 @@ async fn wait_for_request_and_ping(stream: &mut TcpStream, posts: &AtomicUsize) 
 
 async fn reject_replay_connections(listener: &TcpListener, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return,
-            accepted = listener.accept() => {
-                let _ = accepted.unwrap();
-                panic!("POST was replayed on another HTTP/2 connection");
-            }
+    tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => {}
+        accepted = listener.accept() => {
+            let _ = accepted.unwrap();
+            panic!("POST was replayed on another HTTP/2 connection");
         }
     }
 }
@@ -139,10 +137,11 @@ async fn delayed_ping_server(
 }
 
 fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPolicy {
-    let mut policy = CodexTransportPolicy::default();
-    policy.read_timeout_millis = read_timeout.as_millis() as u64;
-    policy.request_timeout_millis = request_timeout.as_millis() as u64;
-    policy
+    CodexTransportPolicy {
+        read_timeout_millis: read_timeout.as_millis() as u64,
+        request_timeout_millis: request_timeout.as_millis() as u64,
+        ..CodexTransportPolicy::default()
+    }
 }
 
 #[tokio::test]
