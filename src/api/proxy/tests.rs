@@ -4355,6 +4355,76 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
 }
 
 #[tokio::test]
+async fn codex_quiet_stream_keeps_downstream_open_and_settles_once() {
+    let fixture = codex_route_fixture("quiet-stream-heartbeat").await;
+    let prefix =
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage-contract\"}}\n\n"
+            .to_owned();
+    let completed = completed_response_with_usage(3, 7);
+    let terminal = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+    );
+    let (endpoint, terminal_tx, upstream) =
+        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "quiet stream", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut rendered = String::new();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while !rendered.contains("\"type\":\"response.in_progress\"") {
+            let frame = futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("the quiet stream must remain open")
+                .expect("the quiet stream must not reset downstream");
+            rendered.push_str(std::str::from_utf8(&frame).unwrap());
+        }
+    })
+    .await
+    .expect("a real idle interval must produce a Responses progress event");
+    assert!(rendered.contains("\"type\":\"response.created\""));
+    assert!(!rendered.contains("response.completed"));
+    let pending = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status_code, None);
+
+    terminal_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = futures_util::StreamExt::next(&mut body).await {
+            rendered.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+    })
+    .await
+    .expect("the terminal and EOF must follow the idle interval");
+    upstream.await.unwrap();
+    assert_eq!(rendered.matches("event: response.completed").count(), 1);
+    assert_eq!(rendered.matches("data: [DONE]").count(), 1);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
+}
+
+#[tokio::test]
 async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
     let fixture = codex_route_fixture("streaming-truncated-upstream").await;
     let created =
