@@ -666,13 +666,10 @@ async fn discover_models(
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
-    if base_url != "https://api.anthropic.com" && base_url != "https://api.anthropic.com/v1" {
-        return Err("destination_invalid");
-    }
-    let endpoint = crate::oauth::claude::MODEL_ENDPOINT;
-    let client = network::client_for_oauth_url_no_retry(
+    let client = network::client_for_config_url(
         &state.http,
-        endpoint,
+        &base_url,
+        &account.config,
         credential.proxy(),
         state.config.allow_oauth_loopback,
     )
@@ -759,10 +756,13 @@ async fn discover_claude_models(
         .map_err(|_| "credential_invalid")?;
     crate::oauth::claude::claude_account_id(credential).map_err(|_| "credential_invalid")?;
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
-    let client = network::client_for_config_url(
+    if base_url != "https://api.anthropic.com" && base_url != "https://api.anthropic.com/v1" {
+        return Err("destination_invalid");
+    }
+    let endpoint = crate::oauth::claude::MODEL_ENDPOINT;
+    let client = network::client_for_oauth_url_no_retry(
         &state.http,
-        &base_url,
-        &account.config,
+        endpoint,
         credential.proxy(),
         state.config.allow_oauth_loopback,
     )
