@@ -916,10 +916,53 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
     ));
     assert!(blocked.to_string().contains("already dispatched"));
 
+    let (unchanged, changed) = state
+        .db
+        .rotate_codex_transport_proxy(
+            account.id,
+            "codex-proxy-refresh-fence",
+            original_proxy.into(),
+            account.updated_at,
+            account.credential_generation,
+            "same-proxy-during-refresh",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(unchanged.credential_generation, account.credential_generation);
+
     if expire_refresh {
         let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         sqlx::query(
-            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0, pending_credential_ciphertext = 'pending-result' WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            state
+                .db
+                .rotate_codex_transport_proxy(
+                    account.id,
+                    "codex-proxy-refresh-fence",
+                    replacement_proxy.into(),
+                    account.updated_at,
+                    account.credential_generation,
+                    "proxy-with-pending-refresh-result",
+                    None,
+                    pepper,
+                )
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("already dispatched")
+        );
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = NULL WHERE account_id = $1",
         )
         .bind(account.id.to_string())
         .execute(&pool)
@@ -983,6 +1026,25 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
         assert_eq!(access_token, "access-v1");
         assert_eq!(refresh_token.as_deref(), Some("refresh-v1"));
         assert_eq!(proxy_url.as_deref(), Some(replacement_proxy));
+        let (replayed, changed) = state
+            .db
+            .rotate_codex_transport_proxy(
+                account.id,
+                "codex-proxy-refresh-fence",
+                replacement_proxy.into(),
+                account.updated_at,
+                account.credential_generation,
+                "proxy-after-refresh-timeout",
+                None,
+                pepper,
+            )
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed.credential_generation,
+            recovered.credential_generation
+        );
         return;
     }
 
