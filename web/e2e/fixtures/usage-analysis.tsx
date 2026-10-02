@@ -9,7 +9,7 @@ import '../../src/styles/metrics.css';
 import '../../src/operator/operator.css';
 
 declare global {
-  interface Window { usageAnalysisFixture: { calls: string[] } }
+  interface Window { usageAnalysisFixture: { calls: string[]; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
 }
 
 const largeMetric = 1_250_000_000_000;
@@ -48,7 +48,7 @@ const analysis: OperatorUsageAnalysis = {
   heatmap: [],
 };
 
-window.usageAnalysisFixture = { calls: [] };
+window.usageAnalysisFixture = { calls: [], presets: { named: [], recent: [] } };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -57,10 +57,18 @@ function json(value: unknown, status = 200) {
   });
 }
 
-globalThis.fetch = async (input: RequestInfo | URL) => {
+globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input.toString(), location.origin);
   window.usageAnalysisFixture.calls.push(`${url.pathname}${url.search}`);
   if (url.pathname === '/internal/v1/usage-analysis') return json(analysis);
+  if (url.pathname === '/internal/v1/keys') return json([{ alias: 'client-a' }]);
+  if (url.pathname === '/internal/v1/filter-presets') {
+    if (init?.method === 'POST' && init.body) {
+      const body = JSON.parse(String(init.body)) as { name?: string; ast: unknown };
+      if (body.name) window.usageAnalysisFixture.presets.named.push({ name: body.name, ast: body.ast, updated_at: Date.now() });
+    }
+    return json(window.usageAnalysisFixture.presets);
+  }
   return json([]);
 };
 

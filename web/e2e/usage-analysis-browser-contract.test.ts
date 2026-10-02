@@ -148,15 +148,6 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     const runtimeErrors: string[] = [];
     page.on('pageerror', (error) => runtimeErrors.push(error.message));
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    const saved: Array<{ name: string; ast: unknown; updated_at: number }> = [];
-    await page.route('**/internal/v1/filter-presets*', async (route) => {
-      if (route.request().method() === 'POST') {
-        const body = route.request().postDataJSON() as { name?: string; ast: unknown };
-        if (body.name) saved.push({ name: body.name, ast: body.ast, updated_at: Date.now() });
-      }
-      await route.fulfill({ json: { named: saved, recent: [] } });
-    });
-    await page.route('**/internal/v1/keys*', (route) => route.fulfill({ json: [{ alias: 'client-a' }] }));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
     await page.locator('.usage-metrics').waitFor();
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
@@ -183,6 +174,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     assert.equal(presetQuery.get('key_alias'), 'client-a');
     assert.equal(presetQuery.get('protocol'), 'anthropic');
     assert.equal(Number(presetQuery.get('to_created_at')) - Number(presetQuery.get('from_created_at')), 7 * 86_400_000);
+    const saved = await page.evaluate(() => window.usageAnalysisFixture.presets.named);
     assert.equal((saved[0].ast as { conditions: Array<{ field: string }> }).conditions.filter((condition) => condition.field === 'created_at').length, 1);
     await filter.click();
     await dialog.getByRole('button', { name: 'Custom' }).click();
