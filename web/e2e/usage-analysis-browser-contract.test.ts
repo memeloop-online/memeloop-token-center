@@ -160,6 +160,9 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
     await filter.click();
     const dialog = page.getByRole('dialog');
+    const panelMarkup = await page.locator('.typed-filter-dialog').evaluate((panel) => ({ html: panel.innerHTML, open: panel.matches(':popover-open') }));
+    assert.equal(panelMarkup.open, true, 'the filter popover opens');
+    assert.match(panelMarkup.html, /Last 7 days/, 'the unified period controls render in the filter popover');
     await dialog.getByRole('button', { name: 'Last 7 days' }).click();
     await dialog.getByLabel('Client credential').selectOption('client-a');
     await dialog.getByRole('button', { name: 'Add condition' }).click();
