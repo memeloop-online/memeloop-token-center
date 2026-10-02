@@ -174,7 +174,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     assert.equal(presetQuery.get('key_alias'), 'client-a');
     assert.equal(presetQuery.get('protocol'), 'anthropic');
     assert.equal(Number(presetQuery.get('to_created_at')) - Number(presetQuery.get('from_created_at')), 7 * 86_400_000);
-    const saved = await page.evaluate(() => window.usageAnalysisFixture.presets.named);
+    const saved = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { presets: { named: Array<{ name: string; ast: unknown }> } } }).usageAnalysisFixture.presets.named);
     assert.equal((saved[0].ast as { conditions: Array<{ field: string }> }).conditions.filter((condition) => condition.field === 'created_at').length, 1);
     await filter.click();
     await dialog.getByRole('button', { name: 'Custom' }).click();
