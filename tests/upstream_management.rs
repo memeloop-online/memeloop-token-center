@@ -819,6 +819,15 @@ async fn codex_proxy_rotation_fences_stale_reauthorization_and_token_rotation() 
 
 #[tokio::test]
 async fn codex_proxy_rotation_cannot_clone_a_dispatched_refresh_token() {
+    check_codex_proxy_refresh_fence(false).await;
+}
+
+#[tokio::test]
+async fn codex_proxy_recovery_preserves_an_expired_unknown_refresh_fence() {
+    check_codex_proxy_refresh_fence(true).await;
+}
+
+async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -827,7 +836,7 @@ async fn codex_proxy_rotation_cannot_clone_a_dispatched_refresh_token() {
             .join("codex-proxy-refresh-fence.db")
             .display()
     );
-    let state = AppState::initialize(Config::for_test(database_url))
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
         .unwrap();
     let pepper = state.config.key_pepper.as_bytes();
@@ -906,6 +915,76 @@ async fn codex_proxy_rotation_cannot_clone_a_dispatched_refresh_token() {
         memeloop_token_center::error::AppError::Conflict(_)
     ));
     assert!(blocked.to_string().contains("already dispatched"));
+
+    if expire_refresh {
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (recovered, changed) = state
+            .db
+            .rotate_codex_transport_proxy(
+                account.id,
+                "codex-proxy-refresh-fence",
+                replacement_proxy.into(),
+                account.updated_at,
+                account.credential_generation,
+                "proxy-after-refresh-timeout",
+                None,
+                pepper,
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            recovered.credential_generation,
+            account.credential_generation + 1
+        );
+        assert!(
+            state
+                .db
+                .claim_upstream_oauth_refresh(account.id, "refresh-after-proxy-recovery", pepper)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("outcome is unknown")
+        );
+        assert!(
+            state
+                .db
+                .finish_upstream_oauth_refresh(
+                    account.id,
+                    credential("late-access", "late-refresh", original_proxy),
+                    refresh_key,
+                    pepper,
+                )
+                .await
+                .is_err()
+        );
+        let (_, installed, _, _) = state
+            .db
+            .upstream_account_with_current_credential(account.id, pepper)
+            .await
+            .unwrap();
+        let UpstreamCredential::OAuth {
+            access_token,
+            refresh_token,
+            proxy_url,
+            ..
+        } = installed
+        else {
+            panic!("Codex credential must stay OAuth");
+        };
+        assert_eq!(access_token, "access-v1");
+        assert_eq!(refresh_token.as_deref(), Some("refresh-v1"));
+        assert_eq!(proxy_url.as_deref(), Some(replacement_proxy));
+        return;
+    }
 
     let refreshed = state
         .db
