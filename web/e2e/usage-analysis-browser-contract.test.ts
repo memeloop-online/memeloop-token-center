@@ -161,6 +161,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.locator('.usage-metrics').waitFor();
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
     await filter.click();
+    await nextPaint(page);
     assert.equal(runtimeErrors.length, 0, `filter render errors: ${runtimeErrors.join('; ')}`);
     assert.equal(await page.locator('.typed-filter-actions button').count(), 1, `filter actions remain mounted at ${page.url()}`);
     assert.equal(await filter.getAttribute('aria-expanded'), 'true', 'filter remains expanded after opening');
