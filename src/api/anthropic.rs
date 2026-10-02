@@ -23,6 +23,13 @@ pub(super) fn apply_request_headers(
 ) -> RequestBuilder {
     for (name, value) in inbound {
         let name = name.as_str();
+        if name.starts_with("anthropic-telemetry-")
+            || name.starts_with("anthropic-analytics-")
+            || name.starts_with("x-claude-code-telemetry-")
+            || name.starts_with("x-claude-code-analytics-")
+        {
+            continue;
+        }
         let forward = (name.starts_with("anthropic-")
             && name != "anthropic-version"
             && name != "anthropic-beta")
@@ -115,6 +122,14 @@ mod tests {
             HeaderValue::from_static("agent-a"),
         );
         headers.insert("x-other", HeaderValue::from_static("do-not-forward"));
+        headers.insert(
+            "anthropic-telemetry-event",
+            HeaderValue::from_static("optional-event"),
+        );
+        headers.insert(
+            "x-claude-code-analytics-session",
+            HeaderValue::from_static("optional-session"),
+        );
 
         let beta = combined_beta(&headers, true).expect("merged beta");
         assert_eq!(
@@ -138,6 +153,13 @@ mod tests {
         );
         assert_eq!(request.headers()["x-claude-code-agent-id"], "agent-a");
         assert!(request.headers().get("x-other").is_none());
+        assert!(request.headers().get("anthropic-telemetry-event").is_none());
+        assert!(
+            request
+                .headers()
+                .get("x-claude-code-analytics-session")
+                .is_none()
+        );
     }
 
     #[test]
