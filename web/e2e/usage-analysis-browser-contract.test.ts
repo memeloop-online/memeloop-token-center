@@ -159,6 +159,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.locator('.usage-metrics').waitFor();
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
     await filter.click();
+    assert.equal(await filter.getAttribute('aria-expanded'), 'true', 'filter remains expanded after opening');
     const dialog = page.getByRole('dialog');
     const panelMarkup = await page.locator('.typed-filter-dialog').evaluate((panel) => ({ html: panel.innerHTML, open: panel.matches(':popover-open') }));
     assert.equal(panelMarkup.open, true, 'the filter popover opens');
