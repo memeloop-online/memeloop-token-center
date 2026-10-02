@@ -242,9 +242,9 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
     return <input value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: value.type, value: event.target.value } as TypedFilterValue)} placeholder={value.type === 'uuid' ? '019f…' : undefined} />;
   };
 
-  return <div className="typed-filter-builder">
-    <div className="typed-filter-chips" aria-label={t('filter.applied')}>
-      {ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}
+  return <div className="typed-filter-builder" style={scope === 'usage' ? { minWidth: 0 } : undefined}>
+    <div className="typed-filter-chips" style={scope === 'usage' ? { minWidth: 0 } : undefined} aria-label={t('filter.applied')}>
+      {ast.conditions.filter((condition) => scope !== 'usage' || condition.field !== 'created_at' || usageSelection?.preset !== '24h').map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}
       {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
       {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>

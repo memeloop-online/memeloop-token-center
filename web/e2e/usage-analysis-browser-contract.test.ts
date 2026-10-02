@@ -156,6 +156,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     });
     await page.route('**/internal/v1/keys*', (route) => route.fulfill({ json: [{ alias: 'client-a' }] }));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    await page.locator('.usage-metrics').waitFor();
     const filter = page.getByRole('button', { name: 'Filter', exact: true });
     await filter.click();
     const dialog = page.getByRole('dialog');
