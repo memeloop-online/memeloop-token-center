@@ -19,6 +19,7 @@ use crate::{
         ModelPickerSelectionKind, unix_millis,
     },
     error::AppError,
+    provider::canonicalize_provider_driver,
 };
 
 const DEFAULT_MODEL_PICKER_LIMIT: i64 = 50;
@@ -118,7 +119,13 @@ pub(super) async fn list_model_picker_options(
         .iter()
         .map(|provider| (provider.id.clone(), provider.clone()))
         .collect::<BTreeMap<_, _>>();
-    let public_provider_ids = providers.keys().cloned().collect::<Vec<_>>();
+    let mut public_provider_ids = providers.keys().cloned().collect::<Vec<_>>();
+    for alias in ["cbcnx", "openai-compatible", "one-api"] {
+        let canonical = canonicalize_provider_driver(alias);
+        if canonical != alias && providers.contains_key(canonical) {
+            public_provider_ids.push(alias.to_owned());
+        }
+    }
     let cursor_scope = ModelPickerCursorScope {
         tenant_external_id: &tenant,
         selection_kind: query.selection_kind,
@@ -149,9 +156,11 @@ pub(super) async fn list_model_picker_options(
 
     for item in &mut data {
         for source in &mut item.sources {
+            let canonical_id = canonicalize_provider_driver(&source.provider.id).to_owned();
             let provider = providers
-                .get(&source.provider.id)
+                .get(&canonical_id)
                 .ok_or(AppError::Internal)?;
+            source.provider.id = canonical_id;
             source.provider.label = provider.display_name.clone();
             source.provider.protocols = provider.protocols.clone();
             source.provider.modalities = provider.modalities.clone();

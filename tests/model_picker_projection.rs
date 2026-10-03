@@ -568,6 +568,7 @@ async fn postgres_projection_matches_sqlite_contract() {
         .await
         .expect("initialize PostgreSQL model picker state");
     exercise_database_projection(&state, "postgres", &database_url).await;
+    legacy_connector_aliases_remain_visible(&state).await;
 }
 
 async fn request(
@@ -597,6 +598,95 @@ async fn request(
         serde_json::from_slice(&bytes).expect("model picker JSON")
     };
     (status, value)
+}
+
+async fn legacy_connector_aliases_remain_visible(state: &AppState) {
+    let tenant = format!("picker-legacy-aliases-{}", Uuid::now_v7());
+    for (driver, model) in [
+        ("cbcnx", "legacy-cbcnx-model"),
+        ("openai-compatible", "legacy-compatible-model"),
+        ("one-api", "legacy-one-api-model"),
+        ("retired-hidden", "hidden-model"),
+    ] {
+        let account = create_account(state, &tenant, driver, driver).await;
+        create_route(
+            state,
+            &tenant,
+            RouteFixtureInput {
+                public_model: model,
+                upstream_model: model,
+                protocol: "openai",
+                priority: 0,
+                account_ids: vec![account],
+                included_provider_group_ids: Vec::new(),
+            },
+        )
+        .await;
+    }
+    let reader = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "legacy model picker reader".to_owned(),
+                scopes: vec!["routes:read".to_owned(), "providers:read".to_owned()],
+                tenant_external_id: Some(tenant.clone()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("create legacy picker reader");
+    let base = format!(
+        "/internal/v1/model-picker-options?tenant_external_id={tenant}&selection_kind=model"
+    );
+    let (status, all) = request(state, RuntimeRole::Control, &reader.token, &base).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["data"].as_array().expect("visible models").len(), 3);
+
+    for (driver, canonical, label, protocols, model) in [
+        (
+            "cbcnx",
+            "http-json",
+            "OpenAI Compatible",
+            json!(["openai", "anthropic", "openai-audio", "generation"]),
+            "legacy-cbcnx-model",
+        ),
+        (
+            "openai-compatible",
+            "http-json",
+            "OpenAI Compatible",
+            json!(["openai", "anthropic", "openai-audio", "generation"]),
+            "legacy-compatible-model",
+        ),
+        (
+            "one-api",
+            "new-api",
+            "New API",
+            json!(["openai", "anthropic"]),
+            "legacy-one-api-model",
+        ),
+    ] {
+        let (status, page) = request(
+            state,
+            RuntimeRole::Control,
+            &reader.token,
+            &format!("{base}&q={driver}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{driver}: {page}");
+        let items = page["data"].as_array().expect("alias search results");
+        assert_eq!(items.len(), 1, "{driver}");
+        assert_eq!(items[0]["value"], model);
+        let provider = &items[0]["sources"][0]["provider"];
+        assert_eq!(provider["id"], canonical);
+        assert_eq!(provider["label"], label);
+        assert_eq!(provider["protocols"], protocols);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_legacy_connector_aliases_keep_canonical_picker_identity() {
+    let (state, _directory, _database_url) = sqlite_state("legacy-aliases").await;
+    legacy_connector_aliases_remain_visible(&state).await;
 }
 
 #[tokio::test]
