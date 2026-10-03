@@ -6,6 +6,7 @@ pub(super) struct CapturedSseDelivery {
 }
 
 pub(super) struct FrameDelivery<'a> {
+    pub waits: &'a mut wait_diagnostics::WaitDiagnostics,
     pub state: &'a AppState,
     pub sender: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     pub request_id: Uuid,
@@ -29,7 +30,12 @@ pub(super) async fn send_frame(
         bytes, billable, ..
     } = frame;
     if billable && !*input.confirmed {
-        let permit = tokio::time::timeout(MAX_DOWNSTREAM_SEND_WAIT, input.sender.reserve())
+        let permit = input
+            .waits
+            .downstream(tokio::time::timeout(
+                MAX_DOWNSTREAM_SEND_WAIT,
+                input.sender.reserve(),
+            ))
             .await
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
@@ -69,7 +75,12 @@ pub(super) async fn send_frame(
         *input.confirmed = true;
         permit.send(Ok(bytes));
     } else {
-        tokio::time::timeout(MAX_DOWNSTREAM_SEND_WAIT, input.sender.send(Ok(bytes)))
+        input
+            .waits
+            .downstream(tokio::time::timeout(
+                MAX_DOWNSTREAM_SEND_WAIT,
+                input.sender.send(Ok(bytes)),
+            ))
             .await
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
