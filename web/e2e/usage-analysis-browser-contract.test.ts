@@ -91,6 +91,113 @@ test('Usage analysis keeps exact localized metrics and real trend charts contain
   }
 });
 
+test('usage filter period, credential, saved AST, drilldown, and clear stay synchronized', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage filter assertions');
+    return test.skip('a local Chromium runtime is required for usage filter assertions');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0, strictPort: false } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    const runtimeErrors: string[] = [];
+    page.on('pageerror', (error) => runtimeErrors.push(error.message));
+    await page.clock.install({ time: new Date('2026-10-02T12:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    await page.locator('.usage-metrics').waitFor();
+    const filter = page.getByRole('button', { name: 'Filter', exact: true });
+    await filter.click();
+    await nextPaint(page);
+    assert.equal(runtimeErrors.length, 0, `filter render errors: ${runtimeErrors.join('; ')}`);
+    assert.equal(await page.locator('.typed-filter-actions button').count(), 1, `filter actions remain mounted at ${page.url()}`);
+    assert.equal(await filter.getAttribute('aria-expanded'), 'true', 'filter remains expanded after opening');
+    const dialog = page.getByRole('dialog');
+    const panelMarkup = await page.locator('.typed-filter-dialog').evaluate((panel) => ({ html: panel.innerHTML, open: panel.matches(':popover-open') }));
+    assert.equal(panelMarkup.open, true, 'the filter popover opens');
+    assert.match(panelMarkup.html, /Last 7 days/, 'the unified period controls render in the filter popover');
+    assert.equal(await dialog.getByLabel('Client credential').locator('option[value="late-client"]').count(), 0);
+    await dialog.getByRole('button', { name: 'Load more credentials' }).click();
+    await dialog.getByLabel('Client credential').locator('option[value="late-client"]').waitFor();
+    const credentialCalls = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/keys?')));
+    const secondPage = new URLSearchParams(new URL(credentialCalls.at(-1)!, 'http://fixture').search);
+    assert.equal(secondPage.get('before_created_at'), '1999901');
+    assert.equal(secondPage.get('before_id'), '00000000-0000-0000-0000-000000000100');
+    await dialog.getByRole('button', { name: 'Last 7 days' }).click();
+    await dialog.getByLabel('Client credential').selectOption('client-a');
+    await dialog.getByRole('button', { name: 'Add condition' }).click();
+    await dialog.locator('.typed-filter-row select').first().selectOption('protocol');
+    await dialog.locator('.typed-filter-row [data-filter-field="protocol"] select').selectOption('anthropic');
+    await dialog.getByPlaceholder('Filter name').fill('week-client');
+    await dialog.getByRole('button', { name: 'Save filter' }).click();
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    const calls = () => page.evaluate(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.startsWith('/internal/v1/usage-analysis?')));
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 2);
+    const presetQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    assert.equal(presetQuery.get('key_alias'), 'client-a');
+    assert.equal(presetQuery.get('protocol'), 'anthropic');
+    assert.equal(Number(presetQuery.get('to_created_at')) - Number(presetQuery.get('from_created_at')), 7 * 86_400_000);
+    const saved = await page.evaluate(() => (window as unknown as { usageAnalysisFixture: { presets: { named: Array<{ name: string; ast: unknown }> } } }).usageAnalysisFixture.presets.named);
+    assert.equal((saved[0].ast as { conditions: Array<{ field: string }> }).conditions.filter((condition) => condition.field === 'created_at').length, 1);
+    await filter.click();
+    await dialog.getByRole('button', { name: 'Custom' }).click();
+    await dialog.locator('.usage-custom-range input').first().fill('2026-09-01T00:00');
+    await dialog.locator('.usage-custom-range input').last().fill('2026-09-02T00:00');
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 3);
+    await page.evaluate(() => { window.usageAnalysisFixture.presets.named.push({ name: 'unsupported-filter', ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'contains', value: { type: 'model', value: 'public-model' } }] }, updated_at: Date.now() }); });
+    await filter.click();
+    await dialog.getByRole('button', { name: 'unsupported-filter' }).click();
+    await dialog.getByRole('alert').getByText('Usage analysis cannot apply duplicate fields or unsupported conditions.').waitFor();
+    await dialog.getByRole('button', { name: 'week-client' }).click();
+    assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await dialog.getByLabel('Client credential').inputValue(), 'client-a');
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 4);
+    const reopenedQuery = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    assert.equal(reopenedQuery.get('from_created_at'), presetQuery.get('from_created_at'));
+    assert.equal(reopenedQuery.get('to_created_at'), presetQuery.get('to_created_at'));
+    assert.equal(reopenedQuery.get('protocol'), 'anthropic');
+    await page.locator('.usage-overview-chart-grid .usage-chart-card').first().getByRole('tab', { name: 'Data' }).click();
+    await page.locator('.usage-overview-chart-grid .usage-chart-card').first().locator('.usage-chart-table button').first().click();
+    await filter.click();
+    assert.equal(await dialog.getByRole('button', { name: 'Custom' }).getAttribute('aria-pressed'), 'true');
+    await dialog.getByRole('button', { name: 'Clear' }).click();
+    await filter.click();
+    assert.equal(await dialog.getByRole('button', { name: 'Last 24 hours' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await dialog.getByLabel('Client credential').inputValue(), '');
+    assert.equal(await dialog.locator('.typed-filter-row').count(), 0);
+    await dialog.getByPlaceholder('Search credentials').fill('late');
+    await dialog.getByLabel('Client credential').selectOption('late-client');
+    await dialog.getByRole('button', { name: 'Apply filters' }).click();
+    await filter.click();
+    await dialog.getByPlaceholder('Filter name').fill('failed-save');
+    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = true; });
+    await dialog.getByRole('button', { name: 'Save filter' }).click();
+    await dialog.getByRole('alert').getByText('Preset storage failed').waitFor();
+    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = false; });
+    for (let condition = 0; condition < 10; condition += 1) await dialog.getByRole('button', { name: 'Add condition' }).click();
+    assert.equal(await dialog.getByRole('button', { name: 'Add condition' }).isDisabled(), true, 'period and credential reserve two AST slots');
+    const beforeClearCount = (await calls()).length;
+    await dialog.getByRole('button', { name: 'Clear' }).click();
+    await page.waitForFunction((previousCount) => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length > previousCount, beforeClearCount);
+    const beforeRefresh = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    const callCount = (await calls()).length;
+    await page.clock.fastForward(60_000);
+    await page.getByRole('button', { name: 'Refresh' }).click();
+    await page.waitForFunction((previousCount) => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length > previousCount, callCount);
+    const refreshed = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
+    assert.equal(Number(refreshed.get('to_created_at')) - Number(beforeRefresh.get('to_created_at')), 60_000);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
 test('Usage analysis publishes completed data while the lazy chart module is paused', async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {

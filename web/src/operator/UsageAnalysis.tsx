@@ -1,6 +1,7 @@
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
+import { Button, Input, Select } from '../design-system';
 import { ChartDataView } from '../charts/ChartDataView';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import {
@@ -12,11 +13,11 @@ import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel 
 import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { UsageSummaryMetrics } from './UsageSummaryMetrics';
 import { useI18n } from '../i18n';
-import type { KeyView, OperatorUsageAnalysis, TypedFilterAst, TypedFilterCondition, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
+import type { KeyView, OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
 import { TypedFilterBuilder } from './TypedFilterBuilder';
 import { emptyTypedFilterAst } from './traffic/requestTraffic';
-import { defaultUsageSelection, emptyUsageFilters, localDateTimeInput, nextUsageTab, statsQuery, usagePresets, usageTabs, type Preset, type UsageFilters, type UsageSelection, type UsageTab } from './usageState';
+import { defaultUsageSelection, localDateTimeInput, nextUsageTab, statsQuery, usageAstFromSelection, usagePresets, usageTabs, type UsageFilters, type UsageSelection, type UsageTab } from './usageState';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
@@ -35,62 +36,36 @@ const localCopy = {
   },
 } as const;
 
-function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst): UsageSelection {
-  const filters = { ...emptyUsageFilters, keyAlias: current.filters.keyAlias };
-  let customFrom = current.customFrom; let customTo = current.customTo; let preset: Preset = current.preset;
-  for (const condition of ast.conditions) {
-    if (condition.field === 'created_at' && condition.operator === 'between' && condition.value.type === 'timestamp' && condition.upper?.type === 'timestamp') {
-      preset = 'custom'; customFrom = localDateTimeInput(condition.value.value); customTo = localDateTimeInput(condition.upper.value);
-    } else if (condition.operator === 'equals' && condition.field === 'model' && condition.value.type === 'model') filters.model = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'key_id' && condition.value.type === 'uuid') filters.keyId = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'key_alias' && condition.value.type === 'text') filters.keyAlias = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'upstream_account_id' && condition.value.type === 'uuid') filters.upstreamId = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'protocol' && condition.value.type === 'protocol') filters.protocol = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'status' && condition.value.type === 'status' && condition.value.value !== 'pending') filters.status = condition.value.value;
-    else if (condition.operator === 'equals' && condition.field === 'error_code' && condition.value.type === 'text') filters.errorCode = condition.value.value;
-  }
-  return { ...current, preset, customFrom, customTo, filters };
-}
-
-const typedFieldForUsageFilter: Record<keyof UsageFilters, TypedFilterCondition['field']> = {
-  model: 'model', keyId: 'key_id', keyAlias: 'key_alias', upstreamId: 'upstream_account_id', protocol: 'protocol', status: 'status', errorCode: 'error_code',
-};
-
-function typedUsageCondition(filter: keyof UsageFilters, bucket: UsageAnalysisBucket): TypedFilterCondition | undefined {
-  if (filter === 'model') return { field: 'model', operator: 'equals', value: { type: 'model', value: bucket.id } };
-  if (filter === 'keyId') return { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
-  if (filter === 'keyAlias') return { field: 'key_alias', operator: 'equals', value: { type: 'text', value: bucket.id } };
-  // `unassigned` is a read-only analytics sentinel, not a UUID accepted by
-  // the reusable typed-filter AST.  Its drilldown still uses the documented
-  // usage API query parameter below.
-  if (filter === 'upstreamId') return bucket.id === 'unassigned' ? undefined : { field: 'upstream_account_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
-  if (filter === 'protocol') return { field: 'protocol', operator: 'equals', value: { type: 'protocol', value: bucket.id as 'openai' | 'anthropic' | 'openai-image' | 'audio-transcription' | 'generation' } };
-  if (filter === 'status') return { field: 'status', operator: 'equals', value: { type: 'status', value: bucket.id as 'success' | 'error' | 'pending' } };
-  return { field: 'error_code', operator: 'equals', value: { type: 'text', value: bucket.id } };
-}
-
-function replaceTypedUsageCondition(ast: TypedFilterAst, filter: keyof UsageFilters, bucket: UsageAnalysisBucket): TypedFilterAst {
-  const field = typedFieldForUsageFilter[filter];
-  const conditions = ast.conditions.filter((condition) => condition.field !== field);
-  const condition = typedUsageCondition(filter, bucket);
-  return condition ? { ...ast, conditions: [...conditions, condition] } : { ...ast, conditions };
-}
-
 function UsageCredentialAliasSelect({ disabled, onChange, tenant, token, value }: { disabled: boolean; onChange: (value: string) => void; tenant: string; token: string; value: string }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [credentials, setCredentials] = useState<KeyView[]>([]);
+  const [search, setSearch] = useState('');
+  const [cursor, setCursor] = useState<{ created_at: number; key_id: string }>();
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    setCredentials([]); setCursor(undefined); setHasMore(false);
+  }, [tenant, token, search]);
   useEffect(() => {
     if (!token.trim()) { setCredentials([]); return; }
     const controller = new AbortController();
     const params = new URLSearchParams({ limit: '100' });
     if (tenant) params.set('tenant_external_id', tenant);
+    if (search.trim()) params.set('search', search.trim());
+    if (cursor) { params.set('before_created_at', String(cursor.created_at)); params.set('before_id', cursor.key_id); }
+    setLoading(true); setError('');
     void api<KeyView[]>(`/internal/v1/keys?${params}`, token.trim(), { signal: controller.signal })
-      .then((values) => { if (!controller.signal.aborted) setCredentials(Array.isArray(values) ? values : []); })
-      .catch(() => { if (!controller.signal.aborted) setCredentials([]); });
+      .then((values) => { if (!controller.signal.aborted) { setCredentials((previous) => cursor ? [...previous, ...values] : values); setHasMore(values.length === 100); } })
+      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t('common.requestFailed')); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [tenant, token]);
-  const aliases = [...new Set(credentials.map((credential) => credential.alias.trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
-  return <label>{t('usage.clientCredential')}<select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}><option value="">{t('common.all')}</option>{aliases.map((alias) => <option key={alias} value={alias}>{alias}</option>)}</select></label>;
+  }, [tenant, token, search, cursor, t]);
+  const aliases = [...new Set([...credentials.map((credential) => credential.alias.trim()), value].filter(Boolean))].sort((left, right) => left.localeCompare(right));
+  return <div><label>{t('usage.clientCredential')}<Select value={value} disabled={disabled} onChange={(_, data) => onChange(data.value)}><option value="">{t('common.all')}</option>{aliases.map((alias) => <option key={alias} value={alias}>{alias}</option>)}</Select></label>
+    <Input aria-label={t('routes.searchCredentials')} placeholder={t('routes.searchCredentials')} value={search} disabled={disabled} onChange={(_, data) => setSearch(data.value)} />
+    {error && <span role="alert">{error}</span>}{hasMore && <Button type="button" appearance="subtle" disabled={disabled || loading} onClick={() => { const last = credentials.at(-1); if (last) setCursor({ created_at: last.created_at, key_id: last.key_id }); }}>{locale === 'zh-CN' ? '加载更多凭据' : 'Load more credentials'}</Button>}
+  </div>;
 }
 
 const formatCurrency = (value: string | number, currency: string, locale: 'en' | 'zh-CN') => formatCurrencyDisplay(value, currency, locale).text;
@@ -123,14 +98,14 @@ function DimensionTable<T extends UsageAnalysisBucket>({ title, values, onSelect
     {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.tokens')}</th><th>{t('usage.generationUnits')}</th><th><LocalSettlementNotice /></th><th>{t('usage.successRate')}</th></tr></thead><tbody>{values.map((value) => {
       const label = labelForValue?.(value) || value.label || t('common.none');
       const requestDisplay = formatMetricDisplay(value.requests, locale); const tokenDisplay = formatMetricDisplay(totalTokens(value), locale); const unitDisplay = formatMetricDisplay(value.generation_units, locale);
-      return <tr key={value.id}><td>{onSelect ? <button type="button" className="table-link usage-filter-link" onClick={() => onSelect(value)}>{label}</button> : label}</td><td title={requestDisplay.title}>{requestDisplay.text}</td><td title={tokenDisplay.title}>{tokenDisplay.text}</td><td title={unitDisplay.title}>{unitDisplay.text}</td><td><CostValue costs={value.costs} /></td><td>{formatPercent(successRate(value), locale)}</td></tr>;
+      return <tr key={value.id}><td>{onSelect ? <Button type="button" appearance="transparent" className="table-link usage-filter-link" onClick={() => onSelect(value)}>{label}</Button> : label}</td><td title={requestDisplay.title}>{requestDisplay.text}</td><td title={tokenDisplay.title}>{tokenDisplay.text}</td><td title={unitDisplay.title}>{unitDisplay.text}</td><td><CostValue costs={value.costs} /></td><td>{formatPercent(successRate(value), locale)}</td></tr>;
     })}</tbody></table></div>}
   </article>;
 }
 
 function ChartTable({ onSelect, points, timeZone }: { onSelect?: (point: UsageAnalysisTimeBucket) => void; points: UsageAnalysisTimeBucket[]; timeZone: string }) {
   const { locale, t } = useI18n(); const copy = localCopy[locale];
-  return <div className="usage-chart-table" aria-label={copy.charts}><div className="table-scroll"><table><thead><tr><th>{t('traffic.from')} · {timeZone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.tokens}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th><LocalSettlementNotice /></th></tr></thead><tbody>{points.map((point) => { const label = new Date(point.bucket_start).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { timeZone }); const success = formatMetricDisplay(point.success, locale); const failed = formatMetricDisplay(point.failed, locale); const tokens = formatMetricDisplay(totalTokens(point), locale); return <tr key={point.bucket_start}><td>{onSelect ? <button type="button" className="table-link" onClick={() => onSelect(point)}>{label}</button> : label}</td><td title={success.title}>{success.text}</td><td title={failed.title}>{failed.text}</td><td title={tokens.title}>{tokens.text}</td><td title={analyticsDuration(point.avg_duration_ms, locale).title}>{analyticsDuration(point.avg_duration_ms, locale).text}</td><td title={histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).title}>{histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).text}</td><td><CostValue costs={point.costs} /></td></tr>; })}</tbody></table></div></div>;
+  return <div className="usage-chart-table" aria-label={copy.charts}><div className="table-scroll"><table><thead><tr><th>{t('traffic.from')} · {timeZone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.tokens}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th><LocalSettlementNotice /></th></tr></thead><tbody>{points.map((point) => { const label = new Date(point.bucket_start).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { timeZone }); const success = formatMetricDisplay(point.success, locale); const failed = formatMetricDisplay(point.failed, locale); const tokens = formatMetricDisplay(totalTokens(point), locale); return <tr key={point.bucket_start}><td>{onSelect ? <Button type="button" appearance="transparent" className="table-link" onClick={() => onSelect(point)}>{label}</Button> : label}</td><td title={success.title}>{success.text}</td><td title={failed.title}>{failed.text}</td><td title={tokens.title}>{tokens.text}</td><td title={analyticsDuration(point.avg_duration_ms, locale).title}>{analyticsDuration(point.avg_duration_ms, locale).text}</td><td title={histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).title}>{histogramP95(point.p95_duration_ms, point.p95_is_capped, locale).text}</td><td><CostValue costs={point.costs} /></td></tr>; })}</tbody></table></div></div>;
 }
 function ChartCard({ title, children, className = '', onSelect, points, timeZone }: { title: string; children: ReactNode; className?: string; onSelect?: (point: UsageAnalysisTimeBucket) => void; points: UsageAnalysisTimeBucket[]; timeZone: string }) {
   const { locale } = useI18n();
@@ -146,9 +121,11 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const [tab, setTab] = useState<UsageTab>('overview'); const [dimension, setDimension] = useState<Dimension>('models');
   const [heatMetric, setHeatMetric] = useState<HeatmapMetric>('requests'); const [heatCurrency, setHeatCurrency] = useState(''); const [selectedHeatHour, setSelectedHeatHour] = useState<number>();
   const [selection, setSelection] = useState<UsageSelection>(() => defaultUsageSelection());
-  const [typedFilters, setTypedFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
+  const [typedFilters, setTypedFilters] = useState<TypedFilterAst>(() => usageAstFromSelection(emptyTypedFilterAst, selection)!);
   const [applied, setApplied] = useState(selection); const [refresh, setRefresh] = useState(0); const scope = useMemo(() => ({}), [token, tenant, applied, refresh]);
   const [remote, setRemote] = useState<{ scope: object; status: 'loading' } | { scope: object; status: 'ready'; value: OperatorUsageAnalysis } | { scope: object; status: 'error'; message: string }>(); const requestSequence = useRef(0);
+
+  const refreshUsage = () => { const next = selection.preset === 'custom' ? selection : { ...selection, resolvedAt: Date.now() }; setSelection(next); setApplied(next); setTypedFilters(usageAstFromSelection(emptyTypedFilterAst, next)!); setRefresh((value) => value + 1); };
 
   useEffect(() => {
     const sequence = ++requestSequence.current;
@@ -165,10 +142,10 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
 
   const applyDimension = (filter: keyof UsageFilters, bucket: UsageAnalysisBucket) => {
     const next = { ...selection, filters: { ...selection.filters, [filter]: bucket.id } };
-    setTypedFilters((current) => replaceTypedUsageCondition(current, filter, bucket));
+    setTypedFilters(usageAstFromSelection(emptyTypedFilterAst, next)!);
     setSelection(next); setApplied(next);
   };
-  const selectUtcBucket = (point: UsageAnalysisTimeBucket) => { const millis = stats?.granularity === 'hour' ? 3_600_000 : 86_400_000; const next = { ...selection, preset: 'custom' as const, customFrom: localDateTimeInput(point.bucket_start), customTo: localDateTimeInput(point.bucket_start + millis - 1) }; setSelection(next); setApplied(next); setTab('overview'); };
+  const selectUtcBucket = (point: UsageAnalysisTimeBucket) => { const millis = stats?.granularity === 'hour' ? 3_600_000 : 86_400_000; const next = { ...selection, preset: 'custom' as const, customFrom: localDateTimeInput(point.bucket_start), customTo: localDateTimeInput(point.bucket_start + millis - 1) }; setTypedFilters(usageAstFromSelection(emptyTypedFilterAst, next)!); setSelection(next); setApplied(next); setTab('overview'); };
 
   const chartCopy: UsageChartCopy = useMemo(() => ({ requests: copy.requests, success: copy.success, failures: copy.failures, averageLatency: copy.averageLatency, p95Latency: copy.p95Latency, cost: localSettlementLabel(locale), noData: copy.chartEmpty }), [copy, locale]);
   const chartFormatters: UsageChartFormatters = useMemo(() => {
@@ -190,7 +167,6 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], heatMetric, effectiveHeatCurrency, weekdays, t('usage.heatmapLabel'), chartFormatters), [stats?.heatmap, heatMetric, effectiveHeatCurrency, weekdays, t, chartFormatters]);
   const externalFilterChips = [
     ...(applied.filters.upstreamId === 'unassigned' ? [{ id: 'usage-upstream-unassigned', label: `${t('filter.field.upstream_account_id')} ${t('filter.operator.equals')} ${t('usage.unassigned')}` }] : []),
-    ...(applied.filters.keyAlias ? [{ id: 'usage-key-alias', label: `${t('usage.clientCredential')} ${t('filter.operator.equals')} ${applied.filters.keyAlias}` }] : []),
   ];
   const heatMetricLabel = heatMetric === 'requests' ? copy.requests : heatMetric === 'tokens' ? copy.tokens : heatMetric === 'cost' ? localSettlementLabel(locale) : copy.failureRate;
   const selectedHeatCell = stats?.heatmap.find((value) => value.hour_of_week === selectedHeatHour);
@@ -210,18 +186,18 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
     ? `${new Date(stats.from_created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { timeZone: displayTimeZone() })} – ${new Date(stats.to_created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { timeZone: displayTimeZone() })}`
     : undefined;
 
-  return <div className="usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p>{stats && <span className="usage-time-zone" title={reportedRange}>{bucketTimeZoneNote(locale, stats.time_zone)}</span>}</div><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => setRefresh((value) => value + 1)}>{loading ? t('common.loading') : t('usage.refresh')}</button></div>
-    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} externalChips={externalFilterChips} panelActive={Object.values(selection.filters).some(Boolean) || selection.preset !== '24h' || selection.granularity !== 'auto'} panelControls={<div className="usage-controls">
-      <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{usagePresets.map((preset) => <button type="button" className={selection.preset === preset ? 'active' : 'secondary'} aria-pressed={selection.preset === preset} key={preset} onClick={() => setSelection({ ...selection, preset })}>{t(`usage.preset.${preset}`)}</button>)}</div></fieldset>
-      {selection.preset === 'custom' && <div className="usage-custom-range"><label>{t('traffic.from')}<input type="datetime-local" step="0.001" value={selection.customFrom} onChange={(event) => setSelection({ ...selection, customFrom: event.target.value })} /></label><label>{t('traffic.to')}<input type="datetime-local" step="0.001" value={selection.customTo} onChange={(event) => setSelection({ ...selection, customTo: event.target.value })} /></label></div>}
-      <div className="usage-filter-grid"><label>{t('usage.granularity')}<select value={selection.granularity} onChange={(event) => setSelection({ ...selection, granularity: event.target.value as UsageSelection['granularity'] })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></select></label><UsageCredentialAliasSelect disabled={Boolean(loading) || !token.trim()} token={token} tenant={tenant} value={selection.filters.keyAlias} onChange={(keyAlias) => setSelection({ ...selection, filters: { ...selection.filters, keyAlias } })} /></div>
-    </div>} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = defaultUsageSelection(); setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
+  return <div className="usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p>{stats && <span className="usage-time-zone" title={reportedRange}>{bucketTimeZoneNote(locale, stats.time_zone)}</span>}</div><Button type="button" appearance="secondary" disabled={loading || !token.trim()} onClick={refreshUsage}>{loading ? t('common.loading') : t('usage.refresh')}</Button></div>
+    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} externalChips={externalFilterChips} panelActive={selection.preset !== '24h' || selection.granularity !== 'auto'} usageSelection={selection} panelControls={(draft, setDraft) => <div className="usage-controls">
+      <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{usagePresets.map((preset) => <Button type="button" appearance="secondary" className={draft.preset === preset ? 'active' : undefined} aria-pressed={draft.preset === preset} key={preset} onClick={() => setDraft({ ...draft, preset, resolvedAt: Date.now() })}>{t(`usage.preset.${preset}`)}</Button>)}</div></fieldset>
+      {draft.preset === 'custom' && <div className="usage-custom-range"><label>{t('traffic.from')}<Input type="datetime-local" step="0.001" value={draft.customFrom} onChange={(_, data) => setDraft({ ...draft, customFrom: data.value })} /></label><label>{t('traffic.to')}<Input type="datetime-local" step="0.001" value={draft.customTo} onChange={(_, data) => setDraft({ ...draft, customTo: data.value })} /></label></div>}
+      <div className="usage-filter-grid"><label>{t('usage.granularity')}<Select value={draft.granularity} onChange={(_, data) => setDraft({ ...draft, granularity: data.value as UsageSelection['granularity'] })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></Select></label><UsageCredentialAliasSelect disabled={Boolean(loading) || !token.trim()} token={token} tenant={tenant} value={draft.filters.keyAlias} onChange={(keyAlias) => setDraft({ ...draft, filters: { ...draft.filters, keyAlias } })} /></div>
+    </div>} onApply={(ast, next) => { if (!next) return; setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = defaultUsageSelection(); setTypedFilters(usageAstFromSelection(emptyTypedFilterAst, next)!); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
     {!token.trim() && <div className="notice warning" role="status">{t('usage.connectPrompt')}</div>}{loading && <div className="notice" role="status">{t('common.loading')}</div>}{error && <div className="notice error" role="alert">{error}</div>}
-    <nav className="usage-tabs" role="tablist" aria-label={t('usage.sections')}>{usageTabs.map((id) => <button type="button" role="tab" id={`usage-tab-${id}`} aria-controls={`usage-panel-${id}`} aria-selected={tab === id} tabIndex={tab === id ? 0 : -1} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)} onKeyDown={(event) => { const next = nextUsageTab(id, event.key); if (!next) return; event.preventDefault(); setTab(next); requestAnimationFrame(() => document.getElementById(`usage-tab-${next}`)?.focus()); }}>{id === 'dimensions' ? copy.dimensions : t(`usage.tab.${id}`)}</button>)}</nav>
+    <nav className="usage-tabs" role="tablist" aria-label={t('usage.sections')}>{usageTabs.map((id) => <Button type="button" role="tab" id={`usage-tab-${id}`} aria-controls={`usage-panel-${id}`} aria-selected={tab === id} tabIndex={tab === id ? 0 : -1} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)} onKeyDown={(event) => { const next = nextUsageTab(id, event.key); if (!next) return; event.preventDefault(); setTab(next); requestAnimationFrame(() => document.getElementById(`usage-tab-${next}`)?.focus()); }}>{id === 'dimensions' ? copy.dimensions : t(`usage.tab.${id}`)}</Button>)}</nav>
     {stats && <section className="usage-tab-panel" role="tabpanel" id={`usage-panel-${tab}`} aria-labelledby={`usage-tab-${tab}`}><p className="analytics-settlement-note"><LocalSettlementNotice /></p>{tab === 'overview' && <><UsageSummaryMetrics stats={stats} /><p className="analytics-p95-note">{locale === 'zh-CN' ? 'P95 按直方图区间上界展示；超出范围及早期无法确定的值留空。' : 'P95 uses histogram upper bounds. Out-of-range and ambiguous earlier values leave gaps.'}</p><GenerationBreakdown stats={stats} /><div className="usage-overview-chart-grid"><ChartCard className="usage-chart-primary" title={copy.throughput} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.throughput} locale={locale} option={throughput} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={copy.latency} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.latency} locale={locale} option={latency} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={localSettlementTrendLabel(locale)} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={localSettlementTrendLabel(locale)} locale={locale} option={costs} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard></div></>}
       {tab === 'trend' && <div className="usage-chart-grid"><ChartCard title={copy.throughput} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.throughput} locale={locale} option={throughput} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={copy.latency} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={copy.latency} locale={locale} option={latency} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard><ChartCard title={localSettlementTrendLabel(locale)} onSelect={selectUtcBucket} points={stats.time_series} timeZone={displayTimeZone()}><LazyChart><EChart ariaLabel={localSettlementTrendLabel(locale)} locale={locale} option={costs} timeZone={displayTimeZone()} onClick={({ dataIndex }) => stats.time_series[dataIndex] && selectUtcBucket(stats.time_series[dataIndex])} /></LazyChart></ChartCard></div>}
-      {tab === 'dimensions' && <><div className="usage-dimension-picker" role="tablist" aria-label={copy.dimensions}>{dimensions.map((id) => <button key={id} type="button" className={dimension === id ? 'active' : 'secondary'} aria-pressed={dimension === id} onClick={() => setDimension(id)}>{t(`usage.${id}`)}</button>)}</div>{renderDimension()}</>}
-      {tab === 'heatmap' && <article className="panel usage-heatmap-panel"><ChartDataView title={t('usage.heatmap')} metadata={<div className="usage-heatmap-controls"><span>{stats.time_zone}</span><label>{copy.heatMetric}<select value={heatMetric} onChange={(event) => { setHeatMetric(event.target.value as HeatmapMetric); setSelectedHeatHour(undefined); }}><option value="requests">{copy.requests}</option><option value="tokens">{copy.tokens}</option><option value="cost">{copy.cost}</option><option value="failure_rate">{copy.failureRate}</option></select></label>{heatMetric === 'cost' && <label>{t('usage.trendCurrency')}<select value={effectiveHeatCurrency} onChange={(event) => { setHeatCurrency(event.target.value); setSelectedHeatHour(undefined); }}>{currencies.map((currency) => <option key={currency}>{currency}</option>)}</select></label>}</div>} data={<HeatmapDataTable currency={effectiveHeatCurrency} format={chartFormatters} metric={heatMetric} onSelect={(value) => setSelectedHeatHour(value.hour_of_week)} summary={copy.charts} timeZone={stats.time_zone} valueLabel={heatMetricLabel} values={stats.heatmap} weekdays={weekdays} />}>{stats.heatmap.length === 0 ? <div className="empty">{t('usage.noHeatmapData')}</div> : <LazyChart><EChart ariaLabel={t('usage.heatmapLabel')} className="usage-echart-heatmap" locale={locale} option={heatmap} timeZone={stats.time_zone} onClick={({ dataIndex }) => setSelectedHeatHour(stats.heatmap[dataIndex]?.hour_of_week)} /></LazyChart>}</ChartDataView>{selectedHeatCell && <div className="usage-heatmap-selection" role="status">{copy.selectedCell}: {weekdays[Math.floor(selectedHeatCell.hour_of_week / 24)]} {String(selectedHeatCell.hour_of_week % 24).padStart(2, '0')}:00 · {heatMetric === 'failure_rate' ? formatPercent(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), locale) : heatMetric === 'cost' ? formatCurrency(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), effectiveHeatCurrency, locale) : formatMetricDisplay(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), locale).text}</div>}</article>}
+      {tab === 'dimensions' && <><div className="usage-dimension-picker" role="tablist" aria-label={copy.dimensions}>{dimensions.map((id) => <Button key={id} type="button" className={dimension === id ? 'active' : 'secondary'} aria-pressed={dimension === id} onClick={() => setDimension(id)}>{t(`usage.${id}`)}</Button>)}</div>{renderDimension()}</>}
+      {tab === 'heatmap' && <article className="panel usage-heatmap-panel"><ChartDataView title={t('usage.heatmap')} metadata={<div className="usage-heatmap-controls"><span>{stats.time_zone}</span><label>{copy.heatMetric}<Select value={heatMetric} onChange={(_, data) => { setHeatMetric(data.value as HeatmapMetric); setSelectedHeatHour(undefined); }}><option value="requests">{copy.requests}</option><option value="tokens">{copy.tokens}</option><option value="cost">{copy.cost}</option><option value="failure_rate">{copy.failureRate}</option></Select></label>{heatMetric === 'cost' && <label>{t('usage.trendCurrency')}<Select value={effectiveHeatCurrency} onChange={(_, data) => { setHeatCurrency(data.value); setSelectedHeatHour(undefined); }}>{currencies.map((currency) => <option key={currency}>{currency}</option>)}</Select></label>}</div>} data={<HeatmapDataTable currency={effectiveHeatCurrency} format={chartFormatters} metric={heatMetric} onSelect={(value) => setSelectedHeatHour(value.hour_of_week)} summary={copy.charts} timeZone={stats.time_zone} valueLabel={heatMetricLabel} values={stats.heatmap} weekdays={weekdays} />}>{stats.heatmap.length === 0 ? <div className="empty">{t('usage.noHeatmapData')}</div> : <LazyChart><EChart ariaLabel={t('usage.heatmapLabel')} className="usage-echart-heatmap" locale={locale} option={heatmap} timeZone={stats.time_zone} onClick={({ dataIndex }) => setSelectedHeatHour(stats.heatmap[dataIndex]?.hour_of_week)} /></LazyChart>}</ChartDataView>{selectedHeatCell && <div className="usage-heatmap-selection" role="status">{copy.selectedCell}: {weekdays[Math.floor(selectedHeatCell.hour_of_week / 24)]} {String(selectedHeatCell.hour_of_week % 24).padStart(2, '0')}:00 · {heatMetric === 'failure_rate' ? formatPercent(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), locale) : heatMetric === 'cost' ? formatCurrency(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), effectiveHeatCurrency, locale) : formatMetricDisplay(heatmapValue(selectedHeatCell, heatMetric, effectiveHeatCurrency), locale).text}</div>}</article>}
     </section>}
     {!loading && token.trim() && !error && !stats && <div className="empty">{t('usage.noData')}</div>}
   </div>;
