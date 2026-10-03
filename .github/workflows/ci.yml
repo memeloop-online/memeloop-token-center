@@ -226,12 +226,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: memeloop-online/claude-code-wire
-          ref: ceba7ef7c7a961a59574eb4fb24bd90b7eec2193
-          path: claude-code-wire-fixture
-          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
@@ -302,10 +296,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Verify pinned Claude privacy component through the host ABI
         run: |
+          mkdir claude-code-wire-fixture
           cd claude-code-wire-fixture
-          cargo build --locked --release --target wasm32-unknown-unknown
-          cargo run --locked --release --manifest-path componentize/Cargo.toml -- \
-            target/wasm32-unknown-unknown/release/mtc_claude_code_wire.wasm plugin.wasm
+          curl --fail --location --retry 3 --output plugin.wasm \
+            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.wasm
+          curl --fail --location --retry 3 --output plugin.json \
+            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.json
+          printf '%s\n' \
+            '51043af426632581a218c227a0f90b2de2253d27b5438519098c44d965c01f3c  plugin.wasm' \
+            '95aa1c2ec715a766e865d861b6e9b00cb157c1f77056fab300fc55fa3925c68e  plugin.json' \
+            | sha256sum --check --strict
           cd ..
           MTC_CLAUDE_WIRE_FIXTURE="$GITHUB_WORKSPACE/claude-code-wire-fixture" \
             cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
