@@ -117,9 +117,57 @@ async fn streaming_handoff_keeps_the_stream_owner_and_successful_settlement() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(
+        rows[0].status_code,
+        Some(200),
+        "terminal error_code={:?}",
+        rows[0].error_code
+    );
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+}
+
+#[tokio::test]
+async fn malformed_handoff_prefix_keeps_the_incomplete_response_cause() {
+    let fixture = codex_route_fixture("cancel-guard-malformed-prefix").await;
+    let upstream = MockServer::start().await;
+    let prefix = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("{prefix}{}", completed_codex_sse("synthetic handoff")),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "synthetic invalid prefix", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].status_code,
+        Some(502),
+        "terminal error_code={:?}",
+        rows[0].error_code
+    );
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_incomplete_response")
+    );
+    assert_eq!(rows[0].cost, "0");
 }
 
 #[tokio::test]
