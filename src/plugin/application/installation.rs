@@ -1326,6 +1326,132 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn source_keyless_worker_selects_two_exact_signers() {
+        const CHILD_ROOT: &str = "MTC_SOURCE_SIGNER_WORKER_TEST_ROOT";
+        let Ok(child_root) = std::env::var(CHILD_ROOT) else {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let bin = directory.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::create_dir(directory.path().join("lib")).unwrap();
+            let executable = bin.join("worker-test");
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let installer = bin.join("install-plugin-oci");
+            std::fs::write(&installer, r#"#!/bin/sh
+set -eu
+reference=$1
+shift
+root=
+attempt=
+identity=
+issuer=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --plugin-dir) root=$2 ;;
+        --publication-attempt-id) attempt=$2 ;;
+        --cosign-certificate-identity) identity=$2 ;;
+        --cosign-certificate-oidc-issuer) issuer=$2 ;;
+        --allowed-source) ;;
+        *) exit 90 ;;
+    esac
+    shift 2
+done
+source=${reference%@sha256:*}
+digest=${reference##*@}
+name=${source##*/}
+printf '%s\n%s\n%s\n' "$reference" "$identity" "$issuer" >> "$root/worker-arguments"
+package="$root/mtc-attempt-$attempt/$name"
+mkdir "$package"
+printf '{"id":"%s","version":"1.0.0","wit_version":"0.2.0","wasm":null,"capabilities":[],"contributions":{}}' "$name" > "$package/plugin.json"
+printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosign-keyless"}' "$source" "$digest" > "$package/.mtc-oci-install.json"
+"#).unwrap();
+            std::fs::set_permissions(&installer, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(120),
+                tokio::process::Command::new(executable)
+                    .arg("source_keyless_worker_selects_two_exact_signers")
+                    .arg("--nocapture")
+                    .env(CHILD_ROOT, directory.path())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        assert_eq!(
+            std::env::current_exe().unwrap().parent().unwrap(),
+            PathBuf::from(child_root).join("bin")
+        );
+        let (directory, state, _, _) = fixture().await;
+        let authority = state.application_plugins.as_ref().unwrap();
+        let mut value = source_signer_policy();
+        value["plugin_root"] = json!(directory.path().join("worker-root"));
+        std::fs::write(
+            directory.path().join("policy.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let policy = authority.install_policy().await.unwrap();
+        let packages: Vec<_> = policy
+            .allowed_sources
+            .iter()
+            .map(|source| format!("{source}@sha256:{}", "a".repeat(64)))
+            .collect();
+        let input = InstallPluginRequest {
+            inventory_id: "worker-signers".into(),
+            packages,
+        };
+        let (record, run) = state
+            .db
+            .begin_plugin_installation(
+                &input.inventory_id,
+                &json!(input.packages),
+                "worker-hash",
+                "worker-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        let (_, review) = authority
+            .perform_install(&record.id, &record.attempt_id, &input, &policy)
+            .await
+            .unwrap();
+        assert_eq!(review["plugins"].as_array().unwrap().len(), 2);
+        let captured =
+            std::fs::read_to_string(policy.plugin_root.join("worker-arguments")).unwrap();
+        let expected: String = input
+            .packages
+            .iter()
+            .map(|reference| {
+                let source = reference.rsplit_once("@sha256:").unwrap().0;
+                let signer = &policy.source_keyless[source];
+                format!("{reference}\n{}\n{}\n", signer.identity, signer.issuer)
+            })
+            .collect();
+        assert_eq!(captured, expected);
+        assert_eq!(
+            state
+                .db
+                .plugin_installation(&record.id)
+                .await
+                .unwrap()
+                .completed_packages,
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn source_keyless_rejects_invalid_policy_at_load_and_selection() {
         let (directory, state, _, _) = fixture().await;
         let authority = state.application_plugins.as_ref().unwrap();
@@ -1456,6 +1582,14 @@ mod tests {
         let public_key_digest = trust_digest(&authority.install_policy().await.unwrap())
             .await
             .unwrap();
+        assert_eq!(
+            public_key_digest,
+            super::super::super::plugin_configuration_schema_digest(&json!({
+                "sources": ["ghcr.io/example/new"],
+                "keys": [b"public-key-fixture-must-not-appear-in-api".to_vec()]
+            }))
+            .unwrap()
+        );
         value["cosign_keyless"] = json!({
             "issuer":"https://token.actions.githubusercontent.com",
             "identity":"https://github.com/memeloop-online/memeloop-token-center/.github/workflows/publish-first-party-plugin.yml@refs/heads/master"
