@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestIsPending, requestUsageIsActual } from '../src/requestTablePresentation.js';
-import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
+import { mergeLiveRequestEvents, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
 import { requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
@@ -38,6 +38,40 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(requestStatusCopy({ ...request, status_code: 200, error_code: 'upstream_stream' }, 'en').hint, 'Recorded cause: The upstream response stream was interrupted');
   assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_http2_reset' }, 'en').hint, 'Recorded cause: The upstream HTTP/2 stream was reset');
   assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: Unknown (no specific cause recorded)');
+});
+
+test('hostile or unrecorded terminal cause codes never reach operators and never mask a known recorded cause', () => {
+  const hostile = { ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token\r\nSet-Cookie: session=attacker' };
+  const hostileCopy = requestStatusCopy(hostile, 'en');
+  assert.equal(hostileCopy.hint, 'Recorded cause: Unknown (no specific cause recorded)');
+  assert.equal(hostileCopy.cause, hostileCopy.hint);
+  assert.doesNotMatch(hostileCopy.hint, /secret-token|Set-Cookie|attacker/);
+  assert.equal(requestFailureCause(hostile, 'zh-CN'), null);
+  assert.equal(requestErrorCopy(hostile.terminal_cause_code!, 'en'), 'The request failed', 'generic copy never interpolates the raw recorded value');
+  const unknownTerminal = { ...request, status_code: 502, error_code: 'upstream_stream_read_error', terminal_cause_code: 'transport_future_code_v9' };
+  assert.equal(requestStatusCopy(unknownTerminal, 'en').hint, 'Recorded cause: The upstream response stream was interrupted', 'an unrecognized terminal cause falls back to the recorded error evidence');
+  assert.equal(requestStatusCopy(unknownTerminal, 'zh-CN').hint, '已记录原因: 读取上游响应时连接中断');
+  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: null, terminal_cause_code: 'upstream_transport_connection_reset' }, 'en').hint, 'Recorded cause: The upstream connection was reset');
+});
+
+test('terminal cause survives SSE reconciliation and legacy events never erase recorded evidence', () => {
+  const finished = { ...request, event_id: 'event', event_at: 3000, event_kind: 'finished', key_id: 'key', status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_http2_reset' } as RequestEvent;
+  const started = { ...finished, event_kind: 'started', status_code: null, error_code: null, terminal_cause_code: null } as RequestEvent;
+  const running = requestViewFromEvent(started);
+  assert.equal(running?.terminal_cause_code, null, 'a running row has no recorded terminal cause yet');
+  const finishedView = requestViewFromEvent(finished, running);
+  assert.equal(finishedView?.terminal_cause_code, 'upstream_transport_http2_reset');
+  const archive = { ...finished, event_id: 'event-2', event_at: 3001, event_kind: 'archive_bound' } as RequestEvent;
+  delete (archive as Partial<RequestEvent>).terminal_cause_code;
+  assert.equal(requestViewFromEvent(archive, finishedView)?.terminal_cause_code, 'upstream_transport_http2_reset', 'later partial events without the field keep the recorded cause');
+  const restRow: RequestView = { ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_read_timeout', completed_at: 3000 };
+  const legacyFinished = { ...finished } as Partial<RequestEvent>;
+  delete legacyFinished.terminal_cause_code;
+  assert.equal(requestViewFromEvent(legacyFinished as RequestEvent, restRow)?.terminal_cause_code, 'upstream_read_timeout', 'a legacy finished event lacking the field must not clear a REST-recorded cause');
+  assert.equal(requestViewFromEvent(started, restRow)?.terminal_cause_code, 'upstream_read_timeout', 'a replayed start never regresses the terminal row');
+  assert.equal(requestViewFromEvent({ ...finished, terminal_cause_code: null })?.terminal_cause_code, null, 'explicit null without previous evidence stays null');
+  const merged = mergeLiveRequestEvents([restRow], new Map([[restRow.request_id, archive]]), true);
+  assert.equal(merged[0]?.terminal_cause_code, 'upstream_read_timeout');
 });
 
 test('generation TPS requires observed output interval and does not relabel total-duration fallback', () => {

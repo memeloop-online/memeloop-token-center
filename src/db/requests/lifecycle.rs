@@ -70,30 +70,6 @@ fn terminal_transport_cause(error_code: Option<&str>) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
-mod terminal_cause_tests {
-    use super::terminal_transport_cause;
-
-    #[test]
-    fn only_recorded_transport_codes_become_terminal_causes() {
-        assert_eq!(
-            terminal_transport_cause(Some("upstream_transport_http2_reset")),
-            Some("upstream_transport_http2_reset")
-        );
-        assert_eq!(
-            terminal_transport_cause(Some("upstream_read_timeout")),
-            Some("upstream_read_timeout")
-        );
-        assert_eq!(terminal_transport_cause(Some("http_502")), None);
-        assert_eq!(
-            terminal_transport_cause(Some("transport_http2_reset_delivery_unknown")),
-            None
-        );
-        assert_eq!(terminal_transport_cause(Some("Bearer secret-token")), None);
-        assert_eq!(terminal_transport_cause(None), None);
-    }
-}
-
 pub struct StartProxyRequest<'a> {
     pub request_id: Uuid,
     pub key: &'a AuthenticatedKey,
@@ -2266,4 +2242,28 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Err(AppError::Internal);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod terminal_cause_tests {
+    use super::terminal_transport_cause;
+
+    #[test]
+    fn only_recorded_transport_codes_become_terminal_causes() {
+        assert_eq!(
+            terminal_transport_cause(Some("upstream_transport_http2_reset")),
+            Some("upstream_transport_http2_reset")
+        );
+        assert_eq!(
+            terminal_transport_cause(Some("upstream_read_timeout")),
+            Some("upstream_read_timeout")
+        );
+        assert_eq!(terminal_transport_cause(Some("http_502")), None);
+        assert_eq!(
+            terminal_transport_cause(Some("transport_http2_reset_delivery_unknown")),
+            None
+        );
+        assert_eq!(terminal_transport_cause(Some("Bearer secret-token")), None);
+        assert_eq!(terminal_transport_cause(None), None);
+    }
 }

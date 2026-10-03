@@ -9270,6 +9270,10 @@ components:
         usage: { $ref: '#/components/schemas/RequestUsage' }
         billing: { $ref: '#/components/schemas/RequestBilling' }
         error_code: { type: [string, 'null'] }
+        terminal_cause_code:
+          type: [string, 'null']
+          enum: [upstream_transport_timeout, upstream_transport_outer_deadline, upstream_transport_connection_reset, upstream_transport_http2_reset, upstream_transport_http2_goaway, upstream_transport_body, upstream_transport_decode, upstream_transport_request, upstream_transport_other, upstream_http2_reset, upstream_http2_goaway, upstream_read_timeout, upstream_request_timeout, upstream_stream_read_error, null]
+          description: Allowlisted transport cause recorded by the winning terminal transaction. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive.
         archive_state: { $ref: '#/components/schemas/RequestArchiveState' }
         credential_identity:
           description: Operator-scoped stable credential identity; null in self-service projections.
