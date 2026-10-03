@@ -75,7 +75,7 @@ pub(super) async fn send_frame(
             .map_err(|_| "downstream_disconnected")?;
     }
     if billable && let Some(probe) = input.probe {
-        probe.delivered_validated_output().await;
+        probe.delivered_validated_output();
     }
     Ok(billable)
 }

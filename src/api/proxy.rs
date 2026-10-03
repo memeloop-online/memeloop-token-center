@@ -29,6 +29,7 @@ mod buffered_upstream;
 mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
+pub(crate) mod observations;
 pub(crate) mod persistence;
 mod response_metadata;
 mod routing;
@@ -80,7 +81,6 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
-const SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -1023,13 +1023,11 @@ async fn proxy_with_cancellation_guard(
     let avoid_route_account = session_route_account_to_avoid(
         &state,
         &key,
-        request_id,
         &conversation_hints,
         &model,
         protocol.name(),
         applied.upstream_account_hint,
-    )
-    .await;
+    );
     let candidate_query =
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
@@ -1244,6 +1242,14 @@ async fn proxy_with_cancellation_guard(
     let request_body_length = body.len();
     drop(body);
     let mut buffered_request = BufferedRequest {
+        session_preference: conversation.as_ref().and_then(|conversation| {
+            observations::sessions::cache_key(
+                &key,
+                conversation.hints.session_id.as_deref()?,
+                &model,
+                protocol.name(),
+            )
+        }),
         state: &state,
         reservation,
         request_id,
@@ -2184,6 +2190,7 @@ impl<'a> ProxyConversationProjection<'a> {
 }
 
 struct BufferedRequest<'a> {
+    session_preference: Option<[u8; 32]>,
     state: &'a AppState,
     reservation: crate::model::UsageReservation,
     request_id: Uuid,
@@ -2839,6 +2846,11 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }
     let result = result?;
+    if matches!(result, FinishProxyRequestResult::Finished { .. })
+        && let Some(identity) = request.session_preference
+    {
+        request.state.observations.sessions.invalidate(identity);
+    }
     if matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }) {
         tracing::debug!(%request_id, stage = "terminal_replay", "proxy request already finalized");
     }
@@ -2867,10 +2879,9 @@ fn routing_selection_seed(
     Uuid::from_bytes(bytes)
 }
 
-async fn session_route_account_to_avoid(
+fn session_route_account_to_avoid(
     state: &AppState,
     key: &AuthenticatedKey,
-    request_id: Uuid,
     hints: &crate::conversation::ConversationHints,
     model: &str,
     protocol: &str,
@@ -2883,31 +2894,5 @@ async fn session_route_account_to_avoid(
         return None;
     }
     let session_id = hints.session_id.as_deref()?;
-    match tokio::time::timeout(
-        SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT,
-        state
-            .db
-            .latest_session_transport_route_to_avoid(key, session_id, model, protocol),
-    )
-    .await
-    {
-        Ok(Ok(account_id)) => account_id,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                %request_id,
-                error_category = error.diagnostic_category(),
-                stage = "session_route_account_avoid_lookup",
-                "session transport evidence lookup failed open"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                %request_id,
-                stage = "session_route_account_avoid_lookup",
-                "session transport evidence lookup timed out and failed open"
-            );
-            None
-        }
-    }
+    observations::sessions::SessionCache::lookup(state, key, session_id, model, protocol)
 }

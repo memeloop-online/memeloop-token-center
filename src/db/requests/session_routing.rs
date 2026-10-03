@@ -37,9 +37,26 @@ impl Database {
     /// Returns the exact route/account pair used by the latest terminal for
     /// this model and protocol in an explicit session, but only when that
     /// terminal is a transport-class 502.
+    #[cfg(test)]
     pub(crate) async fn latest_session_transport_route_to_avoid(
         &self,
         key: &AuthenticatedKey,
+        explicit_session_id: &str,
+        model: &str,
+        protocol: &str,
+    ) -> Result<Option<(Uuid, Uuid)>, AppError> {
+        self.latest_session_transport_route_to_avoid_scoped(
+            (key.tenant_id, key.principal_id, key.key_id),
+            explicit_session_id,
+            model,
+            protocol,
+        )
+        .await
+    }
+
+    pub(crate) async fn latest_session_transport_route_to_avoid_scoped(
+        &self,
+        scope: (Uuid, Uuid, Uuid),
         explicit_session_id: &str,
         model: &str,
         protocol: &str,
@@ -57,9 +74,9 @@ impl Database {
              ORDER BY observed_at DESC, request_id DESC
              LIMIT 1",
         )
-        .bind(key.tenant_id.to_string())
-        .bind(key.principal_id.to_string())
-        .bind(key.key_id.to_string())
+        .bind(scope.0.to_string())
+        .bind(scope.1.to_string())
+        .bind(scope.2.to_string())
         .bind(explicit_session_id)
         .bind(model)
         .bind(protocol)

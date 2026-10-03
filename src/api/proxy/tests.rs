@@ -42,6 +42,7 @@ mod ha_policy;
 mod kimi;
 mod memory_admission;
 mod memory_metrics;
+mod observations;
 mod passthrough_reservation;
 mod persistence_isolation;
 mod phase_diagnostics;
