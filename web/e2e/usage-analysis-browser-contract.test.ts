@@ -205,7 +205,10 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await page.getByRole('button', { name: 'Refresh' }).click();
     await page.waitForFunction((previousCount) => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length > previousCount, callCount);
     const refreshed = new URLSearchParams(new URL((await calls()).at(-1)!, 'http://fixture').search);
-    assert.equal(Number(refreshed.get('to_created_at')) - Number(beforeRefresh.get('to_created_at')), 60_000);
+    // The fake clock advances when page timers fire, so Fluent's scheduled
+    // work can add a few milliseconds to the fast-forwarded minute.
+    const advanced = Number(refreshed.get('to_created_at')) - Number(beforeRefresh.get('to_created_at'));
+    assert.ok(advanced >= 60_000 && advanced < 61_000, `refresh advances the range by the elapsed minute (advanced ${advanced}ms)`);
   } finally {
     await browser.close();
     await server.close();
