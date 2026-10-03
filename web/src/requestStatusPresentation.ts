@@ -30,7 +30,9 @@ function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null
 }
 
 export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
-  return request.error_code ? recordedCause(request.error_code, locale) : null;
+  return request.terminal_cause_code
+    ? recordedCause(request.terminal_cause_code, locale)
+    : request.error_code ? recordedCause(request.error_code, locale) : null;
 }
 
 export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {

@@ -50,6 +50,50 @@ struct MeteredRequestUsage<'a> {
     billing_unit: &'a str,
 }
 
+fn terminal_transport_cause(error_code: Option<&str>) -> Option<&'static str> {
+    match error_code? {
+        "upstream_transport_timeout" => Some("upstream_transport_timeout"),
+        "upstream_transport_outer_deadline" => Some("upstream_transport_outer_deadline"),
+        "upstream_transport_connection_reset" => Some("upstream_transport_connection_reset"),
+        "upstream_transport_http2_reset" => Some("upstream_transport_http2_reset"),
+        "upstream_transport_http2_goaway" => Some("upstream_transport_http2_goaway"),
+        "upstream_transport_body" => Some("upstream_transport_body"),
+        "upstream_transport_decode" => Some("upstream_transport_decode"),
+        "upstream_transport_request" => Some("upstream_transport_request"),
+        "upstream_transport_other" => Some("upstream_transport_other"),
+        "upstream_http2_reset" => Some("upstream_http2_reset"),
+        "upstream_http2_goaway" => Some("upstream_http2_goaway"),
+        "upstream_read_timeout" => Some("upstream_read_timeout"),
+        "upstream_request_timeout" => Some("upstream_request_timeout"),
+        "upstream_stream_read_error" => Some("upstream_stream_read_error"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod terminal_cause_tests {
+    use super::terminal_transport_cause;
+
+    #[test]
+    fn only_recorded_transport_codes_become_terminal_causes() {
+        assert_eq!(
+            terminal_transport_cause(Some("upstream_transport_http2_reset")),
+            Some("upstream_transport_http2_reset")
+        );
+        assert_eq!(
+            terminal_transport_cause(Some("upstream_read_timeout")),
+            Some("upstream_read_timeout")
+        );
+        assert_eq!(terminal_transport_cause(Some("http_502")), None);
+        assert_eq!(
+            terminal_transport_cause(Some("transport_http2_reset_delivery_unknown")),
+            None
+        );
+        assert_eq!(terminal_transport_cause(Some("Bearer secret-token")), None);
+        assert_eq!(terminal_transport_cause(None), None);
+    }
+}
+
 pub struct StartProxyRequest<'a> {
     pub request_id: Uuid,
     pub key: &'a AuthenticatedKey,
@@ -1947,7 +1991,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -1967,6 +2011,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .bind(usage_basis.map(crate::model::RequestUsageBasis::as_str))
     .bind(billed_units)
     .bind(billing_unit)
+    .bind(terminal_transport_cause(request.error_code.as_deref()))
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {

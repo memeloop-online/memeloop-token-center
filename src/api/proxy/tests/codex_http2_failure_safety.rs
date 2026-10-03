@@ -153,6 +153,31 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
         Failure::PostHeaderSilence => "upstream_read_timeout",
     };
     assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
+    assert_eq!(rows[0].terminal_cause_code.as_deref(), Some(expected_error));
+    let detail = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.view.terminal_cause_code.as_deref(),
+        Some(expected_error)
+    );
+    let events = fixture
+        .state
+        .db
+        .all_request_events_after(0, None, 500)
+        .await
+        .unwrap();
+    let finished = events
+        .iter()
+        .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
+        .unwrap();
+    assert_eq!(
+        finished.terminal_cause_code.as_deref(),
+        Some(expected_error)
+    );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 

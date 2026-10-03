@@ -266,6 +266,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
+    terminal_cause_code: event.event_kind === 'finished' ? event.terminal_cause_code ?? null : event.terminal_cause_code ?? previous?.terminal_cause_code ?? null,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };

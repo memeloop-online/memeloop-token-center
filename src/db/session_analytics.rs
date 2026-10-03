@@ -1272,6 +1272,7 @@ impl Database {
                         usage,
                         billing,
                         error_code,
+                        terminal_cause_code: None,
                         archive_state: crate::model::RequestArchiveState::from_storage(
                             row.try_get::<String, _>("archive_state")?.as_str(),
                         )

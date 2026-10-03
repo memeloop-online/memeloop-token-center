@@ -650,6 +650,7 @@ pub struct RequestView {
     /// explicitly non-billable and never enter request or generation totals.
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
+    pub terminal_cause_code: Option<String>,
     /// Current durable archive workflow state. Terminal spool transitions are
     /// also emitted on the request event stream so an open view can converge.
     pub archive_state: RequestArchiveState,
@@ -671,7 +672,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 27)?;
+        let mut state = serializer.serialize_struct("RequestView", 28)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
@@ -705,6 +706,7 @@ impl Serialize for RequestView {
         state.serialize_field("usage", &self.usage)?;
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
+        state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
         state.serialize_field("session_context", &self.session_context)?;
@@ -901,6 +903,7 @@ pub struct RequestEventView {
     pub usage: RequestUsageView,
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
+    pub terminal_cause_code: Option<String>,
     pub archive_state: RequestArchiveState,
     pub credential_identity: Option<RequestCredentialIdentityView>,
 }
@@ -913,7 +916,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 31)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 32)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -952,6 +955,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("usage", &self.usage)?;
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
+        state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
         state.end()

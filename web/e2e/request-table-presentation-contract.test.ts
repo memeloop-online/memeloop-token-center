@@ -36,6 +36,8 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(requestErrorCopy(http2.error_code, 'en'), requestFailureCause(http2, 'en'));
   assert.equal(requestStatusCopy({ ...http2, error_code: 'upstream_http2_reset' }, 'zh-CN').hint, '已记录原因: 上游 HTTP/2 流被重置');
   assert.equal(requestStatusCopy({ ...request, status_code: 200, error_code: 'upstream_stream' }, 'en').hint, 'Recorded cause: The upstream response stream was interrupted');
+  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_http2_reset' }, 'en').hint, 'Recorded cause: The upstream HTTP/2 stream was reset');
+  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: Unknown (no specific cause recorded)');
 });
 
 test('generation TPS requires observed output interval and does not relabel total-duration fallback', () => {
