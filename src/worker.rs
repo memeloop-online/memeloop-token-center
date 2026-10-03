@@ -919,6 +919,7 @@ mod tests {
         state
             .db
             .finish_proxy_request(FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,

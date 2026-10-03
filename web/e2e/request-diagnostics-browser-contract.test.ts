@@ -99,8 +99,8 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await stage('read table request ID', () => tableId.textContent(), history, current), requestId);
     assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell .request-value-info').getAttribute('aria-label'), history, current) ?? '', /Cache read 40.*Cache write 20/);
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
-    assert.match(recordedText, /The request failed/);
-    assert.doesNotMatch(recordedText, /http_429/, 'internal error codes are supplemental diagnostics, not permanent detail copy');
+    assert.match(recordedText, /The upstream connection was reset/, 'the recorded terminal cause takes precedence over a legacy error code');
+    assert.doesNotMatch(recordedText, /http_429|upstream_transport_connection_reset/, 'raw recorded codes are never permanent detail copy');
     assert.match(recordedText, /Production Codex/);
     assert.match(recordedText, /Research key/);
     assert.doesNotMatch(recordedText, new RegExp(`${upstreamId}|${routeId}|${requestId}|${sessionId}`), 'technical identifiers are supplemental, not permanent detail rows');
@@ -120,6 +120,8 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     await page.keyboard.press('Escape');
     const historicalGapText = await stage('read historical diagnostics', () => historicalGap.textContent(), history, current) ?? '';
     assert.doesNotMatch(historicalGapText, /Completed at/, 'completion is supplemental timing information, not another permanent row');
+    assert.match(historicalGapText, /Reading the upstream response timed out/, 'a terminal-only failure presents its recorded cause without any error code');
+    assert.doesNotMatch(historicalGapText, /upstream_read_timeout/, 'raw recorded codes are never permanent detail copy');
     assert.match(historicalGapText, /Final upstreamNot recorded/);
     assert.doesNotMatch(historicalGapText, /Final upstream ID|Final route ID/, 'missing technical values do not occupy empty rows');
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');

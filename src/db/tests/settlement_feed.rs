@@ -147,6 +147,7 @@ async fn finish_with_terminal_evidence(
     fixture
         .database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis,
             first_output_ms: None,
             generation_duration_ms: None,

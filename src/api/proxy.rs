@@ -585,7 +585,12 @@ async fn finish_non_sse_proxy_response(
         Ok(body) => Bytes::from(body),
         Err(error) => {
             buffer_phase.finish(error.code(), Some(status.as_u16()), None);
-            let result = finish_proxy_failure(buffered_request, error.code()).await;
+            let result = finish_proxy_failure_with_cause(
+                buffered_request,
+                error.code(),
+                error.terminal_cause(),
+            )
+            .await;
             upstream_attempt
                 .complete(upstream_error_health_terminal(error.code()))
                 .await;
@@ -1653,21 +1658,32 @@ async fn proxy_with_cancellation_guard(
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_proxy_failure(&buffered_request, error_code).await;
+                return finish_proxy_failure_with_cause(
+                    &buffered_request,
+                    error_code,
+                    upstream_response::terminal_cause_from_stream_error(error_code),
+                )
+                .await;
             }
             Err(ProxySendError::NonRetryableTransport(kind)) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_proxy_failure(&buffered_request, kind.error_code()).await;
+                return finish_proxy_failure_with_cause(
+                    &buffered_request,
+                    kind.error_code(),
+                    Some(kind.terminal_cause()),
+                )
+                .await;
             }
             Err(ProxySendError::OuterDeadline) => {
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_proxy_failure(
+                return finish_proxy_failure_with_cause(
                     &buffered_request,
                     "upstream_transport_outer_deadline",
+                    Some(crate::model::RequestTerminalCause::TransportOuterDeadline),
                 )
                 .await;
             }
@@ -1741,7 +1757,14 @@ async fn proxy_with_cancellation_guard(
                     )
                     .await
                 }
-                Err(error) => finish_proxy_failure(&buffered_request, error.code()).await,
+                Err(error) => {
+                    finish_proxy_failure_with_cause(
+                        &buffered_request,
+                        error.code(),
+                        error.terminal_cause(),
+                    )
+                    .await
+                }
             };
             if let Ok(response) = result.as_mut() {
                 crate::api::anthropic::append_response_headers(
@@ -1759,8 +1782,13 @@ async fn proxy_with_cancellation_guard(
             codex_retry.complete(CodexRetryTerminal::Failed);
             return result;
         }
-        drop(upstream);
-        let result = finish_buffered_request(
+        let terminal_cause = if status == StatusCode::BAD_GATEWAY {
+            upstream_response::rejected_response_terminal_cause(upstream).await
+        } else {
+            drop(upstream);
+            None
+        };
+        let result = finish_buffered_request_with_upstream_attribution_and_response_object(
             &buffered_request,
             status,
             Bytes::from_static(
@@ -1772,6 +1800,11 @@ async fn proxy_with_cancellation_guard(
                 crate::model::RequestUsageBasis::NotObserved,
             ),
             Some(format!("http_{}", status.as_u16())),
+            BufferedFinishPolicy {
+                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                response_storage: BufferedResponseStorage::DurableArchive,
+                terminal_cause,
+            },
         )
         .await;
         upstream_attempt
@@ -1838,7 +1871,12 @@ async fn proxy_with_cancellation_guard(
             Err(error_code) => {
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
-                let result = finish_proxy_failure(&buffered_request, error_code).await;
+                let result = finish_proxy_failure_with_cause(
+                    &buffered_request,
+                    error_code,
+                    upstream_response::terminal_cause_from_stream_error(error_code),
+                )
+                .await;
                 upstream_attempt
                     .complete(upstream_error_health_terminal(error_code))
                     .await;
@@ -1878,7 +1916,12 @@ async fn proxy_with_cancellation_guard(
                 Err(error_code) => {
                     buffer_phase.finish(error_code, None, None);
                     tracing::warn!(%request_id, stage = error_code, "Codex Chat response translation failed");
-                    let result = finish_proxy_failure(&buffered_request, error_code).await;
+                    let result = finish_proxy_failure_with_cause(
+                        &buffered_request,
+                        error_code,
+                        upstream_response::terminal_cause_from_stream_error(error_code),
+                    )
+                    .await;
                     upstream_attempt
                         .complete(UpstreamAttemptTerminal::invalid_response())
                         .await;
@@ -2589,6 +2632,14 @@ async fn finish_proxy_failure(
     request: &BufferedRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
+    finish_proxy_failure_with_cause(request, error_code, None).await
+}
+
+async fn finish_proxy_failure_with_cause(
+    request: &BufferedRequest<'_>,
+    error_code: &str,
+    terminal_cause: Option<crate::model::RequestTerminalCause>,
+) -> Result<Response, AppError> {
     let memory_capacity = error_code == "upstream_response_memory_capacity";
     if memory_capacity {
         request
@@ -2596,18 +2647,28 @@ async fn finish_proxy_failure(
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Response);
     }
-    finish_local_buffered_error(
+    let body = Bytes::from_static(
+        b"{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}",
+    );
+    let stored_response = format!(
+        "inline-json:{}",
+        std::str::from_utf8(&body).map_err(|_| AppError::Internal)?
+    );
+    finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         StatusCode::BAD_GATEWAY,
-        Bytes::from_static(
-            b"{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}",
-        ),
+        body,
         "application/json",
         (
             TokenUsage::default(),
             crate::model::RequestUsageBasis::NotObserved,
         ),
         Some(error_code.to_owned()),
+        BufferedFinishPolicy {
+            upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+            terminal_cause,
+        },
     )
     .await
 }
@@ -2658,6 +2719,7 @@ async fn finish_local_buffered_error_with_upstream_attribution(
         BufferedFinishPolicy {
             upstream_attribution,
             response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+            terminal_cause: None,
         },
     )
     .await
@@ -2675,6 +2737,7 @@ enum BufferedResponseStorage {
 struct BufferedFinishPolicy {
     upstream_attribution: ProxyRequestUpstreamAttribution,
     response_storage: BufferedResponseStorage,
+    terminal_cause: Option<crate::model::RequestTerminalCause>,
 }
 
 async fn finish_buffered_request(
@@ -2716,6 +2779,7 @@ async fn finish_buffered_request_with_upstream_attribution(
         BufferedFinishPolicy {
             upstream_attribution,
             response_storage: BufferedResponseStorage::DurableArchive,
+            terminal_cause: None,
         },
     )
     .await
@@ -2739,6 +2803,7 @@ async fn finish_unarchived_proxy_response(
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
             response_storage: BufferedResponseStorage::Omit,
+            terminal_cause: None,
         },
     )
     .await
@@ -2756,6 +2821,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     let BufferedFinishPolicy {
         upstream_attribution,
         response_storage,
+        terminal_cause,
     } = policy;
     let (inline_response_object, archive_response) = match response_storage {
         BufferedResponseStorage::DurableArchive => (None, true),
@@ -2866,6 +2932,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         None
     };
     let terminal = FinishProxyRequest {
+        terminal_cause,
         first_output_ms: None,
         generation_duration_ms: None,
         request_id,

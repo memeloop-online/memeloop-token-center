@@ -182,6 +182,7 @@ impl Database {
                     .await
                 } else {
                     self.finish_proxy_request(FinishProxyRequest {
+                        terminal_cause: None,
                         usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                         first_output_ms: None,
                         generation_duration_ms: None,

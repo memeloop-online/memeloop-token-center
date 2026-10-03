@@ -8,3 +8,4 @@ mod settlement;
 mod settlement_adjustments;
 mod settlement_feed;
 mod synchronous;
+mod terminal_cause;
