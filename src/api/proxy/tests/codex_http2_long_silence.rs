@@ -195,7 +195,6 @@ async fn assert_settled(fixture: &CodexRouteFixture, count: usize) {
     }
 }
 
-#[tokio::test]
 async fn created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settles_once() {
     tokio::time::timeout(Duration::from_secs(360), async {
         let fixture = fixture("h2-310-second-silence").await;
@@ -274,7 +273,6 @@ async fn complete_post(fixture: &CodexRouteFixture, upstream: &mut QuietUpstream
     (post.connection_id, post.stream_id)
 }
 
-#[tokio::test]
 async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_seconds() {
     tokio::time::timeout(Duration::from_secs(130), async {
         let fixture = fixture("h2-pool-real-idle").await;
@@ -312,4 +310,12 @@ async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_second
     })
     .await
     .expect("real idle-pool acceptance must finish within 130 seconds");
+}
+
+#[tokio::test]
+async fn real_http2_long_silence_and_idle_pool_acceptance() {
+    tokio::join!(
+        created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settles_once(),
+        same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_seconds(),
+    );
 }
