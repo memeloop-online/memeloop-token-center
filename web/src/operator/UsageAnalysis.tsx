@@ -1,7 +1,7 @@
 import { displayTimeZone, bucketTimeZoneNote } from '../charts/displayTimeZone';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from '../api';
-import { Button, Input, Select } from '../design-system';
+import { Button, Combobox, Input, Option, Select } from '../design-system';
 import { ChartDataView } from '../charts/ChartDataView';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import {
@@ -13,9 +13,10 @@ import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel 
 import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { UsageSummaryMetrics } from './UsageSummaryMetrics';
 import { useI18n } from '../i18n';
-import type { KeyView, OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
+import type { KeyListCursor, KeyView, OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
 import { TypedFilterBuilder } from './TypedFilterBuilder';
+import { appendDistinctKeys, keyListPage, keyListPath } from './keyPagination';
 import { emptyTypedFilterAst } from './traffic/requestTraffic';
 import { defaultUsageSelection, localDateTimeInput, nextUsageTab, statsQuery, usageAstFromSelection, usagePresets, usageTabs, type UsageFilters, type UsageSelection, type UsageTab } from './usageState';
 
@@ -39,33 +40,40 @@ const localCopy = {
 function UsageCredentialAliasSelect({ disabled, onChange, tenant, token, value }: { disabled: boolean; onChange: (value: string) => void; tenant: string; token: string; value: string }) {
   const { locale, t } = useI18n();
   const [credentials, setCredentials] = useState<KeyView[]>([]);
-  const [search, setSearch] = useState('');
-  const [cursor, setCursor] = useState<{ created_at: number; key_id: string }>();
-  const [hasMore, setHasMore] = useState(false);
+  const [query, setQuery] = useState<string>();
+  const [cursor, setCursor] = useState<KeyListCursor>();
+  const [nextCursor, setNextCursor] = useState<KeyListCursor>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const search = (query ?? '').trim();
   useEffect(() => {
-    setCredentials([]); setCursor(undefined); setHasMore(false);
+    setCredentials([]); setCursor(undefined); setNextCursor(undefined);
   }, [tenant, token, search]);
   useEffect(() => {
     if (!token.trim()) { setCredentials([]); return; }
     const controller = new AbortController();
-    const params = new URLSearchParams({ limit: '100' });
-    if (tenant) params.set('tenant_external_id', tenant);
-    if (search.trim()) params.set('search', search.trim());
-    if (cursor) { params.set('before_created_at', String(cursor.created_at)); params.set('before_id', cursor.key_id); }
     setLoading(true); setError('');
-    void api<KeyView[]>(`/internal/v1/keys?${params}`, token.trim(), { signal: controller.signal })
-      .then((values) => { if (!controller.signal.aborted) { setCredentials((previous) => cursor ? [...previous, ...values] : values); setHasMore(values.length === 100); } })
+    void api<KeyView[]>(keyListPath(tenant, cursor, { search }), token.trim(), { signal: controller.signal })
+      .then((rows) => {
+        if (controller.signal.aborted) return;
+        const page = keyListPage(rows);
+        setCredentials((previous) => cursor ? appendDistinctKeys(previous, page.values) : page.values);
+        setNextCursor(page.nextCursor);
+      })
       .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t('common.requestFailed')); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [tenant, token, search, cursor, t]);
   const aliases = [...new Set([...credentials.map((credential) => credential.alias.trim()), value].filter(Boolean))].sort((left, right) => left.localeCompare(right));
-  return <div><label>{t('usage.clientCredential')}<Select value={value} disabled={disabled} onChange={(_, data) => onChange(data.value)}><option value="">{t('common.all')}</option>{aliases.map((alias) => <option key={alias} value={alias}>{alias}</option>)}</Select></label>
-    <Input aria-label={t('routes.searchCredentials')} placeholder={t('routes.searchCredentials')} value={search} disabled={disabled} onChange={(_, data) => setSearch(data.value)} />
-    {error && <span role="alert">{error}</span>}{hasMore && <Button type="button" appearance="subtle" disabled={disabled || loading} onClick={() => { const last = credentials.at(-1); if (last) setCursor({ created_at: last.created_at, key_id: last.key_id }); }}>{locale === 'zh-CN' ? '加载更多凭据' : 'Load more credentials'}</Button>}
-  </div>;
+  return <label>{t('usage.clientCredential')}<span style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+    <Combobox aria-label={t('usage.clientCredential')} disabled={disabled} inlinePopup style={{ flexGrow: 1, minWidth: 0 }} value={query ?? value} selectedOptions={value ? [value] : []} placeholder={t('routes.searchCredentials')}
+      input={{ onBlur: () => setQuery(undefined), onChange: (event) => setQuery(event.target.value) }}
+      onOptionSelect={(_, data) => { if (data.optionValue === undefined) return; setQuery(undefined); onChange(data.optionValue); }}>
+      <Option value="" text={t('common.all')}>{t('common.all')}</Option>
+      {aliases.map((alias) => <Option key={alias} value={alias} text={alias}>{alias}</Option>)}
+    </Combobox>
+    {nextCursor && <Button type="button" appearance="subtle" disabled={disabled || loading} onClick={() => setCursor(nextCursor)}>{locale === 'zh-CN' ? '加载更多凭据' : 'Load more credentials'}</Button>}
+  </span>{error && <span role="alert">{error}</span>}</label>;
 }
 
 const formatCurrency = (value: string | number, currency: string, locale: 'en' | 'zh-CN') => formatCurrencyDisplay(value, currency, locale).text;

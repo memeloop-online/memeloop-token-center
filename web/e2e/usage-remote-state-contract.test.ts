@@ -41,7 +41,10 @@ test('usage filters use one shared panel with presets, explicit ranges, and cred
   assert.doesNotMatch(operatorSource, /<details className="usage-filter-disclosure"/);
   assert.match(operatorSource, /usagePresets\.map/);
   assert.match(operatorSource, /UsageCredentialAliasSelect/);
-  assert.match(operatorSource, /internal\/v1\/keys\?\$\{params\}/);
+  assert.match(operatorSource, /<Combobox[^>]+inlinePopup/);
+  assert.match(operatorSource, /keyListPath\(tenant, cursor, \{ search \}\)/);
+  assert.match(operatorSource, /keyListPage\(rows\)/);
+  assert.match(operatorSource, /appendDistinctKeys/);
   assert.match(operatorSource, /credential\.alias/);
   assert.match(operatorSource, /onClear=\{\(\) => \{ const next = defaultUsageSelection\(\);/);
 });
