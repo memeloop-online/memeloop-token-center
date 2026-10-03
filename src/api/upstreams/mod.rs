@@ -33,7 +33,7 @@ pub(in crate::api) use health::probe_upstream_health;
 pub(crate) use models::sync_upstream_models_after_refresh;
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
-    aggregate_upstream_models, list_upstream_models, sync_upstream_models,
+    aggregate_upstream_models, discover_upstream_model, list_upstream_models, sync_upstream_models,
     sync_upstream_models_and_routes,
 };
 pub(in crate::api) use native_cursor_import::import_native_cursor_oauth;

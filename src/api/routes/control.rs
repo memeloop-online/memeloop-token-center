@@ -267,6 +267,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_upstream_models),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/models/discovery",
+            get(discover_upstream_model),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/models/sync",
             post(sync_upstream_models),
         )
