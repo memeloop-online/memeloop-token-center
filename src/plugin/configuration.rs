@@ -85,7 +85,8 @@ impl PluginRuntime {
             .iter()
             .filter(|plugin| {
                 (plugin.manifest.contributions.traffic_policy
-                    || plugin.manifest.contributions.request_rewrite)
+                    || plugin.manifest.contributions.request_rewrite
+                    || plugin.manifest.contributions.wire_shim.is_some())
                     && plugin.manifest.contributions.configuration.is_some()
             })
             .collect();
@@ -302,6 +303,7 @@ mod tests {
                 manifest,
                 component: None,
                 service_data_component: None,
+                wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: Some(validator),
                 routing_validator: None,

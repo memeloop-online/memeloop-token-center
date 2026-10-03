@@ -226,6 +226,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: memeloop-online/claude-code-wire
+          ref: ceba7ef7c7a961a59574eb4fb24bd90b7eec2193
+          path: claude-code-wire-fixture
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
@@ -294,6 +300,17 @@ jobs:
           "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
           "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
+      - name: Verify pinned Claude privacy component through the host ABI
+        run: |
+          cd claude-code-wire-fixture
+          cargo build --locked --release --target wasm32-unknown-unknown
+          cargo run --release --manifest-path componentize/Cargo.toml -- \
+            target/wasm32-unknown-unknown/release/mtc_claude_code_wire.wasm plugin.wasm
+          cd ..
+          MTC_CLAUDE_WIRE_FIXTURE="$GITHUB_WORKSPACE/claude-code-wire-fixture" \
+            cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
+          cargo test --locked --all-features --test plugin_product \
+            installable_example_contributes_provider_oauth_policy_and_rewrite
       - name: Build the fixed preferred-account guest for real host acceptance
         run: |
           cargo fmt --manifest-path plugin-sources/preferred-account/Cargo.toml -- --check
