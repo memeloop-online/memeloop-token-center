@@ -63,7 +63,10 @@ const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
 const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_ENDPOINTS: usize = 32;
 const PLUGIN_SERVICE_DATA_COMPONENT_API: &str = "component-v1";
-const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
+const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.4.0";
+const WIRE_SHIM_FUEL_BASE: u64 = 8_000_000;
+const WIRE_SHIM_FUEL_PER_BODY_BYTE: u64 = 2;
+const WIRE_SHIM_MEMORY_BYTES: usize = 96 * 1024 * 1024;
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
 const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
@@ -113,6 +116,13 @@ mod service_data_component {
     });
 }
 
+mod wire_shim_component {
+    wasmtime::component::bindgen!({
+        world: "memeloop:token-center/wire-shim-plugin@0.3.0",
+        path: ["wit/token-center.wit", "wit/wire-shim.wit"],
+    });
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
@@ -154,6 +164,31 @@ pub struct PluginContributions {
     /// only call the core proxy route for one of these manifest entries.
     #[serde(default)]
     pub service_data: Vec<PluginServiceDataEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_shim: Option<WireShimContribution>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireShimContribution {
+    pub drivers: Vec<String>,
+    pub protocols: Vec<String>,
+}
+
+pub(crate) struct WireShimOutcome {
+    pub(crate) request_json: String,
+}
+
+fn validate_wire_shim_output(
+    request_json: &str,
+    set_headers: &[(String, String)],
+) -> Result<(), AppError> {
+    if request_json.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES || !set_headers.is_empty() {
+        return Err(AppError::Upstream(
+            "wire shim returned an unsupported body or headers".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -359,6 +394,7 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
     routing_validator: Option<crate::schema::CompiledSchema>,
@@ -578,6 +614,112 @@ fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
 }
 
 impl PluginRuntime {
+    pub(crate) fn wire_shim_matches(&self, driver: &str, protocol: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .wire_shim
+                .as_ref()
+                .is_some_and(|shim| {
+                    shim.drivers.iter().any(|value| value == driver)
+                        && shim.protocols.iter().any(|value| value == protocol)
+                })
+        })
+    }
+
+    pub(crate) fn finalize_wire_shim(
+        &self,
+        driver: &str,
+        protocol: &str,
+        mut context: types::RequestContext,
+        request_json: &str,
+        headers_json: &str,
+        configurations: &BTreeMap<String, Value>,
+    ) -> Result<Option<WireShimOutcome>, AppError> {
+        let Some(plugin) = self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .wire_shim
+                .as_ref()
+                .is_some_and(|shim| {
+                    shim.drivers.iter().any(|value| value == driver)
+                        && shim.protocols.iter().any(|value| value == protocol)
+                })
+        }) else {
+            return Ok(None);
+        };
+        let pre = plugin
+            .wire_shim_component
+            .as_ref()
+            .ok_or(AppError::Internal)?;
+        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(WIRE_SHIM_MEMORY_BYTES)
+            .table_elements(PLUGIN_TABLE_ELEMENTS)
+            .instances(8)
+            .tables(2)
+            .memories(2)
+            .build();
+        let mut store = Store::new(
+            engine,
+            HostState {
+                plugin_id: plugin.manifest.id.clone(),
+                capabilities: plugin.manifest.capabilities.clone(),
+                http: self.http.as_ref().ok_or(AppError::Internal)?.clone(),
+                runtime: self.runtime.as_ref().ok_or(AppError::Internal)?.clone(),
+                kv: self.kv.clone(),
+                limits,
+                deadline: Instant::now() + self.execution_timeout,
+                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
+        store
+            .set_fuel(WIRE_SHIM_FUEL_BASE.saturating_add(
+                (request_json.len() as u64).saturating_mul(WIRE_SHIM_FUEL_PER_BODY_BYTE),
+            ))
+            .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
+        let configuration = configurations
+            .get(&plugin.manifest.id)
+            .cloned()
+            .or_else(|| {
+                plugin
+                    .manifest
+                    .contributions
+                    .configuration
+                    .as_ref()
+                    .map(|value| value.default.clone())
+            })
+            .unwrap_or_else(empty_json_object);
+        context.config_json =
+            serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
+        let context = wire_shim_component::memeloop::token_center0_3_0::types::RequestContext {
+            tenant_id: context.tenant_id,
+            principal_id: context.principal_id,
+            key_id: context.key_id,
+            protocol: context.protocol,
+            model: context.model,
+            config_json: context.config_json,
+        };
+        let bindings = pre
+            .instantiate(&mut store)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
+        let result = bindings
+            .memeloop_token_center0_3_0_wire_shim_v1()
+            .call_finalize(&mut store, &context, request_json, headers_json)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
+            .map_err(|error| {
+                plugin_reported_error(&plugin.manifest.id, "wire-shim-finalize", &error)
+            })?;
+        validate_wire_shim_output(&result.request_json, &result.set_headers)?;
+        Ok(Some(WireShimOutcome {
+            request_json: result.request_json,
+        }))
+    }
+
     pub fn load(root: Option<&str>, database: Database) -> Result<Self, AppError> {
         let Some(root) = root else {
             return Ok(Self::default());
@@ -714,6 +856,28 @@ impl PluginRuntime {
             } else {
                 None
             };
+            let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
+                let component = component.as_ref().ok_or(AppError::Internal)?;
+                let mut linker = Linker::<HostState>::new(&engine);
+                register_wire_shim_host_imports(&mut linker)
+                    .map_err(|_| plugin_runtime_failure("wire_shim_linker_configuration"))?;
+                let instance_pre = linker.instantiate_pre(component).map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "plugin {} wire shim imports or ABI are incompatible",
+                        manifest.id
+                    ))
+                })?;
+                Some(
+                    wire_shim_component::WireShimPluginPre::new(instance_pre).map_err(|_| {
+                        AppError::BadRequest(format!(
+                            "plugin {} wire shim ABI is incompatible",
+                            manifest.id
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
             #[cfg(feature = "experimental-plugin-revisions")]
             let identity = {
                 let receipt_path = directory.join(".mtc-oci-install.json");
@@ -748,6 +912,7 @@ impl PluginRuntime {
                 manifest,
                 component,
                 service_data_component,
+                wire_shim_component,
                 ui_modules,
                 configuration_validator,
                 routing_validator,
@@ -1835,6 +2000,51 @@ impl memeloop::token_center::host::Host for HostState {
 
 impl memeloop::token_center::types::Host for HostState {}
 
+fn register_wire_shim_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
+    let mut host = linker.instance("memeloop:token-center/host@0.3.0")?;
+    host.func_wrap(
+        "log",
+        |_caller: wasmtime::StoreContextMut<'_, HostState>,
+         (_level, _message): (String, String)| {
+            Err::<(), wasmtime::Error>(wasmtime::Error::msg(
+                "wire shim host logging is unavailable",
+            ))
+        },
+    )?;
+    host.func_wrap(
+        "kv-get",
+        |_caller: wasmtime::StoreContextMut<'_, HostState>, (_key,): (String,)| {
+            Ok((Err::<Option<Vec<u8>>, String>(
+                "wire shim KV is unavailable".into(),
+            ),))
+        },
+    )?;
+    host.func_wrap(
+        "kv-put",
+        |_caller: wasmtime::StoreContextMut<'_, HostState>, (_key, _value): (String, Vec<u8>)| {
+            Ok((Err::<(), String>("wire shim KV is unavailable".into()),))
+        },
+    )?;
+    host.func_wrap(
+        "http-request",
+        |_caller: wasmtime::StoreContextMut<'_, HostState>,
+         (_method, _url, _headers_json, _body): (String, String, String, Vec<u8>)| {
+            Ok((Err::<Vec<u8>, String>(
+                "wire shim HTTP is unavailable".into(),
+            ),))
+        },
+    )?;
+    host.func_wrap(
+        "random-bytes",
+        |_caller: wasmtime::StoreContextMut<'_, HostState>, (_len,): (u32,)| {
+            Ok((Err::<Vec<u8>, String>(
+                "plugin random capability is unavailable".into(),
+            ),))
+        },
+    )?;
+    Ok(())
+}
+
 /// Validates one unpacked plugin package with the same authoritative rules the
 /// runtime uses at startup. Distribution installers call this before making a
 /// staged package visible.
@@ -1920,6 +2130,36 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     {
         return Err(AppError::BadRequest(format!(
             "plugin {} needs a component for its traffic or request-rewrite contribution",
+            manifest.id
+        )));
+    }
+    if let Some(wire_shim) = &manifest.contributions.wire_shim {
+        if manifest.wit_version != "0.3.0"
+            || manifest.wasm.is_none()
+            || !manifest.capabilities.is_empty()
+            || wire_shim.drivers.is_empty()
+            || wire_shim.drivers.len() > 32
+            || wire_shim.protocols.is_empty()
+            || wire_shim
+                .drivers
+                .iter()
+                .any(|driver| !safe_plugin_token(driver, MAX_PLUGIN_ID_BYTES))
+            || wire_shim
+                .protocols
+                .iter()
+                .any(|protocol| !matches!(protocol.as_str(), "anthropic" | "openai"))
+            || wire_shim.drivers.iter().collect::<BTreeSet<_>>().len() != wire_shim.drivers.len()
+            || wire_shim.protocols.iter().collect::<BTreeSet<_>>().len()
+                != wire_shim.protocols.len()
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} has an invalid privacy wire shim contribution",
+                manifest.id
+            )));
+        }
+    } else if manifest.wit_version.starts_with("0.3.") {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} needs a wire shim contribution for WIT 0.3",
             manifest.id
         )));
     }
@@ -2749,6 +2989,209 @@ fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn privacy_wire_shim_output_rejects_headers_but_not_valid_growth() {
+        assert!(validate_wire_shim_output("{\"text\":\"\\u4fdd\\u7559\"}", &[]).is_ok());
+        assert!(
+            validate_wire_shim_output("{}", &[("authorization".into(), "bad".into())]).is_err()
+        );
+        assert!(
+            validate_wire_shim_output(&"x".repeat(MAX_TRAFFIC_REQUEST_JSON_BYTES + 1), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn privacy_wire_shim_manifest_is_versioned_and_scoped() {
+        let mut manifest: super::PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "claude-code-wire",
+            "version": "1.0.1",
+            "wit_version": "0.3.0",
+            "wasm": "plugin.wasm",
+            "capabilities": [],
+            "contributions": {
+                "wire_shim": {"drivers": ["anthropic-claude"], "protocols": ["anthropic"]},
+                "configuration": {"schema": {"type": "object"}, "default": {"enabled": true}}
+            }
+        }))
+        .unwrap();
+        assert!(super::validate_manifest(&manifest).is_ok());
+        manifest.wit_version = "0.2.0".into();
+        assert!(super::validate_manifest(&manifest).is_err());
+        manifest.wit_version = "0.3.0".into();
+        manifest
+            .contributions
+            .wire_shim
+            .as_mut()
+            .unwrap()
+            .drivers
+            .push("anthropic-claude".into());
+        assert!(super::validate_manifest(&manifest).is_err());
+        manifest.contributions.wire_shim = None;
+        assert!(super::validate_manifest(&manifest).is_err());
+        manifest.wit_version = "0.2.0".into();
+        assert!(super::validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn privacy_wire_shim_only_matches_declared_driver_and_protocol() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "claude-code-wire",
+            "version": "1.0.1",
+            "wit_version": "0.3.0",
+            "wasm": "plugin.wasm",
+            "contributions": {
+                "wire_shim": {"drivers": ["anthropic-claude"], "protocols": ["anthropic"]}
+            }
+        }))
+        .unwrap();
+        let runtime = PluginRuntime {
+            plugins: Arc::new(vec![LoadedPlugin {
+                manifest,
+                component: None,
+                service_data_component: None,
+                wire_shim_component: None,
+                ui_modules: BTreeMap::new(),
+                configuration_validator: None,
+                routing_validator: None,
+                routing_fingerprint: String::new(),
+                #[cfg(feature = "experimental-plugin-revisions")]
+                identity: PluginPackageIdentity {
+                    component_sha256: None,
+                    provenance: None,
+                },
+            }]),
+            ..PluginRuntime::default()
+        };
+        assert!(runtime.wire_shim_matches("anthropic-claude", "anthropic"));
+        assert!(!runtime.wire_shim_matches("anthropic-claude", "openai"));
+        assert!(!runtime.wire_shim_matches("http-json", "anthropic"));
+        let context = types::RequestContext {
+            tenant_id: Uuid::nil().to_string(),
+            principal_id: Uuid::nil().to_string(),
+            key_id: Uuid::nil().to_string(),
+            protocol: "anthropic".into(),
+            model: "claude-test".into(),
+            config_json: "{}".into(),
+        };
+        assert!(
+            runtime
+                .finalize_wire_shim(
+                    "http-json",
+                    "anthropic",
+                    context.clone(),
+                    "{}",
+                    "{}",
+                    &BTreeMap::new()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .finalize_wire_shim(
+                    "anthropic-claude",
+                    "anthropic",
+                    context,
+                    "{}",
+                    "{}",
+                    &BTreeMap::new()
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "CI builds the pinned claude-code-wire v1.0.1 component"]
+    async fn privacy_wire_shim_release_component() {
+        let fixture = std::path::PathBuf::from(
+            std::env::var("MTC_CLAUDE_WIRE_FIXTURE").expect("CI fixture directory"),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("plugins");
+        let package = root.join("claude-code-wire");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::copy(fixture.join("plugin.json"), package.join("plugin.json")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), package.join("plugin.wasm")).unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("fixture.db").display()
+        ))
+        .await
+        .unwrap();
+        let runtime = PluginRuntime::load(root.to_str(), database).unwrap();
+        assert_eq!(runtime.manifests()[0].version, "1.0.1");
+        assert_eq!(runtime.manifests()[0].wit_version, "0.3.0");
+        let context = types::RequestContext {
+            tenant_id: Uuid::nil().to_string(),
+            principal_id: Uuid::nil().to_string(),
+            key_id: Uuid::nil().to_string(),
+            protocol: "anthropic".into(),
+            model: "claude-test".into(),
+            config_json: "{}".into(),
+        };
+        let request = r#"{ "metadata": {"user_id":"private", "other":"保留"}, "messages":[] }"#;
+        let finalize = |configurations: &BTreeMap<String, Value>, body: &str| {
+            runtime.finalize_wire_shim(
+                "anthropic-claude",
+                "anthropic",
+                context.clone(),
+                body,
+                "{}",
+                configurations,
+            )
+        };
+        let finalized = finalize(&BTreeMap::new(), request).unwrap().unwrap();
+        let value: Value = serde_json::from_str(&finalized.request_json).unwrap();
+        assert!(value.pointer("/metadata/user_id").is_none());
+        assert_eq!(
+            value.pointer("/metadata/other"),
+            Some(&serde_json::json!("保留"))
+        );
+        assert_eq!(value.pointer("/messages"), Some(&serde_json::json!([])));
+        for configuration in [
+            serde_json::json!({"enabled": false, "remove_user_id": true}),
+            serde_json::json!({"enabled": true, "remove_user_id": false}),
+        ] {
+            let configurations = BTreeMap::from([("claude-code-wire".into(), configuration)]);
+            assert_eq!(
+                finalize(&configurations, request)
+                    .unwrap()
+                    .unwrap()
+                    .request_json
+                    .as_bytes(),
+                request.as_bytes()
+            );
+        }
+        let unchanged = r#"{ "metadata": {"other":"保留"}, "messages":[] }"#;
+        assert_eq!(
+            finalize(&BTreeMap::new(), unchanged)
+                .unwrap()
+                .unwrap()
+                .request_json
+                .as_bytes(),
+            unchanged.as_bytes()
+        );
+        assert!(finalize(&BTreeMap::new(), "{invalid").is_err());
+        let invalid_configuration = BTreeMap::from([(
+            "claude-code-wire".into(),
+            serde_json::json!({"enabled": "invalid"}),
+        )]);
+        assert!(finalize(&invalid_configuration, request).is_err());
+        assert!(
+            runtime
+                .finalize_wire_shim(
+                    "http-json",
+                    "anthropic",
+                    context,
+                    request,
+                    "{}",
+                    &BTreeMap::new()
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
     #[test]
     fn configurable_responses_transport_requires_a_closed_provider_schema() {
         let mut provider = crate::provider::ProviderCatalog::builtins()

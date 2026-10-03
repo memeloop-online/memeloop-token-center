@@ -4,7 +4,7 @@ import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestIn
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
-import { requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
+import { requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
 
 const request: RequestView = {
   usage_basis: 'provider_reported',
@@ -12,6 +12,31 @@ const request: RequestView = {
   duration_ms: 2000, input_tokens: 160, cached_input_tokens: 40, cache_write_tokens: 20,
   output_tokens: 32, cost: '0', error_code: null,
 };
+
+test('502 tooltip and detail share recorded cause, and missing evidence stays explicitly unknown', () => {
+  const reset = { ...request, status_code: 502, error_code: 'upstream_transport_connection_reset' };
+  const known = requestStatusCopy(reset, 'en');
+  assert.equal(requestFailureCause(reset, 'en'), 'The upstream connection was reset');
+  assert.equal(known.cause, 'Recorded cause: The upstream connection was reset');
+  assert.equal(known.hint, known.cause);
+  assert.equal(requestErrorCopy(reset.error_code, 'en'), requestFailureCause(reset, 'en'));
+  const generic = requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502' }, 'en');
+  assert.equal(generic.cause, 'Recorded cause: Unknown (no specific cause recorded)');
+  assert.equal(generic.hint, generic.cause);
+  assert.equal(requestFailureCause({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en'), null);
+  assert.doesNotMatch(requestStatusCopy({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en').hint, /secret-token/);
+  const chinese = requestStatusCopy(reset, 'zh-CN');
+  assert.equal(chinese.hint, '已记录原因: 上游连接被重置');
+  assert.equal(chinese.hint, chinese.cause);
+  for (const hint of [known.hint, generic.hint, chinese.hint]) {
+    assert.doesNotMatch(hint, /Recorded status|记录状态码|502|The server recorded a request failure|服务端记录了请求失败|See the error details/);
+  }
+  const http2 = { ...request, status_code: 502, error_code: 'upstream_transport_http2_reset' };
+  assert.equal(requestStatusCopy(http2, 'en').hint, 'Recorded cause: The upstream HTTP/2 stream was reset');
+  assert.equal(requestErrorCopy(http2.error_code, 'en'), requestFailureCause(http2, 'en'));
+  assert.equal(requestStatusCopy({ ...http2, error_code: 'upstream_http2_reset' }, 'zh-CN').hint, '已记录原因: 上游 HTTP/2 流被重置');
+  assert.equal(requestStatusCopy({ ...request, status_code: 200, error_code: 'upstream_stream' }, 'en').hint, 'Recorded cause: The upstream response stream was interrupted');
+});
 
 test('generation TPS requires observed output interval and does not relabel total-duration fallback', () => {
   const timed = { ...request, first_output_ms: 1000, generation_duration_ms: 500 };
