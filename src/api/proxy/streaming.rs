@@ -906,6 +906,25 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // before routing publication or request settlement can block on
             // database work.
             drop(_sse_streaming_memory.take());
+            if let Some(conversation) = conversation.as_ref()
+                && let Some(session_id) = conversation.hints.session_id.as_deref()
+            {
+                let (route, account) = upstream_attempt.route_assignment();
+                background_state.observations.sessions.publish(
+                    crate::db::SessionRoutingTerminalInput {
+                        key: &conversation.key,
+                        request_id,
+                        explicit_session_id: session_id,
+                        model: &public_model,
+                        protocol: protocol.name(),
+                        status_code: classification.status_code,
+                        error_code: classification.error_code,
+                        model_route_id: Some(route),
+                        upstream_account_id: Some(account),
+                        observed_at: crate::db::unix_millis(),
+                    },
+                );
+            }
             drop(body_sender);
             let routing_terminal_observed_at = conversation
                 .as_ref()

@@ -562,6 +562,7 @@ pub(crate) struct UpstreamAttemptGuard {
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
     _shared_probe_permit: Option<SharedProbePermit>,
     delivery_recovery_attempted: bool,
+    delivery_recovery: Option<tokio::sync::oneshot::Receiver<bool>>,
     recovered_on_delivery: bool,
     defer_delivery_recovery: bool,
 }
@@ -661,6 +662,7 @@ impl UpstreamAttemptGuard {
             heartbeat_stop,
             _shared_probe_permit: shared_probe_permit,
             delivery_recovery_attempted: false,
+            delivery_recovery: None,
             recovered_on_delivery: false,
             defer_delivery_recovery,
         }
@@ -673,7 +675,7 @@ impl UpstreamAttemptGuard {
     /// Call only after a protocol-validated billable frame is durably recorded
     /// and enqueued downstream. Headers, comments and usage-only frames do not
     /// establish recovery. This is not request completion or usage settlement.
-    pub(in crate::api::proxy) async fn delivered_validated_output(&mut self) {
+    pub(in crate::api::proxy) fn delivered_validated_output(&mut self) {
         if self.delivery_recovery_attempted || self.defer_delivery_recovery {
             return;
         }
@@ -681,62 +683,62 @@ impl UpstreamAttemptGuard {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let recovery = async {
-            if let Some(token) = self.lease_token
-                && self.owns_probe_lease
-            {
-                state
-                    .db
+        let Some(token) = self.lease_token else {
+            return;
+        };
+        let database = state.observation_db.clone();
+        let metrics = state.metrics.clone();
+        let account = self.upstream_account_id;
+        let generation = self.credential_generation;
+        let revision = self.transport_revision;
+        let owns_lease = self.owns_probe_lease;
+        let request_id = self.request_id;
+        self.delivery_recovery = state.observations.submit_health(async move {
+            let result = if owns_lease {
+                database
                     .record_upstream_account_probe_delivery_at_revision(
-                        self.upstream_account_id,
-                        self.credential_generation,
-                        self.transport_revision,
-                        token,
-                    )
-                    .await
-            } else if let Some(token) = self.lease_token {
-                // A shared recovery request is independent evidence, not the
-                // owner of the long-running probe epoch. Rotate the lease into
-                // a healthy admission epoch on its first validated delivery so
-                // a later owner failure cannot overwrite this proven success.
-                state
-                    .db
-                    .record_upstream_account_probe_success_at_revision(
-                        self.upstream_account_id,
-                        self.credential_generation,
-                        self.transport_revision,
+                        account,
+                        generation,
+                        revision,
                         token,
                     )
                     .await
             } else {
-                // Healthy admissions keep their cohort fence until complete
-                // protocol and usage validation. Partial delivery can still
-                // end in a terminal invalid response, which must retain the
-                // original epoch so that failure remains authoritative.
-                Ok(false)
+                database
+                    .record_upstream_account_probe_success_at_revision(
+                        account,
+                        generation,
+                        revision,
+                        token,
+                    )
+                    .await
+            };
+            match result {
+                Ok(true) => {
+                    metrics.observe_upstream_health(UpstreamHealthEvent::Recovered, UpstreamHealthReason::Success);
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    tracing::warn!(%request_id, upstream_account_id = %account, error_category = error.diagnostic_category(), stage = "probe_delivery_ack", "streaming probe recovery acknowledgement unavailable");
+                    false
+                }
             }
-        };
-        match tokio::time::timeout(std::time::Duration::from_millis(250), recovery).await {
-            Ok(Ok(true)) if self.lease_token.is_some() => {
-                self.recovered_on_delivery = true;
-                state.metrics.observe_upstream_health(
-                    UpstreamHealthEvent::Recovered,
-                    UpstreamHealthReason::Success,
-                );
+        });
+    }
+
+    async fn finish_delivery_recovery(&mut self) {
+        if let Some(recovery) = self.delivery_recovery.as_mut() {
+            self.recovered_on_delivery |= recovery.await.unwrap_or(false);
+            self.delivery_recovery = None;
+            if self.recovered_on_delivery {
                 self.stop_heartbeat();
             }
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => {}
-            _ => tracing::warn!(
-                request_id = %self.request_id,
-                upstream_account_id = %self.upstream_account_id,
-                stage = "probe_delivery_ack",
-                "streaming probe recovery acknowledgement unavailable"
-            ),
         }
     }
 
     pub(crate) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
+        self.finish_delivery_recovery().await;
         let Some(state) = self.state.take() else {
             return;
         };
@@ -781,6 +783,7 @@ impl UpstreamAttemptGuard {
     /// A lost durable job fence grants no authority to publish an observation.
     /// Release only this exact owned lease; never heal or record a failure.
     pub(crate) async fn abandon_without_observe(&mut self) {
+        self.finish_delivery_recovery().await;
         let state = self.state.take();
         self.stop_heartbeat();
         if let Some(state) = state
@@ -809,7 +812,7 @@ impl UpstreamAttemptGuard {
 
 impl Drop for UpstreamAttemptGuard {
     fn drop(&mut self) {
-        self.stop_heartbeat();
+        let heartbeat = self.heartbeat_stop.take();
         let Some(state) = self.state.take() else {
             return;
         };
@@ -823,11 +826,17 @@ impl Drop for UpstreamAttemptGuard {
         let lease_token = self.lease_token;
         let owns_probe_lease = self.owns_probe_lease;
         let recovered_on_delivery = self.recovered_on_delivery;
+        let recovery = self.delivery_recovery.take();
         // Proxy guards are created and dropped on the Tokio request runtime.
         // Cancellation cannot prove either upstream failure or recovery. It
         // must not make a half-open account healthy, and it must not let a
         // downstream disconnect poison an otherwise healthy account.
         tokio::spawn(async move {
+            let recovered_on_delivery = recovered_on_delivery
+                | match recovery {
+                    Some(recovery) => recovery.await.unwrap_or(false),
+                    None => false,
+                };
             record_terminal(
                 UpstreamAttemptRecord {
                     state,
@@ -845,6 +854,7 @@ impl Drop for UpstreamAttemptGuard {
                 UpstreamAttemptTerminal::Inconclusive,
             )
             .await;
+            drop(heartbeat);
         });
     }
 }

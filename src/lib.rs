@@ -69,6 +69,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: Database,
     pub(crate) persistence_db: Database,
+    pub(crate) observation_db: Database,
+    pub(crate) observations: Arc<api::proxy::observations::Observations>,
     pub(crate) persistence: Arc<api::proxy::persistence::Persistence>,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
@@ -147,6 +149,7 @@ impl AppState {
             .await
             .map_err(|_| InitializationError::Archive)?;
         let persistence_db = db.independent_persistence_pool();
+        let observation_db = db.independent_persistence_pool();
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins
@@ -195,6 +198,8 @@ impl AppState {
             config: Arc::new(config),
             db,
             persistence_db,
+            observation_db,
+            observations: Arc::new(api::proxy::observations::Observations::default()),
             persistence: Arc::new(api::proxy::persistence::Persistence::default()),
             archive,
             providers,

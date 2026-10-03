@@ -176,7 +176,8 @@ pub(super) async fn prometheus_metrics(
         ],
         state.metrics.render(&runtime)
             + &state.archive.readiness_metrics()
-            + &state.persistence.render(),
+            + &state.persistence.render()
+            + &state.observations.render(),
     )
         .into_response())
 }
