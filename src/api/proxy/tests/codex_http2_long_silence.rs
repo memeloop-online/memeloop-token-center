@@ -168,6 +168,14 @@ fn assert_terminal(rendered: &str) {
     assert!(!rendered.contains("event: error"));
 }
 
+fn record_evidence(evidence: Value) {
+    std::io::Write::write_all(
+        &mut std::io::stdout(),
+        format!("MTC_CONTROLLED_HTTP2_ACCEPTANCE {evidence}\n").as_bytes(),
+    )
+    .unwrap();
+}
+
 async fn assert_settled(fixture: &CodexRouteFixture, count: usize) {
     wait_for_request_settlement(fixture, count).await;
     let rows = fixture
@@ -181,6 +189,7 @@ async fn assert_settled(fixture: &CodexRouteFixture, count: usize) {
         assert_eq!(row.status_code, Some(200));
         assert_eq!(row.error_code, None);
         assert_eq!((row.input_tokens, row.output_tokens), (3, 7));
+        assert_eq!(row.cost, "0.00001");
         assert_exactly_once_side_effects(fixture, row.request_id, Some("resp-usage-contract"))
             .await;
     }
@@ -237,6 +246,7 @@ async fn created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settl
         assert!(post.created_at.elapsed() >= SILENCE);
         assert!(last_progress.elapsed() <= HEARTBEAT_BOUND);
         assert!(progress_count - initial_progress >= 18, "heartbeats must span the whole five minutes");
+        let silence_seconds = post.created_at.elapsed().as_secs_f64();
         post.complete();
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(frame) = body.next().await {
@@ -246,7 +256,13 @@ async fn created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settl
         assert_terminal(&rendered);
         upstream.finish(1, 1).await;
         assert_settled(&fixture, 1).await;
-        println!("controlled_h2_silence wall_seconds={} progress_events={} max_progress_gap_ms={} posts=1 connections=1 terminals=1 settlements=1", post.created_at.elapsed().as_secs_f64(), progress_count - initial_progress, max_gap.as_millis());
+        record_evidence(json!({
+            "case": "created_then_310_seconds_silence",
+            "silence_wall_seconds": silence_seconds,
+            "progress_events": progress_count - initial_progress,
+            "max_progress_gap_ms": max_gap.as_millis(),
+            "posts": 1, "connections": 1, "terminals": 1, "settlements": 1
+        }));
     }).await.expect("real five-minute HTTP/2 acceptance must finish within six minutes");
 }
 
@@ -269,17 +285,31 @@ async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_second
         tokio::time::sleep(Duration::from_secs(2)).await;
         let second = complete_post(&fixture, &mut upstream).await;
         assert!(short_idle.elapsed() >= Duration::from_secs(2));
-        assert_eq!(first.0, second.0, "same client must reuse its short-idle connection");
+        assert_eq!(
+            first.0, second.0,
+            "same client must reuse its short-idle connection"
+        );
         assert!(second.1 > first.1, "reuse must open a new HTTP/2 stream");
         assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
         assert_settled(&fixture, 2).await;
         let long_idle = Instant::now();
         tokio::time::sleep(Duration::from_secs(95)).await;
         assert!(long_idle.elapsed() > Duration::from_secs(90));
+        let idle_seconds = long_idle.elapsed().as_secs_f64();
         let third = complete_post(&fixture, &mut upstream).await;
-        assert_ne!(second.0, third.0, "expired pool entry must create a fresh TCP/HTTP2 connection");
+        assert_ne!(
+            second.0, third.0,
+            "expired pool entry must create a fresh TCP/HTTP2 connection"
+        );
         upstream.finish(3, 2).await;
         assert_settled(&fixture, 3).await;
-        println!("controlled_h2_pool long_idle_seconds={} connection_stream_ids={first:?},{second:?},{third:?} posts=3 connections=2 terminals=3 settlements=3", long_idle.elapsed().as_secs_f64());
-    }).await.expect("real idle-pool acceptance must finish within 130 seconds");
+        record_evidence(json!({
+            "case": "same_client_short_idle_reuse_then_expiry",
+            "idle_wall_seconds": idle_seconds,
+            "connection_stream_ids": [first, second, third],
+            "posts": 3, "connections": 2, "terminals": 3, "settlements": 3
+        }));
+    })
+    .await
+    .expect("real idle-pool acceptance must finish within 130 seconds");
 }
