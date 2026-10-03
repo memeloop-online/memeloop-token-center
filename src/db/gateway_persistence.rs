@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use sqlx::{AnyPool, any::AnyPoolOptions};
@@ -19,6 +25,10 @@ pub(super) struct GatewayPersistence {
     slots: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     writer: Arc<Semaphore>,
+    accepted: AtomicU64,
+    capacity: AtomicU64,
+    failed: AtomicU64,
+    retention_limit: AtomicU64,
 }
 
 impl GatewayPersistence {
@@ -55,6 +65,10 @@ impl GatewayPersistence {
             slots: Arc::new(Semaphore::new(TASK_LIMIT)),
             bytes: Arc::new(Semaphore::new(BYTE_LIMIT)),
             writer: Arc::new(Semaphore::new(1)),
+            accepted: AtomicU64::new(0),
+            capacity: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            retention_limit: AtomicU64::new(0),
         })
     }
 
@@ -70,6 +84,19 @@ impl GatewayPersistence {
 }
 
 impl Database {
+    pub(crate) fn gateway_persistence_metrics(&self) -> String {
+        let persistence = &self.gateway_persistence;
+        format!(
+            "# TYPE memeloop_token_center_request_persistence_jobs gauge\nmemeloop_token_center_request_persistence_jobs {}\n# TYPE memeloop_token_center_request_persistence_bytes gauge\nmemeloop_token_center_request_persistence_bytes {}\n# TYPE memeloop_token_center_request_persistence_total counter\nmemeloop_token_center_request_persistence_total{{outcome=\"accepted\"}} {}\nmemeloop_token_center_request_persistence_total{{outcome=\"capacity\"}} {}\nmemeloop_token_center_request_persistence_total{{outcome=\"failed\"}} {}\nmemeloop_token_center_request_persistence_total{{outcome=\"retention_limit\"}} {}\n",
+            TASK_LIMIT - persistence.slots.available_permits(),
+            BYTE_LIMIT - persistence.bytes.available_permits(),
+            persistence.accepted.load(Ordering::Relaxed),
+            persistence.capacity.load(Ordering::Relaxed),
+            persistence.failed.load(Ordering::Relaxed),
+            persistence.retention_limit.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) async fn start_proxy_request_with_deferred_archive(
         &self,
         input: StartProxyRequest<'_>,
@@ -101,9 +128,15 @@ impl Database {
             .saturating_add(nodes.saturating_mul(256))
             .saturating_add(4 * 1024 * 1024);
         let archive_admission = if body.len() > super::archive_spool::REQUEST_ARCHIVE_PLAIN_LIMIT {
+            self.gateway_persistence
+                .retention_limit
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%request_id, reason = "retention_limit", "request archive omitted");
             RequestArchiveAdmission::GapRetentionLimit
         } else if let Some(permits) = self.gateway_persistence.try_admit(charge) {
+            self.gateway_persistence
+                .accepted
+                .fetch_add(1, Ordering::Relaxed);
             let body = Bytes::copy_from_slice(body);
             let pepper = pepper.to_vec();
             let mut database = self.clone();
@@ -140,15 +173,26 @@ impl Database {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
+                        database
+                            .gateway_persistence
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(%request_id, reason = error.diagnostic_category(), "request archive omitted; durable gap retained")
                     }
                     Err(_) => {
+                        database
+                            .gateway_persistence
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(%request_id, reason = "timeout", "request archive deadline; durable gap retained unless capture committed")
                     }
                 }
             });
             RequestArchiveAdmission::Queued
         } else {
+            self.gateway_persistence
+                .capacity
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%request_id, reason = "queue_full", "request archive omitted");
             RequestArchiveAdmission::GapCapacity
         };
@@ -175,6 +219,9 @@ impl Database {
         let prepared = archive.prepare_first_batch().await?;
         let capacity = self.reserve_deferred_archive_capacity(&archive).await?;
         let Some(capacity) = capacity else {
+            self.gateway_persistence
+                .capacity
+                .fetch_add(1, Ordering::Relaxed);
             let mut transaction = self.begin_write_transaction().await?;
             super::archive_spool::insert_request_archive_gap_in_transaction(
                 &mut transaction,

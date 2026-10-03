@@ -84,6 +84,8 @@ export function permitEvidence(metrics: string): Record<string, number> {
     deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs',
     deferred_bytes: 'memeloop_token_center_deferred_persistence_bytes',
     deferred_stream_bytes: 'memeloop_token_center_deferred_stream_memory_bytes',
+    request_jobs: 'memeloop_token_center_request_persistence_jobs',
+    request_bytes: 'memeloop_token_center_request_persistence_bytes',
   };
   return Object.fromEntries(Object.entries(series).map(([name, prefix]) => {
     const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
@@ -95,14 +97,32 @@ export function permitEvidence(metrics: string): Record<string, number> {
 }
 
 export function deferredPersistenceEvidence(metrics: string): Record<string, number> {
-  return Object.fromEntries(["accepted", "capacity", "failed"].map((outcome) => {
-    const prefix = `memeloop_token_center_deferred_persistence_total{outcome="${outcome}"}`;
+  return persistenceEvidence(metrics, "deferred", ["accepted", "capacity", "failed"]);
+}
+
+export function requestPersistenceEvidence(metrics: string): Record<string, number> {
+  return persistenceEvidence(metrics, "request", ["accepted", "capacity", "failed", "retention_limit"]);
+}
+
+function persistenceEvidence(metrics: string, queue: string, outcomes: string[]): Record<string, number> {
+  return Object.fromEntries(outcomes.map((outcome) => {
+    const prefix = `memeloop_token_center_${queue}_persistence_total{outcome="${outcome}"}`;
     const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
-    assert(line, `required deferred persistence counter absent: ${outcome}`);
+    assert(line, `required ${queue} persistence counter absent: ${outcome}`);
     const value = Number(line.slice(prefix.length + 1));
-    assert(Number.isSafeInteger(value) && value >= 0, `invalid deferred persistence counter: ${outcome}`);
+    assert(Number.isSafeInteger(value) && value >= 0, `invalid ${queue} persistence counter: ${outcome}`);
     return [outcome, value];
   }));
+}
+
+export function assertArchiveGapEvidence(requestGaps: number, responseGaps: number, request: Record<string, number>, response: Record<string, number>): void {
+  assert(request.failed === 0 && response.failed === 0, "healthy archive storage must not report capture failures");
+  assert(request.retention_limit === 0, "acceptance inputs must not exceed the request retention limit");
+  for (const [purpose, gaps, evidence] of [["request", requestGaps, request], ["response", responseGaps, response]] as const) {
+    assert(Number.isSafeInteger(gaps) && gaps >= 0, `${purpose} archive gap count must be valid`);
+    assert(Number.isSafeInteger(evidence.capacity) && evidence.capacity >= 0, `${purpose} capacity rejection counter must be present and valid`);
+    assert(gaps <= evidence.capacity, `${purpose} archive gaps (${gaps}) must be accounted for by explicit bounded capacity rejection (${evidence.capacity})`);
+  }
 }
 
 export function allocatorEvidence(metrics: string): Record<string, number> {
@@ -359,14 +379,17 @@ export async function run(binary: string, output: string): Promise<boolean> {
               const metricsText = metrics.body.toString("utf8");
               const gauges = permitEvidence(metricsText);
               if (Object.values(gauges).every((value) => value === 0)) {
-                const successfulGaps = reader.prepare("SELECT COALESCE(SUM(CASE WHEN request_object LIKE 'gap:%' THEN 1 ELSE 0 END + CASE WHEN response_object IS NULL OR response_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS count FROM request_records WHERE status_code = 200").get();
+                const currentBudget = reader.prepare("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").get();
+                assert(currentBudget, "archive budget row missing after capture drain");
+                if (Object.values(currentBudget).some((value) => Number(value) !== 0)) { await delay(100); continue; }
+                const successfulGaps = reader.prepare("SELECT COALESCE(SUM(CASE WHEN request_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS request_gaps, COALESCE(SUM(CASE WHEN response_object IS NULL OR response_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS response_gaps FROM request_records WHERE status_code = 200").get();
                 const persistence = deferredPersistenceEvidence(metricsText);
-                assert(persistence.failed === 0, "healthy archive storage must not report capture failures");
-                const rejected = persistence.capacity;
-                assert(rejected !== undefined, "capacity rejection counter must be present");
-                assert(Number(successfulGaps?.count) <= rejected, "archive gaps must be accounted for by explicit bounded capacity rejection");
+                const requestPersistence = requestPersistenceEvidence(metricsText);
+                const requestGaps = Number(successfulGaps?.request_gaps);
+                const responseGaps = Number(successfulGaps?.response_gaps);
+                assertArchiveGapEvidence(requestGaps, responseGaps, requestPersistence, persistence);
                 const processMemoryEvidence = processMemory(service!.pid!);
-                return { ...row, permits: gauges, persistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: Number(successfulGaps?.count) };
+                return { ...row, permits: gauges, persistence, request_persistence: requestPersistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: requestGaps + responseGaps, successful_request_archive_gaps: requestGaps, successful_response_archive_gaps: responseGaps };
               }
             }
             await delay(100);
@@ -378,13 +401,17 @@ export async function run(binary: string, output: string): Promise<boolean> {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
       const operationStarted = performance.now();
-      const result = await deadline(operation(), 60_000, name);
-      const operationDurationMs = performance.now() - operationStarted;
-      sample();
-      const peak = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
-      const entry = { name, result, upstream_calls: upstreamCalls - callsBefore, peak_rss_mib: peak, operation_duration_ms: operationDurationMs, drain_duration_ms: 0, drain: {} };
+      const entry = { name, result: undefined as unknown, upstream_calls: 0, peak_rss_mib: 0, operation_duration_ms: 0, drain_duration_ms: 0, drain: {} };
       report.phases.push(entry);
-      assert(peak <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
+      try {
+        entry.result = await deadline(operation(), 60_000, name);
+      } finally {
+        entry.operation_duration_ms = performance.now() - operationStarted;
+        entry.upstream_calls = upstreamCalls - callsBefore;
+        sample();
+        entry.peak_rss_mib = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
+      }
+      assert(entry.peak_rss_mib <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
       const drainStarted = performance.now();
       entry.drain = await drain();
       entry.drain_duration_ms = performance.now() - drainStarted;

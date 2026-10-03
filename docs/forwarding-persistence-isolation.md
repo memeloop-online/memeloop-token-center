@@ -63,6 +63,11 @@ the integrated head. Validation is GitHub Actions only; no production changes.
    `memeloop_token_center_deferred_persistence_total`, jobs/bytes gauges and
    structured gap logs. Request/response locators remain `gap://` until upload
    binds verified content. EOF no longer promises durable archive visibility.
+   The independent request queue exposes
+   `memeloop_token_center_request_persistence_total` with accepted, capacity,
+   failed and retention-limit outcomes, plus its own jobs/bytes gauges. Queue
+   byte/slot rejection and shared spool-budget rejection count as capacity;
+   SQL errors and optional-job timeouts count as failures.
 
 ## CI evidence
 
@@ -86,6 +91,37 @@ review, formatting and `git diff --check`.
   stream validation and memory acceptance suites remain required release gates.
 
 See PR #423 for the current head and Actions conclusions. No unrun test is a pass.
+
+Integration run `37131774170` passed Rust, security, API contracts, migrations,
+packaging, binary production and both image assembly checks. Web failed a tooltip
+description association assertion. The independent RSS gate passed its first
+64 MiB response phase and then failed during the internal drain in
+`four-concurrent-16MiB-known-length-inputs`: request queue capacity gaps were not
+represented by the response-only counter. Its observed peak was 295.71 MiB, below
+the unchanged 448 MiB ceiling. A 16 MiB request's three-copy charge plus overhead
+exceeds the unchanged 32 MiB request archive envelope and legitimately omits
+archival. This is distinct from failing mandatory request admission.
+
+The corrected gate drains both queues, rechecks the durable spool budget after
+capture drains, and requires request gaps to have request-capacity evidence and
+response gaps to have response-capacity evidence independently. Neither queue's
+failures are permitted on healthy storage. It records the current phase before
+execution so an internal drain failure retains its case name. Concurrency, memory
+ceilings, exact byte/hash checks, settlement and recovery assertions are retained.
+
+The Web correction resolves the tooltip from the current trigger's
+`aria-describedby` tokens before waiting for visibility and checking its content.
+The old global visible-text lookup could capture a previous focused trigger's
+tooltip with overlapping candidate text during Fluent's focus delay, then wait
+forever for that other tooltip's ID on the current trigger. The description
+association, visible content, keyboard/touch/Escape, viewport and no-write
+assertions remain; no production tooltip behavior or timeout is changed.
+
+Terminal-cause integration must preserve PR #455's separate typed
+`FinishProxyRequest.terminal_cause: Option<RequestTerminalCause>` through archive
+fallback, including `..input`, into the same winning `completed_at IS NULL` CAS
+(bind 19). Do not derive it from the public error code or earlier retry evidence.
+Migration 0114 remains reserved for PR #422; 0115 belongs to terminal cause.
 
 ## Unresolved release risks
 

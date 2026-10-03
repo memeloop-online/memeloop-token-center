@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, deferredPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, assertArchiveGapEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -49,6 +49,22 @@ test("archive gaps require explicit finite capacity evidence", () => {
   assert.deepEqual(deferredPersistenceEvidence(metrics), { accepted: 0, capacity: 1, failed: 2 });
   assert.throws(() => deferredPersistenceEvidence(""), /required deferred persistence counter absent/u);
   assert.throws(() => deferredPersistenceEvidence(metrics.replace("} 1", "} NaN")), /invalid deferred persistence counter/u);
+});
+
+test("request and response gaps require their own bounded queue evidence", () => {
+  const request = { accepted: 1, capacity: 2, failed: 0, retention_limit: 0 };
+  const response = { accepted: 2, capacity: 1, failed: 0 };
+  const metrics = Object.entries(request).map(([outcome, value]) => `memeloop_token_center_request_persistence_total{outcome="${outcome}"} ${value}`).join("\n");
+  assert.deepEqual(requestPersistenceEvidence(metrics), request);
+  assert.throws(() => requestPersistenceEvidence(""), /required request persistence counter absent/u);
+  assert.throws(() => requestPersistenceEvidence(metrics.replace("} 2", "} NaN")), /invalid request persistence counter/u);
+  assertArchiveGapEvidence(2, 1, request, response);
+  assert.throws(() => assertArchiveGapEvidence(3, 0, request, response), /request archive gaps/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 2, request, response), /response archive gaps/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, failed: 1 }, response), /capture failures/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 0, request, { ...response, failed: 1 }), /capture failures/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, retention_limit: 1 }, response), /retention limit/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 0, request, {}), /capacity rejection counter/u);
 });
 
 test("allocator evidence preserves every jemalloc state", () => {
