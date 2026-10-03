@@ -1125,8 +1125,24 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("online_projection_lock_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated_url = url::Url::parse(&database_url).unwrap();
+    isolated_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database_url = isolated_url.to_string();
     let database = Database::connect_with_max(&database_url, 8).await.unwrap();
     database.migrate().await.unwrap();
+    let actual_schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(actual_schema, schema);
     let unique = Uuid::now_v7();
     let pepper = b"online projection shared lock ordering pepper";
     let model = format!("online-projection-lock-{unique}");
@@ -1418,6 +1434,12 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .expect("key-budget/stats writers exceeded the deadline or returned 55P03")
         .expect("stats-first task panicked")
         .expect("stats-first writer returned 40P01 or 55P03");
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }
 
 #[tokio::test]
