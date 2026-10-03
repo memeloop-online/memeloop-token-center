@@ -344,6 +344,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             value: next,
                             downstream_closed,
                         }) => {
+                            if next.as_ref().is_some_and(|chunk| {
+                                chunk.as_ref().is_ok_and(|bytes| !bytes.is_empty())
+                            }) {
+                                waits.body_chunk();
+                            }
                             downstream_closed_observed |= downstream_closed;
                             if downstream_closed {
                                 drop(archive_sender.take());
@@ -473,9 +478,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             _sse_streaming_memory = Some(memory);
                         }
                         let raw_chunk_len = raw_chunk.len();
-                        if !flushing_terminal && raw_chunk_len > 0 {
-                            waits.body_chunk();
-                        }
                         if downstream_closed_observed && !flushing_terminal {
                             downstream_ready_bytes =
                                 downstream_ready_bytes.saturating_add(raw_chunk_len);
