@@ -219,6 +219,7 @@ async fn hidden_exact_selection_bootstraps_route_creation_and_candidate_admissio
     )
     .await;
     assert!(status.is_success(), "{status}: {route}");
+    assert_eq!(route["enabled"], false);
     assert_eq!(
         state
             .db
@@ -257,6 +258,17 @@ async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
         json!({"models":[{"slug":"gpt-6-sol", "visibility":"list", "context_window":272000}]}),
     )
     .await;
+    let (status, working_catalog, _) =
+        request(&state, "POST", &format!("{base}/sync"), Value::Null, token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(working_catalog["status"], "ready");
+    let working_snapshot: String = sqlx::query_scalar(
+        "SELECT current_snapshot_id FROM upstream_model_catalog_state WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&state.db.pool)
+    .await
+    .unwrap();
     let (_, diagnostic, _) = request(
         &state,
         "GET",
@@ -277,6 +289,37 @@ async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, retained_catalog, _) = request(&state, "GET", &base, Value::Null, token).await;
+    assert_eq!(retained_catalog["models"], working_catalog["models"]);
+    assert_eq!(
+        retained_catalog["disabled_models"],
+        working_catalog["disabled_models"]
+    );
+    assert_eq!(
+        retained_catalog["last_success_at"],
+        working_catalog["last_success_at"]
+    );
+    let retained_snapshot: String = sqlx::query_scalar(
+        "SELECT current_snapshot_id FROM upstream_model_catalog_state WHERE upstream_account_id = $1",
+    )
+    .bind(account.to_string())
+    .fetch_one(&state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_snapshot, working_snapshot);
+    state
+        .db
+        .validate_managed_codex_route_catalog("exact-tenant", &[account], "gpt-6-sol")
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .filter_accounts_supporting_upstream_model("exact-tenant", &[account], "gpt-6-sol")
+            .await
+            .unwrap(),
+        vec![account]
+    );
     assert!(
         state
             .db
@@ -315,6 +358,7 @@ async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
 #[tokio::test]
 async fn exact_discovery_enforces_scopes_and_tenant_before_upstream_io() {
     let (state, _directory, server, account) = fixture().await;
+    state.db.create_tenant("other-tenant", None).await.unwrap();
     let base = format!("/internal/v1/upstreams/{account}/models");
     for (tenant, scopes, method, suffix, expected) in [
         (
