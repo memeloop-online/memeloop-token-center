@@ -120,8 +120,9 @@ export function assertArchiveGapEvidence(requestGaps: number, responseGaps: numb
   assert(request.retention_limit === 0, "acceptance inputs must not exceed the request retention limit");
   for (const [purpose, gaps, evidence] of [["request", requestGaps, request], ["response", responseGaps, response]] as const) {
     assert(Number.isSafeInteger(gaps) && gaps >= 0, `${purpose} archive gap count must be valid`);
-    assert(Number.isSafeInteger(evidence.capacity) && evidence.capacity >= 0, `${purpose} capacity rejection counter must be present and valid`);
-    assert(gaps <= evidence.capacity, `${purpose} archive gaps (${gaps}) must be accounted for by explicit bounded capacity rejection (${evidence.capacity})`);
+    const capacity = evidence.capacity;
+    assert(capacity !== undefined && Number.isSafeInteger(capacity) && capacity >= 0, `${purpose} capacity rejection counter must be present and valid`);
+    assert(gaps <= capacity, `${purpose} archive gaps (${gaps}) must be accounted for by explicit bounded capacity rejection (${capacity})`);
   }
 }
 

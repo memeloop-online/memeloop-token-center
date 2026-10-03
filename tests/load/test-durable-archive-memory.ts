@@ -64,7 +64,7 @@ test("request and response gaps require their own bounded queue evidence", () =>
   assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, failed: 1 }, response), /capture failures/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, request, { ...response, failed: 1 }), /capture failures/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, retention_limit: 1 }, response), /retention limit/u);
-  assert.throws(() => assertArchiveGapEvidence(0, 0, request, {}), /capacity rejection counter/u);
+  assert.throws(() => assertArchiveGapEvidence(0, 0, request, { failed: 0 }), /capacity rejection counter/u);
 });
 
 test("allocator evidence preserves every jemalloc state", () => {
