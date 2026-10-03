@@ -86,10 +86,11 @@ async fn cancelled_buffered_request_settles_without_waiting_for_orphan_reaper() 
 #[tokio::test]
 async fn streaming_handoff_keeps_the_stream_owner_and_successful_settlement() {
     let fixture = codex_route_fixture("cancel-guard-stream-handoff").await;
-    let prefix = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n".to_owned();
-    let (endpoint, release, server) =
-        gated_completed_sse_upstream_endpoint(prefix, completed_codex_sse("synthetic handoff"))
-            .await;
+    let (endpoint, release, server) = gated_completed_sse_upstream_endpoint(
+        String::new(),
+        completed_codex_sse("synthetic handoff"),
+    )
+    .await;
     let response = send_codex_route_to_endpoint(
         &fixture,
         endpoint,
