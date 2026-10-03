@@ -157,9 +157,7 @@ pub(super) async fn list_model_picker_options(
     for item in &mut data {
         for source in &mut item.sources {
             let canonical_id = canonicalize_provider_driver(&source.provider.id).to_owned();
-            let provider = providers
-                .get(&canonical_id)
-                .ok_or(AppError::Internal)?;
+            let provider = providers.get(&canonical_id).ok_or(AppError::Internal)?;
             source.provider.id = canonical_id;
             source.provider.label = provider.display_name.clone();
             source.provider.protocols = provider.protocols.clone();
