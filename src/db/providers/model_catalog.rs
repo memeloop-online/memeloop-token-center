@@ -802,7 +802,7 @@ impl Database {
     ) -> Result<(), AppError> {
         for account_id in account_ids {
             let row = sqlx::query(
-                "SELECT a.driver, EXISTS (SELECT 1 FROM upstream_model_catalog_state s JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = s.upstream_account_id AND snapshot.credential_generation = a.credential_generation JOIN upstream_models m ON m.snapshot_id = snapshot.id WHERE s.upstream_account_id = a.id AND s.credential_generation = a.credential_generation AND m.model_id = $1) AS catalogued FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $2 AND t.external_id = $3",
+                "SELECT a.driver, CASE WHEN EXISTS (SELECT 1 FROM upstream_model_catalog_state s JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = s.upstream_account_id AND snapshot.credential_generation = a.credential_generation JOIN upstream_models m ON m.snapshot_id = snapshot.id WHERE s.upstream_account_id = a.id AND s.credential_generation = a.credential_generation AND m.model_id = $1) THEN 1 ELSE 0 END AS catalogued FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $2 AND t.external_id = $3",
             )
             .bind(upstream_model)
             .bind(account_id.to_string())
@@ -811,7 +811,7 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
             let driver: String = row.try_get("driver")?;
-            let catalogued: bool = row.try_get("catalogued")?;
+            let catalogued = row.try_get::<i64, _>("catalogued")? != 0;
             if driver == "openai-codex" && !catalogued {
                 return Err(AppError::BadRequest(
                     "managed Codex routes require a synchronized model catalog entry".into(),
