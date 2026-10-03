@@ -2,21 +2,40 @@ import type { RequestView } from './types.js';
 
 export type RequestOutcome = 'running' | 'delivering' | 'completed' | 'cancelled' | 'interrupted' | 'failed' | 'unknown';
 
+const recordedFailureCopy: Record<string, [string, string]> = {
+  upstream_eof_without_terminal: ['上游响应在结束事件前中断', 'Upstream response ended before a terminal event'],
+  upstream_stream_read_error: ['读取上游响应时连接中断', 'The upstream response stream was interrupted'],
+  upstream_stream: ['上游响应流中断', 'The upstream response stream was interrupted'],
+  upstream_incomplete_response: ['上游响应未完整结束', 'The upstream response did not finish'],
+  upstream_response_terminal_conflict: ['上游响应包含冲突的结束信息', 'The upstream response contained conflicting terminal information'],
+  upstream_transport_timeout: ['等待上游响应超时', 'The upstream request timed out'],
+  upstream_transport_outer_deadline: ['等待上游响应超过请求时限', 'The upstream request exceeded its overall deadline'],
+  upstream_transport_connection_reset: ['上游连接被重置', 'The upstream connection was reset'],
+  upstream_transport_http2_reset: ['上游 HTTP/2 流被重置', 'The upstream HTTP/2 stream was reset'],
+  upstream_transport_http2_goaway: ['上游 HTTP/2 连接收到 GOAWAY', 'The upstream HTTP/2 connection received GOAWAY'],
+  upstream_http2_reset: ['上游 HTTP/2 流被重置', 'The upstream HTTP/2 stream was reset'],
+  upstream_http2_goaway: ['上游 HTTP/2 连接收到 GOAWAY', 'The upstream HTTP/2 connection received GOAWAY'],
+  upstream_transport_body: ['发送上游请求内容失败', 'Sending the upstream request body failed'],
+  upstream_transport_decode: ['解析上游响应失败', 'Decoding the upstream response failed'],
+  upstream_transport_request: ['发送上游请求失败', 'Sending the upstream request failed'],
+  upstream_transport_other: ['上游网络请求失败', 'The upstream network request failed'],
+  upstream_connection: ['上游连接失败', 'The upstream connection failed'],
+  upstream_read_timeout: ['读取上游响应超时', 'Reading the upstream response timed out'],
+  upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
+};
+
+function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null {
+  const cause = recordedFailureCopy[errorCode];
+  return cause ? cause[locale === 'zh-CN' ? 0 : 1] : null;
+}
+
+export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+  return request.error_code ? recordedCause(request.error_code, locale) : null;
+}
+
 export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
-  const exact: Record<string, [string, string]> = {
-    upstream_eof_without_terminal: ['上游响应在结束事件前中断', 'Upstream response ended before a terminal event'],
-    upstream_stream_read_error: ['读取上游响应时连接中断', 'The upstream response stream was interrupted'],
-    upstream_response_terminal_conflict: ['上游响应包含冲突的结束信息', 'The upstream response contained conflicting terminal information'],
-    upstream_transport_timeout: ['等待上游响应超时', 'The upstream request timed out'],
-    upstream_transport_connection_reset: ['上游连接被重置', 'The upstream connection was reset'],
-    upstream_transport_body: ['发送上游请求内容失败', 'Sending the upstream request body failed'],
-    upstream_transport_decode: ['解析上游响应失败', 'Decoding the upstream response failed'],
-    upstream_transport_request: ['发送上游请求失败', 'Sending the upstream request failed'],
-    upstream_transport_other: ['上游网络请求失败', 'The upstream network request failed'],
-    upstream_transport_outer_deadline: ['等待上游响应超过请求时限', 'The upstream request exceeded its overall deadline'],
-  };
-  const copy = exact[errorCode];
-  if (copy) return copy[locale === 'zh-CN' ? 0 : 1];
+  const cause = recordedCause(errorCode, locale);
+  if (cause) return cause;
   if (errorCode.startsWith('upstream_')) return locale === 'zh-CN' ? '上游服务返回错误' : 'The upstream service returned an error';
   if (errorCode.startsWith('downstream_')) return locale === 'zh-CN' ? '响应交付中断' : 'Response delivery was interrupted';
   if (errorCode.startsWith('client_')) return locale === 'zh-CN' ? '客户端未完成请求' : 'The client did not complete the request';
@@ -42,7 +61,7 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     completed: ['已完成', '服务端已记录正常结束；不代表客户端已确认接收全部内容。'],
     cancelled: ['客户端断开', '客户端连接已断开，响应未正常交付完成。'],
     interrupted: ['响应中断', '响应未正常结束；已记录用量不代表响应完整交付。'],
-    failed: ['失败', '服务端记录了请求失败，请查看错误详情。'],
+    failed: ['失败', ''],
     unknown: ['记录待补充', '此历史记录缺少完成时间，无法确认完整交付。'],
   } : {
     running: ['Running', 'No terminal outcome is recorded yet. Usage and cost await settlement.'],
@@ -50,11 +69,15 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     completed: ['Completed', 'The server recorded a normal finish; this is not client acknowledgement of the complete response.'],
     cancelled: ['Client disconnected', 'The client connection closed before normal response delivery completed.'],
     interrupted: ['Interrupted', 'The response did not finish normally. Recorded usage does not establish complete delivery.'],
-    failed: ['Failed', 'The server recorded a request failure. See the error details.'],
+    failed: ['Failed', ''],
     unknown: ['Record incomplete', 'Completion time is missing; complete delivery is not confirmed.'],
   };
   const [label, explanation] = copy[outcome];
   const code = request.status_code === null ? '' : `${locale === 'zh-CN' ? '记录状态码' : 'Recorded status'}: ${request.status_code}`;
+  const cause = ['failed', 'interrupted'].includes(outcome) ? requestFailureCause(request, locale) : null;
+  const failureDetail = ['failed', 'interrupted'].includes(outcome)
+    ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? (locale === 'zh-CN' ? '未知（未记录具体原因）' : 'Unknown (no specific cause recorded)')}` : '';
   return { outcome, label, tone: outcome === 'completed' ? 'ok' : ['cancelled', 'interrupted', 'failed'].includes(outcome) ? 'bad' : outcome === 'unknown' ? 'unknown' : 'pending',
-    hint: [explanation, code, request.error_code ? requestErrorCopy(request.error_code, locale) : ''].filter(Boolean).join(' · ') };
+    cause: failureDetail,
+    hint: ['failed', 'interrupted'].includes(outcome) ? failureDetail : [explanation, code].filter(Boolean).join(' · ') };
 }
