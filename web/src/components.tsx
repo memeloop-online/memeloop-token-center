@@ -313,11 +313,10 @@ export function RequestTable({
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
             const currencyForRequest = recordedCurrency(request, currency);
             const technicalSummary = [
-              `${t('request.protocol')}: ${request.protocol}`,
+              `${t('request.protocol')}: ${['openai', 'anthropic', 'openai-image', 'audio-transcription', 'generation'].includes(request.protocol) ? t(`usage.protocol.${request.protocol}`) : request.protocol}`,
               request.upstream_account_id
-                ? `${t('request.upstreamId')}: ${upstreamNames?.get(request.upstream_account_id) ? `${upstreamNames.get(request.upstream_account_id)} (${request.upstream_account_id})` : request.upstream_account_id}`
+                ? `${locale === 'zh-CN' ? '服务账号' : 'Service account'}: ${upstreamNames?.get(request.upstream_account_id)?.trim() || (locale === 'zh-CN' ? '账号名称不可用' : 'Account name unavailable')}`
                 : '',
-              request.route_id ? `${t('request.routeId')}: ${request.route_id}` : '',
             ].filter(Boolean).join(' · ');
             const durationSummary = request.completed_at != null
               ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`

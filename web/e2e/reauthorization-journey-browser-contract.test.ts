@@ -20,6 +20,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       let proxy = 'socks5h://10.0.0.8:1080';
       let pollCount = 0;
       let failPoll = true;
+      let failStart = true;
       let expiredRecovery = false;
       const writes: { path: string; body: Record<string, unknown> }[] = [];
       await page.route('**/*', async route => {
@@ -44,7 +45,8 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
         assert.equal(request.method(), 'POST');
         if (url.pathname === '/internal/v1/oauth/codex/start') {
           assert.equal(body.upstream_account_id, account.id);
-          assert.equal('proxy_url' in body, false);
+          assert.equal('proxy_url' in body, false, 'reauthorization uses the saved account proxy');
+          if (failStart) { failStart = false; return route.fulfill({ status: 503, json: { error: { message: 'do-not-display-raw-proxy-address' } } }); }
           return route.fulfill({ json: { session_id: '00000000-0000-4000-8000-000000000001', session_token: 'synthetic-device-session', user_code: 'FIXTURE-CODE', verification_url: `${origin}/mock-provider`, poll_after_seconds: 5, expires_at: Date.now() + 600_000 } });
         }
         assert.equal(url.pathname, '/internal/v1/oauth/codex/poll');
@@ -65,15 +67,22 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       assert.equal(writes.length, 0, 'opening an already-authorized account never starts OAuth');
       await workspace.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).click();
       assert.equal(await start.isDisabled(), true);
+      await workspace.getByText(chinese ? '正在编辑网络代理。请先保存或取消代理编辑，再开始登录。' : 'You are editing the network proxy. Save or cancel proxy editing before starting login.', { exact: true }).waitFor();
       const proxyInput = workspace.locator('.upstream-proxy-editor input');
       await proxyInput.fill('socks5h://10.0.0.9:1080');
       await proxyInput.press('Enter');
       await workspace.locator('.provider-readable-proxy input').waitFor();
+      assert.equal(await workspace.getByText(chinese ? '正在编辑网络代理。' : 'You are editing the network proxy.', { exact: false }).count(), 0, 'proxy editing hint clears once the proxy is saved');
       assert.equal(await workspace.locator('.provider-readable-proxy input').inputValue(), 'socks5h://10.0.0.9:1080');
-      assert.equal(writes.length, 1, 'proxy save is immediate and does not start login');
+      assert.equal(writes.filter(write => write.path.endsWith('/transport-proxy')).length, 1, 'proxy save is immediate and does not start login');
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
       await page.getByRole('heading', { name: chinese ? '编辑 reauthorize@example.org' : 'Edit reauthorize@example.org', exact: true }).waitFor();
       await reauthorize.click();
+      await start.click();
+      await workspace.getByText(chinese ? '未能获取登录会话。请检查此账号的网络代理和出口连接，然后重试。' : 'Could not obtain a login session. Check this account’s proxy and egress, then retry.').waitFor();
+      assert.equal(await workspace.getByText('FIXTURE-CODE', { exact: true }).count(), 0);
+      assert.equal(await workspace.getByText('do-not-display-raw-proxy-address').count(), 0);
+      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1, 'failed start does not implicitly retry');
       await start.click();
       await workspace.getByText('FIXTURE-CODE', { exact: true }).waitFor();
       const copyCode = workspace.getByRole('button', { name: chinese ? '复制设备验证码' : 'Copy device code', exact: true });
@@ -91,7 +100,8 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       }
       const failed = page.waitForResponse(response => response.url().endsWith('/oauth/codex/poll'));
       await page.clock.fastForward(6_000); await failed;
-      await workspace.getByText(chinese ? '暂时无法确认授权状态，系统会稍后自动重试。请勿重复开始登录。' : 'Authorization could not be confirmed yet. The system will retry automatically. Do not start another login.').waitFor();
+      await workspace.getByText(chinese ? '当前网络出口暂时无法确认授权状态。系统会自动重试；请检查代理连接，不要重复开始登录。' : 'The current network connection cannot confirm authorization yet. The system will retry automatically; check the proxy connection and do not start another login.').waitFor();
+      assert.equal(await workspace.getByText('do-not-display-raw-provider-error').count(), 0);
       assert.equal(pollCount, 1);
       const stored = await page.evaluate(() => sessionStorage.getItem('mtc-codex-device-recovery'));
       assert.ok(stored?.includes('00000000-0000-4000-8000-000000000001'));
@@ -105,13 +115,13 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await page.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true }).waitFor();
       await page.locator('.provider-detail-workspace').waitFor();
       assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-codex-device-recovery')), null);
-      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1);
+      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 2);
       assert.equal(pollCount, 3);
       await page.clock.fastForward(60_000); assert.equal(pollCount, 3, 'successful login stops polling');
       await reauthorize.click();
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
       assert.equal(await reauthorize.evaluate(element => element === document.activeElement), true);
-      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1, 'reopening and closing never repeats login');
+      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 2, 'reopening and closing never repeats login');
       expiredRecovery = true;
       await page.evaluate(() => sessionStorage.setItem('mtc-codex-device-recovery', JSON.stringify({ session_id: '00000000-0000-4000-8000-000000000001', tenant: 'fixture-a', account_id: 'reauthorization-fixture', expires_at: Date.now() - 1000 })));
       await page.reload();
@@ -119,7 +129,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       const expiredPolls = pollCount;
       await page.clock.fastForward(60_000);
       assert.equal(pollCount, expiredPolls, 'an expired pending session stops status polling');
-      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 1, 'expiry never starts another OAuth session');
+      assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 2, 'expiry never starts another OAuth session');
       assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-codex-device-recovery')), null);
       await page.close();
     }

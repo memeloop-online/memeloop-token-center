@@ -135,9 +135,11 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.equal(await recordedRow.locator('.request-credential-cell').evaluate(cell => cell.nextElementSibling?.classList.contains('request-model-cell')), true, 'the credential alias is adjacent to the model');
     assert.equal(await page.locator('.request-technical-cell, .request-technical-heading, .request-technical-info').count(), 0, 'technical data has no blank column or isolated information icon');
     await recordedRow.locator('.request-routing-info').focus();
-    await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
-    assert.match(await page.getByRole('tooltip').filter({ hasText: upstreamId }).innerText(), /Production Codex.*e82ea007/, 'keyboard focus on model/account identity exposes the precise routing metadata');
-    assert.ok((await page.getByRole('tooltip').filter({ hasText: upstreamId }).innerText()).includes('Production Codex · csil.ai.automation@example.test'), 'the tooltip retains the complete account even when its row label truncates');
+    const routingTooltip = page.getByRole('tooltip').filter({ hasText: 'Service account:' });
+    await routingTooltip.waitFor();
+    assert.doesNotMatch(await routingTooltip.innerText(), new RegExp(`${upstreamId}|${routeId}|Final upstream ID|Final route ID`), 'routine tooltips do not expose internal identifiers');
+    assert.match(await routingTooltip.innerText(), /Protocol: OpenAI/);
+    assert.ok((await routingTooltip.innerText()).includes('Production Codex · csil.ai.automation@example.test'), 'the tooltip retains the complete account even when its row label truncates');
     assert.match(await recordedRow.locator('.request-token-primary').innerText(), /Uncached input\s*100[\s\S]*Output\s*32/);
     assert.equal(await recordedRow.locator('.request-token-total > span').evaluate(element => getComputedStyle(element).textDecorationLine), 'line-through');
     assert.equal(await recordedRow.locator('.request-token-primary b').first().evaluate(element => getComputedStyle(element).textDecorationLine), 'none');
@@ -251,7 +253,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
           }
           assert.equal(layout.tableScrollWidth, layout.tableClientWidth, 'mobile request cards do not require horizontal panning');
           await recordedRow.locator('.request-routing-info').tap();
-          await page.getByRole('tooltip').filter({ hasText: upstreamId }).waitFor();
+          await page.getByRole('tooltip').filter({ hasText: 'Service account:' }).waitFor();
           await recordedRow.locator('.request-credential-cell [tabindex="0"]').focus();
           assert.equal(await recordedRow.locator('.request-credential-cell [tabindex="0"]').evaluate((element) => document.activeElement === element), true, 'credential identity remains keyboard reachable');
         } else {

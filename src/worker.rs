@@ -18,8 +18,10 @@ const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 6
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const CODEX_MODEL_CATALOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PLUGIN_SERVICE_DATA_INTERVAL: Duration = Duration::from_secs(5);
 const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
+const CODEX_MODEL_CATALOG_RETRY_MILLIS: i64 = 60 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
 async fn refresh_expiring_oauth(
@@ -351,6 +353,34 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
                 }
                 Err(error) => {
                     tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
+                }
+            }
+        }
+    );
+    periodic!(
+        "codex_model_catalog",
+        CODEX_MODEL_CATALOG_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            let now = crate::db::unix_millis();
+            match state
+                .db
+                .list_codex_model_catalog_refresh_candidates(
+                    now.saturating_sub(CODEX_MODEL_CATALOG_RETRY_MILLIS),
+                    now,
+                    20,
+                )
+                .await
+            {
+                Ok(accounts) => {
+                    for account_id in accounts {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                        api::sync_upstream_models_after_refresh(state, account_id, None).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to list Codex model catalog refresh candidates");
                 }
             }
         }

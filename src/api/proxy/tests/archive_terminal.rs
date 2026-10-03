@@ -30,10 +30,6 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
 async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat_settlement() {
     let fixture = codex_route_fixture("request-capture-gap").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    // Simulate a terminal background request-archive failure only once the
-    // upstream response has returned and its independent capture is inserted.
-    sqlx::query("CREATE TRIGGER fail_request_archive_after_dispatch AFTER INSERT ON response_archive_spools BEGIN UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE request_id = NEW.request_id AND tenant_id = NEW.tenant_id AND reservation_id = NEW.reservation_id; END")
-        .execute(&pool).await.unwrap();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -57,6 +53,10 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
+    fixture.state.db.drain_gateway_persistence_for_test().await;
+    let failed = sqlx::query("UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = request_archive_spools.request_id AND s.tenant_id = request_archive_spools.tenant_id AND s.reservation_id = request_archive_spools.reservation_id)")
+        .execute(&pool).await.unwrap();
+    assert_eq!(failed.rows_affected(), 1);
     let rows = fixture
         .state
         .db
@@ -120,15 +120,18 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
 }
 
 #[tokio::test]
-async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admission() {
+async fn request_capture_failure_preserves_admission_and_dispatches_once() {
     let fixture = codex_route_fixture("request-capture-admission-failure").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("CREATE TRIGGER reject_request_capture BEFORE INSERT ON request_archive_spools BEGIN SELECT RAISE(ABORT, 'fixture capture rejection'); END")
         .execute(&pool).await.unwrap();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("response survives optional spool rejection"),
+            "text/event-stream",
+        ))
+        .expect(1)
         .mount(&upstream)
         .await;
     let response = send_codex_route(
@@ -136,12 +139,19 @@ async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admissio
         &upstream,
         "/v1/responses",
         json!({
-            "model": fixture.model, "input": "must be durable before dispatch", "stream": false
+            "model": fixture.model, "input": "only safety must be durable before dispatch", "stream": false
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(response.headers().contains_key(header::RETRY_AFTER));
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
+        "response survives optional spool rejection"
+    );
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
@@ -150,7 +160,24 @@ async fn request_capture_failure_rejects_before_upstream_and_rolls_back_admissio
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!((requests, reservations), (0, 0));
+    assert_eq!((requests, reservations), (1, 1));
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
     pool.close().await;
 }

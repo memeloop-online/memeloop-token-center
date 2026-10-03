@@ -629,6 +629,18 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
         )
         .await
         .unwrap();
+    assert!(
+        state
+            .db
+            .list_codex_model_catalog_refresh_candidates(
+                unix_millis() - 60 * 60 * 1_000,
+                unix_millis(),
+                20,
+            )
+            .await
+            .unwrap()
+            .contains(&account.id)
+    );
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
@@ -656,6 +668,31 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{synced}");
+    assert!(
+        !state
+            .db
+            .list_codex_model_catalog_refresh_candidates(
+                unix_millis() - 60 * 60 * 1_000,
+                unix_millis(),
+                20,
+            )
+            .await
+            .unwrap()
+            .contains(&account.id)
+    );
+    let next_refresh = unix_millis() + 60 * 60 * 1_000 + 1_000;
+    assert!(
+        state
+            .db
+            .list_codex_model_catalog_refresh_candidates(
+                next_refresh - 60 * 60 * 1_000,
+                next_refresh,
+                20,
+            )
+            .await
+            .unwrap()
+            .contains(&account.id)
+    );
     let models = synced["models"].as_array().unwrap();
     assert_eq!(models.len(), 6);
     for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {

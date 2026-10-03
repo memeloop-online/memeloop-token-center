@@ -52,6 +52,8 @@ impl ClientKey {
 pub(crate) struct CodexClients {
     clients: Mutex<VecDeque<(ClientKey, wreq::Client)>>,
     dispatch: dispatch::DispatchLanes,
+    #[cfg(test)]
+    test_client: Mutex<Option<wreq::Client>>,
 }
 
 impl CodexClients {
@@ -64,9 +66,23 @@ impl CodexClients {
     }
 
     pub(crate) fn snapshot(&self, route: &ResolvedUpstream) -> Result<wreq::Client, &'static str> {
+        #[cfg(test)]
+        if let Some(client) = self
+            .test_client
+            .lock()
+            .map_err(|_| "transport_client_unavailable")?
+            .as_ref()
+        {
+            return Ok(client.clone());
+        }
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
         let key = ClientKey::new(route, policy);
         self.client(key, policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_client(&self, client: wreq::Client) {
+        *self.test_client.lock().unwrap() = Some(client);
     }
 
     /// Control-plane reads share the generation transport's TLS profile and cache.

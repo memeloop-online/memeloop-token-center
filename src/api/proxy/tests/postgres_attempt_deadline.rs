@@ -1,7 +1,16 @@
 use super::*;
 
 #[tokio::test]
-async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
+async fn postgres_archive_budget_lock_does_not_block_upstream_dispatch() {
+    postgres_archive_lock_isolation(false).await;
+}
+
+#[tokio::test]
+async fn postgres_request_archive_table_lock_does_not_block_response_body() {
+    postgres_archive_lock_isolation(true).await;
+}
+
+async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL unset; skipping PostgreSQL attempt deadline contract");
         return;
@@ -117,9 +126,11 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
 
     let holder_pool = sqlx::PgPool::connect(isolated_url.as_str()).await.unwrap();
     let mut budget_holder = holder_pool.begin().await.unwrap();
-    sqlx::query(
-        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE",
-    )
+    sqlx::query(if lock_request_chunks {
+        "LOCK TABLE request_archive_spool_chunks IN ACCESS EXCLUSIVE MODE"
+    } else {
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"
+    })
     .execute(&mut *budget_holder)
     .await
     .unwrap();
@@ -142,35 +153,18 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity
-                 WHERE application_name = $1 AND wait_event_type = 'Lock'
-                   AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
-            )
-            .bind(&application_name)
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-            if waiting == 1 {
+            if upstream.received_requests().await.unwrap().len() == 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("request admission must wait at the PostgreSQL spool budget barrier");
-    assert!(
-        upstream.received_requests().await.unwrap().is_empty(),
-        "durable admission must complete before upstream dispatch"
-    );
-
-    // Advance the request clock past the configured one-second attempt window
-    // while PostgreSQL proves admission is still blocked. No wall-clock sleep
-    // participates in the ordering assertion.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    budget_holder.commit().await.unwrap();
-    tokio::time::resume();
+    .expect("upstream must receive the request while the archive budget is still locked");
+    let mut budget_holder = Some(budget_holder);
+    if !lock_request_chunks {
+        budget_holder.take().unwrap().commit().await.unwrap();
+    }
 
     let response = tokio::time::timeout(Duration::from_secs(5), request)
         .await
@@ -184,7 +178,11 @@ async fn postgres_archive_admission_wait_does_not_consume_attempt_deadline() {
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "admitted exactly once"
     );
+    if let Some(holder) = budget_holder {
+        holder.commit().await.unwrap();
+    }
     upstream.verify().await;
+    state.db.drain_gateway_persistence_for_test().await;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

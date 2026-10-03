@@ -265,10 +265,10 @@ impl Database {
         }
         let refresh_select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 FOR UPDATE"
+                "SELECT request_started_at, pending_credential_ciphertext, lease_expires_at FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT request_started_at, pending_credential_ciphertext FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2"
+                "SELECT request_started_at, pending_credential_ciphertext, lease_expires_at FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2"
             }
         };
         let refresh = sqlx::query(refresh_select)
@@ -276,19 +276,6 @@ impl Database {
             .bind(generation)
             .fetch_optional(&mut *tx)
             .await?;
-        if let Some(refresh) = refresh
-            && (refresh
-                .try_get::<Option<i64>, _>("request_started_at")?
-                .is_some()
-                || refresh
-                    .try_get::<Option<String>, _>("pending_credential_ciphertext")?
-                    .is_some())
-        {
-            return Err(AppError::Conflict(
-                "OAuth refresh for this credential generation was already dispatched; recover that refresh or authorize again before changing its transport proxy"
-                    .into(),
-            ));
-        }
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let current_credential = open_credential(&ciphertext, key_material)?;
         let current_proxy = current_credential
@@ -316,9 +303,41 @@ impl Database {
         let mut view = upstream_account_view(row)?;
 
         if proxy_changed {
+            let mut preserve_refresh_fence = false;
+            if let Some(refresh) = refresh {
+                let dispatched = refresh
+                    .try_get::<Option<i64>, _>("request_started_at")?
+                    .is_some();
+                let pending = refresh
+                    .try_get::<Option<String>, _>("pending_credential_ciphertext")?
+                    .is_some();
+                let active = refresh.try_get::<i64, _>("lease_expires_at")? > now;
+                if pending || (dispatched && active) {
+                    return Err(AppError::Conflict(
+                        "OAuth refresh for this credential generation was already dispatched; recover that refresh or authorize again before changing its transport proxy"
+                            .into(),
+                    ));
+                }
+                preserve_refresh_fence = dispatched;
+            }
             let replacement_ciphertext = seal_credential(&replacement, key_material)?;
             let next_generation = generation.checked_add(1).ok_or(AppError::Internal)?;
             let next_updated_at = now.max(updated_at.saturating_add(1));
+            if preserve_refresh_fence {
+                let fenced = sqlx::query(
+                    "UPDATE upstream_oauth_refresh_leases SET credential_generation = $1, idempotency_key = $2 WHERE account_id = $3 AND credential_generation = $4 AND request_started_at IS NOT NULL AND pending_credential_ciphertext IS NULL AND lease_expires_at <= $5",
+                )
+                .bind(next_generation)
+                .bind(format!("transport-proxy-fence-{}", Uuid::now_v7()))
+                .bind(account_id.to_string())
+                .bind(generation)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                if fenced.rows_affected() != 1 {
+                    return Err(oauth_refresh_outcome_unknown());
+                }
+            }
             sqlx::query(
                 "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
             )

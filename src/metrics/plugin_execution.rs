@@ -11,14 +11,16 @@ pub(crate) enum Phase {
     Normalize,
     GroupRoutingPlan,
     GroupRoutingObserve,
+    WireShimFinalize,
 }
 impl Phase {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::PostAuth,
         Self::Prepare,
         Self::Normalize,
         Self::GroupRoutingPlan,
         Self::GroupRoutingObserve,
+        Self::WireShimFinalize,
     ];
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -27,6 +29,7 @@ impl Phase {
             Self::Normalize => "normalize",
             Self::GroupRoutingPlan => "group_routing_plan",
             Self::GroupRoutingObserve => "group_routing_observe",
+            Self::WireShimFinalize => "wire_shim_finalize",
         }
     }
 }
@@ -64,7 +67,7 @@ impl Outcome {
     }
 }
 
-pub(super) struct Counters([AtomicU64; 35]);
+pub(super) struct Counters([AtomicU64; 42]);
 impl Default for Counters {
     fn default() -> Self {
         Self(std::array::from_fn(|_| AtomicU64::new(0)))

@@ -27,11 +27,14 @@ mod buffered_responses_incomplete;
 mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
+mod codex_http2_downstream_cancel;
+mod codex_http2_failure_safety;
 mod codex_output_limits;
 mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
 mod filter_assistant;
+mod gateway_persistence;
 mod group_routing;
 mod ha_policy;
 mod kimi;
@@ -2797,6 +2800,7 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
 }
 
 async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
@@ -4169,6 +4173,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4348,6 +4353,76 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
+}
+
+#[tokio::test]
+async fn codex_quiet_stream_keeps_downstream_open_and_settles_once() {
+    let fixture = codex_route_fixture("quiet-stream-heartbeat").await;
+    let prefix =
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage-contract\"}}\n\n"
+            .to_owned();
+    let completed = completed_response_with_usage(3, 7);
+    let terminal = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+    );
+    let (endpoint, terminal_tx, upstream) =
+        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "quiet stream", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut rendered = String::new();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while !rendered.contains("\"type\":\"response.in_progress\"") {
+            let frame = futures_util::StreamExt::next(&mut body)
+                .await
+                .expect("the quiet stream must remain open")
+                .expect("the quiet stream must not reset downstream");
+            rendered.push_str(std::str::from_utf8(&frame).unwrap());
+        }
+    })
+    .await
+    .expect("a real idle interval must produce a Responses progress event");
+    assert!(rendered.contains("\"type\":\"response.created\""));
+    assert!(!rendered.contains("response.completed"));
+    let pending = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status_code, None);
+
+    terminal_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = futures_util::StreamExt::next(&mut body).await {
+            rendered.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+    })
+    .await
+    .expect("the terminal and EOF must follow the idle interval");
+    upstream.await.unwrap();
+    assert_eq!(rendered.matches("event: response.completed").count(), 1);
+    assert_eq!(rendered.matches("data: [DONE]").count(), 1);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
 }
 
 #[tokio::test]
@@ -4581,6 +4656,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(body.as_ref(), sse.as_bytes());
 
     wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4614,9 +4690,6 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         crate::model::RequestArchiveState::Pending
     );
 
-    // HTTP completion publishes only placeholder locators while both exact
-    // bodies remain recoverable from the encrypted database spool. Object
-    // storage and its worker may be unavailable without losing either body.
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     for (spools, chunks, plaintext, expected_bytes) in [
         (
@@ -4767,6 +4840,7 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
     let gap = sqlx::query(
         "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
                 cleaned_at

@@ -294,6 +294,23 @@ jobs:
           "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
           "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
+      - name: Verify pinned Claude privacy component through the host ABI
+        run: |
+          mkdir claude-code-wire-fixture
+          cd claude-code-wire-fixture
+          curl --fail --location --retry 3 --output plugin.wasm \
+            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.wasm
+          curl --fail --location --retry 3 --output plugin.json \
+            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.json
+          printf '%s\n' \
+            '51043af426632581a218c227a0f90b2de2253d27b5438519098c44d965c01f3c  plugin.wasm' \
+            '95aa1c2ec715a766e865d861b6e9b00cb157c1f77056fab300fc55fa3925c68e  plugin.json' \
+            | sha256sum --check --strict
+          cd ..
+          MTC_CLAUDE_WIRE_FIXTURE="$GITHUB_WORKSPACE/claude-code-wire-fixture" \
+            cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
+          cargo test --locked --all-features --test plugin_product \
+            installable_example_contributes_provider_oauth_policy_and_rewrite
       - name: Build the fixed preferred-account guest for real host acceptance
         run: |
           cargo fmt --manifest-path plugin-sources/preferred-account/Cargo.toml -- --check

@@ -211,6 +211,24 @@ pub(super) fn plan_proxy_route(
     let codex_store_disabled =
         codex_plan.is_some() && forwarded_json.get("store").and_then(Value::as_bool) == Some(false);
     let codex_session_id = codex_plan.map(|plan| plan.session_id);
+    let plugins = wire_shim_runtime(state);
+    let wire_protocol = if responses_anthropic.is_some() {
+        "anthropic"
+    } else {
+        protocol.name()
+    };
+    let wire_shim_context = (upstream_path == Protocol::AnthropicMessages.path()
+        && plugins.wire_shim_matches(&route.driver, wire_protocol))
+    .then(
+        || crate::plugin::memeloop::token_center::types::RequestContext {
+            tenant_id: key.tenant_id.to_string(),
+            principal_id: key.principal_id.to_string(),
+            key_id: key.key_id.to_string(),
+            protocol: wire_protocol.to_owned(),
+            model: model.to_owned(),
+            config_json: "{}".to_owned(),
+        },
+    );
     Ok(PlannedProxyRoute {
         route,
         forwarded_json,
@@ -225,7 +243,16 @@ pub(super) fn plan_proxy_route(
         compact_v2_bridge,
         wrap_compact_as_sse,
         responses_anthropic,
+        wire_shim_context,
     })
+}
+
+fn wire_shim_runtime(state: &AppState) -> crate::plugin::PluginRuntime {
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(snapshot) = &state.pinned_application_plugins {
+        return snapshot.runtime.runtime().clone();
+    }
+    state.plugins.clone()
 }
 
 pub(super) fn passthrough_output_reservation_bound(
@@ -345,6 +372,34 @@ pub(super) async fn materialize_proxy_route(
     let mut forwarded_body = Vec::with_capacity(encoded_length);
     serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
         .map_err(|_| AppError::Internal)?;
+    if let Some(context) = planned.wire_shim_context {
+        let plugins = wire_shim_runtime(state);
+        let configurations = plugins
+            .resolved_traffic_configurations(
+                context.tenant_id.parse().map_err(|_| AppError::Internal)?,
+            )
+            .await?;
+        let body = String::from_utf8(forwarded_body).map_err(|_| AppError::Internal)?;
+        let driver = planned.route.driver.clone();
+        let protocol = context.protocol.clone();
+        let outcome = crate::api::plugin_execution::run(
+            state.metrics.clone(),
+            crate::api::plugin_execution::Phase::WireShimFinalize,
+            move || {
+                plugins.finalize_wire_shim(
+                    &driver,
+                    &protocol,
+                    context,
+                    &body,
+                    "{}",
+                    &configurations,
+                )
+            },
+        )
+        .await?
+        .ok_or(AppError::Internal)?;
+        forwarded_body = outcome.request_json.into_bytes();
+    }
     Ok(PreparedProxyRoute {
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),

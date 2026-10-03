@@ -7,6 +7,22 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+fn isolated_gateway_persistence(
+    database_url: &str,
+    schema: &str,
+) -> std::sync::Arc<crate::db::gateway_persistence::GatewayPersistence> {
+    let mut url = url::Url::parse(database_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    std::sync::Arc::new(
+        crate::db::gateway_persistence::GatewayPersistence::new(
+            url.as_str(),
+            DatabaseBackend::PostgreSql,
+        )
+        .unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn postgres_request_preseal_and_capture_do_not_hold_the_event_cursor() {
     use crate::{
@@ -436,6 +452,7 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         backend: DatabaseBackend::PostgreSql,
+        gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
     assert!(
@@ -801,6 +818,7 @@ impl PgFixture {
         let db = Database {
             pool: schema_pool(&url, &schema).await,
             backend: DatabaseBackend::PostgreSql,
+            gateway_persistence: isolated_gateway_persistence(&url, &schema),
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         let id = ArchiveSpoolIdentity {
@@ -813,7 +831,7 @@ impl PgFixture {
         } else {
             // Same request columns exercised by the production spool API; there is
             // deliberately no FK to billing tables, matching request_records.
-            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
+            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, request_object TEXT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
             .execute(&db.pool).await.unwrap();
             // This focused fixture intentionally omits the production request
             // projection tables. Keeping the locator table empty exercises the
@@ -999,6 +1017,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         backend: DatabaseBackend::PostgreSql,
+        gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
     // Simulate the existing orphan finalizer. It remains the only owner of
@@ -1067,6 +1086,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         backend: DatabaseBackend::PostgreSql,
+        gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
     fixture

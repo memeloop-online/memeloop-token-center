@@ -29,6 +29,8 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) compact_v2_bridge: bool,
     pub(super) wrap_compact_as_sse: bool,
     pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
+    pub(super) wire_shim_context:
+        Option<crate::plugin::memeloop::token_center::types::RequestContext>,
 }
 
 impl PlannedProxyRoute {
