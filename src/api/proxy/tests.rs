@@ -28,6 +28,7 @@ mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
 mod codex_http2_failure_safety;
+mod codex_http2_long_silence;
 mod codex_output_limits;
 mod codex_quota;
 mod codex_workbuddy;
