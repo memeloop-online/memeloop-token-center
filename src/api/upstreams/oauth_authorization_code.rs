@@ -31,6 +31,8 @@ pub(in crate::api) async fn start_authorization_code_oauth(
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let state = state.pin_application_plugins().await?;
+    body.provider_driver =
+        crate::provider::canonicalize_provider_driver(&body.provider_driver).to_owned();
     // Supplying a client, callback or explicit proxy changes token destination
     // authority and is restricted to the global operator, just like plugin install.
     if service.tenant_external_id.is_some() {

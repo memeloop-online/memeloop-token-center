@@ -1,6 +1,9 @@
 use super::*;
 use crate::{db::Database, proxy_lifecycle::ProxyArchiveAttempt};
 
+mod cancellation;
+pub(super) use cancellation::CancellationGuard;
+
 /// Unlike health failover exhaustion, local dispatch overload keeps its typed
 /// public body in both the response and the durable local-error archive.
 pub(super) async fn finish_dispatch_failure(

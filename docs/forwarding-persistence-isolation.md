@@ -1,11 +1,13 @@
 # Forwarding and persistence isolation audit
 
-Baseline: `e16b5579` on `origin/master`. Implementation and CI run from the
-isolated `fix/forward-storage-isolation-20260930` checkout. The original checkout
-was only read. Its dirty pricing fallback, Codex transport diagnostics and
-multi-agent normalization, request/session query fields, tests, lockfile and web
-changes are not included or reverted. In particular the upstream-model pricing
-change in the original dirty tree still needs independent integration review.
+Integration baseline: `5e2cef492189ffd76558bf1f541a8f5e430ea24b` on
+`origin/master`. Continued the existing conflicted integration in
+`mtc-forward-storage-completion-20261003`, preserving its staged and dirty work
+and merging the existing PR #423 head `608c21ff` without replaying it. Master
+cancellation settlement (#451), typed transport errors (#434), and asynchronous
+projection work remain included. The related terminal-cause worktree is untouched.
+Historical PR #423 CI evidence predates this integration and is not a pass for
+the integrated head. Validation is GitHub Actions only; no production changes.
 
 ## Actual call graph and blocking boundaries
 
@@ -18,7 +20,7 @@ change in the original dirty tree still needs independent integration review.
 | Capacity | Codex dispatch admission, request memory reservation, retained memory admission | Forwarding resource limits remain bounded; these are not archive queue admission |
 | Billing admission (before) | `start_proxy_request_with_archive_compression` → preseal → reserve shared archive budget → usage reservation / request owner / encrypted spool / global event cursor → commit | Archive and event waits previously rejected or delayed dispatch |
 | Billing admission (after) | `start_proxy_forwarding_request` → usage reservation / unique request owner → positive commit | Archive bytes and started-event cursor excluded; no dispatch on failed/unknown commit |
-| Deferred request capture | `persistence::capture` → nonwaiting submission → started event → retention sanitizer → archive reservation/capture | Errors/capacity affect archive/event availability only; already admitted forwarding receives no result |
+| Deferred request capture | `start_proxy_request_with_deferred_archive` → gateway persistence nonwaiting submission → started event → retention sanitizer → archive reservation/capture | Errors/capacity affect archive/event availability only; already admitted forwarding receives no result |
 | Candidate dispatch | generation/transport revision refresh, health claim, reservation resizing on failover, native credential refresh | Required authorization/quota/ownership fences preserved |
 | First billable SSE output | `delivery::send_frame` → `prepare_proxy_delivery` → `mark_proxy_delivery_started` | Required owner/ceiling CAS remains before billable delivery; no archive transaction in these methods |
 | SSE frames | `ResponseArchiveProducer::append` → bounded `try_reserve` | No await; full/inactive writer abandons capture. Retention transforms still consume bounded CPU on stream task |
@@ -35,19 +37,25 @@ change in the original dirty tree still needs independent integration review.
    generation/transport fences, quota resizing and billing CAS are unchanged.
 2. Production proxy billing admission does not call archive encryption, archive
    budget admission, spool insertion or event-cursor allocation.
-3. Deferred buffered capture has at most four admitted jobs (including running
+3. Deferred buffered response capture has at most four admitted jobs (including running
    jobs), no waiting submitters, and a 64 MiB charged envelope. Each charge covers
    three body copies, 256 bytes per scanned JSON node and 4 MiB of batch overhead.
    Over-budget input is rejected for archival before cloning/parsing a JSON tree.
    This is an allocation model, not an RSS upper bound.
-4. Background capture uses a separate two-connection pool with lazy connection
+   Request capture preserves master's separate queue: at most 16 jobs, a 32 MiB
+   charged envelope using the same allocation model, one writer, and a two-second
+   optional-job deadline. The deadline never wraps mandatory billing admission.
+4. Response capture uses a separate two-connection pool with lazy connection
    establishment, so its availability is not a new startup gate. Native stream archive
    writers have at most four owners and a separate 4 MiB memory budget. The
    existing per-stream queue is three complete 64 KiB chunks; producer/writer
    permits bound complete chunks together, plus one partial chunk.
-5. Accepted archive jobs keep capacity until SQL/refund returns. Failed deferred
-   refunds use the existing durable expiry recovery and do not spawn additional
-   unbounded retries. No timer cancels a billing commit or replays an upstream.
+   Request capture uses master's separate lazy one-connection pool with bounded
+   SQL timeouts. These are two independently bounded queues, not one shared cap.
+5. Accepted response archive jobs keep capacity until SQL/refund returns. Failed
+   deferred refunds use existing durable expiry recovery without unbounded retries.
+   Request jobs retain master's timeout and durable refund recovery semantics.
+   No timer cancels a billing commit or replays an upstream.
 6. SSE archive begin/append/seal/fence completion is not a prerequisite for first
    byte, terminal frame or HTTP EOF. Protocol validation and delivery-owner CAS
    remain prerequisites where they were previously required.
@@ -68,7 +76,8 @@ review, formatting and `git diff --check`.
 - `pending_response_archive_begin_does_not_hold_first_byte_or_eof`: archive begin
   latch remains closed until a complete HTTP body is received and the forwarding
   memory budget returns to zero; archive memory remains independently charged.
-- `postgres_archive_budget_lock_does_not_block_dispatch_or_buffered_delivery`:
+- `postgres_archive_budget_lock_does_not_block_upstream_dispatch` and
+  `postgres_request_archive_table_lock_does_not_block_response_body`:
   a real PostgreSQL transaction holds the shared budget row while dispatch and
   the entire buffered response complete.
 - Queue unit contracts cover job/byte saturation, rejected futures never running,

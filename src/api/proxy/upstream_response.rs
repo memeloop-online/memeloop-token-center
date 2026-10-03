@@ -31,15 +31,25 @@ impl CodexHttp2Failure {
 pub(super) fn codex_http2_failure(
     error: &(dyn std::error::Error + 'static),
 ) -> Option<CodexHttp2Failure> {
+    let error = codex_http2_error(error)?;
+    if error.is_reset() {
+        Some(CodexHttp2Failure::Reset)
+    } else if error.is_go_away() {
+        Some(CodexHttp2Failure::GoAway)
+    } else {
+        None
+    }
+}
+
+pub(super) fn codex_http2_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a http2::Error> {
     let mut source = Some(error);
     while let Some(current) = source {
-        if let Some(http2) = current.downcast_ref::<http2::Error>() {
-            if http2.is_reset() {
-                return Some(CodexHttp2Failure::Reset);
-            }
-            if http2.is_go_away() {
-                return Some(CodexHttp2Failure::GoAway);
-            }
+        if let Some(http2) = current.downcast_ref::<http2::Error>()
+            && (http2.is_reset() || http2.is_go_away())
+        {
+            return Some(http2);
         }
         if let Some(inner) = current
             .downcast_ref::<std::io::Error>()
@@ -299,9 +309,16 @@ mod tests {
         };
         assert!(error.is_reset());
         assert!(error.is_remote());
-        assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
+        assert!(!error.is_library());
         assert_eq!(
-            codex_http2_failure(&std::io::Error::other(error)),
+            codex_http2_error(&error).unwrap().reason(),
+            Some(http2::Reason::CANCEL)
+        );
+        assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
+        let wrapped = std::io::Error::other(error);
+        assert!(codex_http2_error(&wrapped).unwrap().is_remote());
+        assert_eq!(
+            codex_http2_failure(&wrapped),
             Some(CodexHttp2Failure::Reset)
         );
         driver.abort();
@@ -334,6 +351,10 @@ mod tests {
         };
         assert!(error.is_go_away());
         assert!(error.is_remote());
+        assert_eq!(
+            codex_http2_error(&error).unwrap().reason(),
+            Some(http2::Reason::INTERNAL_ERROR)
+        );
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::GoAway));
         driver.abort();
         server.abort();
@@ -390,6 +411,75 @@ mod tests {
             content_length: None,
             stream: Box::pin(stream),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ten_minute_stream_progress_survives_and_reset_is_terminal_once() {
+        let started = tokio::time::Instant::now();
+        let parts = delayed_body(vec![std::time::Duration::from_secs(30); 20]).into_parts();
+        let response = UpstreamResponse::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: None,
+            stream: Box::pin(
+                parts
+                    .stream
+                    .chain(stream::iter([Err(UPSTREAM_HTTP2_RESET)])),
+            ),
+        }
+        .with_body_timeouts(
+            started + std::time::Duration::from_secs(900),
+            std::time::Duration::from_secs(60),
+        );
+        let mut body = response.bytes_stream();
+        for _ in 0..20 {
+            assert_eq!(body.next().await, Some(Ok(Bytes::from_static(b"chunk"))));
+        }
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(body.next().await, Some(Err(UPSTREAM_HTTP2_RESET)));
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn locally_cancelled_http2_stream_is_not_remote_reset_evidence() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = http2::server::handshake(server_io).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let (sender, connection) = http2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let request = http::Request::post("https://example.test/v1/responses")
+            .body(())
+            .unwrap();
+        let (response, mut request_body) = sender.send_request(request, false).unwrap();
+        request_body.send_reset(http2::Reason::CANCEL);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), response)
+            .await
+            .expect("local cancellation must terminate")
+            .unwrap_err();
+        let evidence = codex_http2_error(&error).expect("local reset retains typed evidence");
+        assert!(evidence.is_reset());
+        assert!(!evidence.is_remote());
+        assert!(!evidence.is_library());
+        assert_eq!(evidence.reason(), Some(http2::Reason::CANCEL));
+        assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
+        driver.abort();
+        server.abort();
+    }
+
+    #[test]
+    fn io_reset_and_bare_reason_do_not_claim_http2_frame_evidence() {
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(codex_http2_error(&error).is_none());
+        assert!(codex_http2_error(&http2::Error::from(http2::Reason::CANCEL)).is_none());
     }
 
     #[tokio::test(start_paused = true)]
