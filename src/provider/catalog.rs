@@ -170,7 +170,9 @@ pub enum ResponsesViaChatDialect {
 /// (so the operator form renders it with an explanatory description) and read
 /// by the routing bridge when converting Responses requests.
 pub const RESPONSES_VIA_CHAT_COMPACTION_CONFIG: &str = "responses_via_chat_compaction";
+pub const HTTP_JSON_PROVIDER_DRIVER: &str = "http-json";
 pub const NEW_API_PROVIDER_DRIVER: &str = "new-api";
+pub const ONE_API_PROVIDER_ALIAS: &str = "one-api";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -220,16 +222,18 @@ impl RequestCompatibility {
     }
 }
 
-/// Retired CBCNX accounts use the generic HTTP JSON upstream.
+/// Normalize public connector aliases before provider lookup, persistence, or
+/// protocol selection. `new-api` remains its own reviewed transport contract.
 pub fn canonicalize_provider_driver(driver: &str) -> &str {
     match driver {
-        "cbcnx" => "http-json",
+        "cbcnx" | "openai-compatible" => HTTP_JSON_PROVIDER_DRIVER,
+        ONE_API_PROVIDER_ALIAS => NEW_API_PROVIDER_DRIVER,
         other => other,
     }
 }
 
 pub fn is_openai_compatible_http_driver(driver: &str) -> bool {
-    canonicalize_provider_driver(driver) == "http-json"
+    canonicalize_provider_driver(driver) == HTTP_JSON_PROVIDER_DRIVER
 }
 
 pub fn is_new_api_driver(driver: &str) -> bool {
@@ -439,8 +443,8 @@ impl ProviderCatalog {
             "description": "Only enable when this account supports POST /v1/responses/compact. Converts Responses compaction_trigger into that endpoint and wraps the result as Responses SSE when requested."
         });
         let mut types = vec![ProviderType {
-            id: "http-json".to_owned(),
-            display_name: "HTTP JSON upstream".to_owned(),
+            id: HTTP_JSON_PROVIDER_DRIVER.to_owned(),
+            display_name: "OpenAI Compatible".to_owned(),
             protocols: vec![
                 "openai".to_owned(),
                 "anthropic".to_owned(),

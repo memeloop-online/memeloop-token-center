@@ -558,6 +558,10 @@ fn http_json_compact_bridge_is_an_optional_account_capability() {
 fn retired_cbcnx_accounts_use_http_json() {
     let catalog = ProviderCatalog::builtins();
     assert_eq!(canonicalize_provider_driver("cbcnx"), "http-json");
+    assert_eq!(
+        canonicalize_provider_driver("openai-compatible"),
+        "http-json"
+    );
     assert!(is_openai_compatible_http_driver("cbcnx"));
     assert!(!catalog.list().iter().any(|provider| provider.id == "cbcnx"));
     let http_json = catalog
@@ -565,6 +569,15 @@ fn retired_cbcnx_accounts_use_http_json() {
         .expect("retired CBCNX maps to http-json");
     assert_eq!(http_json.id, "http-json");
     assert!(catalog.is_public("cbcnx"));
+}
+
+#[test]
+fn one_api_alias_uses_the_existing_new_api_provider() {
+    let catalog = ProviderCatalog::builtins();
+    assert_eq!(canonicalize_provider_driver("one-api"), "new-api");
+    assert_eq!(catalog.get("one-api").unwrap().id, "new-api");
+    assert!(is_new_api_driver("one-api"));
+    assert!(!is_openai_compatible_http_driver("one-api"));
 }
 
 #[test]

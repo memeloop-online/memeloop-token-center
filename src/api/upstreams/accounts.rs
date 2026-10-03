@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::provider::canonicalize_provider_driver;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,11 +28,12 @@ pub(in crate::api) async fn create_upstream(
     let service = require_service(&headers, &state, "providers:write").await?;
     let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
-    if !state.providers.is_public(&body.driver) {
+    let driver = canonicalize_provider_driver(&body.driver).to_owned();
+    if !state.providers.is_public(&driver) {
         return Err(AppError::BadRequest("unknown provider driver".into()));
     }
-    validate_provider_config_schema(&state, &body.driver, &body.config)?;
-    validate_provider_credential_schema(&state, &body.driver, &body.credential)?;
+    validate_provider_config_schema(&state, &driver, &body.config)?;
+    validate_provider_credential_schema(&state, &driver, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
     if credential.provider_adapter_secret_patch()?.is_some() {
@@ -41,30 +43,22 @@ pub(in crate::api) async fn create_upstream(
     }
     if !state
         .providers
-        .supports_direct_credential(&body.driver, credential.auth_kind())
+        .supports_direct_credential(&driver, credential.auth_kind())
     {
         return Err(AppError::BadRequest(
             "this upstream must be connected with its authorization flow".into(),
         ));
     }
-    validate_upstream_destination(&body.driver, &body.config, &service, &state).await?;
+    validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     credential.validate(unix_millis())?;
-    validate_upstream_proxy(
-        &body.driver,
-        &body.config,
-        &credential,
-        &service,
-        &state,
-        true,
-    )
-    .await?;
+    validate_upstream_proxy(&driver, &body.config, &credential, &service, &state, true).await?;
     let mut account = state
         .db
         .create_upstream_account(
             CreateUpstreamAccountInput {
                 tenant_external_id: body.tenant_external_id,
                 name: body.name,
-                driver: body.driver,
+                driver,
                 config: body.config,
                 credential,
                 oauth_session_id: None,
