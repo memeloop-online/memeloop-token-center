@@ -365,12 +365,13 @@ struct QueuedArchiveChunk {
 }
 
 pub(crate) struct ResponseArchiveSettlement {
-    writer: super::OwnedTask<()>,
+    _writer: super::OwnedTask<()>,
 }
 
 impl ResponseArchiveSettlement {
+    #[cfg(test)]
     pub(crate) async fn wait(mut self) {
-        if let Some(Err(error)) = self.writer.wait().await {
+        if let Some(Err(error)) = self._writer.wait().await {
             tracing::warn!(
                 stage = "response_spool_writer",
                 error_category = error.diagnostic_category(),
@@ -382,7 +383,7 @@ impl ResponseArchiveSettlement {
     #[cfg(test)]
     pub(crate) fn pending_for_test(released: tokio::sync::oneshot::Receiver<()>) -> Self {
         Self {
-            writer: super::OwnedTask::spawn(
+            _writer: super::OwnedTask::spawn(
                 async move {
                     released.await.map_err(|_| AppError::Internal)?;
                     Ok(())
@@ -459,6 +460,17 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
         memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Option<Self> {
+        let archive_permit = match state
+            .proxy_archive_stream_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(request_id = %identity.request_id, stage = "response_spool_admission", outcome = "capacity", "proxy archive gap");
+                return None;
+            }
+        };
         if !memory.try_grow(
             super::CAPTURE_MEMORY_BYTES,
             crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
@@ -477,10 +489,12 @@ impl ResponseArchiveProducer {
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
         let failure_active = active.clone();
-        let writer_state = state.clone();
+        let mut writer_state = state.clone();
+        writer_state.db = state.persistence_db.clone();
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
+                let _archive_permit = archive_permit;
                 let _queue_memory = writer_memory;
                 let _capture_metrics = writer_state.metrics.memory_usage(
                     crate::metrics::MemoryComponent::StreamCapture,
@@ -622,7 +636,7 @@ impl ResponseArchiveProducer {
         }
         sender.take();
         writer.continue_on_drop();
-        Some(ResponseArchiveSettlement { writer })
+        Some(ResponseArchiveSettlement { _writer: writer })
     }
 }
 

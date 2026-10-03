@@ -43,6 +43,7 @@ mod kimi;
 mod memory_admission;
 mod memory_metrics;
 mod passthrough_reservation;
+mod persistence_isolation;
 mod phase_diagnostics;
 mod postgres_attempt_deadline;
 mod recovery_wait;
@@ -2801,8 +2802,23 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
     .unwrap();
 }
 
-async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+async fn drain_archive_capture(fixture: &CodexRouteFixture) {
     fixture.state.db.drain_gateway_persistence_for_test().await;
+    fixture.state.persistence.drain_for_test().await;
+    let _writers = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .state
+            .proxy_archive_stream_permits
+            .acquire_many(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32),
+    )
+    .await
+    .expect("bounded stream persistence drain")
+    .unwrap();
+}
+
+async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+    drain_archive_capture(fixture).await;
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
@@ -4175,7 +4191,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
 
     wait_for_request_settlement(&fixture, 1).await;
-    fixture.state.db.drain_gateway_persistence_for_test().await;
+    drain_archive_capture(&fixture).await;
     let rows = fixture
         .state
         .db
@@ -4658,7 +4674,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(body.as_ref(), sse.as_bytes());
 
     wait_for_request_settlement(&fixture, 1).await;
-    fixture.state.db.drain_gateway_persistence_for_test().await;
+    drain_archive_capture(&fixture).await;
     let rows = fixture
         .state
         .db
@@ -4842,7 +4858,7 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
-    fixture.state.db.drain_gateway_persistence_for_test().await;
+    drain_archive_capture(&fixture).await;
     let gap = sqlx::query(
         "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
                 cleaned_at

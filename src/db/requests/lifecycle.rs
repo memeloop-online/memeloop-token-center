@@ -201,9 +201,53 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None)
+        self.start_proxy_request_inner(input, None, true)
             .await
             .map(|started| started.reservation)
+    }
+
+    pub(crate) async fn start_proxy_forwarding_request(
+        &self,
+        input: StartProxyRequest<'_>,
+    ) -> Result<UsageReservation, AppError> {
+        self.start_proxy_request_inner(input, None, false)
+            .await
+            .map(|started| started.reservation)
+            .map_err(|error| match error {
+                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                other => other,
+            })
+    }
+
+    pub(crate) async fn publish_proxy_started_event(
+        &self,
+        identity: ArchiveSpoolIdentity,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let row = sqlx::query("SELECT * FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string())
+            .fetch_one(&mut *transaction).await?;
+        let started = NewRequest {
+            request_id: identity.request_id,
+            tenant_id: identity.tenant_id,
+            key_id: parse_uuid(row.try_get("key_id")?)?,
+            reservation_id: identity.reservation_id,
+            protocol: row.try_get("protocol")?,
+            model: row.try_get("model")?,
+            request_object: row.try_get("request_object")?,
+            upstream_account_id: None,
+            model_route_id: None,
+        };
+        insert_request_started_event_in_transaction(
+            &mut transaction,
+            &started,
+            row.try_get("created_at")?,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn start_metered_synchronous_request(
@@ -265,7 +309,7 @@ impl Database {
     ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)))
+            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true)
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -286,6 +330,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
+        publish_started: bool,
     ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
@@ -432,8 +477,10 @@ impl Database {
         // batches are inserted. The event and admission remain one commit,
         // without holding the cross-tenant cursor during compression/inserts.
         BudgetHold::set_phase(&mut hold, "event_cursor");
-        insert_request_started_event_in_transaction(&mut transaction, &started_request, now)
-            .await?;
+        if publish_started {
+            insert_request_started_event_in_transaction(&mut transaction, &started_request, now)
+                .await?;
+        }
         // No cancellation deadline: only a positively observed COMMIT permits
         // dispatch. Unknown COMMIT returns unavailable, leaving orphan recovery
         // to settle any admission which actually committed without dispatch.
@@ -990,6 +1037,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_proxy_request_with_buffered_archive_and_upstream_attribution(
         &self,
         input: FinishProxyRequest<'_>,
@@ -1912,7 +1960,7 @@ async fn insert_request_started_event_in_transaction(
     let event =
         allocate_request_event_cursor(transaction, now, &tenant_id, &key_id, &request_id).await?;
     sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) SELECT $1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0 WHERE EXISTS (SELECT 1 FROM request_records WHERE id = $4 AND tenant_id = $2 AND key_id = $3 AND completed_at IS NULL)",
     )
     .bind(&event.event_id)
     .bind(&tenant_id)

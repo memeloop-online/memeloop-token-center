@@ -4,12 +4,10 @@ use super::*;
 async fn postgres_archive_budget_lock_does_not_block_upstream_dispatch() {
     postgres_archive_lock_isolation(false).await;
 }
-
 #[tokio::test]
 async fn postgres_request_archive_table_lock_does_not_block_response_body() {
     postgres_archive_lock_isolation(true).await;
 }
-
 async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL unset; skipping PostgreSQL attempt deadline contract");
@@ -161,14 +159,10 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     })
     .await
     .expect("upstream must receive the request while the archive budget is still locked");
-    let mut budget_holder = Some(budget_holder);
-    if !lock_request_chunks {
-        budget_holder.take().unwrap().commit().await.unwrap();
-    }
 
     let response = tokio::time::timeout(Duration::from_secs(5), request)
         .await
-        .expect("request must complete after the admission barrier is released")
+        .expect("request must complete while the archive budget lock is still held")
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -178,11 +172,10 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "admitted exactly once"
     );
-    if let Some(holder) = budget_holder {
-        holder.commit().await.unwrap();
-    }
+    budget_holder.commit().await.unwrap();
     upstream.verify().await;
     state.db.drain_gateway_persistence_for_test().await;
+    state.persistence.drain_for_test().await;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

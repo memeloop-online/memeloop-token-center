@@ -27,7 +27,8 @@ fn native_kimi_chat_capture_preserves_documented_cache_usage_without_relaxing_op
 
 #[tokio::test]
 async fn ready_upstream_evidence_wins_when_downstream_is_already_closed() {
-    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
+    let (body_sender, body_receiver) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     drop(body_receiver);
 
     match poll_upstream_or_downstream_closed(&body_sender, std::future::ready("terminal")).await {
@@ -141,27 +142,21 @@ fn send_disconnect_only_finishes_nonempty_pending_terminal_delivery() {
 }
 
 #[tokio::test]
-async fn archive_eof_owner_keeps_the_body_open_until_settlement_handoff_finishes() {
-    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(1);
-    let (settlement_sender, settlement_receiver) = tokio::sync::oneshot::channel();
+async fn archive_settlement_does_not_own_downstream_eof() {
+    let (body_sender, body_receiver) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let (release, released) = tokio::sync::oneshot::channel();
-    let owner = tokio::spawn(hold_response_eof_until_archive_settles(
-        settlement_receiver,
-        body_sender.clone(),
-        proxy_diagnostics::Context::new(),
-    ));
     let settlement =
         crate::response_archive_spool::ResponseArchiveSettlement::pending_for_test(released);
-    assert!(settlement_sender.send(Some(settlement)).is_ok());
+    drop(settlement);
     drop(body_sender);
     tokio::task::yield_now().await;
     assert!(
-        !body_receiver.is_closed(),
-        "the independently owned sender must keep graceful HTTP drain open"
+        body_receiver.is_closed(),
+        "pending archive work must not retain HTTP delivery ownership"
     );
 
     release.send(()).unwrap();
-    owner.await.unwrap();
     assert!(body_receiver.is_closed());
 }
 

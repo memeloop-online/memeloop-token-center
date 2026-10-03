@@ -17,19 +17,23 @@ test('route list exposes group-only candidate scope and readable models without 
     const page = await browser.newPage({ hasTouch: true }); const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     const describedTooltip = async (trigger: Locator, expectedText: string | RegExp) => {
-      // Fluent keeps description portals mounted while hidden; locate the active tooltip by its user-visible content,
-      // then verify its generated ID is the trigger's accessible description.
-      const tooltip = page.getByRole('tooltip').filter({ hasText: expectedText, visible: true });
+      const element = await trigger.elementHandle();
+      assert.ok(element);
+      const idHandle = await page.waitForFunction(currentTrigger => {
+        const ids = (currentTrigger.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+        return ids.length ? ids : null;
+      }, element);
+      const ids = await idHandle.jsonValue() as string[];
+      const tooltip = page.locator(ids.map(id => `[id=${JSON.stringify(id)}]`).join(', ')).and(page.getByRole('tooltip', { includeHidden: true }));
+      assert.equal(await tooltip.count(), 1, 'trigger accessible description must resolve to a single tooltip surface');
       await tooltip.waitFor({ state: 'visible' });
       const tooltipId = await tooltip.getAttribute('id');
       assert.ok(tooltipId, 'visible tooltip must expose an id for its accessible description');
-      const element = await trigger.elementHandle();
-      assert.ok(element);
-      await page.waitForFunction(({ element: currentTrigger, id }) =>
-        (currentTrigger.getAttribute('aria-describedby') ?? '').split(/\s+/).includes(id),
-      { element, id: tooltipId });
       const describedBy = (await trigger.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
       assert.ok(describedBy.includes(tooltipId), 'visible tooltip must be referenced by its trigger accessible description');
+      const text = await tooltip.innerText();
+      if (typeof expectedText === 'string') assert.ok(text.includes(expectedText));
+      else assert.match(text, expectedText);
       return tooltip;
     };
     for (const locale of ['zh-CN', 'en']) {

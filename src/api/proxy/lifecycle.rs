@@ -65,37 +65,6 @@ pub(super) async fn finish_unavailable(
     Ok(response)
 }
 
-pub(super) async fn finish_buffered_proxy_request_with_retry(
-    database: &Database,
-    input: FinishProxyRequest<'_>,
-    archive: &crate::response_archive_spool::BufferedArchive<'_>,
-    upstream_attribution: ProxyRequestUpstreamAttribution,
-) -> Result<FinishProxyRequestResult, AppError> {
-    // Keep the same identity and ciphertext across unknown COMMIT ACKs. Do not
-    // cancel in-flight SQL or replay upstream work to repair archive delivery.
-    for millis in [10, 50, 200] {
-        match database
-            .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
-                input.clone(),
-                archive,
-                upstream_attribution,
-            )
-            .await
-        {
-            Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(Duration::from_millis(millis)).await,
-            Err(error) => return Err(error),
-        }
-    }
-    database
-        .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
-            input,
-            archive,
-            upstream_attribution,
-        )
-        .await
-}
-
 pub(super) async fn run_bounded_proxy_lifecycle<F>(
     deadline: tokio::time::Instant,
     lifecycle: F,

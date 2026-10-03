@@ -24,11 +24,12 @@ pub(in crate::api) async fn classify_codex_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
-mod archive_retention;
+pub(crate) mod archive_retention;
 mod buffered_upstream;
 mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
+pub(crate) mod persistence;
 mod response_metadata;
 mod routing;
 mod sse_capture;
@@ -1158,30 +1159,12 @@ async fn proxy_with_cancellation_guard(
     route_preparation.finish("completed", None, None);
     let admission = proxy_diagnostics::Phase::account(
         diagnostic_context,
-        "request_archive_admission",
+        "request_billing_admission",
         upstream_account_id,
         Some(primary.credential_generation),
     );
     let admitted_request_object = format!("gap://{request_id}/request");
-    let retained_request_json = archive_retention::prepare_request_json(original_request_json);
-    let archive_output_memory = if let Some(retained) = retained_request_json.as_ref() {
-        let Some(reservation) =
-            memory.try_reserve_archive_output(archive_retention::encoded_json_len(retained))
-        else {
-            state
-                .metrics
-                .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
-            return Err(AppError::Overloaded);
-        };
-        Some(reservation)
-    } else {
-        None
-    };
-    let archive_request_body = retained_request_json.as_ref().map_or_else(
-        || body.clone(),
-        |retained| archive_retention::encode_json_body(&body, retained),
-    );
-    drop(retained_request_json);
+    drop(original_request_json);
     let request_capture_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::StreamCapture,
         body.len().saturating_mul(3),
@@ -1201,7 +1184,7 @@ async fn proxy_with_cancellation_guard(
                 upstream_account_id,
                 model_route_id,
             },
-            &archive_request_body,
+            &body,
             state.config.key_pepper.as_bytes(),
             state.config.archive_spool_compression_enabled,
         )
@@ -1209,11 +1192,7 @@ async fn proxy_with_cancellation_guard(
     {
         Ok(started) => started,
         Err(error) => {
-            admission.finish(
-                error.diagnostic_category(),
-                None,
-                Some(archive_request_body.len()),
-            );
+            admission.finish(error.diagnostic_category(), None, Some(body.len()));
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
@@ -1236,15 +1215,10 @@ async fn proxy_with_cancellation_guard(
             .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit),
     }
     let reservation = started_request.reservation;
-    admission.finish("completed", None, Some(archive_request_body.len()));
-    // Freeze policy before admission, but start its absolute network clock only
-    // after the durable request transaction has positively committed. Waiting
-    // for the global archive budget must never consume the candidate budget.
+    admission.finish("completed", None, Some(body.len()));
     attempt_budget.arm();
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
-    drop(archive_request_body);
-    drop(archive_output_memory);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -1282,8 +1256,6 @@ async fn proxy_with_cancellation_guard(
         tenant_id: key.tenant_id,
         memory,
     };
-    // Admission ACK includes reservation, request record, and encrypted sealed
-    // request spool in one transaction. No upstream work starts before it.
     // Native streams and source-backed Responses retain their charged request
     // under the process-wide budget without occupying buffered-response
     // headroom while waiting for headers. An unexpected JSON response must
@@ -2791,58 +2763,6 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    // Seal the independent response spool in the terminal transaction. Only
-    // its durable ACK gates delivery, never an object-store upload.
-    let capture_started = Instant::now();
-    let response_capture_permit = request.state.proxy_memory_budget.reservation();
-    let base_capture_bytes = body.len().max(256);
-    let response_capture_admitted = archive_response
-        && (request.memory.has_buffered_response()
-            || response_capture_permit.try_grow(
-                base_capture_bytes,
-                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-            ));
-    let response_capture_memory = response_capture_admitted.then(|| {
-        request.state.metrics.memory_usage(
-            crate::metrics::MemoryComponent::StreamCapture,
-            base_capture_bytes.saturating_mul(3),
-        )
-    });
-    let archive_body = if response_capture_admitted {
-        let retained_response_json = archive_retention::prepare_json_body_if_valid(&body);
-        let encoded_len = retained_response_json
-            .as_ref()
-            .map_or(body.len(), archive_retention::encoded_json_len);
-        let extra_output_bytes = encoded_len.saturating_sub(base_capture_bytes);
-        if extra_output_bytes > 0 && !response_capture_permit.try_grow(extra_output_bytes, 1) {
-            None
-        } else {
-            Some(retained_response_json.as_ref().map_or_else(
-                || body.clone(),
-                |retained| archive_retention::encode_json_body(&body, retained),
-            ))
-        }
-    } else {
-        None
-    };
-    let response_archive = archive_response.then(|| {
-        archive_body.as_ref().map_or_else(
-            || Err(AppError::Overloaded),
-            |archive_body| {
-                BufferedArchive::new(
-                    crate::db::ArchiveSpoolIdentity {
-                        request_id,
-                        tenant_id: request.tenant_id,
-                        reservation_id: request.reservation.id,
-                    },
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    archive_body,
-                    request.state.config.key_pepper.as_bytes(),
-                    request.state.config.archive_spool_compression_enabled,
-                )
-            },
-        )
-    });
     let stored_response =
         inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
     let routing_session_id = request
@@ -2889,33 +2809,23 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     };
     let terminal_phase = proxy_diagnostics::Phase::new(
         proxy_diagnostics::Context::for_request(request_id),
-        "buffered_archive_settlement",
+        "buffered_billing_settlement",
     );
-    let result = match response_archive {
-        Some(Ok(archive)) => {
-            lifecycle::finish_buffered_proxy_request_with_retry(
-                &request.state.db,
-                terminal,
-                &archive,
-                upstream_attribution,
-            )
-            .await
-        }
-        Some(Err(_)) => {
-            tracing::warn!(
-                phase = "response_encrypt",
-                error_code = "capture_failed",
-                elapsed_ms = capture_started.elapsed().as_millis() as u64,
-                "proxy archive gap"
-            );
-            finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
-                .await
-        }
-        None => {
-            finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
-                .await
-        }
-    };
+    let result =
+        finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
+            .await;
+    if archive_response && result.is_ok() {
+        persistence::capture(
+            request.state,
+            crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: request.tenant_id,
+                reservation_id: request.reservation.id,
+            },
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
+            body.clone(),
+        );
+    }
     terminal_phase.finish(
         if result.is_ok() {
             "completed"
@@ -2925,8 +2835,6 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         Some(status.as_u16()),
         Some(body.len()),
     );
-    drop(response_capture_memory);
-    drop(response_capture_permit);
     if result.is_err() {
         tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }
