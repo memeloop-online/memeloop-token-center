@@ -929,6 +929,35 @@ async fn proxy_with_identity_and_conversation_spool(
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
+    let mut cancellation = lifecycle::CancellationGuard::default();
+    let result = proxy_with_cancellation_guard(
+        state,
+        headers,
+        body,
+        protocol,
+        key,
+        pinned_route,
+        memory,
+        conversation_spool,
+        &mut cancellation,
+    )
+    .await;
+    cancellation.disarm();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_with_cancellation_guard(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Option<Uuid>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    cancellation: &mut lifecycle::CancellationGuard,
+) -> Result<Response, AppError> {
     let official_codex_client =
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
@@ -1189,6 +1218,13 @@ async fn proxy_with_identity_and_conversation_spool(
             return Err(error);
         }
     };
+    cancellation.arm(
+        state.db.clone(),
+        diagnostic_context,
+        key.tenant_id,
+        started_request.reservation.clone(),
+        proxy_lifecycle_permit,
+    );
     match started_request.archive_admission {
         crate::db::RequestArchiveAdmission::Captured
         | crate::db::RequestArchiveAdmission::Queued => {}
@@ -1935,7 +1971,7 @@ async fn proxy_with_identity_and_conversation_spool(
         sse_framing_limits,
         response_headers,
         buffered_request,
-        proxy_lifecycle_permit,
+        proxy_lifecycle_permit: cancellation.handoff()?,
         dispatch_permit,
     })
     .await

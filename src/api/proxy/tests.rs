@@ -24,6 +24,7 @@ use crate::{
 mod anthropic_bridge;
 mod archive_terminal;
 mod buffered_responses_incomplete;
+mod cancellation;
 mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
