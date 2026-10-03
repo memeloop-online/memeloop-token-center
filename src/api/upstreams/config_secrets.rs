@@ -170,6 +170,7 @@ pub(super) fn redact_account(
     state: &AppState,
     account: &mut UpstreamAccountView,
 ) -> Result<(), AppError> {
+    account.driver = crate::provider::canonicalize_provider_driver(&account.driver).to_owned();
     let Some(provider) = state.providers.get(&account.driver) else {
         // An unavailable plugin cannot supply trustworthy annotations.
         account.config = Value::Object(Map::new());

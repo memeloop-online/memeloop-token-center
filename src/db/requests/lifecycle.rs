@@ -835,6 +835,50 @@ impl Database {
         reservation: &UsageReservation,
         duration_ms: i64,
     ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_unobserved_proxy_request(
+            request_id,
+            tenant_id,
+            reservation,
+            duration_ms,
+            (504, "request_lifecycle_timeout"),
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_cancelled_proxy_request(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        reservation: &UsageReservation,
+        duration_ms: i64,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        let mut reservation = reservation.clone();
+        reservation.reserved_tokens = sqlx::query_scalar(
+            "SELECT reserved_tokens FROM usage_reservations WHERE id = $1 AND key_id = $2 AND account_id = $3",
+        )
+        .bind(reservation.id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(reservation.account_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        self.finish_unobserved_proxy_request(
+            request_id,
+            tenant_id,
+            &reservation,
+            duration_ms,
+            (499, "request_cancelled"),
+        )
+        .await
+    }
+
+    async fn finish_unobserved_proxy_request(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        reservation: &UsageReservation,
+        duration_ms: i64,
+        terminal: (i64, &'static str),
+    ) -> Result<FinishProxyRequestResult, AppError> {
         let pending = sqlx::query(
             "SELECT error_code, input_tokens, output_tokens, service_tier FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL",
         )
@@ -895,10 +939,10 @@ impl Database {
             input_token_ceiling,
             output_token_ceiling,
             requested_service_tier: requested_service_tier.as_deref(),
-            status_code: 504,
+            status_code: terminal.0,
             duration_ms: duration_ms.max(0),
             usage: TokenUsage::default(),
-            error_code: Some("request_lifecycle_timeout"),
+            error_code: Some(terminal.1),
             response_object: &response_object,
             routing_session_id: None,
             routing_terminal_observed_at: None,
