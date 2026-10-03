@@ -159,7 +159,7 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await dialog.locator('.usage-custom-range input').last().fill('2026-09-02T00:00');
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
     await page.waitForFunction(() => (window as unknown as { usageAnalysisFixture: { calls: string[] } }).usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?')).length >= 3);
-    await page.evaluate(() => { window.usageAnalysisFixture.presets.named.push({ name: 'unsupported-filter', ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'contains', value: { type: 'model', value: 'public-model' } }] }, updated_at: Date.now() }); });
+    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { presets: { named: Array<{ name: string; ast: unknown; updated_at: number }> } } }).usageAnalysisFixture.presets.named.push({ name: 'unsupported-filter', ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'contains', value: { type: 'model', value: 'public-model' } }] }, updated_at: Date.now() }); });
     await filter.click();
     await dialog.getByRole('button', { name: 'unsupported-filter' }).click();
     await dialog.getByRole('alert').getByText('Usage analysis cannot apply duplicate fields or unsupported conditions.').waitFor();
@@ -190,10 +190,10 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     await dialog.getByRole('button', { name: 'Apply filters' }).click();
     await filter.click();
     await dialog.getByPlaceholder('Filter name').fill('failed-save');
-    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = true; });
+    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { failSaves: boolean } }).usageAnalysisFixture.failSaves = true; });
     await dialog.getByRole('button', { name: 'Save filter' }).click();
     await dialog.getByRole('alert').getByText('Preset storage failed').waitFor();
-    await page.evaluate(() => { window.usageAnalysisFixture.failSaves = false; });
+    await page.evaluate(() => { (window as unknown as { usageAnalysisFixture: { failSaves: boolean } }).usageAnalysisFixture.failSaves = false; });
     for (let condition = 0; condition < 10; condition += 1) await dialog.getByRole('button', { name: 'Add condition' }).click();
     assert.equal(await dialog.getByRole('button', { name: 'Add condition' }).isDisabled(), true, 'period and credential reserve two AST slots');
     const beforeClearCount = (await calls()).length;
