@@ -251,6 +251,9 @@ async fn hidden_exact_selection_bootstraps_route_creation_and_candidate_admissio
 #[tokio::test]
 async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
     let (state, _directory, server, account) = fixture().await;
+    let observer = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let base = format!("/internal/v1/upstreams/{account}/models");
     let token = &state.config.service_token;
     catalog(
@@ -266,7 +269,7 @@ async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
         "SELECT current_snapshot_id FROM upstream_model_catalog_state WHERE upstream_account_id = $1",
     )
     .bind(account.to_string())
-    .fetch_one(&state.db.pool)
+    .fetch_one(&observer)
     .await
     .unwrap();
     let (_, diagnostic, _) = request(
@@ -303,7 +306,7 @@ async fn absent_or_invalid_metadata_cannot_bootstrap_an_alias() {
         "SELECT current_snapshot_id FROM upstream_model_catalog_state WHERE upstream_account_id = $1",
     )
     .bind(account.to_string())
-    .fetch_one(&state.db.pool)
+    .fetch_one(&observer)
     .await
     .unwrap();
     assert_eq!(retained_snapshot, working_snapshot);
