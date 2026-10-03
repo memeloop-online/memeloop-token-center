@@ -83,7 +83,7 @@ impl Database {
             return Err(AppError::Internal);
         }
         let reservation = self
-            .start_proxy_request(input)
+            .start_proxy_forwarding_request(input)
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -94,10 +94,16 @@ impl Database {
             tenant_id,
             reservation_id: reservation.id,
         };
+        let nodes = crate::gateway_body::memory::JsonMemoryScanner::default().observe(body);
+        let charge = body
+            .len()
+            .saturating_mul(3)
+            .saturating_add(nodes.saturating_mul(256))
+            .saturating_add(4 * 1024 * 1024);
         let archive_admission = if body.len() > super::archive_spool::REQUEST_ARCHIVE_PLAIN_LIMIT {
             tracing::warn!(%request_id, reason = "retention_limit", "request archive omitted");
             RequestArchiveAdmission::GapRetentionLimit
-        } else if let Some(permits) = self.gateway_persistence.try_admit(body.len()) {
+        } else if let Some(permits) = self.gateway_persistence.try_admit(charge) {
             let body = Bytes::copy_from_slice(body);
             let pepper = pepper.to_vec();
             let mut database = self.clone();
@@ -112,6 +118,15 @@ impl Database {
                         .acquire()
                         .await
                         .map_err(|_| AppError::Internal)?;
+                    if let Err(error) = database.publish_proxy_started_event(identity).await {
+                        tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
+                    }
+                    let retained = crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
+                    let body = retained.as_ref().map_or_else(
+                        || body.clone(),
+                        |retained| crate::api::proxy::archive_retention::encode_json_body(&body, retained),
+                    );
+                    drop(retained);
                     database
                         .capture_deferred_request_archive(
                             identity,

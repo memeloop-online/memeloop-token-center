@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, deferredPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -40,6 +40,15 @@ test("RSS acceptance requires real peak cap AND retained-memory recovery", () =>
 
 test("missing permit telemetry never masquerades as returned permits", () => {
   assert.throws(() => permitEvidence(""), /required permit gauge absent/u);
+});
+
+test("archive gaps require explicit finite capacity evidence", () => {
+  const metrics = ["accepted", "capacity", "failed"]
+    .map((outcome, index) => `memeloop_token_center_deferred_persistence_total{outcome="${outcome}"} ${index}`)
+    .join("\n");
+  assert.deepEqual(deferredPersistenceEvidence(metrics), { accepted: 0, capacity: 1, failed: 2 });
+  assert.throws(() => deferredPersistenceEvidence(""), /required deferred persistence counter absent/u);
+  assert.throws(() => deferredPersistenceEvidence(metrics.replace("} 1", "} NaN")), /invalid deferred persistence counter/u);
 });
 
 test("allocator evidence preserves every jemalloc state", () => {
