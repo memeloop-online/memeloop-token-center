@@ -1,55 +1,85 @@
 use super::*;
+use std::sync::{Mutex, OnceLock};
 
-const DIAGNOSTIC_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const DIAGNOSTIC_QUEUE_CAPACITY: usize = 64;
 
-/// No untrusted strings leave this diagnostic boundary. In particular, inferred
-/// body semantics never enter the transport's retry classification.
-pub(super) async fn observe(response: UpstreamResponse, request_id: Uuid) {
-    let content_type = content_type_class(response.headers());
-    let result = if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RETRYABLE_ERROR_BYTES as u64)
-    {
-        Err("too_large")
-    } else {
-        match tokio::time::timeout(DIAGNOSTIC_WAIT, read_complete(response)).await {
-            Ok(result) => result,
-            Err(_) => Err("timed_out"),
-        }
-    };
-    let (read_result, diagnostic) = match result {
-        Ok(body) => ("complete", body_diagnostic(&body)),
-        Err(reason) => (reason, unknown_diagnostic()),
-    };
-    tracing::warn!(
-        %request_id,
-        stage = "codex_upstream_bad_request",
-        upstream_error_classification = "unclassifiable",
-        upstream_error_reason = "content_type",
-        upstream_content_type_class = content_type,
-        upstream_diagnostic_read = read_result,
-        upstream_body_reason = diagnostic.reason,
-        upstream_error_type = diagnostic.error_type,
-        upstream_error_code = diagnostic.error_code,
-        upstream_error_param = diagnostic.error_param,
-        "Codex upstream rejected the request"
-    );
+#[derive(Debug)]
+struct Diagnostic {
+    request_id: Uuid,
+    content_type: &'static str,
+    dispatch: tracing::Dispatch,
 }
 
-async fn read_complete(response: UpstreamResponse) -> Result<Vec<u8>, &'static str> {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "read_failed")?;
-        if chunk.len() > MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
-            return Err("too_large");
+static DIAGNOSTIC_QUEUE: OnceLock<Mutex<Option<tokio::sync::mpsc::Sender<Diagnostic>>>> =
+    OnceLock::new();
+
+/// Record only response metadata. The current response abstraction cannot
+/// safely tee an untrusted body without retaining it in the request path, so
+/// non-JSON diagnostics intentionally do not preserve or inspect body bytes.
+/// This path is bounded to one fixed-label event and never feeds retry or
+/// classification decisions.
+pub(super) fn observe(response: &UpstreamResponse, request_id: Uuid) {
+    let content_type = content_type_class(response.headers());
+    let queue = DIAGNOSTIC_QUEUE.get_or_init(|| Mutex::new(None));
+    let diagnostic = Diagnostic {
+        request_id,
+        content_type,
+        dispatch: tracing::dispatcher::get_default(Clone::clone),
+    };
+    let enqueue_result = {
+        let mut sender = queue.lock().expect("diagnostic queue lock poisoned");
+        if sender
+            .as_ref()
+            .is_none_or(tokio::sync::mpsc::Sender::is_closed)
+        {
+            let (new_sender, mut receiver) =
+                tokio::sync::mpsc::channel::<Diagnostic>(DIAGNOSTIC_QUEUE_CAPACITY);
+            tokio::spawn(async move {
+                while let Some(diagnostic) = receiver.recv().await {
+                    tracing::dispatcher::with_default(&diagnostic.dispatch, || {
+                        tracing::warn!(
+                            request_id = %diagnostic.request_id,
+                            stage = "codex_upstream_bad_request",
+                            upstream_error_classification = "unclassifiable",
+                            upstream_error_reason = "content_type",
+                            upstream_content_type_class = diagnostic.content_type,
+                            upstream_diagnostic_read = "not_attempted",
+                            "Codex upstream rejected the request"
+                        );
+                    });
+                }
+            });
+            *sender = Some(new_sender);
         }
-        body.extend_from_slice(&chunk);
-        // Even a continuously-ready stream of empty chunks must yield so the
-        // outer diagnostic deadline can cancel the read.
-        tokio::task::yield_now().await;
+        sender
+            .as_ref()
+            .expect("diagnostic sender initialized")
+            .try_send(diagnostic)
+    };
+    if enqueue_result.is_err() {
+        let queue_closed = {
+            let sender = queue.lock().expect("diagnostic queue lock poisoned");
+            sender
+                .as_ref()
+                .is_none_or(tokio::sync::mpsc::Sender::is_closed)
+        };
+        if queue_closed {
+            observe(response, request_id);
+            return;
+        }
     }
-    Ok(body)
+    if enqueue_result.is_err() {
+        tracing::warn!(
+            %request_id,
+            stage = "codex_upstream_bad_request",
+            upstream_error_classification = "unclassifiable",
+            upstream_error_reason = "content_type",
+            upstream_content_type_class = content_type,
+            upstream_diagnostic_read = "not_attempted",
+            upstream_diagnostic_enqueue = "dropped_queue_full",
+            "Codex upstream diagnostic was dropped after bounded queue admission"
+        );
+    }
 }
 
 fn content_type_class(headers: &http::HeaderMap) -> &'static str {
@@ -76,26 +106,4 @@ fn content_type_class(headers: &http::HeaderMap) -> &'static str {
         "application/octet-stream" => "octet_stream",
         _ => "other",
     }
-}
-
-fn unknown_diagnostic() -> BadRequestDiagnostic {
-    BadRequestDiagnostic {
-        error_type: None,
-        error_code: None,
-        error_param: None,
-        reason: "unknown",
-    }
-}
-
-fn body_diagnostic(body: &[u8]) -> BadRequestDiagnostic {
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        return bad_request_diagnostic(&value);
-    }
-    let mut diagnostic = unknown_diagnostic();
-    // Plaintext/HTML can suggest a fixed category, but never proves the
-    // response came from the model backend rather than an edge proxy.
-    if let Ok(text) = std::str::from_utf8(body) {
-        diagnostic.reason = diagnostic_reason(Some(text), None);
-    }
-    diagnostic
 }

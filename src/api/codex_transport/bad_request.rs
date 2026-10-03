@@ -41,9 +41,9 @@ pub(in crate::api) async fn classify_bad_request(
     if response.status() == http::StatusCode::BAD_REQUEST
         && !has_single_json_content_type(&response)
     {
-        // Sniffing is diagnostic only: even a JSON-looking transient error
-        // without the required content type must never gain replay authority.
-        non_json::observe(response, request_id).await;
+        // Do not let an untrusted body delay delivery of the upstream error.
+        // The response is still classified conservatively and never replayed.
+        non_json::observe(&response, request_id);
         return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
     }
     let disposition = inspect_bad_request(response, request_id).await;
@@ -512,6 +512,12 @@ mod tests {
         let disposition = classify_bad_request(response, Uuid::nil())
             .with_subscriber(subscriber)
             .await;
+        for _ in 0..16 {
+            if !capture.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             disposition,
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType)
@@ -626,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_json_tool_reason_does_not_change_content_type_disposition() {
+    async fn non_json_diagnostic_does_not_read_untrusted_body() {
         let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
             status: http::StatusCode::BAD_REQUEST,
             headers: http::HeaderMap::new(),
@@ -637,105 +643,8 @@ mod tests {
             ))])),
         })
         .await;
-        assert_eq!(fields["upstream_body_reason"], "collaboration_not_enabled");
-        assert_eq!(fields["upstream_diagnostic_read"], "complete");
-    }
-
-    #[tokio::test]
-    async fn non_json_body_semantics_never_grant_replay_or_log_provider_bytes() {
-        for (content_types, body, content_class, reason) in [
-            (
-                vec!["text/plain; private-canary"],
-                br#"{"error":{"type":"temporarily_unavailable","message":"private-canary"}}"#
-                    .as_slice(),
-                "text_plain",
-                "unknown",
-            ),
-            (
-                vec![],
-                br#"{"error":{"code":"invalid_encrypted_content","message":"private-canary"}}"#
-                    .as_slice(),
-                "missing",
-                "encrypted_content_rejected",
-            ),
-            (
-                vec!["text/html"],
-                b"<html>Invalid input private-canary https://private-canary.invalid</html>"
-                    .as_slice(),
-                "text_html",
-                "input_shape_invalid",
-            ),
-            (
-                vec!["application/json", "text/plain; private-canary"],
-                b"invalid encrypted content private-canary".as_slice(),
-                "multiple",
-                "encrypted_content_rejected",
-            ),
-            (
-                vec!["application/octet-stream"],
-                b"\xffprivate-canary".as_slice(),
-                "octet_stream",
-                "unknown",
-            ),
-        ] {
-            let mut headers = http::HeaderMap::new();
-            for value in content_types {
-                headers.append(header::CONTENT_TYPE, http::HeaderValue::from_static(value));
-            }
-            let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
-                status: http::StatusCode::BAD_REQUEST,
-                headers,
-                version: http::Version::HTTP_2,
-                content_length: None,
-                stream: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
-                    body,
-                ))])),
-            })
-            .await;
-            assert_eq!(fields["upstream_content_type_class"], content_class);
-            assert_eq!(fields["upstream_diagnostic_read"], "complete");
-            assert_eq!(fields["upstream_body_reason"], reason);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn non_json_diagnostic_obeys_byte_and_time_limits_without_promoting_partial_body() {
-        for case in ["declared_large", "chunk_large", "read_failed", "timed_out"] {
-            let mut headers = http::HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                http::HeaderValue::from_static("text/plain"),
-            );
-            let stream: super::super::super::upstream_response::UpstreamByteStream = match case {
-                "declared_large" | "timed_out" => Box::pin(futures_util::stream::pending()),
-                "chunk_large" => Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from(
-                    vec![b'x'; MAX_RETRYABLE_ERROR_BYTES + 1],
-                ))])),
-                _ => Box::pin(futures_util::stream::iter([
-                    Ok(bytes::Bytes::from_static(
-                        b"invalid encrypted content private-canary",
-                    )),
-                    Err("private-canary transport error"),
-                ])),
-            };
-            let started = tokio::time::Instant::now();
-            let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
-                status: http::StatusCode::BAD_REQUEST,
-                headers,
-                version: http::Version::HTTP_2,
-                content_length: (case == "declared_large")
-                    .then_some(MAX_RETRYABLE_ERROR_BYTES as u64 + 1),
-                stream,
-            })
-            .await;
-            let expected = match case {
-                "declared_large" | "chunk_large" => "too_large",
-                _ => case,
-            };
-            assert_eq!(fields["upstream_diagnostic_read"], expected);
-            assert_eq!(fields["upstream_body_reason"], "unknown");
-            assert!(started.elapsed() <= std::time::Duration::from_secs(1));
-        }
+        assert_eq!(fields["upstream_diagnostic_read"], "not_attempted");
+        assert!(!fields.to_string().contains("private-canary"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -789,6 +698,12 @@ mod tests {
                 .with_subscriber(subscriber)
                 .await;
             assert_eq!(disposition, BadRequestDisposition::Unclassifiable(reason));
+            for _ in 0..16 {
+                if !capture.0.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
             assert_eq!(logged.lines().count(), 1, "{reason:?}: {logged}");
             assert!(!logged.contains("canary"), "{logged}");

@@ -440,7 +440,7 @@ impl ProviderCatalog {
         });
         let mut types = vec![ProviderType {
             id: "http-json".to_owned(),
-            display_name: "HTTP JSON upstream".to_owned(),
+            display_name: "OpenAI Compatible".to_owned(),
             protocols: vec![
                 "openai".to_owned(),
                 "anthropic".to_owned(),
