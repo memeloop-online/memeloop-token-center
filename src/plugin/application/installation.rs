@@ -28,6 +28,8 @@ struct InstallPolicy {
     cosign_public_keys: Vec<PathBuf>,
     #[serde(default)]
     cosign_keyless: Option<crate::plugin::CosignKeylessIdentity>,
+    #[serde(default, deserialize_with = "deserialize_source_keyless")]
+    source_keyless: BTreeMap<String, crate::plugin::CosignKeylessIdentity>,
     #[serde(default)]
     source_credentials: BTreeMap<String, CredentialFiles>,
 }
@@ -132,11 +134,7 @@ impl ApplicationPlugins {
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if !policy.plugin_root.is_absolute()
             || policy.allowed_sources.is_empty()
-            || (policy.cosign_public_keys.is_empty() == policy.cosign_keyless.is_none())
-            || policy
-                .cosign_keyless
-                .as_ref()
-                .is_some_and(|identity| !identity.valid())
+            || !policy.signer_policy_valid()
             || policy.cosign_public_keys.len() > 8
             || policy
                 .cosign_public_keys
@@ -375,16 +373,7 @@ impl ApplicationPlugins {
                 for source in &policy.allowed_sources {
                     command.arg("--allowed-source").arg(source);
                 }
-                for key in &policy.cosign_public_keys {
-                    command.arg("--cosign-public-key").arg(key);
-                }
-                if let Some(identity) = &policy.cosign_keyless {
-                    command
-                        .arg("--cosign-certificate-identity")
-                        .arg(&identity.identity)
-                        .arg("--cosign-certificate-oidc-issuer")
-                        .arg(&identity.issuer);
-                }
+                policy.apply_signer(reference, &mut command)?;
                 if let Some(credentials) = policy.credentials_for(reference) {
                     credentials.apply(&mut command);
                 }
@@ -742,10 +731,96 @@ impl CredentialFiles {
 }
 
 impl InstallPolicy {
+    fn signer_policy_valid(&self) -> bool {
+        if self.source_keyless.is_empty() {
+            return self.cosign_public_keys.is_empty() != self.cosign_keyless.is_none()
+                && self
+                    .cosign_keyless
+                    .as_ref()
+                    .is_none_or(|identity| identity.valid());
+        }
+        self.cosign_public_keys.is_empty()
+            && self.cosign_keyless.is_none()
+            && self.source_keyless.len() <= 16
+            && self.source_keyless.keys().eq(self.allowed_sources.iter())
+            && self
+                .source_keyless
+                .values()
+                .all(|identity| identity.valid())
+    }
+
+    fn apply_signer(
+        &self,
+        reference: &str,
+        command: &mut tokio::process::Command,
+    ) -> Result<(), AppError> {
+        let (source, digest) = reference
+            .rsplit_once("@sha256:")
+            .ok_or(AppError::Forbidden)?;
+        if !self.signer_policy_valid()
+            || !self.allowed_sources.contains(source)
+            || source.contains('@')
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AppError::Forbidden);
+        }
+        let identity = if self.source_keyless.is_empty() {
+            self.cosign_keyless.as_ref()
+        } else {
+            Some(self.source_keyless.get(source).ok_or(AppError::Forbidden)?)
+        };
+        for key in &self.cosign_public_keys {
+            command.arg("--cosign-public-key").arg(key);
+        }
+        if let Some(identity) = identity {
+            command
+                .arg("--cosign-certificate-identity")
+                .arg(&identity.identity)
+                .arg("--cosign-certificate-oidc-issuer")
+                .arg(&identity.issuer);
+        }
+        Ok(())
+    }
+
     fn credentials_for(&self, reference: &str) -> Option<&CredentialFiles> {
         let (source, _) = reference.rsplit_once("@sha256:")?;
         self.source_credentials.get(source)
     }
+}
+
+fn deserialize_source_keyless<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, crate::plugin::CosignKeylessIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SourceKeylessVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for SourceKeylessVisitor {
+        type Value = BTreeMap<String, crate::plugin::CosignKeylessIdentity>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("at most sixteen unique exact source signer entries")
+        }
+
+        fn visit_map<M>(self, mut entries: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut identities = BTreeMap::new();
+            while let Some((source, identity)) = entries.next_entry()? {
+                if identities.len() == 16 || identities.insert(source, identity).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate or excessive source signers",
+                    ));
+                }
+            }
+            Ok(identities)
+        }
+    }
+
+    deserializer.deserialize_map(SourceKeylessVisitor)
 }
 
 // The final name never exists without a complete, durable owner receipt. A
@@ -1086,6 +1161,10 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     if let Some(identity) = &policy.cosign_keyless {
         trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
     }
+    if !policy.source_keyless.is_empty() {
+        trust["source_keyless"] =
+            serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::Internal)?;
+    }
     super::super::plugin_configuration_schema_digest(&trust)
 }
 
@@ -1191,6 +1270,159 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use tower::ServiceExt;
+
+    fn source_signer_policy() -> serde_json::Value {
+        json!({
+            "plugin_root": "/var/lib/plugins",
+            "allowed_sources": ["ghcr.io/example/health", "ghcr.io/example/claude"],
+            "source_keyless": {
+                "ghcr.io/example/health": {
+                    "issuer": "https://token.actions.githubusercontent.com",
+                    "identity": "https://github.com/example/health/.github/workflows/publish.yml@refs/heads/master"
+                },
+                "ghcr.io/example/claude": {
+                    "issuer": "https://token.actions.githubusercontent.com",
+                    "identity": "https://github.com/example/claude/.github/workflows/publish.yml@refs/heads/master"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn source_keyless_selects_only_exact_signer_arguments() {
+        let policy: InstallPolicy = serde_json::from_value(source_signer_policy()).unwrap();
+        assert!(policy.signer_policy_valid());
+        for (source, identity) in &policy.source_keyless {
+            let mut command = tokio::process::Command::new("install-plugin-oci");
+            policy
+                .apply_signer(&format!("{source}@sha256:{}", "a".repeat(64)), &mut command)
+                .unwrap();
+            let arguments: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                arguments,
+                vec![
+                    "--cosign-certificate-identity",
+                    &identity.identity,
+                    "--cosign-certificate-oidc-issuer",
+                    &identity.issuer
+                ]
+            );
+        }
+        for reference in [
+            format!("ghcr.io/example/unknown@sha256:{}", "a".repeat(64)),
+            format!("ghcr.io/example/claude/child@sha256:{}", "a".repeat(64)),
+            format!("ghcr.io/example/claude:latest@sha256:{}", "a".repeat(64)),
+            "ghcr.io/example/claude".into(),
+            "ghcr.io/example/claude@sha256:bad".into(),
+        ] {
+            let mut command = tokio::process::Command::new("install-plugin-oci");
+            assert!(policy.apply_signer(&reference, &mut command).is_err());
+            assert_eq!(command.as_std().get_args().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_keyless_rejects_invalid_policy_at_load_and_selection() {
+        let (directory, state, _, _) = fixture().await;
+        let authority = state.application_plugins.as_ref().unwrap();
+        let valid = source_signer_policy();
+        let mut invalid = Vec::new();
+        for (field, value) in [
+            (
+                "cosign_keyless",
+                valid["source_keyless"]["ghcr.io/example/health"].clone(),
+            ),
+            ("cosign_public_keys", json!(["/run/trust/pub.pem"])),
+            ("allowed_sources", json!(["ghcr.io/example/health"])),
+            (
+                "allowed_sources",
+                json!([
+                    "ghcr.io/example/health",
+                    "ghcr.io/example/claude",
+                    "ghcr.io/example/extra"
+                ]),
+            ),
+        ] {
+            let mut policy = valid.clone();
+            policy[field] = value;
+            invalid.push(policy);
+        }
+        for (field, value) in [
+            ("issuer", "https://untrusted.example"),
+            (
+                "identity",
+                "https://github.com/example/*/.github/workflows/publish.yml@refs/heads/master",
+            ),
+        ] {
+            let mut policy = valid.clone();
+            policy["source_keyless"]["ghcr.io/example/claude"][field] = json!(value);
+            invalid.push(policy);
+        }
+        for value in invalid {
+            std::fs::write(
+                directory.path().join("policy.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            assert!(authority.install_policy().await.is_err());
+            let policy: InstallPolicy = serde_json::from_value(value).unwrap();
+            let mut command = tokio::process::Command::new("install-plugin-oci");
+            assert!(
+                policy
+                    .apply_signer(
+                        &format!("ghcr.io/example/claude@sha256:{}", "a".repeat(64)),
+                        &mut command
+                    )
+                    .is_err()
+            );
+            assert_eq!(command.as_std().get_args().count(), 0);
+        }
+        let identity =
+            serde_json::to_string(&valid["source_keyless"]["ghcr.io/example/health"]).unwrap();
+        let duplicate = format!(
+            r#"{{"plugin_root":"/plugins","allowed_sources":["source"],"source_keyless":{{"source":{identity},"source":{identity}}}}}"#
+        );
+        assert!(serde_json::from_str::<InstallPolicy>(&duplicate).is_err());
+        let mut excessive = valid;
+        excessive["source_keyless"] = json!({});
+        for index in 0..17 {
+            excessive["source_keyless"][format!("source-{index}")] =
+                serde_json::from_str(&identity).unwrap();
+            if index == 15 {
+                assert!(serde_json::from_value::<InstallPolicy>(excessive.clone()).is_ok());
+            }
+        }
+        assert!(serde_json::from_value::<InstallPolicy>(excessive).is_err());
+    }
+
+    #[tokio::test]
+    async fn source_keyless_fingerprint_binds_mapping_and_preserves_legacy() {
+        let mut value = source_signer_policy();
+        let policy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        let original = trust_digest(&policy).await.unwrap();
+        let health = value["source_keyless"]["ghcr.io/example/health"].clone();
+        value["source_keyless"]["ghcr.io/example/health"] =
+            value["source_keyless"]["ghcr.io/example/claude"].clone();
+        value["source_keyless"]["ghcr.io/example/claude"] = health.clone();
+        let swapped: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert_ne!(original, trust_digest(&swapped).await.unwrap());
+        value.as_object_mut().unwrap().remove("source_keyless");
+        value["cosign_keyless"] = health;
+        let legacy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        let expected = super::super::super::plugin_configuration_schema_digest(&json!({
+            "sources": legacy.allowed_sources, "keys": [], "keyless": legacy.cosign_keyless
+        }))
+        .unwrap();
+        assert_eq!(expected, trust_digest(&legacy).await.unwrap());
+        value["source_keyless"] = json!({});
+        let empty: InstallPolicy = serde_json::from_value(value).unwrap();
+        assert!(empty.signer_policy_valid());
+        assert_eq!(expected, trust_digest(&empty).await.unwrap());
+    }
 
     #[tokio::test]
     async fn keyless_policy_is_exclusive_and_identity_changes_invalidate_review() {
