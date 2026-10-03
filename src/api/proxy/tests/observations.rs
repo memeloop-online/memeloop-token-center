@@ -30,6 +30,7 @@ async fn queued_delivery_recovery_cannot_clear_a_newer_health_epoch() {
             1,
             revision,
             fixture.state.config.upstream_health,
+            None,
         )
         .await
         .unwrap();
