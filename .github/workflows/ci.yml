@@ -304,7 +304,7 @@ jobs:
         run: |
           cd claude-code-wire-fixture
           cargo build --locked --release --target wasm32-unknown-unknown
-          cargo run --release --manifest-path componentize/Cargo.toml -- \
+          cargo run --locked --release --manifest-path componentize/Cargo.toml -- \
             target/wasm32-unknown-unknown/release/mtc_claude_code_wire.wasm plugin.wasm
           cd ..
           MTC_CLAUDE_WIRE_FIXTURE="$GITHUB_WORKSPACE/claude-code-wire-fixture" \
