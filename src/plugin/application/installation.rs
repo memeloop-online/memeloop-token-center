@@ -1330,6 +1330,12 @@ mod tests {
         let (directory, state, _, _) = fixture().await;
         let authority = state.application_plugins.as_ref().unwrap();
         let valid = source_signer_policy();
+        std::fs::write(
+            directory.path().join("policy.json"),
+            serde_json::to_vec(&valid).unwrap(),
+        )
+        .unwrap();
+        assert!(authority.install_policy().await.is_ok());
         let mut invalid = Vec::new();
         for (field, value) in [
             (
@@ -1404,6 +1410,12 @@ mod tests {
         let mut value = source_signer_policy();
         let policy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
         let original = trust_digest(&policy).await.unwrap();
+        for field in ["identity", "issuer"] {
+            let mut changed = source_signer_policy();
+            changed["source_keyless"]["ghcr.io/example/claude"][field] = json!("changed");
+            let changed: InstallPolicy = serde_json::from_value(changed).unwrap();
+            assert_ne!(original, trust_digest(&changed).await.unwrap());
+        }
         let health = value["source_keyless"]["ghcr.io/example/health"].clone();
         value["source_keyless"]["ghcr.io/example/health"] =
             value["source_keyless"]["ghcr.io/example/claude"].clone();
@@ -1418,6 +1430,16 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(expected, trust_digest(&legacy).await.unwrap());
+        for source in &legacy.allowed_sources {
+            let mut command = tokio::process::Command::new("install-plugin-oci");
+            legacy
+                .apply_signer(&format!("{source}@sha256:{}", "a".repeat(64)), &mut command)
+                .unwrap();
+            assert_eq!(
+                command.as_std().get_args().nth(1).unwrap(),
+                legacy.cosign_keyless.as_ref().unwrap().identity.as_str()
+            );
+        }
         value["source_keyless"] = json!({});
         let empty: InstallPolicy = serde_json::from_value(value).unwrap();
         assert!(empty.signer_policy_valid());
