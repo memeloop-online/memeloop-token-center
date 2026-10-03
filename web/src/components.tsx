@@ -9,7 +9,7 @@ import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
-import { requestErrorCopy } from './requestStatusPresentation';
+import { requestErrorCopy, requestFailureCause } from './requestStatusPresentation';
 import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -248,6 +248,7 @@ export function RequestDiagnostics({
   const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
+  const failureCause = requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
@@ -260,7 +261,7 @@ export function RequestDiagnostics({
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
-      {request.error_code && <div className="request-detail-wide"><b>{t('request.error')}</b><DetailTooltip content={`${t('traffic.errorCode')}: ${request.error_code}`}><span tabIndex={0}>{requestErrorCopy(request.error_code, locale)}</span></DetailTooltip></div>}
+      {failureCause && <div className="request-detail-wide"><b>{t('request.error')}</b><span>{failureCause}</span></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>
@@ -347,7 +348,7 @@ export function RequestTable({
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
               </td>}
-              <td className="request-status-cell" data-label={t('request.status')}><RequestStatus request={request} />{request.error_code && <span className="visually-hidden">{request.error_code}</span>}</td>
+              <td className="request-status-cell" data-label={t('request.status')}><RequestStatus request={request} /></td>
               <td className="request-duration-cell" data-label={t('request.duration')}>{durationDetails ? <DetailTooltip content={durationDetails}>{durationValue}</DetailTooltip> : durationValue}</td>
               <td className="request-tps-cell" data-label="TPS"><RequestOutputRate request={request} /></td>
               {onSelect && <td className="request-actions-cell"><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}

@@ -338,6 +338,8 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let terminal_result = finish_proxy_request_with_archive_fallback(
         &state.db,
         FinishProxyRequest {
+            terminal_cause: transport_error
+                .and_then(upstream_response::terminal_cause_from_stream_error),
             usage_basis: Some(usage_basis),
             first_output_ms,
             generation_duration_ms,

@@ -48,14 +48,28 @@ async fn assert_terminal_cause_contract(database_url: &str) {
         .await
         .unwrap();
 
-    for (error_code, expected) in [
-        (Some("upstream_http2_reset"), Some("upstream_http2_reset")),
-        (Some("upstream_http2_goaway"), Some("upstream_http2_goaway")),
-        (Some("upstream_read_timeout"), Some("upstream_read_timeout")),
-        (Some("http_502"), None),
-        (Some("Bearer untrusted-diagnostic"), None),
-        (Some("transport_http2_reset_delivery_unknown"), None),
-        (None, None),
+    use crate::model::RequestTerminalCause;
+    for (error_code, terminal_cause, expected) in [
+        (
+            Some("http_502"),
+            Some(RequestTerminalCause::Http2Reset),
+            Some("upstream_http2_reset"),
+        ),
+        (
+            Some("http_502"),
+            Some(RequestTerminalCause::Http2GoAway),
+            Some("upstream_http2_goaway"),
+        ),
+        (
+            Some("http_502"),
+            Some(RequestTerminalCause::ReadTimeout),
+            Some("upstream_read_timeout"),
+        ),
+        (Some("upstream_http2_reset"), None, None),
+        (Some("http_502"), None, None),
+        (Some("Bearer untrusted-diagnostic"), None, None),
+        (Some("transport_http2_reset_delivery_unknown"), None, None),
+        (None, None, None),
     ] {
         let request_id = Uuid::now_v7();
         let reservation = database
@@ -78,7 +92,8 @@ async fn assert_terminal_cause_contract(database_url: &str) {
             .await
             .unwrap();
         assert_eq!(pending.view.terminal_cause_code, None);
-        let finish = |code| FinishProxyRequest {
+        let finish = |code, cause| FinishProxyRequest {
+            terminal_cause: cause,
             usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
@@ -99,14 +114,17 @@ async fn assert_terminal_cause_contract(database_url: &str) {
         };
         assert!(matches!(
             database
-                .finish_proxy_request(finish(error_code))
+                .finish_proxy_request(finish(error_code, terminal_cause))
                 .await
                 .unwrap(),
             FinishProxyRequestResult::Finished { .. }
         ));
         assert!(matches!(
             database
-                .finish_proxy_request(finish(Some("upstream_request_timeout")))
+                .finish_proxy_request(finish(
+                    Some("upstream_request_timeout"),
+                    Some(RequestTerminalCause::RequestTimeout)
+                ))
                 .await
                 .unwrap(),
             FinishProxyRequestResult::AlreadyFinished { .. }
@@ -207,7 +225,12 @@ async fn assert_terminal_cause_contract(database_url: &str) {
 async fn terminal_cause_upgrade_preserves_unknown_historical_causes() {
     use super::super::migrations::{SQLITE_MIGRATIONS, apply_migration_range};
 
-    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upgrade.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
     sqlx::raw_sql(
         "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL);
          CREATE TABLE request_records (id TEXT PRIMARY KEY, error_code TEXT);

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod request_terminal_cause;
+pub use request_terminal_cause::RequestTerminalCause;
+
 pub const MONEY_SCALE: i64 = 1_000_000;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 

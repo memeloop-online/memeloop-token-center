@@ -13,6 +13,7 @@ const recorded: RequestView = {
   request_id: 'request', created_at: 100, completed_at: 800,
   protocol: 'openai', model: 'model', status_code: 200, duration_ms: 400,
   input_tokens: 100, output_tokens: 20, cost: '1', error_code: null,
+  terminal_cause_code: null,
   upstream_account_id: 'upstream', route_id: 'route', currency: 'USD',
   cached_input_tokens: 30, cache_write_tokens: 10,
   credential_identity: { tenant_external_id: 'tenant', key_id: 'key', key_alias: 'Research key', principal_external_id: 'research-team' },
@@ -95,4 +96,19 @@ test('missing cache telemetry remains absent instead of becoming zero', () => {
   const terminal = requestViewFromEvent({ ...event, cached_input_tokens: 0, cache_write_tokens: 0 }, pending);
   assert.equal(terminal?.cached_input_tokens, 0);
   assert.equal(terminal?.cache_write_tokens, 0);
+});
+
+test('legacy SSE without terminal cause preserves the recorded typed cause', () => {
+  const failed: RequestView = {
+    ...recorded, status_code: 502,
+    error_code: 'upstream_eof_without_terminal', terminal_cause_code: 'upstream_eof_without_terminal',
+  };
+  const start: RequestEvent = { ...event, event_kind: 'started', status_code: null };
+  assert.deepEqual(requestViewFromEvent(start, failed), failed);
+  assert.equal(requestViewFromEvent(event, failed)?.terminal_cause_code, 'upstream_eof_without_terminal');
+  const terminal: RequestEvent = {
+    ...event, status_code: 502,
+    error_code: 'upstream_eof_without_terminal', terminal_cause_code: 'upstream_eof_without_terminal',
+  };
+  assert.equal(requestViewFromEvent(terminal, recorded)?.terminal_cause_code, 'upstream_eof_without_terminal');
 });

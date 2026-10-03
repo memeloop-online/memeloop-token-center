@@ -19,6 +19,12 @@ test('conversation content precedes optional operational timelines', () => {
   assert.doesNotMatch(view, /className="session-detail" role=\{onClose/);
 });
 
+test('session timeline failure presentation shares the allowlisted recorded cause and never renders raw codes', () => {
+  assert.match(view, /const failureCause = requestFailureCause\(request, locale\) \?\? \(request\.error_code \? requestErrorCopy\(request\.error_code, locale\) : null\);/);
+  assert.match(view, /\{failureCause && <code className="error-code">\{failureCause\}<\/code>\}/);
+  assert.doesNotMatch(view, /\{request\.error_code\}/, 'raw recorded error codes never render as copy');
+});
+
 test('request inspection retains the selected conversation', () => {
   assert.match(monitor, /onSelect=\{\(request\) => \{ void onSelectRequest\(request\); \}\}/);
   assert.match(monitor, /SessionCredentialFilter value=\{draft.keyId\}/);

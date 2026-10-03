@@ -9,6 +9,9 @@ enum Failure {
     PreHeaderReset,
     PreHeaderSilence,
     PostHeaderSilence,
+    RejectedReset,
+    RejectedPlain,
+    RejectedPriorReset,
 }
 
 async fn http2_failure_upstream(
@@ -44,7 +47,7 @@ async fn http2_failure_upstream(
                             assert_eq!(request.version(), http::Version::HTTP_2);
                             assert_eq!(request.method(), http::Method::POST);
                             assert_eq!(request.uri().path(), codex_transport::RESPONSES_PATH);
-                            count.fetch_add(1, Ordering::SeqCst);
+                            let attempt = count.fetch_add(1, Ordering::SeqCst);
                             match failure {
                                 Failure::PreHeaderReset => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PreHeaderSilence => held_headers.push(response),
@@ -55,6 +58,24 @@ async fn http2_failure_upstream(
                                         .body(())
                                         .unwrap();
                                     held_streams.push(response.send_response(headers, false).unwrap());
+                                }
+                                Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset => {
+                                    let headers = http::Response::builder()
+                                        .status(502)
+                                        .header(http::header::CONTENT_TYPE, "application/json")
+                                        .body(())
+                                        .unwrap();
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    if matches!(failure, Failure::RejectedReset)
+                                        || matches!(failure, Failure::RejectedPriorReset) && attempt == 0
+                                    {
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                            body.send_reset(http2::Reason::CANCEL);
+                                        });
+                                    } else {
+                                        body.send_data(Bytes::from_static(b"{\"error\":\"upstream_http2_reset Bearer untrusted-diagnostic\"}"), true).unwrap();
+                                    }
                                 }
                             }
                             held_requests.push(request);
@@ -96,7 +117,7 @@ async fn set_short_http2_deadline(fixture: &CodexRouteFixture) {
     pool.close().await;
 }
 
-async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
+async fn assert_terminal_failure(failure: Failure, label: &str) {
     let fixture = codex_route_fixture(label).await;
     set_short_http2_deadline(&fixture).await;
     add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
@@ -122,7 +143,7 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
     .expect("a failed HTTP/2 POST must terminate");
     let expected_delivery_status = match failure {
         Failure::PostHeaderSilence => StatusCode::OK,
-        Failure::PreHeaderReset | Failure::PreHeaderSilence => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_GATEWAY,
     };
     assert_eq!(response.status(), expected_delivery_status);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -130,10 +151,18 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
         .unwrap();
     wait_for_request_settlement(&fixture, 1).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let expected_attempts = if matches!(
+        failure,
+        Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset
+    ) {
+        2
+    } else {
+        1
+    };
     assert_eq!(
         received.load(Ordering::SeqCst),
-        1,
-        "POST must not be replayed"
+        expected_attempts,
+        "only explicit HTTP rejection permits candidate failover"
     );
     release.send(()).unwrap();
     server.await.unwrap();
@@ -151,19 +180,22 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
         Failure::PreHeaderReset => "upstream_transport_http2_reset",
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
+        Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset => "http_502",
+    };
+    let expected_cause = match failure {
+        Failure::RejectedReset => Some("upstream_http2_reset"),
+        Failure::RejectedPlain | Failure::RejectedPriorReset => None,
+        _ => Some(expected_error),
     };
     assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
-    assert_eq!(rows[0].terminal_cause_code.as_deref(), Some(expected_error));
+    assert_eq!(rows[0].terminal_cause_code.as_deref(), expected_cause);
     let detail = fixture
         .state
         .db
         .request_archive_refs(fixture.key_id, rows[0].request_id)
         .await
         .unwrap();
-    assert_eq!(
-        detail.view.terminal_cause_code.as_deref(),
-        Some(expected_error)
-    );
+    assert_eq!(detail.view.terminal_cause_code.as_deref(), expected_cause);
     let events = fixture
         .state
         .db
@@ -174,24 +206,36 @@ async fn assert_failure_is_not_replayed(failure: Failure, label: &str) {
         .iter()
         .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
         .unwrap();
-    assert_eq!(
-        finished.terminal_cause_code.as_deref(),
-        Some(expected_error)
-    );
+    assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
 #[tokio::test]
 async fn pre_header_rst_stream_does_not_replay_or_double_settle() {
-    assert_failure_is_not_replayed(Failure::PreHeaderReset, "h2-pre-header-rst").await;
+    assert_terminal_failure(Failure::PreHeaderReset, "h2-pre-header-rst").await;
 }
 
 #[tokio::test]
 async fn pre_header_silence_does_not_replay_or_double_settle() {
-    assert_failure_is_not_replayed(Failure::PreHeaderSilence, "h2-pre-header-silence").await;
+    assert_terminal_failure(Failure::PreHeaderSilence, "h2-pre-header-silence").await;
 }
 
 #[tokio::test]
 async fn post_header_silence_does_not_replay_or_double_settle() {
-    assert_failure_is_not_replayed(Failure::PostHeaderSilence, "h2-post-header-silence").await;
+    assert_terminal_failure(Failure::PostHeaderSilence, "h2-post-header-silence").await;
+}
+
+#[tokio::test]
+async fn http_502_preserves_verified_final_response_reset_independently() {
+    assert_terminal_failure(Failure::RejectedReset, "h2-502-final-reset").await;
+}
+
+#[tokio::test]
+async fn http_502_does_not_infer_a_cause_from_untrusted_response_text() {
+    assert_terminal_failure(Failure::RejectedPlain, "h2-502-unknown").await;
+}
+
+#[tokio::test]
+async fn http_502_does_not_inherit_an_earlier_attempt_reset() {
+    assert_terminal_failure(Failure::RejectedPriorReset, "h2-502-prior-reset").await;
 }
