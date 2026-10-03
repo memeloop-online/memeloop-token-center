@@ -28,20 +28,20 @@ struct Frame {
     payload: Vec<u8>,
 }
 
-async fn read_frame(stream: &mut TcpStream) -> Frame {
+async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
     let mut header = [0_u8; 9];
-    stream.read_exact(&mut header).await.unwrap();
+    stream.read_exact(&mut header).await?;
     let length =
         usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
     assert!(length <= 16_384, "unexpected HTTP/2 frame length");
     let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).await.unwrap();
-    Frame {
+    stream.read_exact(&mut payload).await?;
+    Ok(Frame {
         kind: header[3],
         flags: header[4],
         stream_id: u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff,
         payload,
-    }
+    })
 }
 
 async fn write_frame(stream: &mut TcpStream, kind: u8, flags: u8, stream_id: u32, payload: &[u8]) {
@@ -64,7 +64,7 @@ async fn wait_for_request_and_ping(stream: &mut TcpStream, posts: &AtomicUsize) 
     let mut settings_seen = false;
     let mut request_stream = None;
     loop {
-        let frame = read_frame(stream).await;
+        let frame = read_frame(stream).await.unwrap();
         match (frame.kind, frame.flags) {
             (FRAME_SETTINGS, flags) if flags & FLAG_ACK == 0 && !settings_seen => {
                 settings_seen = true;
@@ -97,10 +97,25 @@ async fn wait_for_request_and_ping(stream: &mut TcpStream, posts: &AtomicUsize) 
     }
 }
 
-async fn reject_replay_connections(listener: &TcpListener, duration: Duration) {
+async fn reject_replays(listener: &TcpListener, stream: &mut TcpStream, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
+    let monitor_stream = async {
+        loop {
+            match read_frame(stream).await {
+                Ok(frame) => assert_ne!(
+                    frame.kind, FRAME_HEADERS,
+                    "POST replayed on the same connection"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    std::future::pending::<()>().await;
+                }
+                Err(error) => panic!("unexpected frame read error: {error}"),
+            }
+        }
+    };
     tokio::select! {
         _ = tokio::time::sleep_until(deadline) => {}
+        _ = monitor_stream => unreachable!(),
         accepted = listener.accept() => {
             let _ = accepted.unwrap();
             panic!("POST was replayed on another HTTP/2 connection");
@@ -119,10 +134,10 @@ async fn delayed_ping_server(
         let (mut stream, _) = listener.accept().await.unwrap();
         let (request_stream, ping) = wait_for_request_and_ping(&mut stream, &count).await;
         let Some(delay) = ack_delay else {
-            reject_replay_connections(&listener, Duration::from_millis(1_300)).await;
+            reject_replays(&listener, &mut stream, Duration::from_secs(4)).await;
             return;
         };
-        reject_replay_connections(&listener, delay).await;
+        reject_replays(&listener, &mut stream, delay).await;
         write_frame(&mut stream, FRAME_PING, FLAG_ACK, 0, &ping).await;
         write_frame(
             &mut stream,
@@ -138,6 +153,7 @@ async fn delayed_ping_server(
 
 fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPolicy {
     CodexTransportPolicy {
+        connect_timeout_millis: 100,
         read_timeout_millis: read_timeout.as_millis() as u64,
         request_timeout_millis: request_timeout.as_millis() as u64,
         ..CodexTransportPolicy::default()
@@ -146,20 +162,21 @@ fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPo
 
 #[tokio::test]
 async fn delayed_http2_ping_ack_completes_one_quiet_post_within_request_budget() {
-    let request_timeout = Duration::from_millis(1_100);
-    let (endpoint, posts, server) = delayed_ping_server(Some(Duration::from_millis(70))).await;
+    let request_timeout = Duration::from_secs(15);
+    let (endpoint, posts, server) = delayed_ping_server(Some(Duration::from_secs(11))).await;
     let client = build_codex_http2_test_client(
         policy(Duration::from_millis(1_000), request_timeout),
         Duration::from_millis(10),
     )
     .unwrap();
 
-    let response = client
-        .post(endpoint)
-        .body("one quiet POST")
-        .send()
-        .await
-        .expect("a delayed PING ACK within the request budget must complete");
+    let response = tokio::time::timeout(
+        request_timeout,
+        client.post(endpoint).body("one quiet POST").send(),
+    )
+    .await
+    .expect("quiet POST must finish within the request budget")
+    .expect("a delayed PING ACK within the request budget must complete");
 
     assert_eq!(response.version(), http::Version::HTTP_2);
     assert_eq!(response.status(), http::StatusCode::OK);
@@ -184,9 +201,26 @@ async fn unacknowledged_http2_ping_stops_at_request_budget_without_replaying_pos
     .await
     .expect("keepalive ACK wait must use the configured request timeout");
 
+    let error = result.expect_err("unacknowledged PING must close the connection");
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut keepalive_timeout = false;
+    while let Some(current) = source {
+        if current.to_string() == "keep-alive timed out"
+            && current
+                .source()
+                .is_some_and(|cause| cause.to_string() == "operation timed out")
+        {
+            keepalive_timeout = true;
+        }
+        source = current.source();
+    }
     assert!(
-        result.is_err(),
-        "unacknowledged PING must close the connection"
+        keepalive_timeout,
+        "expected keepalive timeout, not EOF: {error:?}"
+    );
+    assert!(
+        !server.is_finished(),
+        "server must remain alive beyond the observation window"
     );
     assert_eq!(posts.load(Ordering::SeqCst), 1, "POST must not be replayed");
     server.await.unwrap();
