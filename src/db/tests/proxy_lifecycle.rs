@@ -1138,7 +1138,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let database_url = isolated_url.to_string();
     let database = Database::connect_with_max(&database_url, 8).await.unwrap();
     database.migrate().await.unwrap();
-    let actual_schema: String = sqlx::query_scalar("SELECT current_schema()")
+    let actual_schema: String = sqlx::query_scalar("SELECT CAST(current_schema() AS TEXT)")
         .fetch_one(&database.pool)
         .await
         .unwrap();
