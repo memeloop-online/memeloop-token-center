@@ -19,7 +19,7 @@ async fn fixture(label: &str) -> CodexRouteFixture {
         .db
         .rotate_codex_transport_proxy(
             account.id,
-            &account.tenant_external_id,
+            account.tenant_external_id.as_deref().unwrap(),
             PRIMARY.into(),
             account.updated_at,
             account.credential_generation,
