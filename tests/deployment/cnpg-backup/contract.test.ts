@@ -79,7 +79,7 @@ test('reviewed contracts and negative mutations fail closed independently of pro
     (value: any[]) => { value.find(entry => entry.kind === 'Job').spec.template.spec.hostNetwork = true; },
     (value: any[]) => { value.find(entry => entry.kind === 'Job').spec.template.spec.containers[0].command[6] = stageContainer.command[6].replace('sleep 0.0625', 'true'); },
     (value: any[]) => { value.find(entry => entry.kind === 'Job').spec.template.spec.containers[0].command[6] = stageContainer.command[6].replace('35651584', '0'); },
-    (value: any[]) => { value.find(entry => entry.kind === 'Job').spec.template.spec.containers[0].command[6] = stageContainer.command[6].replace('wait "$rate_pid"', 'true'); },
+    (value: any[]) => { value.find(entry => entry.kind === 'Job').spec.template.spec.containers[0].command[6] = stageContainer.command[6].replaceAll('wait "$rate_pid"', 'true'); },
   ]) {
     const changed = structuredClone(resources);
     mutate(changed);
@@ -125,7 +125,15 @@ test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full r
   const source = createContainer();
   initializeSource(source);
   const started = performance.now();
-  const output = docker(stageArgs(source));
+  let output: Buffer;
+  try {
+    output = docker(stageArgs(source));
+  } catch (error) {
+    const diagnostic = stageArgs(source);
+    diagnostic[diagnostic.length - 1] = 'printf "approval=%s source=%s storage=%s uuid=%s\\n" "$PARENT_REVIEW_APPROVED" "$SOURCE_IO_REVIEW_APPROVED" "$ROOT_STORAGE_REVIEW_APPROVED" "$EXPECTED_BACKUP_FS_UUID"; command -v findmnt; command -v df; findmnt -n -o UUID -T /backup; findmnt -n -o FSTYPE -T /tmp; df -Pk /tmp; df -Pk /backup; head -c 8192 /tmp/stage.stdout /tmp/stage.stderr 2>/dev/null || true';
+    console.log(docker(diagnostic).toString());
+    throw error;
+  }
   const elapsed = performance.now() - started;
   const size = Number(shell(source, `stat -c %s ${archiveDirectory}/${archiveName}`).toString());
   assert.ok(size > copyChunk * 2);
