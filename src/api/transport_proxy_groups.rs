@@ -51,6 +51,20 @@ pub(super) async fn transport_group_response(
     response
 }
 
+pub(super) async fn transport_group_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let managed = path == "/internal/v1/transport-proxy-groups"
+        || path.starts_with("/internal/v1/transport-proxy-groups/")
+        || (path.starts_with("/internal/v1/upstreams/")
+            && path.ends_with("/transport-proxy-group"));
+    let response = next.run(request).await;
+    if managed {
+        transport_group_response(response).await
+    } else {
+        response
+    }
+}
+
 pub(super) async fn list_transport_groups(
     State(state): State<AppState>,
     headers: HeaderMap,

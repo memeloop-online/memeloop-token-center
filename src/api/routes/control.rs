@@ -480,7 +480,8 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             state.clone(),
             authenticate_control_before_body,
         ))
-        .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS));
+        .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS))
+        .layer(middleware::from_fn(transport_group_headers));
     Router::new()
         .route("/operator", get(operator_index))
         .route(

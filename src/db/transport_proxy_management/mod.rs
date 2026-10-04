@@ -85,13 +85,21 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups")
         .fetch_one(&mut **tx)
         .await?;
-    let rows = sqlx::query("SELECT g.members_ciphertext FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
+    let rows = sqlx::query("SELECT b.account_id, g.members_ciphertext FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
         .fetch_all(&mut **tx).await?;
     let mut bytes = 0usize;
     for row in &rows {
-        bytes += serde_json::to_vec(&open_members(row, key)?)
-            .map_err(|_| AppError::Internal)?
-            .len()
+        let proxies = open_members(row, key)?
+            .into_iter()
+            .map(|member| member.proxy_url)
+            .collect::<Vec<_>>();
+        bytes += serde_json::to_vec(&serde_json::json!([{
+            "account_id":row.try_get::<String, _>("account_id")?,
+            "version":u32::MAX,
+            "proxies":proxies,
+        }]))
+        .map_err(|_| AppError::Internal)?
+        .len()
             + 512;
     }
     if count > 256 || rows.len() > 256 || bytes > 256 * 1024 {
