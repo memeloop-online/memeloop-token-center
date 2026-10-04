@@ -1,7 +1,9 @@
 # Sticky Codex transport proxy groups
 
 This backend slice supports native Codex generation, native Codex OAuth refresh,
-and native Codex catalog reads. Other providers and accounts without a configured
+and native Codex catalog reads. Codex image sends, health probes, quota reads and
+quota reset operations also bind to the same selection without adding retries.
+Other providers and accounts without a configured
 group retain their existing single-proxy behavior. It does not deploy proxies or
 change production accounts.
 

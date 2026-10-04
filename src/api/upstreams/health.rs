@@ -140,6 +140,20 @@ pub(in crate::api) async fn probe_upstream_health(
             })));
         }
     }
+    let credential = if account.driver == "openai-codex" {
+        state
+            .transport_proxy_groups
+            .select(
+                &state.db,
+                account.id,
+                account.credential_generation,
+                &credential,
+            )
+            .await?
+            .credential
+    } else {
+        credential
+    };
     let proxy_configured = credential.proxy().is_some();
     let base_url = match validate_config(&account.config) {
         Ok(base_url) => base_url,
