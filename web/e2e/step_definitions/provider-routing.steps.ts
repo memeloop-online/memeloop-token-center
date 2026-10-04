@@ -146,6 +146,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
   const requestDrawer = page.getByRole('dialog');
   await assertContains(requestDrawer, '429');
+  await requestDrawer.getByRole('button', { name: '技术详情', exact: true }).click();
   await assertContains(requestDrawer, 'upstream rejected the request');
   await requestDrawer.getByRole('button', { name: '关闭', exact: true }).click();
 
