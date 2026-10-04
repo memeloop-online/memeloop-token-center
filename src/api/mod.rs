@@ -72,7 +72,9 @@ mod sessions;
 mod sse;
 mod tenants;
 mod traffic;
+mod transport_proxy_groups;
 mod upstreams;
+use transport_proxy_groups::*;
 mod usage_analysis;
 mod web;
 

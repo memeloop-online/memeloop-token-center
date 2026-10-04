@@ -8,6 +8,7 @@ use std::{
 
 use super::*;
 
+mod managed;
 mod persistence;
 #[cfg(test)]
 mod tests;
@@ -68,6 +69,8 @@ impl Snapshot {
 
 pub(crate) struct TransportProxyGroups {
     groups: BTreeMap<Uuid, Arc<Entry>>,
+    managed: std::sync::RwLock<BTreeMap<Uuid, managed::ManagedEntry>>,
+    key: Vec<u8>,
 }
 
 pub(crate) struct ProxySelection {
@@ -100,11 +103,8 @@ impl TransportProxyGroups {
                     return Err(unavailable());
                 }
             }
-            let mut digest = Sha256::new();
-            digest.update(b"mtc/transport-proxy-group/v1\0");
-            digest.update(key);
-            digest.update(serde_json::to_vec(&group).map_err(|_| unavailable())?);
-            let fingerprint = format!("{:x}", digest.finalize());
+            let fingerprint =
+                Self::fingerprint(group.account_id, group.version, group.proxies.clone(), key)?;
             let account_id = group.account_id;
             let entry = Arc::new(Entry {
                 group,
@@ -119,16 +119,74 @@ impl TransportProxyGroups {
                 return Err(unavailable());
             }
         }
-        Ok(Self { groups })
+        Ok(Self {
+            groups,
+            managed: std::sync::RwLock::new(BTreeMap::new()),
+            key: key.to_vec(),
+        })
     }
 
+    pub(crate) fn fingerprint(
+        account_id: Uuid,
+        version: i64,
+        proxies: Vec<String>,
+        key: &[u8],
+    ) -> Result<String, AppError> {
+        let mut digest = Sha256::new();
+        digest.update(b"mtc/transport-proxy-group/v1\0");
+        digest.update(key);
+        digest.update(
+            serde_json::to_vec(&Group {
+                account_id,
+                version,
+                proxies,
+            })
+            .map_err(|_| unavailable())?,
+        );
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn select(
         &self,
         account_id: Uuid,
         credential_generation: i64,
         credential: &UpstreamCredential,
     ) -> Result<ProxySelection, AppError> {
-        let Some(entry) = self.groups.get(&account_id) else {
+        self.select_config(account_id, credential_generation, credential, &Value::Null)
+    }
+
+    pub(crate) fn select_config(
+        &self,
+        account_id: Uuid,
+        credential_generation: i64,
+        credential: &UpstreamCredential,
+        config: &Value,
+    ) -> Result<ProxySelection, AppError> {
+        let managed = self.managed.read().map_err(|_| unavailable())?;
+        let stamp = config
+            .get(super::transport_proxy_management::CONFIG_KEY)
+            .map(|value| {
+                serde_json::from_value::<super::transport_proxy_management::BindingStamp>(
+                    value.clone(),
+                )
+                .map_err(|_| unavailable())
+            })
+            .transpose()?;
+        let entry = match (stamp.as_ref(), managed.get(&account_id)) {
+            (Some(stamp), None) if stamp.group_id.is_none() && stamp.group_version.is_none() => {
+                None
+            }
+            (Some(stamp), Some(current))
+                if &current.stamp == stamp
+                    && credential_generation >= current.credential_generation =>
+            {
+                current.entry.as_ref()
+            }
+            (Some(_), _) | (None, Some(_)) => return Err(unavailable()),
+            (None, None) => self.groups.get(&account_id),
+        };
+        let Some(entry) = entry else {
             return Ok(ProxySelection {
                 credential: credential.clone(),
                 generation: 0,

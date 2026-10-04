@@ -1061,7 +1061,12 @@ async fn fetch_codex_models(
 ) -> Result<Vec<Value>, &'static str> {
     let selection = state
         .transport_proxy_groups
-        .select(account.id, account.credential_generation, credential)
+        .select_config(
+            account.id,
+            account.credential_generation,
+            credential,
+            &account.config,
+        )
         .map_err(|_| "transport_selection_unavailable")?;
     let credential = &selection.credential;
     credential

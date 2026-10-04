@@ -393,9 +393,9 @@ pub(crate) async fn validate_codex_transport(
         ));
     }
     let proxy = checked_proxy_url(proxy_url)?;
-    if proxy.scheme() != "socks5h" || !has_safe_private_ip_literal_host(&proxy) {
+    if proxy.scheme() != "socks5h" || !has_private_codex_proxy_host(&proxy) {
         return Err(AppError::BadRequest(
-            "OpenAI Codex requires a private IP-literal socks5h proxy".into(),
+            "OpenAI Codex requires a private socks5h proxy".into(),
         ));
     }
     if proxy_scope != OutboundScope::Private {
@@ -508,7 +508,7 @@ pub(crate) async fn client_for_codex_oauth_url(
             "OpenAI Codex authorization requires a remote-DNS SOCKS5 proxy".into(),
         ));
     }
-    if !has_safe_private_ip_literal_host(&proxy) {
+    if !has_private_codex_proxy_host(&proxy) {
         if !allow_test_loopback {
             return Err(AppError::BadRequest(
                 "OpenAI Codex authorization requires a private IP-literal socks5h proxy".into(),
@@ -562,6 +562,46 @@ async fn pinned_no_retry_public_client(
         .into_iter()
         .collect();
     crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+}
+
+pub(crate) async fn validate_managed_codex_proxy(value: &str) -> Result<(), AppError> {
+    crate::provider::validate_codex_proxy_url(value)?;
+    let proxy = checked_proxy_url(value)?;
+    validated_endpoint(&proxy, OutboundScope::Private, false)
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            AppError::BadRequest(
+                "proxy endpoint is outside the approved private network or unavailable".into(),
+            )
+        })
+}
+
+pub(crate) fn has_private_codex_proxy_host(proxy: &Url) -> bool {
+    if has_safe_private_ip_literal_host(proxy) {
+        return true;
+    }
+    let Some(Host::Domain(host)) = proxy.host() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    let Some(service) = host
+        .strip_suffix(".svc.cluster.local")
+        .or_else(|| host.strip_suffix(".svc"))
+    else {
+        return false;
+    };
+    let labels = service.split('.').collect::<Vec<_>>();
+    labels.len() == 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 async fn validated_endpoint(

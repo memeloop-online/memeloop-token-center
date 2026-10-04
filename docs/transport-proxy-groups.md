@@ -1,10 +1,11 @@
 # Sticky Codex proxy groups: backend slice
 
-This is an opt-in backend slice. Group management UI/API are not implemented;
-this is not a complete product delivery or a production rollout. Other providers
-and accounts without group configuration retain their single-proxy behavior.
+Named group management is available through the operator API described in
+[the management contract](transport-proxy-group-management-api.md). UI delivery
+and production rollout are separate. Other providers and accounts without group
+configuration retain their single-proxy behavior.
 
-## Private configuration
+## Legacy private configuration
 
 `MTC_TRANSPORT_PROXY_GROUPS` defaults to `[]`. Supply it through the existing
 Secret mechanism, identically to gateway, control and OAuth worker processes.
@@ -78,8 +79,9 @@ group version. Removing a group restores the existing single-proxy path.
 
 ## Schema and validation
 
-The only new production migration is **0116_transport_proxy_groups.sql**,
-registered for both SQLite and PostgreSQL; Helm declares schema 116. Versions
+Selector persistence uses **0116_transport_proxy_groups.sql**,
+registered for both SQLite and PostgreSQL; management adds migration 117 and Helm
+declares schema 117. Versions
 0114 (#422) and 0115 (#455) remain owned by their PRs. The migration runner checks
 the applied-version set, so gaps need no placeholder or dependency cherry-pick.
 Historical migrations and deployed checksums are unchanged.

@@ -612,6 +612,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "sticky account transport proxy selections",
         sql: include_str!("../../../migrations/common/0116_transport_proxy_groups.sql"),
     },
+    Migration {
+        version: 117,
+        name: "managed transport proxy groups",
+        sql: include_str!("../../../migrations/common/0117_transport_proxy_management.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1207,6 +1212,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 116,
         name: "sticky account transport proxy selections",
         sql: include_str!("../../../migrations/common/0116_transport_proxy_groups.sql"),
+    },
+    Migration {
+        version: 117,
+        name: "managed transport proxy groups",
+        sql: include_str!("../../../migrations/common/0117_transport_proxy_management.sql"),
     },
 ];
 

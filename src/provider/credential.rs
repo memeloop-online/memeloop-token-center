@@ -518,9 +518,9 @@ pub(crate) fn validate_codex_proxy_url(value: &str) -> Result<(), AppError> {
     validate_proxy_url(value)?;
     let parsed = url::Url::parse(value)
         .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
-    if parsed.scheme() != "socks5h" || !has_safe_private_ip_literal_host(&parsed) {
+    if parsed.scheme() != "socks5h" || !crate::network::has_private_codex_proxy_host(&parsed) {
         return Err(AppError::BadRequest(
-            "OpenAI Codex requires a private IP-literal socks5h proxy with remote DNS".into(),
+            "OpenAI Codex requires a private socks5h proxy with remote DNS".into(),
         ));
     }
     Ok(())

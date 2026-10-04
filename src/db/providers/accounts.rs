@@ -36,6 +36,15 @@ impl Database {
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
+        if input
+            .config
+            .get(super::super::transport_proxy_management::CONFIG_KEY)
+            .is_some()
+        {
+            return Err(AppError::BadRequest(
+                "transport proxy binding is managed separately".into(),
+            ));
+        }
         let _ = validate_config(&input.config)?;
         if input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
             && let Some((proxy_url, proxy_scope)) = input.credential.proxy()
@@ -291,11 +300,10 @@ impl Database {
         &self,
         account_id: Uuid,
         tenant_external_id: &str,
-        input: UpdateUpstreamAccountInput,
+        mut input: UpdateUpstreamAccountInput,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
-        let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let credential_ciphertext = input
             .credential
             .as_ref()
@@ -317,6 +325,19 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let current_view = upstream_account_view(current)?;
+        let stamp_key = super::super::transport_proxy_management::CONFIG_KEY;
+        if let Some(stamp) = current_view.config.get(stamp_key) {
+            input
+                .config
+                .as_object_mut()
+                .ok_or(AppError::Internal)?
+                .insert(stamp_key.into(), stamp.clone());
+        } else if input.config.get(stamp_key).is_some() {
+            return Err(AppError::BadRequest(
+                "transport proxy binding is managed separately".into(),
+            ));
+        }
+        let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         #[cfg(test)]
         self.pause_oauth_refresh_write_phase(
             account_id,
