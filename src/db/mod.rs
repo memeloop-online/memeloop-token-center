@@ -82,6 +82,7 @@ mod session_analytics;
 mod session_projection;
 mod tenants;
 mod transport_proxy_groups;
+pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::TransportProxyGroups;
 mod time;
 mod upstream_account_availability;

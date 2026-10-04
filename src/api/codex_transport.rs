@@ -288,10 +288,11 @@ pub(in crate::api) async fn prepare_image_request(
     }
     let body = serde_json::to_vec(body).map_err(|_| AppError::Internal)?;
 
-    let selection = state.transport_proxy_groups.select(
+    let selection = state.transport_proxy_groups.select_config(
         route.account_id,
         route.credential_generation,
         &route.credential,
+        &route.config,
     )?;
     let mut transport_route = route.clone();
     transport_route.credential = selection.credential.clone();

@@ -248,6 +248,11 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let driver: String = row.try_get("driver")?;
+        let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_bindings WHERE account_id = $1 AND group_id IS NOT NULL")
+            .bind(account_id.to_string()).fetch_one(&mut *tx).await?;
+        if bound != 0 {
+            return Err(AppError::ProxyGroupConflict("proxy_group_in_use"));
+        }
         if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
             if row.try_get::<String, _>("auth_kind")? != "oauth" {
                 return Err(AppError::BadRequest(
@@ -524,7 +529,7 @@ impl Database {
                 "OAuth reauthorization refresh endpoint is required".into(),
             ));
         }
-        let provider_config_json = input
+        let mut provider_config_json = input
             .provider_config
             .as_ref()
             .map(|config| {
@@ -553,6 +558,24 @@ impl Database {
             .await?
             .ok_or(AppError::Forbidden)?;
         let current_session = row.try_get::<Option<String>, _>("oauth_session_id")?;
+        if let Some(encoded) = &provider_config_json {
+            let current: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+                .map_err(|_| AppError::Internal)?;
+            let mut replacement: Value =
+                serde_json::from_str(encoded).map_err(|_| AppError::Internal)?;
+            let stamp_key = super::super::transport_proxy_management::CONFIG_KEY;
+            if let Some(stamp) = current.get(stamp_key) {
+                replacement
+                    .as_object_mut()
+                    .ok_or(AppError::Internal)?
+                    .insert(stamp_key.into(), stamp.clone());
+            } else if replacement.get(stamp_key).is_some() {
+                return Err(AppError::BadRequest(
+                    "transport proxy binding is managed separately".into(),
+                ));
+            }
+            provider_config_json = Some(replacement.to_string());
+        }
         let completed_session = input.oauth_session_id.to_string();
         if current_session.as_deref() == Some(completed_session.as_str()) {
             let ciphertext = row.try_get::<Option<String>, _>("credential_ciphertext")?;

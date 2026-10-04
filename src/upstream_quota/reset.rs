@@ -34,10 +34,11 @@ async fn fresh_snapshot(
     if account.driver != "openai-codex" {
         return Err(blocked());
     }
-    let selection = state.transport_proxy_groups.select(
+    let selection = state.transport_proxy_groups.select_config(
         account.id,
         account.credential_generation,
         credential,
+        &account.config,
     )?;
     let credential = &selection.credential;
     let _permit = state
@@ -325,10 +326,11 @@ pub(crate) async fn confirm(
         return Err(blocked());
     }
     // Prepare the fixed destination before the durable dispatch claim.
-    let selection = state.transport_proxy_groups.select(
+    let selection = state.transport_proxy_groups.select_config(
         account.id,
         account.credential_generation,
         credential,
+        &account.config,
     )?;
     let credential = &selection.credential;
     let account_header =

@@ -65,6 +65,8 @@ pub enum AppError {
     NotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("transport proxy configuration conflict: {0}")]
+    ProxyGroupConflict(&'static str),
     #[error("invalid request: {0}")]
     BadRequest(String),
     #[error("secret schema analysis exceeds the supported complexity limit")]
@@ -96,6 +98,7 @@ impl AppError {
             Self::LimitExceeded { .. } => "limit_exceeded",
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::ProxyGroupConflict(code) => code,
             Self::BadRequest(_) => "invalid_request",
             Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
             Self::Upstream(_) => "upstream",
@@ -137,6 +140,7 @@ impl IntoResponse for AppError {
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
+            Self::ProxyGroupConflict(code) => (StatusCode::CONFLICT, *code, self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
             Self::SchemaSecretAnalysisTooComplex => (
                 StatusCode::BAD_REQUEST,
