@@ -12,6 +12,7 @@ enum Failure {
     RejectedReset,
     RejectedPlain,
     RejectedPriorReset,
+    RejectedFinalReset,
 }
 
 async fn http2_failure_upstream(
@@ -59,15 +60,16 @@ async fn http2_failure_upstream(
                                         .unwrap();
                                     held_streams.push(response.send_response(headers, false).unwrap());
                                 }
-                                Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset => {
+                                Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset | Failure::RejectedFinalReset => {
                                     let headers = http::Response::builder()
-                                        .status(502)
+                                        .status(if matches!(failure, Failure::RejectedPriorReset | Failure::RejectedFinalReset) && attempt == 0 { 429 } else { 502 })
                                         .header(http::header::CONTENT_TYPE, "application/json")
                                         .body(())
                                         .unwrap();
                                     let mut body = response.send_response(headers, false).unwrap();
                                     if matches!(failure, Failure::RejectedReset)
                                         || matches!(failure, Failure::RejectedPriorReset) && attempt == 0
+                                        || matches!(failure, Failure::RejectedFinalReset) && attempt == 1
                                     {
                                         tokio::spawn(async move {
                                             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -120,7 +122,8 @@ async fn set_short_http2_deadline(fixture: &CodexRouteFixture) {
 async fn assert_terminal_failure(failure: Failure, label: &str) {
     let fixture = codex_route_fixture(label).await;
     set_short_http2_deadline(&fixture).await;
-    add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
+    let standby =
+        add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
     fixture.state.codex_clients.install_test_client(
         wreq::Client::builder()
             .http2_only()
@@ -146,14 +149,17 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         _ => StatusCode::BAD_GATEWAY,
     };
     assert_eq!(response.status(), expected_delivery_status);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(!body.contains("untrusted-diagnostic"));
+    assert!(!body.contains("upstream_http2_reset"));
     wait_for_request_settlement(&fixture, 1).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let expected_attempts = if matches!(
         failure,
-        Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset
+        Failure::RejectedPriorReset | Failure::RejectedFinalReset
     ) {
         2
     } else {
@@ -162,7 +168,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(
         received.load(Ordering::SeqCst),
         expected_attempts,
-        "only explicit HTTP rejection permits candidate failover"
+        "only the initial 429 permits candidate failover; 502 and transport failures forbid replay"
     );
     release.send(()).unwrap();
     server.await.unwrap();
@@ -180,10 +186,13 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         Failure::PreHeaderReset => "upstream_transport_http2_reset",
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
-        Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset => "http_502",
+        Failure::RejectedReset
+        | Failure::RejectedPlain
+        | Failure::RejectedPriorReset
+        | Failure::RejectedFinalReset => "http_502",
     };
     let expected_cause = match failure {
-        Failure::RejectedReset => Some("upstream_http2_reset"),
+        Failure::RejectedReset | Failure::RejectedFinalReset => Some("upstream_http2_reset"),
         Failure::RejectedPlain | Failure::RejectedPriorReset => None,
         _ => Some(expected_error),
     };
@@ -207,7 +216,29 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
         .unwrap();
     assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let (expected_account, expected_route) = if expected_attempts == 2 {
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let route_id: String = sqlx::query_scalar(
+            "SELECT id FROM model_routes WHERE upstream_account_id = $1 AND public_model = $2",
+        )
+        .bind(standby.to_string())
+        .bind(&fixture.model)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        (standby, Uuid::parse_str(&route_id).unwrap())
+    } else {
+        (fixture.upstream_account_id, fixture.route_id)
+    };
+    assert_exactly_once_side_effects_for(
+        &fixture,
+        rows[0].request_id,
+        None,
+        expected_account,
+        expected_route,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -238,4 +269,9 @@ async fn http_502_does_not_infer_a_cause_from_untrusted_response_text() {
 #[tokio::test]
 async fn http_502_does_not_inherit_an_earlier_attempt_reset() {
     assert_terminal_failure(Failure::RejectedPriorReset, "h2-502-prior-reset").await;
+}
+
+#[tokio::test]
+async fn http_502_preserves_only_the_final_attempt_reset_after_failover() {
+    assert_terminal_failure(Failure::RejectedFinalReset, "h2-502-final-reset-after-429").await;
 }
