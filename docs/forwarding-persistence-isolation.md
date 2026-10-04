@@ -240,8 +240,9 @@ CI run `37170299514` at `ee940218` failed clippy because the compatibility wrapp
 in production (`src/db/requests/session_routing.rs:40`, `dead_code` under
 `-D warnings`). The precise fix restricts that wrapper to `#[cfg(test)]`; production
 continues using the identity-scoped method. No lint suppression or gate removal.
-The focused regressions had not run at that failure. All rows above remain pending
-new-head GHA acceptance; the comparison is not permission to close #457 or release
+The focused regressions had not run at that failure. The adapted regressions later
+passed on `1f90e5d1` in GHA `37174865435`; the documented convergence differences
+remain, and this comparison is not permission to close #457 or release
 #423. No #455 worktree, migration, typed terminal-cause field, or winning settlement
 CAS has been replaced during this consolidation.
 
@@ -270,6 +271,15 @@ lifecycle-completion barrier so the terminal job has been submitted before drain
 Failure kinds, exact Wasm cooldowns, no-replay and financial assertions are
 unchanged; no production concurrency, queue, cache or CAS implementation changes.
 
-The preserved authentication regression above is included in the same handoff.
-New-head acceptance remains pending GitHub Actions; no local builds or tests were
-run. #457 remains open and unmerged, and #423 remains the sole integration line.
+The preserved authentication regression above is included in `1f90e5d1`.
+GHA `37174865435` passed Clippy, all nine focused routing regressions, all seven
+previously failing cases, the full suite (library: 1526 passed, zero failed, three
+ignored), web and memory acceptance. Its tested merge `69319bd8` includes master
+`5d84ddd2` and #455/#459. No local builds or tests were run.
+
+Merge `8fcb174a` incorporates newer master `07b9220c`, including #458 and migration
+0116, while retaining #455's typed terminal cause and CAS bind 19. This integration
+and later work require fresh GHA validation. #457 remains open and unmerged;
+#423 remains the sole integration line. The next implementation's exact ownership,
+durable API boundaries and required lock/crash tests are specified in
+[the finalization work split](forwarding-finalization-work-split.md).
