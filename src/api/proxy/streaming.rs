@@ -8,6 +8,7 @@ mod terminal_delivery;
 #[cfg(test)]
 mod tests;
 mod timing;
+mod wait_diagnostics;
 
 use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_failure};
 use lifecycle::{
@@ -243,6 +244,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let deadline_metrics = background_state.metrics.clone();
         let deadline_reservation = reservation.clone();
         let deadline_tenant_id = tenant_id;
+        let mut wait_diagnostics = wait_diagnostics::WaitDiagnostics::default();
+        let waits = &mut wait_diagnostics;
         let lifecycle = async move {
             let stream_phase = proxy_diagnostics::Phase::account(
                 diagnostic_context,
@@ -331,7 +334,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 } else {
                     match poll_upstream_downstream_or_progress_heartbeat(
                         &body_sender,
-                        upstream_stream.next(),
+                        waits.upstream(upstream_stream.next()),
                         stream_deadline,
                         progress_heartbeat_deadline,
                     )
@@ -341,6 +344,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             value: next,
                             downstream_closed,
                         }) => {
+                            if next.as_ref().is_some_and(|chunk| {
+                                chunk.as_ref().is_ok_and(|bytes| !bytes.is_empty())
+                            }) {
+                                waits.body_chunk();
+                            }
                             downstream_closed_observed |= downstream_closed;
                             if downstream_closed {
                                 drop(archive_sender.take());
@@ -359,13 +367,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 progress_heartbeat_deadline = None;
                                 continue;
                             };
-                            match tokio::time::timeout(
-                                MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.send(Ok(heartbeat)),
-                            )
-                            .await
+                            match waits
+                                .downstream(tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(Ok(heartbeat)),
+                                ))
+                                .await
                             {
                                 Ok(Ok(())) => {
+                                    waits.heartbeat();
                                     progress_heartbeat_deadline = Some(
                                         tokio::time::Instant::now()
                                             + CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL,
@@ -712,6 +722,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             };
                             match delivery::send_frame(
                                 delivery::FrameDelivery {
+                                    waits,
                                     diagnostic_context,
                                     state: &background_state,
                                     sender: &body_sender,
@@ -876,6 +887,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 for frame in terminal_frames.take() {
                     match delivery::send_frame(
                         delivery::FrameDelivery {
+                            waits,
                             diagnostic_context,
                             state: &background_state,
                             sender: &body_sender,
@@ -965,6 +977,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     ),
                 }
             }
+            waits.terminal(transport_error.unwrap_or("completed"));
             drop(body_sender);
             terminal_delivery_phase.finish(
                 transport_error.unwrap_or("returned"),
@@ -1011,10 +1024,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // it settled its work, not proof that persistence succeeded.
             terminal_phase.finish("returned", None, None);
         };
-        if run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle)
-            .await
-            .is_err()
-        {
+        let lifecycle_result = run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle).await;
+        wait_diagnostics.emit(
+            request_id,
+            if lifecycle_result.is_err() {
+                "lifecycle_deadline"
+            } else {
+                "lifecycle_returned"
+            },
+        );
+        if lifecycle_result.is_err() {
             tracing::error!(
                 %request_id,
                 stage = "lifecycle_deadline",
