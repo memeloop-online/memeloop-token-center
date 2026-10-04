@@ -767,13 +767,7 @@ async fn read_codex(
 ) -> Result<QuotaSnapshot, &'static str> {
     let selection = state
         .transport_proxy_groups
-        .select(
-            &state.db,
-            account.id,
-            account.credential_generation,
-            credential,
-        )
-        .await
+        .select(account.id, account.credential_generation, credential)
         .map_err(|_| "quota_transport_failed")?;
     let credential = &selection.credential;
     let observation_started_at = unix_millis();

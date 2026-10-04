@@ -281,18 +281,14 @@ async fn send_codex_attempt(
     } = context;
     let mut attempted = Vec::with_capacity(4);
     for connect_attempt in 1..=transport_policy.connect_attempts {
-        let selection = tokio::time::timeout_at(
-            deadline.request,
-            state.transport_proxy_groups.select(
-                &state.db,
+        let selection = state
+            .transport_proxy_groups
+            .select(
                 route.route.account_id,
                 route.route.credential_generation,
                 &route.route.credential,
-            ),
-        )
-        .await
-        .map_err(|_| ProxySendError::CandidateUnavailable)?
-        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+            )
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
         if let Some(member) = selection.member() {
             if attempted.contains(&member) {
                 return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
@@ -336,13 +332,9 @@ async fn send_codex_attempt(
         if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
             && selection.member().is_some()
         {
-            tokio::time::timeout_at(
-                deadline.request,
-                selection.advance_after_connect_failure(&state.db, &attempted),
-            )
-            .await
-            .map_err(|_| ProxySendError::CandidateUnavailable)?
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+            selection
+                .advance_after_connect_failure(&attempted)
+                .map_err(|_| ProxySendError::CandidateUnavailable)?;
         }
         match result {
             Err(ProxySendError::RetryableConnection(failure_stage))

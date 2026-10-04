@@ -998,12 +998,11 @@ async fn refresh_managed_upstream_oauth_impl(
             ));
         }
         let transport_selection = if account.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
-            Some(
-                state
-                    .transport_proxy_groups
-                    .select(&state.db, account_id, credential_generation, &credential)
-                    .await?,
-            )
+            Some(state.transport_proxy_groups.select(
+                account_id,
+                credential_generation,
+                &credential,
+            )?)
         } else {
             None
         };

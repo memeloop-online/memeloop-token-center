@@ -143,13 +143,7 @@ pub(in crate::api) async fn probe_upstream_health(
     let credential = if account.driver == "openai-codex" {
         state
             .transport_proxy_groups
-            .select(
-                &state.db,
-                account.id,
-                account.credential_generation,
-                &credential,
-            )
-            .await?
+            .select(account.id, account.credential_generation, &credential)?
             .credential
     } else {
         credential

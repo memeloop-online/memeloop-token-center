@@ -603,9 +603,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
     },
     Migration {
-        version: 114,
+        version: 116,
         name: "sticky account transport proxy selections",
-        sql: include_str!("../../../migrations/common/0114_transport_proxy_groups.sql"),
+        sql: include_str!("../../../migrations/common/0116_transport_proxy_groups.sql"),
     },
 ];
 
@@ -1194,9 +1194,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
     },
     Migration {
-        version: 114,
+        version: 116,
         name: "sticky account transport proxy selections",
-        sql: include_str!("../../../migrations/common/0114_transport_proxy_groups.sql"),
+        sql: include_str!("../../../migrations/common/0116_transport_proxy_groups.sql"),
     },
 ];
 
@@ -1581,6 +1581,9 @@ fn is_default_partition_overlap(error: &sqlx::Error) -> bool {
             if database_error.code().as_deref() == Some("23514")
     )
 }
+
+#[cfg(test)]
+mod proxy_group_tests;
 
 #[cfg(test)]
 mod tests {

@@ -55,13 +55,7 @@ async fn selection(fixture: &CodexRouteFixture) -> (String, i64) {
     let selected = fixture
         .state
         .transport_proxy_groups
-        .select(
-            &fixture.state.db,
-            account.id,
-            account.credential_generation,
-            &credential,
-        )
-        .await
+        .select(account.id, account.credential_generation, &credential)
         .unwrap();
     (
         selected.credential.proxy().unwrap().0.to_owned(),

@@ -67,10 +67,6 @@ impl CodexClients {
         self.dispatch.acquire(route, metrics).await
     }
 
-    pub(crate) fn snapshot(&self, route: &ResolvedUpstream) -> Result<wreq::Client, &'static str> {
-        self.transport_snapshot(route, 0)
-    }
-
     pub(crate) fn transport_snapshot(
         &self,
         route: &ResolvedUpstream,
@@ -97,14 +93,6 @@ impl CodexClients {
     }
 
     /// Control-plane reads share the generation transport's TLS profile and cache.
-    pub(crate) fn account_snapshot(
-        &self,
-        account: &crate::provider::UpstreamAccountView,
-        credential: &crate::provider::UpstreamCredential,
-    ) -> Result<wreq::Client, &'static str> {
-        self.account_transport_snapshot(account, credential, 0)
-    }
-
     pub(crate) fn account_transport_snapshot(
         &self,
         account: &crate::provider::UpstreamAccountView,
@@ -327,7 +315,7 @@ mod tests {
         };
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             for _ in 0..2 {
-                let client = clients.snapshot(&route).unwrap();
+                let client = clients.transport_snapshot(&route, 0).unwrap();
                 let response = client
                     .get("http://keepalive.example.test/")
                     .proxy(wreq::Proxy::all(&proxy).unwrap())
