@@ -562,6 +562,7 @@ pub(crate) struct UpstreamAttemptGuard {
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
     _shared_probe_permit: Option<SharedProbePermit>,
     delivery_recovery_attempted: bool,
+    delivery_recovery: Option<tokio::sync::oneshot::Receiver<bool>>,
     recovered_on_delivery: bool,
     defer_delivery_recovery: bool,
 }
@@ -661,6 +662,7 @@ impl UpstreamAttemptGuard {
             heartbeat_stop,
             _shared_probe_permit: shared_probe_permit,
             delivery_recovery_attempted: false,
+            delivery_recovery: None,
             recovered_on_delivery: false,
             defer_delivery_recovery,
         }
@@ -678,89 +680,133 @@ impl UpstreamAttemptGuard {
             return;
         }
         self.delivery_recovery_attempted = true;
-        let Some(state) = self.state.as_ref() else {
+        let Some(mut state) = self.state.clone() else {
             return;
         };
-        let recovery = async {
-            if let Some(token) = self.lease_token
-                && self.owns_probe_lease
-            {
-                state
-                    .db
-                    .record_upstream_account_probe_delivery_at_revision(
-                        self.upstream_account_id,
-                        self.credential_generation,
-                        self.transport_revision,
-                        token,
-                    )
-                    .await
-            } else if let Some(token) = self.lease_token {
-                // A shared recovery request is independent evidence, not the
-                // owner of the long-running probe epoch. Rotate the lease into
-                // a healthy admission epoch on its first validated delivery so
-                // a later owner failure cannot overwrite this proven success.
-                state
-                    .db
-                    .record_upstream_account_probe_success_at_revision(
-                        self.upstream_account_id,
-                        self.credential_generation,
-                        self.transport_revision,
-                        token,
-                    )
-                    .await
-            } else {
-                // Healthy admissions keep their cohort fence until complete
-                // protocol and usage validation. Partial delivery can still
-                // end in a terminal invalid response, which must retain the
-                // original epoch so that failure remains authoritative.
-                Ok(false)
-            }
-        };
-        match tokio::time::timeout(std::time::Duration::from_millis(250), recovery).await {
-            Ok(Ok(true)) if self.lease_token.is_some() => {
-                self.recovered_on_delivery = true;
+        if self.lease_token.is_none() {
+            return;
+        }
+        let queue = state.routing_persistence.clone();
+        state.db = state.routing_persistence_db.clone();
+        let upstream_account_id = self.upstream_account_id;
+        let credential_generation = self.credential_generation;
+        let transport_revision = self.transport_revision;
+        let lease_token = self.lease_token;
+        let owns_probe_lease = self.owns_probe_lease;
+        let (published, recovery) = tokio::sync::oneshot::channel();
+        self.delivery_recovery = Some(recovery);
+        queue.submit(4096, async move {
+            let recovery = async {
+                if let Some(token) = lease_token
+                    && owns_probe_lease
+                {
+                    state
+                        .db
+                        .record_upstream_account_probe_delivery_at_revision(
+                            upstream_account_id,
+                            credential_generation,
+                            transport_revision,
+                            token,
+                        )
+                        .await
+                } else if let Some(token) = lease_token {
+                    // A shared recovery request is independent evidence, not the
+                    // owner of the long-running probe epoch. Rotate the lease into
+                    // a healthy admission epoch on its first validated delivery so
+                    // a later owner failure cannot overwrite this proven success.
+                    state
+                        .db
+                        .record_upstream_account_probe_success_at_revision(
+                            upstream_account_id,
+                            credential_generation,
+                            transport_revision,
+                            token,
+                        )
+                        .await
+                } else {
+                    // Healthy admissions keep their cohort fence until complete
+                    // protocol and usage validation. Partial delivery can still
+                    // end in a terminal invalid response, which must retain the
+                    // original epoch so that failure remains authoritative.
+                    Ok(false)
+                }
+            };
+            let recovered = tokio::time::timeout(std::time::Duration::from_millis(250), recovery)
+                .await
+                .map_err(|_| AppError::Internal)??;
+            if recovered {
                 state.metrics.observe_upstream_health(
                     UpstreamHealthEvent::Recovered,
                     UpstreamHealthReason::Success,
                 );
-                self.stop_heartbeat();
             }
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => {}
-            _ => tracing::warn!(
-                request_id = %self.request_id,
-                upstream_account_id = %self.upstream_account_id,
-                stage = "probe_delivery_ack",
-                "streaming probe recovery acknowledgement unavailable"
-            ),
-        }
+            let _ = published.send(recovered);
+            Ok(())
+        });
     }
 
     pub(crate) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
-        let Some(state) = self.state.take() else {
+        let Some(state) = self.state.as_ref() else {
             return;
         };
-        // Observe may wait for bounded component capacity. Keep renewing the
-        // owner fence until its conclusive database transition has finished;
-        // short probe leases must not expire during plugin observation.
-        record_terminal(
-            UpstreamAttemptRecord {
-                state,
-                request_id: self.request_id,
-                route_id: self.route_id,
-                upstream_account_id: self.upstream_account_id,
-                credential_generation: self.credential_generation,
-                transport_revision: self.transport_revision,
-                gateway_identity: self.gateway_identity.clone(),
-                failure_epoch: self.failure_epoch,
-                lease_token: self.lease_token,
-                owns_probe_lease: self.owns_probe_lease,
-                recovered_on_delivery: self.recovered_on_delivery,
-            },
+        let queue = state.routing_persistence.clone();
+        let mandatory = matches!(
             terminal,
-        )
-        .await;
-        self.stop_heartbeat();
+            UpstreamAttemptTerminal::Failed {
+                kind: UpstreamFailureKind::Authentication
+                    | UpstreamFailureKind::RateLimited
+                    | UpstreamFailureKind::RateLimitedUntil { .. },
+                ..
+            }
+        );
+        let Some(completion) = self.take_completion(terminal, !mandatory) else {
+            return;
+        };
+        if mandatory {
+            completion.await;
+        } else {
+            queue.submit(4096, async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+                    .await
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            });
+        }
+    }
+
+    fn take_completion(
+        &mut self,
+        terminal: UpstreamAttemptTerminal,
+        optional: bool,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static + use<>> {
+        let mut state = self.state.take()?;
+        if optional {
+            state.db = state.routing_persistence_db.clone();
+        }
+        let mut record = UpstreamAttemptRecord {
+            state,
+            request_id: self.request_id,
+            route_id: self.route_id,
+            upstream_account_id: self.upstream_account_id,
+            credential_generation: self.credential_generation,
+            transport_revision: self.transport_revision,
+            gateway_identity: self.gateway_identity.clone(),
+            failure_epoch: self.failure_epoch,
+            lease_token: self.lease_token,
+            owns_probe_lease: self.owns_probe_lease,
+            recovered_on_delivery: self.recovered_on_delivery,
+        };
+        let delivery = self.delivery_recovery.take();
+        let heartbeat = self.heartbeat_stop.take();
+        let shared_permit = self._shared_probe_permit.take();
+        Some(async move {
+            if let Some(delivery) = delivery {
+                record.recovered_on_delivery |= delivery.await.unwrap_or(false);
+            }
+            record_terminal(record, terminal).await;
+            drop(heartbeat);
+            drop(shared_permit);
+        })
     }
 
     /// A successful durable CAS has ended the caller's ownership lease. Keep
@@ -769,7 +815,10 @@ impl UpstreamAttemptGuard {
     /// task performs only bounded observation and fenced health persistence;
     /// it has no authority to send or replay an upstream request.
     pub(crate) async fn complete_committed(mut self, terminal: UpstreamAttemptTerminal) {
-        let completion = tokio::spawn(async move { self.complete(terminal).await });
+        let Some(completion) = self.take_completion(terminal, false) else {
+            return;
+        };
+        let completion = tokio::spawn(completion);
         if completion.await.is_err() {
             tracing::warn!(
                 stage = "committed_health_completion",
@@ -809,43 +858,19 @@ impl UpstreamAttemptGuard {
 
 impl Drop for UpstreamAttemptGuard {
     fn drop(&mut self) {
-        self.stop_heartbeat();
-        let Some(state) = self.state.take() else {
+        let Some(state) = self.state.as_ref() else {
             return;
         };
-        let request_id = self.request_id;
-        let route_id = self.route_id;
-        let upstream_account_id = self.upstream_account_id;
-        let credential_generation = self.credential_generation;
-        let transport_revision = self.transport_revision;
-        let gateway_identity = self.gateway_identity.clone();
-        let failure_epoch = self.failure_epoch;
-        let lease_token = self.lease_token;
-        let owns_probe_lease = self.owns_probe_lease;
-        let recovered_on_delivery = self.recovered_on_delivery;
-        // Proxy guards are created and dropped on the Tokio request runtime.
-        // Cancellation cannot prove either upstream failure or recovery. It
-        // must not make a half-open account healthy, and it must not let a
-        // downstream disconnect poison an otherwise healthy account.
-        tokio::spawn(async move {
-            record_terminal(
-                UpstreamAttemptRecord {
-                    state,
-                    request_id,
-                    route_id,
-                    upstream_account_id,
-                    credential_generation,
-                    transport_revision,
-                    gateway_identity,
-                    failure_epoch,
-                    lease_token,
-                    owns_probe_lease,
-                    recovered_on_delivery,
-                },
-                UpstreamAttemptTerminal::Inconclusive,
-            )
-            .await;
-        });
+        let queue = state.routing_persistence.clone();
+        if let Some(completion) = self.take_completion(UpstreamAttemptTerminal::Inconclusive, true)
+        {
+            queue.submit(4096, async move {
+                tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+                    .await
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            });
+        }
     }
 }
 
@@ -900,6 +925,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 signal.for_group_routing_window(crate::db::unix_millis(), scope.window_ms)
             }),
             Err(error) => {
+                state.routing_persistence.record_failure_gap();
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transient_health_sample", "transient health signal unavailable; native health policy retained");
                 None
             }
@@ -954,6 +980,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         )
                         .await
                     {
+                        state.routing_persistence.record_failure_gap();
                         tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), "failed to defer transient probe recovery");
                     }
                 }
@@ -996,12 +1023,15 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     )
                 }
                 Ok(_) => {}
-                Err(error) => tracing::warn!(
-                    %request_id,
-                    %upstream_account_id,
-                    error_category = error.diagnostic_category(),
-                    "failed to clear upstream account cooldown after a valid probe"
-                ),
+                Err(error) => {
+                    state.routing_persistence.record_failure_gap();
+                    tracing::warn!(
+                        %request_id,
+                        %upstream_account_id,
+                        error_category = error.diagnostic_category(),
+                        "failed to clear upstream account cooldown after a valid probe"
+                    );
+                }
             }
         }
         UpstreamAttemptTerminal::Inconclusive => {
@@ -1018,6 +1048,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     )
                     .await
             {
+                state.routing_persistence.record_failure_gap();
                 tracing::warn!(
                     %request_id,
                     %upstream_account_id,
@@ -1047,6 +1078,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 })
                 .await
             {
+                state.routing_persistence.record_failure_gap();
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transport_diagnostic_persist", "failed to persist upstream transport diagnostic");
             }
             // A shared recovery request never owns the heartbeat lease. Its
@@ -1192,12 +1224,15 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     .metrics
                     .observe_upstream_health(UpstreamHealthEvent::Failure, reason),
                 Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    %request_id,
-                    %upstream_account_id,
-                    error_category = error.diagnostic_category(),
-                    "failed to persist unsuccessful upstream attempt"
-                ),
+                Err(error) => {
+                    state.routing_persistence.record_failure_gap();
+                    tracing::warn!(
+                        %request_id,
+                        %upstream_account_id,
+                        error_category = error.diagnostic_category(),
+                        "failed to persist unsuccessful upstream attempt"
+                    );
+                }
             }
         }
     }

@@ -32,6 +32,7 @@ mod lifecycle;
 pub(crate) mod persistence;
 mod response_metadata;
 mod routing;
+pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod upstream_response;
@@ -80,7 +81,6 @@ mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
-const SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
@@ -1028,8 +1028,7 @@ async fn proxy_with_cancellation_guard(
         &model,
         protocol.name(),
         applied.upstream_account_hint,
-    )
-    .await;
+    );
     let candidate_query =
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
@@ -2867,7 +2866,7 @@ fn routing_selection_seed(
     Uuid::from_bytes(bytes)
 }
 
-async fn session_route_account_to_avoid(
+fn session_route_account_to_avoid(
     state: &AppState,
     key: &AuthenticatedKey,
     request_id: Uuid,
@@ -2883,31 +2882,7 @@ async fn session_route_account_to_avoid(
         return None;
     }
     let session_id = hints.session_id.as_deref()?;
-    match tokio::time::timeout(
-        SESSION_ACCOUNT_AVOID_LOOKUP_TIMEOUT,
-        state
-            .db
-            .latest_session_transport_route_to_avoid(key, session_id, model, protocol),
-    )
-    .await
-    {
-        Ok(Ok(account_id)) => account_id,
-        Ok(Err(error)) => {
-            tracing::warn!(
-                %request_id,
-                error_category = error.diagnostic_category(),
-                stage = "session_route_account_avoid_lookup",
-                "session transport evidence lookup failed open"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                %request_id,
-                stage = "session_route_account_avoid_lookup",
-                "session transport evidence lookup timed out and failed open"
-            );
-            None
-        }
-    }
+    state
+        .session_preferences
+        .lookup(state, key, request_id, session_id, model, protocol)
 }

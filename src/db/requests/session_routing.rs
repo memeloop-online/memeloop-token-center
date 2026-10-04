@@ -44,6 +44,22 @@ impl Database {
         model: &str,
         protocol: &str,
     ) -> Result<Option<(Uuid, Uuid)>, AppError> {
+        self.latest_session_transport_route_to_avoid_for_identity(
+            (key.tenant_id, key.principal_id, key.key_id),
+            explicit_session_id,
+            model,
+            protocol,
+        )
+        .await
+    }
+
+    pub(crate) async fn latest_session_transport_route_to_avoid_for_identity(
+        &self,
+        identity: (Uuid, Uuid, Uuid),
+        explicit_session_id: &str,
+        model: &str,
+        protocol: &str,
+    ) -> Result<Option<(Uuid, Uuid)>, AppError> {
         let row = sqlx::query(
             "SELECT status_code, error_code, model_route_id, upstream_account_id
              FROM session_routing_terminals
@@ -57,9 +73,9 @@ impl Database {
              ORDER BY observed_at DESC, request_id DESC
              LIMIT 1",
         )
-        .bind(key.tenant_id.to_string())
-        .bind(key.principal_id.to_string())
-        .bind(key.key_id.to_string())
+        .bind(identity.0.to_string())
+        .bind(identity.1.to_string())
+        .bind(identity.2.to_string())
         .bind(explicit_session_id)
         .bind(model)
         .bind(protocol)

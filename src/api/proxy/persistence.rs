@@ -30,6 +30,22 @@ impl Default for Persistence {
 }
 
 impl Persistence {
+    pub(crate) fn record_capacity_gap(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_failure_gap(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn render_routing(&self) -> String {
+        self.render()
+            .split("# TYPE memeloop_token_center_deferred_stream_memory_bytes")
+            .next()
+            .unwrap_or_default()
+            .replace("deferred_persistence", "routing_persistence")
+    }
+
     #[cfg(test)]
     pub(crate) async fn drain_for_test(&self) {
         let _permits =

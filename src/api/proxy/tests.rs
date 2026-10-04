@@ -48,6 +48,7 @@ mod phase_diagnostics;
 mod postgres_attempt_deadline;
 mod recovery_wait;
 mod responses_transport;
+mod routing_persistence;
 mod soonest_reset;
 mod sse_delivery;
 

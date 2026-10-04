@@ -906,21 +906,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // before routing publication or request settlement can block on
             // database work.
             drop(_sse_streaming_memory.take());
-            drop(body_sender);
             let routing_terminal_observed_at = conversation
                 .as_ref()
                 .and_then(|conversation| conversation.hints.session_id.as_ref())
                 .map(|_| crate::db::unix_millis());
-            let mut routing_terminal_pre_published = false;
-            if crate::db::is_session_avoid_terminal(
-                classification.status_code,
-                classification.error_code,
-            ) && let Some(observed_at) = routing_terminal_observed_at
+            let routing_terminal_pre_published = routing_terminal_observed_at.is_some();
+            if let Some(observed_at) = routing_terminal_observed_at
                 && let Some(conversation) = conversation.as_ref()
                 && let Some(session_id) = conversation.hints.session_id.as_deref()
             {
                 let (model_route_id, upstream_account_id) = upstream_attempt.route_assignment();
-                let evidence = background_state.db.record_session_routing_terminal(
+                background_state.session_preferences.observe(
+                    &background_state,
                     crate::db::SessionRoutingTerminalInput {
                         key: &conversation.key,
                         request_id,
@@ -934,22 +931,33 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         observed_at,
                     },
                 );
-                match tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence).await
-                {
-                    Ok(Ok(())) => routing_terminal_pre_published = true,
-                    Ok(Err(error)) => tracing::error!(
-                        %request_id,
-                        error_category = error.diagnostic_category(),
-                        stage = "stream_routing_terminal",
-                        "failed to persist streaming routing terminal before downstream close"
-                    ),
-                    Err(_) => tracing::error!(
-                        %request_id,
-                        stage = "stream_routing_terminal",
-                        "streaming routing terminal persistence exceeded its short publish budget"
-                    ),
-                }
+                let database = background_state.routing_persistence_db.clone();
+                let key = conversation.key.clone();
+                let session_id = session_id.to_owned();
+                let public_model = public_model.clone();
+                background_state
+                    .routing_persistence
+                    .submit(8192, async move {
+                        let evidence = database.record_session_routing_terminal(
+                            crate::db::SessionRoutingTerminalInput {
+                                key: &key,
+                                request_id,
+                                explicit_session_id: &session_id,
+                                model: &public_model,
+                                protocol: protocol.name(),
+                                status_code: classification.status_code,
+                                error_code: classification.error_code,
+                                model_route_id: Some(model_route_id),
+                                upstream_account_id: Some(upstream_account_id),
+                                observed_at,
+                            },
+                        );
+                        tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence)
+                            .await
+                            .map_err(|_| AppError::Internal)?
+                    });
             }
+            drop(body_sender);
             terminal_delivery_phase.finish(
                 transport_error.unwrap_or("returned"),
                 Some(status.as_u16()),

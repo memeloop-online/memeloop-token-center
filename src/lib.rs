@@ -70,6 +70,9 @@ pub struct AppState {
     pub db: Database,
     pub(crate) persistence_db: Database,
     pub(crate) persistence: Arc<api::proxy::persistence::Persistence>,
+    pub(crate) routing_persistence: Arc<api::proxy::persistence::Persistence>,
+    pub(crate) routing_persistence_db: Database,
+    pub(crate) session_preferences: Arc<api::proxy::session_preferences::SessionPreferences>,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
@@ -147,6 +150,7 @@ impl AppState {
             .await
             .map_err(|_| InitializationError::Archive)?;
         let persistence_db = db.independent_persistence_pool();
+        let routing_persistence_db = db.independent_persistence_pool();
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins
@@ -196,6 +200,9 @@ impl AppState {
             db,
             persistence_db,
             persistence: Arc::new(api::proxy::persistence::Persistence::default()),
+            routing_persistence: Arc::new(api::proxy::persistence::Persistence::default()),
+            routing_persistence_db,
+            session_preferences: Arc::default(),
             archive,
             providers,
             plugins,

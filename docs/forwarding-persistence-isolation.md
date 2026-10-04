@@ -16,7 +16,7 @@ the integrated head. Validation is GitHub Actions only; no production changes.
 | Before body | `authenticate_gateway_before_body` / downstream credential queries | Required authentication; fail closed |
 | Responses ingress | `admit_gateway_request_body_with_memory` → `RequestSpoolAdmission::capture`; `proxy_openai_responses` → `RequestSpool::read_all` | Local filesystem waits still present; source storage is used to enforce the large-body memory envelope, not just archival |
 | Preparation | `proxy_with_identity_and_conversation_spool` → `pin_application_plugins`, traffic policy, authorized candidate query, route refresh/materialization | Authorization and policy evaluation remain synchronous |
-| Session preference | `session_route_account_to_avoid` → DB lookup, 50 ms timeout | Optional lookup still adds persistence-dependent preparation latency |
+| Session preference | `session_route_account_to_avoid` → bounded cache, nonwaiting refresh admission | No SQL awaited; a miss temporarily supplies no optional avoidance preference |
 | Capacity | Codex dispatch admission, request memory reservation, retained memory admission | Forwarding resource limits remain bounded; these are not archive queue admission |
 | Billing admission (before) | `start_proxy_request_with_archive_compression` → preseal → reserve shared archive budget → usage reservation / request owner / encrypted spool / global event cursor → commit | Archive and event waits previously rejected or delayed dispatch |
 | Billing admission (after) | `start_proxy_forwarding_request` → usage reservation / unique request owner → positive commit | Archive bytes and started-event cursor excluded; no dispatch on failed/unknown commit |
@@ -24,7 +24,7 @@ the integrated head. Validation is GitHub Actions only; no production changes.
 | Candidate dispatch | generation/transport revision refresh, health claim, reservation resizing on failover, native credential refresh | Required authorization/quota/ownership fences preserved |
 | First billable SSE output | `delivery::send_frame` → `prepare_proxy_delivery` → `mark_proxy_delivery_started` | Required owner/ceiling CAS remains before billable delivery; no archive transaction in these methods |
 | SSE frames | `ResponseArchiveProducer::append` → bounded `try_reserve` | No await; full/inactive writer abandons capture. Retention transforms still consume bounded CPU on stream task |
-| Validated delivery | `UpstreamAttemptGuard::delivered_validated_output` → recovery DB writes | Still awaited after a billable send; can delay subsequent frames |
+| Validated delivery | `UpstreamAttemptGuard::delivered_validated_output` → bounded publication admission | No SQL awaited after a billable send; delivery-owner CAS remains mandatory |
 | SSE terminal/EOF | producer seal → transfer writer ownership; protocol terminal validation/delivery → drop HTTP sender | Archive writer owns no HTTP sender. Session evidence, conversation projection and finalization run after EOF |
 | Buffered terminal | usage validation → conversation projection → `finish_proxy_request_with_retry` → financial CAS / settlement / analysis facts / events | Archive capture removed. Analysis and conversation still mixed with financial finalization and can delay buffered output |
 | Buffered archive | After successful settlement → nonwaiting `persistence::capture` | No database ACK before delivery; scoped owner can capture a completed request |
@@ -157,3 +157,52 @@ archive scheduling boundaries, subject to the remaining coupling below.
   chunk integrity, exactly-once financial side effects and archive worker races.
 
 Keep the PR draft until the CI results and remaining mandatory scope are resolved.
+
+## Optional routing publication slice (October 4)
+
+This continuation reuses the existing `Persistence` nonwaiting semaphore admission
+implementation in an independent four-job routing lane. It does not change archive
+queue limits or forwarding concurrency. Routing SQL uses an independent lazy
+two-connection pool. Session refresh and streaming terminal evidence have 250 ms
+deadlines; optional terminal health jobs have a two-second deadline. These timers
+never wrap reservation, delivery-owner or credential CAS. Queue rejection does not
+create a waiting submitter or spawn a task. The metrics endpoint exposes
+`memeloop_token_center_routing_persistence_total` with accepted, capacity and failed
+outcomes, and routing jobs/bytes gauges. A failed job can record multiple failed
+publication operations; the failed counter is not an exact count of lost requests.
+
+Session preferences use the existing bounded deque-cache pattern: at most 256
+fixed-size hashed identities, one-second TTL, negative/miss coalescing, and
+nonwaiting cache-lock admission. Tenant, principal, key, credential generation,
+session, model and protocol are all part of the identity. Refresh inputs have a
+4 KiB combined string limit. Expired values are not reused; explicit policy hints
+still override avoidance, and authorized candidate selection remains mandatory.
+Local streaming terminal evidence updates the cache before EOF. Cross-replica
+visibility is eventual and best effort; EOF no longer promises durable session
+evidence. A concurrent refresh cannot overwrite a newer local cache observation.
+
+Delivery recovery and terminal health are ordered per attempt by an owned result
+channel. Existing generation/revision/epoch/lease SQL predicates remain intact.
+Optional terminal jobs own their probe heartbeat and shared-probe permit only;
+they own no downstream sender, forwarding memory reservation, dispatch permit or
+request lifecycle permit. Rejection/timeout drops heartbeat ownership, leaving
+durable probe expiry as recovery. Authentication and hard-quota failure transitions
+remain synchronous, as does the existing committed-media completion contract.
+Streaming session publication no longer waits before settlement or falls back to
+session SQL in that settlement when optional admission fails.
+
+GHA runs `api::proxy::tests::routing_persistence::` explicitly, followed by the
+full existing suite. The regression exercises buffered and streaming gateways,
+held optional-pool connections, a closed optional pool, saturated publication
+capacity, exact once financial effects and upstream invocation, and restored
+lifecycle capacity before releasing optional SQL. Single-poll health tests reject
+any SQL await on the forwarding caller. Cache tests cover scoped identities and
+authoritative policy hints. Local validation is formatting/source review only;
+this slice has no CI pass until the new head finishes Actions.
+
+Remaining release blockers still include filesystem request spooling, financial
+statistics projection locking, buffered session/conversation work inside financial
+finalization, physical database contention and durable financial lifecycle handoff.
+Those mandatory finalization paths may still retain lifecycle permits. This slice
+removes the optional routing publication hold; it does not claim global isolation.
+PR #455's `terminal_cause` interface and migration ownership remain unchanged.
