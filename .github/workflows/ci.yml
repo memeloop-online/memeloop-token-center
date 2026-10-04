@@ -908,6 +908,9 @@ jobs:
         env:
           KUBECONFORM_BIN: /tmp/kubeconform
         run: node --test tests/deployment/backup-egress/contract.test.ts
+      - name: Exercise bounded CNPG export, interrupted copy and isolated full restore
+        timeout-minutes: 12
+        run: node --test tests/deployment/cnpg-backup/contract.test.ts
       - name: Validate release workflow and Docker build contracts
         run: node --test tests/ops/release-packaging-contract.test.ts
       - name: Validate fail-closed BuildKit attestation verification
