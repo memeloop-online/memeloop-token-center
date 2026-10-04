@@ -49,7 +49,7 @@ async fn fixture() -> (AppState, tempfile::TempDir, MockServer, Uuid) {
 async fn catalog(server: &MockServer, body: Value) {
     Mock::given(method("GET"))
         .and(path("/models"))
-        .and(query_param("client_version", "0.155.0"))
+        .and(query_param("client_version", "0.160.0"))
         .and(matches_header(
             "authorization",
             "Bearer private-access-canary",
@@ -132,7 +132,7 @@ async fn hidden_exact_selection_bootstraps_route_creation_and_candidate_admissio
     assert_eq!(diagnostic["visibility"], "hide");
     assert_eq!(diagnostic["filter_decision"], "excluded_visibility");
     assert_eq!(diagnostic["metadata_valid"], true);
-    assert_eq!(diagnostic["client_version"], "0.155.0");
+    assert_eq!(diagnostic["client_version"], "0.160.0");
     let (_, default_catalog, _) =
         request(&state, "POST", &format!("{base}/sync"), Value::Null, token).await;
     assert_eq!(default_catalog["models"].as_array().unwrap().len(), 1);
