@@ -904,6 +904,10 @@ jobs:
         env:
           KUBECONFORM_BIN: /tmp/kubeconform
         run: node --test tests/ops/helm-packaging-contract.test.ts tests/ops/archive-budget-rollout.test.ts
+      - name: Validate pinned backup egress preparation and safety counterexamples
+        env:
+          KUBECONFORM_BIN: /tmp/kubeconform
+        run: node --test tests/deployment/backup-egress/contract.test.ts
       - name: Validate release workflow and Docker build contracts
         run: node --test tests/ops/release-packaging-contract.test.ts
       - name: Validate fail-closed BuildKit attestation verification

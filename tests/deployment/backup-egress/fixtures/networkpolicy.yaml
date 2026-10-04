@@ -1,0 +1,67 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-backup-egress
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    memeloop.io/endpoint-policy: pinned-trojan-upstreams-only-no-direct-or-dns-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mtc-backup-egress
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memeloop-token-center-test
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: memeloop-token-center
+              app.kubernetes.io/instance: memeloop-token-center-test
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [gateway, control]
+      ports:
+        - protocol: TCP
+          port: 1080
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 45.87.164.194/32
+        - ipBlock:
+            cidr: 45.87.165.184/32
+        - ipBlock:
+            cidr: 45.87.166.186/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-test-to-backup-egress
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: memeloop-token-center
+      app.kubernetes.io/instance: memeloop-token-center-test
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [gateway, control]
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memeloop-token-center-test
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mtc-backup-egress
+      ports:
+        - protocol: TCP
+          port: 1080
