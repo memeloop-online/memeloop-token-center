@@ -1,9 +1,10 @@
 {
   "repository": "llm/k3s-gitops",
   "commit": "ee49af94b76ac1016b213c4f12f36a60f84faaf8",
+  "fixture_transformation": "Replace the private registry mirror with the official upstream image; retain the operational commands and bounds.",
   "files": {
-    "mtc-pg-local-stage-20261004.yaml": "ff530f35038667f59684368024ed26f19f7565b395cf59718518f3a8850ae66f",
-    "mtc-pg-offhost-copy-20261004.yaml": "5a980cae51894334b9720c09e1b98a207f18308080719cd8b235b7894215dc4c",
-    "mtc-pg-restore-verification-20261004.yaml": "9969c16974cb1445f61458cad34ac074567f32d4337b40fa2dec48251e00267f"
+    "mtc-pg-local-stage-20261004.yaml": "7fc13c249d3bb53eb67c93ee1edea8e88fd68d84b4d35825308052af1900c19c",
+    "mtc-pg-offhost-copy-20261004.yaml": "34acea1f0cc7eb09578d7793f5f830070fe4d547409da4ef59b358ec08b0ced5",
+    "mtc-pg-restore-verification-20261004.yaml": "88601232dfc48720052425af4ce514f35e41f5344520fb0ef4ce2ef6bac0e99c"
   }
 }

@@ -30,7 +30,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: copy
-          image: harbor.k3s.onetwo.website/ghcr-io/cloudnative-pg/postgresql:17.5
+          image: ghcr.io/cloudnative-pg/postgresql:17.5
           command: ["/bin/sleep", "43200"]
           resources:
             requests:
@@ -94,7 +94,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: copy
-          image: harbor.k3s.onetwo.website/ghcr-io/cloudnative-pg/postgresql:17.5
+          image: ghcr.io/cloudnative-pg/postgresql:17.5
           command: ["/bin/sleep", "43200"]
           resources:
             requests:
