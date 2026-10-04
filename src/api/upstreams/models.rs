@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -136,6 +139,86 @@ pub(in crate::api) struct UpstreamModelsQuery {
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct SyncUpstreamModelsQuery {
     tenant_external_id: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(in crate::api) struct DiscoverUpstreamModelQuery {
+    tenant_external_id: Option<String>,
+    model: String,
+}
+
+pub(in crate::api) async fn discover_upstream_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<DiscoverUpstreamModelQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
+    validate_model_id(&query.model)
+        .map_err(|_| AppError::BadRequest("invalid exact model slug".into()))?;
+    let (account, credential) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if account.tenant_external_id.as_deref() != Some(tenant.as_str()) {
+        return Err(AppError::NotFound);
+    }
+    if account.driver != "openai-codex" {
+        return Err(AppError::BadRequest(
+            "exact discovery requires a Codex account".into(),
+        ));
+    }
+    let budget = codex_catalog_budget(&account.config)
+        .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
+    let values = tokio::time::timeout(
+        budget.total,
+        fetch_codex_models(&state, &account, &credential, true),
+    )
+    .await
+    .unwrap_or(Err("connection_failed"))
+    .map_err(|code| AppError::Upstream(code.into()))?;
+    let matches = values
+        .iter()
+        .filter(|value| value.get("slug").and_then(Value::as_str) == Some(query.model.as_str()))
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(AppError::Upstream("invalid_response".into()));
+    }
+    let metadata = matches.first().copied();
+    let configured = state
+        .db
+        .configured_upstream_model_ids(account_id)
+        .await?
+        .into_iter()
+        .collect();
+    let visibility = metadata.map(
+        |value| match value.get("visibility").and_then(Value::as_str) {
+            Some("list") => "list",
+            Some("hide") => "hide",
+            None => "missing",
+            Some(_) => "unknown",
+        },
+    );
+    let filter_decision = match metadata {
+        None => "absent",
+        Some(value) if codex_model_is_selected(value, &configured, None) => "included",
+        Some(_) => "excluded_visibility",
+    };
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "account_id": account_id,
+            "credential_generation": account.credential_generation,
+            "model": query.model,
+            "present": metadata.is_some(),
+            "visibility": visibility,
+            "filter_decision": filter_decision,
+            "metadata_valid": metadata.is_some_and(|value| normalize_codex_model(value).is_ok()),
+            "client_version": crate::oauth::managed::codex::CLIENT_VERSION
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +327,8 @@ pub(in crate::api) async fn sync_upstream_models(
     let state = state.pin_application_plugins().await?;
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
     Ok(Json(
-        sync_account_models(&state, account_id, &tenant, None).await?,
+        sync_account_models_selected(&state, account_id, &tenant, None, query.model.as_deref())
+            .await?,
     ))
 }
 
@@ -259,6 +343,11 @@ pub(in crate::api) async fn sync_upstream_models_and_routes(
     let service = require_service(&headers, &state, "providers:write").await?;
     if !service.allows("routes:write") {
         return Err(AppError::Forbidden);
+    }
+    if query.model.is_some() {
+        return Err(AppError::BadRequest(
+            "exact selection uses models/sync before explicit route creation".into(),
+        ));
     }
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
     let state = state.pin_application_plugins().await?;
@@ -419,6 +508,16 @@ async fn sync_account_models(
     tenant_external_id: &str,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<CatalogSyncResult, AppError> {
+    sync_account_models_selected(state, account_id, tenant_external_id, blocking, None).await
+}
+
+async fn sync_account_models_selected(
+    state: &AppState,
+    account_id: Uuid,
+    tenant_external_id: &str,
+    blocking: Option<&crate::worker::BlockingTasks>,
+    selected_model: Option<&str>,
+) -> Result<CatalogSyncResult, AppError> {
     let pinned = state.clone().pin_application_plugins().await?;
     let state = &pinned;
     let (account, credential) = state
@@ -427,6 +526,15 @@ async fn sync_account_models(
         .await?;
     if account.tenant_external_id.as_deref() != Some(tenant_external_id) {
         return Err(AppError::NotFound);
+    }
+    if let Some(model) = selected_model {
+        validate_model_id(model)
+            .map_err(|_| AppError::BadRequest("invalid exact model slug".into()))?;
+        if account.driver != "openai-codex" {
+            return Err(AppError::BadRequest(
+                "exact selection requires a Codex account".into(),
+            ));
+        }
     }
     let generation = account.credential_generation;
     let catalog_timeout = if account.driver == "openai-codex" {
@@ -448,6 +556,11 @@ async fn sync_account_models(
         )
         .await?
     {
+        if selected_model.is_some() {
+            return Err(AppError::Conflict(
+                "model catalog sync is in progress".into(),
+            ));
+        }
         return Ok(CatalogSyncResult {
             catalog: state
                 .db
@@ -461,7 +574,16 @@ async fn sync_account_models(
             price_sync: CatalogPriceSyncResult::skipped(),
         });
     }
-    let discovery = discover_models(state, &account, &credential, blocking, false).await;
+    let discovery = if selected_model.is_some() {
+        tokio::time::timeout(
+            catalog_timeout,
+            discover_codex_models_selected(state, &account, &credential, true, selected_model),
+        )
+        .await
+        .unwrap_or(Err("connection_failed"))
+    } else {
+        discover_models(state, &account, &credential, blocking, false).await
+    };
     let mut price_sync = CatalogPriceSyncResult::skipped();
     match discovery {
         Ok((source_kind, models)) => {
@@ -487,6 +609,10 @@ async fn sync_account_models(
             price_sync = sync_discovered_model_prices(state, account_id, &models).await;
         }
         Err(code) => {
+            let catalog_code = match code {
+                "selected_model_not_found" | "partial_catalog" => "invalid_response",
+                code => code,
+            };
             let replaced = state
                 .db
                 .record_upstream_model_catalog_failure(
@@ -494,13 +620,22 @@ async fn sync_account_models(
                     tenant_external_id,
                     generation,
                     lease_id,
-                    code,
+                    catalog_code,
                 )
                 .await?;
             if replaced != ReplaceModelCatalogResult::Replaced {
                 return Err(AppError::Conflict(
                     "upstream credential changed while models were synchronizing".into(),
                 ));
+            }
+            if selected_model.is_some() {
+                return Err(if code == "selected_model_not_found" {
+                    AppError::BadRequest(
+                        "selected model is absent from authenticated upstream metadata".into(),
+                    )
+                } else {
+                    AppError::Upstream(code.into())
+                });
             }
         }
     }
@@ -915,6 +1050,20 @@ async fn discover_codex_models(
     credential: &UpstreamCredential,
     require_complete: bool,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    discover_codex_models_selected(state, account, credential, require_complete, None).await
+}
+
+async fn fetch_codex_models(
+    state: &AppState,
+    account: &crate::provider::UpstreamAccountView,
+    credential: &UpstreamCredential,
+    require_complete: bool,
+) -> Result<Vec<Value>, &'static str> {
+    let selection = state
+        .transport_proxy_groups
+        .select(account.id, account.credential_generation, credential)
+        .map_err(|_| "transport_selection_unavailable")?;
+    let credential = &selection.credential;
     credential
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
@@ -927,7 +1076,11 @@ async fn discover_codex_models(
     )
     .await
     .map_err(|_| "destination_invalid")?;
-    let client = state.codex_clients.account_snapshot(account, credential)?;
+    let client = state.codex_clients.account_transport_snapshot(
+        account,
+        credential,
+        selection.generation,
+    )?;
     let budget = codex_catalog_budget(&account.config)?;
     let account_id = codex_account_header(credential)?;
     let url = format!(
@@ -972,7 +1125,25 @@ async fn discover_codex_models(
     if values.len() > MAX_MODEL_COUNT {
         return Err("invalid_response");
     }
-    let configured_models: std::collections::HashSet<String> = state
+    Ok(values.clone())
+}
+
+async fn discover_codex_models_selected(
+    state: &AppState,
+    account: &crate::provider::UpstreamAccountView,
+    credential: &UpstreamCredential,
+    require_complete: bool,
+    selected_model: Option<&str>,
+) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    let values = fetch_codex_models(state, account, credential, require_complete).await?;
+    if let Some(selected) = selected_model
+        && !values
+            .iter()
+            .any(|value| value.get("slug").and_then(Value::as_str) == Some(selected))
+    {
+        return Err("selected_model_not_found");
+    }
+    let configured_models = state
         .db
         .configured_upstream_model_ids(account.id)
         .await
@@ -981,46 +1152,48 @@ async fn discover_codex_models(
         .collect();
     let normalized = values
         .iter()
-        .filter(|value| {
-            // Codex's supported_in_api flag filters API-key mode, not
-            // ChatGPT OAuth. Visibility controls the picker, not whether
-            // authenticated metadata for an explicitly selected slug exists.
-            value.get("visibility").and_then(Value::as_str) == Some("list")
-                || value
-                    .get("slug")
-                    .and_then(Value::as_str)
-                    .is_some_and(|slug| configured_models.contains(slug))
-        })
-        .map(|value| {
-            let id = value
-                .get("slug")
-                .and_then(Value::as_str)
-                .ok_or("invalid_response")?;
-            validate_model_id(id)?;
-            let context_window = value
-                .get("context_window")
-                .and_then(Value::as_i64)
-                .filter(|limit| (1..=10_000_000).contains(limit))
-                .ok_or("invalid_response")?;
-            Ok(DiscoveredUpstreamModel {
-                model_id: id.to_owned(),
-                protocol: "openai".to_owned(),
-                context_window: Some(context_window),
-                // Codex does not publish an output maximum. The authenticated
-                // total context window is stored as a conservative reservation
-                // bound because output cannot exceed total context.
-                reservation_token_bound: Some(context_window),
-                reservation_bound_source: Some("mtc_context_window_bound".to_owned()),
-            })
-        })
+        .filter(|value| codex_model_is_selected(value, &configured_models, selected_model))
+        .map(normalize_codex_model)
         .collect::<Result<Vec<_>, &'static str>>()?;
     if normalized.is_empty() {
-        // Do not let an empty trusted set reach catalog replacement: that
-        // would return a 400 after the sync lease was claimed, leaving the
-        // catalog falsely shown as syncing until lease expiry.
         return Err("codex_no_trusted_models");
     }
     parse_discovered_models(normalized).map(|models| ("codex_models", models))
+}
+
+fn codex_model_is_selected(
+    value: &Value,
+    configured_models: &HashSet<String>,
+    selected_model: Option<&str>,
+) -> bool {
+    value.get("visibility").and_then(Value::as_str) == Some("list")
+        || value
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| selected_model == Some(slug) || configured_models.contains(slug))
+}
+
+fn normalize_codex_model(value: &Value) -> Result<DiscoveredUpstreamModel, &'static str> {
+    let id = value
+        .get("slug")
+        .and_then(Value::as_str)
+        .ok_or("invalid_response")?;
+    validate_model_id(id)?;
+    let context_window = value
+        .get("context_window")
+        .and_then(Value::as_i64)
+        .filter(|limit| (1..=10_000_000).contains(limit))
+        .ok_or("invalid_response")?;
+    Ok(DiscoveredUpstreamModel {
+        model_id: id.to_owned(),
+        protocol: "openai".to_owned(),
+        context_window: Some(context_window),
+        // Codex does not publish an output maximum. The authenticated
+        // total context window is stored as a conservative reservation
+        // bound because output cannot exceed total context.
+        reservation_token_bound: Some(context_window),
+        reservation_bound_source: Some("mtc_context_window_bound".to_owned()),
+    })
 }
 
 fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'static str> {

@@ -14,6 +14,18 @@ pub(super) enum BoundedUpstreamError {
 }
 
 impl BoundedUpstreamError {
+    pub(super) const fn terminal_cause(self) -> Option<crate::model::RequestTerminalCause> {
+        use crate::model::RequestTerminalCause;
+        match self {
+            Self::ReadTimeout => Some(RequestTerminalCause::ReadTimeout),
+            Self::RequestTimeout => Some(RequestTerminalCause::RequestTimeout),
+            Self::Stream => Some(RequestTerminalCause::StreamReadError),
+            Self::Http2Reset => Some(RequestTerminalCause::Http2Reset),
+            Self::Http2GoAway => Some(RequestTerminalCause::Http2GoAway),
+            _ => None,
+        }
+    }
+
     pub(super) fn code(self) -> &'static str {
         match self {
             Self::ContentEncoding => "upstream_invalid_content_encoding",

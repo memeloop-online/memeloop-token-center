@@ -76,6 +76,7 @@ pub struct AppState {
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
+    pub(crate) transport_proxy_groups: Arc<db::TransportProxyGroups>,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
     /// Request-owned policy snapshot; never shared back into the router state.
@@ -113,10 +114,17 @@ pub enum InitializationError {
     HttpClient,
     #[error("invalid proxy memory budget")]
     ProxyMemoryBudget,
+    #[error("invalid transport proxy groups")]
+    TransportProxyGroups,
 }
 
 impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
+        let transport_proxy_groups = db::TransportProxyGroups::parse(
+            &config.transport_proxy_groups,
+            config.key_pepper.as_bytes(),
+        )
+        .map_err(|_| InitializationError::TransportProxyGroups)?;
         config
             .validate_proxy_memory_budget()
             .map_err(|_| InitializationError::ProxyMemoryBudget)?;
@@ -195,6 +203,10 @@ impl AppState {
             return Err(InitializationError::Plugin);
         }
 
+        let transport_proxy_groups = Arc::new(transport_proxy_groups);
+        transport_proxy_groups
+            .start(&config.database_url)
+            .map_err(|_| InitializationError::TransportProxyGroups)?;
         Ok(Self {
             config: Arc::new(config),
             db,
@@ -237,6 +249,7 @@ impl AppState {
             )),
             http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
             codex_clients: Arc::new(codex_clients::CodexClients::default()),
+            transport_proxy_groups,
         })
     }
 

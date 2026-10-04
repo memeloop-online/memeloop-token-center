@@ -126,6 +126,7 @@ pub struct ProxyConversationInput<'a> {
 
 #[derive(Clone)]
 pub struct FinishProxyRequest<'a> {
+    pub terminal_cause: Option<crate::model::RequestTerminalCause>,
     pub usage_basis: Option<crate::model::RequestUsageBasis>,
     pub first_output_ms: Option<i64>,
     pub generation_duration_ms: Option<i64>,
@@ -933,6 +934,7 @@ impl Database {
         };
         let response_object = format!("gap://{request_id}/response");
         self.finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
@@ -975,6 +977,7 @@ impl Database {
             ));
         }
         let proxy_input = FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: None,
             first_output_ms: None,
             generation_duration_ms: input.generation_duration_ms,
@@ -1611,6 +1614,7 @@ impl Database {
                     billed_units: metered.map(|input| input.billed_units).unwrap_or_default(),
                     billing_unit: &reservation.billing_unit,
                 }),
+            input.terminal_cause,
         )
         .await?;
         if !finished {
@@ -2004,6 +2008,7 @@ async fn record_request_finished_with_basis_in_transaction(
         project_aggregates,
         usage_basis,
         None,
+        None,
     )
     .await
 }
@@ -2015,6 +2020,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     project_aggregates: bool,
     usage_basis: Option<crate::model::RequestUsageBasis>,
     metered_usage: Option<MeteredRequestUsage<'_>>,
+    terminal_cause: Option<crate::model::RequestTerminalCause>,
 ) -> Result<bool, AppError> {
     lock_request_stats_projection_writer_in_transaction(tx).await?;
     let request_id = request.request_id.to_string();
@@ -2039,7 +2045,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -2059,6 +2065,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .bind(usage_basis.map(crate::model::RequestUsageBasis::as_str))
     .bind(billed_units)
     .bind(billing_unit)
+    .bind(terminal_cause.map(crate::model::RequestTerminalCause::as_str))
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {

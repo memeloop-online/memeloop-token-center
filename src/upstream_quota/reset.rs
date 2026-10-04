@@ -34,6 +34,12 @@ async fn fresh_snapshot(
     if account.driver != "openai-codex" {
         return Err(blocked());
     }
+    let selection = state.transport_proxy_groups.select(
+        account.id,
+        account.credential_generation,
+        credential,
+    )?;
+    let credential = &selection.credential;
     let _permit = state
         .upstream_quota
         .permits
@@ -53,7 +59,7 @@ async fn fresh_snapshot(
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
     let http = state
         .codex_clients
-        .account_snapshot(account, credential)
+        .account_transport_snapshot(account, credential, selection.generation)
         .map_err(|_| temporarily_unavailable())?;
     let (credential_header, credential_value) = credential
         .request_header(observed_started_at)
@@ -319,6 +325,12 @@ pub(crate) async fn confirm(
         return Err(blocked());
     }
     // Prepare the fixed destination before the durable dispatch claim.
+    let selection = state.transport_proxy_groups.select(
+        account.id,
+        account.credential_generation,
+        credential,
+    )?;
+    let credential = &selection.credential;
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
     let _permit = state

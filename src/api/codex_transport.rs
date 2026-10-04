@@ -288,21 +288,28 @@ pub(in crate::api) async fn prepare_image_request(
     }
     let body = serde_json::to_vec(body).map_err(|_| AppError::Internal)?;
 
+    let selection = state.transport_proxy_groups.select(
+        route.account_id,
+        route.credential_generation,
+        &route.credential,
+    )?;
+    let mut transport_route = route.clone();
+    transport_route.credential = selection.credential.clone();
     let outbound_base_url = outbound_base_url(&route.base_url);
     crate::network::validate_codex_transport(
         &outbound_base_url,
         &route.config,
-        route.credential.proxy(),
+        selection.credential.proxy(),
         state.config.codex_test_loopback,
     )
     .await?;
     let client = state
         .codex_clients
-        .snapshot(route)
+        .transport_snapshot(&transport_route, selection.generation)
         .map_err(|_| AppError::Upstream("OpenAI Codex transport is unavailable".into()))?;
     let target_url = crate::network::upstream_api_url(&outbound_base_url, RESPONSES_PATH);
     let mut request = client.post(target_url).body(body);
-    if let Some((proxy_url, _)) = route.credential.proxy() {
+    if let Some((proxy_url, _)) = selection.credential.proxy() {
         request = request.proxy(
             wreq::Proxy::all(proxy_url)
                 .map_err(|_| AppError::BadRequest("OpenAI Codex proxy is invalid".into()))?,

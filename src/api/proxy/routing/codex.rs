@@ -64,6 +64,21 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
 #[cfg(test)]
 tokio::task_local! {
     static TEST_PRE_DELIVERY_CONNECT_FAILURES: std::cell::Cell<usize>;
+    static TEST_SEND_FAILURES: std::cell::RefCell<std::collections::VecDeque<ProxySendError>>;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_test_send_failures<F: std::future::Future>(
+    failures: Vec<ProxySendError>,
+    future: F,
+) -> (F::Output, usize) {
+    TEST_SEND_FAILURES
+        .scope(std::cell::RefCell::new(failures.into()), async {
+            let output = future.await;
+            let remaining = TEST_SEND_FAILURES.with(|failures| failures.borrow().len());
+            (output, remaining)
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -107,10 +122,6 @@ pub(super) async fn send_proxy_route(
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let client = state
-        .codex_clients
-        .snapshot(&route.route)
-        .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let target_url = network::upstream_api_url(&outbound_base_url, codex_transport::RESPONSES_PATH);
     let session_id = route
         .codex_session_id
@@ -158,7 +169,6 @@ pub(super) async fn send_proxy_route(
                 transport_policy,
                 deadline,
             },
-            &client,
         )
         .await
         {
@@ -261,7 +271,6 @@ async fn send_codex_attempt(
     route: &PreparedProxyRoute,
     session_id: &str,
     context: CodexAttemptContext,
-    client: &wreq::Client,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
         request_id,
@@ -270,7 +279,28 @@ async fn send_codex_attempt(
         transport_policy,
         deadline,
     } = context;
+    let mut attempted = Vec::with_capacity(4);
     for connect_attempt in 1..=transport_policy.connect_attempts {
+        let selection = state
+            .transport_proxy_groups
+            .select(
+                route.route.account_id,
+                route.route.credential_generation,
+                &route.route.credential,
+            )
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        if let Some(member) = selection.member() {
+            if attempted.contains(&member) {
+                return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
+            }
+            attempted.push(member);
+        }
+        let mut transport_route = route.route.clone();
+        transport_route.credential = selection.credential.clone();
+        let client = state
+            .codex_clients
+            .transport_snapshot(&transport_route, selection.generation)
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
         let phase = proxy_diagnostics::Phase::account(
             proxy_diagnostics::Context::for_request(request_id),
             "codex_transport_attempt",
@@ -278,7 +308,13 @@ async fn send_codex_attempt(
             Some(route.route.credential_generation),
         );
         let result = send_codex_attempt_once(
-            state, headers, target_url, route, session_id, client, context,
+            state,
+            headers,
+            target_url,
+            route,
+            session_id,
+            (&client, &selection.credential),
+            context,
         )
         .await;
         phase.finish(
@@ -293,6 +329,13 @@ async fn send_codex_attempt(
                 .map(|(response, _)| response.status().as_u16()),
             None,
         );
+        if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
+            && selection.member().is_some()
+        {
+            selection
+                .advance_after_connect_failure(&attempted)
+                .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        }
         match result {
             Err(ProxySendError::RetryableConnection(failure_stage))
                 if connect_attempt < transport_policy.connect_attempts =>
@@ -361,7 +404,7 @@ async fn send_codex_attempt_once(
     target_url: &str,
     route: &PreparedProxyRoute,
     session_id: &str,
-    client: &wreq::Client,
+    transport: (&wreq::Client, &UpstreamCredential),
     context: CodexAttemptContext,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
@@ -369,6 +412,15 @@ async fn send_codex_attempt_once(
         deadline,
         ..
     } = context;
+    #[cfg(test)]
+    if let Ok(error) = TEST_SEND_FAILURES.try_with(|failures| {
+        failures
+            .borrow_mut()
+            .pop_front()
+            .expect("unexpected additional upstream send")
+    }) {
+        return Err(error);
+    }
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
         .try_with(|remaining| {
@@ -380,8 +432,9 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
+    let (client, credential) = transport;
     let mut request = client.post(target_url).body(route.forwarded_body.clone());
-    let egress_path = if let Some((proxy_url, _)) = route.route.credential.proxy() {
+    let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
         let proxy =
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
         request = request.proxy(proxy);

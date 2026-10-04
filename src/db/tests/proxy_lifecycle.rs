@@ -42,6 +42,7 @@ async fn insert_completed_session_request(database: &Database, input: CompletedS
         .unwrap();
     database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
@@ -481,6 +482,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
         .unwrap();
     database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: None,
             first_output_ms: None,
             generation_duration_ms: None,
@@ -1210,6 +1212,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         if contender_kind == "completed-fact" {
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    terminal_cause: None,
                     usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                     first_output_ms: None,
                     generation_duration_ms: None,
@@ -1278,6 +1281,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             };
             pending_database
                 .finish_proxy_request(FinishProxyRequest {
+                    terminal_cause: None,
                     usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                     first_output_ms: None,
                     generation_duration_ms: None,
@@ -1521,6 +1525,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
     };
     database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: None,
             first_output_ms: None,
             generation_duration_ms: None,
@@ -1549,6 +1554,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
         .unwrap();
     database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: None,
             first_output_ms: None,
             generation_duration_ms: None,
@@ -1725,6 +1731,7 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
         finish_database
             .finish_proxy_request_with_buffered_archive_and_upstream_attribution(
                 FinishProxyRequest {
+                    terminal_cause: None,
                     usage_basis: None,
                     first_output_ms: None,
                     generation_duration_ms: None,
@@ -2206,6 +2213,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         ..TokenUsage::default()
     };
     let finish = || FinishProxyRequest {
+        terminal_cause: None,
         usage_basis: None,
         first_output_ms: None,
         generation_duration_ms: None,
@@ -2369,6 +2377,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     assert!(matches!(
         database
             .finish_proxy_request(FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,
@@ -2450,6 +2459,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         .unwrap();
     let delivered = database
         .finish_proxy_request(FinishProxyRequest {
+            terminal_cause: None,
             usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
             first_output_ms: None,
             generation_duration_ms: None,
@@ -2546,6 +2556,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     assert!(matches!(
         database
             .finish_proxy_request(FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                 first_output_ms: None,
                 generation_duration_ms: None,
@@ -2642,6 +2653,7 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
             barrier.wait().await;
             database
                 .finish_proxy_request(FinishProxyRequest {
+                    terminal_cause: None,
                     usage_basis: None,
                     first_output_ms: None,
                     generation_duration_ms: None,
@@ -2758,6 +2770,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
     database
         .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,
@@ -2815,6 +2828,7 @@ async fn terminal_upstream_attribution_uses_only_dispatched_candidates() {
     database
         .finish_proxy_request_with_archive_staging_and_upstream_attribution(
             FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: None,
                 first_output_ms: None,
                 generation_duration_ms: None,

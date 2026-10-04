@@ -997,6 +997,18 @@ async fn refresh_managed_upstream_oauth_impl(
                 "this OAuth lifecycle does not support a private proxy".into(),
             ));
         }
+        let transport_selection = if account.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            Some(state.transport_proxy_groups.select(
+                account_id,
+                credential_generation,
+                &credential,
+            )?)
+        } else {
+            None
+        };
+        let transport_credential = transport_selection
+            .as_ref()
+            .map_or(&credential, |selection| &selection.credential);
         let refreshed = match driver.as_str() {
             crate::oauth::authorization_code::FLOW => {
                 let adapter = state
@@ -1039,7 +1051,7 @@ async fn refresh_managed_upstream_oauth_impl(
             crate::oauth::codex_device::OAUTH_DRIVER => {
                 crate::oauth::managed::codex::refresh(
                     &state.http,
-                    &credential,
+                    transport_credential,
                     state.config.codex_test_loopback,
                     &request_guard,
                 )
@@ -1090,13 +1102,18 @@ async fn refresh_managed_upstream_oauth_impl(
                 refresh_managed_oauth_credential(
                     &state.http,
                     &adapter,
-                    &credential,
+                    transport_credential,
                     state.config.allow_oauth_loopback,
                     &request_guard,
                 )
                 .await?
             }
         };
+        if transport_selection.is_some()
+            && let Some((proxy, _)) = credential.proxy()
+        {
+            return refreshed.with_transport_proxy(proxy.to_owned());
+        }
         Ok(refreshed.preserve_proxy_from(&credential))
     }
     .await;
