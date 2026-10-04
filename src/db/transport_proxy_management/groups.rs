@@ -40,13 +40,14 @@ impl Database {
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, &body.tenant_external_id).await?;
         let id = Uuid::now_v7();
+        available_name(&mut tx, &tenant_id, &body.name, id).await?;
         let now = unix_millis();
         sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $5)")
             .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(ciphertext).bind(now).execute(&mut *tx).await?;
         budget(&mut tx, key).await?;
         audit(&mut tx, &tenant_id, id, "create", 1, actor).await?;
         let row = sqlx::query(
-            "SELECT g.*, 0 AS bound_account_count FROM transport_proxy_groups g WHERE id = $1",
+            "SELECT g.*, CAST(0 AS BIGINT) AS bound_account_count FROM transport_proxy_groups g WHERE id = $1",
         )
         .bind(id.to_string())
         .fetch_one(&mut *tx)
@@ -84,6 +85,7 @@ impl Database {
             return Err(conflict("proxy_group_version_conflict"));
         }
         let previous = open_members(&row, key)?;
+        available_name(&mut tx, &tenant_id, &body.name, id).await?;
         let next = members(body.members, &previous)?;
         let destructive = previous.iter().any(|old| {
             !next

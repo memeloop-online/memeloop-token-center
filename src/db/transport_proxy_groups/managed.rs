@@ -9,8 +9,20 @@ pub(super) struct ManagedEntry {
 }
 
 impl TransportProxyGroups {
-    pub(super) async fn refresh_managed(&self, pool: &AnyPool) -> Result<(), AppError> {
-        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.members_ciphertext, a.credential_generation, a.config_json FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id WHERE b.group_id IS NOT NULL ORDER BY b.account_id LIMIT 257")
+    #[cfg(test)]
+    pub(crate) async fn synchronize_managed_for_test(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<(), AppError> {
+        self.refresh_managed(pool).await?;
+        for entry in self.persistence_entries()? {
+            entry.synchronize(pool).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_managed(&self, pool: &AnyPool) -> Result<(), AppError> {
+        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.members_ciphertext, a.credential_generation, a.config_json, s.group_fingerprint AS saved_fingerprint, s.credential_generation AS saved_generation, s.selection_generation AS saved_epoch, s.base_index AS saved_base, s.selected_index AS saved_selected FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id LEFT JOIN upstream_transport_proxy_selections s ON s.account_id = b.account_id WHERE b.group_id IS NOT NULL ORDER BY b.account_id LIMIT 257")
             .fetch_all(pool).await?;
         let mut next = BTreeMap::new();
         let mut active = 0usize;
@@ -73,6 +85,32 @@ impl TransportProxyGroups {
                         .iter()
                         .position(|member| member.id == initial)
                         .ok_or_else(unavailable)?;
+                    if row
+                        .try_get::<Option<String>, _>("saved_fingerprint")?
+                        .as_deref()
+                        == Some(candidate.fingerprint.as_str())
+                        && row.try_get::<Option<i64>, _>("saved_generation")? == Some(generation)
+                    {
+                        let selected = usize::try_from(row.try_get::<i64, _>("saved_selected")?)
+                            .map_err(|_| unavailable())?;
+                        let saved_base = usize::try_from(row.try_get::<i64, _>("saved_base")?)
+                            .map_err(|_| unavailable())?;
+                        if selected >= members.len() || saved_base != base {
+                            return Err(unavailable());
+                        }
+                        let saved = Snapshot {
+                            credential_generation: u32::try_from(generation)
+                                .map_err(|_| unavailable())?,
+                            epoch: u64::try_from(row.try_get::<i64, _>("saved_epoch")?)
+                                .map_err(|_| unavailable())?,
+                            base,
+                            selected,
+                        }
+                        .encode()?;
+                        candidate.state.store(saved, Ordering::Release);
+                        candidate.persisted.store(saved, Ordering::Release);
+                        candidate.durable.store(saved, Ordering::Release);
+                    }
                     if let Some(old) = previous
                         .get(&account_id)
                         .filter(|old| old.stamp.group_id == stamp.group_id)

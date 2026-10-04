@@ -134,7 +134,7 @@ fn delivery_error_class(error: &AppError) -> &'static str {
     match error {
         AppError::Internal => "internal",
         AppError::Storage(_) => "storage",
-        AppError::Conflict(_) => "state_conflict",
+        AppError::Conflict(_) | AppError::ProxyGroupConflict(_) => "state_conflict",
         AppError::NotFound => "owner_missing",
         AppError::BadRequest(_) => "invalid_state",
         AppError::Overloaded => "overloaded",

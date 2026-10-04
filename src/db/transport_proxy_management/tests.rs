@@ -110,6 +110,56 @@ async fn contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(binding["binding_version"], 1);
+    let runtime = TransportProxyGroups::parse("[]", KEY).unwrap();
+    let (bound_account, bound_credential) = database
+        .upstream_account_with_credential(account.id, KEY)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .select_config(
+                account.id,
+                bound_account.credential_generation,
+                &bound_credential,
+                &bound_account.config
+            )
+            .is_err()
+    );
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let first = runtime
+        .select_config(
+            account.id,
+            bound_account.credential_generation,
+            &bound_credential,
+            &bound_account.config,
+        )
+        .unwrap();
+    assert_eq!(first.credential.proxy().unwrap().0, PRIMARY);
+    assert!(first.advance_after_connect_failure(&[0]).unwrap());
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let cold_pod = TransportProxyGroups::parse("[]", KEY).unwrap();
+    cold_pod.refresh_managed(&database.pool).await.unwrap();
+    assert_eq!(
+        cold_pod
+            .select_config(
+                account.id,
+                bound_account.credential_generation,
+                &bound_credential,
+                &bound_account.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
     assert_eq!(
         binding["credential_generation"],
         account.credential_generation + 1
@@ -169,6 +219,71 @@ async fn contract(database: &Database) {
         .unwrap();
     assert_eq!(binding["initial_member_id"], backup.to_string());
     assert_eq!(binding["group_version"], 2);
+    let (edited_account, edited_credential) = database
+        .upstream_account_with_credential(account.id, KEY)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .select_config(
+                account.id,
+                edited_account.credential_generation,
+                &edited_credential,
+                &edited_account.config
+            )
+            .is_err()
+    );
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .select_config(
+                account.id,
+                bound_account.credential_generation,
+                &bound_credential,
+                &bound_account.config
+            )
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .select_config(
+                account.id,
+                edited_account.credential_generation,
+                &edited_credential,
+                &edited_account.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+    assert_eq!(first.credential.proxy().unwrap().0, PRIMARY);
+    assert!(!first.advance_after_connect_failure(&[0]).unwrap());
+    let cold_after_edit = TransportProxyGroups::parse("[]", KEY).unwrap();
+    cold_after_edit
+        .refresh_managed(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        cold_after_edit
+            .select_config(
+                account.id,
+                edited_account.credential_generation,
+                &edited_credential,
+                &edited_account.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
     let unbound = database
         .unbind_transport_group(
             account.id,

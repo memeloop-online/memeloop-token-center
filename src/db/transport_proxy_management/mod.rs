@@ -67,6 +67,20 @@ fn open_members(row: &AnyRow, key: &[u8]) -> Result<Vec<Member>, AppError> {
     )
 }
 
+async fn available_name(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    name: &str,
+    id: Uuid,
+) -> Result<(), AppError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups WHERE tenant_id = $1 AND name = $2 AND id <> $3")
+        .bind(tenant_id).bind(name).bind(id.to_string()).fetch_one(&mut **tx).await?;
+    if count != 0 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppError> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups")
         .fetch_one(&mut **tx)
