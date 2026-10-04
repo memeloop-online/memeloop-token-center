@@ -12,6 +12,7 @@ use crate::provider::{CodexTransportPolicy, ResolvedUpstream};
 struct ClientKey {
     account_id: uuid::Uuid,
     revision: i64,
+    selection_generation: i64,
     proxy_fingerprint: [u8; 32],
     timeouts: [u64; 3],
 }
@@ -35,6 +36,7 @@ impl ClientKey {
         Self {
             account_id,
             revision,
+            selection_generation: 0,
             proxy_fingerprint: Sha256::digest(
                 credential.proxy().map_or("", |(url, _)| url).as_bytes(),
             )
@@ -66,6 +68,14 @@ impl CodexClients {
     }
 
     pub(crate) fn snapshot(&self, route: &ResolvedUpstream) -> Result<wreq::Client, &'static str> {
+        self.transport_snapshot(route, 0)
+    }
+
+    pub(crate) fn transport_snapshot(
+        &self,
+        route: &ResolvedUpstream,
+        selection_generation: i64,
+    ) -> Result<wreq::Client, &'static str> {
         #[cfg(test)]
         if let Some(client) = self
             .test_client
@@ -76,7 +86,8 @@ impl CodexClients {
             return Ok(client.clone());
         }
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
-        let key = ClientKey::new(route, policy);
+        let mut key = ClientKey::new(route, policy);
+        key.selection_generation = selection_generation;
         self.client(key, policy)
     }
 
@@ -91,11 +102,19 @@ impl CodexClients {
         account: &crate::provider::UpstreamAccountView,
         credential: &crate::provider::UpstreamCredential,
     ) -> Result<wreq::Client, &'static str> {
+        self.account_transport_snapshot(account, credential, 0)
+    }
+
+    pub(crate) fn account_transport_snapshot(
+        &self,
+        account: &crate::provider::UpstreamAccountView,
+        credential: &crate::provider::UpstreamCredential,
+        selection_generation: i64,
+    ) -> Result<wreq::Client, &'static str> {
         let policy = CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
-        self.client(
-            ClientKey::for_account(account.id, account.updated_at, credential, policy),
-            policy,
-        )
+        let mut key = ClientKey::for_account(account.id, account.updated_at, credential, policy);
+        key.selection_generation = selection_generation;
+        self.client(key, policy)
     }
 
     fn client(
@@ -254,6 +273,9 @@ mod tests {
         };
         let policy = CodexTransportPolicy::default();
         let first = ClientKey::new(&route, policy);
+        let mut changed_selection = ClientKey::new(&route, policy);
+        changed_selection.selection_generation = 2;
+        assert!(first != changed_selection);
         assert!(
             first
                 == ClientKey::for_account(

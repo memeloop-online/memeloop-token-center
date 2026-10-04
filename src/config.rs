@@ -149,6 +149,8 @@ impl RuntimeRole {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default, skip_serializing)]
+    pub transport_proxy_groups: String,
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
@@ -417,6 +419,7 @@ impl Config {
         let upstream_health = UpstreamHealthConfig::from_env()?;
 
         let config = Self {
+            transport_proxy_groups: env_string("MTC_TRANSPORT_PROXY_GROUPS", "[]"),
             listen: env_string("MTC_LISTEN", "0.0.0.0:8080"),
             database_url: env_string(
                 "MTC_DATABASE_URL",

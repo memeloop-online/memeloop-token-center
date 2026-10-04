@@ -915,6 +915,17 @@ async fn discover_codex_models(
     credential: &UpstreamCredential,
     require_complete: bool,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    let selection = state
+        .transport_proxy_groups
+        .select(
+            &state.db,
+            account.id,
+            account.credential_generation,
+            credential,
+        )
+        .await
+        .map_err(|_| "transport_selection_unavailable")?;
+    let credential = &selection.credential;
     credential
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
@@ -927,7 +938,11 @@ async fn discover_codex_models(
     )
     .await
     .map_err(|_| "destination_invalid")?;
-    let client = state.codex_clients.account_snapshot(account, credential)?;
+    let client = state.codex_clients.account_transport_snapshot(
+        account,
+        credential,
+        selection.generation,
+    )?;
     let budget = codex_catalog_budget(&account.config)?;
     let account_id = codex_account_header(credential)?;
     let url = format!(
