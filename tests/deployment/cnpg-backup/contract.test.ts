@@ -114,9 +114,9 @@ function initializeSource(container: string): void {
 
 function stageArgs(container: string): string[] {
   const path = shell(container, 'printf %s "$PATH"').toString();
-  return ['exec', '-e', `PATH=/tmp/bin:${path}`, '-e', 'PARENT_REVIEW_APPROVED=true', '-e', 'SOURCE_IO_REVIEW_APPROVED=true', '-e', 'ROOT_STORAGE_REVIEW_APPROVED=true',
-    '-e', 'EXPECTED_BACKUP_FS_UUID=test-nvme', '-e', 'EXPECTED_SERVER_ADDRESS=127.0.0.1', '-e', 'DATABASE_URL=host=/scratch/socket user=postgres dbname=source',
-    '-e', 'PGOPTIONS=-c default_transaction_read_only=on -c lock_timeout=5s', container, ...stageContainer.command];
+  return ['exec', '--env', `PATH=/tmp/bin:${path}`, '--env', 'PARENT_REVIEW_APPROVED=true', '--env', 'SOURCE_IO_REVIEW_APPROVED=true', '--env', 'ROOT_STORAGE_REVIEW_APPROVED=true',
+    '--env', 'EXPECTED_BACKUP_FS_UUID=test-nvme', '--env', 'EXPECTED_SERVER_ADDRESS=127.0.0.1', '--env', 'DATABASE_URL=host=/scratch/socket user=postgres dbname=source',
+    '--env', 'PGOPTIONS=-c default_transaction_read_only=on -c lock_timeout=5s', container, ...stageContainer.command];
 }
 
 test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full restore in isolated containers', { timeout: 600_000 }, async context => {
@@ -167,7 +167,7 @@ test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full r
   assert.ok(sleeps.every(milliseconds => milliseconds > 0 && milliseconds <= 4000));
   shell(destination, `test -f ${archiveDirectory}/OFFHOST_COPY_VERIFIED`);
   assert.equal(shell(destination, `sha256sum ${archiveDirectory}/${archiveName}`).toString().split(' ')[0], expectedSha);
-  const restoreOutput = docker(['exec', '-e', 'PARENT_REVIEW_APPROVED=true', '-e', `EXPECTED_SOURCE_SHA256=${expectedSha}`, destination, ...restoreContainer.command]);
+  const restoreOutput = docker(['exec', '--env', 'PARENT_REVIEW_APPROVED=true', '--env', `EXPECTED_SOURCE_SHA256=${expectedSha}`, destination, ...restoreContainer.command]);
   assert.match(restoreOutput.toString(), /full archive restore completed.*254/);
   console.log(`Uncompressed bytes=${size}; export wall_ms=${Math.round(elapsed)}; interrupted copy resumed; destination SHA=${expectedSha}; full isolated restore passed`);
 
