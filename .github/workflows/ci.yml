@@ -341,7 +341,7 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Optional routing SQL cannot delay forwarding or retain lifecycle capacity
-        run: cargo test --locked --all-features --lib api::proxy::tests::routing_persistence::
+        run: cargo test --locked --all-features --lib api::proxy::tests::routing_persistence
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
