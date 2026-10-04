@@ -24,10 +24,13 @@ use crate::{
 mod anthropic_bridge;
 mod archive_terminal;
 mod buffered_responses_incomplete;
+mod cancellation;
 mod chat_sse_usage;
 mod codex_complex_contract;
 mod codex_dispatch;
+mod codex_http2_downstream_cancel;
 mod codex_http2_failure_safety;
+mod codex_http2_long_silence;
 mod codex_output_limits;
 mod codex_quota;
 mod codex_workbuddy;
@@ -4468,6 +4471,7 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
         rows[0].error_code.as_deref(),
         Some("upstream_stream_read_error")
     );
+    assert_eq!(rows[0].cost, "0");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 

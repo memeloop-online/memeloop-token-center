@@ -9,7 +9,7 @@ import '../../src/styles/metrics.css';
 import '../../src/operator/operator.css';
 
 declare global {
-  interface Window { usageAnalysisFixture: { calls: string[] } }
+  interface Window { usageAnalysisFixture: { calls: string[]; failSaves: boolean; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
 }
 
 const largeMetric = 1_250_000_000_000;
@@ -48,7 +48,13 @@ const analysis: OperatorUsageAnalysis = {
   heatmap: [],
 };
 
-window.usageAnalysisFixture = { calls: [] };
+const credentials = Array.from({ length: 101 }, (_, index) => ({
+  alias: index === 0 ? 'client-a' : index === 100 ? 'late-client' : `client-${index}`,
+  created_at: 2_000_000 - index,
+  key_id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
+}));
+
+window.usageAnalysisFixture = { calls: [], failSaves: false, presets: { named: [], recent: [] } };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -57,10 +63,25 @@ function json(value: unknown, status = 200) {
   });
 }
 
-globalThis.fetch = async (input: RequestInfo | URL) => {
+globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input.toString(), location.origin);
   window.usageAnalysisFixture.calls.push(`${url.pathname}${url.search}`);
   if (url.pathname === '/internal/v1/usage-analysis') return json(analysis);
+  if (url.pathname === '/internal/v1/keys') {
+    const search = url.searchParams.get('search')?.toLowerCase() ?? '';
+    const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);
+    const beforeId = url.searchParams.get('before_id') ?? 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+    const limit = Number(url.searchParams.get('limit') ?? 500);
+    return json(credentials.filter((credential) => credential.alias.toLowerCase().includes(search) && (credential.created_at < beforeCreatedAt || (credential.created_at === beforeCreatedAt && credential.key_id < beforeId))).slice(0, limit));
+  }
+  if (url.pathname === '/internal/v1/filter-presets') {
+    if (init?.method === 'POST' && window.usageAnalysisFixture.failSaves) return json({ error: { message: 'Preset storage failed' } }, 500);
+    if (init?.method === 'POST' && init.body) {
+      const body = JSON.parse(String(init.body)) as { name?: string; ast: unknown };
+      if (body.name) window.usageAnalysisFixture.presets.named.push({ name: body.name, ast: body.ast, updated_at: Date.now() });
+    }
+    return json(window.usageAnalysisFixture.presets);
+  }
   return json([]);
 };
 

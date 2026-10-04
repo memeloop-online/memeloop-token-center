@@ -439,6 +439,21 @@ async fn send_codex_attempt_once(
     let upstream_started = Instant::now();
     let upstream_result = send_until_request_deadline(deadline.request, async {
         request.send().await.map_err(|error| {
+            if let Some(http2) = upstream_response::codex_http2_error(&error) {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %route.route.account_id,
+                    transport_revision = route.route.transport_revision,
+                    account_proxy = route.route.credential.proxy().is_some(),
+                    stage = "codex_http2_before_response_headers",
+                    http2_reset = http2.is_reset(),
+                    http2_goaway = http2.is_go_away(),
+                    http2_remote = http2.is_remote(),
+                    http2_library = http2.is_library(),
+                    http2_reason = ?http2.reason().map(u32::from),
+                    "Codex HTTP/2 failure origin evidence"
+                );
+            }
             tracing::warn!(
                 %request_id,
                 upstream_account_id = %route.route.account_id,

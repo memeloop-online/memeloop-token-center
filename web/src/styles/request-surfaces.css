@@ -10,6 +10,8 @@
 .request-table .request-outcome { display: inline-flex; align-items: center; gap: 6px; white-space: normal; }
 .request-outcome.status { border: 0; border-radius: 4px; padding: 4px 6px; text-transform: none; font-size: 12px; line-height: 1.45; }
 .request-outcome small { font: inherit; opacity: .8; }
+.request-status-cause { display: none; }
+.request-diagnostics .request-status-cause { display: block; margin-top: 4px; overflow-wrap: anywhere; }
 .request-outcome.ok { color: var(--mtc-data-primary, #72c7ba); background: color-mix(in srgb, var(--mtc-data-primary, #72c7ba) 10%, transparent); }
 .request-outcome.bad { color: var(--mtc-data-negative, #ed9caa); background: color-mix(in srgb, var(--mtc-data-negative, #ed9caa) 10%, transparent); }
 .request-outcome.pending { color: #f0d697; background: #3d3624; }

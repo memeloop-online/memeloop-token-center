@@ -2104,6 +2104,48 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/upstreams/{account_id}/models/discovery:
+    get:
+      tags: [Upstream providers]
+      operationId: discoverUpstreamModel
+      summary: Inspect one exact Codex slug in authenticated upstream metadata
+      description: Uses the stored account transport, credential and shared client version with bounded complete-catalog validation. Reports upstream presence independently of the default visibility filter. Visibility is normalized to list, hide, missing or unknown; no credentials, instructions or raw upstream body are returned. Does not modify the catalog or create routes. Absent metadata is not evidence that a different client version would expose the model.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: model
+          in: query
+          required: true
+          description: Exact upstream slug; no alias or prefix matching.
+          schema: { type: string, minLength: 1, maxLength: 500 }
+      responses:
+        '200':
+          description: Fresh account-scoped metadata inspection, including a valid absent result.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [account_id, credential_generation, model, present, visibility, filter_decision, metadata_valid, client_version]
+                properties:
+                  account_id: { type: string, format: uuid }
+                  credential_generation: { type: integer }
+                  model: { type: string }
+                  present: { type: boolean }
+                  visibility: { type: [string, 'null'], enum: [list, hide, missing, unknown, null] }
+                  filter_decision: { type: string, enum: [absent, included, excluded_visibility] }
+                  metadata_valid: { type: boolean, description: True only for valid slug and context-window metadata. }
+                  client_version: { type: string }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { description: Authenticated discovery failed or returned incomplete or ambiguous metadata; no raw upstream details are exposed. }
+
   /internal/v1/upstreams/{account_id}/models/sync:
     post:
       tags: [Upstream providers]
@@ -2115,6 +2157,10 @@ paths:
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/TenantFilter'
+        - name: model
+          in: query
+          description: Codex-only explicit exact selection. Includes this slug even when hidden only if complete authenticated metadata supplies it with a valid context window. Publishes current-generation catalog membership for subsequent explicit route creation and candidate admission, without creating routes or grants or enabling unrequested models. Unrequested hidden slugs remain excluded. Missing selection returns 400, concurrent sync returns 409 and failed metadata validation returns 502. Configure the route after selection so later default refreshes retain the hidden slug. No alias is inferred.
+          schema: { type: string, minLength: 1, maxLength: 500 }
       responses:
         '200':
           description: Refreshed, stale, unsupported, or already-syncing catalog state, returning up to 10000 active and 10000 disabled entries without a follow-up GET.
@@ -2126,6 +2172,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+        '502': { description: Explicit exact selection could not validate complete authenticated upstream metadata. }
 
   /internal/v1/upstreams/{account_id}/models/sync-routes:
     post:
