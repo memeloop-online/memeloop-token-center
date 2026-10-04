@@ -1,0 +1,79 @@
+networkPolicy:
+  enabled: true
+  ingress:
+    allowSameNamespace: false
+    controllerNamespaces: []
+    extraRules:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: higress-system
+            podSelector:
+              matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                    - higress-gateway
+                    - higress-gateway-cp
+          - ipBlock:
+              cidr: 100.64.0.1/32
+          - ipBlock:
+              cidr: 100.64.0.6/32
+          - ipBlock:
+              cidr: 100.64.0.7/32
+        ports:
+          - protocol: TCP
+            port: 8080
+  egress:
+    dns:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    allowSameNamespace: false
+    clusterDependencies:
+      enabled: false
+      cidrs: []
+      ports: []
+    outboundProxy:
+      enabled: true
+      cidrs:
+        - 100.64.0.2/32
+      ports:
+        - protocol: TCP
+          port: 1080
+    publicInternet:
+      enabled: false
+      cidrs:
+        - cidr: 0.0.0.0/0
+          except:
+            - 10.0.0.0/8
+            - 100.64.0.0/10
+            - 127.0.0.0/8
+            - 169.254.0.0/16
+            - 172.16.0.0/12
+            - 192.168.0.0/16
+            - 198.18.0.0/15
+            - 224.0.0.0/4
+            - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+    extraRules:
+      - to:
+          - podSelector:
+              matchLabels:
+                cnpg.io/cluster: memeloop-token-center-test-pg
+        ports:
+          - protocol: TCP
+            port: 5432
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: memeloop-token-center-test-objects
+        ports:
+          - protocol: TCP
+            port: 9000
