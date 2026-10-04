@@ -17,6 +17,7 @@ pub(super) async fn rebase_selection(
             .await?;
     let durable = sqlx::query("SELECT group_version, group_fingerprint, selected_index, selection_generation FROM upstream_transport_proxy_selections WHERE account_id = $1")
         .bind(account.to_string()).fetch_optional(&mut **tx).await?;
+    let version = revision(tx).await?;
     let base = next
         .iter()
         .position(|member| member.id == initial)
@@ -59,11 +60,11 @@ pub(super) async fn rebase_selection(
     }
     let fingerprint = TransportProxyGroups::fingerprint(
         account,
-        generation,
+        version,
         next.iter().map(|member| member.proxy_url.clone()).collect(),
         key,
     )?;
-    sqlx::query("INSERT INTO upstream_transport_proxy_selections (account_id, group_version, group_fingerprint, credential_generation, base_index, selected_index, selection_generation) VALUES ($1, $2, $3, $2, $4, $5, $6) ON CONFLICT (account_id) DO UPDATE SET group_version = excluded.group_version, group_fingerprint = excluded.group_fingerprint, credential_generation = excluded.credential_generation, base_index = excluded.base_index, selected_index = excluded.selected_index, selection_generation = excluded.selection_generation")
-        .bind(account.to_string()).bind(generation).bind(fingerprint).bind(base as i64).bind(selected as i64).bind(epoch).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO upstream_transport_proxy_selections (account_id, group_version, group_fingerprint, credential_generation, base_index, selected_index, selection_generation) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (account_id) DO UPDATE SET group_version = excluded.group_version, group_fingerprint = excluded.group_fingerprint, credential_generation = excluded.credential_generation, base_index = excluded.base_index, selected_index = excluded.selected_index, selection_generation = excluded.selection_generation")
+        .bind(account.to_string()).bind(version).bind(fingerprint).bind(generation).bind(base as i64).bind(selected as i64).bind(epoch).execute(&mut **tx).await?;
     Ok(())
 }

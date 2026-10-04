@@ -34,6 +34,14 @@ async fn tenant(tx: &mut Transaction<'_, Any>, external_id: &str) -> Result<Stri
         .ok_or(AppError::NotFound)
 }
 
+async fn revision(tx: &mut Transaction<'_, Any>) -> Result<i64, AppError> {
+    Ok(
+        sqlx::query_scalar("SELECT revision FROM transport_proxy_management_lock WHERE id = 1")
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
 async fn audit(
     tx: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -95,7 +103,7 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
             .collect::<Vec<_>>();
         bytes += serde_json::to_vec(&serde_json::json!([{
             "account_id":row.try_get::<String, _>("account_id")?,
-            "version":u32::MAX,
+            "version":i64::MAX,
             "proxies":proxies,
         }]))
         .map_err(|_| AppError::Internal)?

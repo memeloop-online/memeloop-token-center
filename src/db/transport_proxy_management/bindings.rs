@@ -117,6 +117,7 @@ impl Database {
         };
         let version = version.checked_add(1).ok_or(AppError::Internal)?;
         let stamp = BindingStamp {
+            selection_version: revision(&mut tx).await?,
             binding_version: version,
             group_id: target,
             group_version: target.map(|_| group_version),

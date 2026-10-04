@@ -85,6 +85,29 @@ async fn contract(database: &Database) {
         .await
         .unwrap();
     assert!(!group.to_string().contains("10.20.30"));
+    let unrelated = database
+        .create_transport_group(
+            CreateGroup {
+                tenant_external_id: tenant.clone(),
+                name: "revision-gap".into(),
+                members: vec![input("primary", PRIMARY)],
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    database
+        .delete_transport_group(
+            Uuid::parse_str(unrelated["id"].as_str().unwrap()).unwrap(),
+            DeleteGroup {
+                tenant_external_id: tenant.clone(),
+                expected_version: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
     let id = Uuid::parse_str(group["id"].as_str().unwrap()).unwrap();
     let primary = Uuid::parse_str(group["members"][0]["id"].as_str().unwrap()).unwrap();
     let backup = Uuid::parse_str(group["members"][1]["id"].as_str().unwrap()).unwrap();
@@ -115,6 +138,10 @@ async fn contract(database: &Database) {
         .upstream_account_with_credential(account.id, KEY)
         .await
         .unwrap();
+    assert_ne!(
+        bound_account.config[CONFIG_KEY]["selection_version"],
+        bound_account.credential_generation
+    );
     assert!(
         runtime
             .select_config(
@@ -143,13 +170,45 @@ async fn contract(database: &Database) {
         .synchronize_managed_for_test(&database.pool)
         .await
         .unwrap();
+    let fingerprint: String = sqlx::query_scalar(
+        "SELECT group_fingerprint FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let refreshed_account = database
+        .rotate_upstream_credential(
+            account.id,
+            bound_credential.clone(),
+            &format!("fixture-{}", Uuid::now_v7()),
+            KEY,
+        )
+        .await
+        .unwrap();
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let refreshed_fingerprint: String = sqlx::query_scalar(
+        "SELECT group_fingerprint FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(fingerprint, refreshed_fingerprint);
+    assert_eq!(
+        refreshed_account.config[CONFIG_KEY],
+        bound_account.config[CONFIG_KEY]
+    );
     let cold_pod = TransportProxyGroups::parse("[]", KEY).unwrap();
     cold_pod.refresh_managed(&database.pool).await.unwrap();
     assert_eq!(
         cold_pod
             .select_config(
                 account.id,
-                bound_account.credential_generation,
+                refreshed_account.credential_generation,
                 &bound_credential,
                 &bound_account.config
             )

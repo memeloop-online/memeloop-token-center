@@ -59,7 +59,7 @@ impl TransportProxyGroups {
                     .collect::<Vec<_>>();
                 let encoded = serde_json::to_string(&vec![Group {
                     account_id,
-                    version: generation,
+                    version: stamp.selection_version,
                     proxies,
                 }])
                 .map_err(|_| unavailable())?;

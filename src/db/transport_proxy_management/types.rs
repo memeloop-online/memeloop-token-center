@@ -42,6 +42,7 @@ pub(crate) struct DeleteGroup {
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct BindingStamp {
+    pub selection_version: i64,
     pub binding_version: i64,
     pub group_id: Option<Uuid>,
     pub group_version: Option<i64>,
