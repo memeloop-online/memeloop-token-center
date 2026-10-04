@@ -121,7 +121,7 @@ async fn postgres_proxy_group_116_accepts_empty_113_and_later_114_115() {
     };
     let administrative = Database::connect(&url).await.unwrap();
     let name = format!("mtc_proxy_schema_{}", uuid::Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&administrative.pool)
         .await
         .unwrap();
@@ -130,7 +130,7 @@ async fn postgres_proxy_group_116_accepts_empty_113_and_later_114_115() {
     let database = Database::connect(isolated.as_str()).await.unwrap();
     upgrade_contract(&database).await;
     database.pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {name}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&administrative.pool)
         .await
         .unwrap();
