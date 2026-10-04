@@ -52,3 +52,11 @@ test('request diagnostics use only nullable server-recorded final routing fields
   assert.match(components, /request\.currency === undefined \? fallbackCurrency : request\.currency/);
   assert.doesNotMatch(components, /routing_attempts|ttft|tokens_per_second/i);
 });
+
+test('request failure presentation shares the allowlisted recorded cause and never renders raw codes', () => {
+  assert.match(components, /const failureCause = requestFailureCause\(request, locale\) \?\? \(request\.error_code \? requestErrorCopy\(request\.error_code, locale\) : null\);/);
+  assert.match(components, /\{failureCause && <div className="request-detail-wide"><b>\{t\('request\.error'\)\}<\/b><span>\{failureCause\}<\/span><\/div>\}/);
+  assert.doesNotMatch(components, /\{request\.error_code\}/, 'raw recorded error codes never render as copy');
+  assert.doesNotMatch(components, /traffic\.errorCode/, 'raw recorded error codes never appear in tooltips');
+  assert.match(components, /<td className="request-status-cell" data-label=\{t\('request\.status'\)\}><RequestStatus request=\{request\} \/><\/td>/, 'the status cell relies on the shared status cause presentation');
+});

@@ -138,7 +138,9 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await assertValue(filters.getByLabel('状态'), 'error');
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
-  await assertContains(page.locator('.self-history'), 'http_429');
+  await assertContains(page.locator('.self-history tbody'), '429');
+  await assertContains(page.locator('.self-history tbody'), '已记录原因: 未知（未记录具体原因）');
+  assert.doesNotMatch(await page.locator('.self-history tbody').innerText(), /http_429/);
   await page.locator('.self-history').getByRole('button', { name: /请求详情$/ }).click();
 });
 

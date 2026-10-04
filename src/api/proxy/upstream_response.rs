@@ -13,6 +13,45 @@ pub(super) const UPSTREAM_HTTP2_GOAWAY: &str = "upstream_http2_goaway";
 pub(super) const UPSTREAM_READ_TIMEOUT: &str = "upstream_read_timeout";
 pub(super) const UPSTREAM_REQUEST_TIMEOUT: &str = "upstream_request_timeout";
 
+pub(super) fn terminal_cause_from_stream_error(
+    error: &'static str,
+) -> Option<crate::model::RequestTerminalCause> {
+    use crate::model::RequestTerminalCause;
+    match error {
+        UPSTREAM_HTTP2_RESET => Some(RequestTerminalCause::Http2Reset),
+        UPSTREAM_HTTP2_GOAWAY => Some(RequestTerminalCause::Http2GoAway),
+        UPSTREAM_READ_TIMEOUT => Some(RequestTerminalCause::ReadTimeout),
+        UPSTREAM_REQUEST_TIMEOUT => Some(RequestTerminalCause::RequestTimeout),
+        UPSTREAM_STREAM_ERROR => Some(RequestTerminalCause::StreamReadError),
+        _ => None,
+    }
+}
+
+pub(super) async fn rejected_response_terminal_cause(
+    response: UpstreamResponse,
+) -> Option<crate::model::RequestTerminalCause> {
+    let mut stream = response.bytes_stream();
+    let observed = async {
+        let mut discarded_bytes = 0usize;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Err(error) => return terminal_cause_from_stream_error(error),
+                Ok(bytes) => {
+                    discarded_bytes = discarded_bytes.saturating_add(bytes.len());
+                    if discarded_bytes >= 64 * 1024 {
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    };
+    tokio::time::timeout(std::time::Duration::from_millis(100), observed)
+        .await
+        .ok()
+        .flatten()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodexHttp2Failure {
     Reset,
@@ -260,6 +299,35 @@ impl From<reqwest::Response> for UpstreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_observation_limits_do_not_invent_terminal_causes() {
+        let silent = UpstreamResponse::Prefetched {
+            status: StatusCode::BAD_GATEWAY,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::pending()),
+        };
+        assert_eq!(rejected_response_terminal_cause(silent).await, None);
+        let bounded = UpstreamResponse::Prefetched {
+            status: StatusCode::BAD_GATEWAY,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::iter([
+                Ok(Bytes::from(vec![b'x'; 64 * 1024])),
+                Err(UPSTREAM_HTTP2_RESET),
+            ])),
+        };
+        assert_eq!(rejected_response_terminal_cause(bounded).await, None);
+        assert_eq!(terminal_cause_from_stream_error("http_502"), None);
+        assert_eq!(
+            terminal_cause_from_stream_error("Bearer untrusted-diagnostic"),
+            None
+        );
+        assert_eq!(terminal_cause_from_stream_error("keepalive_timeout"), None);
+    }
     use futures_util::StreamExt;
     use std::{
         pin::Pin,

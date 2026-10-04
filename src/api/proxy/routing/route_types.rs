@@ -96,6 +96,20 @@ pub(in crate::api::proxy) enum TransportFailureKind {
 }
 
 impl TransportFailureKind {
+    pub(in crate::api::proxy) const fn terminal_cause(&self) -> crate::model::RequestTerminalCause {
+        use crate::model::RequestTerminalCause;
+        match self {
+            Self::Timeout => RequestTerminalCause::TransportTimeout,
+            Self::ConnectionReset => RequestTerminalCause::TransportConnectionReset,
+            Self::Http2Reset => RequestTerminalCause::TransportHttp2Reset,
+            Self::Http2GoAway => RequestTerminalCause::TransportHttp2GoAway,
+            Self::Body => RequestTerminalCause::TransportBody,
+            Self::Decode => RequestTerminalCause::TransportDecode,
+            Self::Request => RequestTerminalCause::TransportRequest,
+            Self::Other => RequestTerminalCause::TransportOther,
+        }
+    }
+
     pub(in crate::api::proxy) const fn failure_stage(&self) -> &'static str {
         match self {
             Self::Timeout => "request_timeout",

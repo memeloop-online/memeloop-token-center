@@ -140,7 +140,15 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const errorAst = (errorFilter.request().postDataJSON() as { ast: { conditions: Array<{ field: string; value: { value: string } }> } }).ast;
   assert.deepEqual(errorAst.conditions.slice(-2).map((condition) => [condition.field, condition.value.value]), [['status', 'error'], ['error_code', 'http_429']]);
   await assertCount(requestPanel.locator('tbody tr'), 1);
-  await assertContains(requestPanel.locator('tbody'), 'http_429');
+  await assertContains(requestPanel.locator('tbody'), '429');
+  await assertContains(requestPanel.locator('tbody'), '已记录原因: 未知（未记录具体原因）');
+  assert.doesNotMatch(await requestPanel.locator('tbody').innerText(), /http_429/);
+  await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
+  const requestDrawer = page.getByRole('dialog');
+  await assertContains(requestDrawer, '429');
+  await requestDrawer.getByRole('button', { name: '技术详情', exact: true }).click();
+  await assertContains(requestDrawer, 'upstream rejected the request');
+  await requestDrawer.getByRole('button', { name: '关闭', exact: true }).click();
 
   await builder.getByRole('button', { name: '清除', exact: true }).click();
   await assertCount(requestPanel.locator('tbody tr'), 51);

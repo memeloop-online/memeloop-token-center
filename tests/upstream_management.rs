@@ -56,6 +56,68 @@ async fn json_request(
     (status, value)
 }
 
+fn contains_proxy_port(value: &Value, proxy_port: u16) -> bool {
+    let port = proxy_port.to_string();
+    match value {
+        Value::Object(fields) => fields.iter().any(|(name, value)| {
+            let port_field = name == "port" || name.ends_with("_port") || name.ends_with("Port");
+            (port_field
+                && (value.as_u64() == Some(u64::from(proxy_port))
+                    || value.as_str() == Some(port.as_str())))
+                || contains_proxy_port(value, proxy_port)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_proxy_port(value, proxy_port)),
+        Value::String(text) => {
+            let address_port = format!(":{port}");
+            text.match_indices(&address_port).any(|(offset, matched)| {
+                text[offset + matched.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| {
+                        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+                    })
+            })
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn proxy_port_redaction_allows_unrelated_timestamp_uuid_and_fingerprint_digits() {
+    let sanitized = json!({
+        "created_at": 1791080562194_i64,
+        "updated_at": 1791080562276_i64,
+        "id": "01a104b8-1080-7860-8cd7-ff659d6feaf1",
+        "proxy_fingerprint": "proxy_1080e2c118864822",
+        "proxy_scheme": "socks5h",
+        "proxy_label": "SOCKS5H private proxy",
+        "config": {"base_url": "https://example.test:10800/1080"}
+    });
+    assert!(sanitized.to_string().contains("1080"));
+    assert!(!contains_proxy_port(&sanitized, 1080));
+}
+
+#[test]
+fn proxy_port_redaction_rejects_address_and_structured_port_leaks() {
+    for leaked in [
+        json!({"proxy_url": "socks5h://proxy-user:proxy-secret@100.64.0.16:1080"}),
+        json!({"address": "redacted.example:1080"}),
+        json!({"message": "proxy https://redacted.example:1080/ failed"}),
+        json!({"url": "https://redacted.example:1080?query=value"}),
+        json!({"url": "https://redacted.example:1080#fragment"}),
+        json!({"proxy_port": 1080}),
+        json!({"proxy_port": "1080"}),
+        json!({"proxyPort": 1080}),
+        json!({"proxy": {"port": 1080}}),
+        json!({"diagnostics": [{"port": "1080"}]}),
+        json!({"diagnostics": ["[::1]:1080"]}),
+    ] {
+        assert!(contains_proxy_port(&leaked, 1080), "{leaked}");
+    }
+}
+
 #[tokio::test]
 async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
     let directory = tempfile::tempdir().unwrap();
@@ -187,15 +249,10 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
     .await;
     assert_eq!(status, StatusCode::OK, "{rotated_json}");
     let rendered = rotated_json.to_string();
-    for secret in [
-        proxy_url,
-        "proxy-user",
-        "proxy-secret",
-        "100.64.0.16",
-        "1080",
-    ] {
+    for secret in [proxy_url, "proxy-user", "proxy-secret", "100.64.0.16"] {
         assert!(!rendered.contains(secret), "{rendered}");
     }
+    assert!(!contains_proxy_port(&rotated_json, 1080), "{rendered}");
     let rotated = account(rotated_json);
     assert!(rotated.has_proxy);
     assert!(rotated.can_update_transport_proxy);

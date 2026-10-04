@@ -977,6 +977,7 @@ mod tests {
         let result = fixture
             .database
             .finish_proxy_request(FinishProxyRequest {
+                terminal_cause: None,
                 usage_basis: Some(RequestUsageBasis::ProviderReported),
                 first_output_ms: None,
                 generation_duration_ms: None,
@@ -1460,6 +1461,7 @@ mod tests {
             let response_object = "gap://failed-cost-backfill/concurrent-writer/response";
             writer
                 .finish_proxy_request(FinishProxyRequest {
+                    terminal_cause: None,
                     usage_basis: Some(RequestUsageBasis::ProviderReported),
                     first_output_ms: None,
                     generation_duration_ms: None,

@@ -40,6 +40,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
                 currency: Some("USD".to_owned()),
             },
             error_code: None,
+            terminal_cause_code: None,
             archive_state: crate::model::RequestArchiveState::Bound,
             credential_identity: None,
             session_context: None,
