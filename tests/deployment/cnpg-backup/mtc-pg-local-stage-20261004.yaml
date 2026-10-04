@@ -1,0 +1,282 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mtc-pg-local-stage-20261004
+  namespace: memeloop-token-center
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 64Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-pg-logical-backup-isolation-20261004
+  namespace: memeloop-token-center
+spec:
+  podSelector:
+    matchLabels:
+      recovery.mtc/operation: pg-logical-backup-20261004
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-pg-logical-export-egress-20261004
+  namespace: memeloop-token-center
+spec:
+  podSelector:
+    matchLabels:
+      recovery.mtc/operation: pg-logical-backup-20261004
+      recovery.mtc/role: export
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: memeloop-token-center-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-pg-local-stage-20261004
+  namespace: memeloop-token-center
+  annotations:
+    recovery.mtc/review-state: parent-review-required
+    recovery.mtc/execution-channel: gha-only
+    recovery.mtc/artifact-state: local-staging-is-not-a-backup
+    recovery.mtc/source-io-gate: parent-risk-review-required-sample-cannot-certify-full-export-throughput
+    recovery.mtc/source-sample-scope: context_nodes-only-four-64-page-tid-ranges-no-toast-no-cache-flush
+    recovery.mtc/source-sample-deadline: 2s-per-statement-and-transaction-250ms-lock-timeout
+    recovery.mtc/source-sample-result: completed-20261004T024707Z-four-tid-ranges-256-shared-read-blocks-do-not-repeat
+    recovery.mtc/source-sample-decision: parent-review-required-mixed-route-p95-not-a-standalone-veto
+    recovery.mtc/rate-bound: uncompressed-archive-64KiB-per-62.5ms-at-most-1MiBps-plus-bounded-pipe-and-socket-read-ahead-not-physical-device-qos
+    recovery.mtc/latency-gate: observe-production-route-p95-errors-and-source-disk-before-during-and-after-sample
+    recovery.mtc/error-stop-rule: consecutive-baseline-relative-degradation-with-source-correlation-not-single-existing-5xx
+    recovery.mtc/storage-gate: parent-review-of-root-headroom-and-concurrent-writers-required-not-pvc-quota
+    recovery.mtc/storage-budget: 24Gi-dump-plus-16Mi-toc-plus-4Ki-checksum-plus-64Mi-tmpfs-and-8Ki-emitted-logs
+    recovery.mtc/free-space-gate: 64Gi-at-start-34Gi-abort-trigger-32Gi-reserve-target-not-host-wide-quota
+    recovery.mtc/transport-probe-scope: synthetic-network-only-not-source-io-or-export-throughput
+    recovery.mtc/next-step: resumable-offhost-copy-to-versetensor-then-sha256-and-isolated-restore
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        recovery.mtc/operation: pg-logical-backup-20261004
+        recovery.mtc/role: export
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: haixia
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  cnpg.io/instanceName: memeloop-token-center-pg-7
+                  cnpg.io/instanceRole: primary
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: export
+          image: harbor.k3s.onetwo.website/ghcr-io/cloudnative-pg/postgresql:17.5
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/prlimit
+            - --core=0:0
+            - --fsize=16777216:25769803776
+            - --
+            - /bin/sh
+            - -ec
+            - |
+              umask 077
+              test "$PARENT_REVIEW_APPROVED" = "true"
+              test "$SOURCE_IO_REVIEW_APPROVED" = "true"
+              test "$ROOT_STORAGE_REVIEW_APPROVED" = "true"
+              test -n "$EXPECTED_BACKUP_FS_UUID"
+              actual_backup_fs_uuid=$(findmnt -n -o UUID -T /backup)
+              test "$actual_backup_fs_uuid" = "$EXPECTED_BACKUP_FS_UUID"
+              test "$(findmnt -n -o FSTYPE -T /tmp)" = "tmpfs"
+              tmp_capacity_kib=$(df -Pk /tmp | awk 'NR == 2 { print $2 }')
+              test "$tmp_capacity_kib" -le 65536
+              exec 3>&1
+              exec > /tmp/stage.stdout 2> /tmp/stage.stderr
+              dump_pid=
+              rate_pid=
+              space_guard_pid=
+              cleanup() {
+                stage_status=$?
+                trap - EXIT TERM INT
+                if [ -n "$space_guard_pid" ]; then
+                  kill "$space_guard_pid" 2>/dev/null || true
+                  wait "$space_guard_pid" 2>/dev/null || true
+                fi
+                if [ -n "$dump_pid" ]; then
+                  kill -TERM "$dump_pid" 2>/dev/null || true
+                  sleep 2
+                  kill -KILL "$dump_pid" 2>/dev/null || true
+                  wait "$dump_pid" 2>/dev/null || true
+                fi
+                if [ -n "$rate_pid" ]; then
+                  kill -TERM "$rate_pid" 2>/dev/null || true
+                  wait "$rate_pid" 2>/dev/null || true
+                fi
+                head -c 4096 /tmp/stage.stdout >&3 || true
+                head -c 4096 /tmp/stage.stderr >&3 || true
+                exit "$stage_status"
+              }
+              trap cleanup EXIT
+              trap 'exit 143' TERM
+              trap 'exit 130' INT
+              available_kib=$(timeout 5 df -Pk /backup | awk 'NR == 2 { print $4 }')
+              test "$available_kib" -ge 67108864
+              server_ok=$(psql --dbname="$DATABASE_URL" -X -Atq -v ON_ERROR_STOP=1 -c "SELECT NOT pg_is_in_recovery() AND inet_server_addr() = '$EXPECTED_SERVER_ADDRESS'::inet")
+              test "$server_ok" = "t"
+              transport_probe_start=$(date +%s)
+              timeout 30 psql --dbname="$DATABASE_URL" -X -Atq -v ON_ERROR_STOP=1 -c "SET statement_timeout='20s'; COPY (SELECT repeat('x', 8192) FROM generate_series(1, 2048)) TO STDOUT" > /dev/null
+              transport_probe_elapsed=$(($(date +%s) - transport_probe_start))
+              test "$transport_probe_elapsed" -le 20
+              printf 'synthetic transport only: %s seconds; source reads and export throughput NOT validated\n' "$transport_probe_elapsed"
+              archive_dir=/backup/mtc-pg-logical-20261004
+              mkdir -m 0700 "$archive_dir"
+              cd "$archive_dir"
+              archive=memeloop_token_center.dump
+              stage_pid=$$
+              (
+                trap 'kill -TERM "$stage_pid" 2>/dev/null || true' EXIT
+                observations=0
+                while kill -0 "$stage_pid" 2>/dev/null; do
+                  available_kib=$(timeout 5 df -Pk /backup | awk 'NR == 2 { print $4 }')
+                  if ! test "$available_kib" -ge 35651584; then
+                    printf 'free-space guard aborted staging; preserve partial\n' >&2
+                    kill -TERM "$stage_pid" 2>/dev/null || true
+                    exit 1
+                  fi
+                  observations=$((observations + 1))
+                  if [ "$observations" -ge 15 ]; then
+                    printf 'stage free_kib=%s utc=%s\n' "$available_kib" "$(date -u +%FT%TZ)"
+                    observations=0
+                  fi
+                  sleep 2
+                done
+              ) &
+              space_guard_pid=$!
+              mkfifo /tmp/dump.pipe
+              prlimit --fsize=25769803776:25769803776 -- /bin/sh -ec '
+                exec 4< /tmp/dump.pipe
+                exec 5> "$1"
+                previous_bytes=0
+                while :; do
+                  dd bs=65536 count=1 iflag=fullblock status=none <&4 >&5
+                  current_bytes=$(stat -c %s "$1")
+                  test "$current_bytes" -ge "$previous_bytes"
+                  if [ "$current_bytes" -eq "$previous_bytes" ]; then break; fi
+                  previous_bytes=$current_bytes
+                  sleep 0.0625
+                done
+              ' rate-writer "$archive.partial" 3>&- &
+              rate_pid=$!
+              pg_dump --dbname="$DATABASE_URL" --format=custom --compress=none --lock-wait-timeout=5s > /tmp/dump.pipe 3>&- &
+              dump_pid=$!
+              wait "$dump_pid"
+              dump_pid=
+              wait "$rate_pid"
+              rate_pid=
+              test -s "$archive.partial"
+              prlimit --fsize=16777216:16777216 -- pg_restore --list "$archive.partial" > "$archive.list.partial"
+              test -s "$archive.list.partial"
+              mv "$archive.partial" "$archive"
+              mv "$archive.list.partial" "$archive.list"
+              prlimit --fsize=4096:4096 -- sha256sum "$archive" > "$archive.sha256.partial"
+              mv "$archive.sha256.partial" "$archive.sha256"
+              sha256sum -c "$archive.sha256" > /dev/null
+              touch LOCAL_ARCHIVE_CREATED
+              printf 'local archive SHA256 and TOC only; complete restore has NOT been verified\n'
+          env:
+            - name: PARENT_REVIEW_APPROVED
+              value: "false"
+            - name: SOURCE_IO_REVIEW_APPROVED
+              value: "false"
+            - name: ROOT_STORAGE_REVIEW_APPROVED
+              value: "false"
+            - name: EXPECTED_BACKUP_FS_UUID
+              value: "977bef8a-8b3d-413c-bbb1-166b37ae5b33"
+            - name: EXPECTED_SERVER_ADDRESS
+              value: "10.42.4.179"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: memeloop-token-center-secrets
+                  key: database-url
+            - name: PGCONNECT_TIMEOUT
+              value: "10"
+            - name: PGAPPNAME
+              value: mtc-recovery-export-20261004
+            - name: PGOPTIONS
+              value: -c default_transaction_read_only=on -c lock_timeout=5s
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+              ephemeral-storage: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: mtc-pg-local-stage-20261004
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

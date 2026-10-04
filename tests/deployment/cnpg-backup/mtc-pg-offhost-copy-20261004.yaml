@@ -1,0 +1,127 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-pg-copy-source-20261004
+  namespace: memeloop-token-center
+  annotations:
+    recovery.mtc/review-state: parent-review-required
+    recovery.mtc/transport: kubernetes-exec-only-no-listener-or-production-network-change
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        recovery.mtc/operation: pg-logical-backup-20261004
+        recovery.mtc/role: copy
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: haixia
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: copy
+          image: harbor.k3s.onetwo.website/ghcr-io/cloudnative-pg/postgresql:17.5
+          command: ["/bin/sleep", "43200"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+              ephemeral-storage: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: mtc-pg-local-stage-20261004
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-pg-copy-destination-20261004
+  namespace: memeloop-token-center
+  annotations:
+    recovery.mtc/review-state: parent-review-required
+    recovery.mtc/transport: kubernetes-exec-only-no-listener-or-production-network-change
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        recovery.mtc/operation: pg-logical-backup-20261004
+        recovery.mtc/role: copy
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: versetensor-hv
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: copy
+          image: harbor.k3s.onetwo.website/ghcr-io/cloudnative-pg/postgresql:17.5
+          command: ["/bin/sleep", "43200"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+              ephemeral-storage: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+              readOnly: false
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: mtc-pg-logical-backup-20261003
+            readOnly: false
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
