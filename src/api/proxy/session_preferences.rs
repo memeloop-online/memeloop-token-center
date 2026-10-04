@@ -14,9 +14,15 @@ struct Entry {
     expires: Instant,
     value: Option<(Uuid, Uuid)>,
     observed: Option<(i64, Uuid)>,
+    version: Uuid,
 }
 
-fn identity(key: &AuthenticatedKey, session: &str, model: &str, protocol: &str) -> [u8; 32] {
+pub(super) fn identity(
+    key: &AuthenticatedKey,
+    session: &str,
+    model: &str,
+    protocol: &str,
+) -> [u8; 32] {
     let mut digest = blake3::Hasher::new_derive_key("session preference cache v1");
     for part in [
         key.tenant_id.as_bytes().as_slice(),
@@ -39,6 +45,14 @@ pub(crate) struct SessionPreferences {
 }
 
 impl SessionPreferences {
+    pub(crate) fn invalidate(&self, state: &AppState, identity: [u8; 32]) {
+        if let Ok(mut entries) = self.entries.try_lock() {
+            entries.retain(|entry| entry.identity != identity);
+        } else {
+            state.routing_persistence.record_capacity_gap();
+        }
+    }
+
     pub(crate) fn observe(
         &self,
         state: &AppState,
@@ -72,6 +86,7 @@ impl SessionPreferences {
             expires: Instant::now() + TTL,
             value,
             observed: Some(observed),
+            version: Uuid::new_v4(),
         });
     }
 
@@ -107,11 +122,13 @@ impl SessionPreferences {
             entries.pop_front();
         }
         let expires = now + TTL;
+        let version = Uuid::new_v4();
         entries.push_back(Entry {
             identity,
             expires,
             value: None,
             observed: None,
+            version,
         });
         drop(entries);
         let cache = self.clone();
@@ -124,7 +141,7 @@ impl SessionPreferences {
             let value = tokio::time::timeout(Duration::from_millis(250), database.latest_session_transport_route_to_avoid_for_identity(key_identity, &session, &model, &protocol))
                 .await.map_err(|_| AppError::Internal)??;
             let mut entries = cache.entries.lock().map_err(|_| AppError::Internal)?;
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.identity == identity && entry.expires == expires) {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.identity == identity && entry.version == version) {
                 entry.value = value;
             }
             tracing::debug!(%request_id, stage = "session_preference_refresh", "optional session preference refreshed");

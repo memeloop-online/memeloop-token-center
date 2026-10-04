@@ -731,9 +731,7 @@ impl UpstreamAttemptGuard {
                     Ok(false)
                 }
             };
-            let recovered = tokio::time::timeout(std::time::Duration::from_millis(250), recovery)
-                .await
-                .map_err(|_| AppError::Internal)??;
+            let recovered = recovery.await?;
             if recovered {
                 state.metrics.observe_upstream_health(
                     UpstreamHealthEvent::Recovered,
@@ -759,6 +757,9 @@ impl UpstreamAttemptGuard {
                 ..
             }
         );
+        if mandatory {
+            self.finish_delivery_recovery().await;
+        }
         let Some(completion) = self.take_completion(terminal, !mandatory) else {
             return;
         };
@@ -809,6 +810,16 @@ impl UpstreamAttemptGuard {
         })
     }
 
+    async fn finish_delivery_recovery(&mut self) {
+        if let Some(recovery) = self.delivery_recovery.as_mut() {
+            self.recovered_on_delivery |= recovery.await.unwrap_or(false);
+            self.delivery_recovery = None;
+            if self.recovered_on_delivery {
+                self.stop_heartbeat();
+            }
+        }
+    }
+
     /// A successful durable CAS has ended the caller's ownership lease. Keep
     /// the already-proven terminal transition and its heartbeat alive even if
     /// that caller's timeout/cancellation drops this waiting future. The owned
@@ -830,6 +841,7 @@ impl UpstreamAttemptGuard {
     /// A lost durable job fence grants no authority to publish an observation.
     /// Release only this exact owned lease; never heal or record a failure.
     pub(crate) async fn abandon_without_observe(&mut self) {
+        self.finish_delivery_recovery().await;
         let state = self.state.take();
         self.stop_heartbeat();
         if let Some(state) = state
@@ -933,16 +945,42 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
     } else {
         None
     };
-    let directive = crate::group_routing::observe_with_signal(
-        &state,
-        request_id,
-        route_id,
-        upstream_account_id,
-        credential_generation,
+    let mandatory_failure = matches!(
         outcome,
-        signal,
-    )
-    .await;
+        GroupRoutingOutcome::HardQuota | GroupRoutingOutcome::Authentication
+    );
+    let directive = if mandatory_failure {
+        let background = state.clone();
+        state.routing_persistence.submit(4096, async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::group_routing::observe_with_signal(
+                    &background,
+                    request_id,
+                    route_id,
+                    upstream_account_id,
+                    credential_generation,
+                    outcome,
+                    signal,
+                ),
+            )
+            .await
+            .map_err(|_| AppError::Internal)?;
+            Ok(())
+        });
+        None
+    } else {
+        crate::group_routing::observe_with_signal(
+            &state,
+            request_id,
+            route_id,
+            upstream_account_id,
+            credential_generation,
+            outcome,
+            signal,
+        )
+        .await
+    };
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
@@ -1062,22 +1100,31 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             reason,
             failure_stage,
         } => {
-            if let Err(error) = state
-                .db
-                .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
-                    request_id,
-                    route_id,
-                    upstream_account_id,
-                    credential_generation,
-                    transport_revision,
-                    failure_kind: kind.as_str(),
-                    failure_stage,
-                    gateway_pod: &gateway_identity.pod,
-                    gateway_node: gateway_identity.node.as_deref(),
-                    failure_domain: &gateway_identity.failure_domain,
-                })
-                .await
-            {
+            let diagnostic_db = state.routing_persistence_db.clone();
+            let diagnostic_identity = gateway_identity.clone();
+            let diagnostic = async move {
+                diagnostic_db
+                    .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
+                        request_id,
+                        route_id,
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        failure_kind: kind.as_str(),
+                        failure_stage,
+                        gateway_pod: &diagnostic_identity.pod,
+                        gateway_node: diagnostic_identity.node.as_deref(),
+                        failure_domain: &diagnostic_identity.failure_domain,
+                    })
+                    .await
+            };
+            if mandatory_failure {
+                state.routing_persistence.submit(4096, async move {
+                    tokio::time::timeout(std::time::Duration::from_millis(250), diagnostic)
+                        .await
+                        .map_err(|_| AppError::Internal)?
+                });
+            } else if let Err(error) = diagnostic.await {
                 state.routing_persistence.record_failure_gap();
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transport_diagnostic_persist", "failed to persist upstream transport diagnostic");
             }

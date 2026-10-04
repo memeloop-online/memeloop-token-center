@@ -1243,6 +1243,14 @@ async fn proxy_with_cancellation_guard(
     let request_body_length = body.len();
     drop(body);
     let mut buffered_request = BufferedRequest {
+        session_preference: conversation.as_ref().and_then(|conversation| {
+            Some(session_preferences::identity(
+                &key,
+                conversation.hints.session_id.as_deref()?,
+                &model,
+                protocol.name(),
+            ))
+        }),
         state: &state,
         reservation,
         request_id,
@@ -2183,6 +2191,7 @@ impl<'a> ProxyConversationProjection<'a> {
 }
 
 struct BufferedRequest<'a> {
+    session_preference: Option<[u8; 32]>,
     state: &'a AppState,
     reservation: crate::model::UsageReservation,
     request_id: Uuid,
@@ -2838,6 +2847,14 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }
     let result = result?;
+    if matches!(result, FinishProxyRequestResult::Finished { .. })
+        && let Some(identity) = request.session_preference
+    {
+        request
+            .state
+            .session_preferences
+            .invalidate(request.state, identity);
+    }
     if matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }) {
         tracing::debug!(%request_id, stage = "terminal_replay", "proxy request already finalized");
     }

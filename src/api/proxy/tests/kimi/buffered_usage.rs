@@ -53,6 +53,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .await
         .unwrap();
     let request = BufferedRequest {
+        session_preference: None,
         state: &fixture.state,
         reservation,
         request_id,

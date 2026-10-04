@@ -137,9 +137,9 @@ archive scheduling boundaries, subject to the remaining coupling below.
   that lock or making settlement lossy would violate the billing requirement.
   Financial facts and derived analysis need a separate recoverable projection
   protocol before this path can be declared isolated.
-- Optional session lookups and upstream health observation still wait for SQL.
-  They need bounded cached/owned publication semantics without weakening hard
-  quota or credential-generation fences.
+- Optional session lookup and health publication have bounded cached/owned
+  publication semantics in the continuation below; new-head GHA acceptance is
+  required before considering this specific blocker closed.
 - SQLite has one writer lock even across separate pools. PostgreSQL still shares
   server CPU/I/O, table-level locks, schema and physical availability. A separate
   pool isolates connection starvation, not these resources.
@@ -206,3 +206,41 @@ finalization, physical database contention and durable financial lifecycle hando
 Those mandatory finalization paths may still retain lifecycle permits. This slice
 removes the optional routing publication hold; it does not claim global isolation.
 PR #455's `terminal_cause` interface and migration ownership remain unchanged.
+
+## PR #457 comparison and single integration line
+
+PR #423 is the only integration line. PR #457 at `a8ab8772` remains open for the
+parent's review; its merge base is `b116e25a`, not the later green archive baseline
+`37f861dd`. No whole-branch merge or second observation queue has been imported.
+The four-file work in progress before this comparison was preserved at
+`/tmp/pr423-four-file-wip-20261004.patch` and incorporated, not discarded.
+
+| Boundary from #457 | Decision on #423 | Acceptance |
+| --- | --- | --- |
+| Cache refresh version token and local terminal ordering | Adapted explicit UUID version, replacing timestamp identity; retain timestamp/request UUID terminal order | `local_session_versions_fence_refresh_invalidation_and_older_terminals` |
+| Buffered winning settlement invalidates cached preference and pending refresh | Adapted; only `Finished`, never failed or duplicate settlement | Existing buffered settlement gates plus the version/invalidation regression |
+| Tenant/principal/key/session/model/protocol scope | Retain #423 scope including credential generation | `session_preferences_are_scoped_cached_and_explicit_hints_win_without_sql` |
+| Delivery account generation, transport revision, lease/epoch and probe validity | Retain existing fenced SQL; adapt queued-stale-evidence regression | `queued_delivery_recovery_respects_epoch_generation_revision_and_probe_expiry` |
+| Accepted delivery recovery is not cancelled by an application timer | Adapted: admitted delivery SQL retains its slot until SQL returns; database deadlines still apply | Pool-starvation and cancellation regressions |
+| Cancellation during recovery acknowledgement preserves guard ownership | Adapted borrow of receiver before mandatory completion/abandonment takes state | `cancelled_lease_abandonment_retains_recovery_order_and_bounded_cleanup` |
+| Saturated delivery queue converges through terminal owner | Intentionally different: #423 terminal publication is also optional and bounded; rejection stops heartbeat and relies on fenced lease expiry/new probe, with visible gaps | `saturated_terminal_publication_converges_by_fenced_probe_expiry` |
+| Pool starvation/closed pool/queue saturation must not delay output | Adapted to #423 queue; also require lifecycle permit recovery and exact once settlement | `optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity` |
+| Synchronous hard-quota fence | Retained; optional hook/diagnostic publication uses bounded admission | `mandatory_quota_fence_does_not_wait_for_optional_observe` |
+| Separate 16-slot delivery queue and 1024-entry cache | Not imported: retain one four-job routing lane and 256-entry cache on #423 | Existing queue limit plus new saturation tests |
+
+The delivery SQL no longer has the earlier 250 ms application timer. Optional
+terminal publication still has a two-second deadline, and waits for an admitted
+delivery acknowledgement before issuing terminal SQL. Timeout or rejection never
+asserts health recovery. Mandatory completion and explicit lease abandonment keep
+the receiver in the guard while awaiting it, so cancellation transfers cleanup
+without racing a pending delivery acknowledgement.
+
+CI run `37170299514` at `ee940218` failed clippy because the compatibility wrapper
+`latest_session_transport_route_to_avoid` had only test callers but was compiled
+in production (`src/db/requests/session_routing.rs:40`, `dead_code` under
+`-D warnings`). The precise fix restricts that wrapper to `#[cfg(test)]`; production
+continues using the identity-scoped method. No lint suppression or gate removal.
+The focused regressions had not run at that failure. All rows above remain pending
+new-head GHA acceptance; the comparison is not permission to close #457 or release
+#423. No #455 worktree, migration, typed terminal-cause field, or winning settlement
+CAS has been replaced during this consolidation.

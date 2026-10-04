@@ -37,6 +37,7 @@ impl Database {
     /// Returns the exact route/account pair used by the latest terminal for
     /// this model and protocol in an explicit session, but only when that
     /// terminal is a transport-class 502.
+    #[cfg(test)]
     pub(crate) async fn latest_session_transport_route_to_avoid(
         &self,
         key: &AuthenticatedKey,
