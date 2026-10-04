@@ -118,6 +118,14 @@ impl TransportProxyGroups {
                     {
                         let state = old_entry.state.load(Ordering::Acquire);
                         if state != 0 {
+                            if candidate.fingerprint == old_entry.fingerprint
+                                && candidate.durable.load(Ordering::Acquire) == 0
+                            {
+                                candidate.durable.store(
+                                    old_entry.durable.load(Ordering::Acquire),
+                                    Ordering::Release,
+                                );
+                            }
                             let snapshot = Snapshot::decode(state);
                             let retained =
                                 old.members.get(snapshot.selected).and_then(|old_member| {

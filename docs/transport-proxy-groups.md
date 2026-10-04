@@ -79,7 +79,7 @@ group version. Removing a group restores the existing single-proxy path.
 
 ## Schema and validation
 
-The only new production migration is **0116_transport_proxy_groups.sql**,
+Selector persistence uses **0116_transport_proxy_groups.sql**,
 registered for both SQLite and PostgreSQL; management adds migration 117 and Helm
 declares schema 117. Versions
 0114 (#422) and 0115 (#455) remain owned by their PRs. The migration runner checks
