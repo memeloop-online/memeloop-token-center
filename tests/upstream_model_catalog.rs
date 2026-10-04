@@ -571,18 +571,19 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .and(query_param("client_version", "0.155.0"))
+        .and(query_param("client_version", "0.160.0"))
         .and(matches_header("authorization", "Bearer codex-access"))
         .and(matches_header("originator", "codex-tui"))
         .and(matches_header(
             "user-agent",
-            "codex-tui/0.155.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.155.0)",
+            "codex-tui/0.160.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.160.0)",
         ))
         .and(matches_header("chatgpt-account-id", "account-123"))
         .and(matches_header("accept", "application/json"))
         .and(matches_header("accept-encoding", "identity"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "models": [
+                {"slug": "gpt-6.1-sol", "visibility": "list", "context_window": 272000},
                 {"slug": "gpt-6-astra", "visibility": "list", "context_window": 272000},
                 {"slug": "gpt-6-sol", "visibility": "list", "context_window": 272000},
                 {"slug": "gpt-6-luna", "visibility": "list", "context_window": 272000},
@@ -694,8 +695,8 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
             .contains(&account.id)
     );
     let models = synced["models"].as_array().unwrap();
-    assert_eq!(models.len(), 6);
-    for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+    assert_eq!(models.len(), 7);
+    for id in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
         let model = models.iter().find(|model| model["id"] == id).unwrap();
         assert_eq!(model["context_window"], 272000);
         assert_eq!(model["reservation_token_bound"], 272000);
@@ -864,12 +865,12 @@ async fn codex_catalog_without_trusted_models_records_error_and_releases_sync_le
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .and(query_param("client_version", "0.155.0"))
+        .and(query_param("client_version", "0.160.0"))
         .and(matches_header("authorization", "Bearer codex-access"))
         .and(matches_header("originator", "codex-tui"))
         .and(matches_header(
             "user-agent",
-            "codex-tui/0.155.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.155.0)",
+            "codex-tui/0.160.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.160.0)",
         ))
         .and(matches_header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
