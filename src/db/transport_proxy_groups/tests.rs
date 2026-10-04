@@ -325,14 +325,13 @@ async fn locked_database_cannot_block_cached_selection_or_local_failover() {
             BACKUP
         );
     }
+    let backup = groups.select(account_id, 1, &source).unwrap();
+    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
     writer.rollback().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), blocked)
         .await
         .unwrap()
         .unwrap();
-    database.pool.close().await;
-    let backup = groups.select(account_id, 1, &source).unwrap();
-    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
     assert_eq!(
         groups
             .select(account_id, 1, &source)
@@ -342,5 +341,27 @@ async fn locked_database_cannot_block_cached_selection_or_local_failover() {
             .unwrap()
             .0,
         PRIMARY
+    );
+    entry.synchronize(&database.pool).await.unwrap();
+    let saved: i64 = sqlx::query_scalar(
+        "SELECT selected_index FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(saved, 0);
+    database.pool.close().await;
+    let primary = groups.select(account_id, 1, &source).unwrap();
+    assert!(primary.advance_after_connect_failure(&[0]).unwrap());
+    assert_eq!(
+        groups
+            .select(account_id, 1, &source)
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
     );
 }

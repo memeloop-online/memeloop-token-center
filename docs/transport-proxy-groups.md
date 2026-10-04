@@ -44,11 +44,16 @@ and two two-bit indices. Exhaustion fails closed instead of wrapping old tickets
 
 ## Optional persistence and consistency limits
 
-One background task uses a separate, lazy, one-connection database pool. Each
-account attempt is bounded to 250 ms, followed by a five-second delay between
-sweeps. A sweep contains at most 256 accounts. Dirty state is coalesced into one
-atomic slot per account. Slow/unavailable storage delays recovery and saving;
-it cannot block selection or local fallback. No request waits for CAS persistence.
+One background task uses a separate, lazy, one-connection database pool and
+awaits each account operation before starting the next, with a five-second delay
+between sweeps. A sweep contains at most 256 accounts. Dirty state is coalesced
+into one atomic slot per account. Slow/unavailable storage delays recovery and
+saving; it cannot block selection or local fallback. No request waits for CAS
+persistence. Database operations have no hard completion deadline: cancelling an
+async timeout does not guarantee that the underlying database work has stopped.
+A stuck operation can stall the entire persistence sweep; the worker does not
+cancel it and launch replacement operations. Isolation from dispatch comes from
+the independent pool and memory-only selection, not timeout cancellation.
 
 The database holds only configuration fingerprints, numeric indices and
 generations. Writes compare the observed durable state and current account

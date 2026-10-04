@@ -11,15 +11,9 @@ impl TransportProxyGroups {
             .connect_lazy(database_url)?;
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
-            loop {
-                let Some(current) = groups.upgrade() else {
-                    break;
-                };
+            while let Some(current) = groups.upgrade() {
                 for entry in current.groups.values() {
-                    let result =
-                        tokio::time::timeout(Duration::from_millis(250), entry.synchronize(&pool))
-                            .await;
-                    if !matches!(result, Ok(Ok(()))) {
+                    if entry.synchronize(&pool).await.is_err() {
                         tracing::debug!(account_id = %entry.group.account_id, "optional proxy selection persistence deferred");
                     }
                 }
