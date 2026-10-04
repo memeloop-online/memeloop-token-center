@@ -27,6 +27,7 @@ export interface RequestView {
   currency?: string | null;
   credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
+  terminal_cause_code?: string | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
@@ -145,6 +146,7 @@ export interface RequestEvent {
   output_tokens: number;
   cost: string;
   error_code: string | null;
+  terminal_cause_code?: string | null;
   archive_state: RequestArchiveState;
   credential_identity?: RequestCredentialIdentity | null;
 }

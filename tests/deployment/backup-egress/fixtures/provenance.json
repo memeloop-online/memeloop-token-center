@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "sourceRepository": "llm/k3s-gitops",
+  "sourceCommit": "f48a28a127f34a85856de925debdd4e8beda25a1",
+  "scope": "Static preparation only; no runtime configuration, credentials, live network acceptance, or GitOps deployment evidence.",
+  "files": [
+    {
+      "name": "deployment.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/backup-egress/deployment.yaml",
+      "sourceBlob": "47f8ebe9c78688f72817131876acaa6c5cace92d",
+      "sha256": "2f7cda0ce9af30bc6db11f585468daaa29759ac55950a5ec596826ef78c8e9f7"
+    },
+    {
+      "name": "service.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/backup-egress/service.yaml",
+      "sourceBlob": "f7de58766a37434d281c6be3fddf9a02dc918fb5",
+      "sha256": "bc57d4d7ede03b4f0b76f02ebdc9b4767e1b7dcc0b2291b636be26ed45ce4d16"
+    },
+    {
+      "name": "networkpolicy.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/backup-egress/networkpolicy.yaml",
+      "sourceBlob": "bbc1bcceeda132ee249a3b840d729d89ce4eeb8c",
+      "sha256": "aed08fcae92c8ce72c22cbf3b5ac9bb3475d7876e9b330c7f9364cff4795fd6c"
+    },
+    {
+      "name": "kustomization.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/backup-egress/kustomization.yaml",
+      "sourceBlob": "efc88f3c0473c72629a36446bbec6bf5c4338027",
+      "sha256": "1718f2435df870bcb701de81a39b941a55c19fc49accb417d99a01509759ef8d"
+    },
+    {
+      "name": "test-kustomization.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/kustomization.yaml",
+      "sourceBlob": "9adc22cad26c56c6a5acb6c89d82a6016ea242c5",
+      "sha256": "dfda8e9ce38abf553905f7e882074c2339f5c99cb87c142c0e94b7201ec47d7c"
+    },
+    {
+      "name": "existing-networkpolicy-values.yaml",
+      "sourcePath": "apps/memeloop-token-center-test/values.yaml",
+      "sourceBlob": "c3c29d3853147515039697ea4626f2a90b364a8a",
+      "sourceSha256": "e8d113a706ed99222d20e20fe5dcf30aecd4329e0cd1c2ebb921a207d07f407f",
+      "projection": "networkPolicy",
+      "sha256": "feb171058d6c6b86a37a46a6d3adc08cbeca1e41f579a8e5fc9f87807d747122"
+    }
+  ]
+}

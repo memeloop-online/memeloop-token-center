@@ -41,12 +41,16 @@ async fn upgrade_contract(database: &Database) {
             .unwrap();
     assert!(versions.contains(&116));
     assert!(!versions.contains(&114));
-    assert!(!versions.contains(&115));
+    assert!(versions.contains(&115));
     sqlx::query("DROP TABLE upstream_transport_proxy_selections")
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version = 116")
+    sqlx::query("ALTER TABLE request_records DROP COLUMN terminal_cause_code")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116)")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -55,7 +59,15 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(maximum, 113);
-    database.migrate().await.unwrap();
+    let migrations = match database.backend {
+        DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
+        DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
+    };
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, migrations, 116, 116)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     let applied_at: i64 =
         sqlx::query_scalar("SELECT applied_at FROM schema_migrations WHERE version = 116")
             .fetch_one(&database.pool)
@@ -70,7 +82,7 @@ async fn upgrade_contract(database: &Database) {
         Migration {
             version: 115,
             name: "recorded request terminal cause",
-            sql: "ALTER TABLE request_records ADD COLUMN terminal_cause_code TEXT;",
+            sql: include_str!("../../../migrations/common/0115_request_terminal_cause_code.sql"),
         },
     ];
     let mut transaction = database.pool.begin().await.unwrap();

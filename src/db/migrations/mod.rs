@@ -603,6 +603,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
     },
     Migration {
+        version: 115,
+        name: "recorded request terminal cause",
+        sql: include_str!("../../../migrations/common/0115_request_terminal_cause_code.sql"),
+    },
+    Migration {
         version: 116,
         name: "sticky account transport proxy selections",
         sql: include_str!("../../../migrations/common/0116_transport_proxy_groups.sql"),
@@ -1192,6 +1197,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 113,
         name: "durable plugin service data snapshots",
         sql: include_str!("../../../migrations/common/0113_plugin_service_data_snapshots.sql"),
+    },
+    Migration {
+        version: 115,
+        name: "recorded request terminal cause",
+        sql: include_str!("../../../migrations/common/0115_request_terminal_cause_code.sql"),
     },
     Migration {
         version: 116,
