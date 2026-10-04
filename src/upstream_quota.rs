@@ -765,6 +765,11 @@ async fn read_codex(
     trigger: QuotaReadTrigger,
     session: &retry::ReadSession<'_>,
 ) -> Result<QuotaSnapshot, &'static str> {
+    let selection = state
+        .transport_proxy_groups
+        .select(account.id, account.credential_generation, credential)
+        .map_err(|_| "quota_transport_failed")?;
+    let credential = &selection.credential;
     let observation_started_at = unix_millis();
     let recovery_fence = match state
         .db
@@ -816,7 +821,7 @@ async fn read_codex(
     })?;
     let http = state
         .codex_clients
-        .account_snapshot(account, credential)
+        .account_transport_snapshot(account, credential, selection.generation)
         .map_err(|_| {
             tracing::warn!(
                 operation = "quota_supplier_read",
