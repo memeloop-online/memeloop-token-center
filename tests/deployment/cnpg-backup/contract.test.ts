@@ -90,7 +90,7 @@ test('reviewed contracts and negative mutations fail closed independently of pro
 
 function createContainer(): string {
   const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-    '--tmpfs', '/tmp:rw,size=64m,uid=26,gid=26', '--tmpfs', '/backup:rw,size=128m,uid=26,gid=26', '--tmpfs', '/scratch:rw,size=256m,uid=26,gid=26',
+    '--tmpfs', '/tmp:rw,exec,size=64m,uid=26,gid=26', '--tmpfs', '/backup:rw,size=128m,uid=26,gid=26', '--tmpfs', '/scratch:rw,size=256m,uid=26,gid=26',
     '--entrypoint=/bin/sleep', image, '1200']).toString().trim();
   containers.push(container);
   shell(container, 'mkdir /tmp/bin');
@@ -99,6 +99,7 @@ function createContainer(): string {
   write(container, '/tmp/free-kib', '67108864');
   write(container, '/tmp/bin/findmnt', header + 'case "$*" in *UUID*) printf test-nvme ;; *) printf tmpfs ;; esac\n');
   shell(container, 'chmod 700 /tmp/bin/*');
+  assert.equal(shell(container, '/tmp/bin/findmnt -n -o UUID -T /backup').toString(), 'test-nvme');
   return container;
 }
 
