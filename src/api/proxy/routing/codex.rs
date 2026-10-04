@@ -64,6 +64,21 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
 #[cfg(test)]
 tokio::task_local! {
     static TEST_PRE_DELIVERY_CONNECT_FAILURES: std::cell::Cell<usize>;
+    static TEST_SEND_FAILURES: std::cell::RefCell<std::collections::VecDeque<ProxySendError>>;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_test_send_failures<F: std::future::Future>(
+    failures: Vec<ProxySendError>,
+    future: F,
+) -> (F::Output, usize) {
+    TEST_SEND_FAILURES
+        .scope(std::cell::RefCell::new(failures.into()), async {
+            let output = future.await;
+            let remaining = TEST_SEND_FAILURES.with(|failures| failures.borrow().len());
+            (output, remaining)
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -405,6 +420,15 @@ async fn send_codex_attempt_once(
         deadline,
         ..
     } = context;
+    #[cfg(test)]
+    if let Ok(error) = TEST_SEND_FAILURES.try_with(|failures| {
+        failures
+            .borrow_mut()
+            .pop_front()
+            .expect("unexpected additional upstream send")
+    }) {
+        return Err(error);
+    }
     #[cfg(test)]
     if TEST_PRE_DELIVERY_CONNECT_FAILURES
         .try_with(|remaining| {

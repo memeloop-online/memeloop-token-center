@@ -162,6 +162,23 @@ impl ProxySelection {
         let Some(next) = next else {
             return Ok(false);
         };
+        let mut transaction = database.begin_write_transaction().await?;
+        let account_query = match database.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1 FOR SHARE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1"
+            }
+        };
+        let current: Option<i64> = sqlx::query_scalar(account_query)
+            .bind(ticket.account_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if current != Some(ticket.credential_generation) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         let changed = sqlx::query(
             "UPDATE upstream_transport_proxy_selections SET selected_index = $1, selection_generation = selection_generation + 1 WHERE account_id = $2 AND group_version = $3 AND group_fingerprint = $4 AND credential_generation = $5 AND selection_generation = $6 AND selected_index = $7 AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id = $2 AND a.credential_generation = $5)",
         )
@@ -172,8 +189,9 @@ impl ProxySelection {
         .bind(ticket.credential_generation)
         .bind(self.generation)
         .bind(ticket.selected as i64)
-        .execute(&database.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(changed.rows_affected() == 1)
     }
 }

@@ -31,6 +31,8 @@ pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
+#[cfg(test)]
+pub(super) use codex::with_test_send_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
 pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;

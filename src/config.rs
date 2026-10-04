@@ -537,6 +537,7 @@ impl Config {
 
     pub fn for_test(database_url: String) -> Self {
         Self {
+            transport_proxy_groups: "[]".to_owned(),
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,

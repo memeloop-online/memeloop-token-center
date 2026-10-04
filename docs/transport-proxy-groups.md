@@ -5,6 +5,13 @@ and native Codex catalog reads. Other providers and accounts without a configure
 group retain their existing single-proxy behavior. It does not deploy proxies or
 change production accounts.
 
+Each member must expose a fixed upstream exit. A proxy-local priority/fallback
+group that automatically returns to its preferred node can change the exit
+behind an unchanged SOCKS endpoint and defeats application-level stickiness.
+Use fixed nodes or a selection mode without automatic failback. Network policy
+must allow every process that sends generation, catalog, or OAuth refresh traffic
+to reach each member; credentials belong in the existing Secret mechanism.
+
 Set `MTC_TRANSPORT_PROXY_GROUPS` through private server configuration, identically
 on gateway, control, and worker processes. Its default is `[]`. Each entry has
 `account_id` (MTC upstream account UUID), positive integer `version`, and `proxies`
