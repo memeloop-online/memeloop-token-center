@@ -400,10 +400,6 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
         Some("upstream_invalid_usage")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    // Request settlement commits before the streaming owner persists upstream
-    // health. In this isolated fixture, reacquiring all lifecycle permits waits
-    // for that owner to finish, independently of the health value we assert.
-    // Neither downstream EOF nor a finished request row is this barrier.
     let _completed_lifecycles = tokio::time::timeout(
         Duration::from_secs(3),
         fixture
@@ -414,6 +410,7 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
     .await
     .expect("streaming lifecycle must finish before upstream health is inspected")
     .unwrap();
+    fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health = sqlx::query(
         "SELECT consecutive_failures, last_failure_kind

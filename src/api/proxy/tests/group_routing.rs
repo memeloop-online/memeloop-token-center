@@ -424,6 +424,7 @@ async fn gateway_wasm_zero_transient_cooldown_recovers_only_after_durable_succes
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    fixture.state.routing_persistence.drain_for_test().await;
     let recovered = health(&fixture, tenant, generation).await;
     assert_eq!(recovered.consecutive_failures, 0);
     assert_eq!(recovered.probe_lease_until, 0);
@@ -519,6 +520,7 @@ async fn gateway_wasm_observe_sets_transient_cooldown_without_replaying_503() {
         standby.received_requests().await.unwrap().is_empty(),
         "a confirmed POST response must not replay on the remaining authorized candidate"
     );
+    fixture.state.routing_persistence.drain_for_test().await;
     let observed = health(&fixture, tenant, generation).await;
     assert_eq!(observed.last_failure_kind, "unavailable");
     assert_eq!(
@@ -605,6 +607,7 @@ async fn gateway_group_component_invalid_wire_response_observes_failure_without_
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    fixture.state.routing_persistence.drain_for_test().await;
     let observed = health(&fixture, tenant, generation).await;
     assert_eq!(observed.last_failure_kind, "invalid_response");
     assert_eq!(observed.cooldown_until - observed.updated_at, 12345 * 2);

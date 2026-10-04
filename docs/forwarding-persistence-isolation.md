@@ -244,3 +244,32 @@ The focused regressions had not run at that failure. All rows above remain pendi
 new-head GHA acceptance; the comparison is not permission to close #457 or release
 #423. No #455 worktree, migration, typed terminal-cause field, or winning settlement
 CAS has been replaced during this consolidation.
+
+The #457 Rust failure in run `37134521146` was
+`queued_delivery_recovery_cannot_clear_a_newer_health_epoch`: expected
+`last_failure_kind = authentication`, observed an empty string. Source review
+shows its setup called the generic failure writer during an active probe lease
+and discarded the returned boolean; that writer intentionally rejects updates
+while the current probe owns the lease. The adapted
+`queued_recovery_cannot_overwrite_acknowledged_authentication_failure` uses the
+owned probe-token/revision CAS and requires `true` before releasing delayed
+delivery recovery. This tests an actually acknowledged newer failure rather than
+assuming the fixture created one. #457 itself is unchanged and remains open.
+
+## Latest CI handoff (October 4)
+
+At `a1793142845c`, run `37171578910`, Rust job `111345474211`, passed
+Clippy with `-D warnings` and the focused routing-persistence regressions.
+The full library suite reported 1510 passed, seven failed and three ignored.
+The seven failures inspected optional health publication before its queue had
+finished: invalid image body, streaming Codex invalid usage, transient Codex 400,
+Codex retry followed by 429/5xx, and the three Wasm group-routing recovery,
+cooldown and invalid-wire cases. Their assertions now await the existing bounded
+test drain at the health observation point. The streaming case first retains its
+lifecycle-completion barrier so the terminal job has been submitted before drain.
+Failure kinds, exact Wasm cooldowns, no-replay and financial assertions are
+unchanged; no production concurrency, queue, cache or CAS implementation changes.
+
+The preserved authentication regression above is included in the same handoff.
+New-head acceptance remains pending GitHub Actions; no local builds or tests were
+run. #457 remains open and unmerged, and #423 remains the sole integration line.

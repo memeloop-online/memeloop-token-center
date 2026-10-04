@@ -137,6 +137,54 @@ async fn cancelled_lease_abandonment_retains_recovery_order_and_bounded_cleanup(
 }
 
 #[tokio::test]
+async fn queued_recovery_cannot_overwrite_acknowledged_authentication_failure() {
+    let fixture = codex_route_fixture("acknowledged-authentication-fence").await;
+    let (mut guard, pool) = probe_guard(&fixture).await;
+    let holders = fixture
+        .state
+        .routing_persistence_db
+        .hold_group_snapshot_pool_for_tests()
+        .await;
+    guard.delivered_validated_output().await;
+    let (token, revision): (String, i64) = sqlx::query_as("SELECT probe_lease_token, transport_revision FROM upstream_account_health WHERE upstream_account_id=$1")
+        .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert!(
+        fixture
+            .state
+            .db
+            .record_upstream_account_probe_failure_at_revision_with_health_config(
+                fixture.upstream_account_id,
+                1,
+                revision,
+                Uuid::parse_str(&token).unwrap(),
+                UpstreamFailureKind::Authentication,
+                fixture.state.config.upstream_health,
+            )
+            .await
+            .unwrap()
+    );
+    guard.complete(UpstreamAttemptTerminal::Inconclusive).await;
+    drop(holders);
+    fixture.state.routing_persistence.drain_for_test().await;
+    let failure: String = sqlx::query_scalar(
+        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id=$1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure, UpstreamFailureKind::Authentication.as_str());
+    assert!(
+        !fixture
+            .state
+            .metrics
+            .render(&crate::metrics::RuntimeMetrics::default())
+            .contains("event=\"recovered\"")
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn saturated_terminal_publication_converges_by_fenced_probe_expiry() {
     let fixture = codex_route_fixture("saturated-terminal-expiry").await;
     let (mut guard, pool) = probe_guard(&fixture).await;

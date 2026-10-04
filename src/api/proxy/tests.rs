@@ -1551,6 +1551,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("standby after transient rejection"));
     assert!(!body.contains("transient upstream detail must stay private"));
+    fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let failure_kind: String = sqlx::query_scalar(
         "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
@@ -1686,6 +1687,7 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
         } else {
             fixture.route_id
         };
+        fixture.state.routing_persistence.drain_for_test().await;
         let actual_failure: String = sqlx::query_scalar(
             "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
         )
