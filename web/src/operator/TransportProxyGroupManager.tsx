@@ -27,7 +27,13 @@ export function TransportProxyGroupManager(props: Props) {
   const [access, setAccess] = useState<'checking' | 'allowed' | 'denied' | 'unavailable'>('checking');
   const [accessRevision, setAccessRevision] = useState(0);
   const accessDescription = useId();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const previouslyOpen = useRef(false);
   const closeRequest = useRef<(() => Promise<void>) | null>(null);
+  useLayoutEffect(() => {
+    if (previouslyOpen.current && !open) trigger.current?.focus();
+    previouslyOpen.current = open;
+  }, [open]);
   useEffect(() => {
     const controller = new AbortController();
     setAccess('checking');
@@ -39,7 +45,7 @@ export function TransportProxyGroupManager(props: Props) {
   }, [props.token, props.tenant, accessRevision]);
   return <Dialog open={open} onOpenChange={(_, data) => { if (data.open) setOpen(true); else void closeRequest.current?.(); }}>
     <div className="button-row">
-      <DialogTrigger disableButtonEnhancement><Button appearance="secondary" type="button" disabled={!props.tenant || access !== 'allowed'} aria-describedby={accessDescription}>代理组与账号绑定</Button></DialogTrigger>
+      <DialogTrigger disableButtonEnhancement><Button ref={trigger} appearance="secondary" type="button" disabled={!props.tenant || access !== 'allowed'} aria-describedby={accessDescription}>代理组与账号绑定</Button></DialogTrigger>
       <span id={accessDescription} role="status">{!props.tenant ? '请先选择租户。' : access === 'checking' ? '正在确认全局操作员及 providers:write 管理权限…' : access === 'denied' ? '无管理权限：需要具有 providers:write 权限的全局操作员。' : access === 'unavailable' ? '暂时无法确认管理权限，入口已禁用，请稍后重试。' : '已确认当前租户的全局操作员及 providers:write 管理权限。'}</span>
       {(access === 'denied' || access === 'unavailable') && <Button type="button" onClick={() => setAccessRevision(current => current + 1)}>重新检查管理权限</Button>}
     </div>
