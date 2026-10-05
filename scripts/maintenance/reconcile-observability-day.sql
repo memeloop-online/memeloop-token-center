@@ -103,8 +103,8 @@ INSERT INTO request_daily_aggregates (
 )
 SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol,
        f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
-       f.service_tier, f.currency, COUNT(*), COALESCE(SUM(f.input_tokens), 0),
-       COALESCE(SUM(f.output_tokens), 0), COALESCE(SUM(f.cached_input_tokens), 0),
+       f.service_tier, f.currency, COUNT(*), COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END), 0),
+       COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END), 0), COALESCE(SUM(f.cached_input_tokens), 0),
        COALESCE(SUM(f.cache_write_tokens), 0), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0), COALESCE(SUM(f.cost_micros), 0)
   FROM request_stats_facts f
@@ -145,10 +145,12 @@ INSERT INTO usage_analysis_hourly (
   duration_bucket_6, duration_bucket_7, duration_bucket_8, duration_bucket_9,
   duration_bucket_10, duration_bucket_11, cost_micros
 )
-SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
+SELECT f.tenant_id, f.key_id, f.created_at / 3600000,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END, f.model,
        CASE
          WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
          WHEN f.protocol = 'openai-image' THEN 'openai-image'
+         WHEN f.protocol = 'audio-transcription' THEN 'audio-transcription'
          ELSE 'openai'
        END,
        f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
@@ -157,7 +159,7 @@ SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
          WHEN f.input_tokens >= f.cached_input_tokens + f.cache_write_tokens
          THEN f.input_tokens - f.cached_input_tokens - f.cache_write_tokens ELSE 0 END), 0),
        COALESCE(SUM(f.output_tokens), 0), COALESCE(SUM(f.cached_input_tokens), 0),
-       COALESCE(SUM(f.cache_write_tokens), 0), 0, COUNT(*),
+       COALESCE(SUM(f.cache_write_tokens), 0), COALESCE(SUM(f.generation_units), 0), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0),
        COALESCE(SUM(CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END), 0),
@@ -176,9 +178,11 @@ SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
   CROSS JOIN mtc_reconcile_day_bounds b
  WHERE f.created_at >= b.start_ms AND f.created_at < b.end_ms
  GROUP BY f.tenant_id, f.key_id, f.created_at / 3600000, f.model,
+          CASE WHEN f.protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
           CASE
             WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
             WHEN f.protocol = 'openai-image' THEN 'openai-image'
+            WHEN f.protocol = 'audio-transcription' THEN 'audio-transcription'
             ELSE 'openai'
           END,
           f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,

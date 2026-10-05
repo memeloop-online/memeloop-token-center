@@ -214,6 +214,12 @@ VALUES ('global', (:'cutoff'::date - DATE '1970-01-01')::bigint,
 ON CONFLICT (scope) DO UPDATE SET
   before_day = GREATEST(observability_prune_boundaries.before_day, excluded.before_day),
   recorded_at = excluded.recorded_at;
+CREATE TEMP TABLE mtc_pruned_sessions ON COMMIT DROP AS
+SELECT tenant_id, key_id, session_id FROM request_stats_facts
+ WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+UNION
+SELECT tenant_id, key_id, 'unlinked:' || key_id FROM generation_stats_facts
+ WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 DELETE FROM usage_daily_aggregates
  WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
 DELETE FROM session_usage_daily
@@ -236,6 +242,30 @@ DELETE FROM request_stats_facts
  WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 DELETE FROM generation_stats_facts
  WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
+DELETE FROM session_usage_totals total USING mtc_pruned_sessions affected
+ WHERE total.tenant_id = affected.tenant_id AND total.key_id = affected.key_id
+   AND total.session_id = affected.session_id;
+INSERT INTO session_usage_totals (
+  tenant_id, key_id, session_id, currency, last_activity_at, requests, errors,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  generation_units, duration_count, duration_sum_ms, cost_micros)
+SELECT f.tenant_id, f.key_id, f.session_id, f.currency, MAX(f.created_at), COUNT(*),
+       SUM(CASE WHEN f.status_class = 'failure' THEN 1 ELSE 0 END),
+       SUM(f.input_tokens), SUM(f.output_tokens), SUM(f.cached_input_tokens),
+       SUM(f.cache_write_tokens), SUM(f.generation_units), COUNT(*),
+       SUM(f.duration_ms), SUM(f.cost_micros)
+  FROM (
+    SELECT tenant_id, key_id, session_id, currency, created_at, status_class,
+           GREATEST(0, input_tokens - cached_input_tokens - cache_write_tokens) AS input_tokens,
+           output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
+           duration_ms, cost_micros FROM request_stats_facts
+    UNION ALL
+    SELECT tenant_id, key_id, 'unlinked:' || key_id, currency, created_at, status_class,
+           0, 0, 0, 0, billed_units, duration_ms, cost_micros FROM generation_stats_facts
+  ) f JOIN mtc_pruned_sessions affected
+    ON f.tenant_id = affected.tenant_id AND f.key_id = affected.key_id
+   AND f.session_id = affected.session_id
+ GROUP BY f.tenant_id, f.key_id, f.session_id, f.currency;
 COMMIT;
 ` });
 }

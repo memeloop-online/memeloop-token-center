@@ -5,9 +5,9 @@ pub(super) async fn enqueue_terminal_projection_in_transaction(
     request_id: &str,
 ) -> Result<(), AppError> {
     let inserted = sqlx::query(
-        "INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, terminal_cause_code)
-         SELECT id, reservation_id, tenant_id, key_id, created_at, completed_at, model, protocol, status_code, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, billed_units, billing_unit, service_tier, currency, cost_micros, COALESCE(usage_basis, ''), COALESCE(conversation_cluster_id, 'unlinked:' || key_id), terminal_cause_code
-         FROM request_records WHERE id = $1 AND completed_at IS NOT NULL",
+        "INSERT INTO terminal_projection_outbox (request_id, reservation_id, tenant_id, key_id, account_id, created_at, completed_at, model, protocol, status_code, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, usage_basis, session_id, terminal_cause_code, response_object, account_projected_at)
+         SELECT r.id, r.reservation_id, r.tenant_id, r.key_id, u.account_id, r.created_at, r.completed_at, r.model, r.protocol, r.status_code, COALESCE(r.error_code, ''), COALESCE(r.upstream_account_id, ''), COALESCE(r.model_route_id, ''), COALESCE(r.duration_ms, 0), r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens, r.billed_units, r.billing_unit, r.service_tier, r.currency, r.cost_micros, COALESCE(r.usage_basis, ''), COALESCE(r.conversation_cluster_id, 'unlinked:' || r.key_id), r.terminal_cause_code, r.response_object, CASE WHEN u.enforcement_mode = 'prepaid' THEN r.completed_at ELSE m.projected_at END
+         FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id LEFT JOIN metered_usage_projection_outbox m ON m.reservation_id = u.id WHERE r.id = $1 AND r.completed_at IS NOT NULL",
     )
     .bind(request_id)
     .execute(&mut **transaction)
@@ -17,6 +17,8 @@ pub(super) async fn enqueue_terminal_projection_in_transaction(
             "terminal projection evidence is missing".into(),
         ));
     }
+    sqlx::query("UPDATE metered_usage_projection_outbox SET lease_owner = 'terminal-v118', lease_expires_at = 9223372036854775807 WHERE reservation_id IN (SELECT reservation_id FROM terminal_projection_outbox WHERE request_id = $1) AND projected_at IS NULL")
+        .bind(request_id).execute(&mut **transaction).await?;
     Ok(())
 }
 
@@ -46,7 +48,7 @@ impl Database {
             DatabaseBackend::Sqlite => "",
         };
         let statement = format!(
-            "UPDATE terminal_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY completed_at, request_id LIMIT $4{suffix}) RETURNING request_id"
+            "UPDATE terminal_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM terminal_projection_outbox WHERE projected_at IS NULL AND (lease_owner IS NULL OR lease_owner <> $1) AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY completed_at, request_id LIMIT $4{suffix}) RETURNING request_id"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(lease_owner.to_string())
@@ -72,7 +74,7 @@ impl Database {
         let request_id = request_id.to_string();
         let owner = lease_owner.to_string();
         let claimed = sqlx::query(
-            "UPDATE terminal_projection_outbox SET lease_owner = lease_owner WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at > $3 RETURNING tenant_id, key_id, created_at, completed_at",
+            "UPDATE terminal_projection_outbox SET lease_owner = lease_owner WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at > $3 RETURNING tenant_id, key_id, account_id, reservation_id, cost_micros, account_projected_at, created_at, completed_at",
         )
         .bind(&request_id)
         .bind(&owner)
@@ -125,8 +127,37 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
+        if task
+            .try_get::<Option<i64>, _>("account_projected_at")?
+            .is_none()
+        {
+            let reservation_id: String = task.try_get("reservation_id")?;
+            let account_id: String = task.try_get("account_id")?;
+            let cost_micros: i64 = task.try_get("cost_micros")?;
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND account_id = $2 AND key_id = $3 AND actual_micros = $4 AND projected_at IS NULL AND lease_owner = 'terminal-v118'")
+                .bind(&reservation_id).bind(&account_id).bind(&key_id).bind(cost_micros).fetch_one(&mut *transaction).await?;
+            if matched != 1 {
+                return Err(AppError::Conflict(
+                    "terminal account receipt does not match its settlement".into(),
+                ));
+            }
+            super::super::billing::project_account_usage_in_transaction(
+                &mut transaction,
+                &account_id,
+                cost_micros,
+                now,
+            )
+            .await?;
+            let acknowledged = sqlx::query("UPDATE metered_usage_projection_outbox SET projected_at = $1, lease_owner = NULL, lease_expires_at = NULL WHERE reservation_id = $2 AND projected_at IS NULL AND lease_owner = 'terminal-v118'")
+                .bind(now).bind(&reservation_id).execute(&mut *transaction).await?;
+            if acknowledged.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "terminal account receipt ownership changed".into(),
+                ));
+            }
+        }
         let acknowledged = sqlx::query(
-            "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4",
+            "UPDATE terminal_projection_outbox SET projected_at = $1, account_projected_at = COALESCE(account_projected_at, $1), statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4",
         )
         .bind(now)
         .bind(if pruned { "pruned" } else { "applied" })

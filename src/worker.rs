@@ -295,7 +295,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         "terminal_projection",
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            process_terminal_projection_batch(state, projection_owner).await;
+            process_terminal_projection_batch(state, Uuid::now_v7()).await;
         }
     );
     periodic!(
@@ -309,7 +309,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         "conversation_projection",
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
-            process_conversation_projection_batch(state, projection_owner).await;
+            process_conversation_projection_batch(state, Uuid::now_v7()).await;
         }
     );
     periodic!(

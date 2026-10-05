@@ -1168,6 +1168,23 @@ impl Database {
                 .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
                 return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));
             }
+            if claimed.rows_affected() == 0 && defer_projection
+                && let Some(existing) = sqlx::query("SELECT status_code, cost_micros, NULLIF(error_code, '') AS error_code, response_object FROM terminal_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
+                    .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
+                    .fetch_optional(&mut *transaction).await?
+            {
+                let result = FinishProxyRequestResult::AlreadyFinished {
+                    status_code: existing.try_get("status_code")?,
+                    cost_micros: existing.try_get("cost_micros")?,
+                    error_code: existing.try_get("error_code")?,
+                    response_object: existing.try_get("response_object")?,
+                };
+                BudgetHold::commit_optional(transaction, hold).await?;
+                if let Some(reservation) = budget_reservation.as_ref() {
+                    reservation.release().await;
+                }
+                return Ok(result);
+            }
             let locator = sqlx::query(
                 "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
             )
@@ -1347,8 +1364,8 @@ impl Database {
                     // never create tenant content. Commit its unique-key locks
                     // before acquiring the session lock, including during rolling
                     // upgrades with older session-before-content writers.
-                    if !defer_projection
-                        && trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
+                    if defer_projection
+                        || trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
                     {
                         let atoms = extract_atoms(conversation.request_json);
                         let nodes = build_prefix(&atoms);
@@ -1550,6 +1567,7 @@ impl Database {
                         client_name: conversation.client_name,
                         upstream_response_id: conversation.upstream_response_id,
                         observed_at: now,
+                        content_materialized,
                     },
                 )
                 .await?;

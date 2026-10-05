@@ -128,6 +128,16 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
         .claim_metered_usage_projection_tasks(account_owner, 32)
         .await
         .unwrap();
+    assert!(
+        !account_tasks
+            .iter()
+            .any(|task| task.reservation_id == reservation.id)
+    );
+    let envelope = sqlx::query("SELECT request_json, semantic_snapshot_json, lease_owner FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(envelope.get::<String, _>("request_json"), "{}");
+    assert!(envelope.get::<String, _>("semantic_snapshot_json").len() < 71_000);
+    assert_eq!(envelope.get::<String, _>("lease_owner"), "terminal-v118");
     if account_first {
         for task in &account_tasks {
             assert!(
@@ -167,6 +177,16 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
         .execute(&database.pool)
         .await
         .unwrap();
+    assert!(matches!(
+        database
+            .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::AlreadyFinished {
+            cost_micros: 10,
+            ..
+        }
+    ));
     let stale = Uuid::now_v7();
     assert!(
         database
@@ -372,6 +392,211 @@ async fn postgres_terminal_financial_commit_does_not_wait_for_projection_or_curs
         }
     }
     replay_after_source_deletion(&database, true, false).await;
+    database.pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+fn prune_sql() -> String {
+    let source = include_str!("../../../scripts/maintenance/reconcile-postgres-request-stats.ts");
+    let (_, function) = source.split_once("function pruneApply").unwrap();
+    let (_, input) = function.split_once("input: `").unwrap();
+    let (statement, _) = input.split_once("` });").unwrap();
+    statement.replace(":'cutoff'", "'2021-01-01'")
+}
+
+async fn maintenance(database: &Database, statement: String) -> Result<(), sqlx::Error> {
+    let mut connection = database.pool.acquire().await?;
+    let result = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+        .execute(&mut *connection)
+        .await;
+    if result.is_err() {
+        sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+    }
+    result.map(|_| ())
+}
+
+async fn historical(database: &Database) -> (AuthenticatedKey, UsageReservation, Uuid) {
+    let (key, reservation, request_id) = admitted(database, true).await;
+    for statement in [
+        "UPDATE request_records SET created_at = 1577836800000 WHERE id = $1",
+        "UPDATE request_record_locators SET created_at = 1577836800000 WHERE id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let body =
+        serde_json::json!({"messages": [{"role": "user", "content": "retained semantic content"}]});
+    let hints = ConversationHints {
+        session_id: Some(request_id.to_string()),
+        ..ConversationHints::default()
+    };
+    let mut input = finish(&key, &reservation, request_id);
+    input.conversation = Some(ProxyConversationInput {
+        key: &key,
+        request_json: &body,
+        hints: &hints,
+        client_name: None,
+        upstream_response_id: None,
+    });
+    database.finish_proxy_request_deferred(input).await.unwrap();
+    sqlx::query("DELETE FROM request_records WHERE id = $1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    (key, reservation, request_id)
+}
+
+#[tokio::test]
+async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_boundary() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("terminal_retention_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&database_url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect_with_max(isolated.as_str(), 8)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let (key, reservation, request_id) = historical(&database).await;
+    assert!(maintenance(&database, prune_sql()).await.is_err());
+    let rebuild = include_str!("../../../scripts/maintenance/reconcile-observability-day.sql")
+        .replace(":'day'", "'2020-01-01'");
+    maintenance(&database, rebuild.clone()).await.unwrap();
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_terminal_projection_tasks(owner, 32)
+            .await
+            .unwrap(),
+        vec![request_id]
+    );
+    assert!(
+        database
+            .project_claimed_terminal_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    maintenance(&database, rebuild.clone()).await.unwrap();
+    assert_counts(&database, request_id, reservation.id, 1).await;
+    let requests: i64 =
+        sqlx::query_scalar("SELECT SUM(requests) FROM request_daily_aggregates WHERE key_id = $1")
+            .bind(key.key_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(requests, 1);
+    assert!(maintenance(&database, prune_sql()).await.is_err());
+    let account_owner = Uuid::now_v7();
+    let tasks = database
+        .claim_metered_usage_projection_tasks(account_owner, 32)
+        .await
+        .unwrap();
+    assert!(tasks.is_empty());
+    let conversation_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(conversation_owner, 32)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(conversation_owner, request_id)
+            .await
+            .unwrap()
+    );
+    maintenance(&database, prune_sql()).await.unwrap();
+    assert_counts(&database, request_id, reservation.id, 0).await;
+    assert!(
+        !database
+            .project_claimed_terminal_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(maintenance(&database, rebuild).await.is_err());
+    let (late_key, late_reservation, late_id) = historical(&database).await;
+    let late_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_terminal_projection_tasks(late_owner, 32)
+            .await
+            .unwrap(),
+        vec![late_id]
+    );
+    assert!(
+        database
+            .project_claimed_terminal_projection_task(late_owner, late_id)
+            .await
+            .unwrap()
+    );
+    assert_counts(&database, late_id, late_reservation.id, 0).await;
+    let outcome: String = sqlx::query_scalar(
+        "SELECT statistics_outcome FROM terminal_projection_outbox WHERE request_id = $1",
+    )
+    .bind(late_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(outcome, "pruned");
+    let late_account_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_metered_usage_projection_tasks(late_account_owner, 32)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    let late_conversation_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(late_conversation_owner, 32)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(late_conversation_owner, late_id)
+            .await
+            .unwrap()
+    );
+    let conversation_outcome: String = sqlx::query_scalar(
+        "SELECT statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(late_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(conversation_outcome, "pruned");
+    for account in [key.account_id, late_key.account_id] {
+        let lifetime: i64 = sqlx::query_scalar(
+            "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+        )
+        .bind(account.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifetime, 10);
+    }
     database.pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)

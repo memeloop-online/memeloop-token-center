@@ -69,10 +69,10 @@ impl Database {
         lease_owner: Uuid,
         reservation_id: Uuid,
     ) -> Result<bool, AppError> {
-        let now = unix_millis();
         let reservation_id = reservation_id.to_string();
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        let now = unix_millis();
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT account_id, key_id, actual_micros FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"

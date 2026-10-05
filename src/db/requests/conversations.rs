@@ -81,6 +81,13 @@ pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
     pub(crate) observed_at: i64,
+    pub(crate) content_materialized: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConversationSemanticSnapshot {
+    leaf: Option<String>,
+    atom_hashes: Vec<String>,
 }
 
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
@@ -98,36 +105,85 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
         client_name,
         upstream_response_id,
         observed_at,
+        content_materialized,
     } = input;
     // Exact-capacity serialization keeps the retained request envelope bounded
     // while the terminal transaction also owns the response ciphertext.
-    let mut encoded_request = Vec::with_capacity(crate::gateway_body::memory::json_encoded_length(
-        request_json,
-    )?);
-    serde_json::to_writer(&mut encoded_request, request_json).map_err(|_| AppError::Internal)?;
-    let request_json = String::from_utf8(encoded_request).map_err(|_| AppError::Internal)?;
+    let (request_json, semantic_snapshot) = if content_materialized {
+        let atoms = extract_atoms(request_json);
+        let nodes = build_prefix(&atoms);
+        let snapshot = ConversationSemanticSnapshot {
+            leaf: nodes.last().map(|node| node.node_hash.clone()),
+            atom_hashes: bounded_atom_hashes(&atoms),
+        };
+        (
+            "{}".to_owned(),
+            Some(serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?),
+        )
+    } else {
+        let mut encoded_request = Vec::with_capacity(
+            crate::gateway_body::memory::json_encoded_length(request_json)?,
+        );
+        serde_json::to_writer(&mut encoded_request, request_json)
+            .map_err(|_| AppError::Internal)?;
+        (
+            String::from_utf8(encoded_request).map_err(|_| AppError::Internal)?,
+            None,
+        )
+    };
     let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
-    sqlx::query(
-        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT(request_id) DO NOTHING",
-    )
-    .bind(request_id.to_string())
-    .bind(key.tenant_id.to_string())
-    .bind(key.key_id.to_string())
-    .bind(key.principal_id.to_string())
-    .bind(request_json)
-    .bind(hints_json)
-    .bind(client_name)
-    .bind(upstream_response_id)
-    .bind(observed_at)
-    .bind(serde_json::json!({
+    let key_snapshot = serde_json::json!({
         "account_id": key.account_id,
         "alias": key.alias,
         "currency": key.currency,
         "credential_generation": key.credential_generation,
         "policy": key.policy,
-    }).to_string())
+    })
+    .to_string();
+    let inserted = sqlx::query(
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json, lease_owner, lease_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CASE WHEN $11 IS NOT NULL THEN 'terminal-v118' END, CASE WHEN $11 IS NOT NULL THEN 9223372036854775807 END) ON CONFLICT(request_id) DO NOTHING",
+    )
+    .bind(request_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.principal_id.to_string())
+    .bind(&request_json)
+    .bind(&hints_json)
+    .bind(client_name)
+    .bind(upstream_response_id)
+    .bind(observed_at)
+    .bind(&key_snapshot)
+    .bind(&semantic_snapshot)
     .execute(&mut **transaction)
     .await?;
+    if inserted.rows_affected() == 0 {
+        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
+        if existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
+            || existing.try_get::<String, _>("key_id")? != key.key_id.to_string()
+            || existing.try_get::<String, _>("principal_id")? != key.principal_id.to_string()
+            || existing.try_get::<String, _>("request_json")? != request_json
+            || existing.try_get::<String, _>("hints_json")? != hints_json
+            || existing
+                .try_get::<Option<String>, _>("client_name")?
+                .as_deref()
+                != client_name
+            || existing
+                .try_get::<Option<String>, _>("upstream_response_id")?
+                .as_deref()
+                != upstream_response_id
+            || existing.try_get::<i64, _>("observed_at")? != observed_at
+            || existing
+                .try_get::<Option<String>, _>("key_snapshot_json")?
+                .as_deref()
+                != Some(key_snapshot.as_str())
+            || existing.try_get::<Option<String>, _>("semantic_snapshot_json")? != semantic_snapshot
+        {
+            return Err(AppError::Conflict(
+                "conversation projection evidence does not match its owner".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -178,13 +234,32 @@ impl Database {
         let statement = format!(
             "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN ({claimable}) RETURNING request_id, observed_at"
         );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(lease_owner.to_string())
             .bind(expires_at)
             .bind(now)
             .bind(limit)
             .fetch_all(&mut *transaction)
             .await?;
+        let remaining = limit.saturating_sub(rows.len() as i64);
+        if remaining > 0 {
+            let suffix = match self.backend {
+                DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
+                DatabaseBackend::Sqlite => "",
+            };
+            let statement = format!(
+                "UPDATE conversation_projection_outbox SET terminal_lease_owner = $1, terminal_lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND semantic_snapshot_json IS NOT NULL AND (terminal_lease_owner IS NULL OR terminal_lease_owner <> $1) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3) ORDER BY observed_at, request_id LIMIT $4{suffix}) RETURNING request_id, observed_at"
+            );
+            rows.extend(
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(lease_owner.to_string())
+                    .bind(expires_at)
+                    .bind(now)
+                    .bind(remaining)
+                    .fetch_all(&mut *transaction)
+                    .await?,
+            );
+        }
         transaction.commit().await?;
         rows.into_iter()
             .map(|row| {
@@ -211,7 +286,7 @@ impl Database {
         {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, request_json, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3",
+                "SELECT tenant_id, request_json, observed_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -221,33 +296,37 @@ impl Database {
             let Some(prepare) = prepare else {
                 return Ok(false);
             };
-            let prepare_tenant_id: String = prepare.try_get("tenant_id")?;
-            let prepare_request_json =
-                serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
-                    .map_err(|_| AppError::Internal)?;
-            self.materialize_conversation_content(
-                &prepare_tenant_id,
-                &prepare_request_json,
-                prepare.try_get("observed_at")?,
-            )
-            .await?;
+            if prepare
+                .try_get::<Option<String>, _>("semantic_snapshot_json")?
+                .is_none()
+            {
+                let prepare_tenant_id: String = prepare.try_get("tenant_id")?;
+                let prepare_request_json =
+                    serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
+                        .map_err(|_| AppError::Internal)?;
+                self.materialize_conversation_content(
+                    &prepare_tenant_id,
+                    &prepare_request_json,
+                    prepare.try_get("observed_at")?,
+                )
+                .await?;
+            }
         }
 
-        let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        let now = unix_millis();
         let terminal = sqlx::query(
             "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
         )
         .bind(request_id.to_string())
         .fetch_optional(&mut *transaction)
         .await?;
-        if terminal.as_ref().is_some_and(|row| {
-            row.try_get::<Option<i64>, _>("projected_at")
-                .ok()
-                .flatten()
+        if let Some(terminal) = terminal.as_ref()
+            && terminal
+                .try_get::<Option<i64>, _>("projected_at")?
                 .is_none()
-        }) {
+        {
             return Ok(false);
         }
         if let Some(terminal) = terminal.as_ref()
@@ -257,17 +336,17 @@ impl Database {
             )
             .await?
         {
-            let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'pruned', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3 AND lease_expires_at > $1")
+            let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'pruned', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $1")
                 .bind(now).bind(request_id.to_string()).bind(lease_owner.to_string()).execute(&mut *transaction).await?;
             transaction.commit().await?;
             return Ok(skipped.rows_affected() == 1);
         }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
             }
         };
         let task = sqlx::query(select)
@@ -336,7 +415,11 @@ impl Database {
         let upstream_response_id: Option<String> = task.try_get("upstream_response_id")?;
         let observed_at: i64 = task.try_get("observed_at")?;
 
-        self.record_conversation_observation_in_transaction(
+        let snapshot: Option<ConversationSemanticSnapshot> = task
+            .try_get::<Option<String>, _>("semantic_snapshot_json")?
+            .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
+            .transpose()?;
+        self.record_conversation_observation_with_snapshot_in_transaction(
             &mut transaction,
             ConversationObservationInput {
                 key: &projection_key,
@@ -349,6 +432,7 @@ impl Database {
                 attach_request_record: true,
                 content_materialized: true,
             },
+            snapshot.as_ref(),
         )
         .await?;
         if let Some(upstream_response_id) = upstream_response_id.as_deref() {
@@ -361,7 +445,7 @@ impl Database {
             .await?;
         }
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
         .bind(now)
         .bind(request_id.to_string())
@@ -418,6 +502,16 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
     ) -> Result<Uuid, AppError> {
+        self.record_conversation_observation_with_snapshot_in_transaction(transaction, input, None)
+            .await
+    }
+
+    async fn record_conversation_observation_with_snapshot_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Any>,
+        input: ConversationObservationInput<'_>,
+        snapshot: Option<&ConversationSemanticSnapshot>,
+    ) -> Result<Uuid, AppError> {
         let ConversationObservationInput {
             key,
             request_id,
@@ -434,10 +528,14 @@ impl Database {
         lock_request_stats_projection_writer_in_transaction(transaction).await?;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
-        let atom_hashes = bounded_atom_hashes(&atoms);
+        let atom_hashes = snapshot
+            .map(|snapshot| snapshot.atom_hashes.clone())
+            .unwrap_or_else(|| bounded_atom_hashes(&atoms));
         let atom_hashes_json =
             serde_json::to_string(&atom_hashes).map_err(|_| AppError::Internal)?;
-        let leaf = nodes.last().map(|node| node.node_hash.clone());
+        let leaf = snapshot
+            .map(|snapshot| snapshot.leaf.clone())
+            .unwrap_or_else(|| nodes.last().map(|node| node.node_hash.clone()));
         let now = observed_at;
         let observation_id = Uuid::now_v7();
         let request_id = request_id.to_string();
@@ -577,18 +675,23 @@ impl Database {
             let previous_hashes: Vec<String> =
                 serde_json::from_str(&previous_hashes_json).unwrap_or_default();
             let has_previous_semantic_atoms = !previous_hashes.is_empty();
-            let merkle_prefix = leaf.is_some()
-                && (leaf.as_deref() == candidate_leaf.as_deref()
-                    || candidate_leaf
-                        .as_deref()
-                        .is_some_and(|candidate| current_node_hashes.contains(candidate)));
+            let is_prefix = if let (Some(_), Some(leaf), Some(candidate)) =
+                (snapshot, leaf.as_deref(), candidate_leaf.as_deref())
+            {
+                let matched: i64 = sqlx::query_scalar("WITH RECURSIVE ancestors(node_hash, parent_hash, depth) AS (SELECT node_hash, parent_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 UNION ALL SELECT parent.node_hash, parent.parent_hash, parent.depth FROM context_nodes parent JOIN ancestors child ON parent.node_hash = child.parent_hash AND parent.depth < child.depth WHERE parent.tenant_id = $1) SELECT COUNT(*) FROM ancestors WHERE node_hash = $3")
+                    .bind(&tenant_id).bind(leaf).bind(candidate).fetch_one(&mut **transaction).await?;
+                matched != 0
+            } else {
+                candidate_leaf
+                    .as_deref()
+                    .is_some_and(|candidate| current_node_hashes.contains(candidate))
+            };
+            let merkle_prefix =
+                leaf.is_some() && (leaf.as_deref() == candidate_leaf.as_deref() || is_prefix);
             let (relation, confidence) =
                 if leaf.as_deref() == candidate_leaf.as_deref() && leaf.is_some() {
                     (RelationKind::Retry, 980)
-                } else if candidate_leaf
-                    .as_deref()
-                    .is_some_and(|candidate| current_node_hashes.contains(candidate))
-                {
+                } else if is_prefix {
                     (RelationKind::Continues, 950)
                 } else if has_semantic_atoms && has_previous_semantic_atoms {
                     infer_hash_relation(&previous_hashes, &atom_hashes)

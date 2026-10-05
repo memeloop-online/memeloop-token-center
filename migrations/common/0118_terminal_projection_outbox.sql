@@ -3,6 +3,7 @@ CREATE TABLE terminal_projection_outbox (
     reservation_id TEXT NOT NULL UNIQUE,
     tenant_id TEXT NOT NULL,
     key_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
     created_at BIGINT NOT NULL,
     completed_at BIGINT NOT NULL,
     model TEXT NOT NULL,
@@ -24,10 +25,12 @@ CREATE TABLE terminal_projection_outbox (
     usage_basis TEXT NOT NULL,
     session_id TEXT NOT NULL,
     terminal_cause_code TEXT,
+    response_object TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at BIGINT,
     attempts BIGINT NOT NULL DEFAULT 0,
     projected_at BIGINT,
+    account_projected_at BIGINT,
     statistics_outcome TEXT CHECK (statistics_outcome IN ('applied', 'pruned'))
 );
 CREATE INDEX terminal_projection_pending_idx
@@ -41,3 +44,6 @@ CREATE TABLE observability_prune_boundaries (
 
 ALTER TABLE conversation_projection_outbox ADD COLUMN key_snapshot_json TEXT;
 ALTER TABLE conversation_projection_outbox ADD COLUMN statistics_outcome TEXT;
+ALTER TABLE conversation_projection_outbox ADD COLUMN semantic_snapshot_json TEXT;
+ALTER TABLE conversation_projection_outbox ADD COLUMN terminal_lease_owner TEXT;
+ALTER TABLE conversation_projection_outbox ADD COLUMN terminal_lease_expires_at BIGINT;
