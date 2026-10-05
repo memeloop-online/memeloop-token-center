@@ -1408,6 +1408,8 @@ async fn postgres_complete_cancelled_inside_commit_keeps_atomic_binding() {
     fixture.finish().await;
 }
 
+#[path = "postgres_cas_tests.rs"]
+mod postgres_cas_tests;
 #[path = "postgres_load_tests.rs"]
 mod postgres_load_tests;
 #[path = "postgres_reservation_tests.rs"]

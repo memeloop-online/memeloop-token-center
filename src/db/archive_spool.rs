@@ -1065,7 +1065,7 @@ impl Database {
         let mut tx = self.archive_state_transaction().await?;
         let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
             let receipts: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose,
-                "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id JOIN archive_staging_attempts a ON a.attempt_id = $5 WHERE s.request_id = $1 AND s.tenant_id = $2 AND s.reservation_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4 AND r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 399 AND COALESCE(r.error_code, '') = '' AND a.state IN ('cleanup_pending', 'cleaned') AND a.bound_at IS NOT NULL AND a.writer_owner = $6 AND a.writer_token = $7")))
+                "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id JOIN archive_staging_attempts a ON a.attempt_id = $5 WHERE s.request_id = $1 AND s.tenant_id = $2 AND s.reservation_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4 AND r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 399 AND COALESCE(r.error_code, '') = '' AND a.owner_kind = 'proxy_request' AND a.owner_id = s.request_id AND a.purpose = $8 AND a.state IN ('cleanup_pending', 'cleaned') AND a.bound_at IS NOT NULL AND a.writer_owner = $6 AND a.writer_token = $7")))
                 .bind(task.identity.request_id.to_string())
                 .bind(task.identity.tenant_id.to_string())
                 .bind(task.identity.reservation_id.to_string())
@@ -1073,6 +1073,7 @@ impl Database {
                 .bind(staging.key.attempt_id.to_string())
                 .bind(staging.owner.as_str())
                 .bind(staging.token.to_string())
+                .bind(purpose.as_str())
                 .fetch_one(&mut *tx).await?;
             return Ok(receipts == 1);
         };
