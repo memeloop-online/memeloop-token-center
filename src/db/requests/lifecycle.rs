@@ -1002,7 +1002,7 @@ impl Database {
             None,
             ProxyRequestUpstreamAttribution::KeepSelected,
             Some(&input),
-            false,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1021,7 +1021,7 @@ impl Database {
             None,
             ProxyRequestUpstreamAttribution::KeepSelected,
             None,
-            false,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1038,7 +1038,7 @@ impl Database {
             None,
             upstream_attribution,
             None,
-            false,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1056,7 +1056,7 @@ impl Database {
             Some(archive),
             upstream_attribution,
             None,
-            false,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1066,15 +1066,10 @@ impl Database {
         &self,
         input: FinishProxyRequest<'_>,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(
-            input,
-            None,
-            None,
-            ProxyRequestUpstreamAttribution::KeepSelected,
-            None,
-            true,
-        )
-        .await
+        self.clone()
+            .with_terminal_projection_enabled(true)
+            .finish_proxy_request(input)
+            .await
     }
 
     async fn finish_proxy_request_inner(

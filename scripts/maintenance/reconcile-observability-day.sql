@@ -42,6 +42,27 @@ INSERT INTO request_stats_facts (
   request_id, tenant_id, key_id, created_at, model, protocol, status_class,
   error_code, upstream_account_id, model_route_id, duration_ms,
   input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  generation_units, billing_unit, service_tier, currency, cost_micros, session_id
+)
+SELECT t.request_id, t.tenant_id, t.key_id, t.created_at, t.model, t.protocol,
+       CASE WHEN t.status_code BETWEEN 200 AND 399 AND t.error_code = '' THEN 'success' ELSE 'failure' END,
+       t.error_code, t.upstream_account_id, t.model_route_id, t.duration_ms,
+       t.input_tokens, t.output_tokens, t.cached_input_tokens, t.cache_write_tokens,
+       t.generation_units, t.billing_unit, t.service_tier, t.currency,
+       COALESCE((SELECT c.corrected_fact_cost_micros FROM request_cost_projection_corrections c
+                  WHERE c.request_id = t.request_id ORDER BY c.applied_at DESC, c.correction_version DESC LIMIT 1),
+                CASE WHEN (t.status_code < 200 OR t.status_code >= 400 OR t.error_code <> '')
+                           AND t.usage_basis <> 'provider_reported' THEN 0 ELSE t.cost_micros END),
+       t.session_id
+  FROM terminal_projection_outbox t CROSS JOIN mtc_reconcile_day_bounds b
+ WHERE t.created_at >= b.start_ms AND t.created_at < b.end_ms
+   AND t.projected_at IS NOT NULL AND t.statistics_outcome = 'applied'
+ON CONFLICT (request_id) DO NOTHING;
+
+INSERT INTO request_stats_facts (
+  request_id, tenant_id, key_id, created_at, model, protocol, status_class,
+  error_code, upstream_account_id, model_route_id, duration_ms,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
   service_tier, currency, cost_micros
 )
 SELECT r.id, r.tenant_id, r.key_id, r.created_at, r.model, r.protocol,

@@ -474,6 +474,203 @@ fn prune_sql() -> String {
     statement.replace(":'cutoff'", "'2021-01-01'")
 }
 
+#[tokio::test]
+async fn postgres_terminal_and_legacy_metered_workers_share_account_first_order() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("terminal_mixed_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&database_url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect_with_max(isolated.as_str(), 8)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let (key, legacy_reservation, legacy_id) = admitted(&database, true).await;
+    let model: String = sqlx::query_scalar("SELECT model FROM request_records WHERE id = $1")
+        .bind(legacy_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let terminal_id = Uuid::now_v7();
+    let terminal_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: terminal_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: &model,
+            request_object: "gap://mixed/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request(finish(&key, &legacy_reservation, legacy_id))
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request_deferred(finish(&key, &terminal_reservation, terminal_id))
+        .await
+        .unwrap();
+    let legacy_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_metered_usage_projection_tasks(legacy_owner, 32)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let terminal_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 32)
+            .await
+            .unwrap(),
+        vec![terminal_id]
+    );
+    let legacy = Database::connect_with_max(isolated.as_str(), 1)
+        .await
+        .unwrap();
+    let terminal = Database::connect_with_max(isolated.as_str(), 1)
+        .await
+        .unwrap();
+    let legacy_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&legacy.pool)
+        .await
+        .unwrap();
+    let terminal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&terminal.pool)
+        .await
+        .unwrap();
+    let trigger = format!(
+        "CREATE FUNCTION mixed_account_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF pg_backend_pid() = {legacy_pid} THEN PERFORM pg_advisory_xact_lock(hashtextextended('{schema}', 0)); END IF; RETURN NEW; END $$; CREATE TRIGGER mixed_account_gate AFTER UPDATE ON credit_accounts FOR EACH ROW EXECUTE FUNCTION mixed_account_gate();"
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(trigger))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let mut gate = database.begin_write_transaction().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&schema)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let legacy_task = tokio::spawn(async move {
+        legacy
+            .project_claimed_metered_usage_projection_task(legacy_owner, legacy_reservation.id)
+            .await
+    });
+    wait_for_projection_lock(&database, legacy_pid).await;
+    let terminal_task = tokio::spawn(async move {
+        terminal
+            .project_claimed_terminal_projection_task(terminal_owner, terminal_id)
+            .await
+    });
+    wait_for_projection_lock(&database, terminal_pid).await;
+    gate.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        assert!(legacy_task.await.unwrap().unwrap());
+        assert!(terminal_task.await.unwrap().unwrap());
+    })
+    .await
+    .expect("mixed workers must complete without an account/aggregate deadlock");
+    let lifetime: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifetime, 20);
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT CAST(SUM(requests) AS BIGINT) FROM request_daily_aggregates WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(requests, 2);
+    assert_counts(&database, terminal_id, terminal_reservation.id, 1).await;
+    database.pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+async fn wait_for_projection_lock(database: &Database, pid: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE pid = $1 AND NOT granted")
+                    .bind(pid)
+                    .fetch_one(&database.pool)
+                    .await
+                    .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker must reach the controlled lock gate");
+}
+
+#[tokio::test]
+async fn terminal_projection_configuration_reaches_real_finalization_and_persistence_pool() {
+    for enabled in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("configured.db").display()
+        );
+        let mut config = crate::config::Config::for_test(database_url);
+        assert!(!config.terminal_projection_enabled);
+        config.terminal_projection_enabled = enabled;
+        let state = crate::AppState::initialize(config).await.unwrap();
+        let database = state.db.independent_persistence_pool();
+        let (key, reservation, request_id) = admitted(&database, true).await;
+        database
+            .finish_proxy_request(finish(&key, &reservation, request_id))
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = $1 AND projected_at IS NULL")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(pending, i64::from(enabled));
+        if enabled {
+            let owner = Uuid::now_v7();
+            database
+                .claim_terminal_projection_tasks(owner, 32)
+                .await
+                .unwrap();
+            assert!(
+                database
+                    .project_claimed_terminal_projection_task(owner, request_id)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_counts(&database, request_id, reservation.id, 1).await;
+    }
+}
+
 async fn maintenance(database: &Database, statement: String) -> Result<(), sqlx::Error> {
     let mut connection = database.pool.acquire().await?;
     let result = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
@@ -560,6 +757,21 @@ async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_bounda
     );
     maintenance(&database, rebuild.clone()).await.unwrap();
     assert_counts(&database, request_id, reservation.id, 1).await;
+    sqlx::query("DELETE FROM request_stats_facts WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(
+        !database
+            .project_claimed_terminal_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    for _attempt in 0..2 {
+        maintenance(&database, rebuild.clone()).await.unwrap();
+        assert_counts(&database, request_id, reservation.id, 1).await;
+    }
     let requests: i64 = sqlx::query_scalar(
         "SELECT CAST(SUM(requests) AS BIGINT) FROM request_daily_aggregates WHERE key_id = $1",
     )

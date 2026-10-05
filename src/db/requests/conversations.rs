@@ -1424,6 +1424,9 @@ async fn merge_conversation_clusters_in_transaction(
     .bind(&source_cluster_id)
     .execute(&mut **transaction)
     .await?;
+    sqlx::query("UPDATE terminal_projection_outbox SET session_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4")
+        .bind(&target_cluster_id).bind(tenant_id).bind(key_id).bind(&source_cluster_id)
+        .execute(&mut **transaction).await?;
     let moved_archive_requests = sqlx::query(
         "UPDATE session_archive_unlinked_requests SET conversation_cluster_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND conversation_cluster_id = $4",
     )

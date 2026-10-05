@@ -221,8 +221,11 @@ Events and financial receipts are not observability facts and are not deleted by
 this operation. Session totals are recomputed from surviving facts.
 
 Day rebuild refuses pruned days, never synthesizes pending terminal facts from
-live sources, and preserves acknowledged terminal facts whose raw sources have
-expired. Legacy pending metered facts prevent rebuilding that day until their
+live sources, and restores missing acknowledged, applied terminal facts from
+retained receipts even after raw sources expire. It retains existing facts and
+latest cost corrections, then replaces day aggregates rather than incrementing
+them. Normal replay does not reopen acknowledged financial or event receipts.
+Legacy pending metered facts prevent rebuilding that day until their
 consumer finishes. Thus facts and aggregate acknowledgement share one inclusion
 boundary; neither a timestamp watermark nor a maximum UUID stands in for receipts.
 Maintenance uses READ COMMITTED after acquiring the exclusive fence: an advisory
@@ -239,3 +242,10 @@ acknowledgement rollback and both PostgreSQL locks. Existing 1024-request tests
 retain their sizes. No local build/test/install or production operation is part
 of validation. A2 permit transfer, finalization capacity admission and body
 spooling are still unimplemented; no forwarding concurrency is reduced.
+
+Controlled activation uses `MTC_TERMINAL_PROJECTION_ENABLED=true`; the default is
+false. The setting is propagated to the database and independent persistence
+pools, so real forwarding finalization, not only test helpers, uses the durable
+handoff when enabled. Keep production disabled pending mixed-worker PostgreSQL
+acceptance and test-instance validation. Disabling enqueue does not disable
+replay of previously committed work.
