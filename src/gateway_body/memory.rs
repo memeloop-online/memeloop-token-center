@@ -469,13 +469,6 @@ impl ProxyMemoryReservation {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
 
-    pub(crate) fn response_estimate_fits(&self, bytes: usize, nodes: usize) -> bool {
-        bytes
-            .saturating_mul(2)
-            .saturating_add(nodes.saturating_mul(256))
-            <= self.response_bytes.load(Ordering::Acquire)
-    }
-
     pub(crate) fn release(&self, bytes: usize, weight: usize) {
         let Ok(mut held) = self.held.lock() else {
             return;
@@ -791,7 +784,6 @@ mod tests {
                 )
                 .await
         );
-        assert!(first.response_estimate_fits(MAX_BUFFERED_RESPONSE_BYTES, 8));
     }
 
     #[tokio::test]
