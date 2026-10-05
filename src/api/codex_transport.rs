@@ -80,6 +80,7 @@ const SCALAR_OUTPUT_LIMIT_FIELDS: &[&str] =
     &["max_output_tokens", "max_completion_tokens", "max_tokens"];
 
 const UNSUPPORTED_FIELDS: &[&str] = &[
+    "metadata",
     "temperature",
     "top_p",
     "truncation",
@@ -1306,6 +1307,7 @@ pub(super) struct BufferedCodexResponse {
     pub body: Bytes,
     pub usage: TokenUsage,
     pub terminal: BufferedCodexTerminal,
+    _retained_memory: Vec<crate::gateway_body::memory::ArchiveOutputMemory>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1389,6 +1391,7 @@ pub(super) struct CodexChatStreamTranslator {
     include_usage: bool,
     text_delta: String,
     tools: BTreeMap<usize, chat_tools::StreamingTool>,
+    completed_items: BTreeMap<usize, Value>,
     retained_bytes: usize,
 }
 
@@ -1422,6 +1425,7 @@ impl CodexChatStreamTranslator {
             include_usage,
             text_delta: String::new(),
             tools: BTreeMap::new(),
+            completed_items: BTreeMap::new(),
             retained_bytes: 0,
         }
     }
@@ -1489,6 +1493,22 @@ impl CodexChatStreamTranslator {
             }
             "response.output_item.added" | "response.output_item.done" => {
                 let item = value.get("item").ok_or("upstream_invalid_response")?;
+                if kind == "response.output_item.done" {
+                    let index = value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .filter(|index| *index < MAX_OUTPUT_ITEMS)
+                        .ok_or("upstream_invalid_response")?;
+                    if self.completed_items.contains_key(&index) {
+                        return Err("upstream_invalid_response");
+                    }
+                    let bytes = serde_json::to_vec(item)
+                        .map_err(|_| "upstream_invalid_response")?
+                        .len();
+                    self.retain_bytes(bytes)?;
+                    self.completed_items.insert(index, item.clone());
+                }
                 match item.get("type").and_then(Value::as_str) {
                     Some("message" | "reasoning") => Ok(None),
                     Some("function_call") => {
@@ -1592,12 +1612,18 @@ impl CodexChatStreamTranslator {
         if self.terminal {
             return Err("upstream_invalid_response");
         }
-        let response = event
+        let mut response = event
             .get("response")
             .filter(|response| response.is_object())
+            .cloned()
             .ok_or("upstream_invalid_response")?;
-        let completed = response_chat_content(response, allow_empty_output)?;
-        let usage = canonical_responses_usage(response).map_err(|_| "upstream_invalid_usage")?;
+        restore_completed_output(
+            &mut response,
+            std::mem::take(&mut self.completed_items),
+            CompletedOutputCoverage::ObservedSubset,
+        )?;
+        let completed = response_chat_content(&response, allow_empty_output)?;
+        let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
         let mut output = Vec::new();
         match completed {
             ChatResponseContent::Text(completed) => {
@@ -1635,7 +1661,7 @@ impl CodexChatStreamTranslator {
                 }
             }
         }
-        self.complete_tools(response, &mut output)?;
+        self.complete_tools(&response, &mut output)?;
         let finish_reason = if finish_reason == "stop" && !self.tools.is_empty() {
             "tool_calls"
         } else {
@@ -1836,7 +1862,7 @@ fn response_chat_content(
 
 pub(super) async fn buffer_response(
     response: UpstreamResponse,
-    memory: &crate::gateway_body::memory::ProxyMemoryReservation,
+    memory: &std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     started: std::time::Instant,
     conversation: Option<&super::ProxyConversation>,
     sse_framing_limits: crate::provider::SseFramingLimits,
@@ -1885,7 +1911,6 @@ pub(super) async fn buffer_response(
     ));
     let mut parser = BufferedResponsesParser::with_limits(sse_framing_limits);
     let mut total = 0_usize;
-    let mut memory_scanner = crate::gateway_body::memory::JsonMemoryScanner::default();
     let mut stream = response.bytes_stream();
     loop {
         let next = tokio::time::timeout_at(deadline, stream.next())
@@ -1902,11 +1927,7 @@ pub(super) async fn buffer_response(
         if total > maximum {
             return Err("upstream_response_too_large");
         }
-        let nodes = memory_scanner.observe(&chunk);
-        if !memory.response_estimate_fits(total, nodes) {
-            return Err("upstream_response_memory_capacity");
-        }
-        parser.push(&chunk)?;
+        parser.push_accounted(&chunk, Some(memory))?;
     }
     if let Some(phase) = first_byte.take() {
         phase.finish("no_bytes", None, Some(0));
@@ -1922,6 +1943,51 @@ struct BufferedResponsesParser {
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
     terminal_failure: bool,
     invalid: bool,
+    retained_memory: Vec<crate::gateway_body::memory::ArchiveOutputMemory>,
+}
+
+enum CompletedOutputCoverage {
+    Complete,
+    ObservedSubset,
+}
+
+fn restore_completed_output(
+    response: &mut Value,
+    output_items: BTreeMap<usize, Value>,
+    coverage: CompletedOutputCoverage,
+) -> Result<(), &'static str> {
+    let completed_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or("upstream_invalid_response")?;
+    if output_items.is_empty() {
+        return Ok(());
+    }
+    if !completed_output.is_empty() && matches!(coverage, CompletedOutputCoverage::ObservedSubset) {
+        return if output_items
+            .iter()
+            .all(|(index, item)| completed_output.get(*index) == Some(item))
+        {
+            Ok(())
+        } else {
+            Err("upstream_invalid_response")
+        };
+    }
+    if output_items.len() > MAX_OUTPUT_ITEMS
+        || output_items.keys().copied().ne(0..output_items.len())
+    {
+        return Err("upstream_invalid_response");
+    }
+    let output = output_items.into_values().collect::<Vec<_>>();
+    if completed_output.is_empty() {
+        response
+            .as_object_mut()
+            .ok_or("upstream_invalid_response")?
+            .insert("output".to_owned(), Value::Array(output));
+    } else if completed_output != &output {
+        return Err("upstream_invalid_response");
+    }
+    Ok(())
 }
 
 impl BufferedResponsesParser {
@@ -1932,7 +1998,16 @@ impl BufferedResponsesParser {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, chunk: &[u8]) -> Result<(), &'static str> {
+        self.push_accounted(chunk, None)
+    }
+
+    fn push_accounted(
+        &mut self,
+        chunk: &[u8],
+        memory: Option<&std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+    ) -> Result<(), &'static str> {
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
             return Err(match rejection {
@@ -1941,7 +2016,7 @@ impl BufferedResponsesParser {
             });
         }
         for event in batch.events {
-            self.dispatch(event)?;
+            self.dispatch(event, memory)?;
         }
         Ok(())
     }
@@ -1957,30 +2032,11 @@ impl BufferedResponsesParser {
             .terminal_response
             .take()
             .ok_or("upstream_incomplete_response")?;
-        let completed_output = response
-            .get("output")
-            .and_then(Value::as_array)
-            .ok_or("upstream_invalid_response")?;
-        if !self.output_items.is_empty() {
-            if self.output_items.len() > MAX_OUTPUT_ITEMS
-                || self
-                    .output_items
-                    .keys()
-                    .copied()
-                    .ne(0..self.output_items.len())
-            {
-                return Err("upstream_invalid_response");
-            }
-            let output = self.output_items.into_values().collect::<Vec<_>>();
-            if completed_output.is_empty() {
-                response
-                    .as_object_mut()
-                    .ok_or("upstream_invalid_response")?
-                    .insert("output".to_owned(), Value::Array(output));
-            } else if completed_output != &output {
-                return Err("upstream_invalid_response");
-            }
-        }
+        restore_completed_output(
+            &mut response,
+            self.output_items,
+            CompletedOutputCoverage::Complete,
+        )?;
         let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
         let mut body = serde_json::to_vec(&response).map_err(|_| "upstream_invalid_response")?;
         drop(response);
@@ -1992,10 +2048,15 @@ impl BufferedResponsesParser {
             body: Bytes::from(body),
             usage,
             terminal,
+            _retained_memory: self.retained_memory,
         })
     }
 
-    fn dispatch(&mut self, event: BoundedSseEvent) -> Result<(), &'static str> {
+    fn dispatch(
+        &mut self,
+        event: BoundedSseEvent,
+        memory: Option<&std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+    ) -> Result<(), &'static str> {
         let (event_name, data) = parse_sse_event(&event)?;
         let Some(data) = data else {
             return Ok(());
@@ -2011,6 +2072,13 @@ impl BufferedResponsesParser {
                 Err("upstream_incomplete_response")
             };
         }
+        let retained_memory = memory
+            .map(|memory| {
+                memory
+                    .try_reserve_archive_json_transform(data)
+                    .ok_or("upstream_response_memory_capacity")
+            })
+            .transpose()?;
         let value = parse_unique_json(data)?;
         let payload_kind = value
             .get("type")
@@ -2040,6 +2108,13 @@ impl BufferedResponsesParser {
             return Ok(());
         }
         self.identity.observe(kind, &value)?;
+        if matches!(
+            kind,
+            "response.output_item.done" | "response.completed" | "response.incomplete"
+        ) && let Some(retained_memory) = retained_memory
+        {
+            self.retained_memory.push(retained_memory);
+        }
         match kind {
             "response.output_item.done" => {
                 if self.terminal_response.is_some() || self.terminal_failure {
@@ -2633,6 +2708,65 @@ mod tests {
         assert_eq!(body["output"][1]["id"], "item-1");
         assert_eq!(result.usage.input_tokens, 3);
         assert_eq!(result.usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_parser_accounts_live_events_and_retains_completed_output_until_release() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
+        let memory = budget.reservation();
+        assert!(
+            memory
+                .reserve_buffered_response(64 * 1024, tokio::time::Instant::now())
+                .await
+        );
+        let baseline = budget.snapshot().0;
+        let mut parser = BufferedResponsesParser::default();
+        let progress = b"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\"}}\n\n";
+        for _ in 0..500 {
+            parser.push_accounted(progress, Some(&memory)).unwrap();
+            assert_eq!(budget.snapshot().0, baseline);
+        }
+        parser
+            .push_accounted(&completed_stream(), Some(&memory))
+            .unwrap();
+        let response = parser.finish().unwrap();
+        assert!(budget.snapshot().0 > baseline);
+        assert_eq!(response.usage.output_tokens, 2);
+        drop(response);
+        assert_eq!(budget.snapshot().0, baseline);
+        drop(memory);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_parser_releases_parse_memory_on_error_and_honors_actual_budget_exhaustion() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
+        let memory = budget.reservation();
+        assert!(
+            memory
+                .reserve_buffered_response(1024, tokio::time::Instant::now())
+                .await
+        );
+        let baseline = budget.snapshot().0;
+        let mut parser = BufferedResponsesParser::default();
+        assert!(
+            parser
+                .push_accounted(b"data: {invalid}\n\n", Some(&memory))
+                .is_err()
+        );
+        drop(parser);
+        assert_eq!(budget.snapshot().0, baseline);
+        let occupied = budget.reservation();
+        assert!(occupied.try_grow(64 * 1024, 1));
+        let mut parser = BufferedResponsesParser::default();
+        assert_eq!(
+            parser.push_accounted(&completed_stream(), Some(&memory)),
+            Err("upstream_response_memory_capacity")
+        );
+        drop(parser);
+        drop(occupied);
+        drop(memory);
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[test]

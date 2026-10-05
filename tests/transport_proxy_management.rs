@@ -18,16 +18,15 @@ async fn request(
     token: &str,
     body: Value,
 ) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if !token.is_empty() {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
     let response = api::router_for_role(state.clone(), RuntimeRole::Control)
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -44,6 +43,79 @@ async fn request(
             serde_json::from_slice(&bytes).unwrap()
         },
     )
+}
+
+#[tokio::test]
+async fn proxy_group_access_reports_only_the_authenticated_provider_reader_capability() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("access.db").display()
+    )))
+    .await
+    .unwrap();
+    state.db.create_tenant("access-tenant", None).await.unwrap();
+    let path = "/internal/v1/transport-proxy-groups/access";
+    for (name, tenant, scopes, can_manage) in [
+        (
+            "tenant-reader",
+            Some("access-tenant"),
+            vec!["providers:read"],
+            false,
+        ),
+        (
+            "tenant-writer",
+            Some("access-tenant"),
+            vec!["providers:read", "providers:write"],
+            false,
+        ),
+        ("global-reader", None, vec!["providers:read"], false),
+        (
+            "global-writer",
+            None,
+            vec!["providers:read", "providers:write"],
+            true,
+        ),
+    ] {
+        let credential = state
+            .db
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: name.into(),
+                    scopes: scopes.into_iter().map(str::to_owned).collect(),
+                    tenant_external_id: tenant.map(str::to_owned),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = request(&state, "GET", path, &credential.token, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert_eq!(body, json!({"can_manage": can_manage}), "{name}");
+        assert_eq!(
+            request(
+                &state,
+                "GET",
+                "/internal/v1/transport-proxy-groups?tenant_external_id=access-tenant",
+                &credential.token,
+                Value::Null,
+            )
+            .await
+            .0,
+            if can_manage {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{name}",
+        );
+    }
+    for token in ["", "invalid"] {
+        assert_eq!(
+            request(&state, "GET", path, token, Value::Null).await.0,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
 }
 
 #[tokio::test]

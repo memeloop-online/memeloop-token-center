@@ -3,6 +3,10 @@ use super::super::*;
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route(
+            "/internal/v1/transport-proxy-groups/access",
+            get(transport_group_access),
+        )
+        .route(
             "/internal/v1/transport-proxy-groups",
             get(list_transport_groups)
                 .post(create_transport_group)
