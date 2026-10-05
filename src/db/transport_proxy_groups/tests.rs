@@ -131,6 +131,25 @@ fn packed_generation_and_epoch_cannot_wrap_into_an_old_ticket() {
     assert!(groups.select(account_id, 2, &source).is_err());
 }
 
+#[test]
+fn stale_failure_cannot_overwrite_a_concurrent_selection_round_trip() {
+    let account_id = Uuid::nil();
+    let groups = groups(account_id, 1);
+    let source = credential();
+    let stale = groups.select(account_id, 1, &source).unwrap();
+    let concurrent = groups.select(account_id, 1, &source).unwrap();
+    assert!(concurrent.advance_after_connect_failure(&[0]).unwrap());
+    let backup = groups.select(account_id, 1, &source).unwrap();
+    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
+    let returned = groups.select(account_id, 1, &source).unwrap();
+    assert_eq!(returned.member(), Some(0));
+    assert_eq!(returned.generation, stale.generation + 2);
+    assert!(!stale.advance_after_connect_failure(&[0]).unwrap());
+    let preserved = groups.select(account_id, 1, &source).unwrap();
+    assert_eq!(preserved.member(), returned.member());
+    assert_eq!(preserved.generation, returned.generation);
+}
+
 async fn account(database: &Database) -> Uuid {
     database
         .create_upstream_account(

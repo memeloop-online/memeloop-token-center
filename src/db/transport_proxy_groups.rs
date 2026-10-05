@@ -15,6 +15,11 @@ mod tests;
 
 const MAX_EPOCH: u64 = (1 << 28) - 1;
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_BEFORE_PROXY_ADVANCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Group {
@@ -84,6 +89,16 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
+    #[cfg(test)]
+    pub(crate) async fn with_test_connect_failure_interleaving<F: std::future::Future>(
+        interleave: impl FnOnce() + 'static,
+        future: F,
+    ) -> F::Output {
+        TEST_BEFORE_PROXY_ADVANCE
+            .scope(std::cell::RefCell::new(Some(Box::new(interleave))), future)
+            .await
+    }
+
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
         if input.len() > 256 * 1024 {
             return Err(unavailable());
@@ -269,6 +284,14 @@ impl ProxySelection {
             return Ok(false);
         };
         let snapshot = Snapshot::decode(*state);
+        #[cfg(test)]
+        if let Some(interleave) = TEST_BEFORE_PROXY_ADVANCE
+            .try_with(|hook| hook.borrow_mut().take())
+            .ok()
+            .flatten()
+        {
+            interleave();
+        }
         if entry.blocked.load(Ordering::Acquire)
             || u64::from(snapshot.credential_generation)
                 < entry.observed_generation.load(Ordering::Acquire)
