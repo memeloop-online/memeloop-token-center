@@ -1151,7 +1151,6 @@ async fn codex_catalog_response(
     let budget = codex_catalog_budget(&account.config)?;
     let deadline = tokio::time::Instant::now() + budget.total;
     let retry_delay = Duration::from_millis(policy.connect_retry_delay_millis);
-    let connect_timeout = Duration::from_millis(policy.connect_timeout_millis);
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
     let started = std::time::Instant::now();
     tracing::info!(account_id = %account.id, credential_generation = account.credential_generation,
@@ -1207,9 +1206,8 @@ async fn codex_catalog_response(
         selection
             .advance_after_connect_failure(&attempted)
             .map_err(|_| "transport_selection_unavailable")?;
-        if connect_attempt == policy.connect_attempts
-            || tokio::time::Instant::now() + retry_delay + connect_timeout >= deadline
-        {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if connect_attempt == policy.connect_attempts || retry_delay >= remaining {
             return Err(failure.code);
         }
         tokio::time::sleep(retry_delay).await;
@@ -1845,6 +1843,18 @@ mod tests {
 
     #[tokio::test]
     async fn codex_catalog_connect_failure_uses_backup_and_reuses_selection() {
+        assert_catalog_proxy_fallback(json!({"connect_retry_delay_millis": 0})).await;
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_fallback_succeeds_with_less_time_than_connect_timeout() {
+        let policy = json!({"connect_timeout_millis": 30_000});
+        let budget = codex_catalog_budget(&json!({"transport_policy": policy.clone()})).unwrap();
+        assert_eq!(budget.total, Duration::from_secs(30));
+        assert_catalog_proxy_fallback(policy).await;
+    }
+
+    async fn assert_catalog_proxy_fallback(policy: Value) {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
         let primary = closed_catalog_endpoint().await;
@@ -1857,8 +1867,7 @@ mod tests {
             .expect(2)
             .mount(&backup)
             .await;
-        let (state, account, credential, _directory) =
-            catalog_proxy_fixture(json!({"connect_retry_delay_millis": 0})).await;
+        let (state, account, credential, _directory) = catalog_proxy_fixture(policy).await;
         let mut attempts = Vec::new();
         for _ in 0..2 {
             let result = codex_catalog_response(
