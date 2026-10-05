@@ -559,6 +559,12 @@ pub(super) async fn publish_archive_staging_cas_in_transaction(
     backend: DatabaseBackend,
     lease: &ArchiveStagingWriteLease,
 ) -> Result<bool, AppError> {
+    let Some(existing) = lock_attempt(transaction, backend, lease.key.attempt_id).await? else {
+        return Ok(false);
+    };
+    if archive_staging_key_from_row(&existing)? != lease.key {
+        return Ok(false);
+    }
     let now = archive_database_now(transaction, backend).await?;
     let updated = sqlx::query(
         "UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, bound_locator = NULL, bound_at = $1, next_cleanup_at = $2, empty_observed_at = NULL, last_error_code = NULL, updated_at = $3 WHERE attempt_id = $4 AND state = 'writing' AND lease_owner = $5 AND lease_token = $6 AND lease_expires_at > $7",
