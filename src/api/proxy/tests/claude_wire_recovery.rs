@@ -380,6 +380,15 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
                 );
             }
             assert_eq!(capture.header_names, baseline[index].header_names);
+            if *path == "/v1/messages" {
+                let wire: Value = serde_json::from_str(&capture.body).unwrap();
+                for field in ["system", "tools", "messages", "max_tokens", "model"] {
+                    assert_eq!(
+                        wire[field], request[field],
+                        "native semantic field: {field}"
+                    );
+                }
+            }
             if *path == "/v1/responses" {
                 let wire: Value = serde_json::from_str(&capture.body).unwrap();
                 assert!(wire.get("metadata").is_none());

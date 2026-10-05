@@ -92,6 +92,19 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
         StatusCode::CONFLICT
     );
     assert_eq!(authority.status().await.unwrap().candidates.len(), 1);
+    assert!(matches!(
+        authority
+            .register_empty(
+                RegisterEmptyInventory {
+                    inventory_id: "recovery".into()
+                },
+                "empty-register",
+                "another-global-actor"
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(state.db.plugin_audit(None).await.unwrap().len(), 1);
     let restarted = AppState::initialize((*state.config).clone()).await.unwrap();
     let restarted_authority = restarted.application_plugins.as_ref().unwrap();
     assert!(restarted_authority.status().await.unwrap().candidates[0].staged);
@@ -133,7 +146,7 @@ async fn empty_inventory_rejects_authority_path_grants_and_missing_key() {
             .db
             .create_service_token(
                 crate::db::CreateServiceTokenInput {
-                    name: "empty-limited".into(),
+                    name: format!("empty-limited-{}", tenant.as_deref().unwrap_or("global")),
                     scopes: if tenant.is_some() {
                         vec!["plugins:write".into()]
                     } else {

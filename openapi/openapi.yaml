@@ -1167,7 +1167,7 @@ paths:
               properties:
                 inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
       responses:
-        '204': { description: Empty inventory registered and staged without publication, including exact replay. }
+        '204': { description: 'Empty inventory registered and staged without publication, including exact replay.' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
