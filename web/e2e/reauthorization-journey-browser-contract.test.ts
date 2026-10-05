@@ -4,6 +4,94 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
+declare global {
+  interface Window {
+    claudeCompletionFixture: { calls: number; aborted: boolean; hasSignal: boolean; release?: (success: boolean) => void };
+  }
+}
+
+test('Claude reauthorization locks manual completion and ignores responses after leaving the workspace', { timeout: 60_000 }, async () => {
+  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const account = { id: 'claude-reauthorization-fixture', name: 'Fixture Claude account', tenant_external_id: 'fixture-a', driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, updated_at: 3, route_count: 0, config: {}, can_reauthorize: true, can_update_transport_proxy: false };
+    let accountReads = 0;
+    let starts = 0;
+    await page.route('**/*', async route => {
+      const request = route.request(); const url = new URL(request.url());
+      if (url.origin !== origin) return route.abort();
+      if (!url.pathname.startsWith('/internal/')) return route.continue();
+      if (request.method() === 'GET') {
+        if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'anthropic-claude', display_name: 'Fixture Claude', source: 'builtin', protocols: ['anthropic'], modalities: ['text'], config_schema: { type: 'object' }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'claude_manual_pkce' } }] });
+        if (url.pathname === '/internal/v1/upstreams') { accountReads++; return route.fulfill({ json: [account] }); }
+        return route.fulfill({ json: [] });
+      }
+      assert.equal(url.pathname, '/internal/v1/oauth/claude/start');
+      assert.equal(request.method(), 'POST');
+      assert.equal(request.postDataJSON().upstream_account_id, account.id);
+      starts++;
+      return route.fulfill({ json: { session_token: 'synthetic-claude-session', login_url: `${origin}/mock-provider`, expires_at: Date.now() + 600_000 } });
+    });
+    await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
+    await page.locator(`[data-inline-edit-trigger="${account.id}"]`).click();
+    const reauthorize = page.getByRole('button', { name: 'Authorize again', exact: true });
+    await reauthorize.click();
+    await page.evaluate(account => {
+      const previous = window.fetch;
+      const state = window.claudeCompletionFixture = { calls: 0, aborted: false, hasSignal: false } as Window['claudeCompletionFixture'];
+      window.fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
+        if (url.pathname !== '/internal/v1/oauth/claude/complete') return previous(input, init);
+        state.calls++;
+        state.hasSignal = Boolean(init?.signal);
+        init?.signal?.addEventListener('abort', () => { state.aborted = true; }, { once: true });
+        return new Promise<Response>(resolve => {
+          state.release = success => resolve(new Response(JSON.stringify(success ? { ...account, credential_generation: 3 } : { error: { message: 'synthetic-claude-error-canary' } }), { status: success ? 200 : 503 }));
+        });
+      };
+    }, account);
+    const workspace = page.locator('.provider-reauthorization-workspace');
+    const complete = workspace.getByRole('button', { name: 'Complete authorization', exact: true });
+    const code = workspace.locator('.manual-authorization input');
+    await workspace.getByRole('button', { name: 'Start login', exact: true }).click();
+    await code.fill('synthetic-code#synthetic-state');
+    await complete.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls > 0);
+    assert.equal(await page.evaluate(() => window.claudeCompletionFixture.calls), 1);
+    assert.equal(await complete.isDisabled(), true);
+    assert.equal(await code.isDisabled(), true);
+    await page.evaluate(() => window.claudeCompletionFixture.release?.(false));
+    await workspace.getByRole('alert').waitFor();
+    assert.doesNotMatch(await workspace.innerText(), /synthetic-claude-error-canary/);
+    assert.equal(await complete.isEnabled(), true);
+    await complete.click();
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 2);
+    await workspace.getByRole('button', { name: 'Close', exact: true }).click();
+    await workspace.waitFor({ state: 'detached' });
+    await page.getByRole('heading', { name: 'Edit Fixture Claude account', exact: true }).waitFor();
+    const readsBeforeLateResponse = accountReads;
+    await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(accountReads, readsBeforeLateResponse, 'an abandoned completion cannot refresh or navigate the parent');
+    assert.equal(await page.getByRole('heading', { name: 'Edit Fixture Claude account', exact: true }).count(), 1);
+    assert.equal(await page.evaluate(() => window.claudeCompletionFixture.aborted && window.claudeCompletionFixture.hasSignal), true);
+    await reauthorize.click();
+    await workspace.getByRole('button', { name: 'Start login', exact: true }).click();
+    await code.fill('synthetic-next-code#synthetic-state');
+    await complete.click();
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 3);
+    await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
+    await workspace.waitFor({ state: 'detached' });
+    await page.getByText('Signed in. Account authorization updated.', { exact: true }).waitFor();
+    assert.equal(accountReads, readsBeforeLateResponse + 1);
+    assert.equal(starts, 2, 'retrying completion does not start another authorization session');
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('reauthorization saves its proxy in place, copies device codes, polls automatically and returns one level', { timeout: 120_000 }, async () => {
   const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
