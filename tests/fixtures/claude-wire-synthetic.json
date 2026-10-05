@@ -1,0 +1,80 @@
+{
+  "status": "synthetic_test_inputs_not_execution_evidence",
+  "synthetic_only": true,
+  "model": "mtc-claude-wire-synthetic-v1",
+  "native_messages": {
+    "path": "/v1/messages",
+    "body": {
+      "model": "mtc-claude-wire-synthetic-v1",
+      "max_tokens": 32,
+      "stream": false,
+      "temperature": 0,
+      "system": [{"type": "text", "text": "SYNTHETIC ONLY: preserve the literal user_id and tool history. 保留语义。"}],
+      "tools": [{
+        "name": "lookup_user",
+        "description": "Synthetic lookup; preserve user_id in tool arguments.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"user_id": {"type": "string"}},
+          "required": ["user_id"],
+          "additionalProperties": false
+        }
+      }],
+      "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "Look up synthetic-user-001; keep the literal metadata.user_id in this text."}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_wire_001", "name": "lookup_user", "input": {"user_id": "synthetic-user-001"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_wire_001", "content": "synthetic-result-001"}]}
+      ],
+      "metadata": {"user_id": "synthetic-tracking-001", "scenario": "claude-wire-isolation", "nested": {"user_id": "synthetic-retain-001"}}
+    },
+    "variants": [
+      {"id": "native-remove-user-id", "input_remove_json_pointers": [], "expected_wire_change": "remove only /metadata/user_id"},
+      {"id": "native-no-user-id", "input_remove_json_pointers": ["/metadata/user_id"], "expected_wire_change": "none; raw baseline and active-plugin bodies byte-identical"},
+      {"id": "native-no-metadata", "input_remove_json_pointers": ["/metadata"], "expected_wire_change": "none; raw baseline and active-plugin bodies byte-identical"}
+    ]
+  },
+  "responses_bridge": {
+    "path": "/v1/responses",
+    "body": {
+      "model": "mtc-claude-wire-synthetic-v1",
+      "max_output_tokens": 32,
+      "stream": false,
+      "store": false,
+      "temperature": 0,
+      "instructions": "SYNTHETIC ONLY: preserve the literal user_id and tool history. 保留语义。",
+      "tools": [{
+        "type": "function",
+        "name": "lookup_user",
+        "description": "Synthetic lookup; preserve user_id in tool arguments.",
+        "parameters": {
+          "type": "object",
+          "properties": {"user_id": {"type": "string"}},
+          "required": ["user_id"],
+          "additionalProperties": false
+        }
+      }],
+      "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Look up synthetic-user-001; keep the literal metadata.user_id in this text."}]},
+        {"type": "function_call", "call_id": "call_wire_001", "name": "lookup_user", "arguments": "{\"user_id\":\"synthetic-user-001\"}"},
+        {"type": "function_call_output", "call_id": "call_wire_001", "output": "synthetic-result-001"}
+      ],
+      "metadata": {"user_id": "synthetic-tracking-001", "scenario": "claude-wire-isolation"}
+    },
+    "expected_wire_protocol": "anthropic",
+    "expected_wire_path": "/v1/messages",
+    "expected_wire_change": "none between no-plugin baseline and active-plugin body; adapter already omits metadata",
+    "requires_actual_finalize_observation": true
+  },
+  "capture_response": {
+    "id": "msg_synthetic_wire_001",
+    "type": "message",
+    "role": "assistant",
+    "model": "mtc-claude-wire-synthetic-v1",
+    "content": [{"type": "text", "text": "synthetic-ok"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {"input_tokens": 1, "output_tokens": 1}
+  },
+  "capture_header_policy": "Record names only, never values including Authorization or Cookie",
+  "execution_gate": "GHA disposable test database and signed artifact only; no deployed cluster mutations"
+}

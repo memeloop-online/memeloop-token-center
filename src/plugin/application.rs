@@ -18,6 +18,8 @@ use super::{
 use crate::{db::Database, error::AppError, provider::ProviderCatalog};
 
 const CACHED_REVISIONS: usize = 2;
+mod empty;
+pub use empty::RegisterEmptyInventory;
 pub mod installation;
 pub mod prepare;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
