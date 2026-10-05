@@ -52,7 +52,6 @@ jobs:
       SOURCE_DIGEST: sha256:bac1a74de365ea59270ba134016762c6be05654d55246518de256113bd1c225e
       TARGET_IMAGE: ghcr.io/memeloop-online/mtc-backup-egress
       TARGET_TAG: v1.19.32-bac1a74de365
-      DOCKER_CONFIG: ${{ runner.temp }}/backup-egress-docker-auth
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -69,6 +68,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/crane-bin" "$RUNNER_TEMP/backup-egress-evidence"
           tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
           echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
+          install -d -m 0700 "$RUNNER_TEMP/backup-egress-docker-auth"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/backup-egress-docker-auth" >> "$GITHUB_ENV"
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -108,4 +109,4 @@ jobs:
           retention-days: 90
       - name: Remove temporary registry authentication
         if: always()
-        run: rm -rf -- "$DOCKER_CONFIG"
+        run: rm -rf -- "$RUNNER_TEMP/backup-egress-docker-auth"
