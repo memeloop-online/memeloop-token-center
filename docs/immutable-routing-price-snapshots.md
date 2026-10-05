@@ -1,8 +1,10 @@
 # Immutable routing and price snapshots (ledger 36)
 
-This is the minimal replacement for PR417 on master 602029fe. It does not include
-PR469's terminal projection work or change routing grants, candidate selection,
-request concurrency, archive handoff or deployment.
+This is the replacement for PR417, retaining master 602029fe and stacked on
+PR469 at 36126f8a. PR469 is a hard dependency: merge 469 before 474, and never
+deploy a 119-only release before 118. The integration includes 469 unchanged;
+474 does not redesign its terminal projection protocol or change routing grants,
+candidate selection, request concurrency, archive handoff or deployment.
 
 ## Sources of truth
 
@@ -24,15 +26,21 @@ request concurrency, archive handoff or deployment.
   mutable route lookup. Historical rows remain unknown (NULL), not backfilled
   from today's route. Existing generation snapshots remain unchanged.
 
-Migration 0119 adds only the nullable upstream-model column. Migration 0118 is
-reserved by PR469; no published migration or historical checksum is modified.
-Chart schema metadata follows 119; this is not authorization to deploy.
+Migration 0119 adds only the nullable upstream-model column. Both backend
+registries include 0118 from PR469 before 0119. Registry and upgrade assertions
+require the 117,118,119 suffix; they must not be weakened for an isolated 119
+head. No published migration or historical checksum is modified. Chart schema
+metadata follows 119; this is not authorization to deploy. The production
+candidate remains master 602029fe, excluding both PRs.
 
 ## Verification boundary
 
 New SQLite/PostgreSQL cases cover same-amount/different-rate failover, stale CAS,
 post-terminal rejection, tariff edits, preserved reservation identity, durable
-recovery pricing and exactly-once settlement for prepaid and metered keys. API
+recovery pricing and exactly-once settlement for prepaid and metered keys, with
+terminal projection both disabled and enabled. Admission uses the real
+gateway-persistence entrypoint; replay must retain the settled amount and update
+the account exactly once, not reprice an old request from the current tariff. API
 coverage distinguishes actual upstream pricing from a differently priced public
 alias, preserves historical reads after route edits, and rejects missing actual
 prices before dispatch. Existing route/conversation/event fixtures are retained.

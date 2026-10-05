@@ -2,7 +2,7 @@ use super::super::*;
 
 async fn snapshot_contract(database: &Database, metered: bool) {
     let unique = Uuid::now_v7().to_string();
-    let pepper = b"immutable route price snapshot test";
+    let pepper = b"immutable route price snapshot test pepper over 32 bytes";
     let issued = database
         .create_key(
             CreateKeyInput {
@@ -41,9 +41,25 @@ async fn snapshot_contract(database: &Database, metered: bool) {
         .unwrap();
     let first_assignment = (Uuid::now_v7(), Uuid::now_v7());
     let second_assignment = (Uuid::now_v7(), Uuid::now_v7());
+    let older_request_id = Uuid::now_v7();
+    let older_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: older_request_id,
+            key: &key,
+            price: &first_price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: "public-alias",
+            request_object: "gap://legacy-price/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
     let request_id = Uuid::now_v7();
     let original = database
-        .start_proxy_forwarding_request(
+        .start_proxy_request_with_deferred_archive(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -52,14 +68,19 @@ async fn snapshot_contract(database: &Database, metered: bool) {
                 output_token_ceiling: 10,
                 protocol: "openai",
                 model: "public-alias",
-                request_object: "gap://snapshot/request",
+                request_object: &format!("gap://{request_id}/request"),
                 upstream_account_id: Some(first_assignment.0),
                 model_route_id: Some(first_assignment.1),
             },
+            &bytes::Bytes::from_static(b"{\"input\":\"snapshot\"}"),
+            pepper,
+            false,
             Some(&first_model),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .reservation;
+    database.drain_gateway_persistence_for_test().await;
     let switched = database
         .switch_pending_proxy_candidate(SwitchProxyCandidateInput {
             request_id,
@@ -182,7 +203,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
     };
     database.finish_proxy_request(finish.clone()).await.unwrap();
     assert!(matches!(
-        database.finish_proxy_request(finish).await.unwrap(),
+        database.finish_proxy_request(finish.clone()).await.unwrap(),
         FinishProxyRequestResult::AlreadyFinished { .. }
     ));
     let stored: i64 =
@@ -200,6 +221,59 @@ async fn snapshot_contract(database: &Database, metered: bool) {
     .await
     .unwrap();
     assert_eq!(ledger, 1);
+    if database.terminal_projection_enabled {
+        let receipt_cost: i64 = sqlx::query_scalar("SELECT cost_micros FROM terminal_projection_outbox WHERE request_id = $1 AND projected_at IS NULL")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(receipt_cost, 12);
+        let owner = Uuid::now_v7();
+        assert_eq!(
+            database
+                .claim_terminal_projection_tasks(owner, 32)
+                .await
+                .unwrap(),
+            vec![request_id]
+        );
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(owner, request_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .project_claimed_terminal_projection_task(owner, request_id)
+                .await
+                .unwrap()
+        );
+    } else if metered {
+        let owner = Uuid::now_v7();
+        let tasks = database
+            .claim_metered_usage_projection_tasks(owner, 32)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            database
+                .project_claimed_metered_usage_projection_task(owner, original.id)
+                .await
+                .unwrap()
+        );
+    }
+    let lifetime: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifetime, 12);
+    let projected_cost: i64 =
+        sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(projected_cost, 12);
     let views = database.list_requests(key.key_id, 10).await.unwrap();
     assert_eq!(views[0].model, "public-alias");
     assert_eq!(
@@ -237,6 +311,67 @@ async fn snapshot_contract(database: &Database, metered: bool) {
             .await
             .is_err()
     );
+    database
+        .upsert_model_price(&first_model, "USD", Decimal::from(77), Decimal::from(77))
+        .await
+        .unwrap();
+    let mut older_finish = finish;
+    older_finish.request_id = older_request_id;
+    older_finish.reservation = &older_reservation;
+    database.finish_proxy_request(older_finish).await.unwrap();
+    let older_cost: i64 =
+        sqlx::query_scalar("SELECT actual_micros FROM usage_reservations WHERE id = $1")
+            .bind(older_reservation.id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(older_cost, 28);
+    if database.terminal_projection_enabled {
+        let owner = Uuid::now_v7();
+        assert_eq!(
+            database
+                .claim_terminal_projection_tasks(owner, 32)
+                .await
+                .unwrap(),
+            vec![older_request_id]
+        );
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(owner, older_request_id)
+                .await
+                .unwrap()
+        );
+    } else if metered {
+        let owner = Uuid::now_v7();
+        assert_eq!(
+            database
+                .claim_metered_usage_projection_tasks(owner, 32)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            database
+                .project_claimed_metered_usage_projection_task(owner, older_reservation.id)
+                .await
+                .unwrap()
+        );
+    }
+    let older_view = database
+        .request_archive_refs(key.key_id, older_request_id)
+        .await
+        .unwrap();
+    assert_eq!(older_view.view.upstream_model, None);
+    assert_eq!(older_view.view.cost, "0.000028");
+    let total_usage: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(total_usage, 40);
 }
 
 #[tokio::test]
@@ -249,8 +384,14 @@ async fn sqlite_same_amount_failover_replaces_price_snapshot_not_admission() {
     .await
     .unwrap();
     database.migrate().await.unwrap();
-    for metered in [false, true] {
-        snapshot_contract(&database, metered).await;
+    for deferred in [false, true] {
+        for metered in [false, true] {
+            snapshot_contract(
+                &database.clone().with_terminal_projection_enabled(deferred),
+                metered,
+            )
+            .await;
+        }
     }
 }
 
@@ -273,8 +414,14 @@ async fn postgres_same_amount_failover_replaces_price_snapshot_not_admission() {
         .await
         .unwrap();
     database.migrate().await.unwrap();
-    for metered in [false, true] {
-        snapshot_contract(&database, metered).await;
+    for deferred in [false, true] {
+        for metered in [false, true] {
+            snapshot_contract(
+                &database.clone().with_terminal_projection_enabled(deferred),
+                metered,
+            )
+            .await;
+        }
     }
     database.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

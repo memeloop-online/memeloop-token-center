@@ -219,6 +219,7 @@ pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 pub struct Database {
     pool: AnyPool,
     backend: DatabaseBackend,
+    terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
     #[cfg(test)]
     pub(crate) oauth_refresh_write_phase_seam:
@@ -278,6 +279,11 @@ pub(crate) struct OAuthRefreshWritePhaseSeam {
 }
 
 impl Database {
+    pub fn with_terminal_projection_enabled(mut self, enabled: bool) -> Self {
+        self.terminal_projection_enabled = enabled;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) async fn pause_oauth_refresh_write_phase(
         &self,
@@ -457,6 +463,7 @@ impl Database {
             )?),
             pool,
             backend,
+            terminal_projection_enabled: false,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -490,6 +497,7 @@ impl Database {
                 .max_connections(2)
                 .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
             backend: self.backend,
+            terminal_projection_enabled: self.terminal_projection_enabled,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }

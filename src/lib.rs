@@ -153,7 +153,8 @@ impl AppState {
         }
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await
-            .map_err(|_| InitializationError::Database)?;
+            .map_err(|_| InitializationError::Database)?
+            .with_terminal_projection_enabled(config.terminal_projection_enabled);
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
