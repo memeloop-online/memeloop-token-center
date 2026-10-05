@@ -359,7 +359,7 @@ fn workbuddy_chat_tool_stream_matches_buffered_with_interleaved_arguments() {
             body: Bytes::from(serde_json::to_vec(&terminal["response"]).unwrap()),
             usage: canonical_responses_usage(&terminal["response"]).unwrap(),
             terminal: BufferedCodexTerminal::Completed,
-            retained_memory: Vec::new(),
+            _retained_memory: Vec::new(),
         },
         Uuid::nil(),
         "gpt-6-sol",
