@@ -1,0 +1,111 @@
+name: mirror-backup-egress
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/mirror-backup-egress.yml
+      - scripts/ci/backup-egress-mirror-provenance.ts
+      - tests/deployment/backup-egress/mirror.test.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-egress-mirror-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Install existing pinned parser dependencies
+        run: npm ci --ignore-scripts
+      - name: Validate archive boundaries and evidence rejection cases
+        run: node --test tests/deployment/backup-egress/mirror.test.ts
+      - name: Lint the workflow with checksum-pinned actionlint
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --connect-timeout 15 --max-time 120 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" .github/workflows/mirror-backup-egress.yml
+
+  mirror:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && github.repository == 'memeloop-online/memeloop-token-center'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_IMAGE: docker.io/metacubex/mihomo:v1.19.32
+      SOURCE_DIGEST: sha256:bac1a74de365ea59270ba134016762c6be05654d55246518de256113bd1c225e
+      TARGET_IMAGE: ghcr.io/memeloop-online/mtc-backup-egress
+      TARGET_TAG: v1.19.32-bac1a74de365
+      DOCKER_CONFIG: ${{ runner.temp }}/backup-egress-docker-auth
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+      - name: Install checksum-pinned crane
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --connect-timeout 15 --max-time 120 \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz \
+            --output "$RUNNER_TEMP/crane.tar.gz"
+          echo '5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e  '"$RUNNER_TEMP/crane.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/crane-bin" "$RUNNER_TEMP/backup-egress-evidence"
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP/crane-bin" crane
+          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy only the reviewed complete index without rebuilding
+        id: copy
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          source_ref="$SOURCE_IMAGE@$SOURCE_DIGEST"
+          target_ref="$TARGET_IMAGE:$TARGET_TAG"
+          evidence="$RUNNER_TEMP/backup-egress-evidence"
+          timeout --kill-after=10s 60s crane manifest "$source_ref" > "$evidence/source-index.json"
+          printf '%s  %s\n' "${SOURCE_DIGEST#sha256:}" "$evidence/source-index.json" | sha256sum --check
+          if existing_digest=$(timeout --kill-after=10s 60s crane digest "$target_ref" 2>/dev/null); then
+            [[ "$existing_digest" == "$SOURCE_DIGEST" ]]
+          else
+            timeout --kill-after=10s 12m crane copy --jobs 2 --no-clobber "$source_ref" "$target_ref"
+          fi
+          [[ "$(timeout --kill-after=10s 60s crane digest "$target_ref")" == "$SOURCE_DIGEST" ]]
+          timeout --kill-after=10s 60s crane manifest "$TARGET_IMAGE@$SOURCE_DIGEST" > "$evidence/target-index.json"
+          cmp "$evidence/source-index.json" "$evidence/target-index.json"
+      - name: Record provenance and require anonymous full graph retrieval
+        timeout-minutes: 10
+        run: node scripts/ci/backup-egress-mirror-provenance.ts "$RUNNER_TEMP/backup-egress-evidence"
+      - name: Preserve digest provenance even when public access is not ready
+        if: always() && steps.copy.outcome == 'success'
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: backup-egress-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/backup-egress-evidence/source-index.json
+            ${{ runner.temp }}/backup-egress-evidence/target-index.json
+            ${{ runner.temp }}/backup-egress-evidence/provenance.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove temporary registry authentication
+        if: always()
+        run: rm -rf -- "$DOCKER_CONFIG"
