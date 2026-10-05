@@ -28,6 +28,19 @@ async fn postgres_serve_and_migration_pools_have_bounded_session_timeouts() {
         postgres_timeout(&serve, "idle_in_transaction_session_timeout").await,
         "30s"
     );
+    let persistence = serve.independent_persistence_pool();
+    assert_eq!(persistence.pool.size(), 0);
+    let held = serve.pool.acquire().await.unwrap();
+    let timeout = tokio::time::timeout(
+        Duration::from_secs(2),
+        postgres_timeout(&persistence, "statement_timeout"),
+    )
+    .await
+    .expect("persistence must not acquire from the occupied forwarding pool");
+    assert_eq!(timeout, "30s");
+    assert_eq!(postgres_timeout(&persistence, "lock_timeout").await, "10s");
+    drop(held);
+    persistence.close().await;
 
     let migration = Database::connect_for_migration(&database_url, 1)
         .await

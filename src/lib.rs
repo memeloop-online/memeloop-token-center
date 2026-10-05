@@ -68,6 +68,11 @@ const PROXY_ARCHIVE_STREAM_CONCURRENCY: usize = 4;
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Database,
+    pub(crate) persistence_db: Database,
+    pub(crate) persistence: Arc<api::proxy::persistence::Persistence>,
+    pub(crate) routing_persistence: Arc<api::proxy::persistence::Persistence>,
+    pub(crate) routing_persistence_db: Database,
+    pub(crate) session_preferences: Arc<api::proxy::session_preferences::SessionPreferences>,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
@@ -152,6 +157,8 @@ impl AppState {
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
+        let persistence_db = db.independent_persistence_pool();
+        let routing_persistence_db = db.independent_persistence_pool();
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins
@@ -203,6 +210,11 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             db,
+            persistence_db,
+            persistence: Arc::new(api::proxy::persistence::Persistence::default()),
+            routing_persistence: Arc::new(api::proxy::persistence::Persistence::default()),
+            routing_persistence_db,
+            session_preferences: Arc::default(),
             archive,
             providers,
             plugins,

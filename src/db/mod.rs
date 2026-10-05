@@ -174,6 +174,7 @@ pub use providers::{
     NativeOAuthImportCohortResult, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
+pub(crate) use requests::RequestArchiveAdmission;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -183,9 +184,9 @@ pub use requests::{
 };
 pub(crate) use requests::{
     ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
-    RequestArchiveAdmission, SessionRoutingTerminalInput, SwitchProxyCandidateInput,
-    allocate_request_event_cursor, attach_conversation_upstream_response_in_transaction,
-    is_session_avoid_terminal, price_token_usage, record_request_finished_in_transaction,
+    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
+    attach_conversation_upstream_response_in_transaction, is_session_avoid_terminal,
+    price_token_usage, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
     settle_token_usage_in_transaction, validate_numeric_range,
 };
@@ -476,6 +477,22 @@ impl Database {
                 DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
             })
             .await
+    }
+
+    pub(crate) fn independent_persistence_pool(&self) -> Self {
+        Self {
+            gateway_persistence: self.gateway_persistence.clone(),
+            pool: self
+                .pool
+                .options()
+                .clone()
+                .min_connections(0)
+                .max_connections(2)
+                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            backend: self.backend,
+            #[cfg(test)]
+            oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
     pub async fn require_account_tenant(

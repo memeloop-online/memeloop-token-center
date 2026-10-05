@@ -1,5 +1,3 @@
-//! Durable, encrypted response capture. Object storage is never on the
-//! client-facing delivery path; only a short, bounded database ACK is.
 mod cipher;
 mod producer;
 mod upload;
