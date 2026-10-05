@@ -27,7 +27,19 @@ leave an unactivated host-owned empty entry; retrying the same request validates
 it and completes registration. There is no distributed filesystem/DB transaction
 and no automatic publication. History never includes caller keys or host paths.
 
-Before first plugin activation, register the recovery inventory and verify its
+Publishing empty replaces the **entire application plugin inventory**, rebuilding
+the effective provider catalog from built-ins without plugin-contributed providers;
+it does not merely disable Claude. This limited test procedure requires a fresh
+check that `current:null` and the effective host baseline has no active plugins
+(including host-configured baseline plugins). A staged Claude candidate is not
+an active baseline, and `current:null` alone does not prove that baseline is empty.
+If either condition differs, stop the experiment before publication and coordinate
+with the operator. Preserve the original complete inventory and its revision;
+if activation already occurred, coordinate restoration of that complete baseline
+through the formal publish/rollback API, never substitute empty for a nonempty
+baseline or restore only one plugin.
+
+Only after these checks, register the recovery inventory and verify its
 candidate reports `staged:true` and `plugins:{}` on the shared host inventory.
 For an explicit rollback target, publish that inventory with expected revision
 0, producing revision 1; then publish the reviewed plugin inventory with expected
@@ -35,8 +47,12 @@ revision 1. A rollback to revision 1 from revision 2 creates **revision 3**, not
 revision 0. Existing positive-revision CAS and publication idempotency apply.
 If the empty inventory was staged but never published, disabling plugins instead
 requires publishing it as a new positive revision with the current expected head.
-Wait for gateway request pins to converge; already pinned requests retain their
-original immutable runtime.
+Recovery changes the runtime selected by **new request pins**; it does not revoke
+old pins or cancel in-flight requests. Requests already pinned to the old revision
+may still execute `finalize` after recovery is published. Wait for those requests
+to drain before interpreting unchanged counters as complete cessation. The GHA
+matrix uses sequential completed requests, not proof of immediate in-flight
+revocation.
 
 The existing `ci` Rust job installs the exact official signed Claude
 artifact using an exact keyless identity/issuer and digest, verifies the component
