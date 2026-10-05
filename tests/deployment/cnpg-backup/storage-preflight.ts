@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { sourceBudget, sourceSample, sourceSpace } from './source-space.ts';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 export const storagePath = join(directory, 'exact-storage.json');
@@ -10,9 +11,9 @@ export const storagePlan = JSON.parse(readFileSync(join(directory, 'storage-plan
 export const storageResources = JSON.parse(readFileSync(storagePath, 'utf8')).items;
 const gib = 1024 ** 3;
 
-export function validateStorageResources(resources: any[] = storageResources): void {
-  assert.equal(resources.length, 12);
-  for (const volume of storagePlan.volumes) {
+export function validateStorageResources(resources: any[] = storageResources, volumes: any[] = storagePlan.volumes): void {
+  assert.equal(resources.length, volumes.length * 4);
+  for (const volume of volumes) {
     const find = (kind: string, name: string) => {
       const matches = resources.filter(resource => resource.kind === kind && resource.metadata.name === name);
       assert.equal(matches.length, 1);
@@ -120,10 +121,17 @@ export function evaluateStorage(nodes: any[], settings: Record<string, string>, 
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  assert.deepEqual(process.argv.slice(2), ['--server-dry-run'], 'Only read-only inventory plus server dry-run is supported');
+  const backupOnly = process.argv.includes('--backup-only');
+  assert.deepEqual(process.argv.slice(2), backupOnly ? ['--backup-only', '--server-dry-run'] : ['--server-dry-run'], 'Only read-only inventory plus server dry-run is supported');
   validateStorageResources();
+  const selectedVolumes = storagePlan.volumes.filter((volume: any) => !backupOnly || volume.role !== 'scratch');
+  const selectedResources = backupOnly ? JSON.parse(readFileSync(join(directory, 'backup-storage.json'), 'utf8')).items : storageResources;
+  validateStorageResources(selectedResources, selectedVolumes);
+  assert.deepEqual(selectedResources, storageResources.filter((resource: any) => selectedVolumes.some((volume: any) => [volume.name, volume.storageClass].includes(resource.metadata.name))));
   const kubectl = (args: string[], input?: string) => execFileSync('kubectl', ['--request-timeout=30s', ...args], { input, encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 ** 2 });
   const get = (args: string[]) => JSON.parse(kubectl([...args, '-o', 'json']));
+  const source = sourceSample(JSON.parse(kubectl(['get', '--raw', `/api/v1/nodes/${sourceSpace.node}/proxy/stats/summary`])));
+  sourceBudget(source);
   const nodes = get(['-n', 'longhorn-system', 'get', 'nodes.longhorn.io']).items;
   const settingNames = ['storage-over-provisioning-percentage', 'storage-minimal-available-percentage', 'default-engine-image'];
   const settings = Object.fromEntries(get(['-n', 'longhorn-system', 'get', 'settings.longhorn.io', ...settingNames]).items.map((item: any) => [item.metadata.name, item.value]));
@@ -145,10 +153,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     PersistentVolume: get(['get', 'persistentvolumes']).items,
     PersistentVolumeClaim: get(['-n', 'memeloop-token-center', 'get', 'persistentvolumeclaims']).items,
   };
-  for (const resource of storageResources) {
+  for (const resource of selectedResources) {
     assert.ok(!inventory[resource.kind as keyof typeof inventory].some((entry: any) => entry.metadata.name === resource.metadata.name), `Refusing to prepare over existing ${resource.kind}/${resource.metadata.name}`);
   }
-  const admitted = storageResources.map((resource: any) => JSON.parse(kubectl(['create', '--dry-run=server', '--validate=strict', '-f', '-', '-o', 'json'], JSON.stringify(resource))));
-  validateStorageResources(admitted);
-  console.log(JSON.stringify({ observedAt: new Date().toISOString(), result: 'server-dry-run-only-no-resources-persisted', resources: admitted.map((entry: any) => `${entry.kind}/${entry.metadata.name}`), pools, physicalReservationCreated: false, remainingTask: storagePlan.longTermPhysicalWalProtection }, null, 2));
+  const admitted = selectedResources.map((resource: any) => JSON.parse(kubectl(['create', '--dry-run=server', '--validate=strict', '-f', '-', '-o', 'json'], JSON.stringify(resource))));
+  validateStorageResources(admitted, selectedVolumes);
+  console.log(JSON.stringify({ observedAt: new Date().toISOString(), result: 'server-dry-run-only-no-resources-persisted', source, resources: admitted.map((entry: any) => `${entry.kind}/${entry.metadata.name}`), pools, budgetIncludesDeferredRestore: true, physicalReservationCreated: false, remainingTask: storagePlan.longTermPhysicalWalProtection }, null, 2));
 }

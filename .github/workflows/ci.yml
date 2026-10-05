@@ -915,7 +915,7 @@ jobs:
         run: node --test tests/deployment/cnpg-backup/contract.test.ts
       - name: Exercise aggregate CNPG capacity exhaustion and fail-closed restore receipts
         timeout-minutes: 12
-        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts
+        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts tests/deployment/cnpg-backup/source-space.test.ts
       - name: Render suspended CNPG preparation only (never deploy)
         run: node tests/deployment/cnpg-backup/hard-capacity.ts > "$RUNNER_TEMP/cnpg-hard-capacity-preparation.yaml"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

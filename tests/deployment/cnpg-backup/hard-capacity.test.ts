@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { stringify } from 'yaml';
 import { capacityPolicy } from './capacity-policy.ts';
 import { archiveDirectory, archiveName, copyArchive, type Remote } from './copy.ts';
@@ -50,6 +51,11 @@ test('prepared resources cannot provision unbounded storage or start a productio
     }
   }
   assert.equal(stage.env.find((entry: any) => entry.name === 'EXPECTED_SERVER_ADDRESS').value, '');
+  assert.equal(stage.env.find((entry: any) => entry.name === 'SOURCE_SPACE_LEASE_SECONDS').value, '45');
+  assert.match(stage.env.find((entry: any) => entry.name === 'PGOPTIONS').value, /temp_file_limit=0/);
+  const stagePod = jobs.find(job => job.metadata.name === boundedJobs.stage).spec.template.spec;
+  assert.deepEqual(stagePod.volumes.filter((volume: any) => volume.persistentVolumeClaim).map((volume: any) => volume.persistentVolumeClaim.claimName), [boundedClaims.stage]);
+  assert.deepEqual(stagePod.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, { medium: 'Memory', sizeLimit: '64Mi' });
   for (const required of ['sleep 0.0625', 'wait "$dump_pid"', 'wait "$rate_pid"', '--fsize=25769803776:25769803776', 'capacity_backup']) {
     assert.ok(stage.command[6].includes(required));
   }
@@ -79,6 +85,7 @@ function fixture(backupMiB = 64, scratchMiB = 256, backupInodes = 8192): string 
     CAPACITY_MIN_FREE_INODES: '1', EXPECTED_SERVER_ADDRESS: '127.0.0.1',
     DATABASE_URL: 'host=/scratch/socket user=postgres dbname=source',
     PGOPTIONS: '', HOME: '/tmp',
+    SOURCE_SPACE_LEASE_SECONDS: '45', SOURCE_SPACE_WAIT_SECONDS: '3',
   };
   const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
     ...Object.entries(environment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
@@ -169,7 +176,8 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
 
   const source = fixture();
   initializeSource(source);
-  run(source, stageCommand(), { PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s' });
+  shell(source, 'date +%s > /tmp/source-space.lease');
+  run(source, stageCommand(), { PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s -c temp_file_limit=0' });
   const archive = shell(source, `cat ${archiveDirectory}/${archiveName}`);
   const expectedSha = createHash('sha256').update(archive).digest('hex');
   const seed = (candidate: string, offhost = true) => {
@@ -181,8 +189,44 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
   await context.test('export ENOSPC retains partial without local completion or restore success', () => {
     const candidate = fixture(4);
     initializeSource(candidate);
+    shell(candidate, 'date +%s > /tmp/source-space.lease');
     assert.throws(() => run(candidate, stageCommand()));
     shell(candidate, `test -e ${archiveDirectory}/${archiveName}.partial; test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED; test ! -e /scratch/RESTORE_SUCCESS.json`);
+  });
+  await context.test('missing, stale and future source-space leases fail closed', () => {
+    const candidate = fixture();
+    const lease = () => shell(candidate, '. /policy/capacity.sh; source_space_lease');
+    assert.throws(lease);
+    for (const value of ['bad', '1', '9999999999']) {
+      write(candidate, '/tmp/source-space.lease', value);
+      assert.throws(lease);
+    }
+    shell(candidate, 'date +%s > /tmp/source-space.lease');
+    lease();
+    shell(candidate, 'rm /tmp/source-space.lease');
+    assert.throws(() => run(candidate, stageCommand()));
+    shell(candidate, `test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED`);
+  });
+  await context.test('revoked source-space lease aborts active dump without touching the source server', async () => {
+    const candidate = fixture();
+    initializeSource(candidate);
+    shell(candidate, 'date +%s > /tmp/source-space.lease');
+    const path = shell(candidate, 'printf %s "$PATH"').toString();
+    const child = spawn('docker', ['exec', '--env', `PATH=/tmp/bin:${path}`, candidate, ...stageCommand()], { stdio: 'ignore' });
+    const completed = new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
+    try {
+      let active = false;
+      for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt++) {
+        if (shell(candidate, `if test -s ${archiveDirectory}/${archiveName}.partial; then printf active; fi`).toString() === 'active') { active = true; break; }
+        await delay(100);
+      }
+      assert.ok(active, 'Fixture must revoke during active export, not just preflight');
+      shell(candidate, 'rm /tmp/source-space.lease');
+      assert.notEqual(await completed, 0);
+      shell(candidate, `test -s ${archiveDirectory}/${archiveName}.partial; test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED; pg_ctl -D /scratch/source status`);
+    } finally {
+      if (child.exitCode === null) child.kill();
+    }
   });
   await context.test('copy verifies hard capacity before writing or promoting a partial', async () => {
     const candidate = fixture(4);

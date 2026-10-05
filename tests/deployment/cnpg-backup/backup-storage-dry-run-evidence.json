@@ -1,0 +1,22 @@
+{
+  "observedAt": "2026-10-05T18:23:35.632Z",
+  "manifest": "backup-storage.json",
+  "operation": "node tests/deployment/cnpg-backup/storage-preflight.ts --backup-only --server-dry-run",
+  "admittedResources": 8,
+  "persistedResources": 0,
+  "sourceVolume": {
+    "sampleAt": "2026-10-05T18:22:23Z",
+    "availableBytes": 10385465344,
+    "freeInodes": 15721831,
+    "startThresholdBytes": 9663676416
+  },
+  "allocationsPendingApproval": [
+    { "pvc": "mtc-pg-bounded-stage-20261005", "capacity": "28Gi", "node": "haixia", "disk": "data1-disk" },
+    { "pvc": "mtc-pg-bounded-archive-20261005", "capacity": "28Gi", "node": "versetensor-hv", "disk": "default-disk-2306f5036718ea6d" }
+  ],
+  "excluded": ["64Gi restore scratch allocation", "new CNPG instance or replica", "maintenance window", "dump/export start", "source PG PVC mounts or writes", "frontend concurrency changes"],
+  "sourceLeaseWatchStarted": false,
+  "sourceGuardGhaStatus": "regressions-prepared-not-run-await-PR470-merge-before-single-CI-update",
+  "storageBudgetIncludesDeferredRestore": true,
+  "physicalReservationCreated": false
+}

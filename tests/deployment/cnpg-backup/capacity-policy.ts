@@ -39,6 +39,22 @@ capacity_scratch() {
 capacity_restore() {
   capacity_backup && capacity_scratch
 }
+source_space_lease() {
+  test -f /tmp/source-space.lease || return 1
+  source_epoch=$(cat /tmp/source-space.lease) || return 1
+  case "$source_epoch" in ''|*[!0-9]*) return 1 ;; esac
+  test "$(printf %s "$source_epoch" | wc -c)" -le 10 || return 1
+  source_now=$(date +%s) || return 1
+  test "$source_epoch" -le "$source_now" || return 1
+  test "$((source_now - source_epoch))" -le "$SOURCE_SPACE_LEASE_SECONDS" || return 1
+}
+source_space_wait() {
+  source_wait_start=$(date +%s) || return 1
+  until source_space_lease; do
+    test "$(($(date +%s) - source_wait_start))" -lt "$SOURCE_SPACE_WAIT_SECONDS" || return 1
+    sleep 1
+  done
+}
 `;
 
 export const restoreReceipt = String.raw`

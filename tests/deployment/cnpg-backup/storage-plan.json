@@ -8,6 +8,23 @@
   "requiredMinimumAvailablePercent": 25,
   "hostFreeReserveGiB": 32,
   "minimumFreeInodes": 65536,
+  "initialAllocationManifest": "backup-storage.json",
+  "deferredRestoreAllocation": "64Gi versetensor scratch remains in exact-storage.json but is excluded from backup-storage.json; not a new CNPG instance or replica",
+  "sourceProtection": {
+    "checkCommand": "node tests/deployment/cnpg-backup/source-space.ts --check",
+    "watchCommandAfterApproval": "PARENT_REVIEW_APPROVED=true node tests/deployment/cnpg-backup/source-space.ts --watch EXPORT_POD_NAME",
+    "startFreeGiB": 9,
+    "stopFreeGiB": 8,
+    "stopCumulativeLossMiB": 512,
+    "pollSeconds": 15,
+    "maximumStatsAgeSeconds": 90,
+    "leaseLifetimeSeconds": 45,
+    "failureAction": "Revoke only the export tmpfs lease; existing stage cleanup terminates only its own pg_dump/rate writer. No frontend concurrency, primary, PVC, role or global-setting changes.",
+    "sourceServerTemp": "Export sessions request temp_file_limit=0; reject if current credentials cannot SET it. No grants/configuration changes are authorized.",
+    "dumpLocation": "Dedicated 28Gi haixia/data1 volume mounted at /backup; never the source PG PVC",
+    "clientTemporaryLocation": "64Mi memory emptyDir mounted at /tmp for FIFO/logs/lease; source PG PVC is not mounted",
+    "limitation": "A read-only dump can delay vacuum; monitoring stops the dump but cannot halt unrelated production growth. Source space still needs independent observation after backup cancellation."
+  },
   "physicalBudget": "4 * logical GiB + 2 GiB per volume: one full head + 2x snapshot limit + one full maintenance copy + metadata. Bookkeeping only; not physical preallocation or a host-wide quota.",
   "longTermPhysicalWalProtection": "open-not-satisfied-by-logical-backup",
   "volumes": [

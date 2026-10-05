@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { evaluateStorage, storagePlan, storageResources, validateStorageResources } from './storage-preflight.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
@@ -31,6 +32,11 @@ function fixture(): { nodes: any[]; settings: Record<string, string>; replicas: 
 
 test('exact static volumes enforce snapshot limits on Volume CRs, not unsupported SC parameters', () => {
   validateStorageResources();
+  const backupResources = JSON.parse(readFileSync(new URL('./backup-storage.json', import.meta.url), 'utf8')).items;
+  const backupVolumes = storagePlan.volumes.filter((volume: any) => volume.role !== 'scratch');
+  validateStorageResources(backupResources, backupVolumes);
+  assert.equal(backupResources.length, 8);
+  assert.deepEqual(backupResources, storageResources.filter((resource: any) => backupVolumes.some((volume: any) => [volume.name, volume.storageClass].includes(resource.metadata.name))));
   for (const mutate of [
     (items: any[]) => { items.find(item => item.kind === 'Volume').spec.snapshotMaxSize = '0'; },
     (items: any[]) => { items.find(item => item.kind === 'Volume').spec.snapshotMaxCount = 250; },
