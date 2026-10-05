@@ -24,6 +24,12 @@
 
 ## Endpoints
 
+Codex 请求转发只读取自身使用的账号配置字段，不因额外的账号元数据或
+`transport_policy` 扩展字段拒绝请求，也不将这些配置字段透传给上游。
+代理组绑定戳由代理选择层处理，不能在固定传输校验中再次维护键名白名单。
+固定上游地址、凭据、已知传输参数值以及代理组选择一致性校验仍然生效；
+上述管理 API 的写入校验与请求转发兼容性是两个独立职责。
+
 | Method | Path | 成功响应 |
 | --- | --- | --- |
 | GET | `/internal/v1/transport-proxy-groups?tenant_external_id=tenant-a` | 200 `{ "items": [Group] }` |
