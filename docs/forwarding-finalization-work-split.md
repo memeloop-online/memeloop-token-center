@@ -164,3 +164,58 @@ storage and remains unchanged.
 The first reviewable implementation is A1 with its fault/rebuild tests; A2/B follows
 with the durable ownership API and real permit-release tests. A green baseline or
 this allocation document alone does not satisfy either implementation gate.
+
+## A1 retention boundary audit on merged master
+
+Audited baseline: `aa28e92c75818519e8d5b4a49e4002217de1f2c3`.
+Status: unresolved ownership/retention contract; no runtime isolation enabled.
+The proposed 0118 number was checked against local worktrees and the files of
+open PRs #388, #414, #417, #422, #457, #466, #467 and #468. None added 0118.
+No migration was written or number consumed; check again before allocation.
+
+The exclusive write set omits
+`scripts/maintenance/reconcile-postgres-request-stats.ts`. Its `pruneApply`
+holds the exclusive statistics advisory lock, then checks only retained
+`request_records` and `generation_jobs` before deleting facts and aggregates.
+It has no durable pending-work check or persisted prune boundary. This is a
+second maintenance entry point, separate from the assigned day-rebuild SQL.
+
+The following interleaving must be specified before enabling A1:
+
+1. A financial winner commits its ledger, terminal row and immutable projection
+   task; the projector has not committed.
+2. Source retention removes the terminal source row. This is a required supported
+   condition under A1's requirement to survive source retention, not a claim that
+   this audit ran retention or observed it in production.
+3. `pruneApply` passes its raw-row guard and deletes the old day's facts and
+   aggregates. The pending immutable task is not part of its guard.
+4. After prune commits, a task replay can recreate part of a deliberately pruned
+   day. Conversely, a projector that requires the deleted source cannot meet
+   A1's retention guarantee. An exclusive lock only orders these transactions;
+   it does not decide whether replay or pruning owns that task.
+
+Existing metered replay cannot simply be reused after moving terminal facts:
+`project_claimed_metered_usage_projection_task` discovers requests from live
+`request_records`, requires their facts when a row exists, but acknowledges
+account usage without request projection when no row exists. Conversation
+reclassification also depends on a live request locator/row and existing fact.
+A terminal outbox snapshot alone does not repair these dependent consumers.
+The daily rebuild additionally deletes facts with no live terminal source, so
+reconstructing a retained task's fact is insufficient unless rebuild uses the
+same durable retention/receipt policy.
+
+Required integration decision: assign the prune entry point and its tests to a
+named owner and choose a common receipt/retention policy. At minimum, pruning
+must fail closed while relevant durable work is pending under the same fence;
+task enqueue/replay must also honor a persisted prune boundary, or an equivalent
+proved source-retention exclusion, so a later commit cannot resurrect pruned
+data. Source-independent snapshots and dependencies must remain replayable until
+every required consumer acknowledges. Account lifetime usage and financial
+receipts must never be discarded by an observability prune.
+
+Add Actions acceptance for source deletion before projection, prune with pending
+tasks, replay after prune, and day rebuild after source deletion, including both
+metered and conversation projector orders. Do not run these operations against
+production. Worker, module and migration registration still belong to integrator
+B under the table above; they must land with the runtime change before removing
+any lock or wait. Permit handoff and body spooling remain unimplemented A2/B work.
