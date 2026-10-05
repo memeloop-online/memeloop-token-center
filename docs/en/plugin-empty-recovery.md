@@ -36,7 +36,10 @@ original immutable runtime.
 
 The `claude-wire-recovery` GHA workflow installs the exact official signed Claude
 artifact using an exact keyless identity/issuer and digest, verifies the component
-hash, and executes it in Wasmtime through a real TCP gateway. Its test-only account
+hash, and executes it in Wasmtime through a real TCP gateway. The installer is
+extracted by execution from the already accepted d72 host image, pinned by digest
+and checked against its source-revision label; the older generic installer pin
+predates wire-shim manifests. No deployed image is changed. Its test-only account
 fixture points to an in-process loopback capture server; no production provider
 schema, destination rule, OAuth flow or endpoint override is added. Synthetic
 native Messages and Responses bridge requests verify final wire content, semantic

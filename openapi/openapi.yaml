@@ -1145,6 +1145,38 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /internal/v1/plugin-runtime/empty-inventories:
+    post:
+      tags: [System]
+      operationId: registerEmptyApplicationPluginInventory
+      summary: Register and stage a host-owned empty recovery inventory (experimental)
+      description: Requires writable host-only MTC_PLUGIN_INVENTORY_FILE configuration and a global plugins:write credential. Creates an empty host-owned directory with no grants, atomically registers its immutable ID, and commits staging with an audit receipt under the installation lock. Does not publish or change the current revision. Same-key, same-ID, same-actor replay is idempotent. No caller paths, packages, grants or tenant overrides are accepted. Ordinary signed-package installation remains unchanged.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inventory_id]
+              properties:
+                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '204': { description: Empty inventory registered and staged without publication, including exact replay. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: Unknown or invalid request fields. }
+        '503': { description: Installation or inventory writer is busy; retry the identical idempotent request. }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /internal/v1/plugin-runtime/publish:
     post:
       tags: [System]

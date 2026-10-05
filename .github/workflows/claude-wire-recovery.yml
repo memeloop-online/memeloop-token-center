@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - '.github/workflows/claude-wire-recovery.yml'
-      - '.github/first-party-plugin-installer-trust.json'
       - 'src/**'
       - 'tests/fixtures/claude-wire-synthetic.json'
       - 'Cargo.toml'
@@ -28,6 +27,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+      INSTALLER_SOURCE: ghcr.io/memeloop-online/memeloop-token-center
+      INSTALLER_DIGEST: sha256:7f04c3c5e65225bc4ea64243e52c51a37020927ff0fae00a66adabb552b141ed
+      INSTALLER_SOURCE_REVISION: d72b3ad5c75efd8634390ce55a2e33d47cfa79f2
     services:
       postgres:
         image: postgres:16-alpine
@@ -51,8 +53,6 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - name: Resolve the existing reviewed installer trust pin
-        run: node scripts/ci/resolve-first-party-plugin-installer.ts
       - name: Install the exact official signed Claude artifact without credentials
         env:
           PLUGIN_SOURCE: ghcr.io/memeloop-online/claude-code-wire
