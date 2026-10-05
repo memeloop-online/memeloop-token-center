@@ -901,6 +901,7 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
                 | "output_token_limits"
                 | "image_main_model"
                 | "transport_policy"
+                | crate::db::transport_proxy_management::CONFIG_KEY
         )
     });
     let valid_image_main_model = object.get("image_main_model").is_none_or(|value| {
@@ -914,6 +915,9 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
         || reservation_bounds(config).is_none()
         || !valid_image_main_model
         || !valid_transport_policy(object.get("transport_policy"))
+        || !valid_transport_proxy_binding(
+            object.get(crate::db::transport_proxy_management::CONFIG_KEY),
+        )
     {
         return Err(AppError::BadRequest(
             "OpenAI Codex account has invalid fixed transport configuration".into(),
@@ -924,6 +928,15 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
 
 fn valid_transport_policy(policy: Option<&Value>) -> bool {
     crate::provider::CodexTransportPolicy::parse(policy).is_ok()
+}
+
+fn valid_transport_proxy_binding(binding: Option<&Value>) -> bool {
+    binding.is_none_or(|binding| {
+        serde_json::from_value::<crate::db::transport_proxy_management::BindingStamp>(
+            binding.clone(),
+        )
+        .is_ok()
+    })
 }
 
 pub(super) fn trusted_reservation_token_bound(
@@ -2590,6 +2603,23 @@ mod tests {
             .unwrap()
             .insert("proxy_url".to_owned(), json!("must-not-live-in-config"));
         assert!(validate_route_config(&unknown_top_level).is_err());
+
+        let mut bound = valid.clone();
+        bound.as_object_mut().unwrap().insert(
+            crate::db::transport_proxy_management::CONFIG_KEY.to_owned(),
+            json!({
+                "selection_version": 1,
+                "binding_version": 2,
+                "group_id": "01900000-0000-7000-8000-000000000001",
+                "group_version": 3
+            }),
+        );
+        assert!(validate_route_config(&bound).is_ok());
+        bound.as_object_mut().unwrap().insert(
+            crate::db::transport_proxy_management::CONFIG_KEY.to_owned(),
+            json!("not-a-binding-stamp"),
+        );
+        assert!(validate_route_config(&bound).is_err());
     }
 
     fn completed_stream() -> Vec<u8> {
