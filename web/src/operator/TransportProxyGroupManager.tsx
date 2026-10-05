@@ -72,6 +72,7 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
   const alive = useRef(false);
   const locked = useRef(false);
   const pendingWrite = useRef<AbortController | null>(null);
+  const feedback = useRef<HTMLDivElement>(null);
   const [failureKind, setFailureKind] = useState<ReturnType<typeof transportProxyFailureKind>>();
   const bindingRead = useRef(0);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
@@ -102,6 +103,10 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
     closeRequest.current = requestClose;
     return () => { closeRequest.current = null; };
   });
+
+  useLayoutEffect(() => {
+    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+  }, [busy, error, message]);
 
   useEffect(() => {
     alive.current = true;
@@ -216,8 +221,11 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
       }}>{busy ? '处理中…' : '刷新配置'}</Button>
       <Button type="button" appearance="secondary" onClick={() => void requestClose()}>关闭并返回供应商</Button>
     </div>
-    {error && <p className="notice error" role="alert">{error}</p>}
-    {message && <p className="notice success" role="status">{message}</p>}
+    <div ref={feedback} tabIndex={-1} aria-label="代理组操作状态">
+      {busy && <p role="status">正在处理请求…</p>}
+      {error && <p className="notice error" role="alert">{error}</p>}
+      {message && <p className="notice success" role="status">{message}</p>}
+    </div>
     <fieldset disabled={!ready || busy} style={{ border: 0, padding: 0, minWidth: 0 }}>
       <FormSection title="代理组" description="每组 1–4 个私网 socks5h 出口，按列表顺序尝试候选；配置绑定数不代表活跃连接数。有账号绑定的组可维护成员，但不能整体删除。">
         {ready && groups.length === 0 && <p>尚无代理组，请先新建并添加出口。</p>}

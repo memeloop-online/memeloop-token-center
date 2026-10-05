@@ -132,6 +132,13 @@ async function assertSecretsAbsent(page: Page) {
   assert.doesNotMatch(await page.locator('.transport-proxy-workspace').innerText(), /raw-group-id|raw-member-id|account-native/);
 }
 
+async function assertWorkspaceFocus(page: Page) {
+  assert.deepEqual(await page.locator('.transport-proxy-workspace').evaluate(workspace => ({
+    containsFocus: workspace.contains(document.activeElement),
+    hidden: Boolean(workspace.closest('[aria-hidden="true"], [inert]')),
+  })), { containsFocus: true, hidden: false }, 'the open workspace keeps focus and stays accessible after its initiating control is removed');
+}
+
 test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissions and bounded exit', { timeout: 120_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
@@ -180,6 +187,8 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.getByLabel('私网代理地址（必填）', { exact: true }).getAttribute('type'), 'password');
       await assertSecretsAbsent(page);
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
+      await page.getByText(/代理组配置已保存/).waitFor();
+      await assertWorkspaceFocus(page);
       await page.getByRole('button', { name: '编辑 研发出口组', exact: true }).click();
       assert.equal(await page.getByLabel('替换代理地址（留空保留原值）', { exact: true }).inputValue(), '');
       await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('共享出口组');
@@ -194,9 +203,11 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByLabel('解绑后保留的单代理出口', { exact: true }).selectOption({ label: '主出口' });
       await page.getByRole('button', { name: '解绑并保留所选代理', exact: true }).click(); await confirm(page);
       await page.getByText(/解绑配置已受理/).waitFor();
+      await assertWorkspaceFocus(page);
       await assertSecretsAbsent(page);
       await page.locator('.transport-proxy-workspace').getByRole('button', { name: '删除', exact: true }).click(); await confirm(page);
       await page.getByText('代理组已删除。', { exact: true }).waitFor();
+      await assertWorkspaceFocus(page);
       const fixture = await page.evaluate(() => window.proxyGroupFixture);
       assert.deepEqual(fixture.writes.map(write => write.method), ['POST', 'PUT', 'PUT', 'DELETE', 'DELETE']);
       assert.deepEqual(fixture.writes[0].body, { tenant_external_id: 'fixture', name: '研发出口组', members: [{ label: '主出口', proxy_url: privateProxySecret }] });
