@@ -43,6 +43,13 @@ async fn upgrade_contract(database: &Database) {
     assert!(!versions.contains(&114));
     assert!(versions.contains(&115));
     for statement in [
+        "DROP TABLE terminal_projection_outbox",
+        "DROP TABLE observability_prune_boundaries",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN key_snapshot_json",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN statistics_outcome",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_snapshot_json",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_owner",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_expires_at",
         "DROP TABLE transport_proxy_bindings",
         "DROP TABLE transport_proxy_groups",
         "DROP TABLE transport_proxy_management_audit",
@@ -61,7 +68,7 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117)")
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118)")
         .execute(&database.pool)
         .await
         .unwrap();

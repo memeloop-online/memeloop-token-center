@@ -252,19 +252,21 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
         }
     }
     assert_counts(database, request_id, reservation.id, 1).await;
-    let aggregate: i64 =
-        sqlx::query_scalar("SELECT SUM(requests) FROM request_daily_aggregates WHERE key_id = $1")
-            .bind(key.key_id.to_string())
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+    let aggregate: i64 = sqlx::query_scalar(
+        "SELECT CAST(SUM(requests) AS BIGINT) FROM request_daily_aggregates WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
     assert_eq!(aggregate, 1);
-    let sessions: i64 =
-        sqlx::query_scalar("SELECT SUM(requests) FROM session_usage_totals WHERE key_id = $1")
-            .bind(key.key_id.to_string())
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+    let sessions: i64 = sqlx::query_scalar(
+        "SELECT CAST(SUM(requests) AS BIGINT) FROM session_usage_totals WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
     assert_eq!(sessions, 1);
     let lifetime: i64 = sqlx::query_scalar(
         "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
@@ -493,12 +495,13 @@ async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_bounda
     );
     maintenance(&database, rebuild.clone()).await.unwrap();
     assert_counts(&database, request_id, reservation.id, 1).await;
-    let requests: i64 =
-        sqlx::query_scalar("SELECT SUM(requests) FROM request_daily_aggregates WHERE key_id = $1")
-            .bind(key.key_id.to_string())
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT CAST(SUM(requests) AS BIGINT) FROM request_daily_aggregates WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
     assert_eq!(requests, 1);
     assert!(maintenance(&database, prune_sql()).await.is_err());
     let account_owner = Uuid::now_v7();
