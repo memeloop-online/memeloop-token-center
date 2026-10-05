@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn codex_account_config_extensions_reach_upstream_and_record_success() {
+async fn codex_requests_with_config_extensions_succeed_without_leaking_metadata() {
     let fixture = codex_route_fixture("config-extensions").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let mut config: Value = serde_json::from_str(
@@ -61,6 +61,7 @@ async fn codex_account_config_extensions_reach_upstream_and_record_success() {
         }
     }
 
+    wait_for_request_settlement(&fixture, 2).await;
     let rows = fixture
         .state
         .db
@@ -73,6 +74,7 @@ async fn codex_account_config_extensions_reach_upstream_and_record_success() {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         for field in [
             "operator_metadata",
+            "quota_read_policy",
             "transport_policy",
             "__mtc_transport_proxy_binding",
         ] {
