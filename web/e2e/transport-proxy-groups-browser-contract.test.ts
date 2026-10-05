@@ -140,8 +140,27 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   const errors: string[] = [];
+  let activePage: Page | undefined;
+  context.afterEach(async child => {
+    if (!activePage || activePage.isClosed()) return;
+    const state = await activePage.evaluate(() => ({
+      workspaceCount: document.querySelectorAll('.transport-proxy-workspace').length,
+      confirmations: Array.from(document.querySelectorAll('dialog[open]')).map(dialog => dialog.textContent),
+      buttons: Array.from(document.querySelectorAll('.transport-proxy-workspace button')).map(button => ({
+        text: button.textContent, disabled: button.matches(':disabled'),
+        hiddenAncestor: button.closest('[aria-hidden="true"], [inert]')?.tagName,
+      })),
+      alerts: Array.from(document.querySelectorAll('.transport-proxy-workspace [role="alert"]')).map(alert => alert.textContent),
+      focus: document.activeElement?.tagName,
+      writes: window.proxyGroupFixture.writes.map(write => ({ method: write.method, path: write.path })),
+      reads: window.proxyGroupFixture.reads,
+    }));
+    child.diagnostic(JSON.stringify(state));
+    await activePage.close();
+  });
   async function prepare(allowed = true) {
     const page = await browser.newPage();
+    activePage = page;
     page.on('pageerror', error => errors.push(error.message));
     page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
     await page.route('**/*', route => {
