@@ -113,8 +113,12 @@ async function openManager(page: Page) {
 
 async function enterDraft(page: Page) {
   await page.getByRole('button', { name: '新建代理组', exact: true }).click();
-  await page.getByLabel('代理组名称', { exact: true }).fill('研发出口组');
-  await page.getByLabel('出口名称', { exact: true }).fill('主出口');
+  const groupName = page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ });
+  const memberName = page.getByRole('textbox', { name: /^出口名称\s*\*?$/ });
+  await groupName.fill('研发出口组');
+  await memberName.fill('主出口');
+  assert.equal(await groupName.getAttribute('required'), '');
+  assert.equal(await memberName.getAttribute('required'), '');
   await page.getByLabel('私网代理地址（必填）', { exact: true }).fill(privateProxySecret);
 }
 
@@ -159,7 +163,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByRole('button', { name: '编辑 研发出口组', exact: true }).click();
       assert.equal(await page.getByLabel('替换代理地址（留空保留原值）', { exact: true }).inputValue(), '');
-      await page.getByLabel('代理组名称', { exact: true }).fill('共享出口组');
+      await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('共享出口组');
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByRole('button', { name: '编辑 共享出口组', exact: true }).waitFor();
       await page.getByLabel('账号', { exact: true }).selectOption({ label: '研发订阅' });
@@ -197,17 +201,17 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.getByLabel('私网代理地址（必填）', { exact: true }).inputValue(), privateProxySecret);
       assert.equal(await page.getByRole('button', { name: '保存代理组', exact: true }).isEnabled(), true);
       await assertSecretsAbsent(page);
-      await page.getByLabel('出口名称', { exact: true }).fill('修正后的出口');
+      await page.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).fill('修正后的出口');
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByRole('button', { name: '编辑 研发出口组', exact: true }).click();
-      await page.getByLabel('代理组名称', { exact: true }).fill('本地修改');
+      await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('本地修改');
       await page.evaluate(() => { window.proxyGroupFixture.groups[0].version = 3; window.proxyGroupFixture.groups[0].name = '他人修改'; });
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByText(/代理组已被其他操作更新/).waitFor();
       assert.equal(await page.getByRole('button', { name: '保存代理组', exact: true }).isEnabled(), false);
       await page.getByRole('button', { name: '刷新配置', exact: true }).click(); await confirm(page);
       await page.getByRole('button', { name: '编辑 他人修改', exact: true }).click();
-      await page.getByLabel('代理组名称', { exact: true }).fill('确认后的修改');
+      await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('确认后的修改');
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByRole('button', { name: '编辑 确认后的修改', exact: true }).waitFor();
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.at(-1)?.body.expected_version), 3);
@@ -242,7 +246,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '刷新配置', exact: true }).click(); await confirm(page);
       await page.getByText(/已读回当前配置/).waitFor();
       await page.getByRole('button', { name: '编辑 研发出口组', exact: true }).click();
-      await page.getByLabel('代理组名称', { exact: true }).fill('等待中修改');
+      await page.getByRole('textbox', { name: /^代理组名称\s*\*?$/ }).fill('等待中修改');
       await page.evaluate(() => { window.proxyGroupFixture.holdNext = true; window.proxyGroupFixture.release = undefined; });
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
