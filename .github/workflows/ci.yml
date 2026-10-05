@@ -295,6 +295,7 @@ jobs:
           "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
       - name: Verify pinned Claude privacy component through the host ABI
+        id: claude_component
         env:
           INSTALLER_SOURCE: ghcr.io/memeloop-online/memeloop-token-center
           INSTALLER_DIGEST: sha256:7f04c3c5e65225bc4ea64243e52c51a37020927ff0fae00a66adabb552b141ed
@@ -336,6 +337,7 @@ jobs:
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
       - name: Reuse the signed Claude component through native and bridge gateway finalization
+        if: ${{ !cancelled() && steps.claude_component.outcome == 'success' }}
         run: |
           cargo test --locked --all-features --lib -- --ignored --exact api::proxy::tests::claude_wire_recovery::signed_claude_gateway_empty_recovery_finalize_matrix --nocapture
           test -s "$MTC_CLAUDE_WIRE_EVIDENCE"

@@ -26,10 +26,6 @@ impl ApplicationPlugins {
             "empty-register:{}",
             super::super::plugin_configuration_schema_digest(&json!(key))?
         );
-        let transaction = self
-            .db
-            .begin_empty_plugin_registration(&input.inventory_id, &event_key, actor)
-            .await?;
         let directory = root.clone();
         tokio::task::spawn_blocking(move || {
             match std::fs::create_dir(&directory) {
@@ -66,16 +62,18 @@ impl ApplicationPlugins {
         })
         .await
         .map_err(|_| AppError::Internal)??;
-        installation::append_inventory_file(
-            path,
-            &input.inventory_id,
-            &PreinstalledInventory {
-                root,
-                grants: BTreeMap::new(),
-            },
-        )
-        .await?;
-        let candidate = self.load(&input.inventory_id, 1, "initial").await?;
+        let entry = PreinstalledInventory {
+            root,
+            grants: BTreeMap::new(),
+        };
+        let candidate = self
+            .load_entry(&input.inventory_id, entry.clone(), 1, "initial")
+            .await?;
+        let transaction = self
+            .db
+            .begin_empty_plugin_registration(&input.inventory_id, &event_key, actor)
+            .await?;
+        installation::append_inventory_file(path, &input.inventory_id, &entry).await?;
         self.db
             .finish_empty_plugin_registration(
                 transaction,

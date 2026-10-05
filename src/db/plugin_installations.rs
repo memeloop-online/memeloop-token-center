@@ -99,6 +99,16 @@ impl Database {
         if locked != 1 {
             return Err(AppError::Overloaded);
         }
+        if sqlx::query(
+            "SELECT inventory_id FROM application_plugin_candidates WHERE inventory_id=$1",
+        )
+        .bind(inventory_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
+        {
+            return Err(AppError::Conflict("inventory ID is already staged".into()));
+        }
         // Each attempt publishes into a distinct physical inventory root. Old
         // checkpoints belong to the previous root and must never be reused.
         sqlx::query("UPDATE application_plugin_installations SET status='installing', review_digest=NULL, review_json=NULL, checkpoints_json='{}', failure_category=NULL, lease_until=$1, updated_at=$2, attempt_id=$4 WHERE id=$3")

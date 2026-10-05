@@ -318,6 +318,16 @@ impl ApplicationPlugins {
             .get(id)
             .cloned()
             .ok_or(AppError::Forbidden)?;
+        self.load_entry(id, entry, revision, reason).await
+    }
+
+    async fn load_entry(
+        &self,
+        id: &str,
+        entry: PreinstalledInventory,
+        revision: i64,
+        reason: &str,
+    ) -> Result<ApplicationPluginSnapshot, AppError> {
         let db = self.db.clone();
         let permit =
             tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())

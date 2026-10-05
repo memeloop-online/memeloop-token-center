@@ -105,6 +105,34 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
         Err(AppError::Conflict(_))
     ));
     assert_eq!(state.db.plugin_audit(None).await.unwrap().len(), 1);
+    assert!(matches!(
+        state
+            .db
+            .begin_plugin_installation(
+                "recovery",
+                &json!(["synthetic-reference"]),
+                "stale-preflight",
+                "stale-install-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270_000,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    assert!(state.db.plugin_installations().await.unwrap().is_empty());
+    assert!(matches!(
+        authority
+            .install(
+                installation::InstallPluginRequest {
+                    inventory_id: "not-empty-api".into(),
+                    packages: vec![]
+                },
+                "ordinary-empty-install",
+                "bootstrap",
+            )
+            .await,
+        Err(AppError::BadRequest(_))
+    ));
     let restarted = AppState::initialize((*state.config).clone()).await.unwrap();
     let restarted_authority = restarted.application_plugins.as_ref().unwrap();
     assert!(restarted_authority.status().await.unwrap().candidates[0].staged);
@@ -170,7 +198,7 @@ async fn empty_inventory_rejects_authority_path_grants_and_missing_key() {
     ] {
         assert_eq!(
             register(&state, &state.config.service_token, body, Some("key")).await,
-            StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::BAD_REQUEST
         );
     }
     assert_eq!(
@@ -263,6 +291,40 @@ async fn concurrent_registration_and_cas(state: &AppState) {
 async fn empty_inventory_sqlite_concurrent_registration_and_publication_cas() {
     let (_directory, state) = fixture().await;
     concurrent_registration_and_cas(&state).await;
+}
+
+#[tokio::test]
+async fn empty_inventory_preload_does_not_hold_database_write_lock() {
+    let (_directory, state) = fixture().await;
+    let authority = state.application_plugins.as_ref().unwrap().clone();
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    *authority.compile_gate.lock().unwrap() = Some((entered, released));
+    let registration = tokio::spawn(async move {
+        authority
+            .register_empty(
+                RegisterEmptyInventory {
+                    inventory_id: "unlocked-preload".into(),
+                },
+                "preload-lock-order",
+                "bootstrap",
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), entering)
+        .await
+        .unwrap()
+        .unwrap();
+    let write = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.db.create_tenant("unrelated-writer", None),
+    )
+    .await;
+    release.send(()).unwrap();
+    registration.await.unwrap().unwrap();
+    write
+        .expect("empty preloading must not reserve the SQLite writer")
+        .unwrap();
 }
 
 #[tokio::test]

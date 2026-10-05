@@ -16,6 +16,10 @@ grants and packages are rejected. Normal OCI installations still require one to
 sixteen signed, source-approved packages and their existing review process.
 
 Registration shares the installation lock and the atomic inventory-file writer.
+Candidate loading completes before acquiring the database write transaction;
+waiting for Wasmtime admission does not reserve the SQLite writer. Ordinary
+installation rechecks staged IDs under the same installation lock, so a stale
+preflight cannot consume an already staged recovery ID.
 The staged candidate and `register_empty` audit receipt commit together. Reusing
 the same key, inventory ID and actor is idempotent; changing the ID or actor is a
 conflict. Inventory IDs remain immutable. Interrupted filesystem/DB work may
