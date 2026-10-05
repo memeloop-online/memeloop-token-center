@@ -484,6 +484,9 @@ pub(crate) fn build_explicit_proxy_http_client(
 mod http2_keepalive_tests;
 
 #[cfg(test)]
+mod http2_upload_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         net::{IpAddr, SocketAddr},
