@@ -1902,7 +1902,7 @@ async fn proxy_with_cancellation_guard(
                     )
                     .await;
                     upstream_attempt
-                        .complete(UpstreamAttemptTerminal::invalid_response())
+                        .complete(upstream_error_health_terminal(error_code))
                         .await;
                     codex_retry.complete(CodexRetryTerminal::Failed);
                     return result;
