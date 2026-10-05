@@ -892,32 +892,16 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
             "OpenAI Codex account has invalid fixed transport configuration".into(),
         ));
     };
-    let known_keys = object.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "base_url"
-                | "network_scope"
-                | "reservation_token_bounds"
-                | "output_token_limits"
-                | "image_main_model"
-                | "transport_policy"
-                | crate::db::transport_proxy_management::CONFIG_KEY
-        )
-    });
     let valid_image_main_model = object.get("image_main_model").is_none_or(|value| {
         value.as_str().is_some_and(|model| {
             !model.trim().is_empty() && model.len() <= 200 && !model.chars().any(char::is_control)
         })
     });
-    if !known_keys
-        || object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
+    if object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
         || object.get("network_scope").and_then(Value::as_str) != Some("public")
         || reservation_bounds(config).is_none()
         || !valid_image_main_model
         || !valid_transport_policy(object.get("transport_policy"))
-        || !valid_transport_proxy_binding(
-            object.get(crate::db::transport_proxy_management::CONFIG_KEY),
-        )
     {
         return Err(AppError::BadRequest(
             "OpenAI Codex account has invalid fixed transport configuration".into(),
@@ -928,15 +912,6 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
 
 fn valid_transport_policy(policy: Option<&Value>) -> bool {
     crate::provider::CodexTransportPolicy::parse(policy).is_ok()
-}
-
-fn valid_transport_proxy_binding(binding: Option<&Value>) -> bool {
-    binding.is_none_or(|binding| {
-        serde_json::from_value::<crate::db::transport_proxy_management::BindingStamp>(
-            binding.clone(),
-        )
-        .is_ok()
-    })
 }
 
 pub(super) fn trusted_reservation_token_bound(
@@ -2586,7 +2561,6 @@ mod tests {
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
             json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112, "max_sse_terminal_hold_bytes": 1179648}),
-            json!({"unexpected": true}),
             json!("invalid"),
         ] {
             let mut invalid = config("gpt-codex", 10);
@@ -2596,30 +2570,39 @@ mod tests {
                 .insert("transport_policy".to_owned(), invalid_policy);
             assert!(validate_route_config(&invalid).is_err());
         }
+    }
 
-        let mut unknown_top_level = config("gpt-codex", 10);
-        unknown_top_level
-            .as_object_mut()
-            .unwrap()
-            .insert("proxy_url".to_owned(), json!("must-not-live-in-config"));
-        assert!(validate_route_config(&unknown_top_level).is_err());
+    #[test]
+    fn route_config_extensions_do_not_block_or_change_request_preparation() {
+        let original = config("gpt-codex", 10);
+        let request = json!({"model": "public", "input": "hello", "stream": true});
+        let mut expected = request.clone();
+        prepare_request(&mut expected, "gpt-codex", &original).unwrap();
 
-        let mut bound = valid.clone();
-        bound.as_object_mut().unwrap().insert(
-            crate::db::transport_proxy_management::CONFIG_KEY.to_owned(),
-            json!({
+        for extension in [
+            json!({"operator_metadata": {"label": "account"}}),
+            json!({"quota_read_policy": {"max_attempts": 3}}),
+            json!({"future_field": null, "future_switch": true}),
+            json!({"proxy_url": "ignored-account-metadata"}),
+            json!({"transport_policy": {"future_option": {"version": 2}}}),
+            json!({"__mtc_transport_proxy_binding": {
                 "selection_version": 1,
                 "binding_version": 2,
                 "group_id": "01900000-0000-7000-8000-000000000001",
                 "group_version": 3
-            }),
-        );
-        assert!(validate_route_config(&bound).is_ok());
-        bound.as_object_mut().unwrap().insert(
-            crate::db::transport_proxy_management::CONFIG_KEY.to_owned(),
-            json!("not-a-binding-stamp"),
-        );
-        assert!(validate_route_config(&bound).is_err());
+            }}),
+        ] {
+            let mut extended = original.clone();
+            extended
+                .as_object_mut()
+                .unwrap()
+                .extend(extension.as_object().unwrap().clone());
+            assert!(validate_route_config(&extended).is_ok(), "{extension}");
+            let mut actual = request.clone();
+            let prepared = prepare_request(&mut actual, "gpt-codex", &extended).unwrap();
+            assert_eq!(actual, expected, "{extension}");
+            assert_eq!(prepared.output_token_ceiling, 10);
+        }
     }
 
     fn completed_stream() -> Vec<u8> {

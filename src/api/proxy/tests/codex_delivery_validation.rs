@@ -1,6 +1,89 @@
 use super::*;
 
 #[tokio::test]
+async fn codex_account_config_extensions_reach_upstream_and_record_success() {
+    let fixture = codex_route_fixture("config-extensions").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config["operator_metadata"] = json!({"future_field": "private-account-metadata"});
+    config["quota_read_policy"] = json!({"max_attempts": 3});
+    config["transport_policy"] = json!({"future_option": true});
+    config["__mtc_transport_proxy_binding"] = json!({
+        "selection_version": 1,
+        "binding_version": 1,
+        "group_id": null,
+        "group_version": null,
+        "future_metadata": true
+    });
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(completed_codex_sse("forwarded"), "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    for stream in [false, true] {
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "hello", "stream": stream}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("forwarded"));
+        if stream {
+            assert!(text.contains("response.completed"));
+        }
+    }
+
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status_code == Some(200)));
+    for request in upstream.received_requests().await.unwrap() {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        for field in [
+            "operator_metadata",
+            "transport_policy",
+            "__mtc_transport_proxy_binding",
+        ] {
+            assert!(body.get(field).is_none());
+        }
+        assert!(!String::from_utf8_lossy(&request.body).contains("private-account-metadata"));
+    }
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
     let fixture = codex_route_fixture("ambiguous-non-sse").await;
     let upstream = MockServer::start().await;
