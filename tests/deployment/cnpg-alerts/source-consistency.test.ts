@@ -24,11 +24,14 @@ function ruleFrom(text: string, source: string): unknown {
 function normalizedRuleBlock(text: string): string {
   const lines = text.replaceAll('\r\n', '\n').trimEnd().split('\n');
   const start = lines.findIndex((line) => line.trimStart() === `- alert: ${alertName}`);
-  assert.notEqual(start, -1, `rule block ${alertName} must be present`);
-  const indentation = lines[start].length - lines[start].trimStart().length;
+  if (start === -1) throw new Error(`rule block ${alertName} must be present`);
+  const firstLine = lines[start];
+  if (firstLine === undefined) throw new Error(`rule block ${alertName} must be present`);
+  const indentation = firstLine.length - firstLine.trimStart().length;
   const block: string[] = [];
   for (let index = start; index < lines.length; index += 1) {
     const line = lines[index];
+    if (line === undefined) throw new Error('rule block line must exist');
     if (index > start && (line === '---' || (line.length - line.trimStart().length === indentation && line.trimStart().startsWith('- ')))) break;
     assert.ok(line.startsWith(' '.repeat(indentation)), 'rule block indentation must remain consistent');
     block.push(line.slice(indentation));

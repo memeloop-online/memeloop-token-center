@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cnpg-alert-acceptance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   acceptance:
     runs-on: ubuntu-24.04
@@ -28,16 +32,14 @@ jobs:
       - name: Fetch the pinned GitOps rule source
         env:
           GITOPS_COMMIT: 66efccb5380a772cb89b6999bbe64b7cb6219002
-          GITOPS_PATH: apps/memeloop-token-center/data/monitoring.yaml
         run: |
           set -euo pipefail
-          source_repo="$RUNNER_TEMP/k3s-gitops"
-          git init "$source_repo"
-          git -C "$source_repo" fetch --quiet --depth=1 \
-            https://git.k3s.onetwo.website/llm/k3s-gitops.git "$GITOPS_COMMIT"
-          test "$(git -C "$source_repo" rev-parse FETCH_HEAD)" = "$GITOPS_COMMIT"
-          git -C "$source_repo" show "FETCH_HEAD:$GITOPS_PATH" > "$RUNNER_TEMP/gitops-monitoring.yaml"
-          echo "CNPG_GITOPS_SOURCE=$RUNNER_TEMP/gitops-monitoring.yaml" >> "$GITHUB_ENV"
+          source_file="$RUNNER_TEMP/gitops-monitoring.yaml"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 15 --max-time 60 \
+            "https://git.k3s.onetwo.website/llm/k3s-gitops/raw/commit/$GITOPS_COMMIT/apps/memeloop-token-center/data/monitoring.yaml" \
+            --output "$source_file"
+          echo "CNPG_GITOPS_SOURCE=$source_file" >> "$GITHUB_ENV"
 
       - name: Verify fixture matches the pinned GitOps alert
         run: node --test tests/deployment/cnpg-alerts/source-consistency.test.ts
