@@ -1,0 +1,127 @@
+rule_files:
+  - cnpg-alert.rules.yml
+evaluation_interval: 1m
+tests:
+  - name: healthy primary and rw endpoint remain quiet
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '1+0x4'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '1+0x4'
+      - series: 'kube_endpoint_address{job="kube-state-metrics",namespace="memeloop-token-center",endpoint="memeloop-token-center-pg-rw",ready="true"}'
+        values: '1+0x4'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+
+  - name: unready primary alerts after two minutes, not before
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '1+0x2'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '0+0x2'
+      - series: 'kube_endpoint_address{job="kube-state-metrics",namespace="memeloop-token-center",endpoint="memeloop-token-center-pg-rw",ready="true"}'
+        values: '1+0x2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: postgres
+            exp_annotations:
+              summary: "MTC PostgreSQL primary is not Ready or its rw endpoint is unavailable"
+              description: "Check the CNPG Cluster Ready/currentPrimary status and the memeloop-token-center-pg-rw EndpointSlice. Follow the bounded MTC CNPG maintenance closeout in the cluster Wiki."
+
+  - name: missing primary readiness series alerts after two minutes
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '1+0x2'
+      - series: 'kube_endpoint_address{job="kube-state-metrics",namespace="memeloop-token-center",endpoint="memeloop-token-center-pg-rw",ready="true"}'
+        values: '1+0x2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: postgres
+            exp_annotations:
+              summary: "MTC PostgreSQL primary is not Ready or its rw endpoint is unavailable"
+              description: "Check the CNPG Cluster Ready/currentPrimary status and the memeloop-token-center-pg-rw EndpointSlice. Follow the bounded MTC CNPG maintenance closeout in the cluster Wiki."
+
+  - name: no ready rw address alerts when only not-ready address remains
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '1+0x2'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '1+0x2'
+      - series: 'kube_endpoint_address{job="kube-state-metrics",namespace="memeloop-token-center",endpoint="memeloop-token-center-pg-rw",ready="false"}'
+        values: '1+0x2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: postgres
+            exp_annotations:
+              summary: "MTC PostgreSQL primary is not Ready or its rw endpoint is unavailable"
+              description: "Check the CNPG Cluster Ready/currentPrimary status and the memeloop-token-center-pg-rw EndpointSlice. Follow the bounded MTC CNPG maintenance closeout in the cluster Wiki."
+
+  - name: lost rw endpoint series alerts after two minutes
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '1+0x2'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '1+0x2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: postgres
+            exp_annotations:
+              summary: "MTC PostgreSQL primary is not Ready or its rw endpoint is unavailable"
+              description: "Check the CNPG Cluster Ready/currentPrimary status and the memeloop-token-center-pg-rw EndpointSlice. Follow the bounded MTC CNPG maintenance closeout in the cluster Wiki."
+
+  - name: kube-state-metrics down does not blame MTC
+    interval: 1m
+    input_series:
+      - series: 'up{job="kube-state-metrics",instance="ksm"}'
+        values: '0+0x4'
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '0+0x4'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
+
+  - name: missing kube-state-metrics target does not blame MTC
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_status_ready{job="kube-state-metrics",namespace="memeloop-token-center",pod="memeloop-token-center-pg-7",condition="true"}'
+        values: '0+0x4'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: MTCPostgresPrimaryOrReadWriteEndpointUnavailable
+        exp_alerts: []
