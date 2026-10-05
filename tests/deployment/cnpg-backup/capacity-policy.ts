@@ -1,4 +1,21 @@
-export const capacityPolicy = String.raw`capacity_volume() {
+export const capacityPolicy = String.raw`capacity_attestation() {
+  test "$capacity_path" = /backup || return 1
+  test "$capacity_device" = "$EXPECTED_BACKUP_DEVICE" || return 1
+  test -n "$POD_UID" || return 1
+  capacity_lease=$(cat /tmp/backup-volume.lease) || return 1
+  case "$capacity_lease" in ''|*[!a-zA-Z0-9/:.\ -]*) return 1 ;; esac
+  set -- $capacity_lease
+  test "$#" -eq 5 || return 1
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  test "$(printf %s "$1" | wc -c)" -le 10 || return 1
+  capacity_now=$(date +%s) || return 1
+  test "$1" -le "$capacity_now" || return 1
+  test "$((capacity_now - $1))" -le 45 || return 1
+  test "$2" = "$POD_UID" && test "$3" = "$capacity_device" && test "$4" = "$capacity_uuid" || return 1
+  capacity_device_number=$(timeout 5 findmnt -rn -o MAJ:MIN -T "$capacity_path") || return 1
+  test "$5" = "$capacity_device_number" || return 1
+}
+capacity_volume() {
   capacity_path=$1
   capacity_uuid=$2
   capacity_max=$3
@@ -13,10 +30,15 @@ export const capacityPolicy = String.raw`capacity_volume() {
   capacity_actual_uuid=$(timeout 5 findmnt -rn -o UUID -T "$capacity_path") || return 1
   test "$capacity_target" = "$capacity_path" || return 1
   test "$capacity_root" = / || return 1
-  test "$capacity_actual_uuid" = "$capacity_uuid" || return 1
   capacity_device=$(timeout 5 findmnt -rn -o SOURCE -T "$capacity_path") || return 1
   case "$capacity_device" in /dev/*) ;; *) return 1 ;; esac
   case "$capacity_device" in *'['*|*']'*) return 1 ;; esac
+  if test "$(printenv BACKUP_UUID_ATTESTATION || true)" = external-csi-lease; then
+    capacity_attestation || return 1
+    test -z "$capacity_actual_uuid" || test "$capacity_actual_uuid" = "$capacity_uuid" || return 1
+  else
+    test "$capacity_actual_uuid" = "$capacity_uuid" || return 1
+  fi
   capacity_stats=$(timeout 5 stat -f -c '%S %b %a %c %d' "$capacity_path") || return 1
   set -- $capacity_stats
   test "$#" -eq 5 || return 1

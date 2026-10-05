@@ -6,6 +6,7 @@ import { parseAllDocuments, stringify } from 'yaml';
 import { capacityPolicy, restoreReceipt } from './capacity-policy.ts';
 import { storageResources, validateStorageResources } from './storage-preflight.ts';
 import { sourceSpace } from './source-space.ts';
+import { stageIdentity } from './volume-identity.ts';
 
 export const boundedClaims = {
   stage: 'mtc-pg-bounded-stage-20261005',
@@ -75,6 +76,8 @@ export function preparedResources(): any[] {
       EXPECTED_SERVER_ADDRESS: '',
       SOURCE_SPACE_LEASE_SECONDS: String(sourceSpace.leaseSeconds),
       SOURCE_SPACE_WAIT_SECONDS: String(sourceSpace.waitSeconds),
+      BACKUP_UUID_ATTESTATION: 'external-csi-lease',
+      EXPECTED_BACKUP_DEVICE: stageIdentity.device,
     });
     if (resource.metadata.name === boundedJobs.restore) Object.assign(environment, {
       EXPECTED_SCRATCH_FS_UUID: '',
@@ -84,11 +87,13 @@ export function preparedResources(): any[] {
     });
     container.env.push(...Object.entries(environment).map(([name, value]) => ({ name, value })));
     if (resource.metadata.name === boundedJobs.stage) {
+      container.env.push({ name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } });
       container.env.find((entry: any) => entry.name === 'PGOPTIONS').value += ' -c temp_file_limit=0';
       resource.metadata.annotations['recovery.mtc/source-space-gate'] = '9Gi-start-8Gi-stop-or-512Mi-drop-45s-lease-stop-only-own-dump-no-foreground-concurrency-change';
       resource.metadata.annotations['recovery.mtc/source-temp-gate'] = 'session-temp_file_limit=0-fail-if-not-permitted-no-role-or-source-config-change';
       let script: string = container.command[6];
-      script = replaceOnce(script, 'umask 077', 'umask 077\n. /policy/capacity.sh\ncapacity_backup\ntest -n "$EXPECTED_SERVER_ADDRESS"\nsource_space_wait');
+      script = replaceOnce(script, 'umask 077', 'umask 077\n. /policy/capacity.sh\ntest -n "$EXPECTED_SERVER_ADDRESS"\nsource_space_wait\ncapacity_backup');
+      script = replaceOnce(script, 'actual_backup_fs_uuid=$(findmnt -n -o UUID -T /backup)\ntest "$actual_backup_fs_uuid" = "$EXPECTED_BACKUP_FS_UUID"', 'capacity_backup');
       script = replaceOnce(script, 'available_kib=$(timeout 5 df -Pk /backup | awk \'NR == 2 { print $4 }\')\ntest "$available_kib" -ge 67108864',
         'capacity_volume /backup "$EXPECTED_BACKUP_FS_UUID" "$BACKUP_MAX_BYTES" "$BACKUP_MIN_BYTES" 26071793664');
       script = replaceOnce(script, 'available_kib=$(timeout 5 df -Pk /backup | awk \'NR == 2 { print $4 }\')\n    if ! test "$available_kib" -ge 35651584; then',

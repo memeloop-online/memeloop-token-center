@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { attestStageVolume } from './volume-identity.ts';
 
 export const sourceSpace = {
   namespace: 'memeloop-token-center', pod: 'memeloop-token-center-pg-7', node: 'haixia',
@@ -80,11 +81,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
           break;
         }
         assert.equal(pod.status.phase, 'Running');
+        const volumeLease = attestStageVolume(kubectl, pod);
         const current = read();
         assert.equal(current.sourcePodUID, initial.sourcePodUID, 'Source pod replaced; stop backup');
         sourceBudget(current, initial.availableBytes);
         const epoch = Math.floor(Date.now() / 1000);
-        kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/sh', '-ec', `umask 077; printf '%s\\n' ${epoch} > /tmp/source-space.lease.partial; mv /tmp/source-space.lease.partial /tmp/source-space.lease`]);
+        assert.ok(epoch - Number(volumeLease.split(' ')[0]) <= 45, 'CSI observation expired while sampling source space');
+        kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/sh', '-ec', `umask 077; printf '%s\\n' '${volumeLease}' > /tmp/backup-volume.lease.partial; mv /tmp/backup-volume.lease.partial /tmp/backup-volume.lease; printf '%s\\n' ${epoch} > /tmp/source-space.lease.partial; mv /tmp/source-space.lease.partial /tmp/source-space.lease`]);
         console.log(JSON.stringify({ observedAt: new Date().toISOString(), ...current, initialAvailableBytes: initial.availableBytes }));
         await delay(sourceSpace.intervalMs);
       }
@@ -94,7 +97,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         try {
           const pod = get('pod', exportName!);
           exportPod(pod);
-          if (pod.metadata.uid === watchedUID) kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/rm', '-f', '/tmp/source-space.lease']);
+          if (pod.metadata.uid === watchedUID) kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/rm', '-f', '/tmp/source-space.lease', '/tmp/backup-volume.lease']);
         } catch { }
       }
       throw error;

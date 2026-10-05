@@ -915,13 +915,15 @@ jobs:
         run: node --test tests/deployment/cnpg-backup/contract.test.ts
       - name: Exercise aggregate CNPG capacity exhaustion and fail-closed restore receipts
         timeout-minutes: 12
-        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts tests/deployment/cnpg-backup/source-space.test.ts
+        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts tests/deployment/cnpg-backup/source-space.test.ts tests/deployment/cnpg-backup/volume-identity.test.ts tests/deployment/cnpg-backup/prepare-artifact.test.ts
       - name: Render suspended CNPG preparation only (never deploy)
-        run: node tests/deployment/cnpg-backup/hard-capacity.ts > "$RUNNER_TEMP/cnpg-hard-capacity-preparation.yaml"
+        env:
+          BACKUP_SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node tests/deployment/cnpg-backup/prepare-artifact.ts "$RUNNER_TEMP/cnpg-hard-capacity-preparation"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cnpg-hard-capacity-preparation
-          path: ${{ runner.temp }}/cnpg-hard-capacity-preparation.yaml
+          path: ${{ runner.temp }}/cnpg-hard-capacity-preparation
           if-no-files-found: error
       - name: Validate release workflow and Docker build contracts
         run: node --test tests/ops/release-packaging-contract.test.ts

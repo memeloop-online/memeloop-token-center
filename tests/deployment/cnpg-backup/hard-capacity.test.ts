@@ -52,6 +52,10 @@ test('prepared resources cannot provision unbounded storage or start a productio
   }
   assert.equal(stage.env.find((entry: any) => entry.name === 'EXPECTED_SERVER_ADDRESS').value, '');
   assert.equal(stage.env.find((entry: any) => entry.name === 'SOURCE_SPACE_LEASE_SECONDS').value, '45');
+  assert.equal(stage.env.find((entry: any) => entry.name === 'BACKUP_UUID_ATTESTATION').value, 'external-csi-lease');
+  assert.equal(stage.env.find((entry: any) => entry.name === 'POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
+  assert.ok(stage.command[6].indexOf('source_space_wait') < stage.command[6].indexOf('capacity_backup'));
+  assert.doesNotMatch(stage.command[6], /actual_backup_fs_uuid=/);
   assert.match(stage.env.find((entry: any) => entry.name === 'PGOPTIONS').value, /temp_file_limit=0/);
   const stagePod = jobs.find(job => job.metadata.name === boundedJobs.stage).spec.template.spec;
   assert.deepEqual(stagePod.volumes.filter((volume: any) => volume.persistentVolumeClaim).map((volume: any) => volume.persistentVolumeClaim.claimName), [boundedClaims.stage]);
@@ -108,7 +112,8 @@ case "$*" in
   *FSTYPE*) if test -e /tmp/wrong-type; then printf overlay; else printf ext4; fi ;;
   *FSROOT*) if test -e /tmp/subdirectory; then printf /unbounded-local-path; else printf /; fi ;;
   *TARGET*) printf %s "$fixture_path" ;;
-  *UUID*) printf %s "$fixture_uuid" ;;
+  *UUID*) if test ! -e /tmp/empty-uuid; then printf %s "$fixture_uuid"; fi ;;
+  *MAJ:MIN*) printf 8:32 ;;
   *SOURCE*) printf /dev/fixture ;;
   *) exit 1 ;;
 esac
@@ -167,6 +172,31 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     assert.throws(() => check(candidate, { BACKUP_RESERVE_BYTES: '4096' }));
     shell(candidate, 'test ! -e /scratch/RESTORE_SUCCESS.json');
   });
+  await context.test('rootless empty UUID requires a fresh pod-bound CSI identity and the same mounted device', () => {
+    const candidate = fixture();
+    shell(candidate, 'touch /tmp/empty-uuid');
+    const environment = { BACKUP_UUID_ATTESTATION: 'external-csi-lease', EXPECTED_BACKUP_DEVICE: '/dev/fixture', POD_UID: 'fixture-pod' };
+    assert.throws(() => check(candidate));
+    assert.throws(() => check(candidate, environment));
+    const epoch = Math.floor(Date.now() / 1000);
+    const lease = `${epoch} fixture-pod /dev/fixture fixture-backup 8:32`;
+    write(candidate, '/tmp/backup-volume.lease', lease);
+    check(candidate, environment);
+    for (const invalid of [
+      lease.replace(String(epoch), '1'), lease.replace(String(epoch), '9999999999'),
+      lease.replace('fixture-pod', 'replaced-pod'), lease.replace('/dev/fixture', '/dev/other'),
+      lease.replace('fixture-backup', 'wrong-uuid'), lease.replace('8:32', '8:33'),
+      lease + ' extra', lease.replace(String(epoch), 'invalid'),
+    ]) {
+      write(candidate, '/tmp/backup-volume.lease', invalid);
+      assert.throws(() => check(candidate, environment));
+    }
+    write(candidate, '/tmp/backup-volume.lease', lease);
+    assert.throws(() => check(candidate, { ...environment, EXPECTED_BACKUP_DEVICE: '/dev/other' }));
+    shell(candidate, 'rm /tmp/empty-uuid');
+    write(candidate, '/tmp/backup-volume.lease', lease.replace('fixture-backup', 'wrong-uuid'));
+    assert.throws(() => check(candidate, { ...environment, EXPECTED_BACKUP_FS_UUID: 'wrong-uuid' }));
+  });
   await context.test('inode exhaustion also fails closed without a large file', () => {
     const candidate = fixture(4, 256, 128);
     assert.throws(() => shell(candidate, 'index=0; while test "$index" -lt 256; do touch "/backup/inode-$index"; index=$((index + 1)); done'));
@@ -222,6 +252,28 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
       }
       assert.ok(active, 'Fixture must revoke during active export, not just preflight');
       shell(candidate, 'rm /tmp/source-space.lease');
+      assert.notEqual(await completed, 0);
+      shell(candidate, `test -s ${archiveDirectory}/${archiveName}.partial; test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED; pg_ctl -D /scratch/source status`);
+    } finally {
+      if (child.exitCode === null) child.kill();
+    }
+  });
+  await context.test('revoked CSI identity stops an active rootless export without source writes or success markers', async () => {
+    const candidate = fixture();
+    initializeSource(candidate);
+    shell(candidate, 'touch /tmp/empty-uuid; date +%s > /tmp/source-space.lease');
+    write(candidate, '/tmp/backup-volume.lease', `${Math.floor(Date.now() / 1000)} fixture-pod /dev/fixture fixture-backup 8:32`);
+    const path = shell(candidate, 'printf %s "$PATH"').toString();
+    const child = spawn('docker', ['exec', '--env', `PATH=/tmp/bin:${path}`, '--env', 'BACKUP_UUID_ATTESTATION=external-csi-lease', '--env', 'EXPECTED_BACKUP_DEVICE=/dev/fixture', '--env', 'POD_UID=fixture-pod', candidate, ...stageCommand()], { stdio: 'ignore' });
+    const completed = new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('exit', resolve); });
+    try {
+      let active = false;
+      for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt++) {
+        if (shell(candidate, `if test -s ${archiveDirectory}/${archiveName}.partial; then printf active; fi`).toString() === 'active') { active = true; break; }
+        await delay(100);
+      }
+      assert.ok(active, 'Valid external identity must allow an actual rootless export to start');
+      shell(candidate, 'rm /tmp/backup-volume.lease');
       assert.notEqual(await completed, 0);
       shell(candidate, `test -s ${archiveDirectory}/${archiveName}.partial; test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED; pg_ctl -D /scratch/source status`);
     } finally {
