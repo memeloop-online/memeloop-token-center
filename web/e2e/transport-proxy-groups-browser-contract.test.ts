@@ -39,26 +39,25 @@ async function installFixture(page: Page, allowed = true) {
       if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       const method = init?.method ?? 'GET';
       state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
-      const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
-      if (!state.allowed) return json({ error: { code: 'forbidden', message: secret } }, 403);
+      if (!state.allowed) return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
       if (method === 'GET') {
         state.reads += 1;
         if (url.searchParams.get('tenant_external_id') !== 'fixture') throw new Error('missing read tenant');
-        return json(url.pathname.endsWith('/transport-proxy-group') ? state.binding : { items: state.groups });
+        return new Response(JSON.stringify(url.pathname.endsWith('/transport-proxy-group') ? state.binding : { items: state.groups }));
       }
       const body = JSON.parse(String(init?.body));
       state.writes.push({ path: url.pathname, method, body });
       if (body.tenant_external_id !== 'fixture') throw new Error('missing write tenant');
       if (state.failure) {
         const failure = state.failure; state.failure = undefined;
-        return json({ error: { code: failure.code, message: secret } }, failure.status);
+        return new Response(JSON.stringify({ error: { code: failure.code, message: secret } }), { status: failure.status });
       }
       let response: Response;
       if (url.pathname.endsWith('/transport-proxy-group')) {
         const group = state.groups[0];
         if (body.expected_binding_version !== state.binding.binding_version || body.expected_credential_generation !== state.binding.credential_generation
           || body.expected_updated_at !== state.binding.updated_at || body.expected_group_version !== group.version) {
-          return json({ error: { code: 'proxy_group_binding_conflict' } }, 409);
+          return new Response(JSON.stringify({ error: { code: 'proxy_group_binding_conflict' } }), { status: 409 });
         }
         const unbind = method === 'DELETE';
         state.binding = {
@@ -69,13 +68,13 @@ async function installFixture(page: Page, allowed = true) {
           runtime: { scope: 'this_process', configuration_state: unbind ? 'unbound' : 'pending', selected_member_id: null, observed_at: 101 },
         };
         group.bound_account_count = unbind ? 0 : 1;
-        response = json(state.binding, 202);
+        response = new Response(JSON.stringify(state.binding), { status: 202 });
       } else if (method === 'DELETE') {
         state.groups = [];
         response = new Response(null, { status: 204 });
       } else {
         const old = state.groups[0];
-        if (method === 'PUT' && body.expected_version !== old.version) return json({ error: { code: 'proxy_group_version_conflict' } }, 409);
+        if (method === 'PUT' && body.expected_version !== old.version) return new Response(JSON.stringify({ error: { code: 'proxy_group_version_conflict' } }), { status: 409 });
         const group: TransportProxyGroup = {
           id: 'raw-group-id', tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
           bound_account_count: old?.bound_account_count ?? 0,
@@ -84,7 +83,7 @@ async function installFixture(page: Page, allowed = true) {
           })),
         };
         state.groups = [group];
-        response = json(group, method === 'POST' ? 201 : 200);
+        response = new Response(JSON.stringify(group), { status: method === 'POST' ? 201 : 200 });
       }
       if (state.holdNext) {
         state.holdNext = false;
@@ -93,7 +92,18 @@ async function installFixture(page: Page, allowed = true) {
       return response;
     };
   }, { allowed, secret: privateProxySecret });
+  const probe = await page.evaluate(async () => {
+    const response = await window.fetch('/internal/v1/transport-proxy-groups?tenant_external_id=fixture', {
+      cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
+    });
+    const body = await response.json();
+    return { status: response.status, items: Array.isArray(body.items), code: body.error?.code };
+  });
+  assert.equal(probe.status, allowed ? 200 : 403, 'fixture permission response must be ready before UI interaction');
+  assert.equal(probe.items, allowed);
+  if (!allowed) assert.equal(probe.code, 'forbidden');
   await page.getByRole('button', { name: '重新检查管理权限' }).click();
+  await page.getByText(allowed ? '已确认当前租户的全局操作员及 providers:write 管理权限。' : '无管理权限：需要具有 providers:write 权限的全局操作员。', { exact: true }).waitFor();
 }
 
 async function openManager(page: Page) {
