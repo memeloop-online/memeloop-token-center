@@ -88,6 +88,7 @@ struct CatalogFailure {
     code: &'static str,
     stage: &'static str,
     kind: &'static str,
+    retryable_connect: bool,
 }
 
 impl CatalogFailure {
@@ -104,7 +105,31 @@ impl CatalogFailure {
             } else {
                 "transport"
             },
+            retryable_connect: stage == "send" && connect,
         }
+    }
+
+    fn send(error: wreq::Error) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(current) = source {
+            if let Some(http2) = current.downcast_ref::<http2::Error>()
+                && (http2.is_reset() || http2.is_go_away())
+            {
+                return Self::transport("send", error.is_timeout(), false);
+            }
+            source = match current
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+            {
+                Some(inner) => Some(inner),
+                None => current.source(),
+            };
+        }
+        Self::transport(
+            "send",
+            error.is_timeout(),
+            error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls(),
+        )
     }
 
     fn response(code: &'static str) -> Self {
@@ -112,6 +137,7 @@ impl CatalogFailure {
             code,
             stage: "response",
             kind: code,
+            retryable_connect: false,
         }
     }
 }
@@ -124,6 +150,7 @@ fn log_catalog_failure(
     // Never log the underlying error: its URL or proxy source can carry secrets.
     tracing::warn!(account_id = %account.id, credential_generation = account.credential_generation,
         stage = failure.stage, failure_kind = failure.kind, error_code = failure.code,
+        retryable_connect = failure.retryable_connect,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "upstream model catalog request failed");
 }
@@ -1059,67 +1086,43 @@ async fn fetch_codex_models(
     credential: &UpstreamCredential,
     require_complete: bool,
 ) -> Result<Vec<Value>, &'static str> {
-    let selection = state
-        .transport_proxy_groups
-        .select_config(
-            account.id,
-            account.credential_generation,
-            credential,
-            &account.config,
-        )
-        .map_err(|_| "transport_selection_unavailable")?;
-    let credential = &selection.credential;
-    credential
-        .validate(unix_millis())
-        .map_err(|_| "credential_invalid")?;
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
-    network::validate_codex_transport(
-        &base_url,
-        &account.config,
-        credential.proxy(),
-        state.config.codex_test_loopback,
-    )
-    .await
-    .map_err(|_| "destination_invalid")?;
-    let client = state.codex_clients.account_transport_snapshot(
-        account,
-        credential,
-        selection.generation,
-    )?;
-    let budget = codex_catalog_budget(&account.config)?;
-    let account_id = codex_account_header(credential)?;
     let url = format!(
         "{}/models?client_version={}",
         base_url.trim_end_matches('/'),
         crate::oauth::managed::codex::CLIENT_VERSION,
     );
-    let (credential_header, credential_value) = credential
-        .request_header(unix_millis())
-        .map_err(|_| "credential_invalid")?
-        .ok_or("credential_invalid")?;
-    let mut request = client
-        .get(url)
-        .default_headers(false)
-        .header(credential_header, credential_value)
-        .header(header::ACCEPT, "application/json")
-        .header(header::ACCEPT_ENCODING, "identity")
-        .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
-        .header("originator", crate::oauth::managed::codex::ORIGINATOR)
-        .header("chatgpt-account-id", account_id);
-    if let Some((proxy_url, _)) = credential.proxy() {
-        request = request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "destination_invalid")?);
-    }
-    let started = std::time::Instant::now();
-    tracing::info!(account_id = %account.id, credential_generation = account.credential_generation,
-        transport = "codex_account_client", total_timeout_ms = budget.total.as_millis() as u64,
-        read_timeout_ms = budget.read.as_millis() as u64,
-        "upstream model catalog request started");
-    let value = bounded_json_response(request, budget, require_complete)
-        .await
-        .map_err(|failure| {
-            log_catalog_failure(account, &failure, started);
-            failure.code
-        })?;
+    let value = codex_catalog_response(
+        state,
+        account,
+        credential,
+        require_complete,
+        |credential, generation| {
+            let client = state
+                .codex_clients
+                .account_transport_snapshot(account, credential, generation)?;
+            let account_id = codex_account_header(credential)?;
+            let (credential_header, credential_value) = credential
+                .request_header(unix_millis())
+                .map_err(|_| "credential_invalid")?
+                .ok_or("credential_invalid")?;
+            let mut request = client
+                .get(&url)
+                .default_headers(false)
+                .header(credential_header, credential_value)
+                .header(header::ACCEPT, "application/json")
+                .header(header::ACCEPT_ENCODING, "identity")
+                .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
+                .header("originator", crate::oauth::managed::codex::ORIGINATOR)
+                .header("chatgpt-account-id", account_id);
+            if let Some((proxy_url, _)) = credential.proxy() {
+                request =
+                    request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "destination_invalid")?);
+            }
+            Ok(request)
+        },
+    )
+    .await?;
     if require_complete {
         require_complete_catalog(&value)?;
     }
@@ -1131,6 +1134,85 @@ async fn fetch_codex_models(
         return Err("invalid_response");
     }
     Ok(values.clone())
+}
+
+async fn codex_catalog_response(
+    state: &AppState,
+    account: &crate::provider::UpstreamAccountView,
+    credential: &UpstreamCredential,
+    require_complete: bool,
+    mut build_request: impl FnMut(
+        &UpstreamCredential,
+        i64,
+    ) -> Result<wreq::RequestBuilder, &'static str>,
+) -> Result<Value, &'static str> {
+    let policy =
+        crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
+    let budget = codex_catalog_budget(&account.config)?;
+    let deadline = tokio::time::Instant::now() + budget.total;
+    let retry_delay = Duration::from_millis(policy.connect_retry_delay_millis);
+    let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
+    let started = std::time::Instant::now();
+    tracing::info!(account_id = %account.id, credential_generation = account.credential_generation,
+        transport = "codex_account_client", total_timeout_ms = budget.total.as_millis() as u64,
+        read_timeout_ms = budget.read.as_millis() as u64,
+        "upstream model catalog request started");
+    let mut attempted = Vec::with_capacity(4);
+    for connect_attempt in 1..=policy.connect_attempts {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("connection_failed");
+        }
+        let selection = state
+            .transport_proxy_groups
+            .select_config(
+                account.id,
+                account.credential_generation,
+                credential,
+                &account.config,
+            )
+            .map_err(|_| "transport_selection_unavailable")?;
+        if let Some(member) = selection.member() {
+            if attempted.contains(&member) {
+                return Err("connection_failed");
+            }
+            attempted.push(member);
+        }
+        selection
+            .credential
+            .validate(unix_millis())
+            .map_err(|_| "credential_invalid")?;
+        tokio::time::timeout_at(
+            deadline,
+            network::validate_codex_transport(
+                &base_url,
+                &account.config,
+                selection.credential.proxy(),
+                state.config.codex_test_loopback,
+            ),
+        )
+        .await
+        .map_err(|_| "connection_failed")?
+        .map_err(|_| "destination_invalid")?;
+        let request = build_request(&selection.credential, selection.generation)?;
+        let failure = match bounded_json_response(request, budget, deadline, require_complete).await
+        {
+            Ok(value) => return Ok(value),
+            Err(failure) => failure,
+        };
+        log_catalog_failure(account, &failure, started);
+        if !failure.retryable_connect || selection.member().is_none() {
+            return Err(failure.code);
+        }
+        selection
+            .advance_after_connect_failure(&attempted)
+            .map_err(|_| "transport_selection_unavailable")?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if connect_attempt == policy.connect_attempts || retry_delay >= remaining {
+            return Err(failure.code);
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
+    Err("connection_failed")
 }
 
 async fn discover_codex_models_selected(
@@ -1229,15 +1311,16 @@ fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'sta
 async fn bounded_json_response(
     request: wreq::RequestBuilder,
     budget: CatalogBudget,
+    deadline: tokio::time::Instant,
     require_complete: bool,
 ) -> Result<Value, CatalogFailure> {
-    let deadline = tokio::time::Instant::now() + budget.total;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(CatalogFailure::transport("send", true, false));
+    }
     let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| CatalogFailure::transport("send", true, false))?
-        .map_err(|error| {
-            CatalogFailure::transport("send", error.is_timeout(), error.is_connect())
-        })?;
+        .map_err(CatalogFailure::send)?;
     let status = response.status();
     if status.is_redirection() {
         return Err(CatalogFailure::response("redirect_rejected"));
@@ -1689,6 +1772,386 @@ mod tests {
         );
     }
 
+    const CATALOG_PRIMARY_PROXY: &str = "socks5h://10.20.30.40:1080";
+    const CATALOG_BACKUP_PROXY: &str = "socks5h://10.20.30.41:1080";
+
+    async fn catalog_proxy_fixture(
+        policy: Value,
+    ) -> (
+        AppState,
+        crate::provider::UpstreamAccountView,
+        UpstreamCredential,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("catalog-proxy.db").display()
+        ));
+        let mut state = AppState::initialize(config).await.unwrap();
+        let credential = UpstreamCredential::OAuth {
+            access_token: "catalog-test-access".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1", "account_id": "catalog-test-account"
+            })),
+            proxy_url: Some(CATALOG_PRIMARY_PROXY.into()),
+            proxy_network_scope: Some(network::OutboundScope::Private),
+        };
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: "catalog-proxy".into(),
+                    name: "catalog-proxy".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "network_scope": "public",
+                        "transport_policy": policy,
+                    }),
+                    credential: credential.clone(),
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        state.transport_proxy_groups = std::sync::Arc::new(
+            crate::db::TransportProxyGroups::parse(
+                &json!([{
+                    "account_id": account.id, "version": 1,
+                    "proxies": [CATALOG_PRIMARY_PROXY, CATALOG_BACKUP_PROXY],
+                }])
+                .to_string(),
+                state.config.key_pepper.as_bytes(),
+            )
+            .unwrap(),
+        );
+        (state, account, credential, directory)
+    }
+
+    async fn closed_catalog_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}/models", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_connect_failure_uses_backup_and_reuses_selection() {
+        assert_catalog_proxy_fallback(json!({"connect_retry_delay_millis": 0})).await;
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_fallback_succeeds_with_less_time_than_connect_timeout() {
+        let policy = json!({"connect_timeout_millis": 30_000});
+        let budget = codex_catalog_budget(&json!({"transport_policy": policy.clone()})).unwrap();
+        assert_eq!(budget.total, Duration::from_secs(30));
+        assert_catalog_proxy_fallback(policy).await;
+    }
+
+    async fn assert_catalog_proxy_fallback(policy: Value) {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let primary = closed_catalog_endpoint().await;
+        let backup = MockServer::start().await;
+        let catalog = json!({"models": [{
+            "slug": "gpt-6.1-sol", "visibility": "list", "context_window": 272000
+        }]});
+        Mock::given(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&catalog))
+            .expect(2)
+            .mount(&backup)
+            .await;
+        let (state, account, credential, _directory) = catalog_proxy_fixture(policy).await;
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let result = codex_catalog_response(
+                &state,
+                &account,
+                &credential,
+                true,
+                |selected, generation| {
+                    let proxy = selected.proxy().unwrap().0;
+                    attempts.push((proxy.to_owned(), generation));
+                    let client = state
+                        .codex_clients
+                        .account_transport_snapshot(&account, selected, generation)?;
+                    Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
+                        primary.clone()
+                    } else {
+                        format!("{}/models", backup.uri())
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, catalog);
+        }
+        assert_eq!(
+            attempts,
+            vec![
+                (CATALOG_PRIMARY_PROXY.into(), 1),
+                (CATALOG_BACKUP_PROXY.into(), 2),
+                (CATALOG_BACKUP_PROXY.into(), 2),
+            ]
+        );
+        let (current, stored) = state
+            .db
+            .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(current.credential_generation, account.credential_generation);
+        assert_eq!(stored.proxy(), credential.proxy());
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_connect_fallback_is_bounded_by_members_attempts_and_budget() {
+        for (policy, expected_attempts) in [
+            (
+                json!({"connect_attempts": 4, "connect_retry_delay_millis": 0}),
+                2,
+            ),
+            (json!({"connect_attempts": 1}), 1),
+            (
+                json!({
+                    "connect_attempts": 4, "connect_retry_delay_millis": 1000,
+                    "connect_timeout_millis": 100, "request_timeout_millis": 1000,
+                    "read_timeout_millis": 1000,
+                }),
+                1,
+            ),
+        ] {
+            let endpoint = closed_catalog_endpoint().await;
+            let (state, account, credential, _directory) = catalog_proxy_fixture(policy).await;
+            let mut attempts = Vec::new();
+            let result = codex_catalog_response(
+                &state,
+                &account,
+                &credential,
+                false,
+                |selected, generation| {
+                    attempts.push(selected.proxy().unwrap().0.to_owned());
+                    let client = state
+                        .codex_clients
+                        .account_transport_snapshot(&account, selected, generation)?;
+                    Ok(client.get(&endpoint))
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), "connection_failed");
+            assert_eq!(attempts.len(), expected_attempts);
+            assert_eq!(attempts[0], CATALOG_PRIMARY_PROXY);
+            if expected_attempts == 2 {
+                assert_eq!(attempts[1], CATALOG_BACKUP_PROXY);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_response_failures_do_not_change_proxy_selection() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        for (response, expected) in [
+            (ResponseTemplate::new(401), "authentication_failed"),
+            (ResponseTemplate::new(403), "authentication_failed"),
+            (ResponseTemplate::new(429), "rate_limited"),
+            (ResponseTemplate::new(502), "upstream_unavailable"),
+            (
+                ResponseTemplate::new(200).set_body_string("{"),
+                "invalid_response",
+            ),
+            (
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(2)),
+                "connection_failed",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/models"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (state, account, credential, _directory) = catalog_proxy_fixture(json!({
+                "connect_attempts": 4, "connect_retry_delay_millis": 0,
+                "connect_timeout_millis": 100, "request_timeout_millis": 1000,
+                "read_timeout_millis": 1000,
+            }))
+            .await;
+            let mut attempts = 0;
+            let result = codex_catalog_response(
+                &state,
+                &account,
+                &credential,
+                true,
+                |selected, generation| {
+                    attempts += 1;
+                    let client = state
+                        .codex_clients
+                        .account_transport_snapshot(&account, selected, generation)?;
+                    Ok(client.get(format!("{}/models", server.uri())))
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(attempts, 1);
+            let selected = state
+                .transport_proxy_groups
+                .select_config(
+                    account.id,
+                    account.credential_generation,
+                    &credential,
+                    &account.config,
+                )
+                .unwrap();
+            assert_eq!(selected.member(), Some(0));
+            assert_eq!(selected.generation, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_http2_reset_and_goaway_do_not_change_proxy_selection() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        for goaway in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/models", listener.local_addr().unwrap());
+            let received = Arc::new(AtomicUsize::new(0));
+            let count = received.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = http2::server::handshake(socket).await.unwrap();
+                while let Some(Ok((request, mut response))) = connection.accept().await {
+                    assert_eq!(request.method(), http::Method::GET);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if goaway {
+                        connection.abrupt_shutdown(http2::Reason::INTERNAL_ERROR);
+                    } else {
+                        response.send_reset(http2::Reason::CANCEL);
+                    }
+                }
+            });
+            let (state, account, credential, _directory) = catalog_proxy_fixture(
+                json!({"connect_attempts": 4, "connect_retry_delay_millis": 0}),
+            )
+            .await;
+            let mut attempts = 0;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                codex_catalog_response(
+                    &state,
+                    &account,
+                    &credential,
+                    true,
+                    |selected, generation| {
+                        attempts += 1;
+                        let client = state
+                            .codex_clients
+                            .account_transport_snapshot(&account, selected, generation)?;
+                        Ok(client.get(&endpoint).version(http::Version::HTTP_2))
+                    },
+                ),
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.unwrap().unwrap_err(), "connection_failed");
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+            assert_eq!(attempts, 1);
+            let selected = state
+                .transport_proxy_groups
+                .select_config(
+                    account.id,
+                    account.credential_generation,
+                    &credential,
+                    &account.config,
+                )
+                .unwrap();
+            assert_eq!(selected.member(), Some(0));
+            assert_eq!(selected.generation, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_fallback_keeps_the_original_absolute_deadline() {
+        let primary = closed_catalog_endpoint().await;
+        let backup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/models", backup.local_addr().unwrap());
+        let (state, account, credential, _directory) = catalog_proxy_fixture(json!({
+            "connect_attempts": 4, "connect_retry_delay_millis": 500,
+            "connect_timeout_millis": 100, "request_timeout_millis": 2000,
+            "read_timeout_millis": 2000,
+        }))
+        .await;
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut attempts = Vec::new();
+            let mut start_sender = Some(start_sender);
+            let result = codex_catalog_response(
+                &state,
+                &account,
+                &credential,
+                true,
+                |selected, generation| {
+                    if let Some(sender) = start_sender.take() {
+                        sender.send(tokio::time::Instant::now()).unwrap();
+                    }
+                    let proxy = selected.proxy().unwrap().0;
+                    attempts.push(proxy.to_owned());
+                    let client = state
+                        .codex_clients
+                        .account_transport_snapshot(&account, selected, generation)?;
+                    Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
+                        &primary
+                    } else {
+                        &endpoint
+                    }))
+                },
+            )
+            .await;
+            (result, attempts)
+        });
+        let started = start_receiver.await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), backup.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 4096];
+        assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(2010).saturating_sub(started.elapsed())).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), task).await;
+        tokio::time::resume();
+        let (result, attempts) = result
+            .expect("fallback must not reset the catalog deadline")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "connection_failed");
+        assert_eq!(attempts, vec![CATALOG_PRIMARY_PROXY, CATALOG_BACKUP_PROXY]);
+    }
+
+    #[test]
+    fn catalog_only_retries_proven_connection_failures() {
+        assert!(CatalogFailure::transport("send", false, true).retryable_connect);
+        assert!(CatalogFailure::transport("send", true, true).retryable_connect);
+        for failure in [
+            CatalogFailure::transport("send", true, false),
+            CatalogFailure::transport("send", false, false),
+            CatalogFailure::transport("body", false, true),
+            CatalogFailure::transport("body", true, false),
+            CatalogFailure::response("authentication_failed"),
+            CatalogFailure::response("rate_limited"),
+            CatalogFailure::response("invalid_response"),
+        ] {
+            assert!(!failure.retryable_connect, "{failure:?}");
+        }
+    }
+
     async fn pending_catalog(
         budget: CatalogBudget,
     ) -> (
@@ -1704,7 +2167,12 @@ mod tests {
             crate::provider::CodexTransportPolicy::default(),
         )
         .unwrap();
-        let task = tokio::spawn(bounded_json_response(client.get(url), budget, false));
+        let task = tokio::spawn(bounded_json_response(
+            client.get(url),
+            budget,
+            tokio::time::Instant::now() + budget.total,
+            false,
+        ));
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut bytes = [0; 4096];
         let mut received = 0;
@@ -1794,6 +2262,7 @@ mod tests {
                 total: Duration::from_secs(5),
                 read: Duration::from_secs(5),
             },
+            tokio::time::Instant::now() + Duration::from_secs(5),
             false,
         )
         .await

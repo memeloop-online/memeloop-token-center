@@ -607,7 +607,12 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
                 config: json!({
                     "base_url": server.uri(),
                     "network_scope": "public",
-                    "output_token_limits": {}
+                    "output_token_limits": {},
+                    "transport_policy": {
+                        "connect_timeout_millis": 100,
+                        "request_timeout_millis": 1000,
+                        "read_timeout_millis": 1000
+                    }
                 }),
                 credential: UpstreamCredential::OAuth {
                     access_token: "codex-access".into(),
@@ -729,6 +734,48 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     assert_eq!(
         updated.config["reservation_token_bounds"]["gpt-5.3-codex-spark"],
         128000
+    );
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for _ in 0..2 {
+        let (status, failed) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/models/sync?tenant_external_id=codex-tenant",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{failed}");
+        assert_eq!(failed["status"], "stale");
+        assert_eq!(failed["error_code"], "connection_failed");
+        assert_eq!(failed["models"], synced["models"]);
+        assert_eq!(failed["last_success_at"], synced["last_success_at"]);
+        assert_eq!(failed["disabled_models"], synced["disabled_models"]);
+        assert_eq!(
+            failed["credential_generation"],
+            synced["credential_generation"]
+        );
+        assert_eq!(failed["price_sync"]["status"], "skipped");
+    }
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(
+                account.id,
+                "codex-tenant",
+                updated.credential_generation,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap(),
+        "failed directory reads must release the catalog lease"
     );
 }
 
