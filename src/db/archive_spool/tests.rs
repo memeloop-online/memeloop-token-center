@@ -1,6 +1,143 @@
 use super::*;
 
 #[tokio::test]
+async fn cas_receipt_cleanup_rolls_back_and_replays_without_duplicate_events() {
+    use crate::archive_staging::{
+        ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
+        ArchiveStagingState, BeginArchiveStagingInput, BeginArchiveStagingResult,
+    };
+    let (_dir, db, identity) = fixture().await;
+    assert!(db.begin_response_archive_spool(identity).await.unwrap());
+    assert!(
+        db.append_response_archive_spool(identity, 0, 3, "opaque")
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.seal_response_archive_spool(identity, 1, 3)
+            .await
+            .unwrap()
+    );
+    terminal(&db, identity).await;
+    let task = db
+        .claim_response_archive_spool(Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(identity.request_id),
+        ArchiveStagingPurpose::Response,
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    let lease = match db
+        .begin_archive_staging_attempt(BeginArchiveStagingInput {
+            key,
+            intent_digest: ArchiveStagingIntentDigest::new("a".repeat(64)).unwrap(),
+            lease_token: Uuid::new_v4(),
+            lease_owner: ArchiveStagingLeaseOwner::new("cas-receipt-test").unwrap(),
+        })
+        .await
+        .unwrap()
+    {
+        BeginArchiveStagingResult::Created(lease) => lease,
+        _ => panic!("new attempt expected"),
+    };
+    let digest = blake3::hash(b"abc").to_hex().to_string();
+    let locator = format!(
+        "tenants/{}/cas/v1/blake3/{}/{}",
+        identity.tenant_id,
+        &digest[..2],
+        digest
+    );
+    let alien = locator.replace(&identity.tenant_id.to_string(), &Uuid::new_v4().to_string());
+    assert!(
+        !db.complete_response_archive_spool_cas(&task, &lease, &alien)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE request_records SET error_code = 'stream_incomplete'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.complete_response_archive_spool_cas(&task, &lease, &locator)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE request_records SET error_code = NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut stale = lease.clone();
+    stale.token = Uuid::new_v4();
+    assert!(
+        !db.complete_response_archive_spool_cas(&task, &stale, &locator)
+            .await
+            .unwrap()
+    );
+    sqlx::query("CREATE TRIGGER reject_cas_event BEFORE INSERT ON request_events WHEN NEW.event_kind = 'archive_bound' BEGIN SELECT RAISE(ABORT, 'cas publication rollback'); END").execute(&db.pool).await.unwrap();
+    assert!(
+        db.complete_response_archive_spool_cas(&task, &lease, &locator)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.archive_staging_attempt(key.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArchiveStagingState::Writing
+    );
+    let current: String =
+        sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(current, format!("gap://{}/response", identity.request_id));
+    sqlx::query("DROP TRIGGER reject_cas_event")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.complete_response_archive_spool_cas(&task, &lease, &locator)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.archive_staging_attempt(key.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ArchiveStagingState::CleanupPending
+    );
+    assert!(
+        db.complete_response_archive_spool_cas(&task, &lease, &locator)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.complete_response_archive_spool_cas(&task, &stale, &locator)
+            .await
+            .unwrap()
+    );
+    db.retry_response_archive_spool(&task, "upload_failed")
+        .await
+        .unwrap();
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'").bind(identity.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(events, 1);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    assert!(
+        db.complete_response_archive_spool_cas(&task, &lease, &locator)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn compressed_buffered_capture_refunds_to_exact_ciphertext_in_the_same_transaction() {
     let (_dir, db, id) = fixture().await;
     let pepper = b"compressed-budget-test-pepper-over-32-bytes";
@@ -811,7 +948,7 @@ async fn terminal_gap_event_is_atomic_idempotent_and_preserves_snapshot_facts() 
 }
 
 async fn terminal(db: &Database, id: ArchiveSpoolIdentity) {
-    sqlx::query("UPDATE request_records SET completed_at = 2, response_object = $1 WHERE id = $2")
+    sqlx::query("UPDATE request_records SET completed_at = 2, status_code = 200, response_object = $1 WHERE id = $2")
         .bind(format!("gap://{}/response", id.request_id))
         .bind(id.request_id.to_string())
         .execute(&db.pool)

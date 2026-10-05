@@ -4785,11 +4785,21 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         refs.view.archive_state,
         crate::model::RequestArchiveState::Bound
     );
-    assert!(refs.request_object.starts_with("staging/proxy/"));
+    let tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM request_records WHERE id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
+    assert!(crate::archive::is_tenant_cas_location(
+        tenant_id,
+        &refs.request_object
+    ));
     assert!(
         refs.response_object
             .as_deref()
-            .is_some_and(|locator| locator.starts_with("staging/proxy/"))
+            .is_some_and(|locator| crate::archive::is_tenant_cas_location(tenant_id, locator))
     );
     let archived_request = fixture
         .state

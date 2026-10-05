@@ -8,6 +8,77 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn failed_terminal_spools_never_enter_cas_staging() {
+    for (status_code, error_code) in [(503_i64, None), (200, Some("stream_incomplete"))] {
+        let (_dir, state, pool, identity) = fixture().await;
+        for purpose in [
+            BufferedArchivePurpose::Request,
+            BufferedArchivePurpose::Response,
+        ] {
+            assert!(
+                capture_buffered(
+                    &state,
+                    identity,
+                    purpose,
+                    Bytes::from_static(b"captured text")
+                )
+                .await
+            );
+        }
+        finish(&pool, identity).await;
+        sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3 WHERE id = $4")
+            .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
+            .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+        assert!(!process_one_for_test(&state).await);
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+    }
+}
+
+#[tokio::test]
+async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
+    for missing in [false, true] {
+        let (_dir, state, pool, identity) = fixture().await;
+        assert!(
+            capture_buffered(
+                &state,
+                identity,
+                BufferedArchivePurpose::Response,
+                Bytes::from_static(b"complete text")
+            )
+            .await
+        );
+        finish(&pool, identity).await;
+        if missing {
+            sqlx::query("DELETE FROM response_archive_spool_chunks WHERE request_id = $1")
+                .bind(identity.request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE response_archive_spool_chunks SET ciphertext = 'corrupt' WHERE request_id = $1")
+                .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+        }
+        assert!(process_one_for_test(&state).await);
+        let locator: String =
+            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(locator, format!("gap://{}/response", identity.request_id));
+        let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound'")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(bound, 0);
+    }
+}
+
+#[tokio::test]
 async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
     buffered_purposes_recover(false).await;
 }
@@ -79,11 +150,24 @@ async fn buffered_purposes_recover(compressed: bool) {
     let response_locator: String = row.get("response_object");
     assert_eq!(request_locator.ends_with(".mtcz1"), compressed);
     assert_eq!(response_locator.ends_with(".mtcz1"), compressed);
+    assert!(request_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
+    assert!(response_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
     assert_ne!(request_locator, response_locator);
     assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
     assert_eq!(
         state.archive.get(&response_locator).await.unwrap(),
         response
+    );
+    let staging_states: Vec<String> = sqlx::query_scalar(
+        "SELECT state FROM archive_staging_attempts WHERE owner_id = $1 ORDER BY purpose",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        staging_states,
+        vec!["cleanup_pending".to_owned(), "cleanup_pending".to_owned()]
     );
 }
 
@@ -371,7 +455,7 @@ async fn nine_burst_frames_are_durable_before_any_object_store_consumer() {
     assert_eq!(row.get::<i64, _>("chunk_count"), 1);
     // A fresh worker can recover the persisted stream with the same existing
     // pepper; no in-memory queue/producer state or extra credential is needed.
-    upload::process_one(&state, Uuid::new_v4()).await;
+    assert!(upload::process_one(&state, Uuid::new_v4()).await);
     let locator: String =
         sqlx::query_scalar("SELECT response_object FROM request_records WHERE id=$1")
             .bind(identity.request_id.to_string())
@@ -442,7 +526,7 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
     );
     assert!(producer.seal_for_test().await.is_err());
     finish(&pool, identity).await;
-    upload::process_one(&state, Uuid::new_v4()).await;
+    assert!(!upload::process_one(&state, Uuid::new_v4()).await);
     let locator: String =
         sqlx::query_scalar("SELECT response_object FROM request_records WHERE id=$1")
             .bind(identity.request_id.to_string())
@@ -450,6 +534,13 @@ async fn rejected_capture_never_publishes_a_complete_prefix() {
             .await
             .unwrap();
     assert_eq!(locator, format!("gap://{}/response", identity.request_id));
+    let staging_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(staging_attempts, 0, "gap rows never enter CAS staging");
 }
 
 #[tokio::test]

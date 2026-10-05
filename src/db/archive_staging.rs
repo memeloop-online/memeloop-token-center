@@ -551,6 +551,41 @@ pub(super) async fn bind_archive_staging_attempt_in_transaction(
             == Some(locator))
 }
 
+/// Schedules deletion of the exact staging attempt after a separately
+/// verified immutable CAS object has been published. The caller must update
+/// the application locator in this same transaction.
+pub(super) async fn publish_archive_staging_cas_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    lease: &ArchiveStagingWriteLease,
+) -> Result<bool, AppError> {
+    let now = archive_database_now(transaction, backend).await?;
+    let updated = sqlx::query(
+        "UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, bound_locator = NULL, bound_at = $1, next_cleanup_at = $2, empty_observed_at = NULL, last_error_code = NULL, updated_at = $3 WHERE attempt_id = $4 AND state = 'writing' AND lease_owner = $5 AND lease_token = $6 AND lease_expires_at > $7",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(lease.key.attempt_id.to_string())
+    .bind(lease.owner.as_str())
+    .bind(lease.token.to_string())
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() == 1 {
+        return Ok(true);
+    }
+    let existing = lock_attempt(transaction, backend, lease.key.attempt_id).await?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    Ok(archive_staging_key_from_row(&existing)? == lease.key
+        && existing.try_get::<String, _>("state")? == "cleanup_pending"
+        && existing.try_get::<Option<i64>, _>("bound_at")?.is_some()
+        && existing.try_get::<String, _>("writer_owner")? == lease.owner.as_str()
+        && existing.try_get::<String, _>("writer_token")? == lease.token.to_string())
+}
+
 pub(super) async fn release_bound_archive_staging_attempt_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     backend: DatabaseBackend,
