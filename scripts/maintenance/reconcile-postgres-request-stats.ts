@@ -182,7 +182,6 @@ function pruneApply(environment: NodeJS.ProcessEnv, cutoff: string): void {
   psql(environment, { args: variables({ cutoff }), input: `BEGIN;
 SET LOCAL lock_timeout = '5s';
 SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314));
-LOCK TABLE request_records, generation_jobs IN SHARE MODE;
 CREATE TEMP TABLE mtc_request_stats_prune_guard (
   invalid boolean NOT NULL CHECK (invalid = false)
 ) ON COMMIT DROP;
@@ -194,7 +193,37 @@ SELECT true
    UNION ALL
    SELECT 1 FROM generation_jobs
     WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+   UNION ALL
+   SELECT 1 FROM terminal_projection_outbox
+    WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+      AND projected_at IS NULL
+   UNION ALL
+   SELECT 1 FROM conversation_projection_outbox c
+    LEFT JOIN terminal_projection_outbox t ON t.request_id = c.request_id
+    WHERE c.projected_at IS NULL
+      AND (t.created_at IS NULL OR t.created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint)
+   UNION ALL
+   SELECT 1 FROM metered_usage_projection_outbox m
+    LEFT JOIN terminal_projection_outbox t ON t.reservation_id = m.reservation_id
+    WHERE m.projected_at IS NULL
+      AND (t.created_at IS NULL OR t.created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint)
  );
+INSERT INTO observability_prune_boundaries (scope, before_day, recorded_at)
+VALUES ('global', (:'cutoff'::date - DATE '1970-01-01')::bigint,
+        (extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+ON CONFLICT (scope) DO UPDATE SET
+  before_day = GREATEST(observability_prune_boundaries.before_day, excluded.before_day),
+  recorded_at = excluded.recorded_at;
+DELETE FROM usage_daily_aggregates
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM session_usage_daily
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM session_usage_hourly
+ WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24;
+DELETE FROM generation_usage_dimensions_daily
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM generation_usage_dimensions_hourly
+ WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24;
 DELETE FROM usage_analysis_daily
  WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
 DELETE FROM usage_analysis_hourly

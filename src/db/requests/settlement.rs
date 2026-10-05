@@ -934,7 +934,32 @@ pub(crate) async fn settle_token_usage_in_transaction(
     usage: &TokenUsage,
     now: i64,
 ) -> Result<i64, AppError> {
-    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, None).await
+    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, None, true).await
+}
+
+pub(super) async fn settle_terminal_usage_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    reservation: &UsageReservation,
+    usage: &TokenUsage,
+    metered: Option<(&MeteredUsageReservation, i64)>,
+    now: i64,
+) -> Result<i64, AppError> {
+    let actual_micros = match metered {
+        Some((metered, units)) => {
+            if units < 0 || units > metered.unit_ceiling {
+                return Err(AppError::BadRequest(
+                    "metered request usage exceeds its admitted unit ceiling".into(),
+                ));
+            }
+            Some(
+                units
+                    .checked_mul(metered.micros_per_unit)
+                    .ok_or(AppError::Internal)?,
+            )
+        }
+        None => None,
+    };
+    settle_token_usage_with_explicit_charge(tx, reservation, usage, now, actual_micros, false).await
 }
 
 pub(crate) async fn settle_metered_usage_in_transaction(
@@ -957,6 +982,7 @@ pub(crate) async fn settle_metered_usage_in_transaction(
         &TokenUsage::default(),
         now,
         Some(actual_micros),
+        true,
     )
     .await
 }
@@ -1019,6 +1045,7 @@ pub(crate) async fn settle_confirmed_image_charge_in_transaction(
         &TokenUsage::default(),
         now,
         Some(confirmed),
+        true,
     )
     .await?;
     if charged != confirmed {
@@ -1035,6 +1062,7 @@ async fn settle_token_usage_with_explicit_charge(
     usage: &TokenUsage,
     now: i64,
     forced_actual_micros: Option<i64>,
+    lock_projection: bool,
 ) -> Result<i64, AppError> {
     validate_token_usage(usage)?;
     let calculated_micros = match forced_actual_micros {
@@ -1042,7 +1070,9 @@ async fn settle_token_usage_with_explicit_charge(
         Some(_) => return Err(AppError::Internal),
         None => price_token_usage(reservation, usage)?,
     };
-    lock_request_stats_projection_writer_in_transaction(tx).await?;
+    if lock_projection {
+        lock_request_stats_projection_writer_in_transaction(tx).await?;
+    }
     if !reservation.enforcement_mode.enforces_prepaid_limits() {
         let claimed = sqlx::query(
             "UPDATE usage_reservations SET actual_micros = $1, status = 'settled', settled_at = $2 WHERE id = $3 AND key_id = $4 AND account_id = $5 AND enforcement_mode = 'metered_unlimited' AND status = 'reserved'",

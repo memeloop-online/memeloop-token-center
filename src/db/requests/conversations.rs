@@ -108,7 +108,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let request_json = String::from_utf8(encoded_request).map_err(|_| AppError::Internal)?;
     let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
     sqlx::query(
-        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(request_id.to_string())
     .bind(key.tenant_id.to_string())
@@ -119,6 +119,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(client_name)
     .bind(upstream_response_id)
     .bind(observed_at)
+    .bind(serde_json::json!({
+        "account_id": key.account_id,
+        "alias": key.alias,
+        "currency": key.currency,
+        "credential_generation": key.credential_generation,
+        "policy": key.policy,
+    }).to_string())
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -229,12 +236,38 @@ impl Database {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        let terminal = sqlx::query(
+            "SELECT created_at, projected_at FROM terminal_projection_outbox WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if terminal.as_ref().is_some_and(|row| {
+            row.try_get::<Option<i64>, _>("projected_at")
+                .ok()
+                .flatten()
+                .is_none()
+        }) {
+            return Ok(false);
+        }
+        if let Some(terminal) = terminal.as_ref()
+            && super::terminal_projection::statistics_pruned_in_transaction(
+                &mut transaction,
+                terminal.try_get("created_at")?,
+            )
+            .await?
+        {
+            let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'pruned', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3 AND lease_expires_at > $1")
+                .bind(now).bind(request_id.to_string()).bind(lease_owner.to_string()).execute(&mut *transaction).await?;
+            transaction.commit().await?;
+            return Ok(skipped.rows_affected() == 1);
+        }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3"
             }
         };
         let task = sqlx::query(select)
@@ -251,7 +284,30 @@ impl Database {
         let tenant_id = parse_uuid(task.try_get("tenant_id")?)?;
         let key_id = parse_uuid(task.try_get("key_id")?)?;
         let principal_id = parse_uuid(task.try_get("principal_id")?)?;
-        let key_row = sqlx::query(
+        let projection_key = if let Some(snapshot) =
+            task.try_get::<Option<String>, _>("key_snapshot_json")?
+        {
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+            AuthenticatedKey {
+                key_id,
+                tenant_id,
+                principal_id,
+                account_id: serde_json::from_value(snapshot["account_id"].clone())
+                    .map_err(|_| AppError::Internal)?,
+                alias: serde_json::from_value(snapshot["alias"].clone())
+                    .map_err(|_| AppError::Internal)?,
+                currency: serde_json::from_value(snapshot["currency"].clone())
+                    .map_err(|_| AppError::Internal)?,
+                credential_generation: serde_json::from_value(
+                    snapshot["credential_generation"].clone(),
+                )
+                .map_err(|_| AppError::Internal)?,
+                policy: serde_json::from_value(snapshot["policy"].clone())
+                    .map_err(|_| AppError::Internal)?,
+            }
+        } else {
+            let key_row = sqlx::query(
             "SELECT id, tenant_id, principal_id, account_id, alias, currency, credential_generation, policy_json FROM key_records WHERE id = $1 AND tenant_id = $2 AND principal_id = $3",
         )
         .bind(key_id.to_string())
@@ -260,16 +316,17 @@ impl Database {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(AppError::NotFound)?;
-        let projection_key = AuthenticatedKey {
-            key_id: parse_uuid(key_row.try_get("id")?)?,
-            tenant_id: parse_uuid(key_row.try_get("tenant_id")?)?,
-            principal_id: parse_uuid(key_row.try_get("principal_id")?)?,
-            account_id: parse_uuid(key_row.try_get("account_id")?)?,
-            alias: key_row.try_get("alias")?,
-            currency: key_row.try_get("currency")?,
-            credential_generation: key_row.try_get("credential_generation")?,
-            policy: serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
-                .map_err(|_| AppError::Internal)?,
+            AuthenticatedKey {
+                key_id: parse_uuid(key_row.try_get("id")?)?,
+                tenant_id: parse_uuid(key_row.try_get("tenant_id")?)?,
+                principal_id: parse_uuid(key_row.try_get("principal_id")?)?,
+                account_id: parse_uuid(key_row.try_get("account_id")?)?,
+                alias: key_row.try_get("alias")?,
+                currency: key_row.try_get("currency")?,
+                credential_generation: key_row.try_get("credential_generation")?,
+                policy: serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
+                    .map_err(|_| AppError::Internal)?,
+            }
         };
         let request_json = serde_json::from_str(&task.try_get::<String, _>("request_json")?)
             .map_err(|_| AppError::Internal)?;
@@ -304,7 +361,7 @@ impl Database {
             .await?;
         }
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3",
         )
         .bind(now)
         .bind(request_id.to_string())
@@ -386,7 +443,7 @@ impl Database {
         let request_id = request_id.to_string();
         let request_created_at = if attach_request_record {
             let locator = sqlx::query(
-                "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
+                "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1 UNION ALL SELECT created_at, tenant_id, key_id FROM terminal_projection_outbox WHERE request_id = $1 AND NOT EXISTS (SELECT 1 FROM request_record_locators WHERE id = $1)",
             )
             .bind(&request_id)
             .fetch_optional(&mut **transaction)
@@ -404,14 +461,17 @@ impl Database {
         let request_fact_exists = if let Some(request_created_at) = request_created_at {
             lock_request_records_projection_source_in_transaction(transaction).await?;
             if matches!(self.backend, DatabaseBackend::PostgreSql) {
-                sqlx::query(
+                let source = sqlx::query(
                     "SELECT id FROM request_records WHERE id = $1 AND created_at = $2 FOR UPDATE",
                 )
                 .bind(&request_id)
                 .bind(request_created_at)
                 .fetch_optional(&mut **transaction)
-                .await?
-                .ok_or(AppError::NotFound)?;
+                .await?;
+                if source.is_none() && sqlx::query("SELECT request_id FROM terminal_projection_outbox WHERE request_id = $1 AND created_at = $2")
+                    .bind(&request_id).bind(request_created_at).fetch_optional(&mut **transaction).await?.is_none() {
+                    return Err(AppError::NotFound);
+                }
             }
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1",
@@ -761,7 +821,9 @@ impl Database {
                 .bind(request_created_at)
                 .execute(&mut **transaction)
                 .await?;
-            if attached.rows_affected() != 1 {
+            let snapshot = sqlx::query("UPDATE terminal_projection_outbox SET session_id = $1 WHERE request_id = $2 AND created_at = $3")
+                .bind(cluster_id.to_string()).bind(&request_id).bind(request_created_at).execute(&mut **transaction).await?;
+            if attached.rows_affected() != 1 && snapshot.rows_affected() != 1 {
                 return Err(AppError::Internal);
             }
             if request_fact_exists {
@@ -1079,7 +1141,7 @@ async fn emit_conversation_projected_event_in_transaction(
         allocate_request_event_cursor(transaction, unix_millis(), &tenant_id, &key_id, &request_id)
             .await?;
     let inserted = sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND completed_at IS NOT NULL",
+        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND completed_at IS NOT NULL UNION ALL SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5 AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)",
     )
     .bind(event.event_id)
     .bind(event.event_at)

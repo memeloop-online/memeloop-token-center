@@ -292,6 +292,13 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         }
     );
     periodic!(
+        "terminal_projection",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            process_terminal_projection_batch(state, projection_owner).await;
+        }
+    );
+    periodic!(
         "metered_projection",
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
@@ -633,6 +640,29 @@ async fn supervise_roles(
         }
     }
     assert!(!failed, "background worker role failed");
+}
+
+async fn process_terminal_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let tasks = match state
+        .db
+        .claim_terminal_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::error!(%error, "worker failed to claim terminal projections");
+            return;
+        }
+    };
+    for request_id in tasks {
+        if let Err(error) = state
+            .db
+            .project_claimed_terminal_projection_task(lease_owner, request_id)
+            .await
+        {
+            tracing::error!(%error, %request_id, "worker failed to apply terminal projection");
+        }
+    }
 }
 
 async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: Uuid) {

@@ -28,6 +28,16 @@ SELECT true
   FROM mtc_reconcile_day_bounds
  WHERE end_ms > (extract(epoch FROM (CURRENT_DATE::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 
+INSERT INTO mtc_reconcile_completed_day_guard (invalid)
+SELECT true FROM mtc_reconcile_day_bounds b
+ WHERE EXISTS (SELECT 1 FROM observability_prune_boundaries p
+                WHERE p.scope = 'global' AND b.day_bucket < p.before_day)
+    OR EXISTS (SELECT 1 FROM request_records r
+                JOIN metered_usage_projection_outbox m ON m.reservation_id = r.reservation_id
+               WHERE r.created_at >= b.start_ms AND r.created_at < b.end_ms
+                 AND m.projected_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = r.id));
+
 INSERT INTO request_stats_facts (
   request_id, tenant_id, key_id, created_at, model, protocol, status_class,
   error_code, upstream_account_id, model_route_id, duration_ms,
@@ -45,6 +55,7 @@ SELECT r.id, r.tenant_id, r.key_id, r.created_at, r.model, r.protocol,
   CROSS JOIN mtc_reconcile_day_bounds b
  WHERE r.created_at >= b.start_ms AND r.created_at < b.end_ms
    AND r.completed_at IS NOT NULL AND r.status_code IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = r.id)
 ON CONFLICT (request_id) DO UPDATE SET
   tenant_id = excluded.tenant_id,
   key_id = excluded.key_id,
@@ -68,6 +79,9 @@ ON CONFLICT (request_id) DO UPDATE SET
 DELETE FROM request_stats_facts f
  USING mtc_reconcile_day_bounds b
  WHERE f.created_at >= b.start_ms AND f.created_at < b.end_ms
+   AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t
+                    WHERE t.request_id = f.request_id AND t.projected_at IS NOT NULL
+                      AND t.statistics_outcome = 'applied')
    AND NOT EXISTS (
      SELECT 1
        FROM request_records r
