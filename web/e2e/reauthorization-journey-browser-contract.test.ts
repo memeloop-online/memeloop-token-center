@@ -6,18 +6,19 @@ import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 declare global {
   interface Window {
-    claudeCompletionFixture: { calls: number; aborted: boolean; hasSignal: boolean; release?: (success: boolean) => void };
+    claudeCompletionFixture: { calls: number; aborted: boolean; hasSignal: boolean; release?: (success: boolean, error?: { message: string; code: string; authorization_code?: string; state?: string; session_token?: string }, status?: number) => void };
   }
 }
 
-test('Claude reauthorization locks manual completion and ignores responses after leaving the workspace', { timeout: 60_000 }, async () => {
+for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safely explains failures, locks completion and ignores abandoned responses (${locale})`, { timeout: 60_000 }, async () => {
   const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   try {
+    const chinese = locale === 'zh-CN';
     const page = await browser.newPage();
-    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
     const account = { id: 'claude-reauthorization-fixture', name: 'Fixture Claude account', tenant_external_id: 'fixture-a', driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, updated_at: 3, route_count: 0, config: {}, can_reauthorize: true, can_update_transport_proxy: false };
     let accountReads = 0;
     let starts = 0;
@@ -38,7 +39,7 @@ test('Claude reauthorization locks manual completion and ignores responses after
     });
     await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
     await page.locator(`[data-inline-edit-trigger="${account.id}"]`).click();
-    const reauthorize = page.getByRole('button', { name: 'Authorize again', exact: true });
+    const reauthorize = page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true });
     await reauthorize.click();
     await page.evaluate(account => {
       const previous = window.fetch;
@@ -50,45 +51,80 @@ test('Claude reauthorization locks manual completion and ignores responses after
         state.hasSignal = Boolean(init?.signal);
         init?.signal?.addEventListener('abort', () => { state.aborted = true; }, { once: true });
         return new Promise<Response>(resolve => {
-          state.release = success => resolve(new Response(JSON.stringify(success ? { ...account, credential_generation: 3 } : { error: { message: 'synthetic-claude-error-canary' } }), { status: success ? 200 : 503 }));
+          state.release = (success, error, status = 400) => resolve(new Response(JSON.stringify(success ? { ...account, credential_generation: 3 } : { error }), { status: success ? 200 : status }));
         });
       };
     }, account);
     const workspace = page.locator('.provider-reauthorization-workspace');
-    const complete = workspace.getByRole('button', { name: 'Complete authorization', exact: true });
+    const complete = workspace.getByRole('button', { name: chinese ? '完成授权' : 'Complete authorization', exact: true });
     const code = workspace.locator('.manual-authorization input');
-    await workspace.getByRole('button', { name: 'Start login', exact: true }).click();
+    const start = workspace.getByRole('button', { name: chinese ? '开始登录' : 'Start login', exact: true });
+    const close = workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true });
+    const editHeading = page.getByRole('heading', { name: chinese ? '编辑 Fixture Claude account' : 'Edit Fixture Claude account', exact: true });
+    const mismatch = chinese
+      ? '授权结果与本次登录会话不匹配。请从本次提供商登录页面重新复制完整的授权结果；若已无法获取，请关闭并重新打开授权表单开始登录。'
+      : 'The authorization result does not match this login session. Copy the complete result from this provider login again; if it is no longer available, close and reopen the authorization form to start login again.';
+    const unknown = chinese
+      ? '授权结果暂时无法确认。请关闭表单并检查账号状态；如仍需授权，重新打开表单后重试或重新开始登录。'
+      : 'The authorization result cannot be confirmed yet. Close the form and check the account status; if authorization is still needed, reopen the form to retry or start login again.';
+    const knownFailure = { message: 'invalid request: OAuth state did not match', code: 'invalid_request', authorization_code: 'synthetic-error-code-canary', state: 'synthetic-error-state-canary', session_token: 'synthetic-error-token-canary' };
+    const unknownFailure = { ...knownFailure, message: 'synthetic-error-message-canary code=synthetic-error-code-canary state=synthetic-error-state-canary session_token=synthetic-error-token-canary', code: 'synthetic-error-code-canary' };
+    await start.click();
     await code.fill('synthetic-code#synthetic-state');
     await complete.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
     await page.waitForFunction(() => window.claudeCompletionFixture.calls > 0);
     assert.equal(await page.evaluate(() => window.claudeCompletionFixture.calls), 1);
     assert.equal(await complete.isDisabled(), true);
     assert.equal(await code.isDisabled(), true);
-    await page.evaluate(() => window.claudeCompletionFixture.release?.(false));
-    await workspace.getByRole('alert').waitFor();
-    assert.doesNotMatch(await workspace.innerText(), /synthetic-claude-error-canary/);
+    await page.evaluate(error => window.claudeCompletionFixture.release?.(false, error), knownFailure);
+    await workspace.getByText(mismatch, { exact: true }).waitFor();
+    assert.equal(await workspace.getByRole('alert').innerText(), mismatch);
+    assert.doesNotMatch(await page.locator('body').innerHTML(), /synthetic-error-(?:message|code|state|token)-canary|invalid request: OAuth state did not match/);
     assert.equal(await complete.isEnabled(), true);
     await complete.click();
     await page.waitForFunction(() => window.claudeCompletionFixture.calls === 2);
-    await workspace.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.evaluate(error => window.claudeCompletionFixture.release?.(false, error, 409), unknownFailure);
+    await workspace.getByText(unknown, { exact: true }).waitFor();
+    assert.equal(await workspace.getByRole('alert').innerText(), unknown);
+    assert.doesNotMatch(await page.locator('body').innerHTML(), /synthetic-error-(?:message|code|state|token)-canary/);
+    assert.equal(await complete.isEnabled(), true);
+    await complete.click();
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 3);
+    await close.click();
     await workspace.waitFor({ state: 'detached' });
-    await page.getByRole('heading', { name: 'Edit Fixture Claude account', exact: true }).waitFor();
+    await editHeading.waitFor();
     const readsBeforeLateResponse = accountReads;
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     assert.equal(accountReads, readsBeforeLateResponse, 'an abandoned completion cannot refresh or navigate the parent');
-    assert.equal(await page.getByRole('heading', { name: 'Edit Fixture Claude account', exact: true }).count(), 1);
+    assert.equal(await editHeading.count(), 1);
     assert.equal(await page.evaluate(() => window.claudeCompletionFixture.aborted && window.claudeCompletionFixture.hasSignal), true);
     await reauthorize.click();
-    await workspace.getByRole('button', { name: 'Start login', exact: true }).click();
+    await start.click();
     await code.fill('synthetic-next-code#synthetic-state');
     await complete.click();
-    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 3);
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 4);
+    await close.click();
+    await workspace.waitFor({ state: 'detached' });
+    await editHeading.waitFor();
+    await reauthorize.click();
+    await workspace.waitFor();
+    await page.evaluate(error => window.claudeCompletionFixture.release?.(false, error), knownFailure);
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(await workspace.getByRole('alert').count(), 0, 'an abandoned failure cannot overwrite the reopened authorization workspace');
+    assert.equal(accountReads, readsBeforeLateResponse, 'an abandoned failure cannot refresh the parent');
+    assert.equal(await start.isEnabled(), true);
+    assert.equal(await page.getByText(mismatch, { exact: true }).count(), 0);
+    assert.doesNotMatch(await page.locator('body').innerHTML(), /synthetic-error-(?:message|code|state|token)-canary/);
+    await start.click();
+    await code.fill('synthetic-final-code#synthetic-state');
+    await complete.click();
+    await page.waitForFunction(() => window.claudeCompletionFixture.calls === 5);
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await workspace.waitFor({ state: 'detached' });
-    await page.getByText('Signed in. Account authorization updated.', { exact: true }).waitFor();
+    await page.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true }).waitFor();
     assert.equal(accountReads, readsBeforeLateResponse + 1);
-    assert.equal(starts, 2, 'retrying completion does not start another authorization session');
+    assert.equal(starts, 3, 'completion retries and abandoned responses never start another authorization session');
   } finally { await browser.close(); await server.close(); }
 });
 

@@ -44,7 +44,7 @@ import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
 import { AuthorizationCodeConnection } from '../AuthorizationCodeConnection';
 import { OAuthLoginLinkActions } from '../OAuthLoginLinkActions';
-import { canReauthorizeAccount } from '../authorizationCode';
+import { authorizationCompleteError, canReauthorizeAccount } from '../authorizationCode';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -664,7 +664,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       if (scopeVersion.current !== attempt) return;
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
       savedAccount.current = result; setSession(undefined); setManualCode(''); await reloadList();
-    } catch { if (scopeVersion.current === attempt) setError(t('common.requestFailed')); }
+    } catch (reason) { if (scopeVersion.current === attempt) setError(journeyCopy[authorizationCompleteError(reason)]); }
     finally { if (scopeVersion.current === attempt) { pollLock.current = false; setPolling(false); } }
   };
   return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>

@@ -10,6 +10,26 @@ export function isAuthorizationIdentityMismatch(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 409 && reason.code === 'oauth_identity_mismatch';
 }
 
+export function authorizationCompleteError(reason: unknown) {
+  if (!(reason instanceof ApiError)) return 'completeUncertain';
+  if (reason.status === 400 && reason.code === 'invalid_request') {
+    switch (reason.message) {
+      case 'invalid request: invalid OAuth session token': return 'completeInvalidSession';
+      case 'invalid request: OAuth login session expired': return 'completeExpired';
+      case 'invalid request: OAuth login session is no longer active': return 'completeInactive';
+      case 'invalid request: Claude OAuth completion must be code#state': return 'completeInvalidCode';
+      case 'invalid request: OAuth state did not match': return 'completeStateMismatch';
+    }
+  }
+  if (reason.status === 409 && reason.code === 'conflict'
+    && reason.message === 'conflict: reauthorization must use the same Anthropic account') return 'completeIdentityMismatch';
+  if (reason.status === 401 && reason.code === 'unauthorized') return 'completeUnauthorized';
+  if (reason.status === 403 && reason.code === 'forbidden') return 'completeForbidden';
+  if (reason.status === 502 && reason.code === 'upstream_error') return 'completeUnavailable';
+  if (reason.status === 503 && reason.code === 'service_overloaded') return 'completeOverloaded';
+  return 'completeUncertain';
+}
+
 export interface AuthorizationCodeSession {
   driver: string;
   login_url: string;
