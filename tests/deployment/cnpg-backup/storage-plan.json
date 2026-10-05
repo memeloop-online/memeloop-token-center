@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "engine": "docker.io/longhornio/longhorn-engine:v1.12.0",
+  "sourceVolume": "pvc-74b34d6c-c730-4b9f-bfdc-2f165727c40a",
+  "sourceNode": "haixia",
+  "sourceDiskUUID": "2caae5c7-7bd6-496f-8df4-5f8b186e3f11",
+  "requiredOverProvisioningPercent": 100,
+  "requiredMinimumAvailablePercent": 25,
+  "hostFreeReserveGiB": 32,
+  "minimumFreeInodes": 65536,
+  "physicalBudget": "4 * logical GiB + 2 GiB per volume: one full head + 2x snapshot limit + one full maintenance copy + metadata. Bookkeeping only; not physical preallocation or a host-wide quota.",
+  "longTermPhysicalWalProtection": "open-not-satisfied-by-logical-backup",
+  "volumes": [
+    {
+      "role": "stage",
+      "name": "mtc-pg-bounded-stage-20261005",
+      "storageClass": "mtc-cnpg-stage-haixia-data1-20261005",
+      "node": "haixia",
+      "nodeTags": [
+        "storage-tier-haixia",
+        "storage-tier-large"
+      ],
+      "diskTags": [
+        "storage-tier-control-pane",
+        "storage-tier-large"
+      ],
+      "disk": "data1-disk",
+      "diskUUID": "b59651cb-831f-4a8d-8438-0709359b48c8",
+      "path": "/data1/longhorn",
+      "sizeGiB": 28
+    },
+    {
+      "role": "archive",
+      "name": "mtc-pg-bounded-archive-20261005",
+      "storageClass": "mtc-cnpg-archive-versetensor-20261005",
+      "node": "versetensor-hv",
+      "nodeTags": [
+        "storage-tier-hosted",
+        "storage-tier-poor"
+      ],
+      "diskTags": [
+        "storage-tier-control-pane",
+        "storage-tier-poor"
+      ],
+      "disk": "default-disk-2306f5036718ea6d",
+      "diskUUID": "da83ab44-d26f-4c20-b956-87fa954cd603",
+      "path": "/var/lib/longhorn/",
+      "sizeGiB": 28
+    },
+    {
+      "role": "scratch",
+      "name": "mtc-pg-bounded-scratch-20261005",
+      "storageClass": "mtc-cnpg-scratch-versetensor-20261005",
+      "node": "versetensor-hv",
+      "nodeTags": [
+        "storage-tier-hosted",
+        "storage-tier-poor"
+      ],
+      "diskTags": [
+        "storage-tier-control-pane",
+        "storage-tier-poor"
+      ],
+      "disk": "default-disk-2306f5036718ea6d",
+      "diskUUID": "da83ab44-d26f-4c20-b956-87fa954cd603",
+      "path": "/var/lib/longhorn/",
+      "sizeGiB": 64
+    }
+  ]
+}

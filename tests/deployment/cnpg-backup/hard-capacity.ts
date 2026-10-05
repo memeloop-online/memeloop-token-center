@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseAllDocuments, stringify } from 'yaml';
 import { capacityPolicy, restoreReceipt } from './capacity-policy.ts';
+import { storageResources, validateStorageResources } from './storage-preflight.ts';
 
 export const boundedClaims = {
   stage: 'mtc-pg-bounded-stage-20261005',
@@ -46,7 +47,7 @@ export function preparedResources(): any[] {
   for (const resource of resources.filter(resource => resource.kind === 'Job')) {
     resource.metadata.name = renamedJobs[resource.metadata.name];
     Object.assign(resource.metadata.annotations, {
-      'recovery.mtc/storage-gate': 'unapproved-prebound-dedicated-csi-volumes-no-dynamic-provisioning-no-host-format-or-loop-setup',
+      'recovery.mtc/storage-gate': 'exact-prebound-longhorn-volumes-require-separate-allocation-approval-no-host-format-or-loop-setup',
       'recovery.mtc/deployment-gate': 'separate-owner-approval-required-do-not-apply-or-unsuspend',
       'recovery.mtc/host-headroom-gate': 'review-backing-block-and-inode-reserves-concurrent-writers-and-no-source-data-device-interference-before-deployment',
       'recovery.mtc/long-term-protection': 'physical-backup-and-continuous-wal-archive-remain-open-not-satisfied-by-logical-receipt',
@@ -140,21 +141,8 @@ guard_pid=$!`);
     }
   }
   resources.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: policyName, namespace: 'memeloop-token-center' }, data: { 'capacity.sh': capacityPolicy } });
-  for (const [role, name] of Object.entries(boundedClaims)) {
-    resources.push({
-      apiVersion: 'v1', kind: 'PersistentVolumeClaim',
-      metadata: { name, namespace: 'memeloop-token-center', annotations: {
-        'recovery.mtc/deployment-gate': 'placeholder-only-existing-dedicated-hard-capacity-csi-pv-must-be-reviewed-and-prebound-no-auto-provisioning',
-        'recovery.mtc/storage-review': 'verify-physical-allocation-independent-offhost-placement-reclaim-Retain-and-backing-host-block-inode-reserves',
-      } },
-      spec: {
-        accessModes: ['ReadWriteOnce'], volumeMode: 'Filesystem',
-        storageClassName: 'review-required-existing-hard-capacity',
-        volumeName: `review-required-existing-${role}-pv`,
-        resources: { requests: { storage: role === 'scratch' ? '64Gi' : '28Gi' } },
-      },
-    });
-  }
+  validateStorageResources();
+  resources.push(...structuredClone(storageResources));
   return resources;
 }
 

@@ -6,6 +6,7 @@ import { stringify } from 'yaml';
 import { capacityPolicy } from './capacity-policy.ts';
 import { archiveDirectory, archiveName, copyArchive, type Remote } from './copy.ts';
 import { boundedClaims, boundedJobs, preparedResources } from './hard-capacity.ts';
+import { storagePlan, validateStorageResources } from './storage-preflight.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const resources = preparedResources();
@@ -24,8 +25,8 @@ test('prepared resources cannot provision unbounded storage or start a productio
   const claims = resources.filter(resource => resource.kind === 'PersistentVolumeClaim');
   assert.equal(claims.length, 3);
   for (const claim of claims) {
-    assert.match(claim.spec.volumeName, /^review-required-existing-.*-pv$/);
-    assert.equal(claim.spec.storageClassName, 'review-required-existing-hard-capacity');
+    assert.equal(claim.spec.volumeName, claim.metadata.name);
+    assert.equal(claim.spec.storageClassName, storagePlan.volumes.find((volume: any) => volume.name === claim.metadata.name).storageClass);
     assert.equal(claim.spec.volumeMode, 'Filesystem');
     assert.equal(claim.spec.resources.requests.storage, claim.metadata.name === boundedClaims.scratch ? '64Gi' : '28Gi');
   }
@@ -64,7 +65,9 @@ test('prepared resources cannot provision unbounded storage or start a productio
   assert.equal(isolation.spec.egress, undefined);
   const manifest = resources.map(resource => stringify(resource)).join('---\n');
   assert.doesNotMatch(manifest, /\b(?:mkfs|losetup|fallocate)\b|storageClassName: local-path/);
-  execFileSync('/tmp/kubeconform', ['-strict', '-summary', '-exit-on-error', '-'], { input: manifest, timeout: 90_000 });
+  validateStorageResources(resources.filter(resource => ['StorageClass', 'Volume', 'PersistentVolume', 'PersistentVolumeClaim'].includes(resource.kind)));
+  const coreManifest = resources.filter(resource => resource.apiVersion !== 'longhorn.io/v1beta2').map(resource => stringify(resource)).join('---\n');
+  execFileSync('/tmp/kubeconform', ['-strict', '-summary', '-exit-on-error', '-'], { input: coreManifest, timeout: 90_000 });
 });
 
 function fixture(backupMiB = 64, scratchMiB = 256, backupInodes = 8192): string {
