@@ -70,7 +70,7 @@ test("driver and day rebuild SQL retain reconciliation safety markers", () => {
     "shell: false",
   ]) assert.ok(driverSource.includes(marker), `missing request-stats safety marker: ${marker}`);
   for (const marker of [
-    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
     "IN SHARE ROW EXCLUSIVE MODE",
     "ON CONFLICT (request_id) DO UPDATE SET",
     "cached_input_tokens, cache_write_tokens",

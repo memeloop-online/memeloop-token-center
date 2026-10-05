@@ -1,9 +1,9 @@
 # PR #423: derived publication and durable finalization work split
 
-Status: implementation contract and exclusive file allocation, not completed
-storage isolation. No additional worker has been started by this document.
-The parent can assign the database slice below without another architecture
-discovery pass. All changes integrate through #423 only.
+The #423 allocation below is historical. PR #469 owns the complete A1 database,
+maintenance, worker/module/migration registration and test integration, including
+the prune driver. There is no separate B owner for this iteration. A2 permit
+handoff and body spooling remain outside this change.
 
 ## Integrated starting point
 
@@ -165,57 +165,77 @@ The first reviewable implementation is A1 with its fault/rebuild tests; A2/B fol
 with the durable ownership API and real permit-release tests. A green baseline or
 this allocation document alone does not satisfy either implementation gate.
 
-## A1 retention boundary audit on merged master
+## A1 implementation in #469
 
-Audited baseline: `aa28e92c75818519e8d5b4a49e4002217de1f2c3`.
-Status: unresolved ownership/retention contract; no runtime isolation enabled.
-The proposed 0118 number was checked against local worktrees and the files of
-open PRs #388, #414, #417, #422, #457, #466, #467 and #468. None added 0118.
-No migration was written or number consumed; check again before allocation.
+Baseline: `aa28e92c75818519e8d5b4a49e4002217de1f2c3`. Migration 0118 is reserved
+for terminal projection and prune receipts; master and every open PR were
+checked again before writing it. Both database registries and schema-version
+metadata register 118. Runtime forwarding activation is gated on Actions;
+registered replay and its acceptance entry point land first.
 
-The exclusive write set omits
-`scripts/maintenance/reconcile-postgres-request-stats.ts`. Its `pruneApply`
-holds the exclusive statistics advisory lock, then checks only retained
-`request_records` and `generation_jobs` before deleting facts and aggregates.
-It has no durable pending-work check or persisted prune boundary. This is a
-second maintenance entry point, separate from the assigned day-rebuild SQL.
+The winning request CAS still owns normalization, pricing, reservation settlement,
+the financial ledger, prepaid budgets/account lifetime usage, terminal cause,
+archive generation fence and settlement feed. Its commit inserts a typed terminal
+snapshot with the same request/reservation identity. No lossy queue owns evidence.
+Duplicate financial recovery can return the retained result even after request
+row/locator retention. A conflicting outbox insert aborts the financial transaction.
 
-The following interleaving must be specified before enabling A1:
+Terminal claimers take at most 32 rows, use PostgreSQL `SKIP LOCKED`, and receive
+a five-minute lease. Owners are fresh batch nonces; an expired nonce cannot
+reclaim its own task and accidentally revive an older attempt. Replay takes the
+shared statistics fence before task/fact locks. Facts, aggregates, the committed
+event cursor and statistics acknowledgement commit together. A preceding short
+transaction applies deferred account usage and both account receipts together,
+without acquiring a statistics or event lock. Account updates therefore survive
+a failed statistics attempt, and waiting for a nonfinancial lock holds no account
+lock against a financial writer. This also avoids reversing legacy account/cursor
+lock ordering during rolling upgrades.
+`account_projected_at` and `statistics_outcome` distinguish financial projection
+from an explicitly pruned statistical scope.
 
-1. A financial winner commits its ledger, terminal row and immutable projection
-   task; the projector has not committed.
-2. Source retention removes the terminal source row. This is a required supported
-   condition under A1's requirement to survive source retention, not a claim that
-   this audit ran retention or observed it in production.
-3. `pruneApply` passes its raw-row guard and deletes the old day's facts and
-   aggregates. The pending immutable task is not part of its guard.
-4. After prune commits, a task replay can recreate part of a deliberately pruned
-   day. Conversely, a projector that requires the deleted source cannot meet
-   A1's retention guarantee. An exclusive lock only orders these transactions;
-   it does not decide whether replay or pruning owns that task.
+New conversation envelopes contain a bounded fingerprint (at most 1024 hashes)
+and a Merkle leaf, plus identity and declared hints. They reference immutable
+content/prefix rows prepared before the final financial transaction; they do
+not duplicate the request body. Prefix traversal for background classification
+uses those durable nodes. Request row/locator retention does not prevent fact
+reclassification or projected-event publication. This change does not implement
+request body spooling or eliminate synchronous immutable content preparation.
 
-Existing metered replay cannot simply be reused after moving terminal facts:
-`project_claimed_metered_usage_projection_task` discovers requests from live
-`request_records`, requires their facts when a row exists, but acknowledges
-account usage without request projection when no row exists. Conversation
-reclassification also depends on a live request locator/row and existing fact.
-A terminal outbox snapshot alone does not repair these dependent consumers.
-The daily rebuild additionally deletes facts with no live terminal source, so
-reconstructing a retained task's fact is insufficient unless rebuild uses the
-same durable retention/receipt policy.
+Legacy metered/conversation workers cannot safely consume new tasks: a metered
+worker could add the new terminal's aggregates a second time, and a conversation
+worker cannot interpret the compact semantic envelope. Their old lease fields
+therefore retain a `terminal-v118` marker with a nonexpiring sentinel. New terminal
+replay owns the marked metered account receipt; conversation replay uses separate
+v118 lease fields. Old selectors cannot claim these tasks, including after a new
+worker crashes. A crashed new worker is recovered through the new expiring lease,
+never by releasing the legacy marker. Pending metered amounts remain visible to
+account usage snapshots throughout, and are never skipped by a statistics prune.
 
-Required integration decision: assign the prune entry point and its tests to a
-named owner and choose a common receipt/retention policy. At minimum, pruning
-must fail closed while relevant durable work is pending under the same fence;
-task enqueue/replay must also honor a persisted prune boundary, or an equivalent
-proved source-retention exclusion, so a later commit cannot resurrect pruned
-data. Source-independent snapshots and dependencies must remain replayable until
-every required consumer acknowledges. Account lifetime usage and financial
-receipts must never be discarded by an observability prune.
+The prune driver holds the exclusive background statistics fence, rejects
+unacknowledged terminal/conversation/metered work in the target scope, and commits
+a monotonic global `before_day` tombstone with deletion. Financial enqueue does
+not lock the tombstone: a concurrent commit can miss the prune snapshot, but
+replay must read the committed tombstone under the shared fence. Such a task gets
+an explicit `pruned` statistics receipt while its account update still completes.
+Events and financial receipts are not observability facts and are not deleted by
+this operation. Session totals are recomputed from surviving facts.
 
-Add Actions acceptance for source deletion before projection, prune with pending
-tasks, replay after prune, and day rebuild after source deletion, including both
-metered and conversation projector orders. Do not run these operations against
-production. Worker, module and migration registration still belong to integrator
-B under the table above; they must land with the runtime change before removing
-any lock or wait. Permit handoff and body spooling remain unimplemented A2/B work.
+Day rebuild refuses pruned days, never synthesizes pending terminal facts from
+live sources, and preserves acknowledged terminal facts whose raw sources have
+expired. Legacy pending metered facts prevent rebuilding that day until their
+consumer finishes. Thus facts and aggregate acknowledgement share one inclusion
+boundary; neither a timestamp watermark nor a maximum UUID stands in for receipts.
+Maintenance uses READ COMMITTED after acquiring the exclusive fence: an advisory
+lock query that waits under SERIALIZABLE can establish its snapshot before an
+earlier projector commits. Reading after fence acquisition must see that commit.
+The current maintenance scripts must accompany the runtime change; old maintenance
+scripts do not implement this protocol.
+
+Payloads, content dependencies and receipts are retained; no outbox GC is added.
+Future GC must account for every consumer and the financial recovery boundary.
+Actions acceptance includes actual prune/day-rebuild SQL, source deletion,
+claim expiry, stale owners, duplicate recovery, account/conversation ordering,
+acknowledgement rollback and both PostgreSQL locks. Existing 1024-request tests
+retain their sizes. No local build/test/install or production operation is part
+of validation. A2 permit transfer, finalization capacity admission and body
+spooling are still unimplemented; no forwarding concurrency is reduced.

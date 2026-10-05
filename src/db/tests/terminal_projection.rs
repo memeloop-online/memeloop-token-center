@@ -305,7 +305,7 @@ async fn sqlite_terminal_apply_and_ack_rollback_together() {
     .await
     .unwrap();
     database.migrate().await.unwrap();
-    let (key, reservation, request_id) = admitted(&database, false).await;
+    let (key, reservation, request_id) = admitted(&database, true).await;
     database
         .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
         .await
@@ -329,6 +329,17 @@ async fn sqlite_terminal_apply_and_ack_rollback_together() {
             .await
             .unwrap();
     assert_eq!(facts, 0);
+    let receipt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND account_projected_at IS NOT NULL")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(receipt, 1);
+    let lifetime: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifetime, 10);
     sqlx::query("DROP TRIGGER reject_terminal_ack")
         .execute(&database.pool)
         .await
@@ -339,6 +350,49 @@ async fn sqlite_terminal_apply_and_ack_rollback_together() {
             .await
             .unwrap()
     );
+    assert_counts(&database, request_id, reservation.id, 1).await;
+}
+
+#[tokio::test]
+async fn sqlite_terminal_snapshot_failure_rolls_back_financial_winner() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("enqueue.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    let (key, reservation, request_id) = admitted(&database, false).await;
+    sqlx::raw_sql("CREATE TRIGGER reject_terminal_enqueue BEFORE INSERT ON terminal_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END;").execute(&database.pool).await.unwrap();
+    assert!(
+        database
+            .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
+            .await
+            .is_err()
+    );
+    let state = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS charges, (SELECT status FROM usage_reservations WHERE id = $1) AS status, (SELECT completed_at FROM request_records WHERE id = $2) AS completed_at")
+        .bind(reservation.id.to_string()).bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(state.get::<i64, _>("charges"), 0);
+    assert_eq!(state.get::<String, _>("status"), "reserved");
+    assert_eq!(state.get::<Option<i64>, _>("completed_at"), None);
+    sqlx::query("DROP TRIGGER reject_terminal_enqueue")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database
+        .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
+        .await
+        .unwrap();
+    let owner = Uuid::now_v7();
+    database
+        .claim_terminal_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    database
+        .project_claimed_terminal_projection_task(owner, request_id)
+        .await
+        .unwrap();
     assert_counts(&database, request_id, reservation.id, 1).await;
 }
 
@@ -391,6 +445,17 @@ async fn postgres_terminal_financial_commit_does_not_wait_for_projection_or_curs
                     .unwrap()
             );
             assert_counts(&database, request_id, reservation.id, 1).await;
+            database
+                .publish_proxy_started_event(ArchiveSpoolIdentity {
+                    request_id,
+                    tenant_id: key.tenant_id,
+                    reservation_id: reservation.id,
+                })
+                .await
+                .unwrap();
+            let inversion: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events started JOIN request_events finished ON started.request_id = finished.request_id WHERE started.request_id = $1 AND started.event_kind = 'started' AND finished.event_kind = 'finished' AND (started.event_at > finished.event_at OR (started.event_at = finished.event_at AND started.event_id > finished.event_id))")
+                .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+            assert_eq!(inversion, 0);
         }
     }
     replay_after_source_deletion(&database, true, false).await;

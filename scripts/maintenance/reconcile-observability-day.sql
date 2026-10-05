@@ -1,7 +1,7 @@
 -- Rebuild every compact observability projection for one completed UTC day.
 -- The caller supplies :day and runs this file with ON_ERROR_STOP enabled.
 BEGIN;
-SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SET LOCAL lock_timeout = '5s';
 SELECT pg_advisory_xact_lock(
   hashtextextended('memeloop-token-center:request-stats', 734627102948314)

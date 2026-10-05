@@ -68,6 +68,12 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<bool, AppError> {
+        if !self
+            .project_terminal_account_receipt(lease_owner, request_id)
+            .await?
+        {
+            return Ok(false);
+        }
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let now = unix_millis();
@@ -127,12 +133,43 @@ impl Database {
         .bind(&request_id)
         .execute(&mut *transaction)
         .await?;
+        let acknowledged = sqlx::query(
+            "UPDATE terminal_projection_outbox SET projected_at = $1, statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4 AND account_projected_at IS NOT NULL",
+        )
+        .bind(now)
+        .bind(if pruned { "pruned" } else { "applied" })
+        .bind(&request_id)
+        .bind(&owner)
+        .execute(&mut *transaction)
+        .await?;
+        if acknowledged.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "terminal projection owner changed".into(),
+            ));
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    async fn project_terminal_account_receipt(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = unix_millis();
+        let task = sqlx::query("UPDATE terminal_projection_outbox SET lease_owner = lease_owner WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at > $3 RETURNING reservation_id, account_id, key_id, cost_micros, account_projected_at")
+            .bind(request_id.to_string()).bind(lease_owner.to_string()).bind(now).fetch_optional(&mut *transaction).await?;
+        let Some(task) = task else {
+            return Ok(false);
+        };
         if task
             .try_get::<Option<i64>, _>("account_projected_at")?
             .is_none()
         {
             let reservation_id: String = task.try_get("reservation_id")?;
             let account_id: String = task.try_get("account_id")?;
+            let key_id: String = task.try_get("key_id")?;
             let cost_micros: i64 = task.try_get("cost_micros")?;
             let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND account_id = $2 AND key_id = $3 AND actual_micros = $4 AND projected_at IS NULL AND lease_owner = 'terminal-v118'")
                 .bind(&reservation_id).bind(&account_id).bind(&key_id).bind(cost_micros).fetch_one(&mut *transaction).await?;
@@ -155,20 +192,8 @@ impl Database {
                     "terminal account receipt ownership changed".into(),
                 ));
             }
-        }
-        let acknowledged = sqlx::query(
-            "UPDATE terminal_projection_outbox SET projected_at = $1, account_projected_at = COALESCE(account_projected_at, $1), statistics_outcome = $2, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND lease_owner = $4",
-        )
-        .bind(now)
-        .bind(if pruned { "pruned" } else { "applied" })
-        .bind(&request_id)
-        .bind(&owner)
-        .execute(&mut *transaction)
-        .await?;
-        if acknowledged.rows_affected() != 1 {
-            return Err(AppError::Conflict(
-                "terminal projection owner changed".into(),
-            ));
+            sqlx::query("UPDATE terminal_projection_outbox SET account_projected_at = $1 WHERE request_id = $2")
+                .bind(now).bind(request_id.to_string()).execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
         Ok(true)
