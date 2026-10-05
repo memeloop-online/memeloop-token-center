@@ -49,13 +49,23 @@
       "exact_paths": ["/operator"]
     },
     {
+      "name": "transport-proxy-self-access",
+      "source_role": "control",
+      "runtime_roles": ["control", "all"],
+      "exposure": "private-only",
+      "authentication": "service credential with providers:read; returns only the current principal's global providers:write capability",
+      "in_openapi": true,
+      "exact_paths": ["/internal/v1/transport-proxy-groups/access"]
+    },
+    {
       "name": "control-api",
       "source_role": "control",
       "runtime_roles": ["control", "all"],
       "exposure": "private-only",
       "authentication": "service credential and operation scope",
       "in_openapi": true,
-      "path_prefixes": ["/internal/v1/"]
+      "path_prefixes": ["/internal/v1/"],
+      "excluded_paths": ["/internal/v1/transport-proxy-groups/access"]
     },
     {
       "name": "self-service-portal",

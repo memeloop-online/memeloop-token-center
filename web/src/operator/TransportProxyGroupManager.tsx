@@ -3,6 +3,7 @@ import { Button, Dialog, DialogBody, DialogContent, DialogSurface, DialogTitle, 
 import { SecretInput } from '../SecretInput';
 import type { UpstreamAccount } from '../types';
 import { useConfirmDialog } from '../useConfirmDialog';
+import { useOperatorResource } from './hooks/useOperatorResource';
 import { transportProxyError, transportProxyFailureKind, transportProxyGroupsPath, transportProxyRequest, type TransportProxyBinding, type TransportProxyGroup } from './transportProxyGroups';
 
 interface Props {
@@ -24,8 +25,18 @@ const runtimeLabels = { unbound: '未绑定', pending: '等待当前进程加载
 
 export function TransportProxyGroupManager(props: Props) {
   const [open, setOpen] = useState(false);
-  const [access, setAccess] = useState<'checking' | 'allowed' | 'denied' | 'unavailable'>('checking');
-  const [accessRevision, setAccessRevision] = useState(0);
+  const accessResource = useOperatorResource(Boolean(props.token), props.token, async signal => {
+    try {
+      const result = await transportProxyRequest<{ can_manage: boolean }>(`${transportProxyGroupsPath}/access`, props.token, { signal });
+      if (typeof result?.can_manage !== 'boolean') throw new Error();
+      return result;
+    } catch {
+      throw new Error('暂时无法确认管理权限，入口已禁用，请稍后重试。');
+    }
+  }, '暂时无法确认管理权限，入口已禁用，请稍后重试。');
+  const accessState = accessResource.state;
+  const access = accessState.kind === 'failed' || accessState.kind === 'ready' && accessState.refreshError
+    ? 'unavailable' : accessState.kind === 'ready' ? accessState.value.can_manage ? 'allowed' : 'denied' : 'checking';
   const accessDescription = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const previouslyOpen = useRef(false);
@@ -34,25 +45,17 @@ export function TransportProxyGroupManager(props: Props) {
     if (previouslyOpen.current && !open) trigger.current?.focus();
     previouslyOpen.current = open;
   }, [open]);
-  useEffect(() => {
-    const controller = new AbortController();
-    setAccess('checking');
-    if (!props.tenant || !props.token) return () => controller.abort();
-    void transportProxyRequest<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}?${new URLSearchParams({ tenant_external_id: props.tenant })}`, props.token, { signal: controller.signal })
-      .then(result => { if (!controller.signal.aborted) setAccess(Array.isArray(result.items) ? 'allowed' : 'unavailable'); })
-      .catch(reason => { if (!controller.signal.aborted) setAccess(transportProxyFailureKind(reason) === 'denied' ? 'denied' : 'unavailable'); });
-    return () => controller.abort();
-  }, [props.token, props.tenant, accessRevision]);
   return <Dialog open={open} onOpenChange={(_, data) => { if (data.open) setOpen(true); else void closeRequest.current?.(); }}>
     <div className="button-row">
       <DialogTrigger disableButtonEnhancement><Button ref={trigger} appearance="secondary" type="button" disabled={!props.tenant || access !== 'allowed'} aria-describedby={accessDescription}>代理组与账号绑定</Button></DialogTrigger>
-      <span id={accessDescription} role="status">{!props.tenant ? '请先选择租户。' : access === 'checking' ? '正在确认全局操作员及 providers:write 管理权限…' : access === 'denied' ? '无管理权限：需要具有 providers:write 权限的全局操作员。' : access === 'unavailable' ? '暂时无法确认管理权限，入口已禁用，请稍后重试。' : '已确认当前租户的全局操作员及 providers:write 管理权限。'}</span>
-      {(access === 'denied' || access === 'unavailable') && <Button type="button" onClick={() => setAccessRevision(current => current + 1)}>重新检查管理权限</Button>}
+      <span id={accessDescription} role="status">{access === 'checking' ? '正在检查代理组管理权限…' : access === 'denied' ? '当前服务凭据没有管理代理组的权限。' : access === 'unavailable' ? '暂时无法确认管理权限，入口已禁用，请稍后重试。' : !props.tenant ? '请先选择租户。' : '已具备代理组管理权限。'}</span>
+      {access === 'denied' && <span className="muted">需要全局提供商管理权限。请联系管理员在“服务凭据”中查看该凭据的租户范围和“管理提供商”权限。</span>}
+      {(access === 'denied' || access === 'unavailable') && <Button type="button" onClick={() => void accessResource.reload()}>重新检查管理权限</Button>}
     </div>
     <DialogSurface style={{ width: 'min(920px, 96vw)', maxWidth: '96vw' }}>
       <DialogBody>
         <DialogTitle>代理组与账号绑定</DialogTitle>
-        <DialogContent>{open && <ProxyGroupWorkspace {...props} key={`${props.token}\0${props.tenant}`} closeRequest={closeRequest} onClose={() => setOpen(false)} />}</DialogContent>
+        <DialogContent>{open && access === 'allowed' && <ProxyGroupWorkspace {...props} key={`${props.token}\0${props.tenant}`} closeRequest={closeRequest} onClose={() => setOpen(false)} />}</DialogContent>
       </DialogBody>
     </DialogSurface>
   </Dialog>;
@@ -219,7 +222,7 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
   return <div className="transport-proxy-workspace">
     {confirmationDialog}
     <p>当前出口保持粘性，仅连接失败时尝试备用出口；健康出口不轮询、不自动切回。请求送达不明或已开始输出时不会因此重放。</p>
-    <p className="muted">仅全局操作员的 providers:write 权限可管理当前租户；账号绑定仅支持原生 OpenAI Codex OAuth 账号。</p>
+    <p className="muted">管理代理组需要全局提供商管理权限；账号绑定仅支持通过账户授权接入的原生 OpenAI Codex 账号。</p>
     <div className="button-row">
       <Button type="button" disabled={busy} onClick={async () => {
         if (editing !== undefined && !await confirm('刷新将丢弃当前未保存的代理组修改，是否继续？')) return;

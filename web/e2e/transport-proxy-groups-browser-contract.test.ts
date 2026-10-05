@@ -10,6 +10,8 @@ interface ProxyGroupFixture {
   groups: TransportProxyGroup[];
   binding: TransportProxyBinding;
   reads: number;
+  accessReads: number;
+  accessFailure?: boolean;
   writes: Array<{ path: string; method: string; body: Record<string, any> }>;
   failure?: { status: number; code: string };
   holdNext: boolean;
@@ -27,7 +29,7 @@ async function installFixture(page: Page, allowed = true) {
   await page.evaluate(({ allowed, secret }) => {
     const previousFetch = window.fetch;
     const state: ProxyGroupFixture = window.proxyGroupFixture = {
-      allowed, groups: [], reads: 0, writes: [], holdNext: false, policies: [],
+      allowed, groups: [], reads: 0, accessReads: 0, writes: [], holdNext: false, policies: [],
       binding: {
         account_id: 'account-native', tenant_external_id: 'fixture', binding_version: 0,
         group_id: null, group_version: null, initial_member_id: null, credential_generation: 7, updated_at: 100,
@@ -39,9 +41,15 @@ async function installFixture(page: Page, allowed = true) {
       if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       const method = init?.method ?? 'GET';
       state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
+      if (url.pathname === '/internal/v1/transport-proxy-groups/access') {
+        if (method !== 'GET' || url.search) throw new Error('capability must read the credential scope, not the selected tenant');
+        state.accessReads += 1;
+        if (state.accessFailure) return new Response(JSON.stringify({ error: { message: secret } }), { status: 503 });
+        return new Response(JSON.stringify({ can_manage: state.allowed }));
+      }
+      if (method === 'GET') state.reads += 1;
       if (!state.allowed) return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
       if (method === 'GET') {
-        state.reads += 1;
         if (url.searchParams.get('tenant_external_id') !== 'fixture') throw new Error('missing read tenant');
         return new Response(JSON.stringify(url.pathname.endsWith('/transport-proxy-group') ? state.binding : { items: state.groups }));
       }
@@ -93,17 +101,17 @@ async function installFixture(page: Page, allowed = true) {
     };
   }, { allowed, secret: privateProxySecret });
   const probe = await page.evaluate(async () => {
-    const response = await window.fetch('/internal/v1/transport-proxy-groups?tenant_external_id=fixture', {
+    const response = await window.fetch('/internal/v1/transport-proxy-groups/access', {
       cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
     });
     const body = await response.json();
-    return { status: response.status, items: Array.isArray(body.items), code: body.error?.code };
+    return { status: response.status, canManage: body.can_manage };
   });
-  assert.equal(probe.status, allowed ? 200 : 403, 'fixture permission response must be ready before UI interaction');
-  assert.equal(probe.items, allowed);
-  if (!allowed) assert.equal(probe.code, 'forbidden');
+  assert.equal(probe.status, 200, 'fixture self-capability response must be ready before UI interaction');
+  assert.equal(probe.canManage, allowed);
   await page.getByRole('button', { name: '重新检查管理权限' }).click();
-  await page.getByText(allowed ? '已确认当前租户的全局操作员及 providers:write 管理权限。' : '无管理权限：需要具有 providers:write 权限的全局操作员。', { exact: true }).waitFor();
+  await page.getByText(allowed ? '已具备代理组管理权限。' : '当前服务凭据没有管理代理组的权限。', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.proxyGroupFixture.reads), 0, 'capability checks must not read group or binding data');
 }
 
 async function openManager(page: Page) {
@@ -292,11 +300,22 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
 
     await context.test('denied permission disables entry with explanation, not a failing management dialog', async () => {
       const page = await prepare(false);
-      await page.getByText('无管理权限：需要具有 providers:write 权限的全局操作员。', { exact: true }).waitFor();
+      await page.getByText('当前服务凭据没有管理代理组的权限。', { exact: true }).waitFor();
       assert.equal(await page.getByRole('button', { name: '代理组与账号绑定', exact: true }).isEnabled(), false);
       assert.equal(await page.locator('.transport-proxy-workspace').count(), 0);
       assert.doesNotMatch(await page.content(), /privateProxySecret/);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
+      assert.ok(await page.evaluate(() => window.proxyGroupFixture.accessReads >= 2));
+      await page.evaluate(() => { window.proxyGroupFixture.accessFailure = true; });
+      await page.getByRole('button', { name: '重新检查管理权限' }).click();
+      await page.getByText('暂时无法确认管理权限，入口已禁用，请稍后重试。', { exact: true }).waitFor();
+      assert.equal(await page.getByText('当前服务凭据没有管理代理组的权限。', { exact: true }).count(), 0);
+      assert.equal(await page.getByRole('button', { name: '代理组与账号绑定', exact: true }).isEnabled(), false);
+      assert.doesNotMatch(await page.content(), /privateProxySecret|providers:write/);
+      await page.evaluate(() => { window.proxyGroupFixture.accessFailure = false; });
+      await page.getByRole('button', { name: '重新检查管理权限' }).click();
+      await page.getByText('当前服务凭据没有管理代理组的权限。', { exact: true }).waitFor();
+      assert.equal(await page.evaluate(() => window.proxyGroupFixture.reads), 0);
       await page.close();
     });
     assert.doesNotMatch(errors.join('\n'), /privateProxySecret|fixture-user/);

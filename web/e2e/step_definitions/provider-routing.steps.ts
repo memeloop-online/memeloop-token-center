@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
-import type { Locator, Page } from 'playwright';
+import type { Locator, Page, Request } from 'playwright';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
@@ -172,8 +172,23 @@ Then('租户边界和未认证请求在解析正文前生效', async function ()
 When('管理员维护统一上游和模型路由', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
+  const groupListRequests: string[] = [];
+  const trackGroupList = (request: Request) => {
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === '/internal/v1/transport-proxy-groups') groupListRequests.push(url.pathname);
+  };
+  page.on('request', trackGroupList);
+  const proxyAccess = page.waitForResponse(response => response.request().method() === 'GET'
+    && new URL(response.url()).pathname === '/internal/v1/transport-proxy-groups/access');
 
   await openAppRoute(page, 'operator', 'providers');
+  const proxyAccessResponse = await proxyAccess;
+  assert.equal(proxyAccessResponse.status(), 200);
+  assert.equal(new URL(proxyAccessResponse.url()).search, '');
+  assert.deepEqual(await proxyAccessResponse.json(), { can_manage: false });
+  await assertVisible(page.getByText('当前服务凭据没有管理代理组的权限。', { exact: true }));
+  assert.equal(await page.getByRole('button', { name: '代理组与账号绑定', exact: true }).isEnabled(), false);
+  assert.deepEqual(groupListRequests, []);
   const onboarding = page.locator('.create-journey');
   await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
@@ -229,6 +244,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
 
   await openAppRoute(page, 'operator', 'routes');
+  page.off('request', trackGroupList);
+  assert.deepEqual(groupListRequests, [], 'tenant operator must never probe the global-only group list');
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
   await assertContains(routeRow, 'Browser mock upstream');
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();

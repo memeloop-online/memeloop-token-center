@@ -16,6 +16,9 @@ test('transport proxy failures distinguish editable validation, CAS, denied and 
   }
   assert.equal(transportProxyFailureKind(new TypeError(secret)), 'unknown');
   assert.match(transportProxyError(new TypeError(secret)), /不表示服务端已取消/);
+  const denied = transportProxyError(new ApiError(secret, 403, 'forbidden'));
+  assert.match(denied, /需要全局提供商管理权限/);
+  assert.doesNotMatch(denied, /providers:write|当前租户的全局操作员|privateProxySecret/);
 });
 
 test('stopping client wait rejects even when fetch ignores abort; late response does not turn the result into success', async () => {

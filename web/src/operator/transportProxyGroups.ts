@@ -81,7 +81,7 @@ export function transportProxyError(reason: unknown): string {
     case 'invalid_request': return '配置无效。请检查名称、出口数量、私网 socks5h 地址和替代出口；新出口作为替代项前需先保存。';
     case 'service_overloaded': return '服务暂时无法写入，尚未确认保存成功。请稍后刷新再操作。';
   }
-  if (reason.status === 401 || reason.status === 403) return '需要具有 providers:write 权限的全局操作员，并且能够管理当前租户。';
+  if (reason.status === 401 || reason.status === 403) return '当前服务凭据未通过权限校验，管理代理组需要全局提供商管理权限。请联系管理员检查凭据是否有效及其权限范围。';
   if (reason.status === 400 || reason.status === 422) return '配置校验失败，草稿已保留。请修正输入后重新保存。';
   if (reason.status === 404) return '当前租户下的账号或代理组已不存在，请刷新配置。';
   if (reason.status === 409) return '配置发生冲突，请刷新并重新确认后提交。';
