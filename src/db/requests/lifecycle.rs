@@ -111,6 +111,7 @@ pub(crate) struct SwitchProxyCandidateInput<'a> {
     pub reservation: &'a UsageReservation,
     pub input_token_ceiling: i64,
     pub output_token_ceiling: i64,
+    pub upstream_model: &'a str,
     pub expected_assignment: (Uuid, Uuid),
     pub next_assignment: (Uuid, Uuid),
 }
@@ -202,7 +203,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, true)
+        self.start_proxy_request_inner(input, None, true, None)
             .await
             .map(|started| started.reservation)
     }
@@ -210,8 +211,9 @@ impl Database {
     pub(crate) async fn start_proxy_forwarding_request(
         &self,
         input: StartProxyRequest<'_>,
+        upstream_model: Option<&str>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false)
+        self.start_proxy_request_inner(input, None, false, upstream_model)
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
@@ -310,7 +312,7 @@ impl Database {
     ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true)
+            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true, None)
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -332,6 +334,7 @@ impl Database {
         input: StartProxyRequest<'_>,
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
         publish_started: bool,
+        upstream_model: Option<&str>,
     ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
@@ -423,6 +426,14 @@ impl Database {
         {
             BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
+        }
+        if let Some(upstream_model) = upstream_model {
+            sqlx::query("UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3")
+                .bind(upstream_model)
+                .bind(input.request_id.to_string())
+                .bind(reservation.id.to_string())
+                .execute(&mut *transaction)
+                .await?;
         }
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
@@ -573,9 +584,10 @@ impl Database {
         let (next_upstream_account_id, next_model_route_id) = input.next_assignment;
         let updated = sqlx::query(
             "UPDATE request_records
-             SET upstream_account_id = $1, model_route_id = $2
+             SET upstream_account_id = $1, model_route_id = $2, upstream_model = $9
              WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6
                AND upstream_account_id = $7 AND model_route_id = $8
+               AND (upstream_account_id <> $1 OR model_route_id <> $2 OR upstream_model IS NULL OR upstream_model = $9)
                AND completed_at IS NULL AND error_code IS NULL",
         )
         .bind(next_upstream_account_id.to_string())
@@ -586,6 +598,7 @@ impl Database {
         .bind(input.reservation.id.to_string())
         .bind(expected_upstream_account_id.to_string())
         .bind(expected_model_route_id.to_string())
+        .bind(input.upstream_model)
         .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() != 1 {
@@ -594,10 +607,21 @@ impl Database {
                 "proxy candidate changed after downstream delivery preparation".into(),
             ));
         }
+        let retained_price: ModelPrice;
+        let price = if input.expected_assignment == input.next_assignment {
+            let snapshot: String = sqlx::query_scalar("SELECT price_snapshot_json FROM usage_reservations WHERE id = $1 AND status = 'reserved'")
+                .bind(input.reservation.id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+            retained_price = serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+            &retained_price
+        } else {
+            input.price
+        };
         let resized = resize_usage_reservation_in_transaction(
             &mut transaction,
             input.key,
-            input.price,
+            price,
             input.reservation,
             input.input_token_ceiling,
             input.output_token_ceiling,

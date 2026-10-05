@@ -103,6 +103,7 @@ impl Database {
         body: &Bytes,
         pepper: &[u8],
         compression_enabled: bool,
+        upstream_model: Option<&str>,
     ) -> Result<StartedProxyRequest, AppError> {
         let request_id = input.request_id;
         let tenant_id = input.key.tenant_id;
@@ -110,7 +111,7 @@ impl Database {
             return Err(AppError::Internal);
         }
         let reservation = self
-            .start_proxy_forwarding_request(input)
+            .start_proxy_forwarding_request(input, upstream_model)
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,

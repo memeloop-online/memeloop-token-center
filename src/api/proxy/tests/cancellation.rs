@@ -207,6 +207,7 @@ async fn cancellation_reloads_resized_reservation_and_settles_once() {
             reservation: &reservation,
             input_token_ceiling: 17,
             output_token_ceiling: 31,
+            upstream_model: &fixture.upstream_model,
             expected_assignment: (fixture.upstream_account_id, fixture.route_id),
             next_assignment: (fixture.upstream_account_id, fixture.route_id),
         })

@@ -61,7 +61,11 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117)")
+    sqlx::query("ALTER TABLE request_records DROP COLUMN upstream_model")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 119)")
         .execute(&database.pool)
         .await
         .unwrap();

@@ -82,6 +82,23 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
         )
     });
     let next_assignment = (planned.route.account_id, planned.route.route_id);
+    let candidate_price = if *assigned_route != next_assignment {
+        match state
+            .db
+            .model_price(&planned.route.upstream_model, &request.key.currency)
+            .await
+        {
+            Ok(price) => Some(price),
+            Err(error) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     if *assigned_route != next_assignment
         || *input_token_ceiling != next_input_token_ceiling
         || *output_token_ceiling != next_output_token_ceiling
@@ -92,10 +109,11 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
                 request_id,
                 tenant_id: request.key.tenant_id,
                 key: request.key,
-                price,
+                price: candidate_price.as_ref().unwrap_or(price),
                 reservation,
                 input_token_ceiling: next_input_token_ceiling,
                 output_token_ceiling: next_output_token_ceiling,
+                upstream_model: &planned.route.upstream_model,
                 expected_assignment: *assigned_route,
                 next_assignment,
             })
