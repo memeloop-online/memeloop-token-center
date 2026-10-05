@@ -283,10 +283,11 @@ async fn send_codex_attempt(
     for connect_attempt in 1..=transport_policy.connect_attempts {
         let selection = state
             .transport_proxy_groups
-            .select(
+            .select_config(
                 route.route.account_id,
                 route.route.credential_generation,
                 &route.route.credential,
+                &route.route.config,
             )
             .map_err(|_| ProxySendError::CandidateUnavailable)?;
         if let Some(member) = selection.member() {

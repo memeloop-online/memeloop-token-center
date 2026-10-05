@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mtc-pg-restore-scratch-20261004
+  namespace: memeloop-token-center
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 64Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mtc-pg-restore-isolation-20261004
+  namespace: memeloop-token-center
+spec:
+  podSelector:
+    matchLabels:
+      recovery.mtc/operation: pg-logical-backup-20261004
+      recovery.mtc/role: verify
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mtc-pg-restore-verification-20261004
+  namespace: memeloop-token-center
+  annotations:
+    recovery.mtc/review-state: parent-review-required
+    recovery.mtc/execution-channel: gha-only
+    recovery.mtc/copy-gate: destination-sha256-check-before-OFFHOST_COPY_VERIFIED
+    recovery.mtc/verification-scope: full-archive-restore-without-original-ownership-or-acl-not-application-acceptance
+spec:
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 28800
+  template:
+    metadata:
+      labels:
+        recovery.mtc/operation: pg-logical-backup-20261004
+        recovery.mtc/role: verify
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: versetensor-hv
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verify
+          image: ghcr.io/cloudnative-pg/postgresql:17.5
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              umask 077
+              test "$PARENT_REVIEW_APPROVED" = "true"
+              archive_dir=/backup/mtc-pg-logical-20261004
+              archive="$archive_dir/memeloop_token_center.dump"
+              cd "$archive_dir"
+              test -f LOCAL_ARCHIVE_CREATED
+              test -f OFFHOST_COPY_VERIFIED
+              test "${#EXPECTED_SOURCE_SHA256}" -eq 64
+              case "$EXPECTED_SOURCE_SHA256" in
+                *[!0-9a-f]*) exit 1 ;;
+              esac
+              printf '%s  memeloop_token_center.dump\n' "$EXPECTED_SOURCE_SHA256" | sha256sum -c - > /dev/null
+              sha256sum -c memeloop_token_center.dump.sha256 > /dev/null
+              pg_restore --list "$archive" > /dev/null
+              printf 'SHA256 and TOC passed; full archive restore still pending\n'
+              export PGDATA=/scratch/pgdata PGHOST=/scratch/socket PGUSER=postgres PGDATABASE=postgres
+              mkdir -m 0700 "$PGHOST"
+              initdb -D "$PGDATA" --username=postgres --auth-local=trust --auth-host=reject --no-instructions > /scratch/initdb.log
+              pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c unix_socket_directories=$PGHOST" -w start > /scratch/start.log
+              trap 'pg_ctl -D "$PGDATA" -m immediate stop > /dev/null 2>&1 || true' EXIT
+              createdb -T template0 restore_check
+              pg_restore --dbname=restore_check --no-owner --no-privileges --exit-on-error "$archive" > /scratch/restore.log
+              table_count=$(psql -d restore_check -X -Atqc "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','m')")
+              test "$table_count" -ge 254
+              printf 'full archive restore completed without original ownership or ACL; public relation count: %s; application acceptance still pending\n' "$table_count"
+          env:
+            - name: PARENT_REVIEW_APPROVED
+              value: "false"
+            - name: EXPECTED_SOURCE_SHA256
+              value: ""
+            - name: HOME
+              value: /scratch
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: backup
+              mountPath: /backup
+              readOnly: true
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: backup
+          persistentVolumeClaim:
+            claimName: mtc-pg-logical-backup-20261003
+            readOnly: true
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: mtc-pg-restore-scratch-20261004

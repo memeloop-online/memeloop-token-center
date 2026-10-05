@@ -2,6 +2,26 @@ use super::super::*;
 
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
+        .route(
+            "/internal/v1/transport-proxy-groups",
+            get(list_transport_groups)
+                .post(create_transport_group)
+                .layer(middleware::map_response(transport_group_response)),
+        )
+        .route(
+            "/internal/v1/transport-proxy-groups/{group_id}",
+            get(get_transport_group)
+                .put(update_transport_group)
+                .delete(delete_transport_group)
+                .layer(middleware::map_response(transport_group_response)),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/transport-proxy-group",
+            get(get_transport_binding)
+                .put(bind_transport_group)
+                .delete(unbind_transport_group)
+                .layer(middleware::map_response(transport_group_response)),
+        )
         .route("/internal/v1/keys", get(list_keys).post(create_key))
         .route("/internal/v1/keys/delete", post(delete_client_credentials))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
@@ -460,7 +480,8 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             state.clone(),
             authenticate_control_before_body,
         ))
-        .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS));
+        .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS))
+        .layer(middleware::from_fn(transport_group_headers));
     Router::new()
         .route("/operator", get(operator_index))
         .route(

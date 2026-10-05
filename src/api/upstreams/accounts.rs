@@ -140,7 +140,11 @@ pub(super) fn validate_provider_config_schema(
         .providers
         .get(driver)
         .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
-    crate::schema::validate_instance(&provider.config_schema, config)?;
+    let mut public_config = config.clone();
+    if let Some(config) = public_config.as_object_mut() {
+        config.remove(crate::db::transport_proxy_management::CONFIG_KEY);
+    }
+    crate::schema::validate_instance(&provider.config_schema, &public_config)?;
     // Shared by direct creation, OAuth start/ready/reauthorization and account
     // edits. No lifecycle may write an unsupported secret cycle or discover
     // that configuration analysis failed only after its account mutation.

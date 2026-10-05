@@ -54,7 +54,7 @@ pub(crate) enum CodexResponsesOutputLimitPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct CodexTransportPolicy {
     pub version: u32,
     pub connect_attempts: usize,
@@ -219,6 +219,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_policy_fields_are_ignored_without_changing_known_values() {
+        let policy = CodexTransportPolicy::parse(Some(&json!({
+            "connect_attempts": 3,
+            "future_option": {"nested": true},
+            "account_hint": "untrusted",
+            "retry_503": true,
+            "plugin": "untrusted"
+        })))
+        .unwrap();
+        let defaults = CodexTransportPolicy::default();
+        assert_eq!(policy.connect_attempts, 3);
+        assert_eq!(policy.candidate_attempts, defaults.candidate_attempts);
+        assert_eq!(
+            policy.dispatch_max_in_flight,
+            defaults.dispatch_max_in_flight
+        );
+        assert_eq!(policy.sse_framing_limits(), defaults.sse_framing_limits());
+        assert!(
+            CodexTransportPolicy::parse(Some(&json!({
+                "connect_attempts": 0,
+                "future_option": true
+            })))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn invalid_policy_never_silently_enables_defaults() {
         for invalid in [
             json!(null),
@@ -235,9 +262,6 @@ mod tests {
             json!({"shared_probe_attempts": null}),
             json!({"chat_controls": "unknown"}),
             json!({"responses_output_limits": "unknown"}),
-            json!({"account_hint": "untrusted"}),
-            json!({"retry_503": true}),
-            json!({"plugin": "untrusted"}),
             json!({"connect_timeout_millis": 99}),
             json!({"connect_timeout_millis": 60001}),
             json!({"read_timeout_millis": 999}),

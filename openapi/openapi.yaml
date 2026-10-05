@@ -1996,6 +1996,240 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/transport-proxy-groups:
+    get:
+      tags: [Upstream providers]
+      operationId: listTransportProxyGroups
+      summary: List named encrypted transport groups
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroupList' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+    post:
+      tags: [Upstream providers]
+      operationId: createTransportProxyGroup
+      summary: Create a named private remote-DNS proxy group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTransportProxyGroup' }
+      responses:
+        '201':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroup' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+  /internal/v1/transport-proxy-groups/{group_id}:
+    get:
+      tags: [Upstream providers]
+      operationId: getTransportProxyGroup
+      summary: Read sanitized group and stable member identities
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroup' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+    put:
+      tags: [Upstream providers]
+      operationId: updateTransportProxyGroup
+      summary: Version group membership while retaining healthy selections
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTransportProxyGroup' }
+      responses:
+        '200':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroup' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+    delete:
+      tags: [Upstream providers]
+      operationId: deleteTransportProxyGroup
+      summary: Delete an unbound transport group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteTransportProxyGroup' }
+      responses:
+        '204':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+  /internal/v1/upstreams/{account_id}/transport-proxy-group:
+    get:
+      tags: [Upstream providers]
+      operationId: getTransportProxyGroupBinding
+      summary: Read durable binding and this-process application state
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroupBinding' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+    put:
+      tags: [Upstream providers]
+      operationId: bindTransportProxyGroup
+      summary: Bind an account using exact configuration and credential versions
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BindTransportProxyGroup' }
+      responses:
+        '202':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroupBinding' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
+    delete:
+      tags: [Upstream providers]
+      operationId: unbindTransportProxyGroup
+      summary: Unbind while explicitly retaining one proxy member
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnbindTransportProxyGroup' }
+      responses:
+        '202':
+          description: Global operator only. Private, no-store. Writes are durable; runtime application is asynchronous.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransportProxyGroupBinding' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Version, binding, in-use, or capacity conflict; see error.code.
+        '503':
+          description: Configuration storage temporarily unavailable.
   /internal/v1/upstreams/{account_id}/transport-proxy:
     get:
       tags: [Upstream providers]
@@ -6687,6 +6921,15 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    TransportProxyGroupList: {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/TransportProxyGroup"}}}}
+    TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}
+    CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
+    DeleteTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}
+    TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
+    TransportProxyGroupBinding: {"type":"object","required":["account_id","tenant_external_id","binding_version","group_id","group_version","initial_member_id","credential_generation","updated_at","runtime"],"properties":{"account_id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"binding_version":{"type":"integer"},"group_id":{"type":["string","null"],"format":"uuid"},"group_version":{"type":["integer","null"]},"initial_member_id":{"type":["string","null"],"format":"uuid"},"credential_generation":{"type":"integer"},"updated_at":{"type":"integer"},"runtime":{"type":"object","required":["scope","configuration_state","applied_binding_version","applied_group_version","selected_member_id","observed_at"],"properties":{"scope":{"const":"this_process"},"configuration_state":{"enum":["unbound","pending","applied","unavailable"]},"applied_binding_version":{"type":["integer","null"]},"applied_group_version":{"type":["integer","null"]},"selected_member_id":{"type":["string","null"],"format":"uuid"},"observed_at":{"type":"integer"}}}}}
+    UpdateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}},"expected_version":{"type":"integer","minimum":1},"replacement_member_id":{"type":"string","format":"uuid","description":"Required when removing/replacing an existing member of a bound group. Used only when a selected member no longer exists unchanged. Must identify a retained member in the submitted list."}}}
+    BindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","group_id","initial_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"group_id":{"type":"string","format":"uuid"},"initial_member_id":{"type":"string","format":"uuid"}}}
+    UnbindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","single_proxy_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"single_proxy_member_id":{"type":"string","format":"uuid"}}}
     UpstreamQuotaBatchRequest:
       type: object
       additionalProperties: false

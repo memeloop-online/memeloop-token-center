@@ -2,9 +2,6 @@ use super::*;
 
 impl TransportProxyGroups {
     pub(crate) fn start(self: &Arc<Self>, database_url: &str) -> Result<(), sqlx::Error> {
-        if self.groups.is_empty() {
-            return Ok(());
-        }
         let pool = AnyPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_millis(200))
@@ -12,7 +9,10 @@ impl TransportProxyGroups {
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(current) = groups.upgrade() {
-                for entry in current.groups.values() {
+                if current.refresh_managed(&pool).await.is_err() {
+                    tracing::debug!("transport proxy configuration refresh deferred");
+                }
+                for entry in current.persistence_entries().unwrap_or_default() {
                     if entry.synchronize(&pool).await.is_err() {
                         tracing::debug!(account_id = %entry.group.account_id, "optional proxy selection persistence deferred");
                     }
