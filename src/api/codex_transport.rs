@@ -80,6 +80,7 @@ const SCALAR_OUTPUT_LIMIT_FIELDS: &[&str] =
     &["max_output_tokens", "max_completion_tokens", "max_tokens"];
 
 const UNSUPPORTED_FIELDS: &[&str] = &[
+    "metadata",
     "temperature",
     "top_p",
     "truncation",
@@ -1389,6 +1390,7 @@ pub(super) struct CodexChatStreamTranslator {
     include_usage: bool,
     text_delta: String,
     tools: BTreeMap<usize, chat_tools::StreamingTool>,
+    completed_items: BTreeMap<usize, Value>,
     retained_bytes: usize,
 }
 
@@ -1422,6 +1424,7 @@ impl CodexChatStreamTranslator {
             include_usage,
             text_delta: String::new(),
             tools: BTreeMap::new(),
+            completed_items: BTreeMap::new(),
             retained_bytes: 0,
         }
     }
@@ -1489,6 +1492,22 @@ impl CodexChatStreamTranslator {
             }
             "response.output_item.added" | "response.output_item.done" => {
                 let item = value.get("item").ok_or("upstream_invalid_response")?;
+                if kind == "response.output_item.done" {
+                    let index = value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .filter(|index| *index < MAX_OUTPUT_ITEMS)
+                        .ok_or("upstream_invalid_response")?;
+                    if self.completed_items.contains_key(&index) {
+                        return Err("upstream_invalid_response");
+                    }
+                    let bytes = serde_json::to_vec(item)
+                        .map_err(|_| "upstream_invalid_response")?
+                        .len();
+                    self.retain_bytes(bytes)?;
+                    self.completed_items.insert(index, item.clone());
+                }
                 match item.get("type").and_then(Value::as_str) {
                     Some("message" | "reasoning") => Ok(None),
                     Some("function_call") => {
@@ -1592,12 +1611,18 @@ impl CodexChatStreamTranslator {
         if self.terminal {
             return Err("upstream_invalid_response");
         }
-        let response = event
+        let mut response = event
             .get("response")
             .filter(|response| response.is_object())
+            .cloned()
             .ok_or("upstream_invalid_response")?;
-        let completed = response_chat_content(response, allow_empty_output)?;
-        let usage = canonical_responses_usage(response).map_err(|_| "upstream_invalid_usage")?;
+        restore_completed_output(
+            &mut response,
+            std::mem::take(&mut self.completed_items),
+            CompletedOutputCoverage::ObservedSubset,
+        )?;
+        let completed = response_chat_content(&response, allow_empty_output)?;
+        let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
         let mut output = Vec::new();
         match completed {
             ChatResponseContent::Text(completed) => {
@@ -1635,7 +1660,7 @@ impl CodexChatStreamTranslator {
                 }
             }
         }
-        self.complete_tools(response, &mut output)?;
+        self.complete_tools(&response, &mut output)?;
         let finish_reason = if finish_reason == "stop" && !self.tools.is_empty() {
             "tool_calls"
         } else {
@@ -1924,6 +1949,50 @@ struct BufferedResponsesParser {
     invalid: bool,
 }
 
+enum CompletedOutputCoverage {
+    Complete,
+    ObservedSubset,
+}
+
+fn restore_completed_output(
+    response: &mut Value,
+    output_items: BTreeMap<usize, Value>,
+    coverage: CompletedOutputCoverage,
+) -> Result<(), &'static str> {
+    let completed_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or("upstream_invalid_response")?;
+    if output_items.is_empty() {
+        return Ok(());
+    }
+    if !completed_output.is_empty() && matches!(coverage, CompletedOutputCoverage::ObservedSubset) {
+        return if output_items
+            .iter()
+            .all(|(index, item)| completed_output.get(*index) == Some(item))
+        {
+            Ok(())
+        } else {
+            Err("upstream_invalid_response")
+        };
+    }
+    if output_items.len() > MAX_OUTPUT_ITEMS
+        || output_items.keys().copied().ne(0..output_items.len())
+    {
+        return Err("upstream_invalid_response");
+    }
+    let output = output_items.into_values().collect::<Vec<_>>();
+    if completed_output.is_empty() {
+        response
+            .as_object_mut()
+            .ok_or("upstream_invalid_response")?
+            .insert("output".to_owned(), Value::Array(output));
+    } else if completed_output != &output {
+        return Err("upstream_invalid_response");
+    }
+    Ok(())
+}
+
 impl BufferedResponsesParser {
     fn with_limits(limits: crate::provider::SseFramingLimits) -> Self {
         Self {
@@ -1957,30 +2026,11 @@ impl BufferedResponsesParser {
             .terminal_response
             .take()
             .ok_or("upstream_incomplete_response")?;
-        let completed_output = response
-            .get("output")
-            .and_then(Value::as_array)
-            .ok_or("upstream_invalid_response")?;
-        if !self.output_items.is_empty() {
-            if self.output_items.len() > MAX_OUTPUT_ITEMS
-                || self
-                    .output_items
-                    .keys()
-                    .copied()
-                    .ne(0..self.output_items.len())
-            {
-                return Err("upstream_invalid_response");
-            }
-            let output = self.output_items.into_values().collect::<Vec<_>>();
-            if completed_output.is_empty() {
-                response
-                    .as_object_mut()
-                    .ok_or("upstream_invalid_response")?
-                    .insert("output".to_owned(), Value::Array(output));
-            } else if completed_output != &output {
-                return Err("upstream_invalid_response");
-            }
-        }
+        restore_completed_output(
+            &mut response,
+            self.output_items,
+            CompletedOutputCoverage::Complete,
+        )?;
         let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
         let mut body = serde_json::to_vec(&response).map_err(|_| "upstream_invalid_response")?;
         drop(response);

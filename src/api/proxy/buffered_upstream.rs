@@ -78,6 +78,7 @@ pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
             | "upstream_response_terminal_too_large"
             | "upstream_response_too_large"
             | "upstream_response_memory_capacity"
+            | "upstream_unsupported_chat_output"
     )
 }
 
@@ -177,6 +178,7 @@ mod tests {
             "upstream_response_terminal_too_large",
             "upstream_response_too_large",
             "upstream_response_memory_capacity",
+            "upstream_unsupported_chat_output",
         ] {
             assert!(matches!(
                 upstream_error_health_terminal(error),
