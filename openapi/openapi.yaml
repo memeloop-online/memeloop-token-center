@@ -1996,6 +1996,31 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/transport-proxy-groups/access:
+    get:
+      tags: [Upstream providers]
+      operationId: getTransportProxyGroupAccess
+      summary: Read the current provider reader's proxy group management capability
+      description: Returns only the authenticated principal's capability. Tenant-bound readers and global read-only readers receive can_manage false with HTTP 200. Global readers with providers:write receive true. No tenant selector, group data, member data, or other principals' permissions are read or returned. All management endpoints independently retain global providers:write authorization.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      responses:
+        '200':
+          description: Current principal capability only.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [can_manage]
+                properties:
+                  can_manage: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/transport-proxy-groups:
     get:
       tags: [Upstream providers]

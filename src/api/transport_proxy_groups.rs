@@ -65,6 +65,25 @@ pub(super) async fn transport_group_headers(request: Request, next: Next) -> Res
     }
 }
 
+pub(super) async fn transport_group_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    response(
+        async {
+            let service = require_service(&headers, &state, "providers:read").await?;
+            Ok((
+                StatusCode::OK,
+                json!({
+                    "can_manage": service.tenant_external_id.is_none()
+                        && service.allows("providers:write"),
+                }),
+            ))
+        }
+        .await,
+    )
+}
+
 pub(super) async fn list_transport_groups(
     State(state): State<AppState>,
     headers: HeaderMap,

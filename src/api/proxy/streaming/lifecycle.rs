@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn local_resource_boundaries_are_inconclusive_evidence() {
+    fn local_response_boundaries_are_inconclusive_evidence() {
         let mut boundary_derived = summary(ResponsesSseOutcome::Incomplete, true, true);
         boundary_derived.independently_observed_protocol_invalid = false;
         for error in [
@@ -450,6 +450,7 @@ mod tests {
             "upstream_response_terminal_too_large",
             "upstream_response_too_large",
             "upstream_response_memory_capacity",
+            "upstream_unsupported_chat_output",
         ] {
             assert_eq!(
                 streaming_upstream_evidence(
@@ -466,15 +467,20 @@ mod tests {
     #[test]
     fn local_boundary_preserves_prior_semantic_protocol_failure() {
         let semantic_invalid = summary(ResponsesSseOutcome::Incomplete, true, true);
-        assert_eq!(
-            streaming_upstream_evidence(
-                false,
-                Some("upstream_response_event_batch_too_large"),
-                Some(&semantic_invalid),
-                Some("upstream_response_event_batch_too_large")
-            ),
-            StreamingUpstreamEvidence::InvalidResponse
-        );
+        for error in [
+            "upstream_response_event_batch_too_large",
+            "upstream_unsupported_chat_output",
+        ] {
+            assert_eq!(
+                streaming_upstream_evidence(
+                    false,
+                    Some(error),
+                    Some(&semantic_invalid),
+                    Some(error)
+                ),
+                StreamingUpstreamEvidence::InvalidResponse
+            );
+        }
     }
 
     #[test]
