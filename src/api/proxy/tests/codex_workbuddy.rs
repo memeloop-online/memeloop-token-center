@@ -275,12 +275,30 @@ async fn workbuddy_native_empty_terminal_text_and_tools_complete_and_settle_thro
                 agent_request(&fixture.model, stream),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK);
+            let status = response.status();
             let request_id =
                 Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
             let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
+            if status != StatusCode::OK {
+                wait_for_request_settlement(&fixture, 1).await;
+                let rows = fixture
+                    .state
+                    .db
+                    .list_requests(fixture.key_id, 10)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "stream={stream}, tool={tool}, request_id={request_id}, error_codes={:?}, synthetic_error_body={}",
+                    rows.iter()
+                        .map(|row| row.error_code.as_deref())
+                        .collect::<Vec<_>>(),
+                    String::from_utf8_lossy(&body)
+                );
+            }
             let finish_reason = if tool { "tool_calls" } else { "stop" };
             if stream {
                 let rendered = std::str::from_utf8(&body).unwrap();
@@ -503,7 +521,7 @@ async fn workbuddy_unmappable_native_chat_output_fails_without_replay_or_account
         let upstream = MockServer::start().await;
         add_native_chat_standby_route(
             &fixture,
-            &format!("workbuddy-standby-{stream}"),
+            &format!("codex-route-workbuddy-unmappable-{stream}"),
             &upstream.uri(),
         )
         .await;
