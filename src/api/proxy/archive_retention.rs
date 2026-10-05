@@ -6,17 +6,18 @@ const ENCRYPTED_FIELD: &str = "encrypted_content";
 /// Preserve the exact body when no retention rule applies. This keeps legacy
 /// request byte archives stable while ensuring inline media and explicitly
 /// encrypted protocol fields never enter the durable archive.
+#[cfg(test)]
 pub(super) fn prepare_request_json(mut retained: Value) -> Option<Value> {
     sanitize_value(&mut retained, true, false).then_some(retained)
 }
 
-pub(super) fn encode_json_body(original: &Bytes, retained: &Value) -> Bytes {
+pub(crate) fn encode_json_body(original: &Bytes, retained: &Value) -> Bytes {
     serde_json::to_vec(&retained)
         .map(Bytes::from)
         .unwrap_or_else(|_| metadata_only_body("serialization_failure", original.len()))
 }
 
-pub(super) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
+pub(crate) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
     let mut retained = match crate::api::sse::parse_unique_json(original) {
         Ok(value) => value,
         Err(_) if serde_json::from_slice::<Value>(original).is_ok() => {
@@ -28,10 +29,6 @@ pub(super) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
         return None;
     }
     Some(retained)
-}
-
-pub(super) fn encoded_json_len(retained: &Value) -> usize {
-    retained_size(retained)
 }
 
 #[cfg(test)]

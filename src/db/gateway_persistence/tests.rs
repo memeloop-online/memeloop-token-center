@@ -201,6 +201,11 @@ async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_stat
             .available_permits(),
         BYTE_LIMIT
     );
+    let metrics = fixture.database.gateway_persistence_metrics();
+    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 2\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 0\n"));
+    assert!(metrics.contains("request_persistence_jobs 0\n"));
+    assert!(metrics.contains("request_persistence_bytes 0\n"));
 }
 
 #[tokio::test]
@@ -219,6 +224,9 @@ async fn expired_queued_jobs_release_all_capacity_without_database_work() {
         RequestArchiveAdmission::Queued
     );
     fixture.database.drain_gateway_persistence_for_test().await;
+    let metrics = fixture.database.gateway_persistence_metrics();
+    assert!(metrics.contains("request_persistence_total{outcome=\"accepted\"} 1\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 1\n"));
     fixture.assert_reserved(request_id).await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools")
         .fetch_one(&fixture.database.pool)

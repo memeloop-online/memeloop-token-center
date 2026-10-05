@@ -53,7 +53,7 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    fixture.state.db.drain_gateway_persistence_for_test().await;
+    drain_archive_capture(&fixture).await;
     let failed = sqlx::query("UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = request_archive_spools.request_id AND s.tenant_id = request_archive_spools.tenant_id AND s.reservation_id = request_archive_spools.reservation_id)")
         .execute(&pool).await.unwrap();
     assert_eq!(failed.rows_affected(), 1);
@@ -151,7 +151,7 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
         "response survives optional spool rejection"
     );
-    fixture.state.db.drain_gateway_persistence_for_test().await;
+    drain_archive_capture(&fixture).await;
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await

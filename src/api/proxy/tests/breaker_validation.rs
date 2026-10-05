@@ -362,7 +362,7 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
 }
 
 #[tokio::test]
-async fn streaming_transport_terminal_is_visible_before_immediate_same_session_retry() {
+async fn streaming_transport_terminal_is_cached_before_immediate_same_session_retry() {
     let (failed_endpoint, failed_upstream) = truncated_sse_upstream_endpoint(
         b"data: {\"id\":\"partial\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
     )
@@ -392,9 +392,6 @@ async fn streaming_transport_terminal_is_visible_before_immediate_same_session_r
     }
     assert!(observed_disconnect);
 
-    // No settlement wait is allowed here: downstream EOF itself is the client
-    // boundary. The next independent request must already see the shared,
-    // durable terminal and choose the healthy route.
     let second = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(second.status(), StatusCode::OK);
     let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -499,6 +496,7 @@ async fn server_error_is_preserved_then_cools_the_account_for_the_next_request()
     // therefore this request must not be replayed to another account. The
     // recorded cooldown still makes the standby eligible for a later,
     // independent request.
+    fixture.state.routing_persistence.drain_for_test().await;
     let response = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)

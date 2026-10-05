@@ -174,7 +174,11 @@ pub(super) async fn prometheus_metrics(
             ),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        state.metrics.render(&runtime) + &state.archive.readiness_metrics(),
+        state.metrics.render(&runtime)
+            + &state.archive.readiness_metrics()
+            + &state.persistence.render()
+            + &state.routing_persistence.render_routing()
+            + &state.db.gateway_persistence_metrics(),
     )
         .into_response())
 }

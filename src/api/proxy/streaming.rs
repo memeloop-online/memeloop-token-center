@@ -218,25 +218,15 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             Some(upstream_account_id),
             Some(credential_generation),
         );
-        // Streaming responses outlive the handler response. Keep the workload
-        // permit until proxy finalization or timeout reconciliation; accepted
-        // archive tails have a separate bounded EOF owner below.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _dispatch_permit = dispatch_permit;
-        let archive_memory = memory.clone();
+        let archive_memory = background_state.persistence.stream_memory.reservation();
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
-        let (archive_settlement_sender, archive_settlement_receiver) =
-            tokio::sync::oneshot::channel();
-        let archive_eof_owner = tokio::spawn(hold_response_eof_until_archive_settles(
-            archive_settlement_receiver,
-            body_sender.clone(),
-            diagnostic_context,
-        ));
         // The bounded lifecycle below owns these values. Keep exact copies for
         // the timeout convergence path, which must not infer delivery from a
         // task that Tokio has just cancelled.
@@ -857,13 +847,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(spool) => spool.seal(),
                 None => None,
             };
-            if let Err(unowned) = archive_settlement_sender.send(archive_settlement)
-                && let Some(settlement) = unowned
-            {
-                // The EOF owner contains no fallible work before receiving, so
-                // this is defensive. Retain ownership locally if it exited.
-                settlement.wait().await;
-            }
+            drop(archive_settlement);
             // A spawned writer exclusively fences its failed/abandoned
             // capture, including a begin that commits after cancellation.
             // No writer means memory admission failed before any spool SQL;
@@ -938,16 +922,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 .as_ref()
                 .and_then(|conversation| conversation.hints.session_id.as_ref())
                 .map(|_| crate::db::unix_millis());
-            let mut routing_terminal_pre_published = false;
-            if crate::db::is_session_avoid_terminal(
-                classification.status_code,
-                classification.error_code,
-            ) && let Some(observed_at) = routing_terminal_observed_at
+            let routing_terminal_pre_published = routing_terminal_observed_at.is_some();
+            if let Some(observed_at) = routing_terminal_observed_at
                 && let Some(conversation) = conversation.as_ref()
                 && let Some(session_id) = conversation.hints.session_id.as_deref()
             {
                 let (model_route_id, upstream_account_id) = upstream_attempt.route_assignment();
-                let evidence = background_state.db.record_session_routing_terminal(
+                background_state.session_preferences.observe(
+                    &background_state,
                     crate::db::SessionRoutingTerminalInput {
                         key: &conversation.key,
                         request_id,
@@ -961,21 +943,31 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         observed_at,
                     },
                 );
-                match tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence).await
-                {
-                    Ok(Ok(())) => routing_terminal_pre_published = true,
-                    Ok(Err(error)) => tracing::error!(
-                        %request_id,
-                        error_category = error.diagnostic_category(),
-                        stage = "stream_routing_terminal",
-                        "failed to persist streaming routing terminal before downstream close"
-                    ),
-                    Err(_) => tracing::error!(
-                        %request_id,
-                        stage = "stream_routing_terminal",
-                        "streaming routing terminal persistence exceeded its short publish budget"
-                    ),
-                }
+                let database = background_state.routing_persistence_db.clone();
+                let key = conversation.key.clone();
+                let session_id = session_id.to_owned();
+                let public_model = public_model.clone();
+                background_state
+                    .routing_persistence
+                    .submit(8192, async move {
+                        let evidence = database.record_session_routing_terminal(
+                            crate::db::SessionRoutingTerminalInput {
+                                key: &key,
+                                request_id,
+                                explicit_session_id: &session_id,
+                                model: &public_model,
+                                protocol: protocol.name(),
+                                status_code: classification.status_code,
+                                error_code: classification.error_code,
+                                model_route_id: Some(model_route_id),
+                                upstream_account_id: Some(upstream_account_id),
+                                observed_at,
+                            },
+                        );
+                        tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence)
+                            .await
+                            .map_err(|_| AppError::Internal)?
+                    });
             }
             waits.terminal(transport_error.unwrap_or("completed"));
             drop(body_sender);
@@ -1072,19 +1064,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
         }
-        // The absolute proxy lifecycle ends after normal finalization or
-        // timeout reconciliation. A slow archive tail remains memory-bounded
-        // and connection-drain-owned, but must not retain scarce admission
-        // concurrency past that boundary.
         drop(_proxy_lifecycle_permit);
         drop(_dispatch_permit);
-        if let Err(error) = archive_eof_owner.await {
-            tracing::error!(
-                task_cancelled = error.is_cancelled(),
-                task_panicked = error.is_panic(),
-                "response archive EOF owner failed"
-            );
-        }
         stream_owner.finish("returned", Some(status.as_u16()), None);
     });
     let mut response = Response::builder()
@@ -1115,24 +1096,5 @@ fn chat_usage_capture_with_limits(
         ResponsesSseCapture::for_kimi_chat_usage_with_limits(limits)
     } else {
         ResponsesSseCapture::for_openai_chat_usage_with_limits(limits)
-    }
-}
-
-async fn hold_response_eof_until_archive_settles(
-    settlement: tokio::sync::oneshot::Receiver<
-        Option<crate::response_archive_spool::ResponseArchiveSettlement>,
-    >,
-    _body_sender: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-    diagnostic_context: proxy_diagnostics::Context,
-) {
-    let handoff = proxy_diagnostics::Phase::new(diagnostic_context, "archive_terminal_handoff");
-    if let Ok(Some(settlement)) = settlement.await {
-        handoff.finish("accepted", None, None);
-        let drain = proxy_diagnostics::Phase::new(diagnostic_context, "archive_eof_drain");
-        settlement.wait().await;
-        // wait() reports writer errors separately. Never label this success.
-        drain.finish("returned", None, None);
-    } else {
-        handoff.finish("no_settlement", None, None);
     }
 }

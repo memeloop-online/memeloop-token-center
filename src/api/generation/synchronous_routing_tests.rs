@@ -458,6 +458,7 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     assert_eq!(body["error"]["code"], "image_submission_uncertain");
     assert_eq!(body["error"]["retryable"], false);
     assert_eq!(body["error"]["reconciliation_available"], true);
+    fixture.state.routing_persistence.drain_for_test().await;
     let health = fixture
         .state
         .db
