@@ -183,6 +183,18 @@ async fn gateway_exposes_authenticated_failover_metrics_without_control_diagnost
         UpstreamHealthEvent::Failover,
         UpstreamHealthReason::RateLimited,
     );
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "gateway-metrics-reader".to_owned(),
+                scopes: vec!["metrics:read".to_owned()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("isolated scoped metrics credential");
     let application = api::router_for_role(state, RuntimeRole::Gateway);
 
     assert_eq!(get(&application, "/readyz").await.status(), StatusCode::OK);
@@ -190,13 +202,18 @@ async fn gateway_exposes_authenticated_failover_metrics_without_control_diagnost
         get(&application, "/metrics").await.status(),
         StatusCode::UNAUTHORIZED
     );
-    let response = get_authorized(&application, "/metrics").await;
+    assert_eq!(
+        get_authorized(&application, "/metrics").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = request_with_token(&application, Method::GET, "/metrics", &issued.token).await;
     assert_eq!(response.status(), StatusCode::OK);
     let metrics = body_text(response).await;
     assert!(metrics.contains(
         "memeloop_token_center_upstream_candidate_health_events_total{event=\"failover\",reason=\"rate_limited\"} 1"
     ));
     assert!(!metrics.contains("test-service-token"));
+    assert!(!metrics.contains(&issued.token));
     assert_eq!(
         get(&application, "/version").await.status(),
         StatusCode::NOT_FOUND
