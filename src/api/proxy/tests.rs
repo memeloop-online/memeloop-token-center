@@ -5034,17 +5034,10 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         .request_archive_refs(fixture.key_id, rows[0].request_id)
         .await
         .unwrap();
-    let archived = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().unwrap())
-        .await
-        .unwrap();
-    let archived = String::from_utf8(archived.to_vec()).unwrap();
-    assert_eq!(archived, rendered);
-    for secret in ["provider-secret", "secret-token"] {
-        assert!(!archived.contains(secret));
-    }
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+    );
     let rendered_metrics = fixture
         .state
         .metrics

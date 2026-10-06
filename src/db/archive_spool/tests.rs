@@ -1,6 +1,72 @@
 use super::*;
 
 #[tokio::test]
+async fn failed_terminal_claim_gaps_atomically_and_releases_budget_through_existing_gc() {
+    let (_dir, db, identity) = fixture().await;
+    assert!(db.begin_response_archive_spool(identity).await.unwrap());
+    assert!(
+        db.append_response_archive_spool(identity, 0, 3, "opaque")
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.seal_response_archive_spool(identity, 1, 3)
+            .await
+            .unwrap()
+    );
+    terminal(&db, identity).await;
+    sqlx::query("UPDATE request_records SET status_code = 502 WHERE id = $1")
+        .bind(identity.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let retained = budget(&db).await;
+    assert!(retained > 0);
+    sqlx::query("CREATE TRIGGER reject_terminal_gap BEFORE INSERT ON request_events WHEN NEW.event_kind = 'archive_gap' BEGIN SELECT RAISE(ABORT, 'terminal gap rollback'); END")
+        .execute(&db.pool).await.unwrap();
+    assert!(
+        db.claim_response_archive_spool(Uuid::new_v4())
+            .await
+            .is_err()
+    );
+    let row = sqlx::query("SELECT state, attempts, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1")
+        .bind(identity.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i64, _>("attempts"), 0);
+    assert!(row.get::<i64, _>("expires_at") > row.get::<i64, _>("updated_at"));
+    assert_eq!(budget(&db).await, retained);
+    sqlx::query("DROP TRIGGER reject_terminal_gap")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            db.claim_response_archive_spool(Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_gap'",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    assert_eq!(budget(&db).await, 0);
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0);
+}
+
+#[tokio::test]
 async fn cas_replay_rejects_completed_attempt_credentials_with_mismatched_database_ownership() {
     use crate::archive_staging::{
         ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,

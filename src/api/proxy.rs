@@ -1618,7 +1618,7 @@ async fn proxy_with_cancellation_guard(
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_buffered_request(
+                return finish_local_buffered_error(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
                     Bytes::from_static(
@@ -1767,12 +1767,17 @@ async fn proxy_with_cancellation_guard(
             drop(upstream);
             None
         };
+        let body = Bytes::from_static(
+            b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
+        );
+        let stored_response = format!(
+            "inline-json:{}",
+            std::str::from_utf8(&body).map_err(|_| AppError::Internal)?
+        );
         let result = finish_buffered_request_with_upstream_attribution_and_response_object(
             &buffered_request,
             status,
-            Bytes::from_static(
-                b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-            ),
+            body,
             "application/json",
             (
                 TokenUsage::default(),
@@ -1781,7 +1786,7 @@ async fn proxy_with_cancellation_guard(
             Some(format!("http_{}", status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::DurableArchive,
+                response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                 terminal_cause,
             },
         )

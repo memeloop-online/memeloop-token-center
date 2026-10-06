@@ -9,7 +9,11 @@ const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
 async fn failed_terminal_spools_never_enter_cas_staging() {
-    for (status_code, error_code) in [(503_i64, None), (200, Some("stream_incomplete"))] {
+    for (status_code, error_code) in [
+        (503_i64, None),
+        (200, Some("stream_incomplete")),
+        (429, None),
+    ] {
         let (_dir, state, pool, identity) = fixture().await;
         for purpose in [
             BufferedArchivePurpose::Request,
@@ -26,10 +30,37 @@ async fn failed_terminal_spools_never_enter_cas_staging() {
             );
         }
         finish(&pool, identity).await;
-        sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3 WHERE id = $4")
+        let response_locator = if status_code == 429 {
+            "inline-json:{\"error\":{\"message\":\"local failure\"}}".to_owned()
+        } else {
+            format!("gap://{}/response", identity.request_id)
+        };
+        sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, response_object = $5 WHERE id = $4")
             .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
-            .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
-        assert!(!process_one_for_test(&state).await);
+            .bind(identity.request_id.to_string()).bind(&response_locator).execute(&pool).await.unwrap();
+        for _ in 0..3 {
+            assert!(!process_one_for_test(&state).await);
+        }
+        let budget: i64 = sqlx::query_scalar(
+            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            budget, 0,
+            "failed terminal captures must not retain budget until TTL"
+        );
+        let gaps: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'gap' AND attempts = 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'gap' AND attempts = 0)")
+            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(gaps, 2);
+        let stored: String =
+            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, response_locator);
         let attempts: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
                 .bind(identity.request_id.to_string())
