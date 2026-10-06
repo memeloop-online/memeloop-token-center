@@ -1,0 +1,44 @@
+name: peer-stream-fingerprint
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/peer-stream-fingerprint.yml
+      - tests/deployment/peer-fingerprint/**
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/peer-stream-fingerprint.yml
+      - tests/deployment/peer-fingerprint/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peer-stream-fingerprint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-and-budget:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HELPER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Stdlib synthetic reassembly and independent cleanup
+        run: python3 -B -m unittest discover -v -s tests/deployment/peer-fingerprint -p 'test_*.py'
+      - name: Pinned tools, NET_RAW only, whole-cgroup 32Mi and 200m gate
+        run: python3 -B tests/deployment/peer-fingerprint/ci_resources.py
+      - name: Retain bounded metadata only
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: peer-fingerprint-resource-report
+          path: ${{ runner.temp }}/peer-fingerprint-resource-report.json
+          if-no-files-found: warn
+          retention-days: 7

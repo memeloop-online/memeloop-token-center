@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,8 @@ import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
 import { sourceFilesystem, sourceStatCommand } from './source-filesystem.ts';
 import { sourceInventory, sourceStatOutput } from './source-filesystem.fixture.ts';
+import { capacityPolicy } from './capacity-policy.ts';
+import { boundedJobs, preparedResources } from './hard-capacity.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const collector = fileURLToPath(new URL('./source-space.ts', import.meta.url));
@@ -25,7 +28,7 @@ const exportPod = {
   ] }] },
   status: { phase: 'Running' },
 };
-type Step = { contains: string[]; reply?: any; delayMs?: number; requestTimeout?: string; stderr?: string; exitCode?: number };
+type Step = { contains: string[]; reply?: any; delayMs?: number; requestTimeout?: string; stderr?: string; exitCode?: number; leaseOperation?: 'publish' | 'revoke' };
 function sourceCalls(options: { statDelayMs?: number; output?: string; after?: (value: any) => void } = {}): Step[] {
   const before = sourceInventory();
   const after = sourceInventory();
@@ -54,7 +57,7 @@ const volumeCalls = (): Step[] => [
 ];
 const revokeCalls = (): Step[] => [exportCall(), { contains: ['exec', exportName, '/bin/rm', '/tmp/source-space.lease', '/tmp/backup-volume.lease'], reply: '' }];
 
-async function run(context: TestContext, plan: Step[], watch = false) {
+async function run(context: TestContext, plan: Step[], watch = false, leaseContainer?: string) {
   const directory = mkdtempSync(join(tmpdir(), 'cnpg-collector-'));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   writeFileSync(join(directory, 'plan.json'), JSON.stringify(plan));
@@ -62,7 +65,7 @@ async function run(context: TestContext, plan: Step[], watch = false) {
   writeFileSync(join(directory, 'kubectl'), `#!/bin/sh\nexec '${process.execPath}' '${fixture}' "$@"\n`, { mode: 0o700 });
   const child = spawn(process.execPath, [collector, ...(watch ? ['--watch', exportName] : ['--check'])], {
     detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, KUBECONFIG: join(directory, 'no-cluster-credentials'), COLLECTOR_FIXTURE_DIRECTORY: directory, PARENT_REVIEW_APPROVED: 'true' },
+    env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, KUBECONFIG: join(directory, 'no-cluster-credentials'), COLLECTOR_FIXTURE_DIRECTORY: directory, PARENT_REVIEW_APPROVED: 'true', ...(leaseContainer ? { COLLECTOR_LEASE_CONTAINER: leaseContainer } : {}) },
   });
   const stop = () => { try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { } };
   context.after(stop);
@@ -86,7 +89,8 @@ async function run(context: TestContext, plan: Step[], watch = false) {
     assert.ok(Number.isFinite(Date.parse(started.observedAt)) && Number.isFinite(Date.parse(ended.observedAt)));
   }
   context.diagnostic(JSON.stringify({ status, observations: events.filter(event => ['source-sample', 'lease-publication-start', 'lease-publication-end', 'transient-api-retry-no-lease-renewal', 'collector-failed'].includes(event.event)), delayedCalls: events.filter(event => event.event === 'api-end' && event.durationMs >= 200) }));
-  return { status, events, stdout };
+  const calls = readFileSync(join(directory, 'calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  return { status, events, stdout, calls };
 }
 
 test('real collector executes a new stat and retains its conservative collection start through postflight', { timeout: 120_000 }, async context => {
@@ -209,4 +213,134 @@ test('three transient subprocess failures never publish or leak stderr; malforme
   assert.equal(malformed.status, 1);
   assert.equal(malformed.events.at(-1).category, 'API_INVALID_JSON');
   assert.equal(malformed.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+});
+
+const scheduleImage = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
+const docker = (args: string[], input?: string) => execFileSync('docker', args, { input, encoding: 'utf8', timeout: 180_000, stdio: ['pipe', 'pipe', 'pipe'] });
+const shell = (container: string, command: string) => docker(['exec', container, '/bin/sh', '-ec', command]);
+const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+function supervisedStage(context: TestContext) {
+  const stage = preparedResources().find(resource => resource.kind === 'Job' && resource.metadata.name === boundedJobs.stage).spec.template.spec.containers[0];
+  const environment = Object.fromEntries(stage.env.filter((entry: any) => entry.value !== undefined).map((entry: any) => [entry.name, entry.value]));
+  Object.assign(environment, {
+    PARENT_REVIEW_APPROVED: 'true', SOURCE_IO_REVIEW_APPROVED: 'true', ROOT_STORAGE_REVIEW_APPROVED: 'true', HARD_CAPACITY_REVIEW_APPROVED: 'true',
+    EXPECTED_BACKUP_FS_UUID: stageIdentity.filesystemUUID, EXPECTED_BACKUP_DEVICE: stageIdentity.device, POD_UID: exportPod.metadata.uid,
+    EXPECTED_SERVER_ADDRESS: '127.0.0.1', DATABASE_URL: 'unused-fixture-no-credentials', PGOPTIONS: '',
+    BACKUP_MAX_BYTES: String(128 * 1024 ** 2), BACKUP_MIN_BYTES: '1048576', BACKUP_RESERVE_BYTES: '0', CAPACITY_MIN_FREE_INODES: '1',
+  });
+  const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+    ...Object.entries(environment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+    '--tmpfs', '/tmp:rw,exec,size=32m,uid=26,gid=26', '--tmpfs', '/policy:rw,size=1m,uid=26,gid=26', '--tmpfs', '/backup:rw,size=128m,uid=26,gid=26',
+    '--entrypoint=/bin/sleep', scheduleImage, '600']).trim();
+  context.after(() => docker(['rm', '-f', container]));
+  const write = (path: string, contents: string) => docker(['exec', '-i', container, 'dd', `of=${path}`, 'status=none'], contents);
+  shell(container, 'mkdir /tmp/bin');
+  write('/policy/capacity.sh', capacityPolicy);
+  write('/tmp/bin/findmnt', `#!/bin/sh
+case "$*" in
+  *'/tmp') printf tmpfs ;;
+  *FSTYPE*) printf xfs ;;
+  *FSROOT*) printf / ;;
+  *TARGET*) printf /backup ;;
+  *UUID*) printf '' ;;
+  *MAJ:MIN*) printf 8:32 ;;
+  *SOURCE*) printf %s '${stageIdentity.device}' ;;
+  *) exit 1 ;;
+esac
+`);
+  write('/tmp/bin/psql', '#!/bin/sh\ncase "$*" in *"SELECT NOT pg_is_in_recovery()"*) printf "t\\n" ;; esac\n');
+  write('/tmp/bin/pg_dump', '#!/bin/sh\ntrap "" TERM\nprintf "%s\\n" "$$" >> /tmp/producer-starts\ndd if=/dev/zero bs=65536 status=none &\nwait "$!"\n');
+  const command = [...stage.command];
+  command[6] = command[6].replace('26071793664', '1048576').replace('rate_pid=$!\n', 'rate_pid=$!\nprintf \'%s\\n\' "$rate_pid" >> /tmp/writer-starts\n');
+  write('/tmp/export-command', `#!/bin/sh\nexport PATH=/tmp/bin:$PATH\nprintf '%s\\n' "$$" > /tmp/supervisor.pid\nexec ${command.map(quote).join(' ')}\n`);
+  shell(container, 'chmod 700 /tmp/bin/* /tmp/export-command');
+  const exporter = spawn('docker', ['exec', container, '/tmp/export-command'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  exporter.stdout!.on('data', chunk => { output += chunk; });
+  exporter.stderr!.on('data', chunk => { output += chunk; });
+  context.after(() => { if (exporter.exitCode === null) exporter.kill('SIGKILL'); });
+  return { container, exporter, output: () => output };
+}
+
+function assertSequentialCalls(calls: any[]): void {
+  let active: number | undefined;
+  for (const call of calls) {
+    if (call.event === 'start') {
+      assert.equal(active, undefined, 'No overlapping collector API processes');
+      active = call.index;
+    } else {
+      assert.equal(call.index, active);
+      active = undefined;
+    }
+  }
+  assert.equal(active, undefined);
+}
+
+async function assertStoppedStage(stage: ReturnType<typeof supervisedStage>): Promise<void> {
+  for (let attempt = 0; attempt < 100 && stage.exporter.exitCode === null; attempt++) await delay(100);
+  assert.equal(stage.exporter.exitCode, 1, 'Independent supervisor must stop, never falsely succeed');
+  const directory = '/backup/mtc-pg-logical-20261004';
+  shell(stage.container, `test -s ${directory}/memeloop_token_center.dump.partial; test ! -e ${directory}/LOCAL_ARCHIVE_CREATED; test "$(wc -l < /tmp/producer-starts)" -eq 1; test "$(wc -l < /tmp/writer-starts)" -eq 1`);
+  const remaining = docker(['top', stage.container, '-eo', 'pid,ppid,pgid,stat,comm']).trim().split('\n').slice(1).filter(line => !line.trim().split(/\s+/)[3]!.startsWith('Z'));
+  assert.equal(remaining.length, 1, `Producer/writer descendants leaked: ${remaining.join('; ')}`);
+  assert.equal(remaining[0]!.trim().split(/\s+/).at(-1), 'sleep', 'Unrelated PID1 remains alive');
+  assert.match(stage.output(), /guard_abort=/);
+  assert.doesNotMatch(stage.output(), /local archive SHA256 and TOC only/);
+}
+
+test('25s collection immediately starts the next 12s cycle; real 45s CSI TTL keeps one producer/writer alive until revocation', { timeout: 120_000 }, async context => {
+  docker(['pull', scheduleImage]);
+  const stage = supervisedStage(context);
+  const slowVolume = volumeCalls();
+  slowVolume[0]!.delayMs = 12500;
+  slowVolume[1]!.delayMs = 12500;
+  const nextSource = sourceCalls();
+  nextSource[0]!.delayMs = 6000;
+  nextSource[1]!.delayMs = 6000;
+  const publish: Step = { contains: ['exec', exportName, '/bin/sh'], reply: '', leaseOperation: 'publish' };
+  const revoke = revokeCalls();
+  revoke[1]!.leaseOperation = 'revoke';
+  const failedVolume = volumeCalls().slice(0, 1);
+  Object.assign(failedVolume[0]!, { exitCode: 1, reply: sentinel, stderr: sentinel });
+  const result = await run(context, [
+    ...sourceCalls(), exportCall(), ...slowVolume, ...sourceCalls(), publish,
+    exportCall(), ...volumeCalls(), ...nextSource, publish,
+    exportCall(), ...failedVolume, ...revoke,
+  ], true, stage.container);
+  assert.equal(result.status, 1);
+  const schedules = result.events.filter(event => event.event === 'renewal-schedule');
+  assert.equal(schedules.length, 2);
+  assert.ok(schedules[0].cycleElapsedMs >= 25000);
+  assert.equal(schedules[0].delayMs, 0, 'Do not add a fixed 15s delay after slow collection');
+  const firstEnd = result.events.find(event => event.event === 'collection-end' && event.cycle === 1);
+  const secondStart = result.events.find(event => event.event === 'collection-start' && event.cycle === 2);
+  assert.ok(secondStart.monotonicMs - firstEnd.monotonicMs < 2000, 'Overrun starts the next sequential cycle immediately');
+  const leases = result.events.filter(event => event.event === 'lease-publication-end');
+  assert.equal(leases.length, 2, 'Failed collection cannot publish a third lease');
+  assert.ok(Date.parse(leases[0].observedAt) / 1000 - leases[0].volumeLeaseEpoch >= 25, 'Keep actual old observation epoch, do not retimestamp');
+  assert.ok(Date.parse(leases[1].observedAt) / 1000 - leases[0].volumeLeaseEpoch < 45, 'Second publication arrives inside the original CSI TTL');
+  assert.ok(result.events.some(event => event.phase === 'lease-revoke' && event.outcome === 'success'));
+  assertSequentialCalls(result.calls);
+  await assertStoppedStage(stage);
+});
+
+test('a collection exceeding 45s still expires the real volume lease and cleans up without renewal or overlapping writers', { timeout: 120_000 }, async context => {
+  const stage = supervisedStage(context);
+  const expiredVolume = volumeCalls();
+  for (const step of expiredVolume.slice(0, 3)) step.delayMs = 16000;
+  const revoke = revokeCalls();
+  revoke[1]!.leaseOperation = 'revoke';
+  const result = await run(context, [
+    ...sourceCalls(), exportCall(), ...volumeCalls(), ...sourceCalls(),
+    { contains: ['exec', exportName, '/bin/sh'], reply: '', leaseOperation: 'publish' },
+    exportCall(), ...expiredVolume, ...revoke,
+  ], true, stage.container);
+  assert.equal(result.status, 1);
+  assert.equal(result.events.filter(event => event.event === 'lease-publication-end').length, 1);
+  assert.equal(result.events.filter(event => event.event === 'renewal-schedule').length, 1);
+  assert.ok(result.events.some(event => event.event === 'collection-end' && event.cycle === 2 && event.durationMs >= 48000 && event.outcome === 'failure'));
+  assert.equal(result.events.at(-1).category, 'GUARD_ASSERTION');
+  assertSequentialCalls(result.calls);
+  await assertStoppedStage(stage);
 });

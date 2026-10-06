@@ -26,6 +26,9 @@ const WINDOW: i64 = 65_535;
 const PRIME: &[u8] = b"prime";
 const HOST: &str = "upload.example.test";
 
+#[path = "http2_upload_tests/multiplex.rs"]
+mod multiplex;
+
 struct Frame {
     from_client: bool,
     kind: u8,
