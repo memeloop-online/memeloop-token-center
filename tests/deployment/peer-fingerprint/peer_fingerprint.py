@@ -309,6 +309,12 @@ def supervise(command, consumer, duration):
         capture.stderr.close()
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     if failure is not None:
+        failure.capture_returncode = capture.returncode
+        failure.capture_startup_rejected = any(
+            marker in diagnostic for marker in (
+                b"You don't have permission", b"Operation not permitted", b"Permission denied",
+            )
+        )
         raise failure
     return result, capture.returncode, diagnostic
 

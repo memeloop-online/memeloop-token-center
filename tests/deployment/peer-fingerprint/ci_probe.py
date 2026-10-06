@@ -9,6 +9,7 @@ import peer_fingerprint as helper
 
 
 PEERS = ("192.0.2.1", "192.0.2.2")
+STATE = {"stage": "initializing"}
 
 
 def memory():
@@ -35,14 +36,22 @@ def main():
     assembler = helper.Assembler(PEERS)
     started = time.monotonic()
     measurements = {"baseline": memory()}
+    STATE["measurements"] = measurements
+    STATE["capabilities"] = {
+        line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+        for line in Path("/proc/self/status").read_text().splitlines()
+        if line.startswith(("CapEff:", "CapPrm:", "CapAmb:", "CapBnd:"))
+    }
     output = CountingSink()
 
     def consume(stream):
+        STATE["stage"] = "synthetic_assembly"
         payload = bytes(range(256)) * 16
         for index in range(helper.MAX_BLOCKS):
             assembler.segment(*PEERS, 30000, 2380, (index + 1) * helper.BLOCK_SIZE, 16, payload, 2_000_000_000)
         assembler.segment(*PEERS, 30000, 2380, 4096, 16, payload, 2_000_000_000)
         summary = assembler.summary("0" * 32, "left", 1_000_000_000, 3_000_000_000, 1_000_000_000, 3_000_000_000)
+        STATE["stage"] = "serialize_summary"
         if len(summary["records"]) != helper.MAX_BLOCKS or summary["issues"]:
             raise RuntimeError("synthetic_assembly_incomplete")
         helper.safe_emit(summary, output)
@@ -55,9 +64,12 @@ def main():
                 raise
         else:
             raise RuntimeError("assembly_budget_not_enforced")
+        STATE["stage"] = "read_idle_capture_header"
         helper.read_pcap(stream, helper.Assembler(PEERS))
 
+    STATE["stage"] = "start_capture_group"
     _, returncode, diagnostic = helper.supervise(helper.capture_command(PEERS, interface="lo"), consume, 45)
+    STATE["stage"] = "capture_statistics"
     statistics = helper.capture_statistics(diagnostic)
     measurements["after_cleanup"] = memory()
     if returncode != 0 or statistics != {"captured": 0, "received": 0, "dropped": 0}:
@@ -83,6 +95,13 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except BaseException:
-        print('{"probe_failure":"bounded_probe_failed","production_capture":false}', flush=True)
+    except BaseException as error:
+        print(json.dumps({
+            "probe_failure": "bounded_probe_failed",
+            "error_type": type(error).__name__,
+            "capture_returncode": getattr(error, "capture_returncode", None),
+            "capture_startup_rejected": getattr(error, "capture_startup_rejected", None),
+            "state": STATE,
+            "production_capture": False,
+        }), flush=True)
         sys.exit(1)
