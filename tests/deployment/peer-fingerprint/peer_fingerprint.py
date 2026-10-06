@@ -322,7 +322,7 @@ def supervise(command, consumer, duration):
 def capture_command(peers, interface="tailscale0"):
     first, second = (str(ipaddress.IPv4Address(peer)) for peer in peers)
     expression = f"tcp port 2380 and ((src host {first} and dst host {second}) or (src host {second} and dst host {first}))"
-    return ["/usr/bin/tcpdump", "-i", interface, "-p", "-nn", "-Z", "root", "-s", "0", "-B", "512", "-U", "-w", "-", expression]
+    return ["/usr/bin/tcpdump", "-i", interface, "-p", "-nn", "-s", "0", "-B", "512", "-U", "-w", "-", expression]
 
 
 def validate_capabilities(status):

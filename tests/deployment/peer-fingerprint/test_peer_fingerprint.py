@@ -356,7 +356,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(command[0], "/usr/bin/tcpdump")
         self.assertIn("-p", command)
         self.assertIn("-nn", command)
-        self.assertEqual(command[command.index("-Z") + 1], "root")
+        self.assertNotIn("-Z", command)
         self.assertEqual(command[command.index("-w") + 1], "-")
         self.assertEqual(command[-1], "tcp port 2380 and ((src host 192.0.2.1 and dst host 192.0.2.2) or (src host 192.0.2.2 and dst host 192.0.2.1))")
 

@@ -83,9 +83,11 @@ at both 32MiB and 64MiB. The revised CI tests UID 0, still nonprivileged with on
 NET_RAW, rather than adding SETUID/SETGID/NET_ADMIN, changing file capabilities,
 installing a launcher or changing node runtime configuration. The helper checks
 effective/permitted/bounding capabilities are exactly NET_RAW and requires
-NoNewPrivs=1. `tcpdump -Z root` suppresses the compiled default user transition;
-it does not grant capabilities. This behavior is explicit in the publisher's
-[tcpdump 4.99.6 source](https://github.com/the-tcpdump-group/tcpdump/blob/tcpdump-4.99.6/tcpdump.c).
+NoNewPrivs=1. Do not add `-Z root`: the CMake build defaults to no `WITH_USER`,
+so that option requests an unnecessary uid/group transition requiring additional
+capabilities. The conditional behavior is explicit in the publisher's
+[tcpdump 4.99.6 source](https://github.com/the-tcpdump-group/tcpdump/blob/tcpdump-4.99.6/tcpdump.c)
+and [CMake configuration](https://github.com/the-tcpdump-group/tcpdump/blob/tcpdump-4.99.6/CMakeLists.txt).
 Green CI for this alternative is not approval to change the production identity.
 
 If 32MiB fails, a **CI-only 64MiB diagnostic measurement** is reported, but the
