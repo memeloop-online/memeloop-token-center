@@ -199,6 +199,24 @@ pub(in crate::api) async fn stage_application_plugin(
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn register_empty_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::RegisterEmptyInventory>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
+    authority
+        .register_empty(body, runtime_operation_key(&headers)?, &actor)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
 pub(in crate::api) async fn publish_application_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,

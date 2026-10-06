@@ -26,6 +26,8 @@ mod archive_terminal;
 mod buffered_responses_incomplete;
 mod cancellation;
 mod chat_sse_usage;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod claude_wire_recovery;
 mod codex_complex_contract;
 mod codex_dispatch;
 mod codex_http2_downstream_cancel;
