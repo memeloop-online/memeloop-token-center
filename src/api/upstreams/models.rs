@@ -609,7 +609,14 @@ async fn sync_account_models_selected(
         .await
         .unwrap_or(Err("connection_failed"))
     } else {
-        discover_models(state, &account, &credential, blocking, false).await
+        discover_models(
+            state,
+            &account,
+            &credential,
+            blocking,
+            account.driver == "openai-codex",
+        )
+        .await
     };
     let mut price_sync = CatalogPriceSyncResult::skipped();
     match discovery {
@@ -1590,6 +1597,265 @@ mod tests {
             ..ManagedModelRouteSyncResult::default()
         };
         assert!(managed_route_snapshot_is_current(&result));
+    }
+
+    #[tokio::test]
+    async fn codex_background_and_manual_refresh_preserve_availability_on_partial_catalogs() {
+        use sqlx::Connection;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("partial-catalog.db").display()
+        ));
+        config.pricing_models_dev_url = format!("{}/prices-models-dev", server.uri());
+        config.pricing_litellm_url = format!("{}/prices-litellm", server.uri());
+        config.pricing_openrouter_url = format!("{}/prices-openrouter", server.uri());
+        let state = AppState::initialize(config).await.unwrap();
+        let tenant = "partial-catalog";
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "partial-catalog".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({"base_url": server.uri(), "network_scope": "public"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "catalog-test-access".into(),
+                        refresh_token: None,
+                        expires_at: None,
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: Some(json!({
+                            "schema": "openai-codex-oauth-v1", "account_id": "catalog-test-account"
+                        })),
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let metadata =
+            |model: &str| json!({"slug": model, "visibility": "list", "context_window": 272000});
+        for names in [vec!["previously-removed"], vec!["keep", "retain"]] {
+            let lease = Uuid::now_v7();
+            assert!(
+                state
+                    .db
+                    .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+                    .await
+                    .unwrap()
+            );
+            let models = names
+                .into_iter()
+                .map(|name| normalize_codex_model(&metadata(name)).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                state
+                    .db
+                    .replace_upstream_model_catalog(
+                        account.id,
+                        tenant,
+                        1,
+                        lease,
+                        "codex_models",
+                        &models,
+                    )
+                    .await
+                    .unwrap(),
+                ReplaceModelCatalogResult::Replaced
+            );
+        }
+        for model in ["keep", "retain"] {
+            state
+                .db
+                .create_model_route(crate::db::CreateModelRouteInput {
+                    tenant_external_id: tenant.into(),
+                    public_model: model.into(),
+                    upstream_account_id: account.id,
+                    upstream_model: model.into(),
+                    protocol: "openai".into(),
+                    priority: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let before = state
+            .db
+            .upstream_model_catalog(account.id, tenant, None, 100)
+            .await
+            .unwrap();
+        let (account_before, _) = state
+            .db
+            .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        let mut observer = sqlx::AnyConnection::connect(&state.config.database_url)
+            .await
+            .unwrap();
+        let snapshot_before: String = sqlx::query_scalar(
+            "SELECT current_snapshot_id FROM upstream_model_catalog_state WHERE upstream_account_id=$1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+        let partial = json!({"models": [metadata("keep")]});
+        let responses = [
+            ResponseTemplate::new(206).set_body_json(partial.clone()),
+            ResponseTemplate::new(200)
+                .insert_header("Content-Range", "models 0-0/2")
+                .set_body_json(partial.clone()),
+            ResponseTemplate::new(200)
+                .insert_header("Link", "</models?page=2>; rel=\"next\"")
+                .set_body_json(partial.clone()),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models": [metadata("keep")], "has_more": true})),
+            ResponseTemplate::new(200).set_body_json(json!({
+                "models": [metadata("keep")], "pagination": {"next_page_token": "next"}
+            })),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models": [metadata("keep")], "total": 2})),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models": [metadata("keep")], "truncated": true})),
+            ResponseTemplate::new(200).set_body_json(json!({
+                "models": [metadata("keep")], "error": {"message": "incomplete"}
+            })),
+        ];
+        for response in responses {
+            for background in [false, true] {
+                server.reset().await;
+                Mock::given(path("/models"))
+                    .respond_with(response.clone())
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                if background {
+                    sync_upstream_models_after_refresh(&state, account.id, None).await;
+                } else {
+                    let result = sync_account_models(&state, account.id, tenant, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.price_sync.status, "skipped");
+                }
+                let after = state
+                    .db
+                    .upstream_model_catalog(account.id, tenant, None, 100)
+                    .await
+                    .unwrap();
+                assert_eq!(after.status, "stale");
+                assert_eq!(after.error_code.as_deref(), Some("invalid_response"));
+                assert_eq!(after.last_success_at, before.last_success_at);
+                assert_eq!(after.expires_at, before.expires_at);
+                assert_eq!(
+                    serde_json::to_value(&after.models).unwrap(),
+                    serde_json::to_value(&before.models).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&after.disabled_models).unwrap(),
+                    serde_json::to_value(&before.disabled_models).unwrap()
+                );
+                let (snapshot, lease, expires): (String, Option<String>, Option<i64>) =
+                    sqlx::query_as("SELECT current_snapshot_id, sync_lease_id, sync_lease_expires_at FROM upstream_model_catalog_state WHERE upstream_account_id=$1")
+                        .bind(account.id.to_string()).fetch_one(&mut observer).await.unwrap();
+                assert_eq!(snapshot, snapshot_before);
+                assert_eq!((lease, expires), (None, None));
+                let eligible: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM model_route_eligible_upstream_accounts WHERE upstream_account_id=$1",
+                )
+                .bind(account.id.to_string())
+                .fetch_one(&mut observer)
+                .await
+                .unwrap();
+                assert_eq!(eligible, 2);
+                let (account_after, _) = state
+                    .db
+                    .upstream_account_with_credential(
+                        account.id,
+                        state.config.key_pepper.as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(account_after.config, account_before.config);
+                assert_eq!(account_after.updated_at, account_before.updated_at);
+                assert_eq!(account_after.credential_generation, 1);
+                let now = unix_millis();
+                assert!(
+                    state
+                        .db
+                        .list_codex_model_catalog_refresh_candidates(now - 3_600_000, now, 20)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let retry_at = now + 3_601_000;
+                assert_eq!(
+                    state
+                        .db
+                        .list_codex_model_catalog_refresh_candidates(
+                            retry_at - 3_600_000,
+                            retry_at,
+                            20,
+                        )
+                        .await
+                        .unwrap(),
+                    vec![account.id]
+                );
+                server.verify().await;
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1, "no pagination, pricing or OAuth request");
+                assert_eq!(requests[0].method.as_str(), "GET");
+            }
+        }
+        server.reset().await;
+        Mock::given(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [metadata("keep"), metadata("new-model")], "has_more": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        sync_upstream_models_after_refresh(&state, account.id, None).await;
+        let recovered = state
+            .db
+            .upstream_model_catalog(account.id, tenant, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(recovered.status, "ready");
+        assert!(recovered.error_code.is_none());
+        assert!(recovered.models.iter().any(|model| model.id == "new-model"));
+        assert!(
+            recovered
+                .disabled_models
+                .iter()
+                .any(|model| model.id == "retain")
+        );
+        let eligible: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_route_eligible_upstream_accounts WHERE upstream_account_id=$1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+        assert_eq!(eligible, 1);
+        assert_eq!(
+            state
+                .db
+                .list_model_routes(Some(tenant))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
