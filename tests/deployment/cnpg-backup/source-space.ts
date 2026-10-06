@@ -121,6 +121,7 @@ async function main(): Promise<void> {
     const started = Date.now();
     try {
       while (Date.now() - started < sourceSpace.deadlineMs) {
+        const cycleStarted = performance.now();
         cycle++;
         attempt = 0;
         const observation = await retryObservation(() => collect('renewal', () => {
@@ -154,7 +155,10 @@ async function main(): Promise<void> {
           return true;
         }), { report });
         if (!observation) break;
-        await delay(sourceSpace.intervalMs);
+        const cycleElapsedMs = performance.now() - cycleStarted;
+        const delayMs = Math.max(0, sourceSpace.intervalMs - cycleElapsedMs);
+        emit('renewal-schedule', { cycleElapsedMs, delayMs });
+        await delay(delayMs);
       }
       assert.ok(Date.now() - started < sourceSpace.deadlineMs, 'Source watcher deadline exceeded');
     } catch (error) {
