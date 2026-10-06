@@ -67,6 +67,7 @@ const PROXY_ARCHIVE_STREAM_CONCURRENCY: usize = 4;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub(crate) service_auth_role: Option<config::RuntimeRole>,
     pub db: Database,
     pub(crate) persistence_db: Database,
     pub(crate) persistence: Arc<api::proxy::persistence::Persistence>,
@@ -210,6 +211,7 @@ impl AppState {
             .map_err(|_| InitializationError::TransportProxyGroups)?;
         Ok(Self {
             config: Arc::new(config),
+            service_auth_role: None,
             db,
             persistence_db,
             persistence: Arc::new(api::proxy::persistence::Persistence::default()),

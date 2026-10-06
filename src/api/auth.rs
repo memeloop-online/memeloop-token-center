@@ -25,6 +25,11 @@ use super::proxy_diagnostics;
 const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const CONTROL_BODY_PERMIT_WAIT: Duration = Duration::from_secs(1);
 const CONTROL_BODY_READ_CONCURRENCY: usize = 4;
+const DISABLED_BOOTSTRAP_SERVICE_TOKEN: &str = "bootstrap-disabled-for-this-role";
+
+#[cfg(test)]
+mod role_bootstrap_tests;
+
 static CONTROL_BODY_READ_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(CONTROL_BODY_READ_CONCURRENCY);
 
@@ -531,15 +536,20 @@ pub(super) async fn authenticated_service(
     state: &AppState,
 ) -> Result<AuthenticatedService, AppError> {
     let provided = bearer(headers).ok_or(AppError::Unauthorized)?;
-    let service =
-        if crypto::constant_time_eq(provided.as_bytes(), state.config.service_token.as_bytes()) {
-            AuthenticatedService::bootstrap()
-        } else {
-            state
-                .db
-                .authenticate_service_token(provided, state.config.key_pepper.as_bytes())
-                .await?
-        };
+    let bootstrap_enabled = state
+        .service_auth_role
+        .is_some_and(crate::config::RuntimeRole::serves_control)
+        && state.config.service_token != DISABLED_BOOTSTRAP_SERVICE_TOKEN;
+    let service = if bootstrap_enabled
+        && crypto::constant_time_eq(provided.as_bytes(), state.config.service_token.as_bytes())
+    {
+        AuthenticatedService::bootstrap()
+    } else {
+        state
+            .db
+            .authenticate_service_token(provided, state.config.key_pepper.as_bytes())
+            .await?
+    };
     Ok(service)
 }
 
