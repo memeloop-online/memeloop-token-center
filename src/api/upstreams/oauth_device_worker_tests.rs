@@ -14,6 +14,7 @@ use crate::{
     provider::{UpstreamCredential, seal_private_json},
 };
 use serde_json::json;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 fn credential(value: &str) -> UpstreamCredential {
@@ -195,19 +196,24 @@ async fn staged_login_recovery(stale_account: bool) {
         );
         return;
     }
+    let control = crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Control);
     let observe = || async {
-        let headers = axum::http::HeaderMap::from_iter([(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_str(&format!("Bearer {}", state.config.service_token))
-                .unwrap(),
-        )]);
-        super::oauth::poll_codex_oauth(
-            axum::extract::State(state.clone()),
-            headers,
-            axum::Json(serde_json::from_value(json!({"session_id":session_id})).unwrap()),
-        )
-        .await
-        .unwrap()
+        control
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/internal/v1/oauth/codex/poll")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", state.config.service_token),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"session_id":session_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     };
     assert_eq!(observe().await.status(), axum::http::StatusCode::ACCEPTED);
     assert_eq!(
