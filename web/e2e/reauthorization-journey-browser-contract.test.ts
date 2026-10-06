@@ -19,7 +19,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     const chinese = locale === 'zh-CN';
     const page = await browser.newPage();
     await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
-    const account = { id: 'claude-reauthorization-fixture', name: 'Fixture Claude account', tenant_external_id: 'fixture-a', driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, updated_at: 3, route_count: 0, config: {}, can_reauthorize: true, can_update_transport_proxy: false };
+    const account = { id: 'claude-reauthorization-fixture', name: 'Fixture Claude account', tenant_id: 'fixture-tenant-id', tenant_external_id: 'fixture-a', driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, created_at: 1, updated_at: 3, route_count: 0, config: {}, can_refresh: true, can_rotate: false, can_reauthorize: true, can_update_transport_proxy: false };
     let accountReads = 0;
     let starts = 0;
     await page.route('**/*', async route => {

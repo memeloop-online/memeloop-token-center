@@ -6,7 +6,7 @@ use memeloop_token_center::{
     config::{Config, RuntimeRole},
     db::{
         Database, FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE, FailedRequestCostBackfillCursor,
-        FailedRequestCostBackfillInput,
+        FailedRequestCostBackfillExactManifest, FailedRequestCostBackfillInput,
     },
     worker::{self, wait_for_server_shutdown},
 };
@@ -53,6 +53,15 @@ enum Command {
         role: RuntimeRole,
     },
     Migrate,
+    #[command(
+        about = "Preview an exact USD contract-ceiling cancellation manifest; --apply only changes statistical projections"
+    )]
+    BackfillExactFailedRequestCosts {
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Audit or correct one bounded batch of historical failed-request cost projections.
     /// Without --apply this is a read-only dry run; resume from the returned JSON cursor.
     BackfillFailedRequestCosts {
@@ -183,6 +192,34 @@ async fn run() -> Result<(), &'static str> {
                 .map_err(|_| "database_migration_failed")?;
             info!("database schema is current");
         }
+        Command::BackfillExactFailedRequestCosts { manifest, apply } => {
+            use tokio::io::AsyncReadExt;
+
+            let file = tokio::fs::File::open(manifest)
+                .await
+                .map_err(|_| "exact_projection_manifest_unreadable")?;
+            let mut bytes = Vec::new();
+            file.take(524_289)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| "exact_projection_manifest_unreadable")?;
+            if bytes.len() > 524_288 {
+                return Err("exact_projection_manifest_too_large");
+            }
+            let manifest: FailedRequestCostBackfillExactManifest =
+                serde_json::from_slice(&bytes).map_err(|_| "exact_projection_manifest_invalid")?;
+            let database = Database::connect_with_max(&config.database_url, 1)
+                .await
+                .map_err(|_| "database_connect_failed")?;
+            let report = database
+                .backfill_failed_request_costs_exact(manifest, apply)
+                .await
+                .map_err(|_| "exact_projection_backfill_failed")?;
+            println!(
+                "{}",
+                serde_json::to_string(&report).map_err(|_| "exact_projection_report_failed")?
+            );
+        }
         Command::BackfillFailedRequestCosts {
             apply,
             batch_size,
@@ -290,6 +327,41 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn exact_projection_backfill_requires_manifest_and_defaults_to_preview() {
+        assert!(
+            Cli::try_parse_from([
+                "memeloop-token-center",
+                "backfill-exact-failed-request-costs",
+            ])
+            .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "memeloop-token-center",
+            "backfill-exact-failed-request-costs",
+            "--manifest",
+            "reviewed.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::BackfillExactFailedRequestCosts { apply: false, .. }
+        ));
+        for disallowed in ["--batch-size", "--from-created-at", "--after-created-at"] {
+            assert!(
+                Cli::try_parse_from([
+                    "memeloop-token-center",
+                    "backfill-exact-failed-request-costs",
+                    "--manifest",
+                    "reviewed.json",
+                    disallowed,
+                    "1",
+                ])
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn failed_request_cost_backfill_is_explicit_bounded_and_dry_run_by_default() {

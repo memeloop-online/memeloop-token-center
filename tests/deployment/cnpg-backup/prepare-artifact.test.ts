@@ -15,7 +15,7 @@ test('independent export artifact binds tested revision, includes dependency-fre
   const output = join(parent, 'bundle');
   const revision = { testedCommit: '1'.repeat(40), sourceHead: '2'.repeat(40), runId: '37358304060' };
   prepareArtifact(output, revision);
-  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'provenance.json', 'source-space.ts', 'volume-identity.ts']);
+  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'provenance.json', 'source-filesystem.ts', 'source-space.ts', 'volume-identity.ts']);
   const manifest = parseAllDocuments(readFileSync(join(output, 'cnpg-export-preparation.yaml'), 'utf8')).map(document => {
     assert.deepEqual(document.errors, []);
     return document.toJS({ maxAliasCount: 0 });
@@ -37,9 +37,9 @@ test('independent export artifact binds tested revision, includes dependency-fre
     const [expected, name] = line.split('  ');
     assert.equal(createHash('sha256').update(readFileSync(join(output, name!))).digest('hex'), expected);
   }
-  for (const name of ['source-space.ts', 'volume-identity.ts']) {
+  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts']) {
     const contents = readFileSync(join(output, name), 'utf8');
-    for (const imported of contents.matchAll(/from '([^']+)'/g)) assert.ok(imported[1]!.startsWith('node:') || imported[1] === './volume-identity.ts');
+    for (const imported of contents.matchAll(/from '([^']+)'/g)) assert.ok(imported[1]!.startsWith('node:') || ['./volume-identity.ts', './source-filesystem.ts'].includes(imported[1]!));
   }
   assert.throws(() => prepareArtifact(output, revision), 'Refuse to overwrite a reviewed bundle');
 });

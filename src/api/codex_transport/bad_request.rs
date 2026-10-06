@@ -523,6 +523,26 @@ mod tests {
             "unclassifiable"
         );
         assert_eq!(event["fields"]["upstream_error_reason"], "content_type");
+        assert_eq!(
+            event["fields"].as_object().unwrap().len(),
+            7,
+            "non-JSON diagnostics contain only fixed metadata, never body/queue fields"
+        );
+        for field in event["fields"].as_object().unwrap().keys() {
+            assert!(
+                [
+                    "message",
+                    "request_id",
+                    "stage",
+                    "upstream_error_classification",
+                    "upstream_error_reason",
+                    "upstream_content_type_class",
+                    "upstream_diagnostic_read"
+                ]
+                .contains(&field.as_str()),
+                "unexpected diagnostic field: {field}"
+            );
+        }
         event["fields"].clone()
     }
 
@@ -616,6 +636,19 @@ mod tests {
             let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
             assert!(!logged.contains("private-canary"));
             let event: Value = serde_json::from_str(logged.trim()).unwrap();
+            assert_eq!(
+                event["fields"],
+                json!({
+                    "message": "Codex upstream rejected the request",
+                    "request_id": Uuid::nil().to_string(),
+                    "stage": "codex_upstream_bad_request",
+                    "upstream_error_classification": "ordinary",
+                    "upstream_error_type": "unknown",
+                    "upstream_error_code": "unknown",
+                    "upstream_error_reason": expected
+                }),
+                "tool refusal must emit exactly the allowlisted fields"
+            );
             assert_eq!(
                 event["fields"]["upstream_error_reason"], expected,
                 "{message}"

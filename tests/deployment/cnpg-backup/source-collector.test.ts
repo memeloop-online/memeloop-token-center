@@ -7,6 +7,8 @@ import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
+import { sourceFilesystem, sourceStatCommand } from './source-filesystem.ts';
+import { sourceInventory, sourceStatOutput } from './source-filesystem.fixture.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const collector = fileURLToPath(new URL('./source-space.ts', import.meta.url));
@@ -23,12 +25,23 @@ const exportPod = {
   ] }] },
   status: { phase: 'Running' },
 };
-type Step = { contains: string[]; reply?: any; delayMs?: number; sample?: { mode?: string; ageMs?: number }; stderr?: string; exitCode?: number };
-const sourceCalls = (sample: Step['sample'] = {}, delayMs = 0): Step[] => [
-  { contains: ['get', 'clusters.postgresql.cnpg.io'], reply: { status: { currentPrimary: sourceSpace.pod } } },
-  { contains: ['get', 'pod', sourceSpace.pod], reply: { metadata: { uid: 'fixture-source' }, spec: { nodeName: sourceSpace.node }, status: { containerStatuses: [{ name: 'postgres', ready: true }] } } },
-  { contains: ['get', '--raw'], delayMs, sample, reply: { node: { nodeName: sourceSpace.node }, pods: [{ podRef: { name: sourceSpace.pod, namespace: sourceSpace.namespace, uid: 'fixture-source' }, volume: [{ name: 'pgdata', pvcRef: { name: sourceSpace.claim, namespace: sourceSpace.namespace }, availableBytes: 10 * 1024 ** 3, capacityBytes: 30 * 1024 ** 3, inodesFree: 100_000 }] }] } },
-];
+type Step = { contains: string[]; reply?: any; delayMs?: number; requestTimeout?: string; stderr?: string; exitCode?: number };
+function sourceCalls(options: { statDelayMs?: number; output?: string; after?: (value: any) => void } = {}): Step[] {
+  const before = sourceInventory();
+  const after = sourceInventory();
+  options.after?.(after);
+  return [
+    { contains: ['get', 'clusters.postgresql.cnpg.io'], reply: before.cluster },
+    { contains: ['get', 'pod', sourceSpace.pod], reply: before.pod },
+    { contains: ['get', 'pvc', sourceSpace.claim], reply: before.claim },
+    { contains: ['get', 'pv', sourceFilesystem.persistent], reply: before.persistent },
+    { contains: ['exec', sourceSpace.pod, '-c', 'postgres', ...sourceStatCommand], requestTimeout: '--request-timeout=8s', reply: options.output ?? sourceStatOutput(), delayMs: options.statDelayMs ?? 0 },
+    { contains: ['get', 'clusters.postgresql.cnpg.io'], reply: after.cluster },
+    { contains: ['get', 'pvc', sourceSpace.claim], reply: after.claim },
+    { contains: ['get', 'pv', sourceFilesystem.persistent], reply: after.persistent },
+    { contains: ['get', 'pod', sourceSpace.pod], reply: after.pod },
+  ];
+}
 const exportCall = (): Step => ({ contains: ['get', 'pod', exportName], reply: exportPod });
 const volumeCalls = (): Step[] => [
   { contains: ['get', 'pvc'], reply: { metadata: { name: stageIdentity.name, uid: stageIdentity.claimUID, namespace: stageIdentity.namespace }, spec: { volumeName: stageIdentity.name }, status: { phase: 'Bound' } } },
@@ -64,6 +77,7 @@ async function run(context: TestContext, plan: Step[], watch = false) {
   } finally { clearTimeout(deadline); }
   assert.doesNotMatch(stdout + stderr, new RegExp(sentinel));
   const events = stderr.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  assert.ok(events.filter(event => event.event === 'api-start').every(event => !['source-summary', 'api-other'].includes(event.phase)), 'No cached-summary fallback or unrecognized API operation');
   assert.equal(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')).index, plan.length, stderr);
   for (const ended of events.filter(event => event.event === 'api-end' || event.event === 'collection-end')) {
     const started = events.find(event => event.event === ended.event.replace('-end', '-start') && event.cycle === ended.cycle && event.attempt === ended.attempt && event.call === ended.call);
@@ -75,66 +89,107 @@ async function run(context: TestContext, plan: Step[], watch = false) {
   return { status, events, stdout };
 }
 
-test('real collector subprocess separates invalid, future and stale samples without API body leakage', { timeout: 120_000 }, async context => {
-  for (const [sample, category] of [
-    [{ mode: 'invalid' }, 'SOURCE_SAMPLE_INVALID'],
-    [{ ageMs: -60_000 }, 'SOURCE_SAMPLE_FUTURE'],
-    [{ ageMs: 91_000 }, 'SOURCE_SAMPLE_STALE'],
+test('real collector executes a new stat and retains its conservative collection start through postflight', { timeout: 120_000 }, async context => {
+  const result = await run(context, sourceCalls({ statDelayMs: 350 }));
+  assert.equal(result.status, 0);
+  const sample = JSON.parse(result.stdout);
+  assert.equal(sample.method, 'mounted-statfs');
+  assert.equal(sample.sourcePodUID, sourceFilesystem.podUID);
+  assert.equal(sample.availableBytes, 10 * 1024 ** 3);
+  assert.ok(Date.parse(sample.time) <= Date.parse(sample.execStartedAt));
+  assert.ok(Date.parse(sample.execCompletedAt) - Date.parse(sample.execStartedAt) >= 350);
+  assert.ok(Date.parse(sample.collectedAt) >= Date.parse(sample.execCompletedAt));
+  assert.equal(sample.sourceSpace.maximumSampleAgeMs, 90000);
+  assert.equal(sample.sourceSpace.leaseSeconds, 45);
+  assert.ok(result.events.some(event => event.phase === 'source-statfs' && event.durationMs >= 350));
+});
+
+test('real stat/parser errors and mount races cannot fall back to a cached summary or leak its body', { timeout: 120_000 }, async context => {
+  for (const output of [sentinel, sourceStatOutput().replace('15721786', '65535'), sourceStatOutput().replace(/65:48\n$/, '65:49\n')]) {
+    const result = await run(context, sourceCalls({ output }).slice(0, 5));
+    assert.equal(result.status, 1);
+    assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
+    assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+  }
+});
+
+test('actual collector rejects pre/post source identity races before lease publication', { timeout: 300_000 }, async context => {
+  for (const [name, mutate] of [
+    ['pod', (value: any) => { value.pod.metadata.uid = 'replacement'; }],
+    ['container', (value: any) => { value.pod.status.containerStatuses[0].containerID = `containerd://${'b'.repeat(64)}`; }],
+    ['restart', (value: any) => { value.pod.status.containerStatuses[0].restartCount = 1; }],
+    ['wal-mount', (value: any) => { value.pod.spec.containers[0].volumeMounts.push({ name: 'wal', mountPath: `${sourceFilesystem.pgdata}/pg_wal` }); }],
+    ['base-mount', (value: any) => { value.pod.spec.containers[0].volumeMounts.push({ name: 'base', mountPath: `${sourceFilesystem.pgdata}/base` }); }],
+    ['claim', (value: any) => { value.claim.metadata.uid = 'replacement'; }],
+    ['pv', (value: any) => { value.persistent.metadata.uid = 'replacement'; }],
+    ['claimRef', (value: any) => { value.persistent.spec.claimRef.uid = 'replacement'; }],
+    ['volumeHandle', (value: any) => { value.persistent.spec.csi.volumeHandle = 'replacement'; }],
+    ['node', (value: any) => { value.pod.spec.nodeName = 'other'; }],
+    ['primary', (value: any) => { value.cluster.status.currentPrimary = 'other'; }],
   ] as const) {
-    await context.test(category, async childContext => {
-      const result = await run(childContext, sourceCalls(sample, 250));
+    await context.test(name, async childContext => {
+      const result = await run(childContext, [...sourceCalls(), exportCall(), ...volumeCalls(), ...sourceCalls({ after: mutate }), ...revokeCalls()], true);
       assert.equal(result.status, 1);
-      const observed = result.events.find(event => event.event === 'source-sample');
-      assert.equal(observed.category, category);
-      if (category === 'SOURCE_SAMPLE_INVALID') assert.equal(observed.sourceSampleAt, null);
       assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
-      assert.ok(result.events.some(event => event.phase === 'source-summary' && event.durationMs >= 250));
+      assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+      assert.ok(result.events.some(event => event.phase === 'lease-revoke' && event.outcome === 'success'));
     });
   }
 });
 
-test('real delayed summary crosses the unchanged 90-second threshold before publication', { timeout: 120_000 }, async context => {
-  const result = await run(context, [...sourceCalls(), exportCall(), ...volumeCalls(), ...sourceCalls({ ageMs: 89_000 }, 1600), ...revokeCalls()], true);
+test('real delayed identity subprocesses expire the stat observation after 90s without retimestamping', { timeout: 120_000 }, async context => {
+  const plan = sourceCalls({ statDelayMs: 250 });
+  for (const step of plan.slice(0, 4)) step.delayMs = 14000;
+  for (const step of plan.slice(5)) step.delayMs = 9000;
+  const result = await run(context, plan);
   assert.equal(result.status, 1);
-  const observed = result.events.filter(event => event.event === 'source-sample').at(-1);
-  assert.equal(observed.category, 'SOURCE_SAMPLE_STALE');
-  assert.ok(observed.sampleAgeMs >= 90_600);
-  assert.ok(result.events.some(event => event.phase === 'source-summary' && event.durationMs >= 1600));
+  const sample = result.events.find(event => event.event === 'source-sample');
+  assert.equal(sample.category, 'SOURCE_SAMPLE_STALE');
+  assert.ok(sample.sampleAgeMs > 90000 && sample.monotonicAgeMs > 90000);
   assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
-  assert.ok(result.events.some(event => event.phase === 'lease-revoke' && event.outcome === 'success'));
 });
 
-test('cached source sample, serial CSI latency and lease publication have distinct measured timestamps', { timeout: 120_000 }, async context => {
-  const firstVolume = volumeCalls();
-  firstVolume[0]!.delayMs = 350;
-  firstVolume[5]!.delayMs = 350;
+test('every renewal requires a new stat and an exec failure cannot reuse the prior fresh observation', { timeout: 120_000 }, async context => {
+  const failed = sourceCalls().slice(0, 5);
+  Object.assign(failed[4]!, { exitCode: 1, reply: sentinel, stderr: sentinel });
   const result = await run(context, [
-    ...sourceCalls({ ageMs: 75_000 }), exportCall(), ...firstVolume, ...sourceCalls({ mode: 'cached' }),
+    ...sourceCalls(), exportCall(), ...volumeCalls(), ...sourceCalls({ statDelayMs: 250 }),
     { contains: ['exec', exportName, '/bin/sh'], reply: '', delayMs: 350 },
-    exportCall(), ...volumeCalls(), ...sourceCalls({ mode: 'cached' }), ...revokeCalls(),
+    exportCall(), ...volumeCalls(), ...failed, ...revokeCalls(),
   ], true);
   assert.equal(result.status, 1);
-  const samples = result.events.filter(event => event.event === 'source-sample');
-  assert.equal(samples.length, 3);
-  assert.equal(new Set(samples.map(event => event.sourceSampleAt)).size, 1);
-  assert.equal(samples[2].category, 'SOURCE_SAMPLE_STALE');
-  assert.ok(samples[2].sampleAgeMs > 90_000);
+  assert.equal(result.events.filter(event => event.event === 'api-start' && event.phase === 'source-statfs').length, 3);
   const published = result.events.filter(event => event.event === 'lease-publication-end');
   assert.equal(published.length, 1);
   assert.equal(published[0].leaseSeconds, 45);
-  assert.equal(published[0].sourceSampleAt, samples[0].sourceSampleAt);
-  assert.ok(Number.isSafeInteger(published[0].sourceLeaseEpoch));
-  assert.ok(Number.isSafeInteger(published[0].volumeLeaseEpoch));
   const publishing = result.events.find(event => event.event === 'lease-publication-start');
   assert.ok(published[0].sampleAgeMs >= publishing.sampleAgeMs + 350);
-  for (const phase of ['volume-claim', 'volume-filesystem-identity', 'lease-publish']) assert.ok(result.events.some(event => event.phase === phase && event.durationMs >= 350));
   assert.ok(result.events.some(event => event.phase === 'lease-revoke' && event.outcome === 'success'));
+});
+
+test('stat API timeout is ten seconds, a complete retry recollects identity and inner timeout fails closed', { timeout: 120_000 }, async context => {
+  const blocked = sourceCalls().slice(0, 5);
+  blocked[4]!.delayMs = 60000;
+  const recovered = await run(context, [...blocked, ...sourceCalls()]);
+  assert.equal(recovered.status, 0);
+  const timeout = recovered.events.find(event => event.phase === 'source-statfs' && event.category === 'API_TIMEOUT');
+  assert.ok(timeout.durationMs >= 10000 && timeout.durationMs < 15000);
+  assert.equal(recovered.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 1);
+  for (const exitCode of [124, 137]) {
+    const terminated = sourceCalls().slice(0, 5);
+    Object.assign(terminated[4]!, { exitCode, reply: sentinel });
+    const result = await run(context, terminated);
+    assert.equal(result.status, 1);
+    assert.equal(result.events.at(-1).category, 'SOURCE_STAT_TIMEOUT');
+    assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+    assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
+  }
 });
 
 test('real timed-out API subprocess is bounded, redacted and retried with a complete fresh collection', { timeout: 120_000 }, async context => {
   const result = await run(context, [
     { contains: ['get', 'clusters.postgresql.cnpg.io'], delayMs: 60_000, reply: sentinel },
-    ...sourceCalls({}, 250),
+    ...sourceCalls({ statDelayMs: 250 }),
   ]);
   assert.equal(result.status, 0);
   assert.equal(JSON.parse(result.stdout).sourceSpace.leaseSeconds, 45);

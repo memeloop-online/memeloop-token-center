@@ -953,7 +953,7 @@ jobs:
         run: node --test tests/deployment/cnpg-backup/contract.test.ts
       - name: Exercise aggregate CNPG capacity exhaustion and fail-closed restore receipts
         timeout-minutes: 12
-        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/export-supervisor.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts tests/deployment/cnpg-backup/source-space.test.ts tests/deployment/cnpg-backup/source-collector.test.ts tests/deployment/cnpg-backup/volume-identity.test.ts tests/deployment/cnpg-backup/prepare-artifact.test.ts
+        run: node --test tests/deployment/cnpg-backup/hard-capacity.test.ts tests/deployment/cnpg-backup/export-supervisor.test.ts tests/deployment/cnpg-backup/storage-preflight.test.ts tests/deployment/cnpg-backup/source-space.test.ts tests/deployment/cnpg-backup/source-filesystem.test.ts tests/deployment/cnpg-backup/source-collector.test.ts tests/deployment/cnpg-backup/volume-identity.test.ts tests/deployment/cnpg-backup/prepare-artifact.test.ts
       - name: Render suspended CNPG preparation only (never deploy)
         env:
           BACKUP_SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
