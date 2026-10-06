@@ -2565,6 +2565,7 @@ dependencies = [
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-http",

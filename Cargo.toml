@@ -92,6 +92,7 @@ cucumber = { version = "0.23.0", features = ["macros"] }
 percent-encoding = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 wat = "1.252"
 wiremock = "0.6.5"

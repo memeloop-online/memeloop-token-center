@@ -29,6 +29,9 @@ const HOST: &str = "upload.example.test";
 #[path = "http2_upload_tests/multiplex.rs"]
 mod multiplex;
 
+#[path = "http2_upload_tests/tls_fixture.rs"]
+mod tls_fixture;
+
 struct Frame {
     from_client: bool,
     kind: u8,
@@ -93,14 +96,14 @@ impl Decoder {
     }
 }
 
-struct ObservedIo {
-    socket: TcpStream,
+struct ObservedIo<Socket = TcpStream> {
+    socket: Socket,
     incoming: Decoder,
     outgoing: Decoder,
 }
 
-impl ObservedIo {
-    fn new(socket: TcpStream, wire: Arc<Mutex<Wire>>) -> Self {
+impl<Socket> ObservedIo<Socket> {
+    fn new(socket: Socket, wire: Arc<Mutex<Wire>>) -> Self {
         Self {
             socket,
             incoming: Decoder {
@@ -119,7 +122,7 @@ impl ObservedIo {
     }
 }
 
-impl AsyncRead for ObservedIo {
+impl<Socket: AsyncRead + Unpin> AsyncRead for ObservedIo<Socket> {
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -133,7 +136,7 @@ impl AsyncRead for ObservedIo {
     }
 }
 
-impl AsyncWrite for ObservedIo {
+impl<Socket: AsyncWrite + Unpin> AsyncWrite for ObservedIo<Socket> {
     fn poll_write(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -155,6 +158,10 @@ impl AsyncWrite for ObservedIo {
 }
 
 async fn accept_socks(socket: &mut TcpStream) {
+    accept_socks_at_port(socket, 80).await;
+}
+
+async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
     let mut greeting = [0; 2];
     socket.read_exact(&mut greeting).await.unwrap();
     assert_eq!(greeting[0], 5);
@@ -169,11 +176,9 @@ async fn accept_socks(socket: &mut TcpStream) {
     let mut destination = vec![0; usize::from(length)];
     socket.read_exact(&mut destination).await.unwrap();
     assert_eq!(destination, HOST.as_bytes());
-    assert_eq!(socket.read_u16().await.unwrap(), 80);
-    socket
-        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
-        .await
-        .unwrap();
+    assert_eq!(socket.read_u16().await.unwrap(), port);
+    socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1]).await.unwrap();
+    socket.write_all(&port.to_be_bytes()).await.unwrap();
 }
 
 struct Receipt {

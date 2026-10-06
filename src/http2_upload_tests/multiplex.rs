@@ -300,7 +300,12 @@ fn assert_mixed_wire(wire: &Wire, receipts: &[UploadReceipt], reset: bool) {
     }
 }
 
-async fn mixed_upload_case(reset: bool) {
+async fn mixed_upload_case(reset: bool, tls: bool) {
+    let fixture = if tls {
+        Some(tls_fixture::TlsFixture::new().await)
+    } else {
+        None
+    };
     timeout(Duration::from_secs(15), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
@@ -313,10 +318,20 @@ async fn mixed_upload_case(reset: bool) {
         let barrier = Arc::new(Barrier::new(3));
         let wire = Arc::new(Mutex::new(Wire { started: Instant::now(), frames: Vec::new() }));
         let observed = wire.clone();
+        let acceptor = fixture.as_ref().map(|fixture| fixture.acceptor.clone());
         let (shutdown, mut stopped) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            accept_socks(&mut socket).await;
+            accept_socks_at_port(&mut socket, if tls { 443 } else { 80 }).await;
+            let socket: Box<dyn tls_fixture::FixtureStream> = if let Some(acceptor) = acceptor {
+                let encrypted = acceptor.accept(socket).await.unwrap();
+                let session = encrypted.get_ref().1;
+                assert_eq!(session.alpn_protocol(), Some(b"h2".as_slice()));
+                assert_eq!(session.server_name(), Some(HOST));
+                Box::new(encrypted)
+            } else {
+                Box::new(socket)
+            };
             let mut connection = http2::server::Builder::new()
                 .initial_window_size(STREAM_WINDOW)
                 .initial_connection_window_size(WINDOW as u32)
@@ -350,13 +365,20 @@ async fn mixed_upload_case(reset: bool) {
             assert_eq!(receipts.len(), 4);
             receipts
         });
-        let client = build_codex_http_client_with_policy(CodexTransportPolicy::default()).unwrap();
+        let client = if let Some(fixture) = fixture {
+            crate::codex_http_client_builder(CodexTransportPolicy::default(), crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
+                .tls_cert_store(fixture.roots).build().unwrap()
+        } else {
+            build_codex_http_client_with_policy(CodexTransportPolicy::default()).unwrap()
+        };
         let send = |payload: Bytes| {
-            client.post(format!("http://{HOST}/v1/responses"))
-                .version(http::Version::HTTP_2)
+            let scheme = if tls { "https" } else { "http" };
+            let request = client.post(format!("{scheme}://{HOST}/v1/responses"))
                 .proxy(proxy.clone())
                 .header(http::header::CONTENT_TYPE, "application/json")
-                .body(payload).send()
+                .body(payload);
+            let request = if tls { request } else { request.version(http::Version::HTTP_2) };
+            request.send()
         };
         let prime = send(bodies[&PRIME.len()].clone()).await.unwrap();
         assert_eq!(prime.status(), http::StatusCode::OK);
@@ -388,8 +410,9 @@ async fn mixed_upload_case(reset: bool) {
         let receipts = server.await.unwrap();
         assert_mixed_wire(&wire.lock().unwrap(), &receipts, reset);
         emit_evidence(serde_json::json!({
-            "boundary": "socks5h-cleartext-h2-multiplex-not-tls-not-production-root-proof",
+            "boundary": if tls { "socks5h-tls-alpn-h2-synthetic-not-production-root-proof" } else { "socks5h-cleartext-h2-multiplex-not-tls-not-production-root-proof" },
             "phase": "assertions_passed",
+            "tls": tls,
             "injected_protocol_error": reset,
             "successful_posts": if reset { 3 } else { 4 },
             "total_posts_including_prime": 4,
@@ -400,10 +423,20 @@ async fn mixed_upload_case(reset: bool) {
 
 #[tokio::test]
 async fn socks_single_client_same_connection_mixed_uploads_overlap() {
-    mixed_upload_case(false).await;
+    mixed_upload_case(false, false).await;
 }
 
 #[tokio::test]
 async fn socks_mixed_upload_remote_protocol_error_preserves_siblings_without_replay() {
-    mixed_upload_case(true).await;
+    mixed_upload_case(true, false).await;
+}
+
+#[tokio::test]
+async fn socks_tls_alpn_single_connection_mixed_uploads_overlap() {
+    mixed_upload_case(false, true).await;
+}
+
+#[tokio::test]
+async fn socks_tls_alpn_remote_reset_preserves_siblings_without_replay() {
+    mixed_upload_case(true, true).await;
 }
