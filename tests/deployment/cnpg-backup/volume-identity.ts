@@ -8,6 +8,7 @@ export const stageIdentity = {
   diskUUID: 'b59651cb-831f-4a8d-8438-0709359b48c8', diskPath: '/data1/longhorn',
   filesystemUUID: 'b5d8f16f-7409-444b-98a9-32812a50abe5',
   device: '/dev/longhorn/mtc-pg-bounded-stage-20261005',
+  capacityGiB: 28,
   leaseSeconds: 45,
 };
 
@@ -38,12 +39,12 @@ export function verifyStageBinding(claim: any, persistent: any, volume: any, rep
   assert.equal(persistent.spec.claimRef.namespace, expected.namespace);
   assert.equal(persistent.spec.volumeMode, 'Filesystem');
   assert.equal(persistent.spec.persistentVolumeReclaimPolicy, 'Retain');
-  assert.equal(persistent.spec.capacity.storage, '28Gi');
+  assert.equal(persistent.spec.capacity.storage, `${expected.capacityGiB}Gi`);
   assert.equal(persistent.spec.csi.driver, 'driver.longhorn.io');
   assert.equal(persistent.spec.csi.volumeHandle, expected.name);
   assert.equal(persistent.spec.csi.fsType, 'xfs');
   assert.equal(volume.metadata.namespace, 'longhorn-system');
-  assert.equal(volume.spec.size, String(28 * 1024 ** 3));
+  assert.equal(volume.spec.size, String(expected.capacityGiB * 1024 ** 3));
   assert.equal(volume.spec.numberOfReplicas, 1);
   assert.equal(volume.spec.dataLocality, 'strict-local');
   assert.equal(volume.status.state, 'attached');
@@ -64,16 +65,17 @@ export function attestStageVolume(read: InventoryReader, pod: any, clock: () => 
   return attestBackupVolume(read, pod, stageIdentity, 'export', clock);
 }
 
-export function attestBackupVolume(read: InventoryReader, pod: any, expected: typeof stageIdentity, containerName: string, clock: () => number = Date.now): string {
+export function attestBackupVolume(read: InventoryReader, pod: any, expected: typeof stageIdentity, containerName: string, clock: () => number = Date.now, mount: 'backup' | 'scratch' = 'backup'): string {
   const observed = Math.floor(clock() / 1000);
   assert.equal(pod.metadata.namespace, expected.namespace);
   assert.equal(pod.spec.nodeName, expected.node);
   assert.match(pod.metadata.uid, /^[a-zA-Z0-9-]{1,64}$/);
   const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
   const environment = (name: string) => container.env.find((entry: any) => entry.name === name);
-  assert.equal(environment('EXPECTED_BACKUP_FS_UUID').value, expected.filesystemUUID);
-  assert.equal(environment('EXPECTED_BACKUP_DEVICE').value, expected.device);
-  assert.equal(environment('BACKUP_UUID_ATTESTATION').value, 'external-csi-lease');
+  const environmentPrefix = mount.toUpperCase();
+  assert.equal(environment(`EXPECTED_${environmentPrefix}_FS_UUID`).value, expected.filesystemUUID);
+  assert.equal(environment(`EXPECTED_${environmentPrefix}_DEVICE`).value, expected.device);
+  assert.equal(environment(`${environmentPrefix}_UUID_ATTESTATION`).value, 'external-csi-lease');
   assert.equal(environment('POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
   const get = (args: string[]) => JSON.parse(read([...args, '-o', 'json']));
   verifyStageBinding(
