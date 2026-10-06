@@ -44,7 +44,7 @@ case "$*" in
 esac
 `);
     write(container, '/tmp/bin/psql', '#!/bin/sh\ncase "$*" in *"SELECT NOT pg_is_in_recovery()"*) printf "t\\n" ;; esac\n');
-    write(container, '/tmp/bin/pg_dump', '#!/bin/sh\ntrap "" TERM\nprintf "%s\\n" "$$" > /tmp/producer.pid\ndd if=/dev/zero bs=65536 status=none &\nprintf "%s\\n" "$!" > /tmp/producer-child.pid\nwait "$!"\n');
+    write(container, '/tmp/bin/pg_dump', '#!/bin/sh\ntrap "" TERM\nprintf "%s\\n" "$$" > /tmp/producer.pid\nsleep 100 &\nprintf "%s\\n" "$!" > /tmp/producer-sleep.pid\ndd if=/dev/zero bs=65536 status=none &\nprintf "%s\\n" "$!" > /tmp/producer-child.pid\nwait "$!"\n');
     const command = [...stage.command];
     command[6] = command[6].replace('26071793664', '1048576');
     if (legacy) command[6] = command[6].replace('space_guard_pid=$!\n', 'space_guard_pid=$!\nprintf \'%s\\n\' "$space_guard_pid" > /tmp/guard.pid\n');
@@ -151,6 +151,7 @@ test('foreground expiry supervisor kills actual producer/writer groups without a
         assert.notEqual(await completed, 0);
         shell(container, `test -s ${directory}/memeloop_token_center.dump.partial; test ! -e ${directory}/LOCAL_ARCHIVE_CREATED`);
         const remaining = docker(['top', container, '-eo', 'pid,ppid,pgid,stat,comm']).trim().split('\n').slice(1).filter(line => !line.trim().split(/\s+/)[3]!.startsWith('Z'));
+        assert.equal(remaining.length, 1, 'Only the fixture container init may remain, not sleeping producer descendants');
         assert.ok(remaining.every(line => line.trim().split(/\s+/).at(-1) === 'sleep'), `Leaked producer/writer: ${remaining.join('; ')}`);
       }
     });

@@ -11,14 +11,14 @@ export function superviseExport(script: string): string {
   assert.ok(cleanupStart > 0 && cleanupEnd > cleanupStart);
   script = script.slice(0, cleanupStart) + String.raw`  for owned_pid in "$dump_pid" "$rate_pid"; do
     if test -n "$owned_pid"; then
-      kill -TERM -- "-$owned_pid" 2>/dev/null || true
+      kill -TERM "-$owned_pid" 2>/dev/null || true
       kill -TERM "$owned_pid" 2>/dev/null || true
     fi
   done
   if test -n "$dump_pid$rate_pid"; then sleep 2; fi
   for owned_pid in "$dump_pid" "$rate_pid"; do
     if test -n "$owned_pid"; then
-      kill -KILL -- "-$owned_pid" 2>/dev/null || true
+      kill -KILL "-$owned_pid" 2>/dev/null || true
       kill -KILL "$owned_pid" 2>/dev/null || true
       wait "$owned_pid" 2>/dev/null || true
     fi
