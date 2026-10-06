@@ -2,6 +2,12 @@ use std::collections::HashSet;
 
 use super::*;
 
+mod exact_scope;
+pub use exact_scope::{
+    FailedRequestCostBackfillExactManifest, FailedRequestCostBackfillExactReport,
+    FailedRequestCostBackfillExpectedRequest,
+};
+
 pub const FAILED_REQUEST_COST_BACKFILL_MAX_BATCH_SIZE: i64 = 1_000;
 pub const FAILED_REQUEST_COST_CORRECTION_VERSION: &str = "failed-request-projection-cost-v2";
 
@@ -208,17 +214,27 @@ impl Database {
             input.batch_size.saturating_add(1),
         )
         .await?;
-        let (candidates, mut report) = prepare_batch(candidates, input.batch_size, true);
-        if candidates.is_empty() {
-            transaction.rollback().await?;
-            return Ok(report);
-        }
+        apply_candidates(transaction, candidates, input.batch_size, false).await
+    }
+}
 
-        let applied_at = unix_millis();
-        let mut changed = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let inserted = sqlx::query(
-                r#"INSERT INTO request_cost_projection_corrections (
+async fn apply_candidates(
+    mut transaction: Transaction<'_, Any>,
+    candidates: Vec<Candidate>,
+    batch_size: i64,
+    exact: bool,
+) -> Result<FailedRequestCostBackfillReport, AppError> {
+    let (candidates, mut report) = prepare_batch(candidates, batch_size, true);
+    if candidates.is_empty() {
+        transaction.rollback().await?;
+        return Ok(report);
+    }
+
+    let applied_at = unix_millis();
+    let mut changed = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let inserted = sqlx::query(
+            r#"INSERT INTO request_cost_projection_corrections (
                        correction_version, request_id, request_created_at, evidence_kind,
                        observed_status_code, observed_error_code, observed_usage_basis,
                        reservation_id, reservation_reserved_micros, reservation_actual_micros,
@@ -226,27 +242,32 @@ impl Database {
                        corrected_fact_cost_micros, applied_at)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                    ON CONFLICT (correction_version, request_id) DO NOTHING"#,
-            )
-            .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
-            .bind(&candidate.request_id)
-            .bind(candidate.created_at)
-            .bind(&candidate.evidence_kind)
-            .bind(candidate.status_code)
-            .bind(&candidate.error_code)
-            .bind(&candidate.usage_basis)
-            .bind(&candidate.reservation_id)
-            .bind(candidate.reservation_reserved_micros)
-            .bind(candidate.reservation_actual_micros)
-            .bind(candidate.request_cost_micros)
-            .bind(candidate.cost_micros)
-            .bind(candidate.corrected_cost_micros)
-            .bind(applied_at)
-            .execute(&mut *transaction)
-            .await?;
-            if inserted.rows_affected() == 0 {
-                continue;
+        )
+        .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+        .bind(&candidate.request_id)
+        .bind(candidate.created_at)
+        .bind(&candidate.evidence_kind)
+        .bind(candidate.status_code)
+        .bind(&candidate.error_code)
+        .bind(&candidate.usage_basis)
+        .bind(&candidate.reservation_id)
+        .bind(candidate.reservation_reserved_micros)
+        .bind(candidate.reservation_actual_micros)
+        .bind(candidate.request_cost_micros)
+        .bind(candidate.cost_micros)
+        .bind(candidate.corrected_cost_micros)
+        .bind(applied_at)
+        .execute(&mut *transaction)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            if exact {
+                return Err(AppError::Conflict(
+                    "exact projection marker changed while correction was being applied".into(),
+                ));
             }
-            let updated = sqlx::query(
+            continue;
+        }
+        let updated = sqlx::query(
                 "UPDATE request_stats_facts SET cost_micros = $1 WHERE request_id = $2 AND cost_micros = $3",
             )
             .bind(candidate.corrected_cost_micros)
@@ -254,94 +275,92 @@ impl Database {
             .bind(candidate.cost_micros)
             .execute(&mut *transaction)
             .await?;
-            if updated.rows_affected() != 1 {
-                return Err(AppError::Conflict(
-                    "historical request cost changed while correction was being applied".into(),
-                ));
-            }
-            report.changed_rows += 1;
-            report.changed_cost_micros = report
-                .changed_cost_micros
-                .saturating_add(candidate.cost_micros);
-            report.changed_cost_reduction_micros =
-                report.changed_cost_reduction_micros.saturating_add(
-                    candidate
-                        .cost_micros
-                        .saturating_sub(candidate.corrected_cost_micros),
-                );
-            report.changed_cost_delta_micros = report.changed_cost_delta_micros.saturating_add(
-                candidate
-                    .corrected_cost_micros
-                    .saturating_sub(candidate.cost_micros),
-            );
-            changed.push(candidate);
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "historical request cost changed while correction was being applied".into(),
+            ));
         }
-
-        let usage_daily_keys = changed
-            .iter()
-            .map(UsageDailyKey::from)
-            .collect::<HashSet<_>>();
-        for key in &usage_daily_keys {
-            rebuild_usage_daily(&mut transaction, key).await?;
-        }
-        report.usage_daily_dimensions_rebuilt = usage_daily_keys.len() as u64;
-
-        let request_daily_keys = changed
-            .iter()
-            .map(RequestDailyKey::from)
-            .collect::<HashSet<_>>();
-        for key in &request_daily_keys {
-            rebuild_request_daily(&mut transaction, key).await?;
-        }
-        report.request_daily_dimensions_rebuilt = request_daily_keys.len() as u64;
-
-        let hourly_keys = changed
-            .iter()
-            .map(|candidate| AnalysisKey::from_candidate(candidate, 3_600_000))
-            .collect::<HashSet<_>>();
-        for key in &hourly_keys {
-            rebuild_analysis(
-                &mut transaction,
-                key,
-                "usage_analysis_hourly",
-                "hour_bucket",
-                3_600_000,
-            )
-            .await?;
-        }
-        report.usage_analysis_hourly_dimensions_rebuilt = hourly_keys.len() as u64;
-
-        let daily_keys = changed
-            .iter()
-            .map(|candidate| AnalysisKey::from_candidate(candidate, 86_400_000))
-            .collect::<HashSet<_>>();
-        for key in &daily_keys {
-            rebuild_analysis(
-                &mut transaction,
-                key,
-                "usage_analysis_daily",
-                "day_bucket",
-                86_400_000,
-            )
-            .await?;
-        }
-        report.usage_analysis_daily_dimensions_rebuilt = daily_keys.len() as u64;
-
-        let session_keys = changed.iter().map(SessionKey::from).collect::<HashSet<_>>();
-        for key in &session_keys {
-            rebuild_request_session_projection_in_transaction(
-                &mut transaction,
-                &key.tenant_id,
-                &key.key_id,
-                &key.session_id,
-            )
-            .await?;
-        }
-        report.session_projections_rebuilt = session_keys.len() as u64;
-
-        transaction.commit().await?;
-        Ok(report)
+        report.changed_rows += 1;
+        report.changed_cost_micros = report
+            .changed_cost_micros
+            .saturating_add(candidate.cost_micros);
+        report.changed_cost_reduction_micros = report.changed_cost_reduction_micros.saturating_add(
+            candidate
+                .cost_micros
+                .saturating_sub(candidate.corrected_cost_micros),
+        );
+        report.changed_cost_delta_micros = report.changed_cost_delta_micros.saturating_add(
+            candidate
+                .corrected_cost_micros
+                .saturating_sub(candidate.cost_micros),
+        );
+        changed.push(candidate);
     }
+
+    let usage_daily_keys = changed
+        .iter()
+        .map(UsageDailyKey::from)
+        .collect::<HashSet<_>>();
+    for key in &usage_daily_keys {
+        rebuild_usage_daily(&mut transaction, key).await?;
+    }
+    report.usage_daily_dimensions_rebuilt = usage_daily_keys.len() as u64;
+
+    let request_daily_keys = changed
+        .iter()
+        .map(RequestDailyKey::from)
+        .collect::<HashSet<_>>();
+    for key in &request_daily_keys {
+        rebuild_request_daily(&mut transaction, key).await?;
+    }
+    report.request_daily_dimensions_rebuilt = request_daily_keys.len() as u64;
+
+    let hourly_keys = changed
+        .iter()
+        .map(|candidate| AnalysisKey::from_candidate(candidate, 3_600_000))
+        .collect::<HashSet<_>>();
+    for key in &hourly_keys {
+        rebuild_analysis(
+            &mut transaction,
+            key,
+            "usage_analysis_hourly",
+            "hour_bucket",
+            3_600_000,
+        )
+        .await?;
+    }
+    report.usage_analysis_hourly_dimensions_rebuilt = hourly_keys.len() as u64;
+
+    let daily_keys = changed
+        .iter()
+        .map(|candidate| AnalysisKey::from_candidate(candidate, 86_400_000))
+        .collect::<HashSet<_>>();
+    for key in &daily_keys {
+        rebuild_analysis(
+            &mut transaction,
+            key,
+            "usage_analysis_daily",
+            "day_bucket",
+            86_400_000,
+        )
+        .await?;
+    }
+    report.usage_analysis_daily_dimensions_rebuilt = daily_keys.len() as u64;
+
+    let session_keys = changed.iter().map(SessionKey::from).collect::<HashSet<_>>();
+    for key in &session_keys {
+        rebuild_request_session_projection_in_transaction(
+            &mut transaction,
+            &key.tenant_id,
+            &key.key_id,
+            &key.session_id,
+        )
+        .await?;
+    }
+    report.session_projections_rebuilt = session_keys.len() as u64;
+
+    transaction.commit().await?;
+    Ok(report)
 }
 
 fn prepare_batch(
@@ -430,6 +449,10 @@ fn prepare_batch(
 }
 
 fn candidate_statement(lock: &str, confirmed_legacy_null: bool) -> String {
+    scoped_candidate_statement(lock, confirmed_legacy_null, "")
+}
+
+fn scoped_candidate_statement(lock: &str, confirmed_legacy_null: bool, scope: &str) -> String {
     let eligibility = if confirmed_legacy_null {
         r#"r.usage_basis IS NULL AND f.request_id = $7
             AND f.cost_micros <> 0
@@ -476,6 +499,7 @@ fn candidate_statement(lock: &str, confirmed_legacy_null: bool) -> String {
                    OR COALESCE(r.error_code, '') <> '')
               AND correction.request_id IS NULL
               AND ({eligibility})
+              {scope}
               AND (f.created_at > $3 OR (f.created_at = $3 AND f.request_id > $4))
             ORDER BY f.created_at ASC, f.request_id ASC
             LIMIT $6{lock}"#
@@ -1263,6 +1287,211 @@ mod tests {
         );
     }
 
+    async fn exact_manifest_for(fixture: &Fixture) -> FailedRequestCostBackfillExactManifest {
+        let mut requests = Vec::new();
+        for _ in 0..6 {
+            let (request_id, expected_cost_micros) = seed_historical_case(
+                fixture,
+                499,
+                Some("client_cancelled"),
+                Some(RequestUsageBasis::ContractCeiling),
+            )
+            .await;
+            let created_at =
+                sqlx::query_scalar("SELECT created_at FROM request_records WHERE id = $1")
+                    .bind(request_id.to_string())
+                    .fetch_one(&fixture.database.pool)
+                    .await
+                    .unwrap();
+            requests.push(FailedRequestCostBackfillExpectedRequest {
+                request_id: request_id.to_string(),
+                created_at,
+                expected_cost_micros,
+            });
+        }
+        FailedRequestCostBackfillExactManifest {
+            tenant_id: fixture.key.tenant_id.to_string(),
+            currency: "USD".into(),
+            requests,
+        }
+    }
+
+    async fn financial_rows(fixture: &Fixture) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
+        let ledger = sqlx::query_as(
+            "SELECT id, amount_micros FROM ledger_entries WHERE account_id = $1 ORDER BY id",
+        )
+        .bind(fixture.account_id.to_string())
+        .fetch_all(&fixture.database.pool)
+        .await
+        .unwrap();
+        let feed = sqlx::query_as(
+            "SELECT settlement_id, cost_micros FROM account_settlement_feed WHERE key_id = $1 ORDER BY settlement_id",
+        ).bind(fixture.key.key_id.to_string()).fetch_all(&fixture.database.pool).await.unwrap();
+        (ledger, feed)
+    }
+
+    async fn exercise_exact_manifest(fixture: &Fixture) {
+        let manifest = exact_manifest_for(fixture).await;
+        let (outside_id, outside_cost) = seed_historical_case(
+            fixture,
+            499,
+            Some("client_cancelled"),
+            Some(RequestUsageBasis::ContractCeiling),
+        )
+        .await;
+        let immutable_before = immutable_snapshot(fixture).await;
+        let financial_before = financial_rows(fixture).await;
+        let aggregates_before = aggregate_costs(fixture).await;
+        let total = manifest
+            .requests
+            .iter()
+            .map(|request| request.expected_cost_micros)
+            .sum::<i64>();
+        let preview = fixture
+            .database
+            .backfill_failed_request_costs_exact(manifest.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(preview.manifest_rows, 6);
+        assert_eq!(preview.already_projected_rows, 0);
+        assert_eq!(preview.backfill.candidate_rows, 6);
+        assert_eq!(preview.backfill.changed_rows, 0);
+        assert_eq!(preview.backfill.candidate_cost_reduction_micros, total);
+        assert!(!preview.backfill.has_more);
+        assert_eq!(aggregate_costs(fixture).await, aggregates_before);
+
+        let mut invalid = manifest.clone();
+        invalid.requests[5].request_id = Uuid::now_v7().to_string();
+        let mut wrong_cost = manifest.clone();
+        wrong_cost.requests[5].expected_cost_micros += 1;
+        let mut wrong_time = manifest.clone();
+        wrong_time.requests[5].created_at += 1;
+        let mut wrong_tenant = manifest.clone();
+        wrong_tenant.tenant_id = Uuid::now_v7().to_string();
+        let mut duplicate = manifest.clone();
+        duplicate.requests[5] = duplicate.requests[0].clone();
+        let mut empty = manifest.clone();
+        empty.requests.clear();
+        for invalid in [
+            invalid,
+            wrong_cost,
+            wrong_time,
+            wrong_tenant,
+            duplicate,
+            empty,
+        ] {
+            for apply in [false, true] {
+                assert!(
+                    fixture
+                        .database
+                        .backfill_failed_request_costs_exact(invalid.clone(), apply)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(immutable_snapshot(fixture).await, immutable_before);
+                assert_eq!(financial_rows(fixture).await, financial_before);
+                assert_eq!(aggregate_costs(fixture).await, aggregates_before);
+                let markers: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM request_cost_projection_corrections correction JOIN request_stats_facts fact ON fact.request_id = correction.request_id WHERE fact.key_id = $1",
+                ).bind(fixture.key.key_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
+                assert_eq!(markers, 0);
+            }
+        }
+        let drift_id = &manifest.requests[5].request_id;
+        sqlx::query("UPDATE request_records SET usage_basis = 'provider_reported' WHERE id = $1")
+            .bind(drift_id)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .database
+                .backfill_failed_request_costs_exact(manifest.clone(), true)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE request_records SET usage_basis = 'contract_ceiling' WHERE id = $1")
+            .bind(drift_id)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        assert_eq!(aggregate_costs(fixture).await, aggregates_before);
+
+        if matches!(fixture.database.backend, DatabaseBackend::PostgreSql) {
+            let (first, second) = tokio::join!(
+                fixture
+                    .database
+                    .backfill_failed_request_costs_exact(manifest.clone(), true),
+                fixture
+                    .database
+                    .backfill_failed_request_costs_exact(manifest.clone(), true),
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(
+                first.backfill.changed_rows + second.backfill.changed_rows,
+                6
+            );
+            assert_eq!(
+                first.already_projected_rows + second.already_projected_rows,
+                6
+            );
+        } else {
+            let applied = fixture
+                .database
+                .backfill_failed_request_costs_exact(manifest.clone(), true)
+                .await
+                .unwrap();
+            assert_eq!(applied.backfill.changed_rows, 6);
+            assert_eq!(applied.backfill.changed_cost_reduction_micros, total);
+        }
+        let aggregates_after = aggregate_costs(fixture).await;
+        assert!(aggregates_after.iter().all(|cost| *cost == outside_cost));
+        for apply in [false, true] {
+            let replay = fixture
+                .database
+                .backfill_failed_request_costs_exact(manifest.clone(), apply)
+                .await
+                .unwrap();
+            assert_eq!(replay.already_projected_rows, 6);
+            assert_eq!(replay.backfill.candidate_rows, 0);
+            assert_eq!(replay.backfill.changed_rows, 0);
+            assert_eq!(replay.backfill.changed_cost_reduction_micros, 0);
+            assert_eq!(immutable_snapshot(fixture).await, immutable_before);
+            assert_eq!(financial_rows(fixture).await, financial_before);
+            assert_eq!(aggregate_costs(fixture).await, aggregates_after);
+        }
+        let outside_fact: i64 =
+            sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+                .bind(outside_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+        assert_eq!(outside_fact, outside_cost);
+        sqlx::query("UPDATE request_cost_projection_corrections SET original_fact_cost_micros = original_fact_cost_micros + 1 WHERE request_id = $1")
+            .bind(drift_id).execute(&fixture.database.pool).await.unwrap();
+        assert!(
+            fixture
+                .database
+                .backfill_failed_request_costs_exact(manifest, true)
+                .await
+                .is_err()
+        );
+        assert_eq!(financial_rows(fixture).await, financial_before);
+        assert_eq!(aggregate_costs(fixture).await, aggregates_after);
+    }
+
+    #[tokio::test]
+    async fn exact_manifest_sqlite_is_all_or_nothing_and_never_changes_financial_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("exact.db").display()
+        );
+        let fixture = fixture(&database_url, Some(directory)).await;
+        exercise_exact_manifest(&fixture).await;
+    }
+
     async fn exercise_provider_reported_fact_repair(fixture: &Fixture) {
         let (request_id, actual_cost) = seed_historical_case(
             fixture,
@@ -1839,12 +2068,15 @@ mod tests {
             .append_pair("options", &format!("-c search_path={schema}"));
         let contract_fixture = fixture(isolated.as_str(), None).await;
         exercise_backfill(&contract_fixture).await;
+        let exact_fixture = fixture(isolated.as_str(), None).await;
+        exercise_exact_manifest(&exact_fixture).await;
         let provider_fixture = fixture(isolated.as_str(), None).await;
         exercise_provider_reported_fact_repair(&provider_fixture).await;
         let concurrency_fixture = fixture(isolated.as_str(), None).await;
         exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
             .await;
         contract_fixture.database.close().await;
+        exact_fixture.database.close().await;
         provider_fixture.database.close().await;
         concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
