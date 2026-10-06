@@ -4,7 +4,8 @@ pub fn router(state: AppState) -> Router {
     router_for_role(state, RuntimeRole::All)
 }
 
-pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
+pub fn router_for_role(mut state: AppState, role: RuntimeRole) -> Router {
+    state.service_auth_role = Some(role);
     let request_id_header = header::HeaderName::from_static(REQUEST_ID_HEADER);
     let mut application = Router::new()
         .route("/healthz", get(deprecated_health))

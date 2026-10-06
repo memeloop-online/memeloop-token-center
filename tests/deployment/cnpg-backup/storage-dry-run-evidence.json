@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "observedAt": "2026-10-05T17:54:03.951Z",
+  "operation": "kubectl create --dry-run=server --validate=strict",
+  "persistedResources": 0,
+  "admission": {
+    "storageClasses": 3,
+    "longhornVolumes": 3,
+    "persistentVolumes": 3,
+    "persistentVolumeClaims": 3,
+    "engine": "docker.io/longhornio/longhorn-engine:v1.12.0",
+    "snapshotMaxCount": 2,
+    "snapshotMaxSizeGiB": {
+      "stage": 56,
+      "archive": 56,
+      "scratch": 128
+    },
+    "recurringDefaultGroup": "disabled",
+    "warning": "Longhorn's existing webhook adds its longhorn.io finalizer; Kubernetes recommends a path-qualified finalizer. No cluster policy was changed."
+  },
+  "budget": {
+    "requiredOverProvisioningPercent": 100,
+    "requiredMinimumAvailablePercent": 25,
+    "minimumFreeInodes": 65536,
+    "method": "available - full existing storageScheduled - (4 * new logical bytes + 2Gi per new volume) >= max(25% disk maximum, configured storageReserved, 32Gi). Existing scheduled data is deliberately counted again without crediting used extents. Bookkeeping only, not an actual reservation. No recurring/user snapshot or rebuild operation is authorized by this manifest.",
+    "pools": [
+      {
+        "node": "haixia",
+        "disk": "data1-disk",
+        "diskUUID": "b59651cb-831f-4a8d-8438-0709359b48c8",
+        "device": "/dev/sdd",
+        "availableBytes": 7448245043200,
+        "existingScheduledBytes": 1640769781760,
+        "additionalWorstCaseBytes": 122406567936,
+        "afterWorstCaseBytes": 5685068693504,
+        "reserveFloorBytes": 1999856556032,
+        "freeInodes": 781402456,
+        "nodeTags": [
+          "storage-tier-haixia",
+          "storage-tier-large"
+        ],
+        "diskTags": [
+          "storage-tier-control-pane",
+          "storage-tier-large"
+        ],
+        "matchingNodes": 1,
+        "matchingDisks": 1
+      },
+      {
+        "node": "versetensor-hv",
+        "disk": "default-disk-2306f5036718ea6d",
+        "diskUUID": "da83ab44-d26f-4c20-b956-87fa954cd603",
+        "device": "/dev/sdb1",
+        "availableBytes": 873988096000,
+        "existingScheduledBytes": 156229435392,
+        "additionalWorstCaseBytes": 399431958528,
+        "afterWorstCaseBytes": 318326702080,
+        "reserveFloorBytes": 249928859648,
+        "freeInodes": 487319392,
+        "nodeTags": [
+          "storage-tier-hosted",
+          "storage-tier-poor"
+        ],
+        "diskTags": [
+          "storage-tier-control-pane",
+          "storage-tier-poor"
+        ],
+        "matchingNodes": 1,
+        "matchingDisks": 1
+      }
+    ]
+  },
+  "limits": [
+    "Server dry-run validates admission, not controller reconciliation, actual binding, filesystem identity or reserve enforcement.",
+    "CSI first mount may initialize only the NEW logical block volumes; no host disk formatting or loop mount is included.",
+    "Fresh preflight is required immediately before any separately approved allocation. Stop if tags, disk UUID, source topology, settings, headroom or names change.",
+    "No production allocation/export, local automated tests/builds/install, existing tag/StorageClass/global Longhorn changes or additional CI runs occurred.",
+    "Physical backup plus continuous WAL protection remains open."
+  ],
+  "sources": [
+    "https://github.com/longhorn/longhorn-manager/blob/v1.12.0/csi/util.go",
+    "https://github.com/longhorn/longhorn-manager/blob/v1.12.0/webhook/resources/volume/validator.go",
+    "https://github.com/longhorn/longhorn-manager/blob/v1.12.0/datastore/longhorn.go",
+    "https://github.com/longhorn/longhorn-engine/blob/v1.12.0/pkg/replica/replica.go"
+  ]
+}

@@ -72,7 +72,11 @@ test('usage copy names stable upstream accounts without exposing analytics imple
   assert.match(translationCatalogs['zh-CN']['usage.sessionScope'], /100 个会话.*未关联会话.*单独列出/);
   assert.match(translationCatalogs.en['usage.sessionScope'], /100 busiest sessions.*without a session.*separately/i);
   for (const [locale, catalog] of Object.entries(translationCatalogs)) {
-    const exposed = Object.values(catalog).filter((value) => /\bSSE\b|\bepoch\b|stable cursor|indexed fields|JSON Schema|Wasmtime|稳定游标|索引字段|毫秒 epoch/i.test(value));
+    const sseLimitTitle = locale === 'zh-CN' ? '最大 SSE 事件（字节）' : 'Maximum SSE event (bytes)';
+    assert.equal(catalog['schema.Maximum SSE event (bytes)'], sseLimitTitle);
+    const exposed = Object.entries(catalog)
+      .filter(([, value]) => /\bSSE\b|\bepoch\b|stable cursor|indexed fields|JSON Schema|Wasmtime|稳定游标|索引字段|毫秒 epoch/i.test(value))
+      .filter(([key, value]) => key !== 'schema.Maximum SSE event (bytes)' || value !== sseLimitTitle);
     assert.deepEqual(exposed, [], `${locale} must not expose transport, storage, or runtime implementation notes`);
   }
 });
