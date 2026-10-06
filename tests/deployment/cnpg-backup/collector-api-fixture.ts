@@ -11,18 +11,10 @@ const statePath = join(directory, 'state.json');
 const state = JSON.parse(readFileSync(statePath, 'utf8'));
 const step = plan[state.index++];
 assert.ok(step, 'Unexpected collector API invocation');
-assert.ok(process.argv.includes('--request-timeout=15s'));
+assert.ok(process.argv.includes(step.requestTimeout ?? '--request-timeout=15s'));
 for (const token of step.contains) assert.ok(process.argv.includes(token), `Expected fixture argument ${token}`);
 const started = performance.now();
 const response = step.reply;
-if (step.sample) {
-  let timestamp: string;
-  if (step.sample.mode === 'cached') timestamp = state.sampleTime;
-  else if (step.sample.mode === 'invalid') timestamp = 'SENSITIVE_API_BODY_SENTINEL';
-  else timestamp = new Date(Date.now() - (step.sample.ageMs ?? 0)).toISOString();
-  response.pods[0].volume[0].time = timestamp;
-  state.sampleTime = timestamp;
-}
 writeFileSync(statePath, JSON.stringify(state));
 appendFileSync(join(directory, 'calls.jsonl'), JSON.stringify({ index: state.index, event: 'start', observedAt: new Date().toISOString() }) + '\n');
 await delay(step.delayMs ?? 0);

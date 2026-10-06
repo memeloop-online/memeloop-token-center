@@ -1,10 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { evaluateStorage, storagePlan, storageResources, validateStorageResources } from './storage-preflight.ts';
+import { evaluateStorage, readStorageSource, storagePlan, storageResources, validateStorageResources } from './storage-preflight.ts';
+import { sourceInventory } from './source-filesystem.fixture.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const gib = 1024 ** 3;
+
+test('source preflight redacts malformed successful API bodies and identity assertions', () => {
+  const sentinel = 'SENSITIVE_API_BODY_SENTINEL';
+  const inventory = sourceInventory();
+  inventory.pod.spec.containers[0]!.env[0]!.value = sentinel;
+  for (const responses of [[sentinel], [inventory.cluster, inventory.pod, inventory.claim, inventory.persistent].map(value => JSON.stringify(value))]) {
+    assert.throws(() => readStorageSource(() => responses.shift()!), (error: Error) => {
+      assert.equal(error.message, 'Read-only source identity/stat preflight failed');
+      assert.doesNotMatch(String(error.stack), new RegExp(sentinel));
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+  }
+});
 
 function fixture(): { nodes: any[]; settings: Record<string, string>; replicas: any[]; filesystem: Record<string, { availableBytes: number; freeInodes: number }> } {
   const nodes: any[] = [];
