@@ -28,7 +28,7 @@ function fixture(init: boolean, legacy = false): string {
     '--entrypoint=/bin/sh', image, '-ec', init ? 'while test ! -e /tmp/start; do sleep 0.1; done; exec /tmp/export-command' : 'exec sleep 300']).trim();
   try {
     shell(container, 'mkdir /tmp/bin');
-    write(container, '/policy/capacity.sh', capacityPolicy);
+    write(container, '/policy/capacity.sh', legacy ? capacityPolicy.replaceAll('timeout -k 1 5', 'timeout 5') : capacityPolicy);
     write(container, '/tmp/bin/findmnt', String.raw`#!/bin/sh
 if test -e /tmp/findmnt-slow; then trap '' TERM; sleep 120; fi
 case "$*" in
@@ -46,6 +46,7 @@ esac
     write(container, '/tmp/bin/pg_dump', '#!/bin/sh\ntrap "" TERM\nprintf "%s\\n" "$$" > /tmp/producer.pid\ndd if=/dev/zero bs=65536 status=none &\nprintf "%s\\n" "$!" > /tmp/producer-child.pid\nwait "$!"\n');
     const command = [...stage.command];
     command[6] = command[6].replace('26071793664', '1048576');
+    if (legacy) command[6] = command[6].replace('space_guard_pid=$!\n', 'space_guard_pid=$!\nprintf \'%s\\n\' "$space_guard_pid" > /tmp/guard.pid\n');
     write(container, '/tmp/export-command', `#!/bin/sh\nexport PATH=/tmp/bin:$PATH\nexec ${command.map(quote).join(' ')}\n`);
     shell(container, 'chmod 700 /tmp/bin/* /tmp/export-command; date +%s > /tmp/source-space.lease');
     shell(container, 'printf "%s fixture-pod /dev/fixture fixture-backup 8:32\\n" "$(date +%s)" > /tmp/backup-volume.lease');
@@ -80,6 +81,31 @@ test('incident baseline: original background guard/parent-wait interaction at PI
   if (!stopped) {
     context.diagnostic(docker(['top', container, '-eo', 'pid,ppid,pgid,stat,comm']).trim());
     context.diagnostic(shell(container, 'printf "source_lease_present="; test ! -e /tmp/source-space.lease; printf "false\\n"; cat /tmp/stage.stdout /tmp/stage.stderr'));
+  }
+});
+
+test('historical guard failure modes demonstrate the unmonitored parent wait, not a PID1 assumption', { timeout: 60_000 }, async context => {
+  for (const mode of ['guard-killed', 'guard-probe-stuck'] as const) {
+    await context.test(mode, async childContext => {
+      const container = fixture(true, true);
+      childContext.after(() => docker(['rm', '-f', container]));
+      shell(container, 'touch /tmp/start');
+      await active(container);
+      if (mode === 'guard-killed') shell(container, 'kill -KILL "$(cat /tmp/guard.pid)"');
+      else {
+        shell(container, 'touch /tmp/findmnt-slow');
+        await delay(3000);
+      }
+      shell(container, 'rm /tmp/source-space.lease /tmp/backup-volume.lease');
+      const before = Number(shell(container, `stat -c %s ${directory}/memeloop_token_center.dump.partial`));
+      await delay(8000);
+      assert.equal(docker(['inspect', '-f', '{{.State.Running}}', container]).trim(), 'true');
+      const after = Number(shell(container, `stat -c %s ${directory}/memeloop_token_center.dump.partial`));
+      assert.ok(after > before, 'Historical parent waits on producer, without supervising dead/stuck guard');
+      shell(container, `test ! -e ${directory}/LOCAL_ARCHIVE_CREATED`);
+      childContext.diagnostic(`Historical ${mode}: missing both leases, export still grew ${after - before} bytes in eight seconds`);
+      childContext.diagnostic(docker(['top', container, '-eo', 'pid,ppid,pgid,stat,comm']).trim());
+    });
   }
 });
 
