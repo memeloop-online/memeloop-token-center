@@ -482,14 +482,13 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
         0,
         "unknown admission ACK never reaches the upstream-dispatch continuation"
     );
-    assert!(
-        fixture
-            .db
-            .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let failed_task = fixture
+        .db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("failed orphan retains its captured request for legacy upload");
+    assert!(!failed_task.successful_terminal);
     // Also exercise a real server-side connection loss, not only caller
     // cancellation. Terminate only this isolated fixture's COMMIT backend.
     let disconnected_id = Uuid::new_v4();
@@ -1228,6 +1227,7 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
     let stale = ArchiveSpoolTask {
         identity: fixture.id,
         purpose: BufferedArchivePurpose::Response,
+        successful_terminal: recovered.successful_terminal,
         lease_owner: owner,
         lease_token: Uuid::parse_str(&token).unwrap(),
         chunk_count: 1,

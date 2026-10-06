@@ -51,6 +51,7 @@ pub(crate) struct ArchiveSpoolIdentity {
 pub(crate) struct ArchiveSpoolTask {
     pub identity: ArchiveSpoolIdentity,
     pub purpose: BufferedArchivePurpose,
+    pub successful_terminal: bool,
     pub lease_owner: Uuid,
     pub lease_token: Uuid,
     pub chunk_count: i64,
@@ -859,10 +860,10 @@ impl Database {
         let hint_now = archive_clock(&mut tx, self.backend).await?;
         let claim = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND (r.response_object = 'gap://' || s.request_id || '/response' OR COALESCE(r.status_code, 0) NOT BETWEEN 200 AND 399 OR COALESCE(r.error_code, '') <> '')) ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND (r.response_object = 'gap://' || s.request_id || '/response' OR COALESCE(r.status_code, 0) NOT BETWEEN 200 AND 399 OR COALESCE(r.error_code, '') <> '')) ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
             }
         };
         let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
@@ -903,26 +904,13 @@ impl Database {
         let successful: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NOT NULL AND status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = ''")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?;
-        if successful == 0 {
-            sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'gap', updated_at = $1, expires_at = $1, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $2")))
-                .bind(now).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
-            emit_response_archive_transition_event_in_transaction(
-                &mut tx,
-                purpose,
-                identity.request_id,
-                now,
-                "archive_gap",
-            )
-            .await?;
-            tx.commit().await?;
-            return Ok(None);
-        }
         let lease_token = Uuid::new_v4();
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'uploading', lease_owner = $1, lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = $4 WHERE request_id = $5")))
             .bind(lease_owner.to_string()).bind(lease_token.to_string()).bind(now + LEASE_TTL).bind(now).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         let task = ArchiveSpoolTask {
             identity,
             purpose,
+            successful_terminal: successful == 1,
             lease_owner,
             lease_token,
             chunk_count: row.try_get("chunk_count")?,
@@ -1014,7 +1002,6 @@ impl Database {
         Ok(true)
     }
 
-    #[cfg(test)]
     pub(crate) async fn complete_response_archive_spool(
         &self,
         task: &ArchiveSpoolTask,

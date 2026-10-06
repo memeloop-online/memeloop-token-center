@@ -8,72 +8,128 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
-async fn failed_terminal_spools_never_enter_cas_staging() {
-    for (status_code, error_code) in [
-        (503_i64, None),
-        (200, Some("stream_incomplete")),
-        (429, None),
-    ] {
-        let (_dir, state, pool, identity) = fixture().await;
-        for purpose in [
-            BufferedArchivePurpose::Request,
-            BufferedArchivePurpose::Response,
+async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_binding() {
+    for compressed in [false, true] {
+        for (status_code, error_code) in [
+            (503_i64, None),
+            (502, Some("stream_incomplete")),
+            (200, Some("stream_incomplete")),
+            (429, None),
         ] {
-            assert!(
-                capture_buffered(
-                    &state,
-                    identity,
-                    purpose,
-                    Bytes::from_static(b"captured text")
-                )
-                .await
-            );
-        }
-        finish(&pool, identity).await;
-        let response_locator = if status_code == 429 {
-            "inline-json:{\"error\":{\"message\":\"local failure\"}}".to_owned()
-        } else {
-            format!("gap://{}/response", identity.request_id)
-        };
-        sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, response_object = $5 WHERE id = $4")
-            .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
-            .bind(identity.request_id.to_string()).bind(&response_locator).execute(&pool).await.unwrap();
-        for _ in 0..3 {
+            let (_dir, mut state, pool, identity) = fixture().await;
+            sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) SELECT id, created_at, tenant_id, key_id FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+            std::sync::Arc::make_mut(&mut state.config).archive_object_compression_enabled =
+                compressed;
+            let request = Bytes::from_static(b"{\"input\":\"diagnostic request\"}");
+            let response =
+                Bytes::from_static(b"{\"error\":{\"message\":\"upstream request failed\"}}");
+            for (purpose, body) in [
+                (BufferedArchivePurpose::Request, request.clone()),
+                (BufferedArchivePurpose::Response, response.clone()),
+            ] {
+                assert!(capture_buffered(&state, identity, purpose, body).await);
+            }
             assert!(!process_one_for_test(&state).await);
+            finish(&pool, identity).await;
+            sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $4")
+                .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
+                .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+            let retained: i64 = sqlx::query_scalar(
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(retained > 0);
+            assert!(process_one_for_test(&state).await);
+            assert!(process_one_for_test(&state).await);
+            for _ in 0..2 {
+                assert!(!process_one_for_test(&state).await);
+            }
+            let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(budget.get::<i64, _>("cipher_bytes"), 0);
+            assert_eq!(budget.get::<i64, _>("request_cipher_bytes"), 0);
+            let row = sqlx::query("SELECT request_object, response_object, status_code, error_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(row.get::<i64, _>("status_code"), status_code);
+            assert_eq!(
+                row.get::<Option<String>, _>("error_code").as_deref(),
+                error_code
+            );
+            assert_eq!(row.get::<i64, _>("input_tokens"), 45);
+            assert_eq!(row.get::<i64, _>("output_tokens"), 67);
+            assert_eq!(row.get::<i64, _>("cost_micros"), 123);
+            for (column, body, purpose) in [
+                ("request_object", request, "request"),
+                ("response_object", response, "response"),
+            ] {
+                let locator: String = row.get(column);
+                assert!(!locator.starts_with("gap://"));
+                assert!(!locator.contains("/cas/"));
+                assert_eq!(locator.ends_with(".mtcz1"), compressed);
+                assert_eq!(state.archive.get(&locator).await.unwrap(), body);
+                let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = $2 AND state = 'bound' AND bound_locator = $3")
+                    .bind(identity.request_id.to_string()).bind(purpose).bind(&locator)
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(bound, 1);
+            }
+            let spools: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0)")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(spools, 2);
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(events, 2);
+            let gaps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_gap'")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(gaps, 0);
         }
-        let budget: i64 = sqlx::query_scalar(
-            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            budget, 0,
-            "failed terminal captures must not retain budget until TTL"
-        );
-        let gaps: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'gap' AND attempts = 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'gap' AND attempts = 0)")
-            .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(gaps, 2);
-        let stored: String =
-            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
-                .bind(identity.request_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored, response_locator);
-        let attempts: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
-                .bind(identity.request_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(attempts, 0);
     }
 }
 
 #[tokio::test]
+async fn inline_failure_summary_keeps_captured_request_and_drains_its_budget() {
+    let (_dir, state, pool, identity) = fixture().await;
+    let request = Bytes::from_static(b"{\"input\":\"diagnostic request\"}");
+    assert!(
+        capture_buffered(
+            &state,
+            identity,
+            BufferedArchivePurpose::Request,
+            request.clone()
+        )
+        .await
+    );
+    finish(&pool, identity).await;
+    let summary = "inline-json:{\"error\":{\"message\":\"upstream rejected the request\"}}";
+    sqlx::query("UPDATE request_records SET status_code = 429, request_object = $1, response_object = $2 WHERE id = $3")
+        .bind(format!("gap://{}/request", identity.request_id)).bind(summary)
+        .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+    assert!(process_one_for_test(&state).await);
+    assert!(!process_one_for_test(&state).await);
+    let row =
+        sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let locator: String = row.get("request_object");
+    assert!(!locator.contains("/cas/"));
+    assert_eq!(state.archive.get(&locator).await.unwrap(), request);
+    assert_eq!(row.get::<String, _>("response_object"), summary);
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(budget, 0);
+}
+
+#[tokio::test]
 async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
-    for missing in [false, true] {
+    for (missing, status_code) in [(false, 200_i64), (true, 200), (false, 502), (true, 502)] {
         let (_dir, state, pool, identity) = fixture().await;
         assert!(
             capture_buffered(
@@ -85,6 +141,12 @@ async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
             .await
         );
         finish(&pool, identity).await;
+        sqlx::query("UPDATE request_records SET status_code = $1 WHERE id = $2")
+            .bind(status_code)
+            .bind(identity.request_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
         if missing {
             sqlx::query("DELETE FROM response_archive_spool_chunks WHERE request_id = $1")
                 .bind(identity.request_id.to_string())

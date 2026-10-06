@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn failed_terminal_claim_gaps_atomically_and_releases_budget_through_existing_gc() {
+async fn failed_terminal_claim_preserves_capture_and_budget_until_legacy_binding() {
     let (_dir, db, identity) = fixture().await;
     assert!(db.begin_response_archive_spool(identity).await.unwrap());
     assert!(
@@ -22,31 +22,24 @@ async fn failed_terminal_claim_gaps_atomically_and_releases_budget_through_exist
         .unwrap();
     let retained = budget(&db).await;
     assert!(retained > 0);
-    sqlx::query("CREATE TRIGGER reject_terminal_gap BEFORE INSERT ON request_events WHEN NEW.event_kind = 'archive_gap' BEGIN SELECT RAISE(ABORT, 'terminal gap rollback'); END")
-        .execute(&db.pool).await.unwrap();
-    assert!(
-        db.claim_response_archive_spool(Uuid::new_v4())
-            .await
-            .is_err()
-    );
-    let row = sqlx::query("SELECT state, attempts, expires_at, updated_at FROM response_archive_spools WHERE request_id = $1")
-        .bind(identity.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i64, _>("attempts"), 0);
-    assert!(row.get::<i64, _>("expires_at") > row.get::<i64, _>("updated_at"));
-    assert_eq!(budget(&db).await, retained);
-    sqlx::query("DROP TRIGGER reject_terminal_gap")
-        .execute(&db.pool)
+    let task = db
+        .claim_response_archive_spool(Uuid::new_v4())
         .await
+        .unwrap()
         .unwrap();
-    for _ in 0..2 {
-        assert!(
-            db.claim_response_archive_spool(Uuid::new_v4())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
+    assert!(!task.successful_terminal);
+    assert_eq!(task.byte_count, 3);
+    assert_eq!(task.chunk_count, 1);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, retained);
+    let row =
+        sqlx::query("SELECT state, attempts FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "uploading");
+    assert_eq!(row.get::<i64, _>("attempts"), 1);
     let events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_gap'",
     )
@@ -54,16 +47,7 @@ async fn failed_terminal_claim_gaps_atomically_and_releases_budget_through_exist
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(events, 1);
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
-    assert_eq!(budget(&db).await, 0);
-    let attempts: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1")
-            .bind(identity.request_id.to_string())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(attempts, 0);
+    assert_eq!(events, 0);
 }
 
 #[tokio::test]

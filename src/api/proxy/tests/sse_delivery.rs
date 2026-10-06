@@ -584,9 +584,15 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
         .request_archive_refs(fixture.key_id, rows[0].request_id)
         .await
         .unwrap();
-    assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
-    );
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().expect("response archive"))
+        .await
+        .unwrap();
+    let archived = String::from_utf8(archived.to_vec()).unwrap();
+    assert!(archived.contains("upstream request failed"));
+    assert!(!archived.contains("provider-payload-secret"));
+    assert!(!archived.contains("bare-event-secret"));
     upstream.verify().await;
 }
