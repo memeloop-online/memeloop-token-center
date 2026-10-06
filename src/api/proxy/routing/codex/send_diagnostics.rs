@@ -1,5 +1,5 @@
-use http::header;
-use hyper::body::Body;
+use ::http::header;
+use ::hyper::body::Body;
 
 use super::*;
 

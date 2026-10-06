@@ -1,3 +1,4 @@
+use ::http::{HeaderMap, HeaderValue};
 use bytes::Bytes;
 
 use super::*;
@@ -21,7 +22,7 @@ fn native_request_discards_stale_length_and_forbidden_downstream_headers() {
     let serialized = Bytes::from(
         serde_json::to_vec(&serde_json::json!({"input": "合成", "store": false})).unwrap(),
     );
-    let mut downstream = http::HeaderMap::new();
+    let mut downstream = HeaderMap::new();
     for (name, value) in [
         ("content-length", "999999"),
         ("connection", "keep-alive, x-private-header"),
@@ -33,7 +34,7 @@ fn native_request_discards_stale_length_and_forbidden_downstream_headers() {
         ("x-private-header", "private-header-value"),
         ("x-codex-turn-metadata", "private-turn-value"),
     ] {
-        downstream.insert(name, http::HeaderValue::from_static(value));
+        downstream.insert(name, HeaderValue::from_static(value));
     }
     let request = codex_transport::apply_wreq_wire_headers(
         client
