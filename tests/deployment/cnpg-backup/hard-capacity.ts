@@ -8,6 +8,7 @@ import { storageResources, validateStorageResources } from './storage-preflight.
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
 import { superviseExport } from './export-supervisor.ts';
+import { copyContainerCommand, copyIdentities, copyImage } from './copy-guard.ts';
 
 export const boundedClaims = {
   stage: 'mtc-pg-bounded-stage-20261005',
@@ -152,7 +153,15 @@ guard_pid=$!`);
       container.command[2] = script;
     }
     if ([boundedJobs.source, boundedJobs.destination].includes(resource.metadata.name)) {
-      container.command = ['/bin/sh', '-ec', '. /policy/capacity.sh; capacity_backup; exec /bin/sleep 43200'];
+      const identity = copyIdentities[resource.metadata.name === boundedJobs.source ? 'source' : 'destination'];
+      container.image = copyImage;
+      container.imagePullPolicy = 'IfNotPresent';
+      container.env.push(
+        { name: 'BACKUP_UUID_ATTESTATION', value: 'external-csi-lease' },
+        { name: 'EXPECTED_BACKUP_DEVICE', value: identity.device },
+        { name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } },
+      );
+      container.command = ['/bin/sh', '-ec', copyContainerCommand];
     }
   }
   resources.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: policyName, namespace: 'memeloop-token-center' }, data: { 'capacity.sh': capacityPolicy } });
