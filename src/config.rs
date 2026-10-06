@@ -154,6 +154,8 @@ pub struct Config {
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
+    #[serde(default)]
+    pub terminal_projection_enabled: bool,
     /// Maximum complete proxy lifecycles retained by one gateway process.
     /// Service saturation is distinct from a credential policy limit and is
     /// reported as HTTP 503, never as a per-key 429.
@@ -237,6 +239,10 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field(
+                "terminal_projection_enabled",
+                &self.terminal_projection_enabled,
+            )
             .field("proxy_memory_budget_bytes", &self.proxy_memory_budget_bytes)
             .field(
                 "proxy_lifecycle_concurrency",
@@ -426,6 +432,7 @@ impl Config {
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            terminal_projection_enabled: env_bool("MTC_TERMINAL_PROJECTION_ENABLED", false),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
             proxy_memory_budget_bytes: env_u32(
@@ -541,6 +548,7 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,
+            terminal_projection_enabled: false,
             proxy_lifecycle_concurrency: 64,
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,

@@ -70,7 +70,7 @@ test("driver and day rebuild SQL retain reconciliation safety markers", () => {
     "shell: false",
   ]) assert.ok(driverSource.includes(marker), `missing request-stats safety marker: ${marker}`);
   for (const marker of [
-    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
     "IN SHARE ROW EXCLUSIVE MODE",
     "ON CONFLICT (request_id) DO UPDATE SET",
     "cached_input_tokens, cache_write_tokens",
@@ -84,11 +84,15 @@ test("driver and day rebuild SQL retain reconciliation safety markers", () => {
 
   const pruneSource = driverSource.slice(driverSource.indexOf("function pruneApply"));
   const exclusiveProjectionLock = pruneSource.indexOf("SELECT pg_advisory_xact_lock");
-  const sourceTableLock = pruneSource.indexOf("LOCK TABLE request_records, generation_jobs IN SHARE MODE");
+  const pendingWorkGuard = pruneSource.indexOf("SELECT 1 FROM terminal_projection_outbox");
   assert.notEqual(exclusiveProjectionLock, -1, "prune must acquire the exclusive projection lock");
-  assert.notEqual(sourceTableLock, -1, "prune must lock both source tables against terminal writers");
+  assert.notEqual(pendingWorkGuard, -1, "prune must reject pending durable terminal work");
   assert.ok(
-    exclusiveProjectionLock < sourceTableLock,
-    "the exclusive projection lock must precede source-table locks to match online writer ordering",
+    exclusiveProjectionLock < pendingWorkGuard,
+    "the exclusive projection lock must precede the durable-work guard",
   );
+  assert.ok(!pruneSource.includes("LOCK TABLE request_records"));
+  assert.ok(pruneSource.includes("INSERT INTO observability_prune_boundaries"));
+  assert.ok(sqlSource.includes("FROM observability_prune_boundaries"));
+  assert.ok(sqlSource.includes("t.statistics_outcome = 'applied'"));
 });

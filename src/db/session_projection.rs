@@ -121,10 +121,13 @@ pub(crate) async fn reclassify_request_session_in_transaction(
                   fact.cached_input_tokens, fact.cache_write_tokens, fact.generation_units,
                   fact.cost_micros,
                   COALESCE(record.conversation_cluster_id,
+                           terminal.session_id,
                            'unlinked:' || fact.key_id) AS authoritative_session_id
              FROM request_stats_facts fact
-             JOIN request_records record
+             LEFT JOIN request_records record
                ON record.id = fact.request_id AND record.created_at = fact.created_at
+             LEFT JOIN terminal_projection_outbox terminal
+               ON terminal.request_id = fact.request_id AND terminal.created_at = fact.created_at
             WHERE fact.request_id = $1"#,
     )
     .bind(&request_id)

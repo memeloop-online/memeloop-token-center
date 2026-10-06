@@ -6,6 +6,7 @@ mod queries;
 mod session_routing;
 mod settlement;
 mod stats;
+mod terminal_projection;
 
 pub use conversations::ConversationProjectionTask;
 pub use conversations::{ConversationDetailFilter, ConversationListFilter};
