@@ -49,7 +49,7 @@ async fn minio_put_get_list_missing_and_read_limit() {
     // readiness_check exercises a signed ListObjectsV2 call, including bucket access.
     store.readiness_check().await.expect("list MinIO bucket");
     store
-        .delete_prefix("tenants/test-tenant")
+        .delete_prefix("tenants/test-tenant/objects")
         .await
         .expect("remove fixtures left by an interrupted earlier test");
 
@@ -101,7 +101,7 @@ async fn minio_put_get_list_missing_and_read_limit() {
     assert!(!error.to_string().contains(&unsafe_location));
 
     store
-        .delete_prefix("tenants/test-tenant")
+        .delete_prefix("tenants/test-tenant/objects")
         .await
         .expect("remove tenant integration fixtures");
 }
@@ -169,6 +169,90 @@ async fn minio_multipart_writer_publishes_only_the_content_address() {
         .delete(&location)
         .await
         .expect("remove multipart test object");
+}
+
+#[tokio::test]
+async fn minio_tenant_cas_create_if_absent_is_atomic_and_replayable() {
+    let Some(config) = s3_config() else {
+        return;
+    };
+    let store = ArchiveStore::from_config(&config)
+        .await
+        .expect("construct MinIO archive store");
+    let tenant_id = Uuid::from_u128(0x8c93_e9e1_f936_4c84_a7d6_84ab_8f38_97ad);
+    let body = Bytes::from("minio exact CAS body ".repeat(5_000));
+    let first_staging = format!("staging/s3-cas/{}/first", Uuid::now_v7());
+    let mut first = store
+        .start_compressed_writer(&first_staging)
+        .await
+        .expect("start first compressed staging object");
+    first.write(body.clone()).await.expect("write first body");
+    let first = first.finish_staged().await.expect("finish first staging");
+    let second_staging = format!("staging/s3-cas/{}/second", Uuid::now_v7());
+    let mut second = store
+        .start_compressed_writer(&second_staging)
+        .await
+        .expect("start second compressed staging object");
+    second.write(body.clone()).await.expect("write second body");
+    let second = second.finish_staged().await.expect("finish second staging");
+
+    let (left, right) = tokio::join!(
+        store.promote_staged_text_to_cas(tenant_id, &first),
+        store.promote_staged_text_to_cas(tenant_id, &second),
+    );
+    let left = left.expect("first conditional CAS publish");
+    let right = right.expect("concurrent CAS replay");
+    assert_eq!(left, right);
+    assert_eq!(
+        store
+            .promote_staged_text_to_cas(tenant_id, &first)
+            .await
+            .unwrap(),
+        left
+    );
+    let other = store
+        .promote_staged_text_to_cas(Uuid::now_v7(), &first)
+        .await
+        .unwrap();
+    assert_ne!(left.object_locator, other.object_locator);
+    assert_eq!(store.get(&left.object_locator).await.unwrap(), body);
+    let mut ranged = store
+        .open_stream(&left.object_locator, Some(65_530..65_550))
+        .await
+        .unwrap()
+        .stream;
+    let mut selected = Vec::new();
+    while let Some(chunk) = ranged.next().await {
+        selected.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(selected, body[65_530..65_550]);
+    let mut wrong_length = first.clone();
+    wrong_length.size_bytes += 1;
+    assert!(
+        store
+            .promote_staged_text_to_cas(tenant_id, &wrong_length)
+            .await
+            .is_err()
+    );
+    let mut wrong_digest = first.clone();
+    wrong_digest.blake3_digest = blake3::hash(b"wrong source").to_hex().to_string();
+    assert!(
+        store
+            .promote_staged_text_to_cas(tenant_id, &wrong_digest)
+            .await
+            .is_err()
+    );
+    assert!(store.get(&first.object_locator).await.is_ok());
+    assert!(store.get(&second.object_locator).await.is_ok());
+
+    store
+        .delete_prefix(&first.object_locator)
+        .await
+        .expect("remove first staging fixture");
+    store
+        .delete_prefix(&second.object_locator)
+        .await
+        .expect("remove second staging fixture");
 }
 
 #[tokio::test]

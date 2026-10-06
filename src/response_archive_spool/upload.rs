@@ -431,6 +431,7 @@ async fn upload(
             state.archive.start_writer(&attempt.object_locator).await?
         };
         let mut total = 0_i64;
+        let mut digest = blake3::Hasher::new();
         let mut seq = 0;
         while seq < task.chunk_count {
             *phase = "chunk_load";
@@ -459,6 +460,7 @@ async fn upload(
                 total = total
                     .checked_add(chunk.byte_count)
                     .ok_or(AppError::Internal)?;
+                digest.update(&bytes);
                 *phase = "object_write";
                 writer.write(bytes).await?;
                 seq += 1;
@@ -477,20 +479,37 @@ async fn upload(
         };
         if stored.object_locator != expected_locator
             || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::Internal)?
+            || stored.blake3_digest != digest.finalize().to_hex().as_str()
         {
             return Err(AppError::Internal);
         }
+        let bind_locator = if task.successful_terminal {
+            *phase = "cas_promote";
+            state
+                .archive
+                .promote_staged_text_to_cas(task.identity.tenant_id, &stored)
+                .await?
+                .object_locator
+        } else {
+            stored.object_locator
+        };
         *phase = "terminal_bind";
         let bind_state = state.clone();
         let bind_task = task.clone();
         let bind_lease = attempt.lease.clone();
-        let bind_locator = stored.object_locator.clone();
         let bound = super::await_owned_unbounded(
             async move {
-                bind_state
-                    .db
-                    .complete_response_archive_spool(&bind_task, &bind_lease, &bind_locator)
-                    .await
+                if bind_task.successful_terminal {
+                    bind_state
+                        .db
+                        .complete_response_archive_spool_cas(&bind_task, &bind_lease, &bind_locator)
+                        .await
+                } else {
+                    bind_state
+                        .db
+                        .complete_response_archive_spool(&bind_task, &bind_lease, &bind_locator)
+                        .await
+                }
             },
             "response_spool_terminal_bind",
         )
