@@ -102,12 +102,14 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
     container.env.push(...Object.entries(environment).map(([name, value]) => ({ name, value })));
     if (resource.metadata.name === boundedJobs.stage) {
       container.env.push({ name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } });
-      container.env.find((entry: any) => entry.name === 'PGOPTIONS').value += ' -c temp_file_limit=0';
       resource.metadata.annotations['recovery.mtc/source-space-gate'] = '9Gi-start-8Gi-stop-or-512Mi-drop-45s-lease-stop-only-own-dump-no-foreground-concurrency-change';
       resource.metadata.annotations['recovery.mtc/source-io-rate'] = 'default-1MiBps-explicit-reviewed-4-or-8MiBps-not-execution-authorization';
-      resource.metadata.annotations['recovery.mtc/source-temp-gate'] = 'session-temp_file_limit=0-fail-if-not-permitted-no-role-or-source-config-change';
+      resource.metadata.annotations['recovery.mtc/source-temp-policy'] = 'observe-existing-temp_file_limit-no-privileged-set-or-grant-source-space-lease-still-required-not-a-zero-temp-guarantee';
       let script: string = container.command[6];
       script = replaceOnce(script, 'umask 077', 'umask 077\n. /policy/capacity.sh\ntest -n "$EXPECTED_SERVER_ADDRESS"\nsource_space_wait\ncapacity_backup');
+      script = replaceOnce(script, 'transport_probe_start=$(date +%s)', `source_temp_limit=$(psql --dbname="$DATABASE_URL" -X -Atq -v ON_ERROR_STOP=1 -c "SELECT setting FROM pg_settings WHERE name = 'temp_file_limit'")
+printf 'source temp_file_limit_kib=%s (inherited; not modified)\\n' "$source_temp_limit"
+transport_probe_start=$(date +%s)`);
       script = replaceOnce(script, 'actual_backup_fs_uuid=$(findmnt -n -o UUID -T /backup)\ntest "$actual_backup_fs_uuid" = "$EXPECTED_BACKUP_FS_UUID"', 'capacity_backup');
       script = replaceOnce(script, 'available_kib=$(timeout 5 df -Pk /backup | awk \'NR == 2 { print $4 }\')\ntest "$available_kib" -ge 67108864',
         'capacity_volume /backup "$EXPECTED_BACKUP_FS_UUID" "$BACKUP_MAX_BYTES" "$BACKUP_MIN_BYTES" 26071793664');
