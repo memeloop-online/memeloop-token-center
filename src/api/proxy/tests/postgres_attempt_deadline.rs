@@ -78,7 +78,7 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
             tenant_external_id: tenant.clone(),
             public_model: model.clone(),
             upstream_account_id: account.id,
-            upstream_model,
+            upstream_model: upstream_model.clone(),
             protocol: "openai".to_owned(),
             priority: 0,
         })
@@ -108,6 +108,11 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     state
         .db
         .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price(&upstream_model, "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
 

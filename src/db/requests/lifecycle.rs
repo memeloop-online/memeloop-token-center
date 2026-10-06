@@ -111,6 +111,7 @@ pub(crate) struct SwitchProxyCandidateInput<'a> {
     pub reservation: &'a UsageReservation,
     pub input_token_ceiling: i64,
     pub output_token_ceiling: i64,
+    pub upstream_model: &'a str,
     pub expected_assignment: (Uuid, Uuid),
     pub next_assignment: (Uuid, Uuid),
 }
@@ -202,7 +203,7 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, true)
+        self.start_proxy_request_inner(input, None, true, None)
             .await
             .map(|started| started.reservation)
     }
@@ -210,8 +211,9 @@ impl Database {
     pub(crate) async fn start_proxy_forwarding_request(
         &self,
         input: StartProxyRequest<'_>,
+        upstream_model: Option<&str>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false)
+        self.start_proxy_request_inner(input, None, false, upstream_model)
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
@@ -310,7 +312,7 @@ impl Database {
     ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true)
+            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true, None)
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -332,6 +334,7 @@ impl Database {
         input: StartProxyRequest<'_>,
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
         publish_started: bool,
+        upstream_model: Option<&str>,
     ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
@@ -423,6 +426,14 @@ impl Database {
         {
             BudgetHold::rollback_optional(transaction, hold).await?;
             return Err(error);
+        }
+        if let Some(upstream_model) = upstream_model {
+            sqlx::query("UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3")
+                .bind(upstream_model)
+                .bind(input.request_id.to_string())
+                .bind(reservation.id.to_string())
+                .execute(&mut *transaction)
+                .await?;
         }
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
@@ -573,9 +584,10 @@ impl Database {
         let (next_upstream_account_id, next_model_route_id) = input.next_assignment;
         let updated = sqlx::query(
             "UPDATE request_records
-             SET upstream_account_id = $1, model_route_id = $2
+             SET upstream_account_id = $1, model_route_id = $2, upstream_model = $9
              WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND reservation_id = $6
                AND upstream_account_id = $7 AND model_route_id = $8
+               AND (upstream_account_id <> $1 OR model_route_id <> $2 OR upstream_model IS NULL OR upstream_model = $9)
                AND completed_at IS NULL AND error_code IS NULL",
         )
         .bind(next_upstream_account_id.to_string())
@@ -586,6 +598,7 @@ impl Database {
         .bind(input.reservation.id.to_string())
         .bind(expected_upstream_account_id.to_string())
         .bind(expected_model_route_id.to_string())
+        .bind(input.upstream_model)
         .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() != 1 {
@@ -594,10 +607,21 @@ impl Database {
                 "proxy candidate changed after downstream delivery preparation".into(),
             ));
         }
+        let retained_price: ModelPrice;
+        let price = if input.expected_assignment == input.next_assignment {
+            let snapshot: String = sqlx::query_scalar("SELECT price_snapshot_json FROM usage_reservations WHERE id = $1 AND status = 'reserved'")
+                .bind(input.reservation.id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+            retained_price = serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+            &retained_price
+        } else {
+            input.price
+        };
         let resized = resize_usage_reservation_in_transaction(
             &mut transaction,
             input.key,
-            input.price,
+            price,
             input.reservation,
             input.input_token_ceiling,
             input.output_token_ceiling,
@@ -1002,6 +1026,7 @@ impl Database {
             None,
             ProxyRequestUpstreamAttribution::KeepSelected,
             Some(&input),
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1020,6 +1045,7 @@ impl Database {
             None,
             ProxyRequestUpstreamAttribution::KeepSelected,
             None,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1036,6 +1062,7 @@ impl Database {
             None,
             upstream_attribution,
             None,
+            self.terminal_projection_enabled,
         )
         .await
     }
@@ -1047,7 +1074,25 @@ impl Database {
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
         upstream_attribution: ProxyRequestUpstreamAttribution,
     ) -> Result<FinishProxyRequestResult, AppError> {
-        self.finish_proxy_request_inner(input, None, Some(archive), upstream_attribution, None)
+        self.finish_proxy_request_inner(
+            input,
+            None,
+            Some(archive),
+            upstream_attribution,
+            None,
+            self.terminal_projection_enabled,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_proxy_request_deferred(
+        &self,
+        input: FinishProxyRequest<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        self.clone()
+            .with_terminal_projection_enabled(true)
+            .finish_proxy_request(input)
             .await
     }
 
@@ -1058,6 +1103,7 @@ impl Database {
         buffered_archive: Option<&crate::response_archive_spool::BufferedArchive<'_>>,
         upstream_attribution: ProxyRequestUpstreamAttribution,
         metered: Option<&FinishMeteredSynchronousRequest<'_>>,
+        defer_projection: bool,
     ) -> Result<FinishProxyRequestResult, AppError> {
         if let Some(archive) = buffered_archive
             && (archive.identity().request_id != input.request_id
@@ -1114,7 +1160,9 @@ impl Database {
             } else {
                 (self.begin_write_transaction().await?, None)
             };
-            lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+            if !defer_projection {
+                lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+            }
             BudgetHold::set_phase(&mut hold, "terminal_owner");
             // SQLite's BEGIN IMMEDIATE can wait for an earlier terminal writer.
             // Capture the observation boundary only after that wait so live writes
@@ -1138,6 +1186,23 @@ impl Database {
             if claimed.rows_affected() == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
                 .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
                 return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));
+            }
+            if claimed.rows_affected() == 0 && defer_projection
+                && let Some(existing) = sqlx::query("SELECT status_code, cost_micros, NULLIF(error_code, '') AS error_code, response_object FROM terminal_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
+                    .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
+                    .fetch_optional(&mut *transaction).await?
+            {
+                let result = FinishProxyRequestResult::AlreadyFinished {
+                    status_code: existing.try_get("status_code")?,
+                    cost_micros: existing.try_get("cost_micros")?,
+                    error_code: existing.try_get("error_code")?,
+                    response_object: existing.try_get("response_object")?,
+                };
+                BudgetHold::commit_optional(transaction, hold).await?;
+                if let Some(reservation) = budget_reservation.as_ref() {
+                    reservation.release().await;
+                }
+                return Ok(result);
             }
             let locator = sqlx::query(
                 "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
@@ -1318,7 +1383,9 @@ impl Database {
                     // never create tenant content. Commit its unique-key locks
                     // before acquiring the session lock, including during rolling
                     // upgrades with older session-before-content writers.
-                    if trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited {
+                    if defer_projection
+                        || trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
+                    {
                         let atoms = extract_atoms(conversation.request_json);
                         let nodes = build_prefix(&atoms);
                         materialize_conversation_content_in_transaction(
@@ -1506,7 +1573,9 @@ impl Database {
             {
                 return Err(AppError::NotFound);
             }
-            if trusted_reservation.enforcement_mode == EnforcementMode::MeteredUnlimited {
+            if defer_projection
+                || trusted_reservation.enforcement_mode == EnforcementMode::MeteredUnlimited
+            {
                 enqueue_conversation_projection_in_transaction(
                     &mut transaction,
                     ConversationProjectionEnqueueInput {
@@ -1517,6 +1586,7 @@ impl Database {
                         client_name: conversation.client_name,
                         upstream_response_id: conversation.upstream_response_id,
                         observed_at: now,
+                        content_materialized,
                     },
                 )
                 .await?;
@@ -1551,7 +1621,21 @@ impl Database {
         let reservation_status: String = reservation_row.try_get("status")?;
         let cost_micros = match reservation_status.as_str() {
             "reserved" => {
-                if let Some(trusted_metered) = trusted_metered.as_ref() {
+                if defer_projection {
+                    super::settlement::settle_terminal_usage_in_transaction(
+                        &mut transaction,
+                        &trusted_reservation,
+                        &usage,
+                        trusted_metered.as_ref().map(|reservation| {
+                            (
+                                reservation,
+                                metered.map(|input| input.billed_units).unwrap_or_default(),
+                            )
+                        }),
+                        now,
+                    )
+                    .await?
+                } else if let Some(trusted_metered) = trusted_metered.as_ref() {
                     settle_metered_usage_in_transaction(
                         &mut transaction,
                         trusted_metered,
@@ -1604,9 +1688,11 @@ impl Database {
                 response_object,
             },
             now,
-            trusted_reservation
-                .enforcement_mode
-                .enforces_prepaid_limits(),
+            (!defer_projection).then_some(
+                trusted_reservation
+                    .enforcement_mode
+                    .enforces_prepaid_limits(),
+            ),
             usage_basis,
             trusted_metered
                 .as_ref()
@@ -2005,7 +2091,7 @@ async fn record_request_finished_with_basis_in_transaction(
         tx,
         request,
         completed_at,
-        project_aggregates,
+        Some(project_aggregates),
         usage_basis,
         None,
         None,
@@ -2017,12 +2103,14 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     request: &FinishRequest,
     completed_at: i64,
-    project_aggregates: bool,
+    project_aggregates: Option<bool>,
     usage_basis: Option<crate::model::RequestUsageBasis>,
     metered_usage: Option<MeteredRequestUsage<'_>>,
     terminal_cause: Option<crate::model::RequestTerminalCause>,
 ) -> Result<bool, AppError> {
-    lock_request_stats_projection_writer_in_transaction(tx).await?;
+    if project_aggregates.is_some() {
+        lock_request_stats_projection_writer_in_transaction(tx).await?;
+    }
     let request_id = request.request_id.to_string();
     let locator = sqlx::query(
         "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1",
@@ -2072,6 +2160,11 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Ok(false);
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
+    let Some(project_aggregates) = project_aggregates else {
+        super::terminal_projection::enqueue_terminal_projection_in_transaction(tx, &request_id)
+            .await?;
+        return Ok(true);
+    };
     if project_aggregates {
         sqlx::query(
             "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",

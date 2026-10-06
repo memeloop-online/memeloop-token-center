@@ -472,6 +472,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .post(super::super::plugins::stage_application_plugin),
         )
         .route(
+            "/internal/v1/plugin-runtime/empty-inventories",
+            post(super::super::plugins::register_empty_application_plugin),
+        )
+        .route(
             "/internal/v1/plugin-runtime/publish",
             post(super::super::plugins::publish_application_plugin),
         )

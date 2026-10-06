@@ -54,7 +54,7 @@ test('request diagnostics use only nullable server-recorded final routing fields
 });
 
 test('request failure presentation shares the allowlisted recorded cause and never renders raw codes', () => {
-  assert.match(components, /const failureCause = requestFailureCause\(request, locale\) \?\? \(request\.error_code \? requestErrorCopy\(request\.error_code, locale\) : null\);/);
+  assert.match(components, /const failureCause = pending \|\| requestStatusCopy\(request, locale\)\.cause \? null : requestFailureCause\(request, locale\) \?\? \(request\.error_code \? requestErrorCopy\(request\.error_code, locale\) : null\);/);
   assert.match(components, /\{failureCause && <div className="request-detail-wide"><b>\{t\('request\.error'\)\}<\/b><span>\{failureCause\}<\/span><\/div>\}/);
   assert.doesNotMatch(components, /\{request\.error_code\}/, 'raw recorded error codes never render as copy');
   assert.doesNotMatch(components, /traffic\.errorCode/, 'raw recorded error codes never appear in tooltips');

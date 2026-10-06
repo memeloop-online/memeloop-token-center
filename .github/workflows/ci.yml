@@ -295,22 +295,60 @@ jobs:
           "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
       - name: Verify pinned Claude privacy component through the host ABI
+        id: claude_component
+        env:
+          INSTALLER_SOURCE: ghcr.io/memeloop-online/memeloop-token-center
+          INSTALLER_DIGEST: sha256:7f04c3c5e65225bc4ea64243e52c51a37020927ff0fae00a66adabb552b141ed
+          INSTALLER_SOURCE_REVISION: d72b3ad5c75efd8634390ce55a2e33d47cfa79f2
+          PLUGIN_SOURCE: ghcr.io/memeloop-online/claude-code-wire
+          PLUGIN_DIGEST: sha256:3e4160580005b15c9db1e3bd419df79ee65de1d86a8fe1d4ec5aac4c88fe5906
+          SIGNING_IDENTITY: https://github.com/memeloop-online/claude-code-wire/.github/workflows/publish-oci.yml@refs/heads/master
+          SIGNING_ISSUER: https://token.actions.githubusercontent.com
         run: |
-          mkdir claude-code-wire-fixture
-          cd claude-code-wire-fixture
-          curl --fail --location --retry 3 --output plugin.wasm \
-            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.wasm
-          curl --fail --location --retry 3 --output plugin.json \
-            https://github.com/memeloop-online/claude-code-wire/releases/download/v1.0.1/plugin.json
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/claude-code-wire-fixture" "$RUNNER_TEMP/claude-wire-evidence"
+          docker pull "$INSTALLER_SOURCE@$INSTALLER_DIGEST"
+          revision=$(docker image inspect "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          test "$revision" = "$INSTALLER_SOURCE_REVISION"
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --mount "type=bind,src=$RUNNER_TEMP/claude-code-wire-fixture,dst=/plugins" \
+            --entrypoint /usr/local/bin/install-plugin-oci "$INSTALLER_SOURCE@$INSTALLER_DIGEST" \
+            "$PLUGIN_SOURCE@$PLUGIN_DIGEST" --plugin-dir /plugins --allowed-source "$PLUGIN_SOURCE" \
+            --cosign-certificate-identity "$SIGNING_IDENTITY" \
+            --cosign-certificate-oidc-issuer "$SIGNING_ISSUER" \
+            > "$RUNNER_TEMP/claude-wire-evidence/verified-installation.json"
+          export MTC_CLAUDE_WIRE_FIXTURE="$RUNNER_TEMP/claude-code-wire-fixture/claude-code-wire"
+          cd "$MTC_CLAUDE_WIRE_FIXTURE"
           printf '%s\n' \
             '51043af426632581a218c227a0f90b2de2253d27b5438519098c44d965c01f3c  plugin.wasm' \
             '95aa1c2ec715a766e865d861b6e9b00cb157c1f77056fab300fc55fa3925c68e  plugin.json' \
             | sha256sum --check --strict
-          cd ..
-          MTC_CLAUDE_WIRE_FIXTURE="$GITHUB_WORKSPACE/claude-code-wire-fixture" \
-            cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
+          cp .mtc-oci-install.json "$RUNNER_TEMP/claude-wire-evidence/provenance.json"
+          echo "MTC_CLAUDE_WIRE_FIXTURE=$MTC_CLAUDE_WIRE_FIXTURE" >> "$GITHUB_ENV"
+          echo "MTC_CLAUDE_WIRE_EVIDENCE=$RUNNER_TEMP/claude-wire-evidence/gateway-final-wire.json" >> "$GITHUB_ENV"
+          cd "$GITHUB_WORKSPACE"
+          cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
           cargo test --locked --all-features --test plugin_product \
             installable_example_contributes_provider_oauth_policy_and_rewrite
+      - name: Verify empty inventory registration and SQLite/PostgreSQL recovery CAS
+        run: cargo test --locked --all-features --lib empty_inventory -- --nocapture
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+      - name: Reuse the signed Claude component through native and bridge gateway finalization
+        if: ${{ !cancelled() && steps.claude_component.outcome == 'success' }}
+        run: |
+          cargo test --locked --all-features --lib -- --ignored --exact api::proxy::tests::claude_wire_recovery::signed_claude_gateway_empty_recovery_finalize_matrix --nocapture
+          test -s "$MTC_CLAUDE_WIRE_EVIDENCE"
+      - name: Retain synthetic Claude final-wire and signature evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: claude-wire-recovery-${{ github.sha }}
+          path: ${{ runner.temp }}/claude-wire-evidence/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build the fixed preferred-account guest for real host acceptance
         run: |
           cargo fmt --manifest-path plugin-sources/preferred-account/Cargo.toml -- --check

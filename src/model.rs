@@ -624,6 +624,7 @@ pub struct RequestView {
     pub lifecycle_state: RequestLifecycleState,
     pub protocol: String,
     pub model: String,
+    pub upstream_model: Option<String>,
     /// Stable upstream identity assigned to this request. For text traffic
     /// this is the final pending assignment after any pre-delivery failover,
     /// not an attempt history.
@@ -675,7 +676,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 28)?;
+        let mut state = serializer.serialize_struct("RequestView", 29)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
@@ -685,6 +686,7 @@ impl Serialize for RequestView {
         state.serialize_field("lifecycle_state", &self.lifecycle_state)?;
         state.serialize_field("protocol", &self.protocol)?;
         state.serialize_field("model", &self.model)?;
+        state.serialize_field("upstream_model", &self.upstream_model)?;
         state.serialize_field("upstream_account_id", &self.upstream_account_id)?;
         state.serialize_field("route_id", &self.route_id)?;
         state.serialize_field("status_code", &self.status_code)?;
@@ -889,6 +891,7 @@ pub struct RequestEventView {
     pub completed_at: Option<i64>,
     pub source_completed_at: Option<i64>,
     pub lifecycle_state: RequestLifecycleState,
+    pub upstream_model: Option<String>,
     pub upstream_account_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
     pub currency: Option<String>,
@@ -919,7 +922,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 32)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 33)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -930,6 +933,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("completed_at", &self.completed_at)?;
         state.serialize_field("source_completed_at", &self.source_completed_at)?;
         state.serialize_field("lifecycle_state", &self.lifecycle_state)?;
+        state.serialize_field("upstream_model", &self.upstream_model)?;
         state.serialize_field("upstream_account_id", &self.upstream_account_id)?;
         state.serialize_field("route_id", &self.route_id)?;
         state.serialize_field("currency", &self.currency)?;
@@ -1091,6 +1095,7 @@ pub struct LogicalSessionSummary {
     pub key_id: Uuid,
     pub key_alias: String,
     pub model: String,
+    pub upstream_model: Option<String>,
     pub protocol: String,
     pub last_status: String,
     pub last_activity_at: i64,
