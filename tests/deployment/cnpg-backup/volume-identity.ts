@@ -72,10 +72,10 @@ export function attestBackupVolume(read: InventoryReader, pod: any, expected: ty
   assert.match(pod.metadata.uid, /^[a-zA-Z0-9-]{1,64}$/);
   const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
   const environment = (name: string) => container.env.find((entry: any) => entry.name === name);
-  const prefix = mount.toUpperCase();
-  assert.equal(environment(`EXPECTED_${prefix}_FS_UUID`).value, expected.filesystemUUID);
-  assert.equal(environment(`EXPECTED_${prefix}_DEVICE`).value, expected.device);
-  assert.equal(environment(`${prefix}_UUID_ATTESTATION`).value, 'external-csi-lease');
+  const environmentPrefix = mount.toUpperCase();
+  assert.equal(environment(`EXPECTED_${environmentPrefix}_FS_UUID`).value, expected.filesystemUUID);
+  assert.equal(environment(`EXPECTED_${environmentPrefix}_DEVICE`).value, expected.device);
+  assert.equal(environment(`${environmentPrefix}_UUID_ATTESTATION`).value, 'external-csi-lease');
   assert.equal(environment('POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
   const get = (args: string[]) => JSON.parse(read([...args, '-o', 'json']));
   verifyStageBinding(
