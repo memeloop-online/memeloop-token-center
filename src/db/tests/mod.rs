@@ -3,6 +3,7 @@ mod event_cursor;
 mod migrations;
 mod operations;
 mod proxy_lifecycle;
+mod routing_price_coverage;
 mod session_analytics;
 mod settlement;
 mod settlement_adjustments;
