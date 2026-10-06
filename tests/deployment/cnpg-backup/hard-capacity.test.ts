@@ -15,6 +15,7 @@ assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts
 const resources = preparedResources();
 const jobs = resources.filter(resource => resource.kind === 'Job');
 const stage = jobs.find(resource => resource.metadata.name === boundedJobs.stage).spec.template.spec.containers[0];
+const exportOptions = stage.env.find((entry: any) => entry.name === 'PGOPTIONS').value as string;
 const restore = jobs.find(resource => resource.metadata.name === boundedJobs.restore).spec.template.spec.containers[0];
 const image = 'ghcr.io/cloudnative-pg/postgresql:17.5';
 const containers: string[] = [];
@@ -62,7 +63,9 @@ test('prepared resources cannot provision unbounded storage or start a productio
   assert.equal(stage.env.find((entry: any) => entry.name === 'POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
   assert.ok(stage.command[6].indexOf('source_space_wait') < stage.command[6].indexOf('capacity_backup'));
   assert.doesNotMatch(stage.command[6], /actual_backup_fs_uuid=/);
-  assert.match(stage.env.find((entry: any) => entry.name === 'PGOPTIONS').value, /temp_file_limit=0/);
+  assert.equal(exportOptions, '-c default_transaction_read_only=on -c lock_timeout=5s');
+  assert.ok(stage.command[6].includes("SELECT setting FROM pg_settings WHERE name = 'temp_file_limit'"));
+  assert.doesNotMatch(stage.command[6], /(?:SET\s+temp_file_limit|GRANT\s+SET|ALTER\s+(?:ROLE|SYSTEM))/i);
   const stagePod = jobs.find(job => job.metadata.name === boundedJobs.stage).spec.template.spec;
   assert.deepEqual(stagePod.volumes.filter((volume: any) => volume.persistentVolumeClaim).map((volume: any) => volume.persistentVolumeClaim.claimName), [boundedClaims.stage]);
   assert.deepEqual(stagePod.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, { medium: 'Memory', sizeLimit: '64Mi' });
@@ -276,9 +279,28 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
   const source = fixture();
   initializeSource(source);
   shell(source, 'date +%s > /tmp/source-space.lease');
-  run(source, stageCommand(), { PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s -c temp_file_limit=0' });
+  run(source, stageCommand(), { PGOPTIONS: exportOptions });
   const archive = shell(source, `cat ${archiveDirectory}/${archiveName}`);
   const expectedSha = createHash('sha256').update(archive).digest('hex');
+  await context.test('ordinary read-only export role needs no parameter SET privilege and produces a full restorable archive', () => {
+    const candidate = fixture();
+    initializeSource(candidate);
+    execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'source', '-v', 'ON_ERROR_STOP=1', '-c', 'CREATE ROLE export_reader LOGIN; GRANT pg_read_all_data TO export_reader;']);
+    const database = 'host=/scratch/socket user=export_reader dbname=source';
+    const query = "SELECT current_user, current_setting('transaction_read_only'), has_parameter_privilege(current_user, 'temp_file_limit', 'SET'), current_setting('temp_file_limit')";
+    const command = ['psql', '--dbname=' + database, '-X', '-Atq', '-v', 'ON_ERROR_STOP=1', '-c', query];
+    assert.equal(run(candidate, command, { PGOPTIONS: exportOptions }).toString().trim(), 'export_reader|on|f|-1');
+    assert.throws(() => run(candidate, command, { PGOPTIONS: exportOptions + ' -c temp_file_limit=0' }), error => /permission denied to set parameter "temp_file_limit"/.test(String((error as { stderr?: Buffer }).stderr)));
+    shell(candidate, `test ! -e ${archiveDirectory}; date +%s > /tmp/source-space.lease`);
+    const output = run(candidate, stageCommand(), { DATABASE_URL: database, PGOPTIONS: exportOptions, BACKUP_RATE_MIB_PER_SECOND: '4' });
+    assert.match(output.toString(), /source temp_file_limit_kib=-1 \(inherited; not modified\)/);
+    shell(candidate, `cd ${archiveDirectory}; test -f LOCAL_ARCHIVE_CREATED; sha256sum -c ${archiveName}.sha256; pg_restore --list ${archiveName} >/dev/null`);
+    execute(candidate, ['createdb', '-h', '/scratch/socket', '-U', 'postgres', 'restored']);
+    execute(candidate, ['pg_restore', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '--no-owner', '--no-privileges', '--exit-on-error', `${archiveDirectory}/${archiveName}`]);
+    assert.equal(execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-c', 'SELECT count(*), sum(octet_length(body)) FROM payload']).toString().trim(), '8192|8388608');
+    assert.equal(execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-c', "SELECT count(*) FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname='public' AND relation.relkind='r'"]).toString().trim(), '254');
+    assert.equal(run(candidate, command, { PGOPTIONS: exportOptions }).toString().trim(), 'export_reader|on|f|-1');
+  });
   await context.test('actual prepared writer retains default pacing and bounds both reviewed faster rates', () => {
     const candidate = fixture();
     const payload = Buffer.alloc(16 * mib, 0x42);
@@ -311,7 +333,7 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
       const candidate = fixture();
       initializeSource(candidate);
       shell(candidate, 'date +%s > /tmp/source-space.lease');
-      run(candidate, stageCommand(), { BACKUP_RATE_MIB_PER_SECOND: rate, PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s -c temp_file_limit=0' });
+      run(candidate, stageCommand(), { BACKUP_RATE_MIB_PER_SECOND: rate, PGOPTIONS: exportOptions });
       shell(candidate, `cd ${archiveDirectory}; test -f LOCAL_ARCHIVE_CREATED; sha256sum -c ${archiveName}.sha256; pg_restore --list ${archiveName} >/dev/null`);
       execute(candidate, ['createdb', '-h', '/scratch/socket', '-U', 'postgres', 'restored']);
       execute(candidate, ['pg_restore', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '--no-owner', '--no-privileges', '--exit-on-error', `${archiveDirectory}/${archiveName}`]);

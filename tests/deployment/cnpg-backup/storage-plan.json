@@ -20,7 +20,7 @@
     "maximumStatsAgeSeconds": 90,
     "leaseLifetimeSeconds": 45,
     "failureAction": "Revoke only the export tmpfs lease; existing stage cleanup terminates only its own pg_dump/rate writer. No frontend concurrency, primary, PVC, role or global-setting changes.",
-    "sourceServerTemp": "Export sessions request temp_file_limit=0; reject if current credentials cannot SET it. No grants/configuration changes are authorized.",
+    "sourceServerTemp": "Observe the existing server temp_file_limit without requesting privileged SET, granting parameter privileges, or changing role/global settings. Read-only and lock timeout options remain. The source-volume floor/loss lease bounds the export lifetime, not zero temporary-file creation or unrelated growth between samples.",
     "dumpLocation": "Dedicated 28Gi haixia/data1 volume mounted at /backup; never the source PG PVC",
     "clientTemporaryLocation": "64Mi memory emptyDir mounted at /tmp for FIFO/logs/lease; source PG PVC is not mounted",
     "limitation": "A read-only dump can delay vacuum; monitoring stops the dump but cannot halt unrelated production growth. Source space still needs independent observation after backup cancellation."
