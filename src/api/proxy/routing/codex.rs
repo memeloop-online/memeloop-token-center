@@ -281,7 +281,7 @@ async fn send_codex_attempt(
     } = context;
     let mut attempted = Vec::with_capacity(4);
     for connect_attempt in 1..=transport_policy.connect_attempts {
-        let selection = state
+        let mut selection = state
             .transport_proxy_groups
             .select_config(
                 route.route.account_id,
@@ -290,6 +290,31 @@ async fn send_codex_attempt(
                 &route.route.config,
             )
             .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        let has_unattempted = selection
+            .select_unattempted(&attempted)
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        tracing::info!(
+            %request_id,
+            upstream_account_id = %route.route.account_id,
+            transport_revision = route.route.transport_revision,
+            credential_generation = route.route.credential_generation,
+            candidate_rank,
+            outbound_attempt,
+            connect_attempt,
+            connect_attempt_limit = transport_policy.connect_attempts,
+            member_index = ?selection.member_index(),
+            member_count = selection.member_count(),
+            selection_epoch = selection.generation,
+            group_selection_version = ?selection.group_selection_version(),
+            request_local = selection.is_request_local(),
+            attempted_members = ?attempted,
+            has_unattempted,
+            stage = "codex_proxy_member_selection",
+            "Codex request-scoped proxy selection"
+        );
+        if !has_unattempted {
+            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
+        }
         if let Some(member) = selection.member() {
             if attempted.contains(&member) {
                 return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
@@ -333,9 +358,26 @@ async fn send_codex_attempt(
         if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
             && selection.member().is_some()
         {
-            selection
-                .advance_after_connect_failure(&attempted)
+            let cas_outcome = selection
+                .advance_after_connect_failure_outcome(&attempted)
                 .map_err(|_| ProxySendError::CandidateUnavailable)?;
+            tracing::info!(
+                %request_id,
+                upstream_account_id = %route.route.account_id,
+                transport_revision = route.route.transport_revision,
+                credential_generation = route.route.credential_generation,
+                candidate_rank,
+                outbound_attempt,
+                connect_attempt,
+                member_index = ?selection.member_index(),
+                member_count = selection.member_count(),
+                selection_epoch = selection.generation,
+                group_selection_version = ?selection.group_selection_version(),
+                attempted_members = ?attempted,
+                cas_outcome,
+                stage = "codex_proxy_member_advance",
+                "Codex connection failure proxy selection outcome"
+            );
         }
         match result {
             Err(ProxySendError::RetryableConnection(failure_stage))
