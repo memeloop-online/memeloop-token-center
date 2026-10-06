@@ -123,12 +123,14 @@ test('service credential creation validates the draft and issues only a read-onl
   const requestsHint = '读取请求记录、监控快照和用量分析；不允许写入。';
   assert.equal(await form.locator('[aria-label^="requests:read:"]').getAttribute('aria-label'),
     `requests:read: ${requestsHint}`);
-  const trace = await form.evaluateHandle(element => {
-    const triggers = [...element.querySelectorAll<HTMLElement>('.service-credential-scope-option > span[aria-label]')];
-    const tooltipFor = (trigger: HTMLElement) => document.getElementById(trigger.getAttribute('aria-describedby') ?? '');
-    const scopeFor = (target: EventTarget | null) => target instanceof Node
+  const trace = await page.evaluateHandle<{ read: (index: number) => unknown; stop: () => void }>(`(() => {
+    const forms = document.querySelectorAll('form.service-credential-create');
+    if (forms.length !== 1) throw new Error('Expected exactly one synthetic service credential form');
+    const triggers = [...forms[0].querySelectorAll('.service-credential-scope-option > span[aria-label]')];
+    const tooltipFor = (trigger) => document.getElementById(trigger.getAttribute('aria-describedby') ?? '');
+    const scopeFor = (target) => target instanceof Node
       ? triggers.findIndex(trigger => trigger.contains(target) || tooltipFor(trigger)?.contains(target)) : -1;
-    const box = (target: HTMLElement | null) => {
+    const box = (target) => {
       if (!target) return null;
       const { x, y, width, height } = target.getBoundingClientRect();
       const { display, visibility, opacity } = getComputedStyle(target);
@@ -138,15 +140,15 @@ test('service credential creation validates the draft and issues only a read-onl
       const tooltip = box(tooltipFor(trigger));
       return tooltip && tooltip.width > 0 && tooltip.height > 0 && tooltip.display !== 'none' && tooltip.visibility === 'visible' ? [index] : [];
     });
-    const events: Array<Record<string, unknown>> = [];
-    const record = (type: string, target: EventTarget | null, programmatic?: boolean) => {
+    const events = [];
+    const record = (type, target, programmatic) => {
       events.push({ time: Math.round(performance.now()), type, scope: scopeFor(target), active: scopeFor(document.activeElement), visible: visibleScopes(), programmatic });
       if (events.length > 48) events.shift();
     };
-    const onEvent = (event: Event) => {
+    const onEvent = (event) => {
       if (event instanceof KeyboardEvent && event.key !== 'Tab') return;
       if (event.type.startsWith('pointer') && scopeFor(event.target) < 0) return;
-      const programmatic = event.type === 'keyborg:focusin' ? (event as CustomEvent<{ isFocusedProgrammatically?: boolean }>).detail?.isFocusedProgrammatically : undefined;
+      const programmatic = event.type === 'keyborg:focusin' ? event.detail?.isFocusedProgrammatically : undefined;
       record(event.type, event.target, programmatic);
     };
     const eventTypes = ['focusin', 'focusout', 'keyborg:focusin', 'pointerenter', 'pointerleave', 'keydown', 'scroll', 'visibilitychange'];
@@ -158,13 +160,13 @@ test('service credential creation validates the draft and issues only a read-onl
     });
     observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'] });
     return {
-      read: (index: number) => ({ events, index, active: scopeFor(document.activeElement), exactFocus: triggers[index] === document.activeElement,
+      read: (index) => ({ events, index, active: scopeFor(document.activeElement), exactFocus: triggers[index] === document.activeElement,
         documentFocused: document.hasFocus(), visibility: document.visibilityState, visible: visibleScopes(),
         hovered: triggers.flatMap((trigger, position) => trigger.matches(':hover') ? [position] : []),
         trigger: box(triggers[index] ?? null), tooltip: triggers[index] ? box(tooltipFor(triggers[index])) : null }),
       stop: () => { observer.disconnect(); for (const type of eventTypes) document.removeEventListener(type, onEvent, true); },
     };
-  });
+  })()`);
   const assertScopeHintWithKeyboard = async (trigger: Locator, hint: string, nextHint?: string) => {
     const tooltip = page.getByRole('tooltip', { name: hint, exact: true });
     assert.equal(await trigger.evaluate(element => element === document.activeElement), true, 'Tab focuses the exact scope help trigger');
