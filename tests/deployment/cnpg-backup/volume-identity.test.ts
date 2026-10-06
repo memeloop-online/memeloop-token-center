@@ -70,6 +70,59 @@ function expansionInventory(): any {
   };
 }
 
+test('stage40 requires actual matching capacity and preserves the original stage identity', () => {
+  const candidate = pod();
+  candidate.spec.containers[0]!.env.push(
+    { name: 'REVIEWED_STAGE_CAPACITY_GIB', value: '40' },
+    { name: 'BACKUP_MAX_BYTES', value: String(40 * 1024 ** 3) },
+    { name: 'BACKUP_MIN_BYTES', value: String(38 * 1024 ** 3) },
+    { name: 'HARD_CAPACITY_REVIEW_APPROVED', value: 'true' },
+  );
+  const identity = stageIdentityForPod(candidate, 'export');
+  assert.deepEqual(identity, { ...stageIdentity, capacityGiB: 40 });
+  const resources = inventory();
+  resources.persistent.spec.capacity.storage = '32Gi';
+  resources.volume.spec.size = String(32 * 1024 ** 3);
+  assert.throws(() => verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity));
+  resources.persistent.spec.capacity.storage = '40Gi';
+  resources.volume.spec.size = String(40 * 1024 ** 3);
+  verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity);
+  candidate.spec.containers[0]!.env.find(entry => entry.name === 'BACKUP_MIN_BYTES')!.value = String(30 * 1024 ** 3);
+  assert.throws(() => stageIdentityForPod(candidate, 'export'));
+});
+
+test('32-to40 planning charges the complete new budget and cannot reuse 28Gi or active inventories', () => {
+  const snapshot = expansionInventory();
+  const now = Date.parse(snapshot.observedAt);
+  assert.throws(() => planStageExpansion(snapshot, now, 40));
+  snapshot.claim.spec.resources.requests.storage = '32Gi';
+  snapshot.claim.status.capacity.storage = '32Gi';
+  snapshot.persistent.spec.capacity.storage = '32Gi';
+  snapshot.volume.spec.size = String(32 * 1024 ** 3);
+  snapshot.volume.spec.snapshotMaxSize = String(64 * 1024 ** 3);
+  const plan: any = planStageExpansion(snapshot, now, 40);
+  assert.equal(plan.oldGiB, 32);
+  assert.equal(plan.targetGiB, 40);
+  assert.equal(plan.physicalBudgetBytes, 162 * 1024 ** 3);
+  assert.equal(plan.backingAfterWorstCaseBytes, 538 * 1024 ** 3);
+  assert.equal(plan.executionAuthorized, false);
+  assert.equal(plan.partialDeletionAuthorized, false);
+  assert.equal(plan.sourceProtectionChanged, false);
+  assert.equal(plan.restoreAllocationAuthorized, false);
+  assert.deepEqual(plan.patches.map((entry: any) => entry.resource), ['storageclass', 'pvc']);
+  assert.deepEqual(plan.patches[1].patch.slice(-2), [
+    { op: 'test', path: '/spec/resources/requests/storage', value: '32Gi' },
+    { op: 'replace', path: '/spec/resources/requests/storage', value: '40Gi' },
+  ]);
+  assert.throws(() => planStageExpansion(snapshot, now));
+  assert.throws(() => planStageExpansion(snapshot, now, 64 as 40));
+  const insufficient = structuredClone(snapshot);
+  insufficient.filesystem.availableBytes = 550 * 1024 ** 3;
+  assert.throws(() => planStageExpansion(insufficient, now, 40));
+  snapshot.consumers = [{ status: { phase: 'Running', containerStatuses: [{ state: { running: {} } }] } }];
+  assert.throws(() => planStageExpansion(snapshot, now, 40));
+});
+
 test('stage expansion plans only two identity/version guarded changes, never apply or shrink', () => {
   const snapshot = expansionInventory();
   const plan: any = planStageExpansion(snapshot, Date.parse(snapshot.observedAt));

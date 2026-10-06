@@ -7,7 +7,9 @@ const gib = 1024 ** 3;
 export const stageExpansionClass = 'mtc-cnpg-stage-haixia-data1-20261005';
 export const expandedStageGiB = 32;
 
-export function planStageExpansion(snapshot: any, now = Date.now()): object {
+export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 32 | 40 = expandedStageGiB): object {
+  assert.ok([32, 40].includes(targetGiB), 'Unknown reviewed expansion target');
+  const oldGiB = targetGiB === 32 ? 28 : 32;
   const age = now - Date.parse(snapshot.observedAt);
   assert.ok(Number.isFinite(age) && age >= 0 && age <= 90_000, 'Expansion inventory must be fresh');
   const { claim, persistent, volume, storageClass, node, replicas, consumers, filesystem, settings } = snapshot;
@@ -20,10 +22,10 @@ export function planStageExpansion(snapshot: any, now = Date.now()): object {
   assert.equal(claim.status.phase, 'Bound');
   assert.equal(claim.spec.storageClassName, stageExpansionClass);
   assert.equal(claim.spec.volumeName, stageIdentity.name);
-  assert.equal(claim.spec.resources.requests.storage, '28Gi');
-  assert.equal(claim.status.capacity.storage, '28Gi');
+  assert.equal(claim.spec.resources.requests.storage, `${oldGiB}Gi`);
+  assert.equal(claim.status.capacity.storage, `${oldGiB}Gi`);
   assert.ok(!claim.status.conditions?.some((condition: any) => condition.status === 'True'));
-  assert.equal(persistent.spec.capacity.storage, '28Gi');
+  assert.equal(persistent.spec.capacity.storage, `${oldGiB}Gi`);
   assert.equal(persistent.status.phase, 'Bound');
   assert.equal(persistent.spec.volumeMode, 'Filesystem');
   assert.equal(persistent.spec.claimRef.uid, stageIdentity.claimUID);
@@ -33,12 +35,12 @@ export function planStageExpansion(snapshot: any, now = Date.now()): object {
   assert.equal(persistent.spec.csi.driver, 'driver.longhorn.io');
   assert.equal(persistent.spec.csi.volumeHandle, stageIdentity.name);
   assert.equal(persistent.spec.csi.fsType, 'xfs');
-  assert.equal(volume.spec.size, String(28 * gib));
+  assert.equal(volume.spec.size, String(oldGiB * gib));
   assert.equal(volume.metadata.namespace, 'longhorn-system');
   assert.equal(volume.spec.numberOfReplicas, 1);
   assert.equal(volume.spec.dataLocality, 'strict-local');
   assert.equal(volume.spec.snapshotMaxCount, 2);
-  assert.equal(volume.spec.snapshotMaxSize, String(56 * gib));
+  assert.equal(volume.spec.snapshotMaxSize, String(2 * oldGiB * gib));
   assert.equal(volume.status.state, 'detached');
   assert.equal(replicas.length, 1);
   assert.ok(!replicas[0].metadata.deletionTimestamp);
@@ -74,7 +76,7 @@ export function planStageExpansion(snapshot: any, now = Date.now()): object {
   assert.equal(filesystem.diskUUID, stageIdentity.diskUUID);
   for (const value of [filesystem.availableBytes, filesystem.freeInodes, status.storageMaximum, status.storageScheduled, status.storageAvailable, disk.storageReserved ?? 0]) assert.ok(Number.isSafeInteger(value) && value >= 0);
   assert.ok(filesystem.freeInodes >= 65_536);
-  const budget = (4 * expandedStageGiB + 2) * gib;
+  const budget = (4 * targetGiB + 2) * gib;
   const floor = Math.max(status.storageMaximum / 4, disk.storageReserved ?? 0, 32 * gib);
   const remaining = Math.min(filesystem.availableBytes, status.storageAvailable) - status.storageScheduled - budget;
   assert.ok(remaining >= floor);
@@ -89,21 +91,21 @@ export function planStageExpansion(snapshot: any, now = Date.now()): object {
     ];
   };
   return {
-    schema: 1, executionAuthorized: false, oldGiB: 28, targetGiB: expandedStageGiB,
+    schema: 1, executionAuthorized: false, oldGiB, targetGiB,
     claimUID: stageIdentity.claimUID, persistentUID: stageIdentity.persistentUID, longhornUID: stageIdentity.longhornUID,
     filesystemUUID: stageIdentity.filesystemUUID, device: stageIdentity.device, node: stageIdentity.node, diskUUID: stageIdentity.diskUUID,
     physicalBudgetBytes: budget, backingReserveFloorBytes: floor, backingAfterWorstCaseBytes: remaining,
     patches: [
       { resource: 'storageclass', name: stageExpansionClass, patch: patch(storageClass, '/allowVolumeExpansion', false, true) },
-      { resource: 'pvc', namespace: stageIdentity.namespace, name: stageIdentity.name, patch: patch(claim, '/spec/resources/requests/storage', '28Gi', '32Gi') },
+      { resource: 'pvc', namespace: stageIdentity.namespace, name: stageIdentity.name, patch: patch(claim, '/spec/resources/requests/storage', `${oldGiB}Gi`, `${targetGiB}Gi`) },
     ],
-    closeout: 'Read fresh identities and resourceVersions, require CSI-controlled PV/Longhorn/filesystem growth to32Gi with same UUID and all partials retained; restore dedicated StorageClass allowVolumeExpansion=false using fresh UID/resourceVersion preconditions. No manual PV size patch, format, shrink, primary mount, source SQL or export.',
+    closeout: `Read fresh identities and resourceVersions, require CSI-controlled PV/Longhorn/filesystem growth to${targetGiB}Gi with same UUID and all partials retained; restore dedicated StorageClass allowVolumeExpansion=false using fresh UID/resourceVersion preconditions. No manual PV size patch, format, shrink, primary mount, source SQL or export.`,
     rollback: 'Before PVC request changes, the sole reversible capability change is disabling expansion with fresh identity/version. After PVC request changes do not shrink or restore old capacity assertions; preserve data, stop and investigate reconciliation. No automatic retry.',
     sourceProtectionChanged: false, partialDeletionAuthorized: false, restoreAllocationAuthorized: false,
   };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  assert.equal(process.argv.length, 3, 'stage-expansion.ts REVIEWED_FRESH_INVENTORY_JSON; plan only, never applies');
-  console.log(JSON.stringify(planStageExpansion(JSON.parse(readFileSync(process.argv[2]!, 'utf8'))), null, 2));
+  assert.ok([3, 4].includes(process.argv.length), 'stage-expansion.ts REVIEWED_FRESH_INVENTORY_JSON [32|40]; plan only, never applies');
+  console.log(JSON.stringify(planStageExpansion(JSON.parse(readFileSync(process.argv[2]!, 'utf8')), Date.now(), Number(process.argv[3] ?? 32) as 32 | 40), null, 2));
 }
