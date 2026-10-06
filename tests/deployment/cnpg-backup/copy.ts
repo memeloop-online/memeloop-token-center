@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { copyIdentities, copySides, validateCopyPod } from './copy-guard.ts';
@@ -61,17 +61,20 @@ async function main(): Promise<void> {
   }
   const directory = process.env.BACKUP_ARCHIVE_DIRECTORY ?? archiveDirectory;
   assert.match(directory, /^\/backup\/mtc-pg-logical-[0-9]{8}(?:-[a-z0-9]+)*$/);
-  const guard = spawn(process.execPath, [fileURLToPath(new URL('./copy-guard.ts', import.meta.url)), ...copySides.flatMap(side => [pods[side], identities[side].metadata.uid])], { stdio: ['ignore', 'pipe', 'pipe'] });
-  guard.stderr.pipe(process.stderr);
+  const guards: ChildProcess[] = [];
   try {
-    await new Promise<void>((resolve, reject) => {
+    await Promise.all(copySides.map(side => new Promise<void>((resolve, reject) => {
+      const guard = spawn(process.execPath, [fileURLToPath(new URL('./copy-guard.ts', import.meta.url)), side, pods[side], identities[side].metadata.uid], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      guards.push(guard);
+      guard.stderr!.pipe(process.stderr);
       const timer = setTimeout(() => reject(new Error('Copy lease startup timeout')), 110_000);
       let output = '';
-      guard.stdout.on('data', chunk => { output += chunk.toString(); if (output === 'COPY_LEASES_READY\n') { clearTimeout(timer); resolve(); } else if (output.length > 128) { clearTimeout(timer); reject(new Error('Unexpected copy guard output')); } });
+      guard.stdout!.on('data', chunk => { output += chunk.toString(); if (output === 'COPY_LEASES_READY\n') { clearTimeout(timer); resolve(); } else if (output.length > 128) { clearTimeout(timer); reject(new Error('Unexpected copy guard output')); } });
       guard.once('error', error => { clearTimeout(timer); reject(error); });
       guard.once('exit', () => { clearTimeout(timer); reject(new Error('Copy lease guard stopped')); });
-    });
+    })));
     const remote: Remote = (side, command, input) => {
+      assert.ok(guards.every(guard => guard.exitCode === null && guard.signalCode === null && guard.connected), 'Copy lease owner stopped');
       const pod = getPod(pods[side]);
       validateCopyPod(pod, side, identities[side].metadata.uid);
       assert.deepEqual(pod.spec, identities[side].spec);
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
     await copyArchive(remote, expectedSha, undefined, true, directory);
     console.log('Offhost SHA and TOC verified; full isolated restore remains required.');
   } finally {
-    guard.kill('SIGTERM');
+    for (const guard of guards) guard.kill('SIGTERM');
   }
 }
 

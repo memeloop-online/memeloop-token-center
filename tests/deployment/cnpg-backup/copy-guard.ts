@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { archiveIdentity, attestBackupVolume, stageIdentity, type InventoryReader } from './volume-identity.ts';
@@ -80,22 +81,30 @@ export function renewCopyLease(read: InventoryReader, side: CopySide, podName: s
     `umask 077; test "$POD_UID" = '${uid}'; printf '%s\\n' '${lease}' > /tmp/backup-volume.lease.partial; mv /tmp/backup-volume.lease.partial /tmp/backup-volume.lease`]);
 }
 
+export async function watchCopyLease(renew: () => void, ready: () => void, clock: () => number = () => performance.now(), pause: (milliseconds: number) => Promise<void> = delay): Promise<never> {
+  const started = clock();
+  let announced = false;
+  while (clock() - started < 43_200_000) {
+    const cycleStarted = clock();
+    renew();
+    if (!announced) { ready(); announced = true; }
+    await pause(Math.max(0, 15_000 - (clock() - cycleStarted)));
+  }
+  throw new Error('Copy guard deadline');
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   assert.equal(process.env.PARENT_REVIEW_APPROVED, 'true');
-  assert.equal(process.argv.length, 6, 'copy-guard.ts SOURCE_POD SOURCE_UID DESTINATION_POD DESTINATION_UID');
-  const args = process.argv.slice(2);
+  assert.equal(process.argv.length, 5, 'copy-guard.ts SIDE POD UID');
+  const [side, podName, uid] = process.argv.slice(2) as [CopySide, string, string];
+  assert.ok(copySides.includes(side));
+  assert.ok(process.connected, 'Copy guard requires its owning controller IPC connection');
+  process.once('disconnect', () => { process.exitCode = 1; process.exit(); });
   const read: InventoryReader = args => execFileSync('kubectl', ['--request-timeout=8s', ...args], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
-  const started = Date.now();
   try {
-    let ready = false;
-    while (Date.now() - started < 43_200_000) {
-      for (const [index, side] of copySides.entries()) renewCopyLease(read, side, args[index * 2]!, args[index * 2 + 1]!);
-      if (!ready) { console.log('COPY_LEASES_READY'); ready = true; }
-      await delay(5000);
-    }
-    throw new Error('Copy guard deadline');
+    await watchCopyLease(() => renewCopyLease(read, side, podName, uid), () => { console.log('COPY_LEASES_READY'); });
   } catch {
-    console.error(JSON.stringify({ event: 'copy-guard-stopped', at: new Date().toISOString(), leaseSeconds: 45 }));
+    console.error(JSON.stringify({ event: 'copy-guard-stopped', side, at: new Date().toISOString(), leaseSeconds: 45 }));
     process.exitCode = 1;
   }
 }

@@ -26,7 +26,7 @@ export function prepareCopyArtifact(output: string, provenance: { testedCommit: 
     schema: 1, ...provenance, executionAuthorized: false, copyRootlessIdentityReady: true, restoreRootlessIdentityReady: false,
     image: copyImage, copyManifest: 'cnpg-copy-preparation.yaml', runtime: 'Existing Node 24 and kubectl; no dependencies or product rollout required',
     command: 'PARENT_REVIEW_APPROVED=true BACKUP_ARCHIVE_DIRECTORY=<reviewed unique directory> node copy.ts SOURCE_COPY_POD DESTINATION_COPY_POD SOURCE_SHA256',
-    protection: 'Independent CSI watcher child; both copy containers independently exit when the 45s volume lease expires. No source database connection, new storage, or restore.',
+    protection: 'Independent CSI watcher per side; elapsed-inclusive renewal cadence and owner IPC disconnect stop renewal. Both copy containers independently exit when the 45s volume lease expires. No source database connection, new storage, or restore.',
     files: Object.fromEntries(Object.entries(files).map(([name, contents]) => [name, digest(contents)])),
   }, null, 2) + '\n';
   files['SHA256SUMS'] = Object.entries(files).map(([name, contents]) => `${digest(contents)}  ${name}\n`).join('');
