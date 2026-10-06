@@ -22,11 +22,17 @@ export function prepareArtifact(output: string, provenance: { testedCommit: stri
   const files: Record<string, string> = {
     'cnpg-hard-capacity-preparation.yaml': render(resources),
     'cnpg-export-preparation.yaml': render(selected),
+    'cnpg-expanded-stage-preparation.yaml': render(preparedResources(undefined, 32).filter(resource =>
+      resource.kind === 'Job' && [boundedJobs.stage, boundedJobs.source].includes(resource.metadata.name) ||
+      resource.kind === 'ConfigMap' && resource.metadata.name === policyName ||
+      resource.kind === 'NetworkPolicy' && ['mtc-pg-logical-backup-isolation-20261004', 'mtc-pg-logical-export-egress-20261004'].includes(resource.metadata.name))),
   };
-  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts']) files[name] = readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
+  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts', 'copy.ts', 'copy-guard.ts', 'stage-expansion.ts']) files[name] = readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
   const digest = (value: string) => createHash('sha256').update(value).digest('hex');
   files['provenance.json'] = JSON.stringify({
     schema: 1, ...provenance, executionAuthorized: false, exportManifest: 'cnpg-export-preparation.yaml',
+    expandedStageManifest: 'cnpg-expanded-stage-preparation.yaml', expansionPlanner: 'stage-expansion.ts', expansionAuthorized: false,
+    expansionBoundary: 'Explicit32Gi stage profile only after separately reviewed physical budget, UID/version-guarded PVC request and actual CSI/filesystem growth. Initial28Gi allocation manifests and old dry-run evidence remain unchanged. No partial deletion, source PG resize, archive cap increase, source budget reset or export approval.',
     runtime: 'Existing Node 24 and kubectl; no npm install, build, product rollout or cluster credentials in artifact',
     watchdog: 'source-space.ts --watch; separate owner approval required before issuing any export lease',
     sourceGuardAndCsiIdentityRequired: true, copyAndRestoreRootlessIdentityReady: false,

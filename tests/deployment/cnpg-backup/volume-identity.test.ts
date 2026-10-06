@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { attestStageVolume, stageIdentity, verifyStageBinding } from './volume-identity.ts';
+import { attestStageVolume, stageIdentity, stageIdentityForPod, verifyStageBinding } from './volume-identity.ts';
+import { planStageExpansion, stageExpansionClass } from './stage-expansion.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const expected = stageIdentity;
@@ -24,6 +25,94 @@ const pod = () => ({
     { name: 'BACKUP_UUID_ATTESTATION', value: 'external-csi-lease' },
     { name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } },
   ] }] },
+});
+
+test('explicit stage32 profile still pins the same filesystem and requires actual expanded PV and device capacity', () => {
+  const candidate = pod();
+  candidate.spec.containers[0]!.env.push(
+    { name: 'REVIEWED_STAGE_CAPACITY_GIB', value: '32' },
+    { name: 'BACKUP_MAX_BYTES', value: String(32 * 1024 ** 3) },
+    { name: 'BACKUP_MIN_BYTES', value: String(30 * 1024 ** 3) },
+    { name: 'HARD_CAPACITY_REVIEW_APPROVED', value: 'true' },
+  );
+  const identity = stageIdentityForPod(candidate, 'export');
+  assert.deepEqual(identity, { ...stageIdentity, capacityGiB: 32 });
+  const resources = inventory();
+  assert.throws(() => verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity));
+  resources.persistent.spec.capacity.storage = '32Gi';
+  resources.volume.spec.size = String(32 * 1024 ** 3);
+  verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity);
+  assert.throws(() => verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas));
+  for (const [name, value] of [['REVIEWED_STAGE_CAPACITY_GIB', '64'], ['BACKUP_MAX_BYTES', String(64 * 1024 ** 3)], ['BACKUP_MIN_BYTES', '0'], ['HARD_CAPACITY_REVIEW_APPROVED', 'false']] as const) {
+    const altered = structuredClone(candidate);
+    altered.spec.containers[0]!.env.find(entry => entry.name === name)!.value = value;
+    assert.throws(() => stageIdentityForPod(altered, 'export'));
+  }
+});
+
+function expansionInventory(): any {
+  const existing: any = inventory();
+  existing.claim.metadata.resourceVersion = '100';
+  existing.claim.spec.storageClassName = stageExpansionClass;
+  existing.claim.spec.resources = { requests: { storage: '28Gi' } };
+  existing.claim.status.capacity = { storage: '28Gi' };
+  existing.volume.status.state = 'detached';
+  existing.replicas[0].status.currentState = 'stopped';
+  existing.volume.spec.snapshotMaxCount = 2;
+  existing.volume.spec.snapshotMaxSize = String(56 * 1024 ** 3);
+  const disk = { storageMaximum: 1000 * 1024 ** 3, storageScheduled: 150 * 1024 ** 3, storageAvailable: 850 * 1024 ** 3,
+    diskUUID: stageIdentity.diskUUID, conditions: [{ type: 'Ready', status: 'True' }, { type: 'Schedulable', status: 'True' }] };
+  return { ...existing, observedAt: '2026-10-06T21:00:00Z', consumers: [], classClaimUIDs: [stageIdentity.claimUID],
+    storageClass: { metadata: { name: stageExpansionClass, uid: '55555555-5555-5555-5555-555555555555', resourceVersion: '99' }, provisioner: 'driver.longhorn.io', reclaimPolicy: 'Retain', allowVolumeExpansion: false },
+    node: { metadata: { name: stageIdentity.node }, spec: { allowScheduling: true, disks: { data1: { allowScheduling: true, path: stageIdentity.diskPath, storageReserved: 0 } } }, status: { diskStatus: { data1: disk } } },
+    filesystem: { diskUUID: stageIdentity.diskUUID, availableBytes: 850 * 1024 ** 3, freeInodes: 100_000 },
+    settings: { overProvisioning: '100', minimalAvailable: '25' },
+  };
+}
+
+test('stage expansion plans only two identity/version guarded changes, never apply or shrink', () => {
+  const snapshot = expansionInventory();
+  const plan: any = planStageExpansion(snapshot, Date.parse(snapshot.observedAt));
+  assert.equal(plan.executionAuthorized, false);
+  assert.equal(plan.targetGiB, 32);
+  assert.equal(plan.physicalBudgetBytes, 130 * 1024 ** 3);
+  assert.equal(plan.backingAfterWorstCaseBytes, 570 * 1024 ** 3);
+  assert.equal(plan.sourceProtectionChanged, false);
+  assert.equal(plan.partialDeletionAuthorized, false);
+  assert.equal(plan.restoreAllocationAuthorized, false);
+  assert.deepEqual(plan.patches.map((entry: any) => entry.resource), ['storageclass', 'pvc']);
+  assert.deepEqual(plan.patches[0].patch.slice(0, 2), [{ op: 'test', path: '/metadata/uid', value: snapshot.storageClass.metadata.uid }, { op: 'test', path: '/metadata/resourceVersion', value: '99' }]);
+  assert.deepEqual(plan.patches[1].patch, [
+    { op: 'test', path: '/metadata/uid', value: stageIdentity.claimUID }, { op: 'test', path: '/metadata/resourceVersion', value: '100' },
+    { op: 'test', path: '/spec/resources/requests/storage', value: '28Gi' }, { op: 'replace', path: '/spec/resources/requests/storage', value: '32Gi' },
+  ]);
+  assert.match(plan.closeout, /allowVolumeExpansion=false/);
+  assert.match(plan.rollback, /do not shrink/);
+});
+
+test('source substitution, active consumers, expansion already pending, stale inventory and insufficient backing space reject planning', () => {
+  for (const mutate of [
+    (value: any) => { value.claim.metadata.uid = 'source-primary'; },
+    (value: any) => { value.persistent.spec.csi.volumeHandle = 'source-primary'; },
+    (value: any) => { value.volume.status.state = 'attached'; },
+    (value: any) => { value.claim.status.capacity.storage = '32Gi'; },
+    (value: any) => { value.claim.status.conditions = [{ type: 'Resizing', status: 'True' }]; },
+    (value: any) => { value.storageClass.allowVolumeExpansion = true; },
+    (value: any) => { value.classClaimUIDs.push('another-claim'); },
+    (value: any) => { value.consumers.push({ status: { phase: 'Running' } }); },
+    (value: any) => { value.replicas[0].spec.diskID = 'source-disk'; },
+    (value: any) => { value.replicas[0].status.currentState = 'running'; },
+    (value: any) => { value.persistent.spec.claimRef.namespace = 'another-namespace'; },
+    (value: any) => { value.filesystem.freeInodes = 100; },
+    (value: any) => { value.filesystem.availableBytes = 500 * 1024 ** 3; },
+    (value: any) => { value.settings.overProvisioning = '200'; },
+    (value: any) => { value.observedAt = '2026-10-06T20:58:29Z'; },
+    (value: any) => { value.claim.metadata.resourceVersion = ''; },
+  ]) {
+    const snapshot = expansionInventory();
+    mutate(snapshot);
+    assert.throws(() => planStageExpansion(snapshot, Date.parse('2026-10-06T21:00:00Z')));
+  }
 });
 
 test('CSI attestation pins NEW PVC, PV, Longhorn UID and unique reviewed replica placement', () => {

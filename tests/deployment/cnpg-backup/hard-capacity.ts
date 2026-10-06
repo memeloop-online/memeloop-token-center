@@ -32,7 +32,8 @@ function replaceOnce(script: string, before: string, after: string): string {
   return script.replace(before, after);
 }
 
-export function preparedResources(stageSupervisor: (script: string) => string = superviseExport): any[] {
+export function preparedResources(stageSupervisor: (script: string) => string = superviseExport, stageCapacityGiB: 28 | 32 = 28): any[] {
+  assert.ok([28, 32].includes(stageCapacityGiB));
   const originals = ['mtc-pg-local-stage-20261004.yaml', 'mtc-pg-offhost-copy-20261004.yaml', 'mtc-pg-restore-verification-20261004.yaml']
     .flatMap(name => parseAllDocuments(readFileSync(join(directory, name), 'utf8')).map(document => {
       assert.deepEqual(document.errors, []);
@@ -90,6 +91,14 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
       SCRATCH_MIN_BYTES: String(60 * gib),
       SCRATCH_RESERVE_BYTES: String(gib),
     });
+    if (stageCapacityGiB === 32 && [boundedJobs.stage, boundedJobs.source].includes(resource.metadata.name)) {
+      Object.assign(environment, {
+        REVIEWED_STAGE_CAPACITY_GIB: '32',
+        BACKUP_MAX_BYTES: String(32 * gib),
+        BACKUP_MIN_BYTES: String(30 * gib),
+      });
+      resource.metadata.annotations['recovery.mtc/stage-capacity-profile'] = 'stage32-after-separate-reviewed-expansion-no-source-pg-resize-or-partial-delete';
+    }
     container.env.push(...Object.entries(environment).map(([name, value]) => ({ name, value })));
     if (resource.metadata.name === boundedJobs.stage) {
       container.env.push({ name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } });
@@ -146,7 +155,7 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
   }
   resources.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: policyName, namespace: 'memeloop-token-center' }, data: { 'capacity.sh': capacityPolicy } });
   validateStorageResources();
-  resources.push(...structuredClone(storageResources));
+  if (stageCapacityGiB === 28) resources.push(...structuredClone(storageResources));
   return resources;
 }
 

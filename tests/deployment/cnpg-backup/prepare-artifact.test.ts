@@ -15,7 +15,7 @@ test('independent export artifact binds tested revision, includes dependency-fre
   const output = join(parent, 'bundle');
   const revision = { testedCommit: '1'.repeat(40), sourceHead: '2'.repeat(40), runId: '37358304060' };
   prepareArtifact(output, revision);
-  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'provenance.json', 'source-filesystem.ts', 'source-space.ts', 'volume-identity.ts']);
+  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-expanded-stage-preparation.yaml', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'copy-guard.ts', 'copy.ts', 'provenance.json', 'source-filesystem.ts', 'source-space.ts', 'stage-expansion.ts', 'volume-identity.ts']);
   const manifest = parseAllDocuments(readFileSync(join(output, 'cnpg-export-preparation.yaml'), 'utf8')).map(document => {
     assert.deepEqual(document.errors, []);
     return document.toJS({ maxAliasCount: 0 });
@@ -33,13 +33,33 @@ test('independent export artifact binds tested revision, includes dependency-fre
   const provenance = JSON.parse(readFileSync(join(output, 'provenance.json'), 'utf8'));
   for (const [name, value] of Object.entries(revision)) assert.equal(provenance[name], value);
   assert.equal(provenance.executionAuthorized, false);
+  assert.equal(provenance.expansionAuthorized, false);
+  const expanded = parseAllDocuments(readFileSync(join(output, provenance.expandedStageManifest), 'utf8')).map(document => {
+    assert.deepEqual(document.errors, []);
+    return document.toJS({ maxAliasCount: 0 });
+  });
+  assert.deepEqual(expanded.map(resource => resource.kind).sort(), ['ConfigMap', 'Job', 'Job', 'NetworkPolicy', 'NetworkPolicy']);
+  for (const resource of expanded.filter(entry => entry.kind === 'Job')) {
+    assert.equal(resource.spec.suspend, true);
+    const environment = resource.spec.template.spec.containers[0].env;
+    const value = (name: string) => environment.find((entry: any) => entry.name === name)?.value;
+    assert.equal(value('REVIEWED_STAGE_CAPACITY_GIB'), '32');
+    assert.equal(value('BACKUP_MAX_BYTES'), String(32 * 1024 ** 3));
+    assert.equal(value('BACKUP_MIN_BYTES'), String(30 * 1024 ** 3));
+    assert.equal(value('HARD_CAPACITY_REVIEW_APPROVED'), 'false');
+    assert.equal(value('PARENT_REVIEW_APPROVED'), 'false');
+  }
+  const expandedExport = expanded.find(resource => resource.kind === 'Job' && resource.metadata.name.includes('bounded-stage'));
+  assert.equal(expandedExport.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'BACKUP_RATE_MIB_PER_SECOND').value, '1');
+  assert.ok(expandedExport.spec.template.spec.containers[0].command[6].includes('--fsize=25769803776:25769803776'));
+  assert.ok(expandedExport.spec.template.spec.containers[0].command[6].includes('26071793664'));
   for (const line of readFileSync(join(output, 'SHA256SUMS'), 'utf8').trim().split('\n')) {
     const [expected, name] = line.split('  ');
     assert.equal(createHash('sha256').update(readFileSync(join(output, name!))).digest('hex'), expected);
   }
-  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts']) {
+  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts', 'copy.ts', 'copy-guard.ts', 'stage-expansion.ts']) {
     const contents = readFileSync(join(output, name), 'utf8');
-    for (const imported of contents.matchAll(/from '([^']+)'/g)) assert.ok(imported[1]!.startsWith('node:') || ['./volume-identity.ts', './source-filesystem.ts'].includes(imported[1]!));
+    for (const imported of contents.matchAll(/from '([^']+)'/g)) assert.ok(imported[1]!.startsWith('node:') || ['./volume-identity.ts', './source-filesystem.ts', './copy-guard.ts'].includes(imported[1]!));
   }
   assert.throws(() => prepareArtifact(output, revision), 'Refuse to overwrite a reviewed bundle');
 });

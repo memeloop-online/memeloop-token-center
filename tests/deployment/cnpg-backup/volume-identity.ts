@@ -14,6 +14,19 @@ export const stageIdentity = {
 
 export type InventoryReader = (args: string[]) => string;
 
+export function stageIdentityForPod(pod: any, containerName: string): typeof stageIdentity {
+  const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
+  const value = (name: string) => container.env.find((entry: any) => entry.name === name)?.value;
+  const capacity = value('REVIEWED_STAGE_CAPACITY_GIB') ?? '28';
+  assert.ok(['28', '32'].includes(capacity), 'Unknown reviewed stage capacity profile');
+  if (capacity === '32') {
+    assert.equal(value('BACKUP_MAX_BYTES'), String(32 * 1024 ** 3));
+    assert.equal(value('BACKUP_MIN_BYTES'), String(30 * 1024 ** 3));
+    assert.equal(value('HARD_CAPACITY_REVIEW_APPROVED'), 'true');
+  }
+  return { ...stageIdentity, capacityGiB: Number(capacity) };
+}
+
 export const archiveIdentity: typeof stageIdentity = {
   ...stageIdentity, name: 'mtc-pg-bounded-archive-20261005', node: 'versetensor-hv',
   claimUID: 'dd506d1e-0dbc-43c8-8d5f-b8138b769c76',
@@ -62,7 +75,7 @@ export function verifyStageBinding(claim: any, persistent: any, volume: any, rep
 }
 
 export function attestStageVolume(read: InventoryReader, pod: any, clock: () => number = Date.now): string {
-  return attestBackupVolume(read, pod, stageIdentity, 'export', clock);
+  return attestBackupVolume(read, pod, stageIdentityForPod(pod, 'export'), 'export', clock);
 }
 
 export function attestBackupVolume(read: InventoryReader, pod: any, expected: typeof stageIdentity, containerName: string, clock: () => number = Date.now, mount: 'backup' | 'scratch' = 'backup'): string {
