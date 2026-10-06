@@ -30,6 +30,39 @@ export function authorizationCompleteError(reason: unknown) {
   return 'completeUncertain';
 }
 
+export const claudeCompletionLimits = { attempts: 20, durationMillis: 120_000, requestMillis: 30_000 } as const;
+
+export type ClaudeCompletion = { status: 'pending'; retry_after_seconds: number } | UpstreamAccount;
+
+export function parseClaudeCompletion(value: unknown, tenant: string, accountId?: string): ClaudeCompletion {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || 'error' in value) throw new Error('Invalid completion response');
+  const result = value as Record<string, unknown>;
+  if (result.status === 'pending' && !('id' in result)) {
+    return { status: 'pending', retry_after_seconds: typeof result.retry_after_seconds === 'number'
+      && Number.isFinite(result.retry_after_seconds) && result.retry_after_seconds > 0 ? result.retry_after_seconds : 5 };
+  }
+  if (['id', 'tenant_id', 'name', 'status'].some(key => typeof result[key] !== 'string' || !(result[key] as string).trim())
+    || result.status === 'pending' || result.driver !== 'anthropic-claude' || result.auth_kind !== 'oauth' || result.connection_method !== 'oauth'
+    || result.tenant_external_id !== tenant || (accountId !== undefined && result.id !== accountId)
+    || !Number.isSafeInteger(result.credential_generation) || (result.credential_generation as number) < 1
+    || !Number.isSafeInteger(result.route_count) || (result.route_count as number) < 0
+    || ['created_at', 'updated_at'].some(key => typeof result[key] !== 'number' || !Number.isFinite(result[key]) || (result[key] as number) < 0)
+    || (result.credential_expires_at !== null && (typeof result.credential_expires_at !== 'number' || !Number.isFinite(result.credential_expires_at)))
+    || ['can_refresh', 'can_rotate', 'can_reauthorize'].some(key => typeof result[key] !== 'boolean')
+    || !result.config || typeof result.config !== 'object' || Array.isArray(result.config)) throw new Error('Invalid completion response');
+  return result as unknown as UpstreamAccount;
+}
+
+export function claudeCompletionRetryMillis(seconds: number): number {
+  return Math.max(1000, Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(seconds * 1000)));
+}
+
+export function claudeCompletionStopReason(expiresAt: number | undefined, deadline: number, attempts: number, now: number) {
+  if (expiresAt !== undefined && Number.isFinite(expiresAt) && now >= expiresAt) return 'completeExpired';
+  if (now >= deadline || attempts >= claudeCompletionLimits.attempts) return 'completeLimited';
+  return undefined;
+}
+
 export interface AuthorizationCodeSession {
   driver: string;
   login_url: string;

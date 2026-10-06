@@ -44,7 +44,7 @@ import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
 import { AuthorizationCodeConnection } from '../AuthorizationCodeConnection';
 import { OAuthLoginLinkActions } from '../OAuthLoginLinkActions';
-import { authorizationCompleteError, canReauthorizeAccount } from '../authorizationCode';
+import { authorizationCompleteError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, parseClaudeCompletion } from '../authorizationCode';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -511,14 +511,14 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       {method === 'direct' ? <>
         <ModelPicker label={t('providers.provider')} value={provider?.id ?? ''} onChange={setDriver} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={directProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
         {schema ? <Form key={`${provider.id}-${locale}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setProviderCreateGeneration(generation => generation + 1); setProviderWorkspaceOpen(false); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><Button appearance="primary" type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</Button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-      </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}
+      </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} active={providerWorkspaceActive} onChanged={onChanged} />}</>}
     </CreateJourney>}
   </section></>;
 }
 
 type NativeAuthorizationSession = { login_url?: string; verification_url?: string; user_code?: string; session_token?: string; session_id?: string; resumed?: boolean; expires_at?: number; poll_after_seconds?: number };
 
-function AuthorizationConnection({ token, tenant, providers, existing, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: (account?: UpstreamAccount) => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
+function AuthorizationConnection({ token, tenant, providers, existing, active = true, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; active?: boolean; onChanged: (account?: UpstreamAccount) => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
   const { locale, t } = useI18n();
   const journeyCopy = authorizationJourneyCopy(locale);
   const [connectionEditing, setConnectionEditing] = useState(false);
@@ -530,6 +530,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [nativeLocked, setNativeLocked] = useState(false);
   useEffect(() => { setNativeLocked(false); }, [token, tenant]);
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
+  const isClaude = selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce';
   const [name, setName] = useState(existing?.name ?? initialProvider?.display_name ?? '');
   const [session, setSession] = useState<NativeAuthorizationSession>();
   const [manualCode, setManualCode] = useState('');
@@ -543,6 +544,8 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const [pollStopped, setPollStopped] = useState(false);
   const pollLock = useRef(false);
   const pollRequest = useRef<AbortController | undefined>(undefined);
+  const [claudePending, setClaudePending] = useState(false);
+  const claudeCompletion = useRef<{ deadline: number; attempts: number; nextAt: number; code: string } | undefined>(undefined);
   const [nextPollAt, setNextPollAt] = useState(0);
   const [now, setNow] = useState(Date.now);
   const [listRetry, setListRetry] = useState(false);
@@ -550,6 +553,11 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const savedAccount = useRef<UpstreamAccount | undefined>(undefined);
   const scopeVersion = useRef(0);
   useEffect(() => () => { scopeVersion.current += 1; pollRequest.current?.abort(); }, [token, tenant]);
+  useLayoutEffect(() => {
+    if (!isClaude) return;
+    if (!active) { setPolling(false); setAuthorizing(false); }
+    return () => { scopeVersion.current += 1; pollRequest.current?.abort(); pollLock.current = false; };
+  }, [active, isClaude, token, tenant]);
   const isKimi = isKimiDeviceProvider(selectedProvider);
   const expired = Boolean(!session?.resumed && (!session?.session_id || pollStopped) && session?.expires_at && now >= session.expires_at);
   useEffect(() => {
@@ -560,7 +568,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   }, [session]);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { scopeVersion.current += 1; pollRequest.current?.abort(); pollLock.current = false; setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setListLoading(false); setAuthorizing(false); setPolling(false); setPollStopped(false); };
+  const reset = () => { scopeVersion.current += 1; pollRequest.current?.abort(); pollLock.current = false; claudeCompletion.current = undefined; setClaudePending(false); setSession(undefined); setManualCode(''); setProxyUrl(''); setUseProxy(false); setMessage(''); setError(''); setNextPollAt(0); setListRetry(false); setListLoading(false); setAuthorizing(false); setPolling(false); setPollStopped(false); };
   useEffect(() => {
     reset();
     const recovery = readDeviceLoginRecovery(tenant);
@@ -653,20 +661,52 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     const timer = window.setTimeout(() => void pollAction.current(), Math.max(0, nextPollAt - Date.now()));
     return () => window.clearTimeout(timer);
   }, [session, polling, pollStopped, expired, nextPollAt, selectedProvider?.oauth_adapter?.flow_kind]);
-  const complete = async () => {
-    if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' || pollLock.current || expired || !manualCode.includes('#')) return;
+  const complete = async (automatic = false) => {
+    if (!active || !session || !isClaude || pollLock.current || pollStopped || !manualCode.includes('#') || (!automatic && claudePending)) return;
+    const budget = claudeCompletion.current ??= { deadline: Date.now() + claudeCompletionLimits.durationMillis, attempts: 0, nextAt: 0, code: manualCode };
+    const stopped = claudeCompletionStopReason(session.expires_at, budget.deadline, budget.attempts, Date.now());
+    if (stopped) { setClaudePending(false); setPollStopped(true); setMessage(''); setError(journeyCopy[stopped]); return; }
+    if (Date.now() < budget.nextAt) return;
+    if (!automatic) budget.code = manualCode;
+    budget.attempts += 1;
     pollLock.current = true;
     const request = new AbortController(); pollRequest.current = request;
     const attempt = scopeVersion.current;
-    setPolling(true); setError('');
+    const deadline = Math.min(budget.deadline, Number.isFinite(session.expires_at) ? session.expires_at! : Infinity);
+    const timer = window.setTimeout(() => request.abort(), Math.min(claudeCompletionLimits.requestMillis, deadline - Date.now()));
+    setPolling(true); setError(''); setMessage('');
     try {
-      const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }), signal: request.signal });
-      if (scopeVersion.current !== attempt) return;
+      const response = await new Promise<unknown>((resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(new Error('Completion stopped')), { once: true });
+        void api<unknown>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: budget.code }), signal: request.signal }).then(resolve, reject);
+      });
+      if (scopeVersion.current !== attempt || request.signal.aborted) return;
+      const elapsed = claudeCompletionStopReason(session.expires_at, budget.deadline, 0, Date.now());
+      if (elapsed) { setClaudePending(false); setPollStopped(true); setError(journeyCopy[elapsed]); return; }
+      const result = parseClaudeCompletion(response, tenant, existing?.id);
+      if (!('id' in result)) {
+        budget.nextAt = Date.now() + claudeCompletionRetryMillis(result.retry_after_seconds);
+        setNextPollAt(budget.nextAt); setClaudePending(true);
+        return;
+      }
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
-      savedAccount.current = result; setSession(undefined); setManualCode(''); await reloadList();
-    } catch (reason) { if (scopeVersion.current === attempt) setError(journeyCopy[authorizationCompleteError(reason)]); }
-    finally { if (scopeVersion.current === attempt) { pollLock.current = false; setPolling(false); } }
+      savedAccount.current = result; claudeCompletion.current = undefined; setClaudePending(false); setSession(undefined); setManualCode(''); await reloadList();
+    } catch (reason) { if (scopeVersion.current === attempt) {
+      const elapsed = claudeCompletionStopReason(session.expires_at, budget.deadline, 0, Date.now());
+      setClaudePending(false); setPollStopped(Boolean(elapsed)); setError(journeyCopy[elapsed ?? authorizationCompleteError(reason)]);
+    } }
+    finally { window.clearTimeout(timer); if (scopeVersion.current === attempt) { pollLock.current = false; setPolling(false); } }
   };
+  const completeAction = useRef(complete);
+  completeAction.current = complete;
+  useEffect(() => {
+    if (!active || !isClaude || !session || !claudePending || polling || pollStopped || !claudeCompletion.current) return;
+    const budget = claudeCompletion.current;
+    const due = budget.attempts >= claudeCompletionLimits.attempts ? Date.now() : Math.min(budget.nextAt, budget.deadline, Number.isFinite(session.expires_at) ? session.expires_at! : Infinity);
+    const attempt = scopeVersion.current;
+    const timer = window.setTimeout(() => { if (scopeVersion.current === attempt) void completeAction.current(true); }, Math.max(0, due - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [active, isClaude, session, claudePending, polling, pollStopped, nextPollAt]);
   return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
     {existing && <>
@@ -694,7 +734,10 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       {(expired || pollStopped) && <Button appearance="secondary" type="button" disabled={polling} onClick={reset}>{t('providers.backToLoginSetup')}</Button>}
       {listRetry && <Button appearance="secondary" type="button" disabled={listLoading} onClick={() => void reloadList()}>{t('providers.reloadAccountList')}</Button>}
     </div>}
-    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<Input value={manualCode} disabled={polling || expired} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><Button appearance="primary" type="button" disabled={polling || expired || !manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button></div>}
+    {session && isClaude && <>
+      {expired ? error !== journeyCopy.completeExpired && <p role="status">{journeyCopy.completeExpired}</p> : (polling || claudePending) && <p role="status">{polling ? journeyCopy.completeChecking : journeyCopy.completePending}</p>}
+      <div className="manual-authorization"><label>{t('providers.manualCode')}<Input value={manualCode} disabled={polling || claudePending || expired || pollStopped} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><Button appearance="primary" type="button" disabled={polling || claudePending || expired || pollStopped || !manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button></div>
+    </>}
     {session?.user_code && !expired && <div className="device-authorization"><p>{selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' ? t('providers.codexSecurity') : t('providers.deviceSecurity', { provider: selectedProvider?.display_name ?? '' })}</p><DeviceAuthorizationCode key={session.user_code} value={session.user_code} /></div>}
     {isKimi && session && selectedProvider && <p role="status">{expired
       ? t('providers.deviceLoginExpired')
