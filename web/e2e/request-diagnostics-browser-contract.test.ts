@@ -111,7 +111,16 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
       const detailText = await surface.innerText();
       assert.equal(detailText.split(cause).length - 1, 1, 'the main detail shows its recorded cause once');
       assert.equal((await surface.textContent() ?? '').split(cause).length - 1, 1, 'duplicate cause DOM must be removed, not hidden by CSS');
-      assert.equal((detailText.match(/\b429\b/g) ?? []).length, 1, 'the recorded status code appears only in its status badge');
+      const statusBadge = surface.locator('.request-outcome > small');
+      assert.equal(await statusBadge.count(), 1, 'the detail has exactly one recorded status badge');
+      assert.equal(await statusBadge.innerText(), '429');
+      assert.equal(await statusBadge.textContent(), '429');
+      const detailWithoutStatusBadge = await surface.evaluate(element => {
+        const detail = element.cloneNode(true) as HTMLElement;
+        detail.querySelector('.request-outcome > small')?.remove();
+        return detail.textContent ?? '';
+      });
+      assert.doesNotMatch(detailWithoutStatusBadge, /429/, 'the recorded status code appears only in its status badge');
       assert.doesNotMatch(detailText, /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
       assert.equal(await surface.getByText('Error', { exact: true }).count(), 0);
       await surface.locator('.request-outcome').focus();

@@ -122,7 +122,11 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await page.waitForFunction(() => window.claudeCompletionFixture.calls === 5);
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await workspace.waitFor({ state: 'detached' });
-    await page.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true }).waitFor();
+    await editHeading.waitFor();
+    const editWorkspace = page.getByRole('region', { name: chinese ? '编辑 Fixture Claude account' : 'Edit Fixture Claude account', exact: true });
+    const successNotice = editWorkspace.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true });
+    await successNotice.waitFor();
+    assert.equal(await successNotice.count(), 1);
     assert.equal(accountReads, readsBeforeLateResponse + 1);
     assert.equal(starts, 3, 'completion retries and abandoned responses never start another authorization session');
   } finally { await browser.close(); await server.close(); }
