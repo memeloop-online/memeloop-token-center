@@ -546,4 +546,36 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     assert.deepEqual(JSON.parse(shell(candidate, 'cat /scratch/RESTORE_SUCCESS.json').toString()), receipt);
     console.log(`Bounded restore receipt verified: sha=${expectedSha}, bytes=${archive.length}, public_relations=254; physical/WAL protection remains open`);
   });
+  for (const rate of [4, 8]) {
+    await context.test(`reviewed ${rate}MiB/s copy keeps chunk bounds, real pacing and complete isolated restore`, async () => {
+      const candidate = fixture(512);
+      const writes: number[] = [];
+      const remote: Remote = (side, command, input) => {
+        if (input) {
+          assert.equal(side, 'destination');
+          assert.ok(input.length > 0 && input.length <= 4 * 1024 ** 2);
+          writes.push(input.length);
+        }
+        const target = side === 'source' ? source : candidate;
+        const path = shell(target, 'printf %s "$PATH"').toString();
+        return execute(target, ['env', `PATH=/tmp/bin:${path}`, ...command], input);
+      };
+      const started = performance.now();
+      await copyArchive(remote, expectedSha, undefined, true, archiveDirectory, rate);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed >= archive.length / 1024 ** 2 / rate * 1000);
+      assert.equal(writes.reduce((total, bytes) => total + bytes, 0), archive.length);
+      shell(candidate, `cd ${archiveDirectory}; test -f OFFHOST_COPY_VERIFIED; sha256sum -c ${archiveName}.sha256; pg_restore --list ${archiveName} >/dev/null`);
+      run(candidate, restore.command, { PGOPTIONS: '', EXPECTED_SOURCE_SHA256: expectedSha });
+      const receipt = JSON.parse(shell(candidate, 'cat /scratch/RESTORE_SUCCESS.json').toString());
+      assert.equal(receipt.archive_sha256, expectedSha);
+      assert.equal(receipt.archive_bytes, archive.length);
+      assert.equal(receipt.public_relations, 254);
+      assert.equal(receipt.original_ownership_acl_verified, false);
+      assert.equal(receipt.application_acceptance_verified, false);
+      assert.equal(receipt.physical_wal_protection_verified, false);
+      assert.throws(() => shell(candidate, 'pg_ctl -D /scratch/pgdata status'));
+      context.diagnostic(`Actual isolated copy/restore: rate_MiB=${rate}, bytes=${archive.length}, wall_ms=${Math.round(elapsed)}, bounded_chunks=${writes.length}`);
+    });
+  }
 });

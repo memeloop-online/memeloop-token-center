@@ -10,7 +10,8 @@ export const archiveLimit = 25_769_803_776;
 export const copyChunk = 4 * 1024 * 1024;
 export type Remote = (side: 'source' | 'destination', command: string[], input?: Buffer) => Buffer;
 
-export async function copyArchive(remote: Remote, expectedSha: string, pause: (milliseconds: number) => Promise<void> = async milliseconds => { await delay(milliseconds); }, hardCapacity = false, directory = archiveDirectory): Promise<void> {
+export async function copyArchive(remote: Remote, expectedSha: string, pause: (milliseconds: number) => Promise<void> = async milliseconds => { await delay(milliseconds); }, hardCapacity = false, directory = archiveDirectory, rateMiB = 1): Promise<void> {
+  assert.ok([1, 4, 8].includes(rateMiB), 'Copy rate must be 1, 4 or 8 MiB/s');
   assert.match(expectedSha, /^[0-9a-f]{64}$/);
   assert.match(directory, /^\/backup\/mtc-pg-logical-[0-9]{8}(?:-[a-z0-9]+)*$/);
   const capacityCheck = (side: 'source' | 'destination') => {
@@ -37,7 +38,7 @@ export async function copyArchive(remote: Remote, expectedSha: string, pause: (m
     const chunk = shell('source', `dd if=${archive} bs=4194304 skip=${position / copyChunk} count=1 iflag=fullblock status=none`);
     assert.equal(chunk.length, Math.min(copyChunk, size - position), 'Short source read');
     shell('destination', `prlimit --core=0:0 --fsize=25769803776:25769803776 -- dd of=${archive}.partial bs=4194304 seek=${position / copyChunk} count=1 iflag=fullblock conv=notrunc,fsync status=none`, chunk);
-    await pause(chunk.length / 1024 / 1024 * 1000);
+    await pause(chunk.length / 1024 / 1024 / rateMiB * 1000);
   }
   capacityCheck('destination');
   const markerTrap = hardCapacity ? `trap 'marker_status=$?; if test "$marker_status" -ne 0; then rm -f LOCAL_ARCHIVE_CREATED OFFHOST_COPY_VERIFIED; fi; exit "$marker_status"' EXIT; ` : '';
@@ -47,6 +48,8 @@ export async function copyArchive(remote: Remote, expectedSha: string, pause: (m
 
 async function main(): Promise<void> {
   assert.equal(process.env.PARENT_REVIEW_APPROVED, 'true', 'Parent review required; this command never starts a dump');
+  const configuredRate = process.env.BACKUP_COPY_RATE_MIB_PER_SECOND ?? '1';
+  assert.ok(['1', '4', '8'].includes(configuredRate), 'Copy rate requires an explicit reviewed 1, 4 or 8 MiB/s selection');
   const [sourcePod, destinationPod, expectedSha] = process.argv.slice(2);
   assert.ok(sourcePod && destinationPod && expectedSha, 'Usage: copy.ts SOURCE_COPY_POD DESTINATION_COPY_POD SOURCE_SHA256');
   assert.equal(process.argv.length, 5);
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
         '/bin/sh', '-ec', 'test "$POD_UID" = "$1"; shift; . /policy/capacity.sh; capacity_backup; exec "$@"', 'copy-fenced', pod.metadata.uid, ...command,
       ], { input, timeout: 1_800_000, maxBuffer: copyChunk + 65_536, stdio: ['pipe', 'pipe', 'pipe'] });
     };
-    await copyArchive(remote, expectedSha, undefined, true, directory);
+    await copyArchive(remote, expectedSha, undefined, true, directory, Number(configuredRate));
     console.log('Offhost SHA and TOC verified; full isolated restore remains required.');
   } finally {
     for (const guard of guards) guard.kill('SIGTERM');
