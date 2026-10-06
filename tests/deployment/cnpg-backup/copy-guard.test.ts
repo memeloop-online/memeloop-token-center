@@ -133,7 +133,7 @@ test('independent collector renews while its controller blocks and exits on owne
   const value = fixture('destination');
   writeFileSync(join(root, 'inventory.json'), JSON.stringify(value));
   writeFileSync(join(root, 'kubectl'), `#!${process.execPath}\n` + String.raw`
-const fs = require('node:fs');
+import fs from 'node:fs';
 const args = process.argv.slice(2);
 const root = process.env.COPY_FIXTURE;
 const data = JSON.parse(fs.readFileSync(root + '/inventory.json', 'utf8'));

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -64,7 +64,12 @@ test('copy bundle is standalone, pinned and suspended without database, allocati
       assert.ok(imported[1]!.startsWith('node:') || ['./copy-guard.ts', './volume-identity.ts'].includes(imported[1]!));
     }
   }
-  execFileSync(process.execPath, ['--input-type=module', '-e', "await import('./copy.ts'); await import('./copy-guard.ts');"], { cwd: output, timeout: 10_000 });
+  const importProbe = spawnSync(process.execPath, [join(output, 'copy.ts')], {
+    cwd: output, timeout: 10_000, encoding: 'utf8', env: { ...process.env, PARENT_REVIEW_APPROVED: 'false' },
+  });
+  assert.equal(importProbe.status, 1);
+  assert.equal(importProbe.stdout, '');
+  assert.match(importProbe.stderr, /^Copy failed; preserve partial and inspect the owned copy Jobs\. No automatic retry\.$/m);
   execFileSync('/tmp/kubeconform', ['-strict', '-summary', '-exit-on-error', '-'], { input: manifest, timeout: 90_000 });
   assert.throws(() => prepareCopyArtifact(output, revision));
 });
