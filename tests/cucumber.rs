@@ -6021,6 +6021,20 @@ async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
             .expect("create routed model price");
         assert_eq!(response.status(), StatusCode::OK);
     }
+    for model in ["api-upstream", "oauth-upstream"] {
+        let response = world
+            .client
+            .post(format!(
+                "{}/internal/v1/prices/USD/{model}",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+            .send()
+            .await
+            .expect("create routed upstream model price");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))
@@ -6505,6 +6519,23 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
         .await
         .expect("create model price");
     assert_eq!(price_response.status(), StatusCode::OK);
+    if model == "cursor-public" {
+        let upstream_price = world
+            .client
+            .post(format!(
+                "{}/internal/v1/prices/USD/cursor-upstream",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({
+                "input_per_million": "1.00",
+                "output_per_million": "1.00"
+            }))
+            .send()
+            .await
+            .expect("create Cursor upstream model price");
+        assert_eq!(upstream_price.status(), StatusCode::OK);
+    }
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))

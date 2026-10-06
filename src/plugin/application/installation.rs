@@ -1168,7 +1168,7 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     super::super::plugin_configuration_schema_digest(&trust)
 }
 
-async fn append_inventory_file(
+pub(super) async fn append_inventory_file(
     path: &std::path::Path,
     id: &str,
     entry: &PreinstalledInventory,

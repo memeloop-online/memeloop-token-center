@@ -2,6 +2,75 @@ use super::*;
 use crate::plugin::application::ApplicationRevision;
 
 impl Database {
+    pub(crate) async fn begin_empty_plugin_registration(
+        &self,
+        inventory_id: &str,
+        event_key: &str,
+        actor: &str,
+    ) -> Result<Transaction<'_, Any>, AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = unix_millis();
+        sqlx::query("INSERT INTO application_plugin_install_lock (scope,operation_id,lease_until) VALUES ('global',$1,0) ON CONFLICT(scope) DO NOTHING")
+            .bind(event_key).execute(&mut *transaction).await?;
+        let locked = sqlx::query("UPDATE application_plugin_install_lock SET operation_id=$1,lease_until=$2 WHERE scope='global' AND lease_until <= $3")
+            .bind(event_key).bind(now + 90_000).bind(now).execute(&mut *transaction).await?.rows_affected();
+        if locked != 1 {
+            return Err(AppError::Overloaded);
+        }
+        let installed =
+            sqlx::query("SELECT id FROM application_plugin_installations WHERE inventory_id=$1")
+                .bind(inventory_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if installed.is_some() {
+            return Err(AppError::Conflict(
+                "inventory ID belongs to an installation".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO application_plugin_audit (id,event_key,actor,action,inventory_id,outcome,created_at) VALUES ($1,$2,$3,'register_empty',$4,'staged',$5) ON CONFLICT(event_key) DO NOTHING")
+            .bind(Uuid::now_v7().to_string()).bind(event_key).bind(actor).bind(inventory_id).bind(now)
+            .execute(&mut *transaction).await?;
+        let receipt = sqlx::query(
+            "SELECT actor,action,inventory_id FROM application_plugin_audit WHERE event_key=$1",
+        )
+        .bind(event_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if receipt.try_get::<String, _>("actor")? != actor
+            || receipt.try_get::<String, _>("action")? != "register_empty"
+            || receipt.try_get::<String, _>("inventory_id")? != inventory_id
+        {
+            return Err(AppError::Conflict(
+                "idempotency key was used for another operation".into(),
+            ));
+        }
+        Ok(transaction)
+    }
+
+    pub(crate) async fn finish_empty_plugin_registration(
+        &self,
+        mut transaction: Transaction<'_, Any>,
+        inventory_id: &str,
+        event_key: &str,
+        identity_digest: &str,
+        contract_digest: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("INSERT INTO application_plugin_candidates (inventory_id,identity_digest,contract_digest,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT(inventory_id) DO NOTHING")
+            .bind(inventory_id).bind(identity_digest).bind(contract_digest).bind(unix_millis())
+            .execute(&mut *transaction).await?;
+        let candidate = sqlx::query("SELECT identity_digest,contract_digest FROM application_plugin_candidates WHERE inventory_id=$1")
+            .bind(inventory_id).fetch_one(&mut *transaction).await?;
+        if candidate.try_get::<String, _>("identity_digest")? != identity_digest
+            || candidate.try_get::<String, _>("contract_digest")? != contract_digest
+        {
+            return Err(AppError::Conflict("inventory ID is immutable".into()));
+        }
+        sqlx::query("UPDATE application_plugin_install_lock SET lease_until=0 WHERE scope='global' AND operation_id=$1")
+            .bind(event_key).execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn application_plugin_history(
         &self,
         before: Option<i64>,

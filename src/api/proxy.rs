@@ -836,6 +836,7 @@ async fn execute_component_primary(
                 reservation: &request.reservation,
                 input_token_ceiling: next_input_token_ceiling,
                 output_token_ceiling: request.output_token_ceiling,
+                upstream_model: &active_route.route.upstream_model,
                 expected_assignment: assignment,
                 next_assignment: assignment,
             })
@@ -1155,7 +1156,10 @@ async fn proxy_with_cancellation_guard(
                 | Protocol::AnthropicMessages
         );
     let price_lookup = proxy_diagnostics::Phase::new(diagnostic_context, "model_price_lookup");
-    let price = state.db.model_price(&model, &key.currency).await?;
+    let price = state
+        .db
+        .model_price(&primary.upstream_model, &key.currency)
+        .await?;
     price_lookup.finish("completed", None, None);
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
@@ -1191,6 +1195,7 @@ async fn proxy_with_cancellation_guard(
             &body,
             state.config.key_pepper.as_bytes(),
             state.config.archive_spool_compression_enabled,
+            Some(&primary.upstream_model),
         )
         .await
     {

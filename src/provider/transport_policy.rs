@@ -39,17 +39,17 @@ impl Default for SseFramingLimits {
 pub(crate) enum CodexChatControlPolicy {
     /// Validate the OpenAI value shape, then let the Codex upstream apply its
     /// own sampling and output-length policy.
+    #[default]
     ProviderDefault,
     /// Accept only controls whose value is neutral for the Codex transport.
-    #[default]
     Strict,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CodexResponsesOutputLimitPolicy {
-    ProviderDefault,
     #[default]
+    ProviderDefault,
     Strict,
 }
 
@@ -97,8 +97,8 @@ impl Default for CodexTransportPolicy {
             max_sse_event_bytes: SseFramingLimits::DEFAULT_EVENT_BYTES,
             max_sse_framed_bytes: SseFramingLimits::DEFAULT_FRAMED_BYTES,
             max_sse_terminal_hold_bytes: SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES,
-            chat_controls: CodexChatControlPolicy::Strict,
-            responses_output_limits: CodexResponsesOutputLimitPolicy::Strict,
+            chat_controls: CodexChatControlPolicy::ProviderDefault,
+            responses_output_limits: CodexResponsesOutputLimitPolicy::ProviderDefault,
         }
     }
 }
@@ -177,10 +177,13 @@ mod tests {
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
         assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
-        assert_eq!(policy.chat_controls, CodexChatControlPolicy::Strict);
+        assert_eq!(
+            policy.chat_controls,
+            CodexChatControlPolicy::ProviderDefault
+        );
         assert_eq!(
             policy.responses_output_limits,
-            CodexResponsesOutputLimitPolicy::Strict
+            CodexResponsesOutputLimitPolicy::ProviderDefault
         );
         let provider_default = CodexTransportPolicy::parse(Some(&json!({
             "chat_controls": "provider_default", "responses_output_limits": "provider_default"
@@ -216,6 +219,50 @@ mod tests {
                 terminal_hold_bytes: 1_114_112,
             }
         );
+    }
+
+    #[test]
+    fn omitted_controls_use_provider_defaults_but_explicit_strict_is_preserved() {
+        assert_eq!(
+            CodexChatControlPolicy::default(),
+            CodexChatControlPolicy::ProviderDefault
+        );
+        assert_eq!(
+            CodexResponsesOutputLimitPolicy::default(),
+            CodexResponsesOutputLimitPolicy::ProviderDefault
+        );
+        for value in [None, Some(json!({})), Some(json!({"connect_attempts":1}))] {
+            let policy = CodexTransportPolicy::parse(value.as_ref()).unwrap();
+            assert_eq!(
+                policy.chat_controls,
+                CodexChatControlPolicy::ProviderDefault
+            );
+            assert_eq!(
+                policy.responses_output_limits,
+                CodexResponsesOutputLimitPolicy::ProviderDefault
+            );
+        }
+        for (config, chat, responses) in [
+            (
+                json!({"chat_controls":"strict"}),
+                CodexChatControlPolicy::Strict,
+                CodexResponsesOutputLimitPolicy::ProviderDefault,
+            ),
+            (
+                json!({"responses_output_limits":"strict"}),
+                CodexChatControlPolicy::ProviderDefault,
+                CodexResponsesOutputLimitPolicy::Strict,
+            ),
+            (
+                json!({"chat_controls":"strict","responses_output_limits":"strict"}),
+                CodexChatControlPolicy::Strict,
+                CodexResponsesOutputLimitPolicy::Strict,
+            ),
+        ] {
+            let policy = CodexTransportPolicy::parse(Some(&config)).unwrap();
+            assert_eq!(policy.chat_controls, chat);
+            assert_eq!(policy.responses_output_limits, responses);
+        }
     }
 
     #[test]
@@ -262,6 +309,10 @@ mod tests {
             json!({"shared_probe_attempts": null}),
             json!({"chat_controls": "unknown"}),
             json!({"responses_output_limits": "unknown"}),
+            json!({"chat_controls": null}),
+            json!({"responses_output_limits": null}),
+            json!({"chat_controls": true}),
+            json!({"responses_output_limits": 1}),
             json!({"connect_timeout_millis": 99}),
             json!({"connect_timeout_millis": 60001}),
             json!({"read_timeout_millis": 999}),

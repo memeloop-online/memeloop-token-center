@@ -712,6 +712,7 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     assert_eq!(operator_stats.by_model[0].name, "video-test");
     let requests = database.list_all_requests(&tenant, 10).await.unwrap();
     assert_eq!(requests[0].protocol, "generation");
+    assert_eq!(requests[0].upstream_model.as_deref(), Some("workflow-test"));
     assert_eq!(requests[0].status_code, Some(200));
     assert_eq!(requests[0].upstream_account_id, Some(account.id));
     assert!(requests[0].route_id.is_none());
@@ -722,6 +723,10 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         .await
         .unwrap();
     assert_eq!(key_detail.view.protocol, "generation");
+    assert_eq!(
+        key_detail.view.upstream_model.as_deref(),
+        Some("workflow-test")
+    );
     let result = json!({
         "provider": {"status": "success"},
         "assets": [{
@@ -737,12 +742,22 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         .request_archive_refs_for_tenant(&tenant, job_id)
         .await
         .unwrap();
+    assert_eq!(
+        operator_detail.view.upstream_model.as_deref(),
+        Some("workflow-test")
+    );
     assert_eq!(operator_detail.view.upstream_account_id, Some(account.id));
     assert!(operator_detail.view.route_id.is_none());
     assert!(operator_detail.view.completed_at.is_some());
     assert_eq!(operator_detail.view.currency.as_deref(), Some("USD"));
     assert_eq!(operator_detail.view.cost, "0.25");
     assert_eq!(operator_detail.response_json, Some(result));
+    let global_detail = database.request_archive_refs_global(job_id).await.unwrap();
+    assert_eq!(
+        global_detail.view.upstream_model.as_deref(),
+        Some("workflow-test")
+    );
+    assert_eq!(global_detail.view.cost, "0.25");
     let events = database
         .request_events_after(&tenant, 0, None, 10)
         .await

@@ -182,7 +182,6 @@ function pruneApply(environment: NodeJS.ProcessEnv, cutoff: string): void {
   psql(environment, { args: variables({ cutoff }), input: `BEGIN;
 SET LOCAL lock_timeout = '5s';
 SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314));
-LOCK TABLE request_records, generation_jobs IN SHARE MODE;
 CREATE TEMP TABLE mtc_request_stats_prune_guard (
   invalid boolean NOT NULL CHECK (invalid = false)
 ) ON COMMIT DROP;
@@ -194,7 +193,43 @@ SELECT true
    UNION ALL
    SELECT 1 FROM generation_jobs
     WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+   UNION ALL
+   SELECT 1 FROM terminal_projection_outbox
+    WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+      AND projected_at IS NULL
+   UNION ALL
+   SELECT 1 FROM conversation_projection_outbox c
+    LEFT JOIN terminal_projection_outbox t ON t.request_id = c.request_id
+    WHERE c.projected_at IS NULL
+      AND (t.created_at IS NULL OR t.created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint)
+   UNION ALL
+   SELECT 1 FROM metered_usage_projection_outbox m
+    LEFT JOIN terminal_projection_outbox t ON t.reservation_id = m.reservation_id
+    WHERE m.projected_at IS NULL
+      AND (t.created_at IS NULL OR t.created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint)
  );
+INSERT INTO observability_prune_boundaries (scope, before_day, recorded_at)
+VALUES ('global', (:'cutoff'::date - DATE '1970-01-01')::bigint,
+        (extract(epoch FROM clock_timestamp()) * 1000)::bigint)
+ON CONFLICT (scope) DO UPDATE SET
+  before_day = GREATEST(observability_prune_boundaries.before_day, excluded.before_day),
+  recorded_at = excluded.recorded_at;
+CREATE TEMP TABLE mtc_pruned_sessions ON COMMIT DROP AS
+SELECT tenant_id, key_id, session_id FROM request_stats_facts
+ WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+UNION
+SELECT tenant_id, key_id, 'unlinked:' || key_id FROM generation_stats_facts
+ WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
+DELETE FROM usage_daily_aggregates
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM session_usage_daily
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM session_usage_hourly
+ WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24;
+DELETE FROM generation_usage_dimensions_daily
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM generation_usage_dimensions_hourly
+ WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24;
 DELETE FROM usage_analysis_daily
  WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
 DELETE FROM usage_analysis_hourly
@@ -207,6 +242,30 @@ DELETE FROM request_stats_facts
  WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 DELETE FROM generation_stats_facts
  WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
+DELETE FROM session_usage_totals total USING mtc_pruned_sessions affected
+ WHERE total.tenant_id = affected.tenant_id AND total.key_id = affected.key_id
+   AND total.session_id = affected.session_id;
+INSERT INTO session_usage_totals (
+  tenant_id, key_id, session_id, currency, last_activity_at, requests, errors,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  generation_units, duration_count, duration_sum_ms, cost_micros)
+SELECT f.tenant_id, f.key_id, f.session_id, f.currency, MAX(f.created_at), COUNT(*),
+       SUM(CASE WHEN f.status_class = 'failure' THEN 1 ELSE 0 END),
+       SUM(f.input_tokens), SUM(f.output_tokens), SUM(f.cached_input_tokens),
+       SUM(f.cache_write_tokens), SUM(f.generation_units), COUNT(*),
+       SUM(f.duration_ms), SUM(f.cost_micros)
+  FROM (
+    SELECT tenant_id, key_id, session_id, currency, created_at, status_class,
+           GREATEST(0, input_tokens - cached_input_tokens - cache_write_tokens) AS input_tokens,
+           output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
+           duration_ms, cost_micros FROM request_stats_facts
+    UNION ALL
+    SELECT tenant_id, key_id, 'unlinked:' || key_id, currency, created_at, status_class,
+           0, 0, 0, 0, billed_units, duration_ms, cost_micros FROM generation_stats_facts
+  ) f JOIN mtc_pruned_sessions affected
+    ON f.tenant_id = affected.tenant_id AND f.key_id = affected.key_id
+   AND f.session_id = affected.session_id
+ GROUP BY f.tenant_id, f.key_id, f.session_id, f.currency;
 COMMIT;
 ` });
 }

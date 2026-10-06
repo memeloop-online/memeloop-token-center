@@ -15,6 +15,11 @@ mod tests;
 
 const MAX_EPOCH: u64 = (1 << 28) - 1;
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_BEFORE_PROXY_ADVANCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Group {
@@ -77,6 +82,7 @@ pub(crate) struct ProxySelection {
     pub(crate) credential: UpstreamCredential,
     pub(crate) generation: i64,
     ticket: Option<(Arc<Entry>, u64)>,
+    member_override: Option<usize>,
 }
 
 fn unavailable() -> AppError {
@@ -84,6 +90,16 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
+    #[cfg(test)]
+    pub(crate) async fn with_test_connect_failure_interleaving<F: std::future::Future>(
+        interleave: impl FnOnce() + 'static,
+        future: F,
+    ) -> F::Output {
+        TEST_BEFORE_PROXY_ADVANCE
+            .scope(std::cell::RefCell::new(Some(Box::new(interleave))), future)
+            .await
+    }
+
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
         if input.len() > 256 * 1024 {
             return Err(unavailable());
@@ -191,6 +207,7 @@ impl TransportProxyGroups {
                 credential: credential.clone(),
                 generation: 0,
                 ticket: None,
+                member_override: None,
             });
         };
         let generation = u32::try_from(credential_generation).map_err(|_| unavailable())?;
@@ -249,38 +266,106 @@ impl TransportProxyGroups {
             credential: credential.clone().with_transport_proxy(proxy.clone())?,
             generation: snapshot.epoch as i64,
             ticket: Some((entry.clone(), state)),
+            member_override: None,
         })
     }
 }
 
 impl ProxySelection {
-    pub(crate) fn member(&self) -> Option<usize> {
+    pub(crate) fn member_index(&self) -> Option<usize> {
+        self.ticket.as_ref().map(|(_, state)| {
+            self.member_override
+                .unwrap_or_else(|| Snapshot::decode(*state).selected)
+        })
+    }
+
+    pub(crate) fn member_count(&self) -> usize {
         self.ticket
             .as_ref()
-            .filter(|(entry, _)| entry.group.proxies.len() > 1)
-            .map(|(_, state)| Snapshot::decode(*state).selected)
+            .map_or(0, |(entry, _)| entry.group.proxies.len())
+    }
+
+    pub(crate) fn group_selection_version(&self) -> Option<i64> {
+        self.ticket.as_ref().map(|(entry, _)| entry.group.version)
+    }
+
+    pub(crate) fn is_request_local(&self) -> bool {
+        self.member_override.is_some()
+    }
+
+    pub(crate) fn member(&self) -> Option<usize> {
+        self.member_index().filter(|_| self.member_count() > 1)
+    }
+
+    pub(crate) fn select_unattempted(&mut self, attempted: &[usize]) -> Result<bool, AppError> {
+        let Some((entry, state)) = &self.ticket else {
+            return Ok(true);
+        };
+        let snapshot = Snapshot::decode(*state);
+        if entry.blocked.load(Ordering::Acquire)
+            || u64::from(snapshot.credential_generation)
+                < entry.observed_generation.load(Ordering::Acquire)
+            || Snapshot::decode(entry.state.load(Ordering::Acquire)).credential_generation
+                != snapshot.credential_generation
+        {
+            return Err(unavailable());
+        }
+        let Some(member) = self.member().filter(|member| attempted.contains(member)) else {
+            return Ok(true);
+        };
+        let count = entry.group.proxies.len();
+        let next = (1..count)
+            .map(|offset| (member + offset) % count)
+            .find(|candidate| !attempted.contains(candidate));
+        let Some(selected) = next else {
+            return Ok(false);
+        };
+        self.credential = self
+            .credential
+            .clone()
+            .with_transport_proxy(entry.group.proxies[selected].clone())?;
+        self.member_override = (selected != snapshot.selected).then_some(selected);
+        Ok(true)
     }
 
     pub(crate) fn advance_after_connect_failure(
         &self,
         attempted: &[usize],
     ) -> Result<bool, AppError> {
+        Ok(self.advance_after_connect_failure_outcome(attempted)? == "advanced")
+    }
+
+    pub(crate) fn advance_after_connect_failure_outcome(
+        &self,
+        attempted: &[usize],
+    ) -> Result<&'static str, AppError> {
         let Some((entry, state)) = &self.ticket else {
-            return Ok(false);
+            return Ok("not_grouped");
         };
         let snapshot = Snapshot::decode(*state);
+        #[cfg(test)]
+        if let Some(interleave) = TEST_BEFORE_PROXY_ADVANCE
+            .try_with(|hook| hook.borrow_mut().take())
+            .ok()
+            .flatten()
+        {
+            interleave();
+        }
         if entry.blocked.load(Ordering::Acquire)
             || u64::from(snapshot.credential_generation)
                 < entry.observed_generation.load(Ordering::Acquire)
         {
-            return Ok(false);
+            return Ok("stale");
+        }
+        if self.is_request_local() {
+            return Ok("request_local");
         }
         let count = entry.group.proxies.len();
         let next = (1..count)
             .map(|offset| (snapshot.selected + offset) % count)
             .find(|candidate| !attempted.contains(candidate));
         let Some(selected) = next else {
-            return Ok(false);
+            return Ok("no_untried_member");
         };
         let next = Snapshot {
             selected,
@@ -288,9 +373,16 @@ impl ProxySelection {
             ..snapshot
         }
         .encode()?;
-        Ok(entry
-            .state
-            .compare_exchange(*state, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok())
+        Ok(
+            if entry
+                .state
+                .compare_exchange(*state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                "advanced"
+            } else {
+                "contended"
+            },
+        )
     }
 }

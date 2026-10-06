@@ -426,6 +426,10 @@ async function seedThroughHttp(): Promise<SeedState> {
     method: 'POST', credential: bootstrapToken,
     body: { input_per_million: '1', output_per_million: '2' },
   });
+  await requestJson('/internal/v1/prices/USD/mock-provider-model', {
+    method: 'POST', credential: bootstrapToken,
+    body: { input_per_million: '1', output_per_million: '2' },
+  });
   for (const price of [
     { model: 'browser-image-model', billing_unit: 'image', price_per_unit: '0.4' },
     { model: 'browser-video-model', billing_unit: 'second', price_per_unit: '0.1' },

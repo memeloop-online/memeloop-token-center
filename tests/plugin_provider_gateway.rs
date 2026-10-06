@@ -260,7 +260,7 @@ async fn component_provider_fixture(
         .unwrap();
     state
         .db
-        .upsert_model_price("example-rewritten", "USD", Decimal::ONE, Decimal::ONE)
+        .upsert_model_price("vendor-route-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
     let account = state

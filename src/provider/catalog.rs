@@ -685,16 +685,16 @@ impl ProviderCatalog {
                 "chat_controls": {
                     "type": "string",
                     "enum": ["provider_default", "strict"],
-                    "default": "strict",
+                    "default": "provider_default",
                     "title": "Chat controls",
-                    "description": "Choose how Chat Completions sampling and output-limit controls are adapted to the Codex Responses transport. Provider default validates and removes controls the upstream cannot represent; strict accepts neutral values only."
+                    "description": "Provider default validates and removes unsupported Chat sampling and output-limit controls; the upstream applies its own defaults and does not promise the requested sampling settings or token cap. Explicit strict accepts neutral sampling values only and rejects output-limit hints. Quota reservations still use the trusted model ceiling."
                 },
                 "responses_output_limits": {
                     "type": "string",
                     "enum": ["provider_default", "strict"],
-                    "default": "strict",
+                    "default": "provider_default",
                     "title": "Responses output limits",
-                    "description": "Strict rejects output limits below the trusted model ceiling because Codex OAuth cannot enforce them. Provider default validates and removes the client's output-limit hint; it does not enforce a hard token cap. Quota always reserves against the trusted model ceiling and settles against observed usage."
+                    "description": "Provider default validates and removes the client's output-limit hint; the upstream applies its own defaults and does not enforce the requested token cap. Explicit strict rejects any output-limit hint because Codex OAuth cannot guarantee it. Quota always reserves against the trusted model ceiling and settles against observed usage."
                 }
             }
         });
