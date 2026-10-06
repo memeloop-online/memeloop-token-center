@@ -1,0 +1,322 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "storage.k8s.io/v1",
+      "kind": "StorageClass",
+      "metadata": {
+        "name": "mtc-cnpg-stage-haixia-data1-20261005",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "b59651cb-831f-4a8d-8438-0709359b48c8",
+          "recovery.mtc/expected-disk-path": "/data1/longhorn",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "provisioner": "driver.longhorn.io",
+      "reclaimPolicy": "Retain",
+      "allowVolumeExpansion": false,
+      "volumeBindingMode": "WaitForFirstConsumer",
+      "parameters": {
+        "numberOfReplicas": "1",
+        "dataEngine": "v1",
+        "dataLocality": "strict-local",
+        "fsType": "xfs",
+        "nodeSelector": "storage-tier-haixia,storage-tier-large",
+        "diskSelector": "storage-tier-control-pane,storage-tier-large",
+        "replicaAutoBalance": "disabled",
+        "disableRevisionCounter": "true",
+        "staleReplicaTimeout": "30",
+        "recurringJobSelector": "[]"
+      }
+    },
+    {
+      "apiVersion": "longhorn.io/v1beta2",
+      "kind": "Volume",
+      "metadata": {
+        "name": "mtc-pg-bounded-stage-20261005",
+        "namespace": "longhorn-system",
+        "labels": {
+          "recurring-job-group.longhorn.io/default": "disabled"
+        },
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "b59651cb-831f-4a8d-8438-0709359b48c8",
+          "recovery.mtc/expected-disk-path": "/data1/longhorn",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "size": "30064771072",
+        "numberOfReplicas": 1,
+        "dataEngine": "v1",
+        "dataLocality": "strict-local",
+        "nodeSelector": [
+          "storage-tier-haixia",
+          "storage-tier-large"
+        ],
+        "diskSelector": [
+          "storage-tier-control-pane",
+          "storage-tier-large"
+        ],
+        "nodeID": "",
+        "frontend": "blockdev",
+        "accessMode": "rwo",
+        "image": "docker.io/longhornio/longhorn-engine:v1.12.0",
+        "replicaAutoBalance": "disabled",
+        "revisionCounterDisabled": true,
+        "staleReplicaTimeout": 30,
+        "snapshotMaxCount": 2,
+        "snapshotMaxSize": "60129542144",
+        "snapshotDataIntegrity": "disabled",
+        "restoreVolumeRecurringJob": "disabled",
+        "offlineRebuilding": "disabled",
+        "backupTargetName": "default"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolume",
+      "metadata": {
+        "name": "mtc-pg-bounded-stage-20261005",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "b59651cb-831f-4a8d-8438-0709359b48c8",
+          "recovery.mtc/expected-disk-path": "/data1/longhorn",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "capacity": {
+          "storage": "28Gi"
+        },
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "volumeMode": "Filesystem",
+        "persistentVolumeReclaimPolicy": "Retain",
+        "storageClassName": "mtc-cnpg-stage-haixia-data1-20261005",
+        "claimRef": {
+          "name": "mtc-pg-bounded-stage-20261005",
+          "namespace": "memeloop-token-center"
+        },
+        "nodeAffinity": {
+          "required": {
+            "nodeSelectorTerms": [
+              {
+                "matchExpressions": [
+                  {
+                    "key": "kubernetes.io/hostname",
+                    "operator": "In",
+                    "values": [
+                      "haixia"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "csi": {
+          "driver": "driver.longhorn.io",
+          "fsType": "xfs",
+          "volumeHandle": "mtc-pg-bounded-stage-20261005",
+          "volumeAttributes": {
+            "numberOfReplicas": "1",
+            "staleReplicaTimeout": "30"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "mtc-pg-bounded-stage-20261005",
+        "namespace": "memeloop-token-center",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "b59651cb-831f-4a8d-8438-0709359b48c8",
+          "recovery.mtc/expected-disk-path": "/data1/longhorn",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "volumeMode": "Filesystem",
+        "storageClassName": "mtc-cnpg-stage-haixia-data1-20261005",
+        "volumeName": "mtc-pg-bounded-stage-20261005",
+        "resources": {
+          "requests": {
+            "storage": "28Gi"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "storage.k8s.io/v1",
+      "kind": "StorageClass",
+      "metadata": {
+        "name": "mtc-cnpg-archive-versetensor-20261005",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "da83ab44-d26f-4c20-b956-87fa954cd603",
+          "recovery.mtc/expected-disk-path": "/var/lib/longhorn/",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "provisioner": "driver.longhorn.io",
+      "reclaimPolicy": "Retain",
+      "allowVolumeExpansion": false,
+      "volumeBindingMode": "WaitForFirstConsumer",
+      "parameters": {
+        "numberOfReplicas": "1",
+        "dataEngine": "v1",
+        "dataLocality": "strict-local",
+        "fsType": "xfs",
+        "nodeSelector": "storage-tier-hosted,storage-tier-poor",
+        "diskSelector": "storage-tier-control-pane,storage-tier-poor",
+        "replicaAutoBalance": "disabled",
+        "disableRevisionCounter": "true",
+        "staleReplicaTimeout": "30",
+        "recurringJobSelector": "[]"
+      }
+    },
+    {
+      "apiVersion": "longhorn.io/v1beta2",
+      "kind": "Volume",
+      "metadata": {
+        "name": "mtc-pg-bounded-archive-20261005",
+        "namespace": "longhorn-system",
+        "labels": {
+          "recurring-job-group.longhorn.io/default": "disabled"
+        },
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "da83ab44-d26f-4c20-b956-87fa954cd603",
+          "recovery.mtc/expected-disk-path": "/var/lib/longhorn/",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "size": "30064771072",
+        "numberOfReplicas": 1,
+        "dataEngine": "v1",
+        "dataLocality": "strict-local",
+        "nodeSelector": [
+          "storage-tier-hosted",
+          "storage-tier-poor"
+        ],
+        "diskSelector": [
+          "storage-tier-control-pane",
+          "storage-tier-poor"
+        ],
+        "nodeID": "",
+        "frontend": "blockdev",
+        "accessMode": "rwo",
+        "image": "docker.io/longhornio/longhorn-engine:v1.12.0",
+        "replicaAutoBalance": "disabled",
+        "revisionCounterDisabled": true,
+        "staleReplicaTimeout": 30,
+        "snapshotMaxCount": 2,
+        "snapshotMaxSize": "60129542144",
+        "snapshotDataIntegrity": "disabled",
+        "restoreVolumeRecurringJob": "disabled",
+        "offlineRebuilding": "disabled",
+        "backupTargetName": "default"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolume",
+      "metadata": {
+        "name": "mtc-pg-bounded-archive-20261005",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "da83ab44-d26f-4c20-b956-87fa954cd603",
+          "recovery.mtc/expected-disk-path": "/var/lib/longhorn/",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "capacity": {
+          "storage": "28Gi"
+        },
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "volumeMode": "Filesystem",
+        "persistentVolumeReclaimPolicy": "Retain",
+        "storageClassName": "mtc-cnpg-archive-versetensor-20261005",
+        "claimRef": {
+          "name": "mtc-pg-bounded-archive-20261005",
+          "namespace": "memeloop-token-center"
+        },
+        "nodeAffinity": {
+          "required": {
+            "nodeSelectorTerms": [
+              {
+                "matchExpressions": [
+                  {
+                    "key": "kubernetes.io/hostname",
+                    "operator": "In",
+                    "values": [
+                      "versetensor-hv"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "csi": {
+          "driver": "driver.longhorn.io",
+          "fsType": "xfs",
+          "volumeHandle": "mtc-pg-bounded-archive-20261005",
+          "volumeAttributes": {
+            "numberOfReplicas": "1",
+            "staleReplicaTimeout": "30"
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": {
+        "name": "mtc-pg-bounded-archive-20261005",
+        "namespace": "memeloop-token-center",
+        "annotations": {
+          "recovery.mtc/approval": "storage-allocation-requires-owner-approval-no-export-authorized",
+          "recovery.mtc/expected-disk-uuid": "da83ab44-d26f-4c20-b956-87fa954cd603",
+          "recovery.mtc/expected-disk-path": "/var/lib/longhorn/",
+          "recovery.mtc/physical-budget-bytes": "122406567936",
+          "recovery.mtc/budget-scope": "full-head-plus-2x-snapshot-limit-plus-1x-maintenance-plus-2Gi-metadata-not-a-host-reservation"
+        }
+      },
+      "spec": {
+        "accessModes": [
+          "ReadWriteOnce"
+        ],
+        "volumeMode": "Filesystem",
+        "storageClassName": "mtc-cnpg-archive-versetensor-20261005",
+        "volumeName": "mtc-pg-bounded-archive-20261005",
+        "resources": {
+          "requests": {
+            "storage": "28Gi"
+          }
+        }
+      }
+    }
+  ]
+}
