@@ -280,8 +280,8 @@ async fn send_codex_attempt(
         deadline,
     } = context;
     let mut attempted = Vec::with_capacity(4);
-    for connect_attempt in 1..=transport_policy.connect_attempts {
-        let mut selection = state
+    let select_proxy = || {
+        state
             .transport_proxy_groups
             .select_config(
                 route.route.account_id,
@@ -289,7 +289,17 @@ async fn send_codex_attempt(
                 &route.route.credential,
                 &route.route.config,
             )
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+            .map_err(|_| ProxySendError::CandidateUnavailable)
+    };
+    let mut selection = select_proxy()?;
+    let (connect_attempt_limit, connect_budget_source) = match selection.member_count() {
+        count if count > 1 => (count, "proxy_group_members"),
+        _ => (transport_policy.connect_attempts, "transport_policy"),
+    };
+    for connect_attempt in 1..=connect_attempt_limit {
+        if connect_attempt > 1 {
+            selection = select_proxy()?;
+        }
         let has_unattempted = selection
             .select_unattempted(&attempted)
             .map_err(|_| ProxySendError::CandidateUnavailable)?;
@@ -301,7 +311,9 @@ async fn send_codex_attempt(
             candidate_rank,
             outbound_attempt,
             connect_attempt,
-            connect_attempt_limit = transport_policy.connect_attempts,
+            connect_attempt_limit,
+            connect_budget_source,
+            configured_connect_attempts = transport_policy.connect_attempts,
             member_index = ?selection.member_index(),
             member_count = selection.member_count(),
             selection_epoch = selection.generation,
@@ -381,7 +393,7 @@ async fn send_codex_attempt(
         }
         match result {
             Err(ProxySendError::RetryableConnection(failure_stage))
-                if connect_attempt < transport_policy.connect_attempts =>
+                if connect_attempt < connect_attempt_limit =>
             {
                 tracing::warn!(
                     %request_id,
@@ -389,7 +401,9 @@ async fn send_codex_attempt(
                     candidate_rank,
                     outbound_attempt,
                     connect_attempt,
-                    connect_attempt_limit = transport_policy.connect_attempts,
+                    connect_attempt_limit,
+                    connect_budget_source,
+                    configured_connect_attempts = transport_policy.connect_attempts,
                     transport_policy_source = transport_policy.source,
                     transport_policy_version = transport_policy.version,
                     failure_kind = "connection",
@@ -417,7 +431,9 @@ async fn send_codex_attempt(
                     candidate_rank,
                     outbound_attempt,
                     connect_attempt,
-                    connect_attempt_limit = transport_policy.connect_attempts,
+                    connect_attempt_limit,
+                    connect_budget_source,
+                    configured_connect_attempts = transport_policy.connect_attempts,
                     transport_policy_source = transport_policy.source,
                     transport_policy_version = transport_policy.version,
                     failure_kind = "connection",
