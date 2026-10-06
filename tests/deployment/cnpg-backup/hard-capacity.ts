@@ -3,12 +3,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseAllDocuments, stringify } from 'yaml';
-import { capacityPolicy, restoreReceipt } from './capacity-policy.ts';
+import { capacityPolicy } from './capacity-policy.ts';
 import { storageResources, validateStorageResources } from './storage-preflight.ts';
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
 import { superviseExport } from './export-supervisor.ts';
 import { withExportRate } from './export-rate.ts';
+import { superviseRestore } from './restore-supervisor.ts';
 import { copyContainerCommand, copyIdentities, copyImage } from './copy-guard.ts';
 
 export const boundedClaims = {
@@ -118,42 +119,18 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
       container.command[6] = stageSupervisor(withExportRate(script));
     }
     if (resource.metadata.name === boundedJobs.restore) {
-      let script: string = container.command[2];
-      script = replaceOnce(script, 'umask 077', String.raw`umask 077
-. /policy/capacity.sh
-capacity_restore
-test ! -e /scratch/RESTORE_SUCCESS.json
-test ! -e /scratch/RESTORE_SUCCESS.json.partial
-guard_pid=
-restore_cleanup() {
-  restore_status=$?
-  trap - EXIT TERM INT
-  if test -n "$guard_pid"; then
-    kill "$guard_pid" 2>/dev/null || true
-    wait "$guard_pid" 2>/dev/null || true
-  fi
-  if test -n "$PGDATA"; then
-    pg_ctl -D "$PGDATA" -m immediate stop > /dev/null 2>&1 || true
-  fi
-  if test "$restore_status" -ne 0; then rm -f /scratch/RESTORE_SUCCESS.json; fi
-  exit "$restore_status"
-}
-trap restore_cleanup EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-restore_pid=$$
-(
-  trap 'kill -TERM "$restore_pid" 2>/dev/null || true' EXIT
-  trap 'trap - EXIT; exit 0' TERM INT
-  while kill -0 "$restore_pid" 2>/dev/null; do
-    capacity_restore || exit 1
-    sleep 2
-  done
-) &
-guard_pid=$!`);
-      script = replaceOnce(script, 'trap \'pg_ctl -D "$PGDATA" -m immediate stop > /dev/null 2>&1 || true\' EXIT\n', '');
-      script = replaceOnce(script, 'test "$table_count" -ge 254', 'test "$table_count" -ge 254\n' + restoreReceipt);
-      container.command[2] = script;
+      container.image = copyImage;
+      container.env.push(
+        { name: 'BACKUP_UUID_ATTESTATION', value: 'external-csi-lease' },
+        { name: 'SCRATCH_UUID_ATTESTATION', value: 'external-csi-lease' },
+        { name: 'EXPECTED_BACKUP_DEVICE', value: copyIdentities.destination.device },
+        { name: 'EXPECTED_SCRATCH_DEVICE', value: '' },
+        { name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } },
+      );
+      pod.volumes.push({ name: 'tmp', emptyDir: { medium: 'Memory', sizeLimit: '64Mi' } });
+      container.volumeMounts.push({ name: 'tmp', mountPath: '/tmp' });
+      resource.metadata.annotations['recovery.mtc/restore-identity'] = 'two-independent-45s-csi-leases-required-scratch-allocation-and-controller-review-remain-open';
+      container.command[2] = superviseRestore(container.command[2]);
     }
     if ([boundedJobs.source, boundedJobs.destination].includes(resource.metadata.name)) {
       const identity = copyIdentities[resource.metadata.name === boundedJobs.source ? 'source' : 'destination'];

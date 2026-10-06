@@ -74,7 +74,12 @@ test('prepared resources cannot provision unbounded storage or start a productio
   assert.equal(jobs.find(job => job.metadata.name === boundedJobs.stage).spec.parallelism, 1);
   const restorePod = jobs.find(job => job.metadata.name === boundedJobs.restore).spec.template.spec;
   assert.equal(restorePod.volumes.find((volume: any) => volume.name === 'backup').persistentVolumeClaim.readOnly, true);
-  assert.ok(!restore.env.some((entry: any) => entry.valueFrom));
+  assert.equal(restore.env.find((entry: any) => entry.name === 'POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
+  assert.equal(restore.env.find((entry: any) => entry.name === 'BACKUP_UUID_ATTESTATION').value, 'external-csi-lease');
+  assert.equal(restore.env.find((entry: any) => entry.name === 'SCRATCH_UUID_ATTESTATION').value, 'external-csi-lease');
+  assert.equal(restore.env.find((entry: any) => entry.name === 'EXPECTED_SCRATCH_DEVICE').value, '');
+  assert.deepEqual(restorePod.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, { medium: 'Memory', sizeLimit: '64Mi' });
+  assert.ok(restore.command[2].includes('setsid /bin/sh -ec'));
   const isolation = resources.find(resource => resource.kind === 'NetworkPolicy' && resource.metadata.name === 'mtc-pg-restore-isolation-20261004');
   assert.deepEqual(isolation.spec.policyTypes, ['Ingress', 'Egress']);
   assert.equal(isolation.spec.ingress, undefined);
@@ -111,16 +116,16 @@ test ! -e /tmp/findmnt-fail
 if test -e /tmp/findmnt-slow; then sleep 20; fi
 case "$*" in
   *'/tmp') printf tmpfs; exit ;;
-  *'/scratch') fixture_path=/scratch; fixture_uuid=fixture-scratch ;;
-  *) fixture_path=/backup; fixture_uuid=fixture-backup ;;
+  *'/scratch') fixture_path=/scratch; fixture_uuid=fixture-scratch; fixture_device=/dev/fixture-scratch; fixture_number=8:33 ;;
+  *) fixture_path=/backup; fixture_uuid=fixture-backup; fixture_device=/dev/fixture; fixture_number=8:32 ;;
 esac
 case "$*" in
   *FSTYPE*) if test -e /tmp/wrong-type; then printf overlay; else printf ext4; fi ;;
   *FSROOT*) if test -e /tmp/subdirectory; then printf /unbounded-local-path; else printf /; fi ;;
   *TARGET*) printf %s "$fixture_path" ;;
   *UUID*) if test ! -e /tmp/empty-uuid; then printf %s "$fixture_uuid"; fi ;;
-  *MAJ:MIN*) printf 8:32 ;;
-  *SOURCE*) printf /dev/fixture ;;
+  *MAJ:MIN*) printf %s "$fixture_number" ;;
+  *SOURCE*) printf %s "$fixture_device" ;;
   *) exit 1 ;;
 esac
 `);
@@ -223,6 +228,43 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     } finally {
       if (child.exitCode === null) child.kill('SIGKILL');
     }
+  });
+  const restoreEnvironment = {
+    BACKUP_UUID_ATTESTATION: 'external-csi-lease', SCRATCH_UUID_ATTESTATION: 'external-csi-lease',
+    EXPECTED_BACKUP_DEVICE: '/dev/fixture', EXPECTED_SCRATCH_DEVICE: '/dev/fixture-scratch', POD_UID: 'fixture-pod',
+  };
+  const restoreLeases = (candidate: string) => {
+    shell(candidate, 'touch /tmp/empty-uuid');
+    const epoch = Math.floor(Date.now() / 1000);
+    write(candidate, '/tmp/backup-volume.lease', `${epoch} fixture-pod /dev/fixture fixture-backup 8:32`);
+    write(candidate, '/tmp/scratch-volume.lease', `${epoch} fixture-pod /dev/fixture-scratch fixture-scratch 8:33`);
+  };
+  await context.test('rootless restore requires independent pod-bound backup and scratch attestations', () => {
+    const candidate = fixture();
+    const checkRestore = (extra: Record<string, string> = {}) => run(candidate, ['/bin/sh', '-ec', '. /policy/capacity.sh; capacity_restore'], { ...restoreEnvironment, ...extra });
+    restoreLeases(candidate);
+    checkRestore();
+    for (const side of ['backup', 'scratch']) {
+      const leasePath = `/tmp/${side}-volume.lease`;
+      const valid = shell(candidate, `cat ${leasePath}`).toString();
+      const fields = valid.split(' ');
+      for (const [index, value] of [[0, '1'], [0, '9999999999'], [1, 'replaced-pod'], [2, '/dev/wrong'], [3, 'wrong-uuid'], [4, '8:34']] as const) {
+        const invalid = [...fields];
+        invalid[index] = value;
+        write(candidate, leasePath, invalid.join(' '));
+        assert.throws(() => checkRestore());
+      }
+      write(candidate, leasePath, valid + ' extra');
+      assert.throws(() => checkRestore());
+      shell(candidate, `rm ${leasePath}`);
+      assert.throws(() => checkRestore());
+      write(candidate, leasePath, valid);
+    }
+    assert.throws(() => checkRestore({ EXPECTED_SCRATCH_DEVICE: '/dev/fixture' }));
+    assert.throws(() => checkRestore({ EXPECTED_SCRATCH_FS_UUID: 'fixture-backup' }));
+    shell(candidate, 'cp /tmp/backup-volume.lease /tmp/scratch-volume.lease');
+    assert.throws(() => checkRestore());
+    shell(candidate, 'test ! -e /scratch/pgdata; test ! -e /scratch/RESTORE_SUCCESS.json');
   });
   await context.test('inode exhaustion also fails closed without a large file', () => {
     const candidate = fixture(4, 256, 128);
@@ -401,6 +443,62 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
       shell(candidate, 'test ! -e /scratch/RESTORE_SUCCESS.json');
     });
   }
+  for (const mode of ['backup-revoked', 'scratch-revoked', 'parent-term'] as const) {
+    await context.test(`${mode} stops an in-flight restore and its descendants without a success receipt`, { timeout: 45_000 }, async () => {
+      const candidate = fixture();
+      seed(candidate);
+      restoreLeases(candidate);
+      const actualRestore = shell(candidate, 'command -v pg_restore').toString().trim();
+      write(candidate, '/tmp/bin/pg_restore', `#!/bin/sh\ncase "$*" in *--list*) exec ${actualRestore} "$@" ;; esac\ntrap '' TERM\nprintf '%s\\n' "$$" > /tmp/blocked-restore.pid\nsleep 100 &\nprintf '%s\\n' "$!" > /tmp/blocked-descendant.pid\nwait\n`);
+      shell(candidate, 'chmod 700 /tmp/bin/pg_restore');
+      const path = shell(candidate, 'printf %s "$PATH"').toString();
+      const environment = { ...restoreEnvironment, PGOPTIONS: '', EXPECTED_SOURCE_SHA256: expectedSha };
+      const command = [...restore.command];
+      command[2] = 'printf \'%s\\n\' "$$" > /tmp/restore-supervisor.pid\n' + command[2];
+      const child = spawn('docker', ['exec', '--env', `PATH=/tmp/bin:${path}`, ...Object.entries(environment).flatMap(([name, value]) => ['--env', `${name}=${value}`]), candidate, ...command], { stdio: 'ignore' });
+      const completed = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+      try {
+        let active = false;
+        for (let attempt = 0; attempt < 100 && child.exitCode === null; attempt++) {
+          if (shell(candidate, 'if test -s /tmp/blocked-descendant.pid; then printf active; fi').toString() === 'active') { active = true; break; }
+          await delay(100);
+        }
+        assert.ok(active, 'Must revoke during actual restore, not preflight');
+        shell(candidate, 'pg_ctl -D /scratch/pgdata status');
+        const stopped = performance.now();
+        shell(candidate, mode === 'parent-term' ? 'kill -TERM "$(cat /tmp/restore-supervisor.pid)"' : `rm /tmp/${mode.split('-')[0]}-volume.lease`);
+        assert.notEqual(await completed, 0);
+        const elapsed = performance.now() - stopped;
+        assert.ok(elapsed < 15_000, `Restore cleanup exceeded bound: ${elapsed}`);
+        shell(candidate, 'test ! -e /scratch/RESTORE_SUCCESS.json; test -d /scratch/pgdata');
+        assert.throws(() => shell(candidate, 'pg_ctl -D /scratch/pgdata status'));
+        shell(candidate, `cd ${archiveDirectory}; sha256sum -c ${archiveName}.sha256; test -f OFFHOST_COPY_VERIFIED`);
+        for (const pidFile of ['blocked-restore.pid', 'blocked-descendant.pid']) {
+          const state = shell(candidate, `owned_pid=$(cat /tmp/${pidFile}); if test -f /proc/$owned_pid/stat; then awk '{print $3}' /proc/$owned_pid/stat; else printf gone; fi`).toString().trim();
+          assert.ok(['gone', 'Z'].includes(state), `Owned restore descendant remains alive: ${state}`);
+        }
+        context.diagnostic(`Actual isolated restore cancellation: reason=${mode} wall_ms=${Math.round(elapsed)} no-success archive-preserved`);
+      } finally {
+        if (child.exitCode === null) child.kill('SIGKILL');
+      }
+    });
+  }
+  await context.test('two rootless CSI leases allow a real isolated restore but never ownership or application acceptance', () => {
+    const candidate = fixture();
+    seed(candidate);
+    restoreLeases(candidate);
+    run(candidate, restore.command, { ...restoreEnvironment, PGOPTIONS: '', EXPECTED_SOURCE_SHA256: expectedSha });
+    const receipt = JSON.parse(shell(candidate, 'cat /scratch/RESTORE_SUCCESS.json').toString());
+    assert.equal(receipt.archive_sha256, expectedSha);
+    assert.equal(receipt.archive_bytes, archive.length);
+    assert.equal(receipt.public_relations, 254);
+    assert.equal(receipt.backup_fs_uuid, 'fixture-backup');
+    assert.equal(receipt.scratch_fs_uuid, 'fixture-scratch');
+    assert.equal(receipt.original_ownership_acl_verified, false);
+    assert.equal(receipt.application_acceptance_verified, false);
+    assert.equal(receipt.physical_wal_protection_verified, false);
+    assert.throws(() => shell(candidate, 'pg_ctl -D /scratch/pgdata status'));
+  });
   await context.test('only a complete offhost copy, isolated restore and clean stop earn a digest-bound receipt', async () => {
     const candidate = fixture(512);
     const remote: Remote = (side, command, input) => {
