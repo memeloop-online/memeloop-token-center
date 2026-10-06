@@ -328,7 +328,6 @@ impl ProxySelection {
         Ok(true)
     }
 
-    #[cfg(test)]
     pub(crate) fn advance_after_connect_failure(
         &self,
         attempted: &[usize],
