@@ -22,7 +22,7 @@ def pinned_tests():
     try:
         docker(
             "run", "--name", name, "--network", "none", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges", "--user", "0:0", "--read-only",
+            "--security-opt", "no-new-privileges", "--user", "65532:65532", "--read-only",
             "--ulimit", "core=0:0", "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--mount", f"type=bind,source={SUPPORT},target=/support,readonly",
             "--entrypoint", "/usr/bin/python3", IMAGE,
@@ -41,7 +41,7 @@ def measure(limit):
     try:
         docker(
             "create", "--name", name, "--network", "none", "--cap-drop", "ALL", "--cap-add", "NET_RAW",
-            "--security-opt", "no-new-privileges", "--user", "65532:65532", "--read-only",
+            "--security-opt", "no-new-privileges", "--user", "0:0", "--read-only",
             "--memory", f"{limit}m", "--memory-swap", f"{limit}m", "--cpus", "0.2", "--pids-limit", "12",
             "--ulimit", "core=0:0", "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--mount", f"type=bind,source={SUPPORT},target=/support,readonly",
