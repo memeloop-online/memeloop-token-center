@@ -101,8 +101,13 @@ test('request detail follows terminal events and fences late responses after sel
     await ownedTooltip.waitFor();
     assert.equal(await ownedTooltip.evaluate((element) => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'only the drawer-owned portal remains in the accessible modal subtree');
     await page.locator('.drawer .close').focus();
-    await page.locator('.drawer .request-outcome').focus();
+    await ownedTooltip.waitFor({ state: 'hidden' });
+    const status = page.locator('.drawer .request-outcome');
+    await status.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    assert.equal(await status.evaluate(element => element === document.activeElement), true, 'Tab focuses the request outcome control');
     await ownedTooltip.waitFor();
+    assert.equal(await ownedTooltip.evaluate((element) => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'the keyboard-triggered tooltip remains in the accessible modal subtree');
     assert.match(await page.locator('.drawer .request-diagnostics').first().innerText(), /Awaiting settlement/);
     const modelDetails = page.locator('.drawer .request-detail-wide .request-metadata-trigger').first();
     await modelDetails.tap();
