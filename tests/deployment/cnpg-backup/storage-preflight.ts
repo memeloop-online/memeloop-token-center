@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { sourceBudget, sourceSample, sourceSpace } from './source-space.ts';
+import { sourceBudget } from './source-space.ts';
+import { readSourceFilesystem, sourceFilesystem } from './source-filesystem.ts';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 export const storagePath = join(directory, 'exact-storage.json');
@@ -130,7 +131,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   assert.deepEqual(selectedResources, storageResources.filter((resource: any) => selectedVolumes.some((volume: any) => [volume.name, volume.storageClass].includes(resource.metadata.name))));
   const kubectl = (args: string[], input?: string) => execFileSync('kubectl', ['--request-timeout=30s', ...args], { input, encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 ** 2 });
   const get = (args: string[]) => JSON.parse(kubectl([...args, '-o', 'json']));
-  const source = sourceSample(JSON.parse(kubectl(['get', '--raw', `/api/v1/nodes/${sourceSpace.node}/proxy/stats/summary`])));
+  const source = readSourceFilesystem((args, timeoutMs = 20_000) => {
+    try {
+      return execFileSync('kubectl', [timeoutMs === sourceFilesystem.processTimeoutMs ? '--request-timeout=8s' : '--request-timeout=15s', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2 });
+    } catch {
+      throw new Error('Read-only source identity/stat preflight failed');
+    }
+  });
   sourceBudget(source);
   const nodes = get(['-n', 'longhorn-system', 'get', 'nodes.longhorn.io']).items;
   const settingNames = ['storage-over-provisioning-percentage', 'storage-minimal-available-percentage', 'default-engine-image'];

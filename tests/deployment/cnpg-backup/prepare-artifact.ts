@@ -23,7 +23,7 @@ export function prepareArtifact(output: string, provenance: { testedCommit: stri
     'cnpg-hard-capacity-preparation.yaml': render(resources),
     'cnpg-export-preparation.yaml': render(selected),
   };
-  for (const name of ['source-space.ts', 'volume-identity.ts']) files[name] = readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
+  for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts']) files[name] = readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
   const digest = (value: string) => createHash('sha256').update(value).digest('hex');
   files['provenance.json'] = JSON.stringify({
     schema: 1, ...provenance, executionAuthorized: false, exportManifest: 'cnpg-export-preparation.yaml',
