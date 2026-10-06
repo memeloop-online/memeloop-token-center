@@ -24,7 +24,7 @@ after=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,FSROOT,MAJ:MIN -T "$PGDATA")
 test "$before" = "$after"
 printf 'mount_after=%s\\n' "$after"`;
 
-export const sourceStatCommand = ['setsid', '--fork', '--wait', 'timeout', '--signal=KILL', '8s', '/bin/sh', '-ec', sourceStatScript];
+export const sourceStatCommand = ['setsid', '--fork', '--wait', '/bin/sh', '-c', 'timeout --signal=KILL 8s /bin/sh -ec "$1"; status=$?; exit "$status"', 'source-statfs', sourceStatScript];
 
 export function verifySourceBinding(pod: any, claim: any, persistent: any, cluster: any) {
   const expected = sourceFilesystem;
