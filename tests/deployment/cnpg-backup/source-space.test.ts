@@ -39,6 +39,27 @@ test('watcher can target only its export pod, never a primary or source PVC', ()
   assert.throws(() => exportPod(changed));
 });
 
+test('sample telemetry preserves exact freshness boundaries and never emits invalid timestamp text', () => {
+  for (const [age, category] of [[-5001, 'SOURCE_SAMPLE_FUTURE'], [-5000, 'SOURCE_SAMPLE_FRESH'], [90000, 'SOURCE_SAMPLE_FRESH'], [90001, 'SOURCE_SAMPLE_STALE']] as const) {
+    const value = summary();
+    value.pods[0]!.volume[0]!.time = new Date(now - age).toISOString();
+    const events: Record<string, unknown>[] = [];
+    const inspect = () => sourceSample(value, now, fields => events.push(fields));
+    if (category === 'SOURCE_SAMPLE_FRESH') inspect();
+    else assert.throws(inspect);
+    assert.equal(events[0]!.category, category);
+    assert.equal(events[0]!.sampleAgeMs, age);
+    assert.equal(events[0]!.validatedAt, new Date(now).toISOString());
+  }
+  const value = summary();
+  value.pods[0]!.volume[0]!.time = 'sensitive-invalid-api-value';
+  const events: Record<string, unknown>[] = [];
+  assert.throws(() => sourceSample(value, now, fields => events.push(fields)));
+  assert.equal(events[0]!.category, 'SOURCE_SAMPLE_INVALID');
+  assert.equal(events[0]!.sourceSampleAt, null);
+  assert.doesNotMatch(JSON.stringify(events), /sensitive-invalid-api-value/);
+});
+
 test('one transient API timeout retries a complete observation without issuing a stale lease', async () => {
   let attempts = 0;
   let leases = 0;

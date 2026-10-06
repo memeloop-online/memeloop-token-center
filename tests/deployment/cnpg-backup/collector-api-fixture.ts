@@ -1,0 +1,32 @@
+import assert from 'node:assert/strict';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
+
+assert.equal(process.env.GITHUB_ACTIONS, 'true');
+const directory = process.env.COLLECTOR_FIXTURE_DIRECTORY!;
+const plan = JSON.parse(readFileSync(join(directory, 'plan.json'), 'utf8'));
+const statePath = join(directory, 'state.json');
+const state = JSON.parse(readFileSync(statePath, 'utf8'));
+const step = plan[state.index++];
+assert.ok(step, 'Unexpected collector API invocation');
+assert.ok(process.argv.includes('--request-timeout=15s'));
+for (const token of step.contains) assert.ok(process.argv.includes(token), `Expected fixture argument ${token}`);
+const started = performance.now();
+const response = step.reply;
+if (step.sample) {
+  let timestamp: string;
+  if (step.sample.mode === 'cached') timestamp = state.sampleTime;
+  else if (step.sample.mode === 'invalid') timestamp = 'SENSITIVE_API_BODY_SENTINEL';
+  else timestamp = new Date(Date.now() - (step.sample.ageMs ?? 0)).toISOString();
+  response.pods[0].volume[0].time = timestamp;
+  state.sampleTime = timestamp;
+}
+writeFileSync(statePath, JSON.stringify(state));
+appendFileSync(join(directory, 'calls.jsonl'), JSON.stringify({ index: state.index, event: 'start', observedAt: new Date().toISOString() }) + '\n');
+await delay(step.delayMs ?? 0);
+appendFileSync(join(directory, 'calls.jsonl'), JSON.stringify({ index: state.index, event: 'end', durationMs: performance.now() - started }) + '\n');
+if (step.stderr) process.stderr.write(step.stderr);
+process.stdout.write(typeof response === 'string' ? response : JSON.stringify(response ?? {}));
+process.exitCode = step.exitCode ?? 0;
