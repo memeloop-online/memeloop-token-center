@@ -37,11 +37,13 @@ def main():
     started = time.monotonic()
     measurements = {"baseline": memory()}
     STATE["measurements"] = measurements
+    status = Path("/proc/self/status").read_text()
     STATE["capabilities"] = {
         line.split(":", 1)[0]: line.split(":", 1)[1].strip()
-        for line in Path("/proc/self/status").read_text().splitlines()
-        if line.startswith(("CapEff:", "CapPrm:", "CapAmb:", "CapBnd:"))
+        for line in status.splitlines()
+        if line.startswith(("CapEff:", "CapPrm:", "CapAmb:", "CapBnd:", "CapInh:", "NoNewPrivs:"))
     }
+    helper.validate_capabilities(status)
     output = CountingSink()
 
     def consume(stream):
@@ -82,6 +84,8 @@ def main():
     print(json.dumps({
         "probe": "whole-cgroup-synthetic-assembly-with-idle-tcpdump",
         "python": sys.version.split()[0],
+        "uid": os.getuid(),
+        "capabilities": STATE["capabilities"],
         "blocks": assembler.block_count,
         "summary_bytes": output.length,
         "measurements": measurements,

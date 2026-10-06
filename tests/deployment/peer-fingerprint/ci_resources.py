@@ -22,7 +22,7 @@ def pinned_tests():
     try:
         docker(
             "run", "--name", name, "--network", "none", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges", "--user", "65532:65532", "--read-only",
+            "--security-opt", "no-new-privileges", "--user", "0:0", "--read-only",
             "--ulimit", "core=0:0", "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--mount", f"type=bind,source={SUPPORT},target=/support,readonly",
             "--entrypoint", "/usr/bin/python3", IMAGE,
@@ -103,6 +103,8 @@ def main():
         "commit": os.environ.get("HELPER_COMMIT"),
         "helper_sha256": hashlib.sha256((SUPPORT / "peer_fingerprint.py").read_bytes()).hexdigest(),
         "production_capture": False,
+        "capture_uid": 0,
+        "capture_identity_requires_parent_review": True,
         "measurements": [],
     }
     passed = False
@@ -122,7 +124,7 @@ def main():
             report["budget_change_requires_review"] = True
     except (subprocess.SubprocessError, ValueError, OSError):
         report["setup_failure"] = True
-    report["approved_32mib_gate_passed"] = passed
+    report["32mib_gate_passed"] = passed
     output = json.dumps(report, indent=2, sort_keys=True) + "\n"
     Path(os.environ["RUNNER_TEMP"], "peer-fingerprint-resource-report.json").write_text(output)
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:

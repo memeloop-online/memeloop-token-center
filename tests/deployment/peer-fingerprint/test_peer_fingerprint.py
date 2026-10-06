@@ -356,6 +356,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(command[0], "/usr/bin/tcpdump")
         self.assertIn("-p", command)
         self.assertIn("-nn", command)
+        self.assertEqual(command[command.index("-Z") + 1], "root")
         self.assertEqual(command[command.index("-w") + 1], "-")
         self.assertEqual(command[-1], "tcp port 2380 and ((src host 192.0.2.1 and dst host 192.0.2.2) or (src host 192.0.2.2 and dst host 192.0.2.1))")
 
@@ -371,6 +372,18 @@ class BoundaryTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(result["issues"], ["summary_budget"])
         self.assertNotIn("fixture", result)
+
+    def test_only_net_raw_and_no_new_privileges_are_accepted(self):
+        valid = "CapEff:\t2000\nCapPrm:\t2000\nCapBnd:\t2000\nCapInh:\t0\nCapAmb:\t0\nNoNewPrivs:\t1\n"
+        helper.validate_capabilities(valid)
+        for invalid in (
+            valid.replace("CapEff:\t2000", "CapEff:\t0"),
+            valid.replace("CapBnd:\t2000", "CapBnd:\t3000"),
+            valid.replace("CapAmb:\t0", "CapAmb:\t1000"),
+            valid.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+        ):
+            with self.assertRaises(helper.InvalidCapture):
+                helper.validate_capabilities(invalid)
 
 
 if __name__ == "__main__":

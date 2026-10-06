@@ -322,7 +322,20 @@ def supervise(command, consumer, duration):
 def capture_command(peers, interface="tailscale0"):
     first, second = (str(ipaddress.IPv4Address(peer)) for peer in peers)
     expression = f"tcp port 2380 and ((src host {first} and dst host {second}) or (src host {second} and dst host {first}))"
-    return ["/usr/bin/tcpdump", "-i", interface, "-p", "-nn", "-s", "0", "-B", "512", "-U", "-w", "-", expression]
+    return ["/usr/bin/tcpdump", "-i", interface, "-p", "-nn", "-Z", "root", "-s", "0", "-B", "512", "-U", "-w", "-", expression]
+
+
+def validate_capabilities(status):
+    fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+    net_raw = 1 << 13
+    for field in ("CapEff", "CapPrm", "CapBnd"):
+        if int(fields.get(field, "0"), 16) != net_raw:
+            raise InvalidCapture("net_raw_only_required")
+    for field in ("CapInh", "CapAmb"):
+        if int(fields.get(field, "0"), 16) & ~net_raw:
+            raise InvalidCapture("net_raw_only_required")
+    if fields.get("NoNewPrivs", "").strip() != "1":
+        raise InvalidCapture("no_new_privileges_required")
 
 
 def capture_statistics(diagnostic):
@@ -350,6 +363,8 @@ def safe_emit(summary, stream=sys.stdout):
 
 
 def run_capture(arguments):
+    with open("/proc/self/status") as status:
+        validate_capabilities(status.read())
     if not re.fullmatch("[0-9a-f]{32}", arguments.window_id):
         raise InvalidCapture("invalid_window_id")
     if arguments.endpoint not in ("left", "right") or not 1 <= arguments.duration <= 240:

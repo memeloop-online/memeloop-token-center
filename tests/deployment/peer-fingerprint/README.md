@@ -66,7 +66,7 @@ config: sha256:2298d942ce5f8e8083c036b6d62e129379998712ef78343f88d41d782d507141
 ```
 
 It checks the resolved config/architecture, then runs `/usr/bin/python3` with
-`/usr/bin/tcpdump` under **one total 32MiB / 200m cgroup**, nonroot UID/GID 65532,
+`/usr/bin/tcpdump` under **one total 32MiB / 200m cgroup**, proposed UID/GID 0,
 NET_RAW only, no-new-privileges, no writable root, no network, no swap and a 12-PID
 limit. The read-only support source is the only CI bind mount. No production
 hostPath is proposed. Tcpdump observes an idle isolated loopback interface with
@@ -75,6 +75,18 @@ the real capture child and watchdog live, Python fills the entire assembly budge
 from synthetic bytes and serializes a maximum-sized summary into a counting sink.
 The report records whole-cgroup `memory.peak`, OOM/exit status, timing and cleanup,
 not a misleading sum of process RSS. It does not measure production throughput.
+
+**Identity change requires parent review before production:** the initial
+nonroot Docker smoke failed, not from OOM. Run 37462208864, head `8b31bb64`,
+measured CapBnd=0x2000 but CapEff=CapPrm=CapAmb=0 and tcpdump permission rejection
+at both 32MiB and 64MiB. The revised CI tests UID 0, still nonprivileged with only
+NET_RAW, rather than adding SETUID/SETGID/NET_ADMIN, changing file capabilities,
+installing a launcher or changing node runtime configuration. The helper checks
+effective/permitted/bounding capabilities are exactly NET_RAW and requires
+NoNewPrivs=1. `tcpdump -Z root` suppresses the compiled default user transition;
+it does not grant capabilities. This behavior is explicit in the publisher's
+[tcpdump 4.99.6 source](https://github.com/the-tcpdump-group/tcpdump/blob/tcpdump-4.99.6/tcpdump.c).
+Green CI for this alternative is not approval to change the production identity.
 
 If 32MiB fails, a **CI-only 64MiB diagnostic measurement** is reported, but the
 required check remains failed even if that measurement succeeds. No production
@@ -85,8 +97,9 @@ each measurement. Resource evidence is a metadata-only seven-day GHA artifact.
 
 Actual capture needs exact-head green checks, review and the parent's explicit
 one-window confirmation. No capture Pod, ConfigMap or host change is created here.
-The approved design remains two temporary hostNetwork Pods, hostPID/hostIPC false,
-NET_RAW only, nonprivileged/nonroot, no SA token/Secret/hostPath/application PID,
+The proposed design remains two temporary hostNetwork Pods, hostPID/hostIPC false,
+NET_RAW only, nonprivileged, UID 0 subject to explicit identity review as above,
+no SA token/Secret/hostPath/application PID,
 32MiB/200m **total per Pod**, restartPolicy Never, activeDeadlineSeconds 300,
 terminationGracePeriodSeconds 2. Mount only the reviewed non-secret helper/settings
 read-only. Check exact helper SHA256, image identity and both-end readiness first;
