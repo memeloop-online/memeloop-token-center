@@ -7,7 +7,7 @@ import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
-import { sourceFilesystem, sourceStatScript } from './source-filesystem.ts';
+import { sourceFilesystem, sourceStatCommand } from './source-filesystem.ts';
 import { sourceInventory, sourceStatOutput } from './source-filesystem.fixture.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
@@ -35,7 +35,7 @@ function sourceCalls(options: { statDelayMs?: number; output?: string; after?: (
     { contains: ['get', 'pod', sourceSpace.pod], reply: before.pod },
     { contains: ['get', 'pvc', sourceSpace.claim], reply: before.claim },
     { contains: ['get', 'pv', sourceFilesystem.persistent], reply: before.persistent },
-    { contains: ['exec', sourceSpace.pod, '-c', 'postgres', 'timeout', '-k', '1s', '8s', '/bin/sh', '-ec', sourceStatScript], requestTimeout: '--request-timeout=8s', reply: options.output ?? sourceStatOutput(), delayMs: options.statDelayMs ?? 0 },
+    { contains: ['exec', sourceSpace.pod, '-c', 'postgres', ...sourceStatCommand], requestTimeout: '--request-timeout=8s', reply: options.output ?? sourceStatOutput(), delayMs: options.statDelayMs ?? 0 },
     { contains: ['get', 'clusters.postgresql.cnpg.io'], reply: after.cluster },
     { contains: ['get', 'pvc', sourceSpace.claim], reply: after.claim },
     { contains: ['get', 'pv', sourceFilesystem.persistent], reply: after.persistent },
@@ -175,12 +175,15 @@ test('stat API timeout is ten seconds, a complete retry recollects identity and 
   const timeout = recovered.events.find(event => event.phase === 'source-statfs' && event.category === 'API_TIMEOUT');
   assert.ok(timeout.durationMs >= 10000 && timeout.durationMs < 15000);
   assert.equal(recovered.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 1);
-  const terminated = sourceCalls().slice(0, 5);
-  Object.assign(terminated[4]!, { exitCode: 124, reply: sentinel });
-  const result = await run(context, terminated);
-  assert.equal(result.status, 1);
-  assert.equal(result.events.at(-1).category, 'SOURCE_STAT_TIMEOUT');
-  assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+  for (const exitCode of [124, 137]) {
+    const terminated = sourceCalls().slice(0, 5);
+    Object.assign(terminated[4]!, { exitCode, reply: sentinel });
+    const result = await run(context, terminated);
+    assert.equal(result.status, 1);
+    assert.equal(result.events.at(-1).category, 'SOURCE_STAT_TIMEOUT');
+    assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+    assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
+  }
 });
 
 test('real timed-out API subprocess is bounded, redacted and retried with a complete fresh collection', { timeout: 120_000 }, async context => {

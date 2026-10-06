@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
-import { assertSourceFresh, parseSourceStat, sourceFilesystem, sourceStatScript, verifySourceBinding } from './source-filesystem.ts';
+import { assertSourceFresh, parseSourceStat, sourceFilesystem, sourceStatCommand, verifySourceBinding } from './source-filesystem.ts';
 import { sourceInventory, sourceStatOutput } from './source-filesystem.fixture.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
@@ -66,7 +66,7 @@ test('same CNPG image executes the exact stat shell and kills only its timed-out
   const image = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
   execFileSync('docker', ['pull', image], { timeout: 180_000, stdio: ['ignore', 'pipe', 'pipe'] });
   const docker = (args: string[], input?: string) => execFileSync('docker', args, { input, encoding: 'utf8', timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'] });
-  const container = docker(['run', '-d', '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=26:26', '--tmpfs', '/tmp:rw,exec,size=16m,uid=26,gid=26', '--tmpfs', `${sourceFilesystem.mount}:rw,size=32m,uid=26,gid=26`, '--env', `PGDATA=${sourceFilesystem.pgdata}`, '--entrypoint=/bin/sleep', image, '180']).trim();
+  const container = docker(['run', '-d', '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=26:26', '--tmpfs', '/tmp:rw,exec,size=16m,uid=26,gid=26', '--tmpfs', '/scratch:rw,size=128m,uid=26,gid=26', '--tmpfs', `${sourceFilesystem.mount}:rw,size=32m,uid=26,gid=26`, '--env', `PGDATA=${sourceFilesystem.pgdata}`, '--entrypoint=/bin/sleep', image, '180']).trim();
   context.after(() => docker(['rm', '-f', container]));
   const shell = (script: string) => docker(['exec', container, '/bin/sh', '-ec', script]);
   const write = (path: string, text: string) => docker(['exec', '-i', container, 'dd', `of=${path}`, 'status=none'], text);
@@ -78,7 +78,7 @@ test('same CNPG image executes the exact stat shell and kills only its timed-out
   write('/tmp/bin/findmnt', `#!/bin/sh\nprintf '%s\\n' '${sourceFilesystem.mount} /dev/longhorn/${sourceFilesystem.persistent} xfs / 65:48'\n`);
   shell('chmod 700 /tmp/bin/findmnt');
   const path = shell('printf %s "$PATH"');
-  const args = ['exec', '--env', `PATH=/tmp/bin:${path}`, container, 'timeout', '-k', '1s', '8s', '/bin/sh', '-ec', sourceStatScript];
+  const args = ['exec', '--env', `PATH=/tmp/bin:${path}`, container, ...sourceStatCommand];
   const actual = docker(args);
   assert.match(actual, /statfs=[0-9 ]+tmpfs [a-fA-F0-9]+/);
   const counters = actual.split('\n')[1]!.slice('statfs='.length).split(' ').slice(0, 6).map(Number);
@@ -89,11 +89,31 @@ test('same CNPG image executes the exact stat shell and kills only its timed-out
   write('/tmp/bin/stat', '#!/bin/sh\ntrap "" TERM\nsleep 120 &\nwait\n');
   shell('chmod 700 /tmp/bin/stat');
   const started = performance.now();
-  assert.throws(() => docker(args));
-  assert.ok(performance.now() - started >= 8000 && performance.now() - started < 12000);
+  assert.throws(() => docker(args), (error: any) => error.status === 137);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed >= 8000 && elapsed < 10000);
   assert.equal(docker(['inspect', '-f', '{{.State.Running}}', container]).trim(), 'true');
-  const remaining = docker(['top', container, '-eo', 'pid,ppid,pgid,stat,comm']).trim().split('\n').slice(1).filter(line => !line.trim().split(/\s+/)[3]!.startsWith('Z'));
+  const liveProcesses = () => docker(['top', container, '-eo', 'pid,ppid,pgid,stat,comm']).trim().split('\n').slice(1).filter(line => !line.trim().split(/\s+/)[3]!.startsWith('Z'));
+  const remaining = liveProcesses();
   assert.equal(remaining.length, 1, `Metadata process leak: ${remaining.join('; ')}`);
   assert.equal(remaining[0]!.trim().split(/\s+/).at(-1), 'sleep');
-  context.diagnostic(`Same-image statfs tool smoke and timeout passed; fake mount identity, real tmpfs counters; timeout wall_ms=${performance.now() - started}`);
+  context.diagnostic(`Same-image statfs tool smoke and timeout passed; fake mount identity, real tmpfs counters; timeout wall_ms=${elapsed}; remaining=${remaining.join('; ')}`);
+  shell('mkdir /scratch/socket; initdb -D /scratch/source -U postgres --auth-local=trust --auth-host=reject >/tmp/init.log; pg_ctl -D /scratch/source -l /tmp/postgres.log -o "-c listen_addresses= -c unix_socket_directories=/scratch/socket -c shared_buffers=8MB -c max_connections=10" -w start');
+  docker(['exec', '-d', container, '/bin/sh', '-ec', 'printf "%s\\n" "$$" > /tmp/unrelated.pid; exec sleep 120']);
+  shell('timeout 2s /bin/sh -ec \'while test ! -s /tmp/unrelated.pid; do sleep 0.01; done\'');
+  const protectedProcesses = liveProcesses();
+  const protectedPids = protectedProcesses.map(line => line.trim().split(/\s+/)[0]!).sort();
+  assert.ok(protectedProcesses.some(line => line.trim().split(/\s+/).at(-1) === 'postgres'));
+  for (const blocked of ['stat', 'findmnt']) {
+    if (blocked === 'findmnt') write('/tmp/bin/findmnt', '#!/bin/sh\ntrap "" TERM\nsleep 120 &\nwait\n');
+    const timed = performance.now();
+    assert.throws(() => docker(args), (error: any) => error.status === 137);
+    const duration = performance.now() - timed;
+    assert.ok(duration >= 8000 && duration < 10000);
+    const survivors = liveProcesses();
+    assert.deepEqual(survivors.map(line => line.trim().split(/\s+/)[0]!).sort(), protectedPids, `Leaked metadata or signalled another session: ${survivors.join('; ')}`);
+    shell('pg_ctl -D /scratch/source status; kill -0 "$(cat /tmp/unrelated.pid)"');
+    assert.equal(shell('psql -h /scratch/socket -U postgres -d postgres -Atc "SELECT 1"').trim(), '1');
+    context.diagnostic(`Same-image blocked ${blocked}: wall_ms=${duration}; only protected PG/other-session processes remain: ${survivors.join('; ')}`);
+  }
 });

@@ -24,6 +24,8 @@ after=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,FSROOT,MAJ:MIN -T "$PGDATA")
 test "$before" = "$after"
 printf 'mount_after=%s\\n' "$after"`;
 
+export const sourceStatCommand = ['setsid', '--fork', '--wait', 'timeout', '--signal=KILL', '8s', '/bin/sh', '-ec', sourceStatScript];
+
 export function verifySourceBinding(pod: any, claim: any, persistent: any, cluster: any) {
   const expected = sourceFilesystem;
   for (const [resource, name, uid] of [[pod, expected.pod, expected.podUID], [claim, expected.claim, expected.claimUID], [persistent, expected.persistent, expected.persistentUID]]) {
@@ -129,7 +131,7 @@ export function readSourceFilesystem(read: (args: string[], timeoutMs?: number) 
   };
   const before = binding('before');
   const execStartedAt = new Date(timer.wall()).toISOString();
-  const output = read(['-n', expected.namespace, 'exec', expected.pod, '-c', expected.container, '--', 'timeout', '-k', '1s', '8s', '/bin/sh', '-ec', sourceStatScript], expected.processTimeoutMs);
+  const output = read(['-n', expected.namespace, 'exec', expected.pod, '-c', expected.container, '--', ...sourceStatCommand], expected.processTimeoutMs);
   const execCompletedAt = new Date(timer.wall()).toISOString();
   const counters = parseSourceStat(output);
   const after = binding('after');
