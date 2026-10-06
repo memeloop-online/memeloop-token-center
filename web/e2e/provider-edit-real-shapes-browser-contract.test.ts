@@ -5,7 +5,7 @@ import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { providerEditShape } from './fixtures/provider-edit-shapes.js';
 
-test('real Codex config shapes keep proxy primary and preserve advanced edits and unknown data', { timeout: 90_000 }, async () => {
+test('real Codex config shapes localize transport controls and preserve advanced edits and unknown data', { timeout: 90_000 }, async () => {
   const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
@@ -44,6 +44,20 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
       await workspace.getByLabel('连接尝试次数').waitFor();
       assert.doesNotMatch(await workspace.innerText(), /Pre-delivery|Maximum inactivity|One absolute budget/);
       await workspace.getByText('建立连接的等待时限，必须小于请求总超时。', { exact: true }).waitFor();
+      await workspace.getByText('运行时传输策略', { exact: true }).waitFor();
+      await workspace.getByText('单位见各字段；这些设置影响该账号的所有请求。', { exact: true }).waitFor();
+      for (const title of ['最大 SSE 事件（字节）', '单个网络分片最大帧数据量（字节）', '终止事件最大暂存量（字节）',
+        '内存排队超时（毫秒）', '调度最大并发数', '调度队列容量', '调度排队超时（毫秒）']) {
+        await workspace.getByLabel(title, { exact: true }).waitFor();
+      }
+      for (const [title, description] of [
+        ['Chat 控制策略', '默认策略（provider_default）会校验并移除不受支持的 Chat 采样和输出限制参数；上游使用自身默认值，不保证请求指定的采样设置或词元上限。显式选择严格策略（strict）时，仅接受中性的采样值，并拒绝输出限制提示。额度预留仍使用可信的模型上限。'],
+        ['Responses 输出限制', '默认策略（provider_default）会校验并移除客户端的输出限制提示；上游使用自身默认值，不强制执行请求指定的词元上限。由于 Codex OAuth 无法保证该限制，显式选择严格策略（strict）时会拒绝任何输出限制提示。额度始终按可信的模型上限预留，并按观测到的实际用量结算。'],
+      ]) {
+        await workspace.getByLabel(title, { exact: true }).waitFor();
+        await workspace.getByText(description, { exact: true }).waitFor();
+      }
+      assert.doesNotMatch(await workspace.innerText(), /Maximum SSE|Maximum framed|Maximum terminal|Memory queue timeout|dispatch_max_in_flight|dispatch_max_queued|dispatch_queue_timeout_millis|Chat controls|Responses output limits|Provider default validates/);
       await retry.click();
       await advanced.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('网络访问范围', { exact: false }).waitFor();
@@ -73,7 +87,7 @@ test('real Codex config shapes keep proxy primary and preserve advanced edits an
         name: 'synthetic.automation.account@example.invalid', tenant_external_id: 'fixture', expected_updated_at: shape === 'retry-only' ? 2 : 1,
         config: { base_url: 'https://chatgpt.com/backend-api/codex', ...original,
           reservation_token_bounds: { ...original.reservation_token_bounds, [model]: 72000 } },
-      }, 'only the edited reservation changes; absent timeouts stay absent and explicit overrides are retained');
+      }, 'only the edited reservation changes; absent fields, zero queue capacity and policy enum values are retained');
       await page.getByRole('button', { name: '编辑', exact: true }).click();
       await advanced.click();
       assert.equal(await bound.inputValue(), '72000');
