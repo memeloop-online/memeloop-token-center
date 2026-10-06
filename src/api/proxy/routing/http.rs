@@ -3,6 +3,7 @@ use bytes::Bytes;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
+const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 fn log_preparation_failure(request_id: Uuid, account_id: Uuid, error: Option<&AppError>) {
     let failure_category = error
@@ -225,15 +226,7 @@ async fn translate_new_api_compact_v2(
     let status = response.status();
     let version = response.version();
     let mut headers = response.headers().clone();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(ProxySendError::AmbiguousResponse(
-            "upstream_invalid_response",
-        ));
-    }
+    let bytes = read_compact_body(response.bytes_stream(), MAX_COMPACT_RESPONSE_BYTES).await?;
     if !status.is_success() {
         let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
             Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
@@ -278,11 +271,127 @@ async fn translate_new_api_compact_v2(
     })
 }
 
+async fn read_compact_body<Error>(
+    stream: impl futures_util::Stream<Item = Result<Bytes, Error>>,
+    limit: usize,
+) -> Result<Bytes, ProxySendError> {
+    tokio::pin!(stream);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(ProxySendError::AmbiguousResponse(
+                "upstream_invalid_response",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    fn compact_response(status: StatusCode, body: &'static str) -> reqwest::Response {
+        http::Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(reqwest::Body::from(body))
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn compact_translation_preserves_upstream_error_status_headers_and_body() {
+        let response = translate_new_api_compact_v2(
+            compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let mut stream = response.bytes_stream();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"private-canary error")
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_translation_never_returns_completed_for_failed_or_incomplete_body() {
+        for body in [
+            r#"{"status":"failed","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
+            r#"{"status":"incomplete","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
+        ] {
+            for wrap_as_sse in [false, true] {
+                let result = translate_new_api_compact_v2(
+                    compact_response(StatusCode::OK, body),
+                    wrap_as_sse,
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(ProxySendError::AmbiguousResponse(
+                        "upstream_invalid_response"
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_body_limit_accepts_exact_boundary_and_empty_chunks() {
+        let stream = futures_util::stream::iter([
+            Ok::<_, &'static str>(Bytes::from_static(b"ab")),
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(b"cd")),
+        ]);
+        assert_eq!(
+            read_compact_body(stream, 4).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_body_limit_stops_on_first_overflow_chunk() {
+        for chunks in [
+            vec![b"abcde".as_slice()],
+            vec![b"ab".as_slice(), b"cde".as_slice()],
+        ] {
+            let stream = futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok::<_, &'static str>(Bytes::from_static(chunk))),
+            )
+            .chain(futures_util::stream::poll_fn(|_| {
+                panic!("oversized compact body must stop before polling again")
+            }));
+            assert!(matches!(
+                read_compact_body(stream, 4).await,
+                Err(ProxySendError::AmbiguousResponse(
+                    "upstream_invalid_response"
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_body_read_failure_preserves_ambiguous_nonreplayable_error() {
+        let stream =
+            futures_util::stream::iter([Ok(Bytes::from_static(b"partial")), Err("private-canary")]);
+        assert!(matches!(
+            read_compact_body(stream, 64).await,
+            Err(ProxySendError::AmbiguousResponse(
+                "upstream_invalid_response"
+            ))
+        ));
+    }
 
     #[test]
     fn preparation_logs_only_fixed_categories_and_dispatch_state() {

@@ -131,6 +131,125 @@ fn packed_generation_and_epoch_cannot_wrap_into_an_old_ticket() {
     assert!(groups.select(account_id, 2, &source).is_err());
 }
 
+#[test]
+fn stale_failure_cannot_overwrite_a_concurrent_selection_round_trip() {
+    let account_id = Uuid::nil();
+    let groups = groups(account_id, 1);
+    let source = credential();
+    let stale = groups.select(account_id, 1, &source).unwrap();
+    let concurrent = groups.select(account_id, 1, &source).unwrap();
+    assert!(concurrent.advance_after_connect_failure(&[0]).unwrap());
+    let backup = groups.select(account_id, 1, &source).unwrap();
+    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
+    let returned = groups.select(account_id, 1, &source).unwrap();
+    assert_eq!(returned.member(), Some(0));
+    assert_eq!(returned.generation, stale.generation + 2);
+    assert!(!stale.advance_after_connect_failure(&[0]).unwrap());
+    assert_eq!(
+        stale.advance_after_connect_failure_outcome(&[0]).unwrap(),
+        "contended"
+    );
+    let preserved = groups.select(account_id, 1, &source).unwrap();
+    assert_eq!(preserved.member(), returned.member());
+    assert_eq!(preserved.generation, returned.generation);
+}
+
+#[test]
+fn request_local_exclusion_visits_untried_members_without_changing_global_stickiness() {
+    let account_id = Uuid::nil();
+    let proxies = [
+        PRIMARY,
+        BACKUP,
+        "socks5h://10.20.30.42:1080",
+        "socks5h://10.20.30.43:1080",
+    ];
+    let groups = TransportProxyGroups::parse(
+        &serde_json::json!([{
+            "account_id": account_id, "version": 1, "proxies": proxies
+        }])
+        .to_string(),
+        KEY,
+    )
+    .unwrap();
+    let source = credential();
+    let global = groups.select(account_id, 1, &source).unwrap();
+    let mut attempted = Vec::new();
+    for (index, proxy) in proxies.into_iter().enumerate() {
+        let mut selected = groups.select(account_id, 1, &source).unwrap();
+        assert!(selected.select_unattempted(&attempted).unwrap());
+        assert_eq!(selected.member(), Some(index));
+        assert_eq!(selected.member_index(), Some(index));
+        assert_eq!(selected.member_count(), 4);
+        assert_eq!(selected.group_selection_version(), Some(1));
+        assert_eq!(selected.generation, global.generation);
+        assert_eq!(selected.credential.proxy().unwrap().0, proxy);
+        assert_eq!(selected.is_request_local(), index != 0);
+        attempted.push(index);
+        if index != 0 {
+            assert_eq!(
+                selected
+                    .advance_after_connect_failure_outcome(&attempted)
+                    .unwrap(),
+                "request_local"
+            );
+        }
+        let preserved = groups.select(account_id, 1, &source).unwrap();
+        assert_eq!(preserved.member(), Some(0));
+        assert_eq!(preserved.generation, global.generation);
+    }
+    let mut exhausted = groups.select(account_id, 1, &source).unwrap();
+    assert!(!exhausted.select_unattempted(&attempted).unwrap());
+    assert_eq!(
+        exhausted
+            .advance_after_connect_failure_outcome(&attempted)
+            .unwrap(),
+        "no_untried_member"
+    );
+}
+
+#[test]
+fn request_local_exclusion_rejects_invalidated_binding_or_credential_snapshot() {
+    for invalidation in ["binding", "observed_generation", "newer_token"] {
+        let account_id = Uuid::nil();
+        let groups = groups(account_id, 1);
+        let source = credential();
+        let mut stale = groups.select(account_id, 1, &source).unwrap();
+        let entry = &groups.groups[&account_id];
+        match invalidation {
+            "binding" => entry.blocked.store(true, Ordering::Release),
+            "observed_generation" => entry.observed_generation.store(2, Ordering::Release),
+            "newer_token" => {
+                groups.select(account_id, 2, &source).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let preserved = entry.state.load(Ordering::Acquire);
+        assert!(stale.select_unattempted(&[0]).is_err());
+        assert!(!stale.advance_after_connect_failure(&[0]).unwrap());
+        assert_eq!(entry.state.load(Ordering::Acquire), preserved);
+    }
+}
+
+#[test]
+fn request_local_exclusion_preserves_ungrouped_and_single_member_retry_policy() {
+    for proxies in [vec![], vec![PRIMARY]] {
+        let account_id = Uuid::nil();
+        let input = if proxies.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{
+                "account_id": account_id, "version": 1, "proxies": proxies
+            }])
+        };
+        let groups = TransportProxyGroups::parse(&input.to_string(), KEY).unwrap();
+        let mut selected = groups.select(account_id, 1, &credential()).unwrap();
+        assert_eq!(selected.member_count(), proxies.len());
+        assert_eq!(selected.member(), None);
+        assert!(selected.select_unattempted(&[0]).unwrap());
+        assert!(!selected.is_request_local());
+    }
+}
+
 async fn account(database: &Database) -> Uuid {
     database
         .create_upstream_account(

@@ -24,7 +24,7 @@ pub(super) async fn enable_provider_default_limits(fixture: &CodexRouteFixture) 
 }
 
 #[tokio::test]
-async fn codex_provider_default_limit_hints_preserve_trusted_reservation_and_observed_settlement() {
+async fn codex_default_limit_hints_preserve_trusted_reservation_and_observed_settlement() {
     for (protocol, stream, limit) in [
         ("responses", false, 16),
         ("responses", true, 1),
@@ -33,7 +33,6 @@ async fn codex_provider_default_limit_hints_preserve_trusted_reservation_and_obs
     ] {
         let label = format!("output-hint-{protocol}-{stream}");
         let fixture = codex_route_fixture(&label).await;
-        enable_provider_default_limits(&fixture).await;
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))

@@ -1,7 +1,7 @@
 -- Rebuild every compact observability projection for one completed UTC day.
 -- The caller supplies :day and runs this file with ON_ERROR_STOP enabled.
 BEGIN;
-SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SET LOCAL lock_timeout = '5s';
 SELECT pg_advisory_xact_lock(
   hashtextextended('memeloop-token-center:request-stats', 734627102948314)
@@ -28,6 +28,37 @@ SELECT true
   FROM mtc_reconcile_day_bounds
  WHERE end_ms > (extract(epoch FROM (CURRENT_DATE::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 
+INSERT INTO mtc_reconcile_completed_day_guard (invalid)
+SELECT true FROM mtc_reconcile_day_bounds b
+ WHERE EXISTS (SELECT 1 FROM observability_prune_boundaries p
+                WHERE p.scope = 'global' AND b.day_bucket < p.before_day)
+    OR EXISTS (SELECT 1 FROM request_records r
+                JOIN metered_usage_projection_outbox m ON m.reservation_id = r.reservation_id
+               WHERE r.created_at >= b.start_ms AND r.created_at < b.end_ms
+                 AND m.projected_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = r.id));
+
+INSERT INTO request_stats_facts (
+  request_id, tenant_id, key_id, created_at, model, protocol, status_class,
+  error_code, upstream_account_id, model_route_id, duration_ms,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  generation_units, billing_unit, service_tier, currency, cost_micros, session_id
+)
+SELECT t.request_id, t.tenant_id, t.key_id, t.created_at, t.model, t.protocol,
+       CASE WHEN t.status_code BETWEEN 200 AND 399 AND t.error_code = '' THEN 'success' ELSE 'failure' END,
+       t.error_code, t.upstream_account_id, t.model_route_id, t.duration_ms,
+       t.input_tokens, t.output_tokens, t.cached_input_tokens, t.cache_write_tokens,
+       t.generation_units, t.billing_unit, t.service_tier, t.currency,
+       COALESCE((SELECT c.corrected_fact_cost_micros FROM request_cost_projection_corrections c
+                  WHERE c.request_id = t.request_id ORDER BY c.applied_at DESC, c.correction_version DESC LIMIT 1),
+                CASE WHEN (t.status_code < 200 OR t.status_code >= 400 OR t.error_code <> '')
+                           AND t.usage_basis <> 'provider_reported' THEN 0 ELSE t.cost_micros END),
+       t.session_id
+  FROM terminal_projection_outbox t CROSS JOIN mtc_reconcile_day_bounds b
+ WHERE t.created_at >= b.start_ms AND t.created_at < b.end_ms
+   AND t.projected_at IS NOT NULL AND t.statistics_outcome = 'applied'
+ON CONFLICT (request_id) DO NOTHING;
+
 INSERT INTO request_stats_facts (
   request_id, tenant_id, key_id, created_at, model, protocol, status_class,
   error_code, upstream_account_id, model_route_id, duration_ms,
@@ -45,6 +76,7 @@ SELECT r.id, r.tenant_id, r.key_id, r.created_at, r.model, r.protocol,
   CROSS JOIN mtc_reconcile_day_bounds b
  WHERE r.created_at >= b.start_ms AND r.created_at < b.end_ms
    AND r.completed_at IS NOT NULL AND r.status_code IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = r.id)
 ON CONFLICT (request_id) DO UPDATE SET
   tenant_id = excluded.tenant_id,
   key_id = excluded.key_id,
@@ -68,6 +100,9 @@ ON CONFLICT (request_id) DO UPDATE SET
 DELETE FROM request_stats_facts f
  USING mtc_reconcile_day_bounds b
  WHERE f.created_at >= b.start_ms AND f.created_at < b.end_ms
+   AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t
+                    WHERE t.request_id = f.request_id AND t.projected_at IS NOT NULL
+                      AND t.statistics_outcome = 'applied')
    AND NOT EXISTS (
      SELECT 1
        FROM request_records r
@@ -89,8 +124,8 @@ INSERT INTO request_daily_aggregates (
 )
 SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol,
        f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
-       f.service_tier, f.currency, COUNT(*), COALESCE(SUM(f.input_tokens), 0),
-       COALESCE(SUM(f.output_tokens), 0), COALESCE(SUM(f.cached_input_tokens), 0),
+       f.service_tier, f.currency, COUNT(*), COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END), 0),
+       COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END), 0), COALESCE(SUM(f.cached_input_tokens), 0),
        COALESCE(SUM(f.cache_write_tokens), 0), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0), COALESCE(SUM(f.cost_micros), 0)
   FROM request_stats_facts f
@@ -131,10 +166,12 @@ INSERT INTO usage_analysis_hourly (
   duration_bucket_6, duration_bucket_7, duration_bucket_8, duration_bucket_9,
   duration_bucket_10, duration_bucket_11, cost_micros
 )
-SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
+SELECT f.tenant_id, f.key_id, f.created_at / 3600000,
+       CASE WHEN f.protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END, f.model,
        CASE
          WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
          WHEN f.protocol = 'openai-image' THEN 'openai-image'
+         WHEN f.protocol = 'audio-transcription' THEN 'audio-transcription'
          ELSE 'openai'
        END,
        f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
@@ -143,7 +180,7 @@ SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
          WHEN f.input_tokens >= f.cached_input_tokens + f.cache_write_tokens
          THEN f.input_tokens - f.cached_input_tokens - f.cache_write_tokens ELSE 0 END), 0),
        COALESCE(SUM(f.output_tokens), 0), COALESCE(SUM(f.cached_input_tokens), 0),
-       COALESCE(SUM(f.cache_write_tokens), 0), 0, COUNT(*),
+       COALESCE(SUM(f.cache_write_tokens), 0), COALESCE(SUM(f.generation_units), 0), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0),
        COALESCE(SUM(CASE WHEN f.duration_ms <= 10 THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN f.duration_ms > 10 AND f.duration_ms <= 50 THEN 1 ELSE 0 END), 0),
@@ -162,9 +199,11 @@ SELECT f.tenant_id, f.key_id, f.created_at / 3600000, 'request', f.model,
   CROSS JOIN mtc_reconcile_day_bounds b
  WHERE f.created_at >= b.start_ms AND f.created_at < b.end_ms
  GROUP BY f.tenant_id, f.key_id, f.created_at / 3600000, f.model,
+          CASE WHEN f.protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END,
           CASE
             WHEN f.protocol = 'anthropic' OR f.protocol LIKE 'anthropic-%' THEN 'anthropic'
             WHEN f.protocol = 'openai-image' THEN 'openai-image'
+            WHEN f.protocol = 'audio-transcription' THEN 'audio-transcription'
             ELSE 'openai'
           END,
           f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
