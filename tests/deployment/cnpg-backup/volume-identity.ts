@@ -13,8 +13,17 @@ export const stageIdentity = {
 
 export type InventoryReader = (args: string[]) => string;
 
-export function verifyStageBinding(claim: any, persistent: any, volume: any, replicas: any[]): void {
-  const expected = stageIdentity;
+export const archiveIdentity: typeof stageIdentity = {
+  ...stageIdentity, name: 'mtc-pg-bounded-archive-20261005', node: 'versetensor-hv',
+  claimUID: 'dd506d1e-0dbc-43c8-8d5f-b8138b769c76',
+  persistentUID: 'fbfd4a51-af78-4cf1-9d6f-524fdb2be140',
+  longhornUID: '670bac6f-4249-4513-980f-2b80569330bd',
+  diskUUID: 'da83ab44-d26f-4c20-b956-87fa954cd603', diskPath: '/var/lib/longhorn/',
+  filesystemUUID: 'd9b22ac2-180f-4f24-a00d-9ea3d8fd3d90',
+  device: '/dev/longhorn/mtc-pg-bounded-archive-20261005',
+};
+
+export function verifyStageBinding(claim: any, persistent: any, volume: any, replicas: any[], expected = stageIdentity): void {
   for (const [resource, uid] of [[claim, expected.claimUID], [persistent, expected.persistentUID], [volume, expected.longhornUID]]) {
     assert.equal(resource.metadata.name, expected.name);
     assert.equal(resource.metadata.uid, uid, 'Reviewed NEW volume identity changed');
@@ -52,12 +61,15 @@ export function verifyStageBinding(claim: any, persistent: any, volume: any, rep
 }
 
 export function attestStageVolume(read: InventoryReader, pod: any, clock: () => number = Date.now): string {
+  return attestBackupVolume(read, pod, stageIdentity, 'export', clock);
+}
+
+export function attestBackupVolume(read: InventoryReader, pod: any, expected: typeof stageIdentity, containerName: string, clock: () => number = Date.now): string {
   const observed = Math.floor(clock() / 1000);
-  const expected = stageIdentity;
   assert.equal(pod.metadata.namespace, expected.namespace);
   assert.equal(pod.spec.nodeName, expected.node);
   assert.match(pod.metadata.uid, /^[a-zA-Z0-9-]{1,64}$/);
-  const container = pod.spec.containers.find((entry: any) => entry.name === 'export');
+  const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
   const environment = (name: string) => container.env.find((entry: any) => entry.name === name);
   assert.equal(environment('EXPECTED_BACKUP_FS_UUID').value, expected.filesystemUUID);
   assert.equal(environment('EXPECTED_BACKUP_DEVICE').value, expected.device);
@@ -69,6 +81,7 @@ export function attestStageVolume(read: InventoryReader, pod: any, clock: () => 
     get(['get', 'pv', expected.name]),
     get(['-n', 'longhorn-system', 'get', 'volumes.longhorn.io', expected.name]),
     get(['-n', 'longhorn-system', 'get', 'replicas.longhorn.io', '-l', `longhornvolume=${expected.name}`]).items,
+    expected,
   );
   const plugins = get(['-n', 'longhorn-system', 'get', 'pods', '-l', 'app=longhorn-csi-plugin']).items.filter((candidate: any) =>
     candidate.spec.nodeName === expected.node && candidate.status.phase === 'Running' && !candidate.metadata.deletionTimestamp &&
