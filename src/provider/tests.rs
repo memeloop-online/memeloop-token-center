@@ -644,13 +644,13 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
         codex
             .config_schema
             .pointer("/properties/transport_policy/properties/chat_controls/default"),
-        Some(&json!("strict"))
+        Some(&json!("provider_default"))
     );
     assert_eq!(
         codex
             .config_schema
             .pointer("/properties/transport_policy/properties/responses_output_limits/default"),
-        Some(&json!("strict"))
+        Some(&json!("provider_default"))
     );
     for (field, bound, expected) in [
         ("version", "enum", json!([1])),

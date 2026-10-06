@@ -26,8 +26,8 @@
 
 Codex OAuth 路由会把文本 Chat Completions 转为 Codex Responses。原生 Codex 请求不会向该上游发送 `max_tokens`、`max_completion_tokens` 或 `max_output_tokens`，因此这些字段不能被宣称为已执行的生成硬上限。
 
-默认的 `transport_policy.chat_controls: strict` 会拒绝带这些上限字段的 Chat 请求；`transport_policy.responses_output_limits: strict` 对 Responses 同理，并明确报出无法保证硬上限。如果业务必须执行硬上限，应使用真正支持并执行该限制的已授权路由，不能仅为消除报错而启用兼容模式。
+未设置时，`transport_policy.chat_controls` 与 `transport_policy.responses_output_limits` 均使用 `provider_default`。合法的 Chat 采样字段及输出上限提示经校验后，无法由 Codex transport 表达的控制字段会被剥离，上游采用自身默认行为；不承诺执行用户指定的 temperature、top-p、penalty、seed、stop 或输出长度。已有显式 `strict` 配置继续生效：仅接受中性采样值，并拒绝任何输出上限提示。需要强制执行指定参数或硬上限的业务，应使用真正支持该能力的已授权路由。
 
-管理员可分别为 Chat 设置 `chat_controls: provider_default`、为 Responses 设置 `responses_output_limits: provider_default`。此模式只接受一个正整数且有界的上限提示，验证后从上游请求剥离，实际输出长度由 Codex 决定。空值、非法值、冲突字段及客户端提交的预留额度元数据均被拒绝。这是兼容提示，**不是** 16 token 或其他数值的硬限制。认证和额度准入保持不变；预留依据运营方可信的模型上界，而非客户端较小的提示；最终按观测到的上游用量结算一次，未知用量和客户端取消仍保持现有保守结算行为。
+管理员可在 Codex 账号上分别显式选择两个策略。`provider_default` 模式只接受一个正整数且有界的上限提示，验证后从上游请求剥离，实际输出长度由 Codex 决定。空值、非法值、冲突字段及客户端提交的预留额度元数据均被拒绝。这是兼容提示，**不是** 16 token 或其他数值的硬限制。认证和额度准入保持不变；预留依据运营方可信的模型上界，而非客户端较小的提示；最终按观测到的上游用量结算一次，未知用量和客户端取消仍保持现有保守结算行为。
 
-开启策略后，以获授权的合成请求验证 `/v1/responses` 的 `max_output_tokens: 16` 和 Chat 的 `max_tokens: 16`，确认上游成功、单笔预留完成结算、用量来自上游，且两个字段都未进入 Codex 上游报文。不要重放私有 WorkBuddy 请求。
+验收缺省行为或显式 `provider_default` 策略时，以获授权的合成请求验证 `/v1/responses` 的 `max_output_tokens: 16` 和 Chat 的 `max_tokens: 16`，确认上游成功、单笔预留完成结算、用量来自上游，且两个字段都未进入 Codex 上游报文。不要重放私有 WorkBuddy 请求。

@@ -3218,6 +3218,7 @@ fn assert_codex_chat_wire(request: &wiremock::Request, upstream_model: &str) {
 #[tokio::test]
 async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
     let fixture = codex_route_fixture("preadmission").await;
+    set_codex_chat_control_policy(&fixture, "strict").await;
     fixture
         .state
         .db
@@ -3344,9 +3345,8 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
 }
 
 #[tokio::test]
-async fn codex_provider_default_chat_controls_are_validated_then_removed() {
+async fn codex_default_chat_controls_are_validated_then_removed() {
     let fixture = codex_route_fixture("provider-default-chat-controls").await;
-    set_codex_chat_control_policy(&fixture, "provider_default").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
