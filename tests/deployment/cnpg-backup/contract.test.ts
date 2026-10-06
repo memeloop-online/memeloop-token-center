@@ -88,6 +88,15 @@ test('reviewed contracts and negative mutations fail closed independently of pro
   execFileSync('/tmp/kubeconform', ['-strict', '-summary', '-exit-on-error', ...names.map(name => join(directory, name))], { timeout: 90_000 });
 });
 
+test('invalid copy rates fail before any remote operation', async () => {
+  let calls = 0;
+  const remote: Remote = () => { calls++; throw new Error('No remote operation expected'); };
+  for (const rate of [0, -1, 2, 4.5, 16, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await assert.rejects(copyArchive(remote, '0'.repeat(64), undefined, false, archiveDirectory, rate), /Copy rate must/);
+  }
+  assert.equal(calls, 0);
+});
+
 function createContainer(): string {
   const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
     '--tmpfs', '/tmp:rw,exec,size=64m,uid=26,gid=26', '--tmpfs', '/backup:rw,size=128m,uid=26,gid=26', '--tmpfs', '/scratch:rw,size=256m,uid=26,gid=26',
@@ -165,6 +174,7 @@ test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full r
   const sleeps: number[] = [];
   await copyArchive(remote, expectedSha, async milliseconds => { sleeps.push(milliseconds!); });
   assert.ok(sleeps.every(milliseconds => milliseconds > 0 && milliseconds <= 4000));
+  assert.equal(sleeps.reduce((total, milliseconds) => total + milliseconds, 0), (size - copyChunk) / 1024 / 1024 * 1000);
   shell(destination, `test -f ${archiveDirectory}/OFFHOST_COPY_VERIFIED`);
   assert.equal(shell(destination, `sha256sum ${archiveDirectory}/${archiveName}`).toString().split(' ')[0], expectedSha);
   const restoreOutput = docker(['exec', '--env', 'PARENT_REVIEW_APPROVED=true', '--env', `EXPECTED_SOURCE_SHA256=${expectedSha}`, destination, ...restoreContainer.command]);
