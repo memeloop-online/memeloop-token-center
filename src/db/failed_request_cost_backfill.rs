@@ -2068,15 +2068,30 @@ mod tests {
             .append_pair("options", &format!("-c search_path={schema}"));
         let contract_fixture = fixture(isolated.as_str(), None).await;
         exercise_backfill(&contract_fixture).await;
-        let exact_fixture = fixture(isolated.as_str(), None).await;
+        let exact_schema = format!("exact_failed_cost_backfill_{}", Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {exact_schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut exact_isolated = Url::parse(&database_url).unwrap();
+        exact_isolated
+            .query_pairs_mut()
+            .append_pair("options", &format!("-c search_path={exact_schema}"));
+        let exact_fixture = fixture(exact_isolated.as_str(), None).await;
         exercise_exact_manifest(&exact_fixture).await;
+        exact_fixture.database.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {exact_schema} CASCADE"
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         let provider_fixture = fixture(isolated.as_str(), None).await;
         exercise_provider_reported_fact_repair(&provider_fixture).await;
         let concurrency_fixture = fixture(isolated.as_str(), None).await;
         exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
             .await;
         contract_fixture.database.close().await;
-        exact_fixture.database.close().await;
         provider_fixture.database.close().await;
         concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
