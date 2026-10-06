@@ -9,6 +9,7 @@ import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 declare global {
   interface Window {
     claudePendingFixture: {
+      initializedAt: number;
       calls: { at: number; body: unknown; aborted: boolean }[];
       release: (index: number, status: number, body: unknown) => void;
     };
@@ -29,12 +30,16 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
   context.after(() => assert.deepEqual(pageErrors, []));
   const time = new Date('2026-10-06T12:00:00Z');
   await page.clock.install({ time });
+  await page.clock.setFixedTime(time);
   await page.clock.pauseAt(time);
+  await page.clock.setSystemTime(time);
+  assert.equal(await page.evaluate(() => Date.now()), time.getTime(), 'the clock is paused at the original epoch before navigation');
   await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
   await page.addInitScript(`(() => {
     const previous = window.fetch;
     const releases = [];
     const state = window.claudePendingFixture = {
+      initializedAt: Date.now(),
       calls: [],
       release: (index, status, body) => releases[index](new Response(JSON.stringify(body), { status }))
     };
@@ -70,6 +75,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
     return route.fulfill({ json: { session_token: 'synthetic-pending-session', login_url: `${origin}/mock-provider`, expires_at: time.getTime() + expiresIn } });
   });
   await page.goto(`${origin}/e2e/fixtures/authorization-code.html?${scopeControls ? 'scope-controls' : 'full-page'}`);
+  assert.deepEqual(await page.evaluate(() => ({ initializedAt: window.claudePendingFixture.initializedAt, now: Date.now() })), { initializedAt: time.getTime(), now: time.getTime() }, 'application initialization must observe the original paused epoch');
   const chinese = locale.startsWith('zh');
   const add = page.getByRole('button', { name: chinese ? '新增上游' : 'Add upstream', exact: true });
   if (reauthorize) {
@@ -103,6 +109,18 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
   };
   return { page, account, workspace, code, complete, start, close, add, copy, calls, release, pending, checking, retained, reads: () => reads, statisticsReads: () => statisticsReads, starts: () => starts };
 }
+
+test('Claude fixture starts at the original paused epoch and Date advances exactly with explicit ticks', { timeout: 60_000 }, async context => {
+  const journey = await fixture(context);
+  const epoch = Date.parse('2026-10-06T12:00:00Z');
+  assert.equal(await journey.page.evaluate(() => Date.now()), epoch);
+  await journey.page.clock.runFor(999);
+  assert.equal(await journey.page.evaluate(() => Date.now()), epoch + 999);
+  await journey.page.clock.runFor(1);
+  assert.equal(await journey.page.evaluate(() => Date.now()), epoch + 1000);
+  assert.equal((await journey.calls()).length, 0);
+  await journey.retained();
+});
 
 for (const locale of ['zh-CN', 'en']) test(`Claude pending stays in the authorization workspace until a real account arrives (${locale})`, { timeout: 60_000 }, async context => {
   const journey = await fixture(context, { locale, reauthorize: true });
