@@ -146,6 +146,7 @@ else process.exit(1);
   const child = spawn(process.execPath, [join(directory, 'copy-guard.ts'), 'destination', value.pod.metadata.name, value.pod.metadata.uid], {
     env: { ...process.env, PARENT_REVIEW_APPROVED: 'true', COPY_FIXTURE: root, PATH: `${root}:${process.env.PATH}` }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
+  assert.ok(child.stdout);
   const exited = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
   context.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; rmSync(root, { recursive: true, force: true }); });
   await new Promise<void>((resolve, reject) => {
