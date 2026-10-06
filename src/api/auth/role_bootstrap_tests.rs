@@ -21,7 +21,8 @@ async fn bootstrap_requires_an_explicit_control_serving_role() {
     let (mut state, _directory) = test_state().await;
     for configured in [
         "isolated-custom-bootstrap-token-at-least-32-bytes",
-        DISABLED_BOOTSTRAP_SERVICE_TOKEN,
+        DISABLED_BOOTSTRAP_SERVICE_TOKENS[0],
+        DISABLED_BOOTSTRAP_SERVICE_TOKENS[1],
     ] {
         Arc::make_mut(&mut state.config).service_token = configured.to_owned();
         for role in [None, Some(RuntimeRole::Gateway), Some(RuntimeRole::Worker)] {
@@ -36,35 +37,52 @@ async fn bootstrap_requires_an_explicit_control_serving_role() {
 }
 
 #[tokio::test]
-async fn disabled_sentinel_cannot_bootstrap_even_on_control_or_all() {
+async fn disabled_literals_cannot_bootstrap_even_on_control_or_all() {
     let (mut state, _directory) = test_state().await;
-    Arc::make_mut(&mut state.config).service_token = DISABLED_BOOTSTRAP_SERVICE_TOKEN.to_owned();
-    for role in [RuntimeRole::Gateway, RuntimeRole::Control, RuntimeRole::All] {
-        let application = router_for_role(state.clone(), role);
-        let response = application
-            .clone()
-            .oneshot(authenticated_get(
-                "/metrics",
-                DISABLED_BOOTSTRAP_SERVICE_TOKEN,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let response = application
-            .oneshot(authenticated_get(
-                "/internal/v1/keys",
-                DISABLED_BOOTSTRAP_SERVICE_TOKEN,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            if role.serves_control() {
-                StatusCode::UNAUTHORIZED
-            } else {
-                StatusCode::NOT_FOUND
+    for disabled in DISABLED_BOOTSTRAP_SERVICE_TOKENS {
+        Arc::make_mut(&mut state.config).service_token = disabled.to_owned();
+        for role in [RuntimeRole::Gateway, RuntimeRole::Control, RuntimeRole::All] {
+            let application = router_for_role(state.clone(), role);
+            let response = application
+                .clone()
+                .oneshot(authenticated_get("/metrics", disabled))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = application
+                .oneshot(authenticated_get("/internal/v1/keys", disabled))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if role.serves_control() {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn disabled_literal_matching_does_not_reject_similar_control_tokens() {
+    let (mut state, _directory) = test_state().await;
+    for disabled in DISABLED_BOOTSTRAP_SERVICE_TOKENS {
+        for configured in [format!("{disabled}-custom"), format!("custom-{disabled}")] {
+            Arc::make_mut(&mut state.config).service_token = configured.clone();
+            for role in [RuntimeRole::Control, RuntimeRole::All] {
+                let application = router_for_role(state.clone(), role);
+                for path in ["/metrics", "/internal/v1/keys"] {
+                    let response = application
+                        .clone()
+                        .oneshot(authenticated_get(path, &configured))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                }
             }
-        );
+        }
     }
 }
 
@@ -123,7 +141,11 @@ async fn gateway_scoped_metrics_identity_is_not_promoted_to_bootstrap() {
     assert_eq!(identity.service_id, Some(issued.service_id));
     assert!(identity.allows("metrics:read"));
     assert!(!identity.allows("keys:write"));
-    for configured in [issued.token.as_str(), DISABLED_BOOTSTRAP_SERVICE_TOKEN] {
+    for configured in [
+        issued.token.as_str(),
+        DISABLED_BOOTSTRAP_SERVICE_TOKENS[0],
+        DISABLED_BOOTSTRAP_SERVICE_TOKENS[1],
+    ] {
         Arc::make_mut(&mut state.config).service_token = configured.to_owned();
         let response = router_for_role(state.clone(), RuntimeRole::Gateway)
             .oneshot(authenticated_get("/metrics", &issued.token))
@@ -141,6 +163,40 @@ async fn gateway_scoped_metrics_identity_is_not_promoted_to_bootstrap() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn disabled_bootstrap_configuration_preserves_scoped_control_identity() {
+    let (mut state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "isolated-control-metrics".to_owned(),
+                scopes: vec!["metrics:read".to_owned()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    for disabled in DISABLED_BOOTSTRAP_SERVICE_TOKENS {
+        Arc::make_mut(&mut state.config).service_token = disabled.to_owned();
+        for role in [RuntimeRole::Control, RuntimeRole::All] {
+            let application = router_for_role(state.clone(), role);
+            let response = application
+                .clone()
+                .oneshot(authenticated_get("/metrics", &issued.token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = application
+                .oneshot(authenticated_get("/internal/v1/keys", &issued.token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
 }
 
 #[tokio::test]
@@ -175,7 +231,6 @@ async fn gateway_metrics_still_requires_active_metrics_scope() {
 #[tokio::test]
 async fn gateway_client_key_authentication_does_not_use_bootstrap() {
     let (mut state, _directory) = test_state().await;
-    Arc::make_mut(&mut state.config).service_token = DISABLED_BOOTSTRAP_SERVICE_TOKEN.to_owned();
     let issued = state
         .db
         .create_key(
@@ -192,30 +247,36 @@ async fn gateway_client_key_authentication_does_not_use_bootstrap() {
         )
         .await
         .unwrap();
-    let application = router_for_role(state, RuntimeRole::Gateway);
-    let response = application
-        .clone()
-        .oneshot(authenticated_get("/v1/models", &issued.key))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = application
-        .oneshot(authenticated_get(
-            "/v1/models",
-            DISABLED_BOOTSTRAP_SERVICE_TOKEN,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    for disabled in DISABLED_BOOTSTRAP_SERVICE_TOKENS {
+        Arc::make_mut(&mut state.config).service_token = disabled.to_owned();
+        let application = router_for_role(state.clone(), RuntimeRole::Gateway);
+        let response = application
+            .clone()
+            .oneshot(authenticated_get("/v1/models", &issued.key))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = application
+            .oneshot(authenticated_get("/v1/models", disabled))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[test]
-fn chart_disabled_token_is_the_reserved_non_authenticating_value() {
-    assert!(
+fn chart_disabled_tokens_are_the_reserved_non_authenticating_values() {
+    let templates = [
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/charts/memeloop-token-center/templates/deployment.yaml"
-        ))
-        .contains(&format!("value: \"{DISABLED_BOOTSTRAP_SERVICE_TOKEN}\""))
-    );
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/charts/memeloop-token-center/templates/migration-job.yaml"
+        )),
+    ];
+    for (template, disabled) in templates.into_iter().zip(DISABLED_BOOTSTRAP_SERVICE_TOKENS) {
+        assert!(template.contains(&format!("value: \"{disabled}\"")));
+    }
 }

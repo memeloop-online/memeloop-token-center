@@ -25,7 +25,10 @@ use super::proxy_diagnostics;
 const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const CONTROL_BODY_PERMIT_WAIT: Duration = Duration::from_secs(1);
 const CONTROL_BODY_READ_CONCURRENCY: usize = 4;
-const DISABLED_BOOTSTRAP_SERVICE_TOKEN: &str = "bootstrap-disabled-for-this-role";
+const DISABLED_BOOTSTRAP_SERVICE_TOKENS: [&str; 2] = [
+    "bootstrap-disabled-for-this-role",
+    "bootstrap-disabled-for-migration",
+];
 
 #[cfg(test)]
 mod role_bootstrap_tests;
@@ -539,7 +542,7 @@ pub(super) async fn authenticated_service(
     let bootstrap_enabled = state
         .service_auth_role
         .is_some_and(crate::config::RuntimeRole::serves_control)
-        && state.config.service_token != DISABLED_BOOTSTRAP_SERVICE_TOKEN;
+        && !DISABLED_BOOTSTRAP_SERVICE_TOKENS.contains(&state.config.service_token.as_str());
     let service = if bootstrap_enabled
         && crypto::constant_time_eq(provided.as_bytes(), state.config.service_token.as_bytes())
     {
