@@ -71,5 +71,6 @@ test "$table_count" -ge 254
 archive=/backup/mtc-pg-logical-20261004/memeloop_token_center.dump
 ` + receipt + String.raw`
 capacity_restore
+cat /scratch/RESTORE_SUCCESS.json
 `;
 }
