@@ -47,7 +47,12 @@ test('independent export artifact binds tested revision, includes dependency-fre
     assert.equal(value('BACKUP_MAX_BYTES'), String(32 * 1024 ** 3));
     assert.equal(value('BACKUP_MIN_BYTES'), String(30 * 1024 ** 3));
     assert.equal(value('HARD_CAPACITY_REVIEW_APPROVED'), 'false');
-    assert.equal(value('PARENT_REVIEW_APPROVED'), 'false');
+    if (resource.metadata.name.includes('bounded-stage')) assert.equal(value('PARENT_REVIEW_APPROVED'), 'false');
+    else {
+      assert.equal(value('PARENT_REVIEW_APPROVED'), undefined);
+      assert.equal(resource.spec.template.spec.volumes.find((entry: any) => entry.name === 'backup').persistentVolumeClaim.readOnly, true);
+      assert.ok(resource.spec.template.spec.containers[0].command[2].includes('capacity_backup || exit 1'));
+    }
   }
   const expandedExport = expanded.find(resource => resource.kind === 'Job' && resource.metadata.name.includes('bounded-stage'));
   assert.equal(expandedExport.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'BACKUP_RATE_MIB_PER_SECOND').value, '1');
