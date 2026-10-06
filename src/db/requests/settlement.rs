@@ -760,7 +760,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
         ));
     }
     if old_micros == reserved_micros && old_tokens == reserved_tokens {
-        return Ok(reservation.clone());
+        return replace_reservation_price_in_transaction(tx, reservation, price).await;
     }
     if !key.policy.enforcement_mode.enforces_prepaid_limits() {
         let updated = sqlx::query(
@@ -785,7 +785,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
         let mut resized = reservation.clone();
         resized.reserved_micros = reserved_micros;
         resized.reserved_tokens = reserved_tokens;
-        return Ok(resized);
+        return replace_reservation_price_in_transaction(tx, &resized, price).await;
     }
     if reserved_tokens > key.policy.tokens_per_minute as i64 {
         return Err(AppError::LimitExceeded {
@@ -925,6 +925,28 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     let mut resized = reservation.clone();
     resized.reserved_micros = reserved_micros;
     resized.reserved_tokens = reserved_tokens;
+    replace_reservation_price_in_transaction(tx, &resized, price).await
+}
+
+async fn replace_reservation_price_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    reservation: &UsageReservation,
+    price: &ModelPrice,
+) -> Result<UsageReservation, AppError> {
+    let snapshot = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
+    let updated = sqlx::query("UPDATE usage_reservations SET price_id = $1, price_snapshot_json = $2 WHERE id = $3 AND account_id = $4 AND key_id = $5 AND status = 'reserved'")
+        .bind(price.id.to_string()).bind(snapshot).bind(reservation.id.to_string())
+        .bind(reservation.account_id.to_string()).bind(reservation.key_id.to_string())
+        .execute(&mut **transaction).await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "proxy reservation changed before price snapshot update".into(),
+        ));
+    }
+    let mut resized = reservation.clone();
+    resized.input_micros_per_million = price.input_micros_per_million;
+    resized.output_micros_per_million = price.output_micros_per_million;
+    resized.price_tiers = price.tiers.clone();
     Ok(resized)
 }
 

@@ -218,7 +218,7 @@ async fn buffered_codex_cache_usage_is_settled_at_distinct_prices() {
         .state
         .db
         .upsert_model_price_tier(
-            &fixture.model,
+            &fixture.upstream_model,
             "USD",
             "default",
             Decimal::ONE,
@@ -308,7 +308,7 @@ async fn streaming_codex_cache_usage_is_settled_at_distinct_prices() {
         .state
         .db
         .upsert_model_price_tier(
-            &fixture.model,
+            &fixture.upstream_model,
             "USD",
             "default",
             Decimal::ONE,

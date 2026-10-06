@@ -272,6 +272,10 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
         .await
         .unwrap();
     assert_eq!(
+        archive_refs.view.upstream_model.as_deref(),
+        Some("workflow-v1")
+    );
+    assert_eq!(
         archive_refs.view.archive_state,
         memeloop_token_center::model::RequestArchiveState::MetadataOnly
     );
@@ -404,7 +408,7 @@ async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
         .get("external_id");
     let selected_route = database
         .create_model_route(CreateModelRouteInput {
-            tenant_external_id,
+            tenant_external_id: tenant_external_id.clone(),
             public_model: "image-test".to_owned(),
             upstream_account_id: upstream_id,
             upstream_model: "workflow-frozen".to_owned(),
@@ -521,6 +525,28 @@ async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
             .upstream_model,
         "workflow-frozen"
     );
+
+    let key_detail = database
+        .request_archive_refs(key.key_id, preparing.job_id)
+        .await
+        .unwrap();
+    let tenant_detail = database
+        .request_archive_refs_for_tenant(&tenant_external_id, preparing.job_id)
+        .await
+        .unwrap();
+    let global_detail = database
+        .request_archive_refs_global(preparing.job_id)
+        .await
+        .unwrap();
+    for detail in [key_detail, tenant_detail, global_detail] {
+        assert_eq!(detail.view.model, "image-test");
+        assert_eq!(
+            detail.view.upstream_model.as_deref(),
+            Some("workflow-frozen")
+        );
+        assert_eq!(detail.view.upstream_account_id, Some(upstream_id));
+        assert_eq!(detail.view.route_id, Some(selected_route.id));
+    }
 
     // An unavailable account is never replaced by another provider candidate.
     sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")

@@ -42,6 +42,8 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&116));
     assert!(!versions.contains(&114));
     assert!(versions.contains(&115));
+    assert!(versions.contains(&118));
+    assert!(versions.contains(&119));
     for statement in [
         "DROP TABLE terminal_projection_outbox",
         "DROP TABLE observability_prune_boundaries",
@@ -68,7 +70,11 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118)")
+    sqlx::query("ALTER TABLE request_records DROP COLUMN upstream_model")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119)")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -118,6 +124,13 @@ async fn upgrade_contract(database: &Database) {
             .await
             .unwrap();
     assert_eq!(applied_at, replayed_at);
+    let tail: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM schema_migrations WHERE version >= 117 ORDER BY version",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(tail, vec![117, 118, 119]);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
@@ -131,6 +144,18 @@ async fn upgrade_contract(database: &Database) {
         .fetch_optional(&database.pool)
         .await
         .unwrap();
+}
+
+#[test]
+fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() {
+    for migrations in [SQLITE_MIGRATIONS, POSTGRES_MIGRATIONS] {
+        let tail: Vec<i64> = migrations
+            .iter()
+            .filter(|migration| migration.version >= 117)
+            .map(|migration| migration.version)
+            .collect();
+        assert_eq!(tail, vec![117, 118, 119]);
+    }
 }
 
 #[tokio::test]

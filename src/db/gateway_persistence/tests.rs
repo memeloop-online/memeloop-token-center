@@ -78,6 +78,7 @@ impl Fixture {
                 &Bytes::from_static(b"{\"input\":\"acceptance\"}"),
                 PEPPER,
                 false,
+                None,
             )
             .await
     }

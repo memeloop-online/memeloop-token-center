@@ -622,6 +622,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable terminal projection and observability prune boundary",
         sql: include_str!("../../../migrations/common/0118_terminal_projection_outbox.sql"),
     },
+    Migration {
+        version: 119,
+        name: "request upstream model snapshot",
+        sql: include_str!("../../../migrations/common/0119_request_upstream_model_snapshot.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1227,6 +1232,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 118,
         name: "durable terminal projection and observability prune boundary",
         sql: include_str!("../../../migrations/common/0118_terminal_projection_outbox.sql"),
+    },
+    Migration {
+        version: 119,
+        name: "request upstream model snapshot",
+        sql: include_str!("../../../migrations/common/0119_request_upstream_model_snapshot.sql"),
     },
 ];
 
