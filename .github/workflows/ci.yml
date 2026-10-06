@@ -963,6 +963,19 @@ jobs:
           name: cnpg-hard-capacity-preparation
           path: ${{ runner.temp }}/cnpg-hard-capacity-preparation
           if-no-files-found: error
+      - name: Exercise rootless offhost CSI leases and independent copy bundle
+        timeout-minutes: 5
+        run: node --test tests/deployment/cnpg-backup/copy-guard.test.ts tests/deployment/cnpg-backup/prepare-copy-artifact.test.ts
+      - name: Render independently traceable suspended copy preparation (never deploy)
+        env:
+          BACKUP_SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node tests/deployment/cnpg-backup/prepare-copy-artifact.ts "$RUNNER_TEMP/cnpg-copy-preparation"
+      - name: Upload standalone copy preparation with upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cnpg-copy-preparation
+          path: ${{ runner.temp }}/cnpg-copy-preparation
+          if-no-files-found: error
       - name: Validate release workflow and Docker build contracts
         run: node --test tests/ops/release-packaging-contract.test.ts
       - name: Validate fail-closed BuildKit attestation verification

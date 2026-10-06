@@ -5,6 +5,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { stringify } from 'yaml';
 import { capacityPolicy } from './capacity-policy.ts';
+import { copyContainerCommand } from './copy-guard.ts';
 import { archiveDirectory, archiveName, copyArchive, type Remote } from './copy.ts';
 import { boundedClaims, boundedJobs, preparedResources } from './hard-capacity.ts';
 import { storagePlan, validateStorageResources } from './storage-preflight.ts';
@@ -196,6 +197,27 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     shell(candidate, 'rm /tmp/empty-uuid');
     write(candidate, '/tmp/backup-volume.lease', lease.replace('fixture-backup', 'wrong-uuid'));
     assert.throws(() => check(candidate, { ...environment, EXPECTED_BACKUP_FS_UUID: 'wrong-uuid' }));
+  });
+  await context.test('rootless copy guardian stops when its real 45-second lease expires and preserves partial bytes', { timeout: 65_000 }, async () => {
+    const candidate = fixture();
+    const path = shell(candidate, 'printf %s "$PATH"').toString();
+    shell(candidate, `touch /tmp/empty-uuid; mkdir -p ${archiveDirectory}; printf preserved > ${archiveDirectory}/${archiveName}.partial`);
+    write(candidate, '/tmp/backup-volume.lease', `${Math.floor(Date.now() / 1000)} fixture-pod /dev/fixture fixture-backup 8:32`);
+    const started = performance.now();
+    const child = spawn('docker', ['exec', '--env', `PATH=/tmp/bin:${path}`, '--env', 'BACKUP_UUID_ATTESTATION=external-csi-lease',
+      '--env', 'EXPECTED_BACKUP_DEVICE=/dev/fixture', '--env', 'POD_UID=fixture-pod', candidate, '/bin/sh', '-ec', copyContainerCommand], { stdio: 'ignore' });
+    const completed = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+    try {
+      await delay(2500);
+      assert.equal(child.exitCode, null, 'Fresh CSI lease must allow the guardian to run');
+      assert.notEqual(await completed, 0);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed >= 43_000 && elapsed < 60_000, `Actual lease expiry boundary changed: ${elapsed}`);
+      assert.equal(shell(candidate, `cat ${archiveDirectory}/${archiveName}.partial`).toString(), 'preserved');
+      shell(candidate, `test ! -e ${archiveDirectory}/OFFHOST_COPY_VERIFIED; test ! -e ${archiveDirectory}/LOCAL_ARCHIVE_CREATED; test ! -e /scratch/RESTORE_SUCCESS.json`);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }
   });
   await context.test('inode exhaustion also fails closed without a large file', () => {
     const candidate = fixture(4, 256, 128);
