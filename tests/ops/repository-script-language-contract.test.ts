@@ -5,8 +5,6 @@ import test from 'node:test';
 import { repository, run } from './contract-helpers.ts';
 
 test('repository scripts enforce Node 24 policy with exact reviewed stdlib diagnostic exceptions', () => {
-  // These reviewed deployment diagnostics use the pinned image's Python stdlib
-  // to keep tcpdump, the parser, and the watchdog together within 32Mi.
   const reviewedStdlibDiagnosticPaths = new Set([
     'tests/deployment/peer-fingerprint/ci_probe.py',
     'tests/deployment/peer-fingerprint/ci_resources.py',
