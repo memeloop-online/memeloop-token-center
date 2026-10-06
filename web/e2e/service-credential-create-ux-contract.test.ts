@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { chromium } from 'playwright';
+import { chromium, type Locator } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 declare global {
@@ -116,14 +116,28 @@ test('service credential creation validates the draft and issues only a read-onl
   assert.equal(await form.getByRole('checkbox', { name: '管理客户端凭据 (keys:write)' }).isChecked(), false);
   const scopeHints = form.locator('.service-credential-scope-option > span[aria-label]');
   assert.ok(await scopeHints.count() > 20, 'each supported permission has a supplemental explanation');
+  const assertScopeHintWithKeyboard = async (trigger: Locator, hint: string) => {
+    const tooltip = page.getByRole('tooltip', { name: hint, exact: true });
+    await trigger.press('Shift+Tab');
+    assert.equal(await trigger.evaluate(element => element.contains(document.activeElement)), false, 'Shift+Tab leaves the scope help trigger');
+    await tooltip.waitFor({ state: 'hidden' });
+    await page.keyboard.press('Tab');
+    assert.equal(await trigger.evaluate(element => element === document.activeElement), true, 'Tab focuses the exact scope help trigger');
+    await tooltip.waitFor({ state: 'visible' });
+    assert.equal(await tooltip.innerText(), hint, 'the focused permission exposes its exact explanation');
+
+    for (let step = 0; step < 2 && await trigger.evaluate(element => element.contains(document.activeElement)); step += 1) {
+      await page.keyboard.press('Tab');
+    }
+    assert.equal(await trigger.evaluate(element => element.contains(document.activeElement)), false, 'Tab leaves the scope help trigger and its checkbox');
+    await tooltip.waitFor({ state: 'hidden' });
+  };
   for (let index = 0; index < await scopeHints.count(); index += 1) {
     const hint = (await scopeHints.nth(index).getAttribute('aria-label'))?.replace(/^\S+: /, '');
     assert.ok(hint);
-    await scopeHints.nth(index).focus();
-    await page.getByRole('tooltip', { name: hint, exact: true }).waitFor();
+    await assertScopeHintWithKeyboard(scopeHints.nth(index), hint);
   }
-  await form.locator('[aria-label^="requests:read:"]').focus();
-  await page.getByRole('tooltip').filter({ hasText: '读取请求记录、监控快照和用量分析' }).waitFor();
+  await assertScopeHintWithKeyboard(form.locator('[aria-label^="requests:read:"]'), '读取请求记录、监控快照和用量分析；不允许写入。');
 
   await metrics.uncheck();
   await requests.uncheck();
