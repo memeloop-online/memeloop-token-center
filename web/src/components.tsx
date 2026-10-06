@@ -9,7 +9,7 @@ import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
 import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
-import { requestErrorCopy, requestFailureCause } from './requestStatusPresentation';
+import { requestErrorCopy, requestFailureCause, requestStatusCopy } from './requestStatusPresentation';
 import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -248,7 +248,7 @@ export function RequestDiagnostics({
   const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
-  const failureCause = requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
+  const failureCause = pending || requestStatusCopy(request, locale).cause ? null : requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>

@@ -104,6 +104,33 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(recordedText, /Production Codex/);
     assert.match(recordedText, /Research key/);
     assert.doesNotMatch(recordedText, new RegExp(`${upstreamId}|${routeId}|${requestId}|${sessionId}`), 'technical identifiers are supplemental, not permanent detail rows');
+    for (const [surface, cause] of [
+      [recordedDiagnostics, 'The upstream connection was reset'],
+      [historicalGapDiagnostics, 'Reading the upstream response timed out'],
+    ] as const) {
+      const detailText = await surface.innerText();
+      assert.equal(detailText.split(cause).length - 1, 1, 'the main detail shows its recorded cause once');
+      assert.equal((await surface.textContent() ?? '').split(cause).length - 1, 1, 'duplicate cause DOM must be removed, not hidden by CSS');
+      const statusBadge = surface.locator('.request-outcome > small');
+      assert.equal(await statusBadge.count(), 1, 'the detail has exactly one recorded status badge');
+      assert.equal(await statusBadge.innerText(), '429');
+      assert.equal(await statusBadge.textContent(), '429');
+      const detailWithoutStatusBadge = await surface.evaluate(element => {
+        const detail = element.cloneNode(true) as HTMLElement;
+        detail.querySelector('.request-outcome > small')?.remove();
+        return detail.textContent ?? '';
+      });
+      assert.doesNotMatch(detailWithoutStatusBadge, /429/, 'the recorded status code appears only in its status badge');
+      assert.doesNotMatch(detailText, /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
+      assert.equal(await surface.getByText('Error', { exact: true }).count(), 0);
+      await surface.locator('.request-outcome').focus();
+      const causeTooltip = page.getByRole('tooltip').filter({ hasText: cause });
+      await causeTooltip.waitFor();
+      assert.equal(await causeTooltip.innerText(), `Recorded cause: ${cause}`);
+      assert.doesNotMatch(await causeTooltip.innerText(), /429|Recorded status|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
+      await page.keyboard.press('Escape');
+    }
+    assert.match(await recordedRow.locator('.request-status-cause').textContent() ?? '', /The upstream connection was reset/);
     await recordedDiagnostics.getByRole('button', { name: 'Production Codex · Details', exact: true }).click();
     const metadata = page.locator('.request-metadata-surface');
     await metadata.waitFor({ state: 'visible' });

@@ -44,7 +44,7 @@ import { upstreamFormTemplates } from '../UpstreamFormTemplates';
 import { providerEditSchema } from '../providerEditSchema';
 import { AuthorizationCodeConnection } from '../AuthorizationCodeConnection';
 import { OAuthLoginLinkActions } from '../OAuthLoginLinkActions';
-import { canReauthorizeAccount } from '../authorizationCode';
+import { authorizationCompleteError, canReauthorizeAccount } from '../authorizationCode';
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
@@ -654,12 +654,18 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     return () => window.clearTimeout(timer);
   }, [session, polling, pollStopped, expired, nextPollAt, selectedProvider?.oauth_adapter?.flow_kind]);
   const complete = async () => {
-    if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce') return;
+    if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' || pollLock.current || expired || !manualCode.includes('#')) return;
+    pollLock.current = true;
+    const request = new AbortController(); pollRequest.current = request;
+    const attempt = scopeVersion.current;
+    setPolling(true); setError('');
     try {
-      const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }) });
+      const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }), signal: request.signal });
+      if (scopeVersion.current !== attempt) return;
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
       savedAccount.current = result; setSession(undefined); setManualCode(''); await reloadList();
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (scopeVersion.current === attempt) setError(journeyCopy[authorizationCompleteError(reason)]); }
+    finally { if (scopeVersion.current === attempt) { pollLock.current = false; setPolling(false); } }
   };
   return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
@@ -688,7 +694,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       {(expired || pollStopped) && <Button appearance="secondary" type="button" disabled={polling} onClick={reset}>{t('providers.backToLoginSetup')}</Button>}
       {listRetry && <Button appearance="secondary" type="button" disabled={listLoading} onClick={() => void reloadList()}>{t('providers.reloadAccountList')}</Button>}
     </div>}
-    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<Input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><Button appearance="primary" type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button></div>}
+    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<Input value={manualCode} disabled={polling || expired} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><Button appearance="primary" type="button" disabled={polling || expired || !manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button></div>}
     {session?.user_code && !expired && <div className="device-authorization"><p>{selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' ? t('providers.codexSecurity') : t('providers.deviceSecurity', { provider: selectedProvider?.display_name ?? '' })}</p><DeviceAuthorizationCode key={session.user_code} value={session.user_code} /></div>}
     {isKimi && session && selectedProvider && <p role="status">{expired
       ? t('providers.deviceLoginExpired')

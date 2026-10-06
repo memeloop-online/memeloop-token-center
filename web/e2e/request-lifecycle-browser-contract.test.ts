@@ -6,6 +6,63 @@ import { chromium } from 'playwright';
 import { createServer } from 'vite';
 declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 
+test('request error details distinguish active delivery from recorded terminal failure', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html`);
+    const open = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) }).locator('.table-action');
+    await open.waitFor();
+    for (const mode of ['delivery', 'terminal', 'unknown'] as const) {
+      await page.evaluate(mode => {
+        const previous = window.fetch;
+        window.fetch = async (input, init) => {
+          const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
+          if (url.pathname !== '/internal/v1/requests/request-a') return previous(input, init);
+          const detail = await (await previous(input, init)).json();
+          return new Response(JSON.stringify({ ...detail,
+            status_code: mode === 'delivery' ? null : 502,
+            completed_at: mode === 'delivery' ? null : 3000,
+            error_code: mode === 'delivery' ? 'delivery_started' : mode === 'terminal' ? 'upstream_stream' : null,
+            terminal_cause_code: mode === 'terminal' ? 'upstream_transport_connection_reset' : null,
+          }));
+        };
+      }, mode);
+      await open.click();
+      const drawer = page.getByRole('dialog', { name: 'model-a' });
+      await drawer.locator(`[data-outcome="${mode === 'delivery' ? 'delivering' : mode === 'terminal' ? 'interrupted' : 'failed'}"]`).waitFor();
+      const text = await drawer.innerText();
+      if (mode === 'delivery') {
+        assert.match(text, /Awaiting settlement/);
+        assert.doesNotMatch(text, /The request failed|delivery_started/);
+        assert.equal(await drawer.getByText('Error', { exact: true }).count(), 0, 'a progress marker must not create an error detail row');
+      } else {
+        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'Unknown (no specific cause recorded)';
+        assert.equal(text.split(cause).length - 1, 1);
+        assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
+        await drawer.locator('.request-outcome').focus();
+        const tooltip = page.getByRole('tooltip').filter({ hasText: cause });
+        await tooltip.waitFor();
+        assert.equal(await tooltip.innerText(), `Recorded cause: ${cause}`);
+      }
+      await drawer.getByRole('button', { name: 'Close', exact: true }).click();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('request detail follows terminal events and fences late responses after selection and scope changes', { timeout: 45_000 }, async (t) => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
@@ -44,8 +101,13 @@ test('request detail follows terminal events and fences late responses after sel
     await ownedTooltip.waitFor();
     assert.equal(await ownedTooltip.evaluate((element) => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'only the drawer-owned portal remains in the accessible modal subtree');
     await page.locator('.drawer .close').focus();
-    await page.locator('.drawer .request-outcome').focus();
+    await ownedTooltip.waitFor({ state: 'hidden' });
+    const status = page.locator('.drawer .request-outcome');
+    await status.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    assert.equal(await status.evaluate(element => element === document.activeElement), true, 'Tab focuses the request outcome control');
     await ownedTooltip.waitFor();
+    assert.equal(await ownedTooltip.evaluate((element) => !!element.closest('.drawer-owned-portals') && !element.closest('[inert], [aria-hidden="true"]')), true, 'the keyboard-triggered tooltip remains in the accessible modal subtree');
     assert.match(await page.locator('.drawer .request-diagnostics').first().innerText(), /Awaiting settlement/);
     const modelDetails = page.locator('.drawer .request-detail-wide .request-metadata-trigger').first();
     await modelDetails.tap();
