@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
-import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
+import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, parseClaudeCompletion, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 
@@ -72,6 +72,57 @@ test('Claude completion classifies only known backend error shapes into safe bil
   }
   assert.match(authorizationJourneyCopy('zh-CN').completeUncertain, /关闭表单并检查账号状态.*重新打开表单/);
   assert.match(authorizationJourneyCopy('en').completeUncertain, /Close the form and check the account status.*reopen the form/);
+});
+
+test('Claude completion distinguishes pending from a complete account in the current scope', () => {
+  const account = { id: 'fixture-account', tenant_id: 'fixture-tenant-id', tenant_external_id: 'fixture-a', name: 'Fixture Claude',
+    driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2,
+    credential_expires_at: null, can_refresh: true, can_rotate: false, can_reauthorize: true, route_count: 0, config: {}, created_at: 1, updated_at: 2 };
+  assert.equal(parseClaudeCompletion(account, 'fixture-a', account.id), account);
+  assert.deepEqual(parseClaudeCompletion({ status: 'pending', retry_after_seconds: 10 }, 'fixture-a'), { status: 'pending', retry_after_seconds: 10 });
+  for (const invalid of [undefined, null, {}, [], 'pending', { id: account.id }, { status: 'unknown' },
+    { ...account, status: 'pending' }, { ...account, driver: 'other' }, { ...account, auth_kind: 'api_key' },
+    { ...account, connection_method: 'api_key' }, { ...account, credential_generation: 0 }, { ...account, route_count: -1 },
+    { ...account, config: [] }, { ...account, name: '' }, { ...account, updated_at: NaN }, { ...account, error: {} },
+    { status: 'pending', error: { message: 'synthetic-secret' } }]) {
+    assert.throws(() => parseClaudeCompletion(invalid, 'fixture-a'), /^Error: Invalid completion response$/);
+  }
+  for (const key of Object.keys(account)) {
+    const incomplete: Record<string, unknown> = { ...account };
+    delete incomplete[key];
+    assert.throws(() => parseClaudeCompletion(incomplete, 'fixture-a'), `missing ${key} cannot be treated as success`);
+  }
+  assert.throws(() => parseClaudeCompletion(account, 'fixture-b'));
+  assert.throws(() => parseClaudeCompletion(account, 'fixture-a', 'another-account'));
+});
+
+test('Claude pending delays never shorten valid server intervals and invalid intervals have a finite fallback', () => {
+  for (const retry_after_seconds of [undefined, null, '0', -1, 0, NaN, Infinity, {}, []]) {
+    const result = parseClaudeCompletion({ status: 'pending', retry_after_seconds }, 'fixture-a');
+    assert.ok(!('id' in result));
+    assert.equal(claudeCompletionRetryMillis(result.retry_after_seconds), 5000);
+  }
+  for (const seconds of [0.1, 1, 5, 10.5, 300]) {
+    assert.ok(claudeCompletionRetryMillis(seconds) >= seconds * 1000);
+  }
+  assert.equal(claudeCompletionRetryMillis(Number.MAX_VALUE), Number.MAX_SAFE_INTEGER);
+  assert.ok(claudeCompletionRetryMillis(Number.MAX_VALUE) > claudeCompletionLimits.durationMillis);
+});
+
+test('Claude continuation is bounded by expiry, a local deadline and an attempt cap', () => {
+  assert.equal(claudeCompletionStopReason(10_000, 20_000, 1, 9999), undefined);
+  assert.equal(claudeCompletionStopReason(10_000, 20_000, 1, 10_000), 'completeExpired');
+  assert.equal(claudeCompletionStopReason(30_000, 20_000, 1, 20_000), 'completeLimited');
+  assert.equal(claudeCompletionStopReason(undefined, 20_000, claudeCompletionLimits.attempts, 0), 'completeLimited');
+  assert.equal(claudeCompletionStopReason(undefined, 20_000, claudeCompletionLimits.attempts - 1, 0), undefined);
+  assert.equal(claudeCompletionStopReason(10_000, 10_000, claudeCompletionLimits.attempts, 10_000), 'completeExpired');
+  for (const locale of ['zh-CN', 'en']) {
+    const copy = authorizationJourneyCopy(locale);
+    for (const key of ['completePending', 'completeChecking', 'completeLimited'] as const) {
+      assert.ok(copy[key]);
+      assert.doesNotMatch(copy[key], /synthetic-secret|session_token|authorization_code/);
+    }
+  }
 });
 
 test('host flow is catalog selected and has no replay, storage, or raw error display', () => {
