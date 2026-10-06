@@ -545,7 +545,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
   const pollLock = useRef(false);
   const pollRequest = useRef<AbortController | undefined>(undefined);
   const [claudePending, setClaudePending] = useState(false);
-  const claudeCompletion = useRef<{ deadline: number; attempts: number; nextAt: number; code: string } | undefined>(undefined);
+  const claudeCompletion = useRef<{ deadline: number; attempts: number; nextAt: number; code: string; phase: 'pending' | 'dispatched' | 'unknown' } | undefined>(undefined);
   const [nextPollAt, setNextPollAt] = useState(0);
   const [now, setNow] = useState(Date.now);
   const [listRetry, setListRetry] = useState(false);
@@ -555,7 +555,13 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
   useEffect(() => () => { scopeVersion.current += 1; pollRequest.current?.abort(); }, [token, tenant]);
   useLayoutEffect(() => {
     if (!isClaude) return;
-    if (!active) { setPolling(false); setAuthorizing(false); }
+    if (!active) {
+      setPolling(false); setAuthorizing(false);
+      if (claudeCompletion.current?.phase === 'dispatched') {
+        claudeCompletion.current.phase = 'unknown';
+        setClaudePending(false); setError(journeyCopy.completeClosedUnknown);
+      }
+    }
     return () => { scopeVersion.current += 1; pollRequest.current?.abort(); pollLock.current = false; };
   }, [active, isClaude, token, tenant]);
   const isKimi = isKimiDeviceProvider(selectedProvider);
@@ -663,11 +669,13 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
   }, [session, polling, pollStopped, expired, nextPollAt, selectedProvider?.oauth_adapter?.flow_kind]);
   const complete = async (automatic = false) => {
     if (!active || !session || !isClaude || pollLock.current || pollStopped || !manualCode.includes('#') || (!automatic && claudePending)) return;
-    const budget = claudeCompletion.current ??= { deadline: Date.now() + claudeCompletionLimits.durationMillis, attempts: 0, nextAt: 0, code: manualCode };
+    if (automatic && claudeCompletion.current?.phase !== 'pending') return;
+    const budget = claudeCompletion.current ??= { deadline: Date.now() + claudeCompletionLimits.durationMillis, attempts: 0, nextAt: 0, code: manualCode, phase: 'unknown' };
     const stopped = claudeCompletionStopReason(session.expires_at, budget.deadline, budget.attempts, Date.now());
-    if (stopped) { setClaudePending(false); setPollStopped(true); setMessage(''); setError(journeyCopy[stopped]); return; }
+    if (stopped) { budget.phase = 'unknown'; setClaudePending(false); setPollStopped(true); setMessage(''); setError(journeyCopy[stopped]); return; }
     if (Date.now() < budget.nextAt) return;
     if (!automatic) budget.code = manualCode;
+    budget.phase = 'dispatched'; setClaudePending(false);
     budget.attempts += 1;
     pollLock.current = true;
     const request = new AbortController(); pollRequest.current = request;
@@ -682,9 +690,10 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
       });
       if (scopeVersion.current !== attempt || request.signal.aborted) return;
       const elapsed = claudeCompletionStopReason(session.expires_at, budget.deadline, 0, Date.now());
-      if (elapsed) { setClaudePending(false); setPollStopped(true); setError(journeyCopy[elapsed]); return; }
+      if (elapsed) { budget.phase = 'unknown'; setClaudePending(false); setPollStopped(true); setError(journeyCopy[elapsed]); return; }
       const result = parseClaudeCompletion(response, tenant, existing?.id);
       if (!('id' in result)) {
+        budget.phase = 'pending';
         budget.nextAt = Date.now() + claudeCompletionRetryMillis(result.retry_after_seconds);
         setNextPollAt(budget.nextAt); setClaudePending(true);
         return;
@@ -692,6 +701,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
       setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
       savedAccount.current = result; claudeCompletion.current = undefined; setClaudePending(false); setSession(undefined); setManualCode(''); await reloadList();
     } catch (reason) { if (scopeVersion.current === attempt) {
+      budget.phase = 'unknown';
       const elapsed = claudeCompletionStopReason(session.expires_at, budget.deadline, 0, Date.now());
       setClaudePending(false); setPollStopped(Boolean(elapsed)); setError(journeyCopy[elapsed ?? authorizationCompleteError(reason)]);
     } }
@@ -700,7 +710,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
   const completeAction = useRef(complete);
   completeAction.current = complete;
   useEffect(() => {
-    if (!active || !isClaude || !session || !claudePending || polling || pollStopped || !claudeCompletion.current) return;
+    if (!active || !isClaude || !session || !claudePending || polling || pollStopped || claudeCompletion.current?.phase !== 'pending') return;
     const budget = claudeCompletion.current;
     const due = budget.attempts >= claudeCompletionLimits.attempts ? Date.now() : Math.min(budget.nextAt, budget.deadline, Number.isFinite(session.expires_at) ? session.expires_at! : Infinity);
     const attempt = scopeVersion.current;

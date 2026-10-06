@@ -51,13 +51,14 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
     driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 3,
     credential_expires_at: null, can_refresh: true, can_rotate: false, can_reauthorize: true, route_count: 0, config: {}, created_at: 1, updated_at: 3 };
   let reads = 0;
+  let statisticsReads = 0;
   let starts = 0;
   await page.route('**/*', async route => {
     const request = route.request(); const url = new URL(request.url());
     assert.equal(url.origin, origin, 'only the synthetic local fixture may receive traffic');
     if (!url.pathname.startsWith('/internal/')) return route.continue();
     if (request.method() === 'GET') {
-      if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } });
+      if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) { statisticsReads++; return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } }); }
       if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'anthropic-claude', display_name: 'Fixture Claude', source: 'builtin', protocols: ['anthropic'], modalities: ['text'], config_schema: { type: 'object' }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'claude_manual_pkce' } }] });
       if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: reauthorize ? [{ ...account, credential_generation: 2 }] : [] }); }
       return route.fulfill({ json: [] });
@@ -100,7 +101,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
     assert.doesNotMatch(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage])), /synthetic-code|synthetic-state|synthetic-pending-session/);
     assert.equal(starts, 1);
   };
-  return { page, account, workspace, code, complete, start, close, add, copy, calls, release, pending, checking, retained, reads: () => reads, starts: () => starts };
+  return { page, account, workspace, code, complete, start, close, add, copy, calls, release, pending, checking, retained, reads: () => reads, statisticsReads: () => statisticsReads, starts: () => starts };
 }
 
 for (const locale of ['zh-CN', 'en']) test(`Claude pending stays in the authorization workspace until a real account arrives (${locale})`, { timeout: 60_000 }, async context => {
@@ -168,37 +169,82 @@ for (const locale of ['zh-CN', 'en']) test(`Claude pending stops on an actionabl
   assert.equal(journey.reads(), reads);
 });
 
-test('closing a pending create journey pauses checks and preserves the same in-memory session on reopen', { timeout: 60_000 }, async context => {
+for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending create journey preserves its one continuation on reopen after ${reopenAfter}ms`, { timeout: 60_000 }, async context => {
   const journey = await fixture(context);
   const reads = journey.reads();
   await journey.complete.click();
   await journey.pending(0, 10);
   await journey.close.click();
   await journey.code.waitFor({ state: 'hidden' });
-  await journey.page.clock.runFor(12_000);
+  await journey.page.clock.runFor(reopenAfter);
   assert.equal((await journey.calls()).length, 1);
   await journey.retained();
   await journey.add.click();
-  await journey.page.clock.runFor(1);
-  await journey.checking();
-  assert.equal((await journey.calls()).length, 2);
-  await journey.close.click();
-  assert.equal((await journey.calls())[1].aborted, true);
-  await journey.release(1, 200, journey.account);
-  await journey.page.clock.runFor(100);
-  assert.equal(journey.reads(), reads, 'late success cannot refresh or clear a closed create draft');
-  await journey.retained();
-  await journey.add.click();
+  if (reopenAfter < 10_000) {
+    await journey.workspace.getByText(journey.copy.completePending, { exact: true }).waitFor();
+    await journey.page.clock.runFor(10_000 - reopenAfter - 1);
+    assert.equal((await journey.calls()).length, 1, 'reopening cannot shorten the confirmed server interval');
+  }
   await journey.page.clock.runFor(1);
   await journey.checking();
   const calls = await journey.calls();
-  assert.equal(calls.length, 3);
-  assert.deepEqual(calls[2].body, calls[0].body);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1].at - calls[0].at >= 10_000);
+  assert.deepEqual(calls[1].body, calls[0].body);
+  await journey.retained();
+  assert.equal(journey.reads(), reads);
   assert.equal(journey.starts(), 1, 'reopening continues the original authorization');
-  await journey.release(2, 200, journey.account);
+  await journey.release(1, 200, journey.account);
   await journey.code.waitFor({ state: 'detached' });
   await journey.workspace.locator('.notice.success').waitFor();
   assert.equal(journey.reads(), reads + 1);
+});
+
+for (const locale of ['zh-CN', 'en']) for (const status of [200, 202, 403]) for (const deliverWhileClosed of [true, false]) test(`closing a dispatched Claude continuation cannot reuse an older pending result (${locale}, late ${status}, ${deliverWhileClosed ? 'closed' : 'reopened'})`, { timeout: 60_000 }, async context => {
+  const journey = await fixture(context, { locale });
+  await journey.complete.click();
+  await journey.pending(0, 5);
+  await journey.page.clock.runFor(5000);
+  await journey.checking();
+  const calls = await journey.calls();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].body, calls[0].body);
+  assert.equal(await journey.workspace.getByText(journey.copy.completePending, { exact: true }).count(), 0);
+  const reads = journey.reads();
+  const statisticsReads = journey.statisticsReads();
+  await journey.close.click();
+  await journey.code.waitFor({ state: 'hidden' });
+  assert.equal((await journey.calls())[1].aborted, true, 'only the browser abort is observed; the synthetic server can still respond');
+  const response = status === 200 ? journey.account : status === 202 ? { status: 'pending', retry_after_seconds: 1 }
+    : { error: { code: 'forbidden', message: 'synthetic-error-message-canary', authorization_code: 'synthetic-error-code-canary', state: 'synthetic-error-state-canary', session_token: 'synthetic-error-token-canary' } };
+  if (deliverWhileClosed) {
+    await journey.release(1, status, response);
+    await journey.page.clock.runFor(100);
+    await journey.code.waitFor({ state: 'hidden' });
+    await journey.retained();
+    assert.equal((await journey.calls()).length, 2);
+    assert.equal(journey.reads(), reads);
+    assert.equal(journey.statisticsReads(), statisticsReads);
+  }
+  await journey.add.click();
+  const unknownNotice = journey.workspace.getByRole('alert').getByText(journey.copy.completeClosedUnknown, { exact: true });
+  await unknownNotice.waitFor();
+  assert.equal(await unknownNotice.count(), 1);
+  await journey.retained();
+  await journey.page.clock.runFor(10_000);
+  assert.equal((await journey.calls()).length, 2, 'reopening cannot authorize a third request from the first pending response');
+  if (!deliverWhileClosed) await journey.release(1, status, response);
+  await journey.page.clock.runFor(60_000);
+  await unknownNotice.waitFor();
+  assert.equal(await unknownNotice.count(), 1);
+  assert.equal(await journey.workspace.getByText(journey.copy.completePending, { exact: true }).count(), 0);
+  assert.equal(await journey.workspace.getByText(journey.copy.completeChecking, { exact: true }).count(), 0);
+  assert.doesNotMatch(await journey.page.locator('body').innerHTML(), /synthetic-error-(?:message|code|state|token)-canary/);
+  await journey.retained();
+  assert.equal((await journey.calls()).length, 2, 'late success, pending and error responses cannot restore continuation permission');
+  assert.equal(journey.reads(), reads);
+  assert.equal(journey.statisticsReads(), statisticsReads);
+  assert.equal(journey.starts(), 1);
 });
 
 test('closing pending reauthorization preserves the original account and fences a late completion', { timeout: 60_000 }, async context => {
