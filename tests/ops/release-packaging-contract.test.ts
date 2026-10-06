@@ -10,6 +10,17 @@ type Workflow = {
   concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string };
   jobs?: Record<string, WorkflowJob>;
 };
+const pinnedActionLine = /uses:\s+(?:\.\/[^\s#]+|[^\s@]+@[0-9a-fA-F]{40})(?:[ \t]+#[^\r\n]*)?[ \t]*$/;
+
+test('action pins require a complete immutable SHA, not a trailing version comment', () => {
+  const action = 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02';
+  for (const value of [action, `${action} # v4`, './.github/actions/local']) {
+    assert.match(`      - uses: ${value}`, pinnedActionLine);
+  }
+  for (const value of ['actions/upload-artifact@v4', 'actions/upload-artifact@main # v4', action.slice(0, -1), `${action}a`, `${action}/suffix`, `${action} extra`]) {
+    assert.doesNotMatch(`      - uses: ${value}`, pinnedActionLine);
+  }
+});
 
 test('release contains only runtime images and no retired migration delivery surface', () => {
   const dockerfile = read('Dockerfile');
@@ -77,7 +88,7 @@ test('release contains only runtime images and no retired migration delivery sur
   const workflows = workflowFiles.map((name) => read(`.github/workflows/${name}`)).join('\n');
   const uses = workflows.split('\n').filter((line) => /^\s*(?:-\s+)?uses:/.test(line));
   assert.ok(uses.length > 0);
-  for (const line of uses) assert.match(line, /uses:\s+(?:\.\/\S+|\S+@[0-9a-fA-F]{40}\s+#\s+\S+)/, `unpinned action: ${line}`);
+  for (const line of uses) assert.match(line, pinnedActionLine, `unpinned action: ${line}`);
   assert.equal(occurrences(workflows, 'actions/checkout@'), occurrences(workflows, 'persist-credentials: false'));
 
   const parsed = parse(workflow) as Workflow;
