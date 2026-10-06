@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -18,6 +19,15 @@ const response = step.reply;
 writeFileSync(statePath, JSON.stringify(state));
 appendFileSync(join(directory, 'calls.jsonl'), JSON.stringify({ index: state.index, event: 'start', observedAt: new Date().toISOString() }) + '\n');
 await delay(step.delayMs ?? 0);
+if (process.env.COLLECTOR_LEASE_CONTAINER && step.leaseOperation) {
+  const command = process.argv.slice(process.argv.indexOf('--') + 1);
+  assert.ok(step.contains.includes('exec'));
+  assert.ok(['publish', 'revoke'].includes(step.leaseOperation));
+  if (step.leaseOperation === 'publish') {
+    execFileSync('docker', ['exec', process.env.COLLECTOR_LEASE_CONTAINER, '/bin/sh', '-ec', 'kill -0 "$(cat /tmp/supervisor.pid)"'], { timeout: 10_000, stdio: 'pipe' });
+  }
+  execFileSync('docker', ['exec', process.env.COLLECTOR_LEASE_CONTAINER, ...command], { timeout: 10_000, stdio: 'pipe' });
+}
 appendFileSync(join(directory, 'calls.jsonl'), JSON.stringify({ index: state.index, event: 'end', durationMs: performance.now() - started }) + '\n');
 if (step.stderr) process.stderr.write(step.stderr);
 process.stdout.write(typeof response === 'string' ? response : JSON.stringify(response ?? {}));
