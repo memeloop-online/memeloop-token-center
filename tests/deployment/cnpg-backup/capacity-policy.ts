@@ -1,8 +1,12 @@
 export const capacityPolicy = String.raw`capacity_attestation() {
-  test "$capacity_path" = /backup || return 1
-  test "$capacity_device" = "$EXPECTED_BACKUP_DEVICE" || return 1
+  case "$capacity_path" in
+    /backup) capacity_expected_device=$EXPECTED_BACKUP_DEVICE; capacity_lease_path=/tmp/backup-volume.lease ;;
+    /scratch) capacity_expected_device=$EXPECTED_SCRATCH_DEVICE; capacity_lease_path=/tmp/scratch-volume.lease ;;
+    *) return 1 ;;
+  esac
+  test "$capacity_device" = "$capacity_expected_device" || return 1
   test -n "$POD_UID" || return 1
-  capacity_lease=$(cat /tmp/backup-volume.lease) || return 1
+  capacity_lease=$(cat "$capacity_lease_path") || return 1
   case "$capacity_lease" in ''|*[!a-zA-Z0-9/:.\ -]*) return 1 ;; esac
   set -- $capacity_lease
   test "$#" -eq 5 || return 1
@@ -33,7 +37,12 @@ capacity_volume() {
   capacity_device=$(timeout -k 1 5 findmnt -rn -o SOURCE -T "$capacity_path") || return 1
   case "$capacity_device" in /dev/*) ;; *) return 1 ;; esac
   case "$capacity_device" in *'['*|*']'*) return 1 ;; esac
-  if test "$(printenv BACKUP_UUID_ATTESTATION || true)" = external-csi-lease; then
+  case "$capacity_path" in
+    /backup) capacity_mode=$(printenv BACKUP_UUID_ATTESTATION || true) ;;
+    /scratch) capacity_mode=$(printenv SCRATCH_UUID_ATTESTATION || true) ;;
+    *) return 1 ;;
+  esac
+  if test "$capacity_mode" = external-csi-lease; then
     capacity_attestation || return 1
     test -z "$capacity_actual_uuid" || test "$capacity_actual_uuid" = "$capacity_uuid" || return 1
   else
@@ -56,6 +65,9 @@ capacity_backup() {
 }
 capacity_scratch() {
   test "$EXPECTED_SCRATCH_FS_UUID" != "$EXPECTED_BACKUP_FS_UUID" || return 1
+  if test "$(printenv SCRATCH_UUID_ATTESTATION || true)" = external-csi-lease; then
+    test "$EXPECTED_SCRATCH_DEVICE" != "$EXPECTED_BACKUP_DEVICE" || return 1
+  fi
   capacity_volume /scratch "$EXPECTED_SCRATCH_FS_UUID" "$SCRATCH_MAX_BYTES" "$SCRATCH_MIN_BYTES" "$SCRATCH_RESERVE_BYTES"
 }
 capacity_restore() {
