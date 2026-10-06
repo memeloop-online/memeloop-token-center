@@ -8,6 +8,7 @@ import { storageResources, validateStorageResources } from './storage-preflight.
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
 import { superviseExport } from './export-supervisor.ts';
+import { withExportRate } from './export-rate.ts';
 import { copyContainerCommand, copyIdentities, copyImage } from './copy-guard.ts';
 
 export const boundedClaims = {
@@ -76,6 +77,7 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
     };
     if (resource.metadata.name === boundedJobs.stage) Object.assign(environment, {
       EXPECTED_SERVER_ADDRESS: '',
+      BACKUP_RATE_MIB_PER_SECOND: '1',
       SOURCE_SPACE_LEASE_SECONDS: String(sourceSpace.leaseSeconds),
       SOURCE_SPACE_WAIT_SECONDS: String(sourceSpace.waitSeconds),
       BACKUP_UUID_ATTESTATION: 'external-csi-lease',
@@ -92,6 +94,7 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
       container.env.push({ name: 'POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } });
       container.env.find((entry: any) => entry.name === 'PGOPTIONS').value += ' -c temp_file_limit=0';
       resource.metadata.annotations['recovery.mtc/source-space-gate'] = '9Gi-start-8Gi-stop-or-512Mi-drop-45s-lease-stop-only-own-dump-no-foreground-concurrency-change';
+      resource.metadata.annotations['recovery.mtc/source-io-rate'] = 'default-1MiBps-explicit-reviewed-4-or-8MiBps-not-execution-authorization';
       resource.metadata.annotations['recovery.mtc/source-temp-gate'] = 'session-temp_file_limit=0-fail-if-not-permitted-no-role-or-source-config-change';
       let script: string = container.command[6];
       script = replaceOnce(script, 'umask 077', 'umask 077\n. /policy/capacity.sh\ntest -n "$EXPECTED_SERVER_ADDRESS"\nsource_space_wait\ncapacity_backup');
@@ -112,7 +115,7 @@ export function preparedResources(stageSupervisor: (script: string) => string = 
 )`);
       script = replaceOnce(script, 'trap \'kill -TERM "$stage_pid" 2>/dev/null || true\' EXIT',
         'trap \'kill -TERM "$stage_pid" 2>/dev/null || true\' EXIT\n  trap \'trap - EXIT; exit 0\' TERM INT');
-      container.command[6] = stageSupervisor(script);
+      container.command[6] = stageSupervisor(withExportRate(script));
     }
     if (resource.metadata.name === boundedJobs.restore) {
       let script: string = container.command[2];

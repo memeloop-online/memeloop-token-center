@@ -9,6 +9,7 @@ import { copyContainerCommand } from './copy-guard.ts';
 import { archiveDirectory, archiveName, copyArchive, type Remote } from './copy.ts';
 import { boundedClaims, boundedJobs, preparedResources } from './hard-capacity.ts';
 import { storagePlan, validateStorageResources } from './storage-preflight.ts';
+import { exportRateSelection } from './export-rate.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const resources = preparedResources();
@@ -52,6 +53,10 @@ test('prepared resources cannot provision unbounded storage or start a productio
     }
   }
   assert.equal(stage.env.find((entry: any) => entry.name === 'EXPECTED_SERVER_ADDRESS').value, '');
+  assert.equal(stage.env.find((entry: any) => entry.name === 'BACKUP_RATE_MIB_PER_SECOND').value, '1');
+  assert.ok(stage.command[6].includes(exportRateSelection));
+  assert.ok(stage.command[6].indexOf(exportRateSelection) < stage.command[6].indexOf('source_space_wait'));
+  assert.ok(stage.command[6].includes('dd bs="$backup_rate_chunk_bytes" count=1 iflag=fullblock'));
   assert.equal(stage.env.find((entry: any) => entry.name === 'SOURCE_SPACE_LEASE_SECONDS').value, '45');
   assert.equal(stage.env.find((entry: any) => entry.name === 'BACKUP_UUID_ATTESTATION').value, 'external-csi-lease');
   assert.equal(stage.env.find((entry: any) => entry.name === 'POD_UID').valueFrom.fieldRef.fieldPath, 'metadata.uid');
@@ -232,6 +237,48 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
   run(source, stageCommand(), { PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s -c temp_file_limit=0' });
   const archive = shell(source, `cat ${archiveDirectory}/${archiveName}`);
   const expectedSha = createHash('sha256').update(archive).digest('hex');
+  await context.test('actual prepared writer retains default pacing and bounds both reviewed faster rates', () => {
+    const candidate = fixture();
+    const payload = Buffer.alloc(16 * mib, 0x42);
+    const digest = createHash('sha256').update(payload).digest('hex');
+    write(candidate, '/tmp/rate-input', payload);
+    const script = stage.command[6] as string;
+    const start = script.indexOf('setsid prlimit --fsize=25769803776:25769803776');
+    const end = script.indexOf('\nrate_pid=$!', start);
+    assert.ok(start > 0 && end > start);
+    const writer = `${exportRateSelection}\nexec 3>&1\narchive=/backup/rate-archive\nmkfifo /tmp/dump.pipe\n${script.slice(start, end)}\nrate_pid=$!\ncat /tmp/rate-input > /tmp/dump.pipe\nwait "$rate_pid"\nrm /tmp/dump.pipe\nsha256sum "$archive.partial"\n`;
+    for (const rate of [undefined, '4', '8']) {
+      const environment: Record<string, string> = rate === undefined ? {} : { BACKUP_RATE_MIB_PER_SECOND: rate };
+      const started = performance.now();
+      const output = run(candidate, ['/bin/sh', '-ec', writer], environment);
+      const elapsed = performance.now() - started;
+      const limit = Number(rate ?? '1');
+      assert.ok(elapsed >= payload.length / (limit * mib) * 1000, `Writer exceeded ${limit}MiB/s pacing`);
+      assert.equal(Number(shell(candidate, 'stat -c %s /backup/rate-archive.partial').toString()), payload.length);
+      assert.equal(output.toString().split(' ')[0], digest);
+      context.diagnostic(`Actual prepared writer: rate_MiBps=${limit} bytes=${payload.length} wall_ms=${Math.round(elapsed)} SHA matched`);
+      shell(candidate, 'rm /backup/rate-archive.partial');
+    }
+    for (const rate of ['0', '2', '9', '64', '-1', '8;touch /tmp/injected-rate', 'unbounded']) {
+      assert.throws(() => run(candidate, ['/bin/sh', '-ec', writer], { BACKUP_RATE_MIB_PER_SECOND: rate }));
+      shell(candidate, 'test ! -e /tmp/injected-rate; test ! -e /tmp/dump.pipe; test ! -e /backup/rate-archive.partial');
+    }
+  });
+  for (const rate of ['4', '8']) {
+    await context.test(`reviewed ${rate}MiB/s export produces a fully restorable synthetic archive`, () => {
+      const candidate = fixture();
+      initializeSource(candidate);
+      shell(candidate, 'date +%s > /tmp/source-space.lease');
+      run(candidate, stageCommand(), { BACKUP_RATE_MIB_PER_SECOND: rate, PGOPTIONS: '-c default_transaction_read_only=on -c lock_timeout=5s -c temp_file_limit=0' });
+      shell(candidate, `cd ${archiveDirectory}; test -f LOCAL_ARCHIVE_CREATED; sha256sum -c ${archiveName}.sha256; pg_restore --list ${archiveName} >/dev/null`);
+      execute(candidate, ['createdb', '-h', '/scratch/socket', '-U', 'postgres', 'restored']);
+      execute(candidate, ['pg_restore', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '--no-owner', '--no-privileges', '--exit-on-error', `${archiveDirectory}/${archiveName}`]);
+      const rows = execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT count(*), sum(octet_length(body)) FROM payload']).toString().trim();
+      assert.equal(rows, '8192|8388608');
+      const relations = execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-v', 'ON_ERROR_STOP=1', '-c', "SELECT count(*) FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname='public' AND relation.relkind='r'"]).toString().trim();
+      assert.equal(relations, '254');
+    });
+  }
   const seed = (candidate: string, offhost = true) => {
     shell(candidate, `mkdir ${archiveDirectory}`);
     write(candidate, `${archiveDirectory}/${archiveName}`, archive);
