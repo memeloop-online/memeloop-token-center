@@ -37,10 +37,7 @@ impl ClientKey {
             account_id,
             revision,
             selection_generation: 0,
-            proxy_fingerprint: Sha256::digest(
-                credential.proxy().map_or("", |(url, _)| url).as_bytes(),
-            )
-            .into(),
+            proxy_fingerprint: proxy_fingerprint(credential),
             timeouts: [
                 policy.connect_timeout_millis,
                 policy.read_timeout_millis,
@@ -48,6 +45,10 @@ impl ClientKey {
             ],
         }
     }
+}
+
+fn proxy_fingerprint(credential: &crate::provider::UpstreamCredential) -> [u8; 32] {
+    Sha256::digest(credential.proxy().map_or("", |(url, _)| url).as_bytes()).into()
 }
 
 #[derive(Default)]
@@ -68,6 +69,17 @@ pub(crate) struct ClientSnapshot {
     pub(crate) client: wreq::Client,
     pub(crate) instance_id: uuid::Uuid,
     pub(crate) cache_hit: bool,
+    proxy_fingerprint: Option<[u8; 32]>,
+}
+
+impl ClientSnapshot {
+    pub(crate) fn matches_selected_proxy(
+        &self,
+        credential: &crate::provider::UpstreamCredential,
+    ) -> Option<bool> {
+        self.proxy_fingerprint
+            .map(|cached| cached == proxy_fingerprint(credential))
+    }
 }
 
 impl CodexClients {
@@ -104,6 +116,7 @@ impl CodexClients {
                 client: client.clone(),
                 instance_id: uuid::Uuid::nil(),
                 cache_hit: false,
+                proxy_fingerprint: None,
             });
         }
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
@@ -154,6 +167,7 @@ impl CodexClients {
                 client: entry.1.client.clone(),
                 instance_id: entry.1.instance_id,
                 cache_hit: true,
+                proxy_fingerprint: Some(entry.0.proxy_fingerprint),
             };
             clients.push_back(entry);
             return Ok(snapshot);
@@ -166,6 +180,7 @@ impl CodexClients {
             clients.pop_front();
         }
         let instance_id = uuid::Uuid::now_v7();
+        let proxy_fingerprint = key.proxy_fingerprint;
         clients.push_back((
             key,
             CachedClient {
@@ -177,6 +192,7 @@ impl CodexClients {
             client,
             instance_id,
             cache_hit: false,
+            proxy_fingerprint: Some(proxy_fingerprint),
         })
     }
 }
@@ -414,15 +430,21 @@ mod tests {
         assert!(reused.cache_hit);
         assert!(!first.instance_id.is_nil());
         assert_eq!(first.instance_id, reused.instance_id);
+        assert_eq!(first.matches_selected_proxy(&route.credential), Some(true));
         route.credential = route
             .credential
             .with_transport_proxy("socks5h://user:password@10.0.0.2:1080".into())
             .unwrap();
+        assert_eq!(first.matches_selected_proxy(&route.credential), Some(false));
         let changed_proxy = clients
             .transport_snapshot_with_diagnostics(&route, 1)
             .unwrap();
         assert!(!changed_proxy.cache_hit);
         assert_ne!(first.instance_id, changed_proxy.instance_id);
+        assert_eq!(
+            changed_proxy.matches_selected_proxy(&route.credential),
+            Some(true)
+        );
         let changed_epoch = clients
             .transport_snapshot_with_diagnostics(&route, 2)
             .unwrap();

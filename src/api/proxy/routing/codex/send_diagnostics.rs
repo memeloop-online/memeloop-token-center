@@ -1,4 +1,4 @@
-use ::http::header;
+use ::http::{Version, header};
 use ::hyper::body::Body;
 
 use super::*;
@@ -6,6 +6,8 @@ use super::*;
 pub(super) struct TransportIdentity {
     pub(super) client_instance_id: Uuid,
     pub(super) cache_hit: bool,
+    pub(super) selected_proxy_matches_client_key: Option<bool>,
+    pub(super) connect_attempt: usize,
     pub(super) proxy_member_index: Option<usize>,
     pub(super) proxy_member_count: usize,
     pub(super) selection_epoch: i64,
@@ -20,7 +22,9 @@ struct PreparedRequestEvidence {
     prepared_content_length_count: usize,
     prepared_content_length: Option<u64>,
     content_length_state: &'static str,
+    request_protocol_policy: &'static str,
     forbidden_connection_header_count: usize,
+    forbidden_connection_header_mask: u8,
     te_present: bool,
     te_trailers_only: bool,
 }
@@ -46,7 +50,7 @@ impl PreparedRequestEvidence {
             (1, None) => "explicit_invalid",
             _ => "explicit_multiple",
         };
-        let forbidden_connection_header_count = [
+        let forbidden_connection_header_mask = [
             "connection",
             "keep-alive",
             "proxy-connection",
@@ -54,15 +58,26 @@ impl PreparedRequestEvidence {
             "upgrade",
         ]
         .into_iter()
-        .filter(|name| headers.contains_key(*name))
-        .count();
+        .enumerate()
+        .fold(0_u8, |mask, (index, name)| {
+            mask | (u8::from(headers.contains_key(name)) << index)
+        });
         Self {
             known_payload_bytes,
             body_size_hint_exact: request.body().and_then(|body| body.size_hint().exact()),
             prepared_content_length_count,
             prepared_content_length,
             content_length_state,
-            forbidden_connection_header_count,
+            request_protocol_policy: match request.version() {
+                None => "client_default_negotiation",
+                Some(Version::HTTP_10) => "explicit_http_10",
+                Some(Version::HTTP_11) => "explicit_http_11",
+                Some(Version::HTTP_2) => "explicit_http_2",
+                Some(_) => "explicit_other",
+            },
+            forbidden_connection_header_count: forbidden_connection_header_mask.count_ones()
+                as usize,
+            forbidden_connection_header_mask,
             te_present: headers.contains_key(header::TE),
             te_trailers_only: headers.get_all(header::TE).iter().all(|value| {
                 value.to_str().is_ok_and(|value| {
@@ -99,6 +114,8 @@ pub(super) fn observe(
         outbound_attempt = context.outbound_attempt,
         client_instance_id = %identity.client_instance_id,
         client_cache_hit = identity.cache_hit,
+        selected_proxy_matches_client_key = identity.selected_proxy_matches_client_key,
+        connect_attempt = identity.connect_attempt,
         configured_outbound_proxy = selected_credential.proxy().is_some(),
         proxy_member_index = ?identity.proxy_member_index,
         proxy_member_count = identity.proxy_member_count,
@@ -111,7 +128,9 @@ pub(super) fn observe(
         prepared_content_length_count = evidence.prepared_content_length_count,
         prepared_content_length = ?evidence.prepared_content_length,
         content_length_state = evidence.content_length_state,
+        request_protocol_policy = evidence.request_protocol_policy,
         forbidden_connection_header_count = evidence.forbidden_connection_header_count,
+        forbidden_connection_header_mask = evidence.forbidden_connection_header_mask,
         te_present = evidence.te_present,
         te_trailers_only = evidence.te_trailers_only,
         observation_scope = "built_request_before_transport",

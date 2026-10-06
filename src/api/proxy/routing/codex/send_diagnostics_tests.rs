@@ -55,7 +55,12 @@ fn native_request_discards_stale_length_and_forbidden_downstream_headers() {
     assert_eq!(evidence.prepared_content_length_count, 0);
     assert_eq!(evidence.prepared_content_length, None);
     assert_eq!(evidence.content_length_state, "not_set_in_built_request");
+    assert_eq!(
+        evidence.request_protocol_policy,
+        "client_default_negotiation"
+    );
     assert_eq!(evidence.forbidden_connection_header_count, 0);
+    assert_eq!(evidence.forbidden_connection_header_mask, 0);
     assert!(!evidence.te_present);
     assert!(evidence.te_trailers_only);
     assert!(!request.headers().contains_key("x-private-header"));
@@ -98,6 +103,7 @@ fn length_and_forbidden_header_observation_never_rewrites_or_rejects_request() {
         assert_eq!(evidence.content_length_state, expected);
         assert_eq!(evidence.prepared_content_length_count, 1);
         assert_eq!(evidence.forbidden_connection_header_count, 1);
+        assert_eq!(evidence.forbidden_connection_header_mask, 1);
         assert!(evidence.te_present);
         assert!(!evidence.te_trailers_only);
         assert_eq!(request.headers()[header::CONTENT_LENGTH], declared);
@@ -106,6 +112,7 @@ fn length_and_forbidden_header_observation_never_rewrites_or_rejects_request() {
     }
     let request = client
         .post("https://example.test/responses")
+        .version(Version::HTTP_2)
         .body(Bytes::from_static(b"abc"))
         .header(header::CONTENT_LENGTH, "3")
         .header(header::CONTENT_LENGTH, "3")
@@ -116,4 +123,5 @@ fn length_and_forbidden_header_observation_never_rewrites_or_rejects_request() {
     assert_eq!(evidence.content_length_state, "explicit_multiple");
     assert_eq!(evidence.prepared_content_length_count, 2);
     assert!(evidence.te_trailers_only);
+    assert_eq!(evidence.request_protocol_policy, "explicit_http_2");
 }
