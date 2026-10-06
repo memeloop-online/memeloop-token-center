@@ -12,6 +12,14 @@ export const storagePlan = JSON.parse(readFileSync(join(directory, 'storage-plan
 export const storageResources = JSON.parse(readFileSync(storagePath, 'utf8')).items;
 const gib = 1024 ** 3;
 
+export function readStorageSource(read: Parameters<typeof readSourceFilesystem>[0]) {
+  try {
+    return readSourceFilesystem(read);
+  } catch {
+    throw new Error('Read-only source identity/stat preflight failed');
+  }
+}
+
 export function validateStorageResources(resources: any[] = storageResources, volumes: any[] = storagePlan.volumes): void {
   assert.equal(resources.length, volumes.length * 4);
   for (const volume of volumes) {
@@ -131,13 +139,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   assert.deepEqual(selectedResources, storageResources.filter((resource: any) => selectedVolumes.some((volume: any) => [volume.name, volume.storageClass].includes(resource.metadata.name))));
   const kubectl = (args: string[], input?: string) => execFileSync('kubectl', ['--request-timeout=30s', ...args], { input, encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 ** 2 });
   const get = (args: string[]) => JSON.parse(kubectl([...args, '-o', 'json']));
-  const source = readSourceFilesystem((args, timeoutMs = 20_000) => {
-    try {
-      return execFileSync('kubectl', [timeoutMs === sourceFilesystem.processTimeoutMs ? '--request-timeout=8s' : '--request-timeout=15s', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2 });
-    } catch {
-      throw new Error('Read-only source identity/stat preflight failed');
-    }
-  });
+  const source = readStorageSource((args, timeoutMs = 20_000) => execFileSync('kubectl', [timeoutMs === sourceFilesystem.processTimeoutMs ? '--request-timeout=8s' : '--request-timeout=15s', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2 }));
   sourceBudget(source);
   const nodes = get(['-n', 'longhorn-system', 'get', 'nodes.longhorn.io']).items;
   const settingNames = ['storage-over-provisioning-percentage', 'storage-minimal-available-percentage', 'default-engine-image'];

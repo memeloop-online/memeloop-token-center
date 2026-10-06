@@ -118,6 +118,8 @@ test('actual collector rejects pre/post source identity races before lease publi
     ['pod', (value: any) => { value.pod.metadata.uid = 'replacement'; }],
     ['container', (value: any) => { value.pod.status.containerStatuses[0].containerID = `containerd://${'b'.repeat(64)}`; }],
     ['restart', (value: any) => { value.pod.status.containerStatuses[0].restartCount = 1; }],
+    ['wal-mount', (value: any) => { value.pod.spec.containers[0].volumeMounts.push({ name: 'wal', mountPath: `${sourceFilesystem.pgdata}/pg_wal` }); }],
+    ['base-mount', (value: any) => { value.pod.spec.containers[0].volumeMounts.push({ name: 'base', mountPath: `${sourceFilesystem.pgdata}/base` }); }],
     ['claim', (value: any) => { value.claim.metadata.uid = 'replacement'; }],
     ['pv', (value: any) => { value.persistent.metadata.uid = 'replacement'; }],
     ['claimRef', (value: any) => { value.persistent.spec.claimRef.uid = 'replacement'; }],

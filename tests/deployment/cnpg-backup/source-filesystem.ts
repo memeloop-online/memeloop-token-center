@@ -51,7 +51,7 @@ export function verifySourceBinding(pod: any, claim: any, persistent: any, clust
   assert.ok(Number.isSafeInteger(status.restartCount) && status.restartCount >= 0);
   assert.deepEqual(container.env.filter((entry: any) => entry.name === 'PGDATA'), [{ name: 'PGDATA', value: expected.pgdata }]);
   assert.deepEqual(container.volumeMounts.filter((mount: any) => mount.name === 'pgdata'), [{ name: 'pgdata', mountPath: expected.mount }]);
-  assert.equal(container.volumeMounts.filter((mount: any) => expected.pgdata === mount.mountPath || expected.pgdata.startsWith(`${mount.mountPath}/`)).length, 1);
+  assert.equal(container.volumeMounts.filter((mount: any) => expected.pgdata === mount.mountPath || expected.pgdata.startsWith(`${mount.mountPath}/`) || mount.mountPath.startsWith(`${expected.pgdata}/`)).length, 1);
   assert.deepEqual(pod.spec.volumes.filter((volume: any) => volume.name === 'pgdata'), [{ name: 'pgdata', persistentVolumeClaim: { claimName: expected.claim } }]);
   assert.equal(claim.status.phase, 'Bound');
   assert.equal(claim.spec.volumeName, expected.persistent);

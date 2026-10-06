@@ -16,6 +16,8 @@ test('source identity and numeric stat counters fail closed without relaxing rev
     (candidate: any) => { candidate.pod.spec.nodeName = 'other'; },
     (candidate: any) => { candidate.pod.spec.containers[0].volumeMounts[0].subPath = 'pgdata'; },
     (candidate: any) => { candidate.pod.spec.containers[0].volumeMounts.push({ name: 'shadow', mountPath: sourceFilesystem.pgdata }); },
+    (candidate: any) => { candidate.pod.spec.containers[0].volumeMounts.push({ name: 'wal', mountPath: `${sourceFilesystem.pgdata}/pg_wal` }); },
+    (candidate: any) => { candidate.pod.spec.containers[0].volumeMounts.push({ name: 'base', mountPath: `${sourceFilesystem.pgdata}/base` }); },
     (candidate: any) => { candidate.claim.metadata.uid = 'other'; },
     (candidate: any) => { candidate.persistent.spec.claimRef.uid = 'other'; },
     (candidate: any) => { candidate.persistent.spec.csi.volumeHandle = 'other'; },
