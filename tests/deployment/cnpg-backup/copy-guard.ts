@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { archiveIdentity, attestBackupVolume, stageIdentity, type InventoryReader } from './volume-identity.ts';
+import { archiveIdentity, attestBackupVolume, stageIdentity, stageIdentityForPod, type InventoryReader } from './volume-identity.ts';
 
 export const copyIdentities = { source: stageIdentity, destination: archiveIdentity };
 export const copyImage = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
@@ -22,7 +22,7 @@ while :; do
 done`;
 
 export function validateCopyPod(pod: any, side: CopySide, expectedUID?: string): void {
-  const expected = copyIdentities[side];
+  const expected = side === 'source' ? stageIdentityForPod(pod, 'copy') : archiveIdentity;
   assert.equal(pod.metadata.namespace, expected.namespace);
   assert.ok(!pod.metadata.deletionTimestamp);
   assert.match(pod.metadata.uid, /^[a-zA-Z0-9-]{1,64}$/);
@@ -69,7 +69,8 @@ export function renewCopyLease(read: InventoryReader, side: CopySide, podName: s
   const getPod = () => JSON.parse(read(['-n', expected.namespace, 'get', 'pod', podName, '-o', 'json']));
   const before = getPod();
   validateCopyPod(before, side, uid);
-  const lease = attestBackupVolume(read, before, expected, 'copy', clock);
+  const observedIdentity = side === 'source' ? stageIdentityForPod(before, 'copy') : expected;
+  const lease = attestBackupVolume(read, before, observedIdentity, 'copy', clock);
   const after = getPod();
   validateCopyPod(after, side, uid);
   assert.deepEqual(after.spec, before.spec, 'Copy pod spec changed across CSI observation');
