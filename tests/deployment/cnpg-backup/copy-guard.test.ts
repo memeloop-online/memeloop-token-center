@@ -146,13 +146,14 @@ else process.exit(1);
   const child = spawn(process.execPath, [join(directory, 'copy-guard.ts'), 'destination', value.pod.metadata.name, value.pod.metadata.uid], {
     env: { ...process.env, PARENT_REVIEW_APPROVED: 'true', COPY_FIXTURE: root, PATH: `${root}:${process.env.PATH}` }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  assert.ok(child.stdout);
+  const outputStream = child.stdout;
+  assert.ok(outputStream);
   const exited = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
   context.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; rmSync(root, { recursive: true, force: true }); });
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('No first copy lease')), 8000);
     let output = '';
-    child.stdout.on('data', chunk => { output += chunk.toString(); if (output === 'COPY_LEASES_READY\n') { clearTimeout(timer); resolve(); } });
+    outputStream.on('data', chunk => { output += chunk.toString(); if (output === 'COPY_LEASES_READY\n') { clearTimeout(timer); resolve(); } });
     child.once('exit', () => { clearTimeout(timer); reject(new Error('Collector exited before readiness')); });
   });
   execFileSync('/bin/sleep', ['17'], { timeout: 20_000 });
