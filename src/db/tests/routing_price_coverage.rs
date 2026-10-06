@@ -78,6 +78,11 @@ async fn postgres_price_coverage_is_read_only_and_detects_alias_only_failover() 
         .await
         .unwrap();
     database.migrate().await.unwrap();
+    let schema_versions_before_preflight: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&database.pool)
+            .await
+            .unwrap();
     let tenant = Uuid::now_v7();
     let route = Uuid::now_v7();
     sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $1, 0)")
@@ -196,11 +201,15 @@ async fn postgres_price_coverage_is_read_only_and_detects_alias_only_failover() 
     assert_eq!(report["candidate_count"], 1);
 
     assert_eq!(coverage_report(&database_url, &schema, &[]).await.0, 0);
-    let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-    assert_eq!(maximum, 117);
+    let schema_versions_after_preflight: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        schema_versions_after_preflight,
+        schema_versions_before_preflight
+    );
     sqlx::query("UPDATE model_routes SET enabled = 0 WHERE id = $1")
         .bind(route.to_string())
         .execute(&database.pool)
