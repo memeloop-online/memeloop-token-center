@@ -34,6 +34,27 @@ export function configForPhase(phase: Phase): Json {
   };
 }
 
+export async function configurePhase(phase: Phase, control: (path: string, body: Json) => Promise<Json>): Promise<Json> {
+  const account = await control("/internal/v1/upstreams", {
+    name: phase.name, driver: phase.driver,
+    config: configForPhase(phase),
+    credential: { type: "api_key", value: "MTC_COMPACT_SYNTHETIC_CREDENTIAL" },
+  });
+  const route = await control("/internal/v1/model-routes", {
+    public_model: phase.name, upstream_account_id: account.id,
+    upstream_model: MODEL, protocol: "openai", custom_model_confirmed: true,
+  });
+  for (const model of [phase.name, MODEL]) {
+    await control(`/internal/v1/prices/USD/${model}`, {
+      input_per_million: "0", output_per_million: "0",
+    });
+  }
+  return control("/internal/v1/keys", {
+    principal_external_id: "synthetic-compact-probe", alias: phase.name,
+    route_ids: [route.id], policy: { enforcement_mode: "metered_unlimited" },
+  });
+}
+
 export function verifyCompactEvidence(text: string) {
   const records = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line) as Json);
   assert.equal(records.length, PHASES.length + 1, "require every phase and terminal evidence");
@@ -202,22 +223,7 @@ async function run() {
     assert.ok(ready);
     for (const phase of PHASES) {
       stage = `configure_${phase.name}`;
-      const account = await control("/internal/v1/upstreams", {
-        name: phase.name, driver: phase.driver,
-        config: configForPhase(phase),
-        credential: { type: "api_key", value: "MTC_COMPACT_SYNTHETIC_CREDENTIAL" },
-      });
-      const route = await control("/internal/v1/model-routes", {
-        public_model: phase.name, upstream_account_id: account.id,
-        upstream_model: MODEL, protocol: "openai", custom_model_confirmed: true,
-      });
-      await control(`/internal/v1/prices/USD/${phase.name}`, {
-        input_per_million: "0", output_per_million: "0",
-      });
-      const key = await control("/internal/v1/keys", {
-        principal_external_id: "synthetic-compact-probe", alias: phase.name,
-        route_ids: [route.id], policy: { enforcement_mode: "metered_unlimited" },
-      });
+      const key = await configurePhase(phase, control);
       stage = `request_${phase.name}`;
       const before = attempts.length;
       const result = await fetch(base + NORMAL_PATH, {
