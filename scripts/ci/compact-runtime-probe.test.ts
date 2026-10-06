@@ -21,16 +21,20 @@ test("actual phase setup prices the upstream model and retains the legacy alias 
       `/internal/v1/prices/USD/${phase.name}`,
       "/internal/v1/prices/USD/synthetic-upstream-model", "/internal/v1/keys",
     ]);
-    const route = calls[1].body;
+    const routeCall = calls[1];
+    const actualPriceCall = calls[3];
+    const keyCall = calls[4];
+    assert.ok(routeCall && actualPriceCall && keyCall);
+    const route = routeCall.body;
     assert.equal(route.public_model, phase.name);
     assert.equal(route.upstream_account_id, "synthetic-account");
     assert.notEqual(route.upstream_model, route.public_model);
-    assert.equal(calls[3].path, `/internal/v1/prices/USD/${route.upstream_model}`);
+    assert.equal(actualPriceCall.path, `/internal/v1/prices/USD/${route.upstream_model}`);
     for (const call of calls.slice(2, 4)) {
       assert.deepEqual(call.body, { input_per_million: "0", output_per_million: "0" });
     }
-    assert.deepEqual(calls[4].body.route_ids, ["synthetic-route"]);
-    assert.deepEqual(calls[4].body.policy, { enforcement_mode: "metered_unlimited" });
+    assert.deepEqual(keyCall.body.route_ids, ["synthetic-route"]);
+    assert.deepEqual(keyCall.body.policy, { enforcement_mode: "metered_unlimited" });
     assert.equal(key.key, "synthetic-client-key");
   }
 });
