@@ -37,10 +37,10 @@ restore_cleanup() {
   restore_status=$?
   trap - EXIT TERM INT
   if test -n "$restore_child_pid"; then
-    kill -TERM -- "-$restore_child_pid" 2>/dev/null || true
+    kill -TERM "-$restore_child_pid" 2>/dev/null || true
     kill -TERM "$restore_child_pid" 2>/dev/null || true
     sleep 2
-    kill -KILL -- "-$restore_child_pid" 2>/dev/null || true
+    kill -KILL "-$restore_child_pid" 2>/dev/null || true
     kill -KILL "$restore_child_pid" 2>/dev/null || true
     wait "$restore_child_pid" 2>/dev/null || true
   fi
