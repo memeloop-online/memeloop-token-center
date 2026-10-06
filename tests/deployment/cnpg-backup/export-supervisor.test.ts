@@ -13,7 +13,7 @@ const shell = (container: string, script: string) => docker(['exec', container, 
 const write = (container: string, path: string, contents: string) => docker(['exec', '-i', container, 'dd', `of=${path}`, 'status=none'], contents);
 const directory = '/backup/mtc-pg-logical-20261004';
 
-function fixture(init: boolean, legacy = false): string {
+function fixture(init: boolean, legacy = false, rate = '1'): string {
   const stage = preparedResources(legacy ? script => script : undefined).find(resource => resource.kind === 'Job' && resource.metadata.name === boundedJobs.stage).spec.template.spec.containers[0];
   const environment = Object.fromEntries(stage.env.filter((entry: any) => entry.value !== undefined).map((entry: any) => [entry.name, entry.value]));
   Object.assign(environment, {
@@ -21,6 +21,7 @@ function fixture(init: boolean, legacy = false): string {
     EXPECTED_BACKUP_FS_UUID: 'fixture-backup', EXPECTED_BACKUP_DEVICE: '/dev/fixture', POD_UID: 'fixture-pod', EXPECTED_SERVER_ADDRESS: '127.0.0.1',
     BACKUP_MAX_BYTES: String(64 * 1024 ** 2), BACKUP_MIN_BYTES: '1048576', BACKUP_RESERVE_BYTES: '0', CAPACITY_MIN_FREE_INODES: '1',
     DATABASE_URL: 'unused-fixture-no-credentials', PGOPTIONS: '',
+    BACKUP_RATE_MIB_PER_SECOND: rate,
   });
   const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
     ...Object.entries(environment).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
@@ -110,10 +111,10 @@ test('historical guard failure modes demonstrate the unmonitored parent wait, no
 });
 
 test('foreground expiry supervisor kills actual producer/writer groups without a live agent', { timeout: 240_000 }, async context => {
-  for (const mode of ['source-revoked', 'volume-revoked', 'volume-expired', 'watcher-lost', 'capacity-timeout', 'nested-shell'] as const) {
+  for (const mode of ['source-revoked', 'volume-revoked', 'volume-expired', 'watcher-lost', 'capacity-timeout', 'nested-shell', 'fast-source-revoked'] as const) {
     await context.test(mode, { timeout: 40_000 }, async childContext => {
       const init = mode !== 'nested-shell';
-      const container = fixture(init);
+      const container = fixture(init, false, mode === 'fast-source-revoked' ? '8' : '1');
       childContext.after(() => docker(['rm', '-f', container]));
       let exported: ReturnType<typeof spawn> | undefined;
       let completed: Promise<number | null> | undefined;
