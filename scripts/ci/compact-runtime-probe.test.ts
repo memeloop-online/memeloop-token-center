@@ -1,10 +1,39 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CHECKPOINT, HISTORY, PHASES, configForPhase, inputForPhase, normalResponse, toSse,
+  CHECKPOINT, HISTORY, PHASES, configForPhase, configurePhase, inputForPhase, normalResponse, toSse,
   validateAttempt, validateDownstream, verifyCompactEvidence,
 } from "./compact-runtime-probe.ts";
 import { renderJob } from "./dns-runtime-job.ts";
+
+test("actual phase setup prices the upstream model and retains the legacy alias fixture before admission", async () => {
+  for (const phase of PHASES) {
+    const calls: { path: string; body: Record<string, any> }[] = [];
+    const key = await configurePhase(phase, async (path, body) => {
+      calls.push({ path, body });
+      if (path === "/internal/v1/upstreams") return { id: "synthetic-account" };
+      if (path === "/internal/v1/model-routes") return { id: "synthetic-route" };
+      if (path === "/internal/v1/keys") return { key: "synthetic-client-key" };
+      return {};
+    });
+    assert.deepEqual(calls.map(call => call.path), [
+      "/internal/v1/upstreams", "/internal/v1/model-routes",
+      `/internal/v1/prices/USD/${phase.name}`,
+      "/internal/v1/prices/USD/synthetic-upstream-model", "/internal/v1/keys",
+    ]);
+    const route = calls[1].body;
+    assert.equal(route.public_model, phase.name);
+    assert.equal(route.upstream_account_id, "synthetic-account");
+    assert.notEqual(route.upstream_model, route.public_model);
+    assert.equal(calls[3].path, `/internal/v1/prices/USD/${route.upstream_model}`);
+    for (const call of calls.slice(2, 4)) {
+      assert.deepEqual(call.body, { input_per_million: "0", output_per_million: "0" });
+    }
+    assert.deepEqual(calls[4].body.route_ids, ["synthetic-route"]);
+    assert.deepEqual(calls[4].body.policy, { enforcement_mode: "metered_unlimited" });
+    assert.equal(key.key, "synthetic-client-key");
+  }
+});
 
 test("both HTTP-json and New API cover normal, compact JSON, and compact SSE", () => {
   for (const driver of ["http-json", "new-api"]) {
