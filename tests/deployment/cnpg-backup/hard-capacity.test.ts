@@ -248,7 +248,7 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     assert.ok(start > 0 && end > start);
     const writer = `${exportRateSelection}\nexec 3>&1\narchive=/backup/rate-archive\nmkfifo /tmp/dump.pipe\n${script.slice(start, end)}\nrate_pid=$!\ncat /tmp/rate-input > /tmp/dump.pipe\nwait "$rate_pid"\nrm /tmp/dump.pipe\nsha256sum "$archive.partial"\n`;
     for (const rate of [undefined, '4', '8']) {
-      const environment = rate === undefined ? {} : { BACKUP_RATE_MIB_PER_SECOND: rate };
+      const environment: Record<string, string> = rate === undefined ? {} : { BACKUP_RATE_MIB_PER_SECOND: rate };
       const started = performance.now();
       const output = run(candidate, ['/bin/sh', '-ec', writer], environment);
       const elapsed = performance.now() - started;
