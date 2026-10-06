@@ -483,14 +483,13 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
         0,
         "unknown admission ACK never reaches the upstream-dispatch continuation"
     );
-    assert!(
-        fixture
-            .db
-            .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let failed_task = fixture
+        .db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("failed orphan retains its captured request for legacy upload");
+    assert!(!failed_task.successful_terminal);
     // Also exercise a real server-side connection loss, not only caller
     // cancellation. Terminate only this isolated fixture's COMMIT backend.
     let disconnected_id = Uuid::new_v4();
@@ -833,7 +832,7 @@ impl PgFixture {
         } else {
             // Same request columns exercised by the production spool API; there is
             // deliberately no FK to billing tables, matching request_records.
-            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, request_object TEXT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, cost_micros BIGINT NOT NULL DEFAULT 123)")
+            sqlx::raw_sql("CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, reservation_id TEXT NOT NULL, completed_at BIGINT, request_object TEXT, response_object TEXT, status_code BIGINT NOT NULL DEFAULT 200, error_code TEXT, cost_micros BIGINT NOT NULL DEFAULT 123)")
             .execute(&db.pool).await.unwrap();
             // This focused fixture intentionally omits the production request
             // projection tables. Keeping the locator table empty exercises the
@@ -900,7 +899,7 @@ impl PgFixture {
 
     async fn terminal(&self) {
         sqlx::query(
-            "UPDATE request_records SET completed_at = 2, response_object = $1 WHERE id = $2",
+            "UPDATE request_records SET completed_at = 2, status_code = 200, error_code = NULL, response_object = $1 WHERE id = $2",
         )
         .bind(format!("gap://{}/response", self.id.request_id))
         .bind(self.id.request_id.to_string())
@@ -1232,6 +1231,7 @@ async fn postgres_claim_cancelled_inside_commit_is_reclaimed_with_new_fence() {
     let stale = ArchiveSpoolTask {
         identity: fixture.id,
         purpose: BufferedArchivePurpose::Response,
+        successful_terminal: recovered.successful_terminal,
         lease_owner: owner,
         lease_token: Uuid::parse_str(&token).unwrap(),
         chunk_count: 1,
@@ -1412,6 +1412,8 @@ async fn postgres_complete_cancelled_inside_commit_keeps_atomic_binding() {
     fixture.finish().await;
 }
 
+#[path = "postgres_cas_tests.rs"]
+mod postgres_cas_tests;
 #[path = "postgres_load_tests.rs"]
 mod postgres_load_tests;
 #[path = "postgres_reservation_tests.rs"]

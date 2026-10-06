@@ -51,6 +51,7 @@ pub(crate) struct ArchiveSpoolIdentity {
 pub(crate) struct ArchiveSpoolTask {
     pub identity: ArchiveSpoolIdentity,
     pub purpose: BufferedArchivePurpose,
+    pub successful_terminal: bool,
     pub lease_owner: Uuid,
     pub lease_token: Uuid,
     pub chunk_count: i64,
@@ -900,12 +901,16 @@ impl Database {
             return Ok(None);
         }
         let identity = identity_from_row(&row)?;
+        let successful: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NOT NULL AND status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = ''")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string()).fetch_one(&mut *tx).await?;
         let lease_token = Uuid::new_v4();
         sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'uploading', lease_owner = $1, lease_token = $2, lease_expires_at = $3, attempts = attempts + 1, updated_at = $4 WHERE request_id = $5")))
             .bind(lease_owner.to_string()).bind(lease_token.to_string()).bind(now + LEASE_TTL).bind(now).bind(identity.request_id.to_string()).execute(&mut *tx).await?;
         let task = ArchiveSpoolTask {
             identity,
             purpose,
+            successful_terminal: successful == 1,
             lease_owner,
             lease_token,
             chunk_count: row.try_get("chunk_count")?,
@@ -1024,6 +1029,68 @@ impl Database {
             self.backend,
             staging,
             locator,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        let bound = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'bound', bound_locator = $1, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3 AND tenant_id = $4 AND reservation_id = $5 AND state = 'uploading'")))
+            .bind(locator).bind(now).bind(task.identity.request_id.to_string())
+            .bind(task.identity.tenant_id.to_string()).bind(task.identity.reservation_id.to_string())
+            .execute(&mut *tx).await?;
+        if bound.rows_affected() != 1 {
+            return Ok(false);
+        }
+        emit_response_archive_transition_event_in_transaction(
+            &mut tx,
+            purpose,
+            task.identity.request_id,
+            now,
+            "archive_bound",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn complete_response_archive_spool_cas(
+        &self,
+        task: &ArchiveSpoolTask,
+        staging: &ArchiveStagingWriteLease,
+        locator: &str,
+    ) -> Result<bool, AppError> {
+        let purpose = task.purpose;
+        if staging.key.owner != ArchiveStagingOwner::ProxyRequest(task.identity.request_id)
+            || staging.key.purpose != purpose.staging()
+            || !crate::archive::is_tenant_cas_location(task.identity.tenant_id, locator)
+        {
+            return Ok(false);
+        }
+        let mut tx = self.archive_state_transaction().await?;
+        let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
+            let receipts: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose,
+                "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id JOIN archive_staging_attempts a ON a.attempt_id = $5 WHERE s.request_id = $1 AND s.tenant_id = $2 AND s.reservation_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4 AND r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 399 AND COALESCE(r.error_code, '') = '' AND a.owner_kind = 'proxy_request' AND a.owner_id = s.request_id AND a.purpose = $8 AND a.state IN ('cleanup_pending', 'cleaned') AND a.bound_at IS NOT NULL AND a.writer_owner = $6 AND a.writer_token = $7")))
+                .bind(task.identity.request_id.to_string())
+                .bind(task.identity.tenant_id.to_string())
+                .bind(task.identity.reservation_id.to_string())
+                .bind(locator)
+                .bind(staging.key.attempt_id.to_string())
+                .bind(staging.owner.as_str())
+                .bind(staging.token.to_string())
+                .bind(purpose.as_str())
+                .fetch_one(&mut *tx).await?;
+            return Ok(receipts == 1);
+        };
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL AND status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = '' AND response_object = $5")))
+            .bind(locator).bind(task.identity.request_id.to_string()).bind(task.identity.tenant_id.to_string())
+            .bind(task.identity.reservation_id.to_string()).bind(format!("gap://{}/{}", task.identity.request_id, purpose.as_str())).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Ok(false);
+        }
+        if !super::archive_staging::publish_archive_staging_cas_in_transaction(
+            &mut tx,
+            self.backend,
+            staging,
         )
         .await?
         {

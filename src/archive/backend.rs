@@ -1,7 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use object_store::{
-    ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, memory::InMemory,
+    ClientOptions, ObjectStore, RetryConfig,
+    aws::{AmazonS3Builder, S3CopyIfNotExists},
+    memory::InMemory,
 };
 
 use super::{ArchiveStore, ReadinessCache, path::archive_path};
@@ -56,7 +58,8 @@ impl ArchiveStore {
                             max_retries: 3,
                             retry_timeout: Duration::from_secs(10),
                             ..RetryConfig::default()
-                        });
+                        })
+                        .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
                     if let Some(endpoint) = &config.s3_endpoint {
                         builder = builder.with_endpoint(endpoint);
                     }

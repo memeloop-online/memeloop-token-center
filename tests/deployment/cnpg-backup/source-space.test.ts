@@ -1,0 +1,91 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { exportPod, retryObservation, sourceBudget, sourceSample, sourceSpace } from './source-space.ts';
+
+assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
+const now = Date.parse('2026-10-05T18:09:17Z');
+const summary = () => ({ node: { nodeName: sourceSpace.node }, pods: [{ podRef: { namespace: sourceSpace.namespace, name: sourceSpace.pod }, volume: [{ name: 'pgdata', pvcRef: { name: sourceSpace.claim, namespace: sourceSpace.namespace }, time: new Date(now).toISOString(), availableBytes: 10 * 1024 ** 3, capacityBytes: 30 * 1024 ** 3, inodesFree: 100_000 }] }] });
+
+test('source reserve and cumulative loss stop the backup before the source filesystem fills', () => {
+  const sample = sourceSample(summary(), now);
+  sourceBudget(sample);
+  assert.throws(() => sourceBudget({ availableBytes: sourceSpace.startBytes - 1 }));
+  assert.throws(() => sourceBudget({ availableBytes: sourceSpace.stopBytes - 1 }, sample.availableBytes));
+  assert.throws(() => sourceBudget({ availableBytes: sample.availableBytes - sourceSpace.maximumDropBytes }, sample.availableBytes));
+  sourceBudget({ availableBytes: sample.availableBytes - sourceSpace.maximumDropBytes + 1 }, sample.availableBytes);
+  for (const mutate of [
+    (value: any) => { value.node.nodeName = 'other'; },
+    (value: any) => { value.pods[0].volume[0].pvcRef.name = 'wrong'; },
+    (value: any) => { value.pods[0].volume[0].time = new Date(now - 90_001).toISOString(); },
+    (value: any) => { value.pods[0].volume[0].availableBytes = null; },
+    (value: any) => { value.pods[0].volume[0].inodesFree = 0; },
+  ]) {
+    const value = summary();
+    mutate(value);
+    assert.throws(() => sourceSample(value, now));
+  }
+});
+
+test('watcher can target only its export pod, never a primary or source PVC', () => {
+  const pod = {
+    metadata: { namespace: sourceSpace.namespace, labels: { 'job-name': sourceSpace.job }, ownerReferences: [{ kind: 'Job', name: sourceSpace.job }] },
+    spec: { nodeName: sourceSpace.node, volumes: [{ persistentVolumeClaim: { claimName: sourceSpace.stageClaim } }], containers: [{ name: 'export' }] },
+  };
+  exportPod(pod);
+  const changed = structuredClone(pod);
+  changed.spec.volumes[0]!.persistentVolumeClaim.claimName = sourceSpace.claim;
+  assert.throws(() => exportPod(changed));
+  changed.metadata.labels['job-name'] = sourceSpace.cluster;
+  assert.throws(() => exportPod(changed));
+});
+
+test('sample telemetry preserves exact freshness boundaries and never emits invalid timestamp text', () => {
+  for (const [age, category] of [[-5001, 'SOURCE_SAMPLE_FUTURE'], [-5000, 'SOURCE_SAMPLE_FRESH'], [90000, 'SOURCE_SAMPLE_FRESH'], [90001, 'SOURCE_SAMPLE_STALE']] as const) {
+    const value = summary();
+    value.pods[0]!.volume[0]!.time = new Date(now - age).toISOString();
+    const events: Record<string, unknown>[] = [];
+    const inspect = () => sourceSample(value, now, fields => events.push(fields));
+    if (category === 'SOURCE_SAMPLE_FRESH') inspect();
+    else assert.throws(inspect);
+    assert.equal(events[0]!.category, category);
+    assert.equal(events[0]!.sampleAgeMs, age);
+    assert.equal(events[0]!.validatedAt, new Date(now).toISOString());
+  }
+  const value = summary();
+  value.pods[0]!.volume[0]!.time = 'sensitive-invalid-api-value';
+  const events: Record<string, unknown>[] = [];
+  assert.throws(() => sourceSample(value, now, fields => events.push(fields)));
+  assert.equal(events[0]!.category, 'SOURCE_SAMPLE_INVALID');
+  assert.equal(events[0]!.sourceSampleAt, null);
+  assert.doesNotMatch(JSON.stringify(events), /sensitive-invalid-api-value/);
+});
+
+test('one transient API timeout retries a complete observation without issuing a stale lease', async () => {
+  let attempts = 0;
+  let leases = 0;
+  const retries: number[] = [];
+  const result = await retryObservation(() => {
+    attempts++;
+    if (attempts === 1) throw Object.assign(new Error('API timeout'), { stderr: 'Client.Timeout exceeded while awaiting headers' });
+    leases++;
+    return 'fresh';
+  }, { pause: async () => {}, report: attempt => retries.push(attempt) });
+  assert.equal(result, 'fresh');
+  assert.equal(attempts, 2);
+  assert.equal(leases, 1);
+  assert.deepEqual(retries, [1]);
+});
+
+test('persistent API failure is bounded and identity/budget assertions are never retried', async () => {
+  let attempts = 0;
+  let clock = 0;
+  const failure = Object.assign(new Error('API timeout'), { code: 'ETIMEDOUT' });
+  await assert.rejects(retryObservation(() => { attempts++; throw failure; }, { pause: async () => {} }), failure);
+  assert.equal(attempts, 3);
+  attempts = 0;
+  await assert.rejects(retryObservation(() => { attempts++; clock += 20_000; throw failure; }, { clock: () => clock, pause: async () => {} }), failure);
+  assert.equal(attempts, 2);
+  attempts = 0;
+  await assert.rejects(retryObservation(() => { attempts++; sourceBudget({ availableBytes: 0 }); }, { pause: async () => {} }), /watermark/);
+  assert.equal(attempts, 1);
+});
