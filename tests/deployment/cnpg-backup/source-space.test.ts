@@ -15,6 +15,31 @@ test('source reserve and cumulative loss stop the backup before the source files
   sourceBudget({ availableBytes: sample.availableBytes - sourceSpace.maximumDropBytes + 1 }, sample.availableBytes);
 });
 
+test('budget diagnostics precede rejection and contain only bounded capacity fields', () => {
+  const initial = 10 * 1024 ** 3;
+  for (const [availableBytes, baseline, category, fails] of [
+    [sourceSpace.startBytes - 1, undefined, 'SOURCE_BUDGET_WATERMARK', true],
+    [sourceSpace.stopBytes - 1, initial, 'SOURCE_BUDGET_WATERMARK', true],
+    [initial - sourceSpace.maximumDropBytes, initial, 'SOURCE_BUDGET_DROP', true],
+    [initial - sourceSpace.maximumDropBytes + 1, initial, 'SOURCE_BUDGET_OK', false],
+    [sourceSpace.startBytes, undefined, 'SOURCE_BUDGET_OK', false],
+  ] as const) {
+    const reports: Record<string, unknown>[] = [];
+    const sample = { availableBytes, credential: 'SENSITIVE_BUDGET_SENTINEL', raw: 'SENSITIVE_BUDGET_SENTINEL' };
+    const operation = () => sourceBudget(sample, baseline, fields => reports.push(fields));
+    if (fails) assert.throws(operation); else operation();
+    assert.deepEqual(reports, [{
+      event: 'source-budget', phase: baseline === undefined ? 'initial' : 'renewal',
+      availableBytes, initialAvailableBytes: baseline ?? null,
+      minimumAvailableBytes: baseline === undefined ? sourceSpace.startBytes : sourceSpace.stopBytes,
+      maximumDropBytes: sourceSpace.maximumDropBytes,
+      dropBytes: baseline === undefined ? null : baseline - availableBytes,
+      category,
+    }]);
+    assert.doesNotMatch(JSON.stringify(reports), /SENSITIVE_BUDGET_SENTINEL/);
+  }
+});
+
 test('watcher can target only its export pod, never a primary or source PVC', () => {
   const pod = {
     metadata: { namespace: sourceSpace.namespace, labels: { 'job-name': sourceSpace.job }, ownerReferences: [{ kind: 'Job', name: sourceSpace.job }] },

@@ -117,6 +117,27 @@ test('real stat/parser errors and mount races cannot fall back to a cached summa
   }
 });
 
+test('actual collector records rejected capacity before stopping and revoking without a new lease', { timeout: 120_000 }, async context => {
+  const initial = 10 * 1024 ** 3;
+  const available = initial - sourceSpace.maximumDropBytes;
+  const result = await run(context, [
+    ...sourceCalls(), exportCall(), ...volumeCalls(),
+    ...sourceCalls({ output: sourceStatOutput(available / 4096) }), ...revokeCalls(),
+  ], true);
+  assert.equal(result.status, 1);
+  const budget = result.events.findIndex(event => event.event === 'source-budget' && event.category === 'SOURCE_BUDGET_DROP');
+  const stopping = result.events.findIndex(event => event.event === 'watcher-stopping-renewal');
+  const revocation = result.events.findIndex(event => event.phase === 'lease-revoke' && event.outcome === 'success');
+  assert.ok(budget >= 0 && stopping > budget && revocation > stopping);
+  assert.equal(result.events[budget].availableBytes, available);
+  assert.equal(result.events[budget].initialAvailableBytes, initial);
+  assert.equal(result.events[budget].dropBytes, sourceSpace.maximumDropBytes);
+  assert.equal(result.events[budget].minimumAvailableBytes, sourceSpace.stopBytes);
+  assert.equal(result.events[budget].maximumDropBytes, 512 * 1024 ** 2);
+  assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
+  assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+});
+
 test('actual collector rejects pre/post source identity races before lease publication', { timeout: 300_000 }, async context => {
   for (const [name, mutate] of [
     ['pod', (value: any) => { value.pod.metadata.uid = 'replacement'; }],

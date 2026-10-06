@@ -33,9 +33,19 @@ export async function retryObservation<T>(operation: () => T | Promise<T>, optio
   }
 }
 
-export function sourceBudget(sample: { availableBytes: number }, initialBytes?: number): void {
-  assert.ok(sample.availableBytes >= (initialBytes === undefined ? sourceSpace.startBytes : sourceSpace.stopBytes), 'Source space watermark breached; stop backup only');
-  if (initialBytes !== undefined) assert.ok(initialBytes - sample.availableBytes < sourceSpace.maximumDropBytes, 'Source lost 512Mi since dump start; stop backup only');
+export function sourceBudget(sample: { availableBytes: number }, initialBytes?: number, report?: (fields: Record<string, unknown>) => void): void {
+  const minimumBytes = initialBytes === undefined ? sourceSpace.startBytes : sourceSpace.stopBytes;
+  const watermarkSatisfied = sample.availableBytes >= minimumBytes;
+  const lossSatisfied = initialBytes === undefined || initialBytes - sample.availableBytes < sourceSpace.maximumDropBytes;
+  report?.({
+    event: 'source-budget', phase: initialBytes === undefined ? 'initial' : 'renewal',
+    availableBytes: sample.availableBytes, initialAvailableBytes: initialBytes ?? null,
+    minimumAvailableBytes: minimumBytes, maximumDropBytes: sourceSpace.maximumDropBytes,
+    dropBytes: initialBytes === undefined ? null : initialBytes - sample.availableBytes,
+    category: !watermarkSatisfied ? 'SOURCE_BUDGET_WATERMARK' : !lossSatisfied ? 'SOURCE_BUDGET_DROP' : 'SOURCE_BUDGET_OK',
+  });
+  assert.ok(watermarkSatisfied, 'Source space watermark breached; stop backup only');
+  assert.ok(lossSatisfied, 'Source lost 512Mi since dump start; stop backup only');
 }
 
 export function exportPod(pod: any): void {
@@ -113,7 +123,7 @@ async function main(): Promise<void> {
   const read = () => readSourceFilesystem(kubectl, observeSource);
   const report = (retryAttempt: number) => emit('transient-api-retry-no-lease-renewal', { retryAttempt });
   const initial = await retryObservation(() => collect('initial-source', read), { report });
-  sourceBudget(initial);
+  sourceBudget(initial, undefined, observeSource);
   if (mode === '--check') {
     console.log(JSON.stringify({ ...initial, sourceSpace, operation: 'read-only-no-source-sql-no-pvc-mount' }, null, 2));
   } else {
@@ -142,7 +152,7 @@ async function main(): Promise<void> {
           assert.deepEqual(current.sourceIdentity, initial.sourceIdentity, 'Source container or binding changed since start');
           assert.equal(current.mount, initial.mount, 'Source mount changed since start');
           assert.equal(current.filesystemId, initial.filesystemId, 'Source filesystem changed since start');
-          sourceBudget(current, initial.availableBytes);
+          sourceBudget(current, initial.availableBytes, observeSource);
           assertSourceFresh(current, observeSource);
           const epoch = Math.floor(Date.now() / 1000);
           assert.ok(epoch - Number(volumeLease.split(' ')[0]) <= 45, 'CSI observation expired while sampling source space');
