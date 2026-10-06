@@ -69,10 +69,10 @@ impl Database {
         lease_owner: Uuid,
         reservation_id: Uuid,
     ) -> Result<bool, AppError> {
-        let now = unix_millis();
         let reservation_id = reservation_id.to_string();
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+        let now = unix_millis();
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT account_id, key_id, actual_micros FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
@@ -125,7 +125,7 @@ impl Database {
         // jobs have no request row and already own their generation projections,
         // so they only need the durable acknowledgement below.
         let request_ids = sqlx::query(
-            "SELECT id FROM request_records WHERE reservation_id = $1 AND key_id = $2 ORDER BY id ASC LIMIT 2",
+            "SELECT id FROM request_records WHERE reservation_id = $1 AND key_id = $2 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox terminal WHERE terminal.reservation_id = $1) ORDER BY id ASC LIMIT 2",
         )
         .bind(&reservation_id)
         .bind(&key_id)
@@ -199,7 +199,7 @@ impl Database {
     }
 }
 
-async fn project_metered_request_fact_in_transaction(
+pub(super) async fn project_metered_request_fact_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
     project_session_rollups: bool,
