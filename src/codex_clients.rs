@@ -52,10 +52,22 @@ impl ClientKey {
 
 #[derive(Default)]
 pub(crate) struct CodexClients {
-    clients: Mutex<VecDeque<(ClientKey, wreq::Client)>>,
+    clients: Mutex<VecDeque<(ClientKey, CachedClient)>>,
     dispatch: dispatch::DispatchLanes,
     #[cfg(test)]
     test_client: Mutex<Option<wreq::Client>>,
+}
+
+#[derive(Clone)]
+struct CachedClient {
+    client: wreq::Client,
+    instance_id: uuid::Uuid,
+}
+
+pub(crate) struct ClientSnapshot {
+    pub(crate) client: wreq::Client,
+    pub(crate) instance_id: uuid::Uuid,
+    pub(crate) cache_hit: bool,
 }
 
 impl CodexClients {
@@ -72,6 +84,15 @@ impl CodexClients {
         route: &ResolvedUpstream,
         selection_generation: i64,
     ) -> Result<wreq::Client, &'static str> {
+        self.transport_snapshot_with_diagnostics(route, selection_generation)
+            .map(|snapshot| snapshot.client)
+    }
+
+    pub(crate) fn transport_snapshot_with_diagnostics(
+        &self,
+        route: &ResolvedUpstream,
+        selection_generation: i64,
+    ) -> Result<ClientSnapshot, &'static str> {
         #[cfg(test)]
         if let Some(client) = self
             .test_client
@@ -79,12 +100,16 @@ impl CodexClients {
             .map_err(|_| "transport_client_unavailable")?
             .as_ref()
         {
-            return Ok(client.clone());
+            return Ok(ClientSnapshot {
+                client: client.clone(),
+                instance_id: uuid::Uuid::nil(),
+                cache_hit: false,
+            });
         }
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
         let mut key = ClientKey::new(route, policy);
         key.selection_generation = selection_generation;
-        self.client(key, policy)
+        self.client_snapshot(key, policy)
     }
 
     #[cfg(test)]
@@ -110,15 +135,28 @@ impl CodexClients {
         key: ClientKey,
         policy: CodexTransportPolicy,
     ) -> Result<wreq::Client, &'static str> {
+        self.client_snapshot(key, policy)
+            .map(|snapshot| snapshot.client)
+    }
+
+    fn client_snapshot(
+        &self,
+        key: ClientKey,
+        policy: CodexTransportPolicy,
+    ) -> Result<ClientSnapshot, &'static str> {
         let mut clients = self
             .clients
             .lock()
             .map_err(|_| "transport_client_unavailable")?;
         if let Some(position) = clients.iter().position(|(cached, _)| cached == &key) {
             let entry = clients.remove(position).expect("cache position exists");
-            let client = entry.1.clone();
+            let snapshot = ClientSnapshot {
+                client: entry.1.client.clone(),
+                instance_id: entry.1.instance_id,
+                cache_hit: true,
+            };
             clients.push_back(entry);
-            return Ok(client);
+            return Ok(snapshot);
         }
         let client = crate::build_codex_http_client_with_policy(policy)
             .map_err(|_| "transport_client_unavailable")?;
@@ -127,8 +165,19 @@ impl CodexClients {
         if clients.len() >= 64 {
             clients.pop_front();
         }
-        clients.push_back((key, client.clone()));
-        Ok(client)
+        let instance_id = uuid::Uuid::now_v7();
+        clients.push_back((
+            key,
+            CachedClient {
+                client: client.clone(),
+                instance_id,
+            },
+        ));
+        Ok(ClientSnapshot {
+            client,
+            instance_id,
+            cache_hit: false,
+        })
     }
 }
 
@@ -333,6 +382,57 @@ mod tests {
             1,
             "cache snapshots and per-request SOCKS binding must preserve the idle connection pool"
         );
+    }
+
+    #[test]
+    fn diagnostic_client_identity_tracks_cache_reuse_and_selected_proxy() {
+        let clients = CodexClients::default();
+        let mut route = ResolvedUpstream {
+            route_id: uuid::Uuid::nil(),
+            account_id: uuid::Uuid::nil(),
+            transport_revision: 1,
+            credential_generation: 1,
+            driver: "openai-codex".into(),
+            base_url: String::new(),
+            config: serde_json::json!({}),
+            upstream_model: String::new(),
+            credential: UpstreamCredential::ProxiedApiKey {
+                value: "synthetic-secret".into(),
+                header: "authorization".into(),
+                prefix: String::new(),
+                proxy_url: "socks5h://user:password@10.0.0.1:1080".into(),
+                proxy_network_scope: crate::network::OutboundScope::Private,
+            },
+        };
+        let first = clients
+            .transport_snapshot_with_diagnostics(&route, 1)
+            .unwrap();
+        let reused = clients
+            .transport_snapshot_with_diagnostics(&route, 1)
+            .unwrap();
+        assert!(!first.cache_hit);
+        assert!(reused.cache_hit);
+        assert!(!first.instance_id.is_nil());
+        assert_eq!(first.instance_id, reused.instance_id);
+        route.credential = route
+            .credential
+            .with_transport_proxy("socks5h://user:password@10.0.0.2:1080".into())
+            .unwrap();
+        let changed_proxy = clients
+            .transport_snapshot_with_diagnostics(&route, 1)
+            .unwrap();
+        assert!(!changed_proxy.cache_hit);
+        assert_ne!(first.instance_id, changed_proxy.instance_id);
+        let changed_epoch = clients
+            .transport_snapshot_with_diagnostics(&route, 2)
+            .unwrap();
+        assert!(!changed_epoch.cache_hit);
+        assert_ne!(changed_proxy.instance_id, changed_epoch.instance_id);
+        let same_epoch = clients
+            .transport_snapshot_with_diagnostics(&route, 2)
+            .unwrap();
+        assert!(same_epoch.cache_hit);
+        assert_eq!(changed_epoch.instance_id, same_epoch.instance_id);
     }
 
     #[test]

@@ -4,6 +4,8 @@ use crate::metrics::{CodexBadRequestRetry, CodexEgressFailureStage, CodexEgressP
 pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
+#[path = "codex/send_diagnostics.rs"]
+mod send_diagnostics;
 
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
@@ -335,10 +337,19 @@ async fn send_codex_attempt(
         }
         let mut transport_route = route.route.clone();
         transport_route.credential = selection.credential.clone();
-        let client = state
+        let client_snapshot = state
             .codex_clients
-            .transport_snapshot(&transport_route, selection.generation)
+            .transport_snapshot_with_diagnostics(&transport_route, selection.generation)
             .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        let transport_identity = send_diagnostics::TransportIdentity {
+            client_instance_id: client_snapshot.instance_id,
+            cache_hit: client_snapshot.cache_hit,
+            proxy_member_index: selection.member_index(),
+            proxy_member_count: selection.member_count(),
+            selection_epoch: selection.generation,
+            group_selection_version: selection.group_selection_version(),
+            request_local_selection: selection.is_request_local(),
+        };
         let phase = proxy_diagnostics::Phase::account(
             proxy_diagnostics::Context::for_request(request_id),
             "codex_transport_attempt",
@@ -351,7 +362,11 @@ async fn send_codex_attempt(
             target_url,
             route,
             session_id,
-            (&client, &selection.credential),
+            (
+                &client_snapshot.client,
+                &selection.credential,
+                transport_identity,
+            ),
             context,
         )
         .await;
@@ -463,7 +478,11 @@ async fn send_codex_attempt_once(
     target_url: &str,
     route: &PreparedProxyRoute,
     session_id: &str,
-    transport: (&wreq::Client, &UpstreamCredential),
+    transport: (
+        &wreq::Client,
+        &UpstreamCredential,
+        send_diagnostics::TransportIdentity,
+    ),
     context: CodexAttemptContext,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let CodexAttemptContext {
@@ -491,7 +510,7 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
-    let (client, credential) = transport;
+    let (client, credential, transport_identity) = transport;
     let mut request = client.post(target_url).body(route.forwarded_body.clone());
     let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
         let proxy =
@@ -510,10 +529,19 @@ async fn send_codex_attempt_once(
         credential_now,
     )
     .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
+    let (client, request) = request.build_split();
+    if let Ok(request) = &request {
+        send_diagnostics::observe(request, route, credential, &transport_identity, context);
+    }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = send_until_request_deadline(deadline.request, async {
-        request.send().await.map_err(|error| {
+        async {
+            let request = request?;
+            client.execute(request).await
+        }
+        .await
+        .map_err(|error| {
             if let Some(http2) = upstream_response::codex_http2_error(&error) {
                 tracing::warn!(
                     %request_id,
