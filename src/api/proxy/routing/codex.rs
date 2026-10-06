@@ -293,7 +293,7 @@ async fn send_codex_attempt(
         let has_unattempted = selection
             .select_unattempted(&attempted)
             .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        tracing::info!(
+        tracing::debug!(
             %request_id,
             upstream_account_id = %route.route.account_id,
             transport_revision = route.route.transport_revision,
@@ -361,7 +361,7 @@ async fn send_codex_attempt(
             let cas_outcome = selection
                 .advance_after_connect_failure_outcome(&attempted)
                 .map_err(|_| ProxySendError::CandidateUnavailable)?;
-            tracing::info!(
+            tracing::debug!(
                 %request_id,
                 upstream_account_id = %route.route.account_id,
                 transport_revision = route.route.transport_revision,
