@@ -7,6 +7,7 @@ import { capacityPolicy, restoreReceipt } from './capacity-policy.ts';
 import { storageResources, validateStorageResources } from './storage-preflight.ts';
 import { sourceSpace } from './source-space.ts';
 import { stageIdentity } from './volume-identity.ts';
+import { superviseExport } from './export-supervisor.ts';
 
 export const boundedClaims = {
   stage: 'mtc-pg-bounded-stage-20261005',
@@ -28,7 +29,7 @@ function replaceOnce(script: string, before: string, after: string): string {
   return script.replace(before, after);
 }
 
-export function preparedResources(): any[] {
+export function preparedResources(stageSupervisor: (script: string) => string = superviseExport): any[] {
   const originals = ['mtc-pg-local-stage-20261004.yaml', 'mtc-pg-offhost-copy-20261004.yaml', 'mtc-pg-restore-verification-20261004.yaml']
     .flatMap(name => parseAllDocuments(readFileSync(join(directory, name), 'utf8')).map(document => {
       assert.deepEqual(document.errors, []);
@@ -110,7 +111,7 @@ export function preparedResources(): any[] {
 )`);
       script = replaceOnce(script, 'trap \'kill -TERM "$stage_pid" 2>/dev/null || true\' EXIT',
         'trap \'kill -TERM "$stage_pid" 2>/dev/null || true\' EXIT\n  trap \'trap - EXIT; exit 0\' TERM INT');
-      container.command[6] = script;
+      container.command[6] = stageSupervisor(script);
     }
     if (resource.metadata.name === boundedJobs.restore) {
       let script: string = container.command[2];

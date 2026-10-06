@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { exportPod, sourceBudget, sourceSample, sourceSpace } from './source-space.ts';
+import { exportPod, retryObservation, sourceBudget, sourceSample, sourceSpace } from './source-space.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const now = Date.parse('2026-10-05T18:09:17Z');
@@ -37,4 +37,34 @@ test('watcher can target only its export pod, never a primary or source PVC', ()
   assert.throws(() => exportPod(changed));
   changed.metadata.labels['job-name'] = sourceSpace.cluster;
   assert.throws(() => exportPod(changed));
+});
+
+test('one transient API timeout retries a complete observation without issuing a stale lease', async () => {
+  let attempts = 0;
+  let leases = 0;
+  const retries: number[] = [];
+  const result = await retryObservation(() => {
+    attempts++;
+    if (attempts === 1) throw Object.assign(new Error('API timeout'), { stderr: 'Client.Timeout exceeded while awaiting headers' });
+    leases++;
+    return 'fresh';
+  }, { pause: async () => {}, report: attempt => retries.push(attempt) });
+  assert.equal(result, 'fresh');
+  assert.equal(attempts, 2);
+  assert.equal(leases, 1);
+  assert.deepEqual(retries, [1]);
+});
+
+test('persistent API failure is bounded and identity/budget assertions are never retried', async () => {
+  let attempts = 0;
+  let clock = 0;
+  const failure = Object.assign(new Error('API timeout'), { code: 'ETIMEDOUT' });
+  await assert.rejects(retryObservation(() => { attempts++; throw failure; }, { pause: async () => {} }), failure);
+  assert.equal(attempts, 3);
+  attempts = 0;
+  await assert.rejects(retryObservation(() => { attempts++; clock += 20_000; throw failure; }, { clock: () => clock, pause: async () => {} }), failure);
+  assert.equal(attempts, 2);
+  attempts = 0;
+  await assert.rejects(retryObservation(() => { attempts++; sourceBudget({ availableBytes: 0 }); }, { pause: async () => {} }), /watermark/);
+  assert.equal(attempts, 1);
 });

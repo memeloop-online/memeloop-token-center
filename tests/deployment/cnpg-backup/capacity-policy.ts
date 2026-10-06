@@ -12,7 +12,7 @@ export const capacityPolicy = String.raw`capacity_attestation() {
   test "$1" -le "$capacity_now" || return 1
   test "$((capacity_now - $1))" -le 45 || return 1
   test "$2" = "$POD_UID" && test "$3" = "$capacity_device" && test "$4" = "$capacity_uuid" || return 1
-  capacity_device_number=$(timeout 5 findmnt -rn -o MAJ:MIN -T "$capacity_path") || return 1
+  capacity_device_number=$(timeout -k 1 5 findmnt -rn -o MAJ:MIN -T "$capacity_path") || return 1
   test "$5" = "$capacity_device_number" || return 1
 }
 capacity_volume() {
@@ -23,14 +23,14 @@ capacity_volume() {
   capacity_reserve=$5
   test "$HARD_CAPACITY_REVIEW_APPROVED" = true || return 1
   case "$capacity_uuid" in ''|*[!a-zA-Z0-9-]*) return 1 ;; esac
-  capacity_type=$(timeout 5 findmnt -rn -o FSTYPE -T "$capacity_path") || return 1
+  capacity_type=$(timeout -k 1 5 findmnt -rn -o FSTYPE -T "$capacity_path") || return 1
   case "$capacity_type" in ext4|xfs) ;; *) return 1 ;; esac
-  capacity_target=$(timeout 5 findmnt -rn -o TARGET -T "$capacity_path") || return 1
-  capacity_root=$(timeout 5 findmnt -rn -o FSROOT -T "$capacity_path") || return 1
-  capacity_actual_uuid=$(timeout 5 findmnt -rn -o UUID -T "$capacity_path") || return 1
+  capacity_target=$(timeout -k 1 5 findmnt -rn -o TARGET -T "$capacity_path") || return 1
+  capacity_root=$(timeout -k 1 5 findmnt -rn -o FSROOT -T "$capacity_path") || return 1
+  capacity_actual_uuid=$(timeout -k 1 5 findmnt -rn -o UUID -T "$capacity_path") || return 1
   test "$capacity_target" = "$capacity_path" || return 1
   test "$capacity_root" = / || return 1
-  capacity_device=$(timeout 5 findmnt -rn -o SOURCE -T "$capacity_path") || return 1
+  capacity_device=$(timeout -k 1 5 findmnt -rn -o SOURCE -T "$capacity_path") || return 1
   case "$capacity_device" in /dev/*) ;; *) return 1 ;; esac
   case "$capacity_device" in *'['*|*']'*) return 1 ;; esac
   if test "$(printenv BACKUP_UUID_ATTESTATION || true)" = external-csi-lease; then
@@ -39,7 +39,7 @@ capacity_volume() {
   else
     test "$capacity_actual_uuid" = "$capacity_uuid" || return 1
   fi
-  capacity_stats=$(timeout 5 stat -f -c '%S %b %a %c %d' "$capacity_path") || return 1
+  capacity_stats=$(timeout -k 1 5 stat -f -c '%S %b %a %c %d' "$capacity_path") || return 1
   set -- $capacity_stats
   test "$#" -eq 5 || return 1
   for capacity_number in "$@" "$capacity_max" "$capacity_min" "$capacity_reserve" "$CAPACITY_MIN_FREE_INODES"; do

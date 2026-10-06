@@ -13,6 +13,24 @@ export const sourceSpace = {
   leaseSeconds: 45, waitSeconds: 120, deadlineMs: 43_200_000,
 };
 
+export async function retryObservation<T>(operation: () => T | Promise<T>, options: {
+  clock?: () => number; pause?: (milliseconds: number) => Promise<unknown>; report?: (attempt: number) => void;
+} = {}): Promise<T> {
+  const clock = options.clock ?? Date.now;
+  const started = clock();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const failure = error as { code?: string; stderr?: string | Buffer; message?: string };
+      const transient = failure.code === 'ETIMEDOUT' || /Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''));
+      if (!transient || attempt >= 3 || clock() - started >= 30_000) throw error;
+      options.report?.(attempt);
+      await (options.pause ?? delay)(1000);
+    }
+  }
+}
+
 export function sourceSample(summary: any, now = Date.now()): { availableBytes: number; time: string; freeInodes: number } {
   assert.equal(summary.node.nodeName, sourceSpace.node);
   const pods = summary.pods.filter((pod: any) => pod.podRef.namespace === sourceSpace.namespace && pod.podRef.name === sourceSpace.pod);
@@ -49,7 +67,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.equal(process.env.PARENT_REVIEW_APPROVED, 'true', 'Watcher writes only an approved export pod tmpfs lease');
     assert.match(exportName!, /^mtc-pg-bounded-stage-20261005-[a-z0-9-]+$/);
   }
-  const kubectl = (args: string[]) => execFileSync('kubectl', ['--request-timeout=15s', ...args], { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 ** 2 });
+  const kubectl = (args: string[]) => execFileSync('kubectl', ['--request-timeout=15s', ...args], { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2 });
   const get = (kind: string, name: string) => JSON.parse(kubectl(['-n', sourceSpace.namespace, 'get', kind, name, '-o', 'json']));
   const read = () => {
     const cluster = get('clusters.postgresql.cnpg.io', sourceSpace.cluster);
@@ -61,7 +79,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.equal(summary.pods.find((entry: any) => entry.podRef.namespace === sourceSpace.namespace && entry.podRef.name === sourceSpace.pod)?.podRef.uid, pod.metadata.uid, 'Source stats belong to a replaced pod');
     return { ...sourceSample(summary), sourcePodUID: pod.metadata.uid };
   };
-  const initial = read();
+  const report = (attempt: number) => console.log(JSON.stringify({ observedAt: new Date().toISOString(), event: 'transient-api-retry-no-lease-renewal', attempt }));
+  const initial = await retryObservation(read, { report });
   sourceBudget(initial);
   if (mode === '--check') {
     console.log(JSON.stringify({ ...initial, sourceSpace, operation: 'read-only-no-source-sql-no-pvc-mount' }, null, 2));
@@ -70,29 +89,34 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const started = Date.now();
     try {
       while (Date.now() - started < sourceSpace.deadlineMs) {
-        const pod = get('pod', exportName!);
-        exportPod(pod);
-        watchedUID ??= pod.metadata.uid;
-        assert.equal(pod.metadata.uid, watchedUID, 'Export pod replaced; refuse to write a new pod');
-        const terminated = pod.status.containerStatuses?.find((container: any) => container.name === 'export')?.state.terminated;
-        if (terminated) {
-          assert.equal(terminated.exitCode, 0, 'Export failed; partial is not a backup');
-          console.log('Export process completed; offhost copy and isolated restore remain required');
-          break;
-        }
-        assert.equal(pod.status.phase, 'Running');
-        const volumeLease = attestStageVolume(kubectl, pod);
-        const current = read();
-        assert.equal(current.sourcePodUID, initial.sourcePodUID, 'Source pod replaced; stop backup');
-        sourceBudget(current, initial.availableBytes);
-        const epoch = Math.floor(Date.now() / 1000);
-        assert.ok(epoch - Number(volumeLease.split(' ')[0]) <= 45, 'CSI observation expired while sampling source space');
-        kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/sh', '-ec', `umask 077; printf '%s\\n' '${volumeLease}' > /tmp/backup-volume.lease.partial; mv /tmp/backup-volume.lease.partial /tmp/backup-volume.lease; printf '%s\\n' ${epoch} > /tmp/source-space.lease.partial; mv /tmp/source-space.lease.partial /tmp/source-space.lease`]);
-        console.log(JSON.stringify({ observedAt: new Date().toISOString(), ...current, initialAvailableBytes: initial.availableBytes }));
+        const observation = await retryObservation(() => {
+          const pod = get('pod', exportName!);
+          exportPod(pod);
+          watchedUID ??= pod.metadata.uid;
+          assert.equal(pod.metadata.uid, watchedUID, 'Export pod replaced; refuse to write a new pod');
+          const terminated = pod.status.containerStatuses?.find((container: any) => container.name === 'export')?.state.terminated;
+          if (terminated) {
+            assert.equal(terminated.exitCode, 0, 'Export failed; partial is not a backup');
+            console.log('Export process completed; offhost copy and isolated restore remain required');
+            return false;
+          }
+          assert.equal(pod.status.phase, 'Running');
+          const volumeLease = attestStageVolume(kubectl, pod);
+          const current = read();
+          assert.equal(current.sourcePodUID, initial.sourcePodUID, 'Source pod replaced; stop backup');
+          sourceBudget(current, initial.availableBytes);
+          const epoch = Math.floor(Date.now() / 1000);
+          assert.ok(epoch - Number(volumeLease.split(' ')[0]) <= 45, 'CSI observation expired while sampling source space');
+          kubectl(['-n', sourceSpace.namespace, 'exec', exportName!, '-c', 'export', '--', '/bin/sh', '-ec', `umask 077; printf '%s\\n' '${volumeLease}' > /tmp/backup-volume.lease.partial; mv /tmp/backup-volume.lease.partial /tmp/backup-volume.lease; printf '%s\\n' ${epoch} > /tmp/source-space.lease.partial; mv /tmp/source-space.lease.partial /tmp/source-space.lease`]);
+          console.log(JSON.stringify({ observedAt: new Date().toISOString(), ...current, initialAvailableBytes: initial.availableBytes }));
+          return true;
+        }, { report });
+        if (!observation) break;
         await delay(sourceSpace.intervalMs);
       }
       assert.ok(Date.now() - started < sourceSpace.deadlineMs, 'Source watcher deadline exceeded');
     } catch (error) {
+      console.error(JSON.stringify({ observedAt: new Date().toISOString(), event: 'watcher-stopping-renewal', leaseSeconds: sourceSpace.leaseSeconds }));
       if (watchedUID) {
         try {
           const pod = get('pod', exportName!);
