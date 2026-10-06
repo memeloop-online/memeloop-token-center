@@ -236,3 +236,74 @@ async fn ambiguous_delivery_never_replays_or_changes_group_selection() {
         assert_eq!(selection(&fixture).await, before);
     }
 }
+
+#[tokio::test]
+async fn concurrent_selection_round_trip_does_not_exhaust_untried_member() {
+    for (label, second_failure, expected_status) in [
+        (
+            "connect",
+            ProxySendError::RetryableConnection("connect"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "h2",
+            ProxySendError::NonRetryableTransport(routing::TransportFailureKind::Http2Reset),
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        let fixture = fixture(&format!("proxy-group-cas-round-trip-{label}")).await;
+        let before = selection(&fixture).await;
+        let (account, credential) = fixture
+            .state
+            .db
+            .upstream_account_with_credential(
+                fixture.upstream_account_id,
+                fixture.state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let groups = fixture.state.transport_proxy_groups.clone();
+        let (response, remaining) =
+            crate::db::TransportProxyGroups::with_test_connect_failure_interleaving(
+                move || {
+                    let primary = groups
+                        .select(account.id, account.credential_generation, &credential)
+                        .unwrap();
+                    assert_eq!(primary.member(), Some(0));
+                    assert!(primary.advance_after_connect_failure(&[0]).unwrap());
+                    let backup = groups
+                        .select(account.id, account.credential_generation, &credential)
+                        .unwrap();
+                    assert_eq!(backup.member(), Some(1));
+                    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
+                },
+                routing::with_test_send_failures(
+                    vec![
+                        ProxySendError::RetryableConnection("connect"),
+                        second_failure,
+                        ProxySendError::RetryableConnection("must_not_send_again"),
+                    ],
+                    send_codex_route_to_endpoint(
+                        &fixture,
+                        codex_transport::BASE_URL.to_owned(),
+                        "/v1/responses",
+                        json!({"model": fixture.model, "input": "hello", "stream": false}),
+                    ),
+                ),
+            )
+            .await;
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert_eq!(status, expected_status);
+        assert_eq!(
+            3 - remaining,
+            2,
+            "each distinct member must be sent exactly once"
+        );
+        let after = selection(&fixture).await;
+        assert_eq!(after.0, PRIMARY);
+        assert_eq!(after.1, before.1 + 2);
+    }
+}
