@@ -10,6 +10,7 @@
   "minimumFreeInodes": 65536,
   "initialAllocationManifest": "backup-storage.json",
   "deferredRestoreAllocation": "64Gi versetensor scratch remains in exact-storage.json but is excluded from backup-storage.json; not a new CNPG instance or replica",
+  "restoreArchiveSelection": "BACKUP_ARCHIVE_DIRECTORY defaults to /backup/mtc-pg-logical-20261004 and must match the reviewed restore plan archiveDirectory. A later completed archive can be restored without rewriting the tested shell command. Directory selection does not authorize storage allocation or replace the offhost SHA, markers, independent leases and full restore receipt.",
   "offhostCopyRate": "Default 1MiB/s; BACKUP_COPY_RATE_MIB_PER_SECOND accepts separately reviewed 4 or 8 without changing the 4MiB chunk, hash/resume, capacity or independent CSI leases. Faster pacing is not execution authorization or physical-device QoS; copy reads the completed stage archive, never PGDATA.",
   "sourceProtection": {
     "checkCommand": "node tests/deployment/cnpg-backup/source-space.ts --check",

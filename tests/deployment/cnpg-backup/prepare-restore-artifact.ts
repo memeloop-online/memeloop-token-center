@@ -8,7 +8,7 @@ import { stringify } from 'yaml';
 import { boundedJobs, policyName, preparedResources } from './hard-capacity.ts';
 import { copyImage } from './copy-guard.ts';
 import { archiveIdentity } from './volume-identity.ts';
-import { restoreClaim } from './restore-guard.ts';
+import { defaultRestoreArchiveDirectory, restoreClaim } from './restore-guard.ts';
 
 export function prepareRestoreArtifact(output: string, provenance: { testedCommit: string; sourceHead: string; runId: string }): void {
   assert.match(provenance.testedCommit, /^[a-f0-9]{40}$/);
@@ -24,7 +24,7 @@ export function prepareRestoreArtifact(output: string, provenance: { testedCommi
   const files: Record<string, string> = {
     'cnpg-restore-preparation.yaml': resources.map(resource => stringify(resource)).join('---\n'),
     'review-required-plan.json': JSON.stringify({
-      commandSHA256: digest(JSON.stringify(command)), archiveSHA256: '',
+      commandSHA256: digest(JSON.stringify(command)), archiveSHA256: '', archiveDirectory: defaultRestoreArchiveDirectory,
       scratch: { ...archiveIdentity, name: restoreClaim, device: `/dev/longhorn/${restoreClaim}`, capacityGiB: 64,
         claimUID: '', persistentUID: '', longhornUID: '', filesystemUUID: '' },
     }, null, 2) + '\n',

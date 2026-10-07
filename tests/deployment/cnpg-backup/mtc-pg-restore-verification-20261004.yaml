@@ -69,7 +69,9 @@ spec:
             - |
               umask 077
               test "$PARENT_REVIEW_APPROVED" = "true"
-              archive_dir=/backup/mtc-pg-logical-20261004
+              archive_dir=${BACKUP_ARCHIVE_DIRECTORY-/backup/mtc-pg-logical-20261004}
+              case "$archive_dir" in *[!a-z0-9/-]*) exit 1 ;; esac
+              printf '%s\n' "$archive_dir" | grep -Eq '^/backup/mtc-pg-logical-[0-9]{8}(-[a-z0-9]+)*$'
               archive="$archive_dir/memeloop_token_center.dump"
               cd "$archive_dir"
               test -f LOCAL_ARCHIVE_CREATED

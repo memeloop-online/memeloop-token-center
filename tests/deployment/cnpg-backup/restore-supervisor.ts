@@ -5,6 +5,10 @@ export function superviseRestore(original: string): string {
   const stopTrap = 'trap \'pg_ctl -D "$PGDATA" -m immediate stop > /dev/null 2>&1 || true\' EXIT\n';
   assert.equal(original.split(stopTrap).length, 2);
   assert.equal(original.split('test "$table_count" -ge 254').length, 2);
+  const archiveStart = original.indexOf('archive_dir=');
+  const archiveEnd = original.indexOf('\narchive="$archive_dir/memeloop_token_center.dump"');
+  assert.ok(archiveStart >= 0 && archiveEnd > archiveStart);
+  const archiveSelection = original.slice(archiveStart, archiveEnd);
   const child = original.replace(stopTrap, '') + String.raw`
 timeout -k 1 15 pg_ctl -D "$PGDATA" -m fast -w stop > /scratch/stop.log
 printf '%s\n' "$table_count" > /tmp/restore-public-relations
@@ -15,6 +19,7 @@ printf '%s\n' "$table_count" > /tmp/restore-public-relations
   const quoted = "'" + child.replaceAll("'", "'\\''") + "'";
   return String.raw`umask 077
 test "$PARENT_REVIEW_APPROVED" = true
+${archiveSelection}
 . /policy/capacity.sh
 test ! -e /scratch/RESTORE_SUCCESS.json
 test ! -e /scratch/RESTORE_SUCCESS.json.partial
@@ -68,7 +73,7 @@ capacity_restore
 table_count=$(cat /tmp/restore-public-relations)
 case "$table_count" in ''|*[!0-9]*) exit 1 ;; esac
 test "$table_count" -ge 254
-archive=/backup/mtc-pg-logical-20261004/memeloop_token_center.dump
+archive="$archive_dir/memeloop_token_center.dump"
 ` + receipt + String.raw`
 capacity_restore
 cat /scratch/RESTORE_SUCCESS.json
