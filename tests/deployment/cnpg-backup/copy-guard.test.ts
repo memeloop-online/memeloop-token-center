@@ -68,16 +68,16 @@ test('both copy sides use pinned distinct CSI identity and publish only a pod-bo
   }
 });
 
-test('explicit32Gi copy source still refuses an unexpanded28Gi volume and leaves destination profile unchanged', () => {
+for (const capacity of [32, 40]) test(`explicit${capacity}Gi copy source refuses unexpanded28Gi and leaves destination unchanged`, () => {
   const value = fixture('source');
   const environment = value.pod.spec.containers[0].env;
-  environment.push({ name: 'REVIEWED_STAGE_CAPACITY_GIB', value: '32' });
-  for (const [name, selected] of [['BACKUP_MAX_BYTES', String(32 * 1024 ** 3)], ['BACKUP_MIN_BYTES', String(30 * 1024 ** 3)], ['HARD_CAPACITY_REVIEW_APPROVED', 'true']]) environment.find((entry: any) => entry.name === name).value = selected;
+  environment.push({ name: 'REVIEWED_STAGE_CAPACITY_GIB', value: String(capacity) });
+  for (const [name, selected] of [['BACKUP_MAX_BYTES', String(capacity * 1024 ** 3)], ['BACKUP_MIN_BYTES', String((capacity - 2) * 1024 ** 3)], ['HARD_CAPACITY_REVIEW_APPROVED', 'true']]) environment.find((entry: any) => entry.name === name).value = selected;
   const commands: string[][] = [];
   assert.throws(() => renewCopyLease(reader(value, commands), 'source', value.pod.metadata.name, value.pod.metadata.uid));
   assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 0);
-  value.pv.spec.capacity.storage = '32Gi';
-  value['volumes.longhorn.io'].spec.size = String(32 * 1024 ** 3);
+  value.pv.spec.capacity.storage = `${capacity}Gi`;
+  value['volumes.longhorn.io'].spec.size = String(capacity * 1024 ** 3);
   renewCopyLease(reader(value, commands), 'source', value.pod.metadata.name, value.pod.metadata.uid);
   assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 1);
   validateCopyPod(fixture('destination').pod, 'destination');

@@ -18,10 +18,10 @@ export function stageIdentityForPod(pod: any, containerName: string): typeof sta
   const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
   const value = (name: string) => container.env.find((entry: any) => entry.name === name)?.value;
   const capacity = value('REVIEWED_STAGE_CAPACITY_GIB') ?? '28';
-  assert.ok(['28', '32'].includes(capacity), 'Unknown reviewed stage capacity profile');
-  if (capacity === '32') {
-    assert.equal(value('BACKUP_MAX_BYTES'), String(32 * 1024 ** 3));
-    assert.equal(value('BACKUP_MIN_BYTES'), String(30 * 1024 ** 3));
+  assert.ok(['28', '32', '40'].includes(capacity), 'Unknown reviewed stage capacity profile');
+  if (capacity !== '28') {
+    assert.equal(value('BACKUP_MAX_BYTES'), String(Number(capacity) * 1024 ** 3));
+    assert.equal(value('BACKUP_MIN_BYTES'), String((Number(capacity) - 2) * 1024 ** 3));
     assert.equal(value('HARD_CAPACITY_REVIEW_APPROVED'), 'true');
   }
   return { ...stageIdentity, capacityGiB: Number(capacity) };
