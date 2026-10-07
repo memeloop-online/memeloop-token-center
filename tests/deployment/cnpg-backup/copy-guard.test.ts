@@ -68,6 +68,31 @@ test('both copy sides use pinned distinct CSI identity and publish only a pod-bo
   }
 });
 
+test('Kubernetes may omit destination readOnly=false; source must remain explicitly read-only at both layers', () => {
+  for (const layer of ['claim', 'mount', 'both']) {
+    for (const side of copySides) {
+      const value = fixture(side);
+      const claim = value.pod.spec.volumes.find((volume: any) => volume.persistentVolumeClaim).persistentVolumeClaim;
+      const mount = value.pod.spec.containers[0].volumeMounts.find((entry: any) => entry.name === 'backup');
+      if (layer !== 'mount') delete claim.readOnly;
+      if (layer !== 'claim') delete mount.readOnly;
+      const commands: string[][] = [];
+      const renew = () => renewCopyLease(reader(value, commands), side, value.pod.metadata.name, value.pod.metadata.uid, () => 1_791_309_000_000);
+      if (side === 'source') {
+        assert.throws(renew);
+        assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 0);
+      } else {
+        renew();
+        assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 1);
+      }
+    }
+    const destination = fixture('destination');
+    if (layer !== 'mount') destination.pod.spec.volumes.find((volume: any) => volume.persistentVolumeClaim).persistentVolumeClaim.readOnly = true;
+    if (layer !== 'claim') destination.pod.spec.containers[0].volumeMounts.find((entry: any) => entry.name === 'backup').readOnly = true;
+    assert.throws(() => validateCopyPod(destination.pod, 'destination'));
+  }
+});
+
 for (const capacity of [32, 40]) test(`explicit${capacity}Gi copy source refuses unexpanded28Gi and leaves destination unchanged`, () => {
   const value = fixture('source');
   const environment = value.pod.spec.containers[0].env;
