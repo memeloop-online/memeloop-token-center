@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { exportPod, retryObservation, sourceBudget, sourceSpace } from './source-space.ts';
+import { exportPod, failureCategory, failureDetails, retryObservation, sourceBudget, sourceSpace } from './source-space.ts';
 import { parseSourceStat } from './source-filesystem.ts';
 import { sourceStatOutput } from './source-filesystem.fixture.ts';
 
@@ -81,4 +81,58 @@ test('persistent API failure is bounded and identity/budget assertions are never
   attempts = 0;
   await assert.rejects(retryObservation(() => { attempts++; sourceBudget({ availableBytes: 0 }); }, { pause: async () => {} }), /watermark/);
   assert.equal(attempts, 1);
+});
+
+test('kubectl deadline and server timeout forms share bounded full-observation retry classification', async () => {
+  for (const [stderr, category] of [
+    ['Unable to connect to the server: context deadline exceeded', 'API_TIMEOUT'],
+    ['error: context deadline exceeded', 'API_TIMEOUT'],
+    ['Error from server (Timeout): the server was unable to return a response in the time allotted', 'API_TRANSIENT'],
+    ['Error from server (ServerTimeout): the server cannot complete the operation at this time', 'API_TRANSIENT'],
+  ]) {
+    const failure = Object.assign(new Error('SENSITIVE_TIMEOUT_SENTINEL'), { stderr: Buffer.from(stderr!), status: 1 });
+    assert.equal(failureCategory(failure), category);
+    let attempts = 0;
+    let publications = 0;
+    const retries: number[] = [];
+    await retryObservation(() => {
+      attempts++;
+      if (attempts === 1) throw failure;
+      publications++;
+    }, { pause: async () => {}, report: attempt => retries.push(attempt) });
+    assert.equal(attempts, 2);
+    assert.equal(publications, 1);
+    assert.deepEqual(retries, [1]);
+    attempts = 0;
+    await assert.rejects(retryObservation(() => { attempts++; throw failure; }, { pause: async () => {} }), failure);
+    assert.equal(attempts, 3);
+    attempts = 0;
+    let elapsed = 0;
+    await assert.rejects(retryObservation(() => { attempts++; elapsed += 20_000; throw failure; }, { clock: () => elapsed, pause: async () => {} }), failure);
+    assert.equal(attempts, 2);
+  }
+  assert.equal(sourceSpace.leaseSeconds, 45);
+  assert.equal(sourceSpace.maximumDropBytes, 512 * 1024 ** 2);
+});
+
+test('safe failure diagnostics exclude raw stderr and never retry local guards or access failures', async () => {
+  const sentinel = 'SENSITIVE_TIMEOUT_SENTINEL';
+  const timeout = Object.assign(new Error(sentinel), { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL', stderr: sentinel });
+  assert.deepEqual(failureDetails(timeout), { category: 'API_TIMEOUT', exitStatus: null, processCode: 'ETIMEDOUT', signal: 'SIGKILL', hasStderr: true });
+  assert.deepEqual(failureDetails(Object.assign(new Error(sentinel), { code: sentinel, signal: sentinel, stderr: sentinel, status: 1 })), { category: 'COLLECTOR_ERROR', exitStatus: 1, processCode: null, signal: null, hasStderr: true });
+  assert.doesNotMatch(JSON.stringify(failureDetails(timeout)), new RegExp(sentinel));
+  for (const [code, stderr, category] of [
+    ['SOURCE_STAT_TIMEOUT', 'context deadline exceeded', 'SOURCE_STAT_TIMEOUT'],
+    ['ERR_ASSERTION', 'context deadline exceeded', 'GUARD_ASSERTION'],
+    ['', 'Error from server (Forbidden): denied', 'COLLECTOR_ERROR'],
+    ['', 'Error from server (Unauthorized): denied', 'COLLECTOR_ERROR'],
+    ['', 'Error from server (NotFound): claim missing', 'COLLECTOR_ERROR'],
+    ['', 'x509: certificate signed by unknown authority', 'COLLECTOR_ERROR'],
+  ]) {
+    const failure = Object.assign(new Error(sentinel), { code, stderr });
+    assert.equal(failureCategory(failure), category);
+    let attempts = 0;
+    await assert.rejects(retryObservation(() => { attempts++; throw failure; }, { pause: async () => {} }), failure);
+    assert.equal(attempts, 1);
+  }
 });
