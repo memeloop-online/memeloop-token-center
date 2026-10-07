@@ -236,6 +236,22 @@ test('three transient subprocess failures never publish or leak stderr; malforme
   assert.equal(malformed.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
 });
 
+test('server timeout stderr is redacted and a complete fresh initial observation is retried', { timeout: 120_000 }, async context => {
+  for (const kind of ['Timeout', 'ServerTimeout']) {
+    const result = await run(context, [
+      { contains: ['get', 'clusters.postgresql.cnpg.io'], stderr: `Error from server (${kind}): ${sentinel}`, exitCode: 1 },
+      ...sourceCalls(),
+    ]);
+    assert.equal(result.status, 0);
+    const failure = result.events.find(event => event.event === 'api-end' && event.outcome === 'failure');
+    assert.equal(failure.category, 'API_TRANSIENT');
+    assert.equal(failure.exitStatus, 1);
+    assert.equal(failure.hasStderr, true);
+    assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 1);
+    assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
+  }
+});
+
 const scheduleImage = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
 const docker = (args: string[], input?: string) => execFileSync('docker', args, { input, encoding: 'utf8', timeout: 180_000, stdio: ['pipe', 'pipe', 'pipe'] });
 const shell = (container: string, command: string) => docker(['exec', container, '/bin/sh', '-ec', command]);
@@ -309,6 +325,37 @@ async function assertStoppedStage(stage: ReturnType<typeof supervisedStage>): Pr
   assert.match(stage.output(), /guard_abort=/);
   assert.doesNotMatch(stage.output(), /local archive SHA256 and TOC only/);
 }
+
+test('one 15s PVC context deadline recollects fully inside the unchanged 45s lease without restarting the export', { timeout: 120_000 }, async context => {
+  docker(['pull', scheduleImage]);
+  const stage = supervisedStage(context);
+  const publish: Step = { contains: ['exec', exportName, '/bin/sh'], reply: '', leaseOperation: 'publish' };
+  const revoke = revokeCalls();
+  revoke[1]!.leaseOperation = 'revoke';
+  const result = await run(context, [
+    ...sourceCalls(), exportCall(), ...volumeCalls(), ...sourceCalls(), publish,
+    exportCall(), { contains: ['get', 'pvc'], requestTimeout: '--request-timeout=15s', delayMs: 15_000, stderr: `Unable to connect to the server: context deadline exceeded ${sentinel}`, exitCode: 1 },
+    exportCall(), ...volumeCalls(), ...sourceCalls(), publish,
+    exportCall(), { contains: ['get', 'pvc'], reply: sentinel, stderr: sentinel, exitCode: 1 }, ...revoke,
+  ], true, stage.container);
+  assert.equal(result.status, 1);
+  const timeout = result.events.find(event => event.event === 'api-end' && event.phase === 'volume-claim' && event.category === 'API_TIMEOUT');
+  assert.ok(timeout.durationMs >= 15_000 && timeout.durationMs < 20_000);
+  assert.equal(timeout.exitStatus, 1);
+  assert.equal(timeout.hasStderr, true);
+  assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 1);
+  const leases = result.events.filter(event => event.event === 'lease-publication-end');
+  assert.equal(leases.length, 2);
+  assert.equal(leases[1].attempt, 2);
+  assert.ok(leases.every(event => event.leaseSeconds === 45));
+  assert.ok(Date.parse(leases[1].observedAt) / 1000 - leases[0].volumeLeaseEpoch < 45);
+  assert.ok(Date.parse(leases[1].sourceSampleAt) > Date.parse(timeout.observedAt));
+  const revocations = result.events.filter(event => event.phase === 'lease-revoke' && event.outcome === 'success');
+  assert.equal(revocations.length, 1);
+  assert.ok(Date.parse(revocations[0].observedAt) > Date.parse(leases[1].observedAt));
+  assertSequentialCalls(result.calls);
+  await assertStoppedStage(stage);
+});
 
 test('25s collection immediately starts the next 12s cycle; real 45s CSI TTL keeps one producer/writer alive until revocation', { timeout: 120_000 }, async context => {
   docker(['pull', scheduleImage]);

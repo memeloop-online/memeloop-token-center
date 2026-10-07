@@ -24,8 +24,7 @@ export async function retryObservation<T>(operation: () => T | Promise<T>, optio
     try {
       return await operation();
     } catch (error) {
-      const failure = error as { code?: string; stderr?: string | Buffer; message?: string };
-      const transient = failure.code === 'ETIMEDOUT' || /Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''));
+      const transient = ['API_TIMEOUT', 'API_TRANSIENT'].includes(failureCategory(error));
       if (!transient || attempt >= 3 || clock() - started >= 30_000) throw error;
       options.report?.(attempt);
       await (options.pause ?? delay)(1000);
@@ -58,14 +57,26 @@ export function exportPod(pod: any): void {
   assert.ok(pod.spec.containers.some((container: any) => container.name === 'export'));
 }
 
-function failureCategory(error: unknown): string {
+export function failureCategory(error: unknown): string {
   const failure = error as { code?: string; stderr?: string | Buffer };
-  if (failure.code === 'ETIMEDOUT') return 'API_TIMEOUT';
   if (failure.code === 'SOURCE_STAT_TIMEOUT') return 'SOURCE_STAT_TIMEOUT';
-  if (/Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
   if (failure.code === 'ERR_ASSERTION') return 'GUARD_ASSERTION';
+  if (failure.code === 'ETIMEDOUT' || /context deadline exceeded/.test(String(failure.stderr ?? ''))) return 'API_TIMEOUT';
+  if (/Error from server \((?:ServerTimeout|Timeout)\):/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
+  if (/Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
   if (error instanceof SyntaxError) return 'API_INVALID_JSON';
   return 'COLLECTOR_ERROR';
+}
+
+export function failureDetails(error: unknown): Record<string, unknown> {
+  const failure = error as { code?: string; status?: number; signal?: string; stderr?: string | Buffer };
+  return {
+    category: failureCategory(error),
+    exitStatus: Number.isInteger(failure.status) ? failure.status : null,
+    processCode: ['ETIMEDOUT', 'ENOENT', 'EACCES', 'ENOBUFS', 'SOURCE_STAT_TIMEOUT', 'ERR_ASSERTION'].includes(failure.code ?? '') ? failure.code : null,
+    signal: ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGABRT', 'SIGSEGV'].includes(failure.signal ?? '') ? failure.signal : null,
+    hasStderr: typeof failure.stderr === 'string' || Buffer.isBuffer(failure.stderr),
+  };
 }
 
 function apiPhase(args: string[]): string {
@@ -96,7 +107,7 @@ async function main(): Promise<void> {
       emit(`${kind}-end`, { ...identity, durationMs: performance.now() - started, outcome: 'success' });
       return result;
     } catch (error) {
-      emit(`${kind}-end`, { ...identity, durationMs: performance.now() - started, outcome: 'failure', category: failureCategory(error) });
+      emit(`${kind}-end`, { ...identity, durationMs: performance.now() - started, outcome: 'failure', ...failureDetails(error) });
       throw error;
     }
   };
