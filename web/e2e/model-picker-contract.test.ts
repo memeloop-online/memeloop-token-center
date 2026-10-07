@@ -66,7 +66,7 @@ test('all maintained model selectors share the same picker and stale catalogs re
   assert.doesNotMatch(upstream, /confirmPartialCoverage|catalogNotReady|partialConfirmed/);
   const messages = await readFile(new URL('../src/i18n.tsx', import.meta.url), 'utf8');
   assert.match(messages, /'routes\.catalogReady': '选择或输入要使用的模型。'/);
-  assert.match(messages, /'routes\.catalogReady': 'Model catalogs loaded\.'/);
+  assert.match(messages, /'routes\.catalogReady': 'Select or enter the model to use\.'/);
   assert.match(upstream, /Math\.min\(4, ids\.length\)/);
   const picker = await readFile(new URL('../src/ModelPicker.tsx', import.meta.url), 'utf8');
   assert.match(picker, /popover="auto"/);
