@@ -35,7 +35,7 @@ export function prepareRestoreArtifact(output: string, provenance: { testedCommi
     image: copyImage, restoreManifest: 'cnpg-restore-preparation.yaml', completeArchiveRequired: true,
     runtime: 'Existing Node 24 and kubectl; independent CSI collectors, owner IPC loss ends renewal; no source database access',
     command: 'PARENT_REVIEW_APPROVED=true node restore.ts EXISTING_RESTORE_POD REVIEWED_PLAN_JSON',
-    protection: 'Both volumes require distinct pinned PVC/PV/Longhorn/replica/filesystem identities and independent 45s leases. Template contains no invented scratch UID or archive checksum; incomplete plan is rejected. No allocation, apply, unsuspend, retry, source SQL, ownership/ACL or application acceptance.',
+    protection: 'Both volumes require distinct pinned PVC/PV/Longhorn/replica/filesystem identities and independent 45s leases. Only transient API errors permit up to three fresh observations within a 30s retry budget; failures do not refresh leases, and identity or permission errors stop immediately. Template contains no invented scratch UID or archive checksum; incomplete plan is rejected. No allocation, apply, unsuspend, restore retry, source SQL, ownership/ACL or application acceptance.',
     files: Object.fromEntries(Object.entries(files).map(([name, contents]) => [name, digest(contents)])),
   }, null, 2) + '\n';
   files['SHA256SUMS'] = Object.entries(files).map(([name, contents]) => `${digest(contents)}  ${name}\n`).join('');

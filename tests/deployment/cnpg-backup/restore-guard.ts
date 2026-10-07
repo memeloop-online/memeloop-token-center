@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { copyImage, watchCopyLease } from './copy-guard.ts';
-import { archiveIdentity, attestBackupVolume, type InventoryReader, type stageIdentity } from './volume-identity.ts';
+import { archiveIdentity, attestBackupVolume, failureDetails, observeInventoryFailures, type InventoryReader, type stageIdentity } from './volume-identity.ts';
 
 export type RestoreSide = 'backup' | 'scratch';
 export type RestorePlan = { commandSHA256: string; archiveSHA256: string; archiveDirectory?: string; scratch: typeof stageIdentity };
@@ -133,11 +133,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   validateRestorePlan(plan);
   assert.ok(process.connected, 'Restore guard requires its owning controller IPC connection');
   process.once('disconnect', () => { process.exitCode = 1; process.exit(); });
-  const read: InventoryReader = args => execFileSync('kubectl', ['--request-timeout=8s', ...args], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
+  const read = observeInventoryFailures(args => execFileSync('kubectl', ['--request-timeout=8s', ...args], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] }), fields => {
+    console.error(JSON.stringify({ event: 'restore-guard-api-failed', side, at: new Date().toISOString(), ...fields }));
+  });
   try {
-    await watchCopyLease(() => renewRestoreLease(read, side, podName, uid, plan), () => { console.log('RESTORE_LEASE_READY'); });
-  } catch {
-    console.error(JSON.stringify({ event: 'restore-guard-stopped', side, at: new Date().toISOString(), leaseSeconds: 45 }));
+    await watchCopyLease(() => renewRestoreLease(read, side, podName, uid, plan), () => { console.log('RESTORE_LEASE_READY'); }, undefined, undefined, attempt => {
+      console.error(JSON.stringify({ event: 'restore-guard-transient-api-retry-no-lease-renewal', side, attempt, at: new Date().toISOString() }));
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'restore-guard-stopped', side, at: new Date().toISOString(), leaseSeconds: 45, ...failureDetails(error) }));
     process.exitCode = 1;
   }
 }

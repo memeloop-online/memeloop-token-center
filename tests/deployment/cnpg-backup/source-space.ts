@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { attestStageVolume } from './volume-identity.ts';
+import { attestStageVolume, failureCategory, failureDetails, retryObservation } from './volume-identity.ts';
+export { failureCategory, failureDetails, retryObservation } from './volume-identity.ts';
 import { assertSourceFresh, readSourceFilesystem, sourceFilesystem } from './source-filesystem.ts';
 
 export const sourceSpace = {
@@ -15,22 +16,6 @@ export const sourceSpace = {
   leaseSeconds: 45, waitSeconds: 120, deadlineMs: 43_200_000,
 };
 
-export async function retryObservation<T>(operation: () => T | Promise<T>, options: {
-  clock?: () => number; pause?: (milliseconds: number) => Promise<unknown>; report?: (attempt: number) => void;
-} = {}): Promise<T> {
-  const clock = options.clock ?? Date.now;
-  const started = clock();
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      const transient = ['API_TIMEOUT', 'API_TRANSIENT'].includes(failureCategory(error));
-      if (!transient || attempt >= 3 || clock() - started >= 30_000) throw error;
-      options.report?.(attempt);
-      await (options.pause ?? delay)(1000);
-    }
-  }
-}
 
 export function sourceBudget(sample: { availableBytes: number }, initialBytes?: number, report?: (fields: Record<string, unknown>) => void): void {
   const minimumBytes = initialBytes === undefined ? sourceSpace.startBytes : sourceSpace.stopBytes;
@@ -57,27 +42,6 @@ export function exportPod(pod: any): void {
   assert.ok(pod.spec.containers.some((container: any) => container.name === 'export'));
 }
 
-export function failureCategory(error: unknown): string {
-  const failure = error as { code?: string; stderr?: string | Buffer };
-  if (failure.code === 'SOURCE_STAT_TIMEOUT') return 'SOURCE_STAT_TIMEOUT';
-  if (failure.code === 'ERR_ASSERTION') return 'GUARD_ASSERTION';
-  if (failure.code === 'ETIMEDOUT' || /context deadline exceeded/.test(String(failure.stderr ?? ''))) return 'API_TIMEOUT';
-  if (/Error from server \((?:ServerTimeout|Timeout)\):/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
-  if (/Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
-  if (error instanceof SyntaxError) return 'API_INVALID_JSON';
-  return 'COLLECTOR_ERROR';
-}
-
-export function failureDetails(error: unknown): Record<string, unknown> {
-  const failure = error as { code?: string; status?: number; signal?: string; stderr?: string | Buffer };
-  return {
-    category: failureCategory(error),
-    exitStatus: Number.isInteger(failure.status) ? failure.status : null,
-    processCode: ['ETIMEDOUT', 'ENOENT', 'EACCES', 'ENOBUFS', 'SOURCE_STAT_TIMEOUT', 'ERR_ASSERTION'].includes(failure.code ?? '') ? failure.code : null,
-    signal: ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGABRT', 'SIGSEGV'].includes(failure.signal ?? '') ? failure.signal : null,
-    hasStderr: typeof failure.stderr === 'string' || Buffer.isBuffer(failure.stderr),
-  };
-}
 
 function apiPhase(args: string[]): string {
   if (args.includes('exec')) {
