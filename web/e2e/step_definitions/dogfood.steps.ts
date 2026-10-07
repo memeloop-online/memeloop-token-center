@@ -131,7 +131,6 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   await restoreEditor.getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await restoreResponse).status(), 200);
   await assertContains(resource, 'Browser E2E credential');
-  await openAppRoute(page, 'operator', 'pricing');
 });
 
 Then('插件配置由 Schema 渲染并可保存租户覆盖', async function (this: DogfoodWorld) {
