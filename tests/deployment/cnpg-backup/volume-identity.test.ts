@@ -60,6 +60,12 @@ function expansionInventory(): any {
   existing.replicas[0].status.currentState = 'stopped';
   existing.volume.spec.snapshotMaxCount = 2;
   existing.volume.spec.snapshotMaxSize = String(56 * 1024 ** 3);
+  existing.volume.metadata.resourceVersion = '101';
+  existing.engine = {
+    metadata: { name: `${stageIdentity.name}-e-0`, namespace: 'longhorn-system', uid: '66666666-6666-6666-6666-666666666666', resourceVersion: '102', ownerReferences: [{ kind: 'Volume', name: stageIdentity.name, uid: stageIdentity.longhornUID }] },
+    spec: { volumeName: stageIdentity.name, volumeSize: existing.volume.spec.size },
+    status: { currentState: 'stopped', currentSize: existing.volume.spec.size, snapshotsError: '', snapshots: { 'volume-head': { name: 'volume-head', size: '1024', removed: false } } },
+  };
   const disk = { storageMaximum: 1000 * 1024 ** 3, storageScheduled: 150 * 1024 ** 3, storageAvailable: 850 * 1024 ** 3,
     diskUUID: stageIdentity.diskUUID, conditions: [{ type: 'Ready', status: 'True' }, { type: 'Schedulable', status: 'True' }] };
   return { ...existing, observedAt: '2026-10-06T21:00:00Z', consumers: [], classClaimUIDs: [stageIdentity.claimUID],
@@ -100,6 +106,8 @@ test('32-to40 planning charges the complete new budget and cannot reuse 28Gi or 
   snapshot.persistent.spec.capacity.storage = '32Gi';
   snapshot.volume.spec.size = String(32 * 1024 ** 3);
   snapshot.volume.spec.snapshotMaxSize = String(64 * 1024 ** 3);
+  snapshot.engine.spec.volumeSize = snapshot.volume.spec.size;
+  snapshot.engine.status.currentSize = snapshot.volume.spec.size;
   const plan: any = planStageExpansion(snapshot, now, 40);
   assert.equal(plan.oldGiB, 32);
   assert.equal(plan.targetGiB, 40);
@@ -156,6 +164,8 @@ test('40-to56 planning preserves all partials and charges the entire new backing
   snapshot.persistent.spec.capacity.storage = '40Gi';
   snapshot.volume.spec.size = String(40 * 1024 ** 3);
   snapshot.volume.spec.snapshotMaxSize = String(80 * 1024 ** 3);
+  snapshot.engine.spec.volumeSize = snapshot.volume.spec.size;
+  snapshot.engine.status.currentSize = snapshot.volume.spec.size;
   const plan: any = planStageExpansion(snapshot, now, 56);
   assert.equal(plan.oldGiB, 40);
   assert.equal(plan.targetGiB, 56);
@@ -193,6 +203,68 @@ test('stage expansion plans only two identity/version guarded changes, never app
   ]);
   assert.match(plan.closeout, /allowVolumeExpansion=false/);
   assert.match(plan.rollback, /do not shrink/);
+});
+
+test('full snapshot slots reserve exactly one before expansion without relaxing byte or physical budgets', () => {
+  const snapshot = expansionInventory();
+  snapshot.claim.spec.resources.requests.storage = '40Gi';
+  snapshot.claim.status.capacity.storage = '40Gi';
+  snapshot.persistent.spec.capacity.storage = '40Gi';
+  snapshot.volume.spec.size = String(40 * 1024 ** 3);
+  snapshot.volume.spec.snapshotMaxSize = String(80 * 1024 ** 3);
+  snapshot.engine.spec.volumeSize = snapshot.volume.spec.size;
+  snapshot.engine.status.currentSize = snapshot.volume.spec.size;
+  for (const name of ['expand-34359738368', 'expand-42949672960']) snapshot.engine.status.snapshots[name] = { name, size: '4096', removed: false };
+  const original = structuredClone(snapshot);
+  const plan: any = planStageExpansion(snapshot, Date.parse(snapshot.observedAt), 56);
+  assert.deepEqual(snapshot, original);
+  assert.deepEqual(plan.patches.map((entry: any) => entry.resource), ['volumes.longhorn.io', 'storageclass', 'pvc']);
+  assert.deepEqual(plan.patches[0].patch, [
+    { op: 'test', path: '/metadata/uid', value: stageIdentity.longhornUID },
+    { op: 'test', path: '/metadata/resourceVersion', value: '101' },
+    { op: 'test', path: '/spec/snapshotMaxCount', value: 2 },
+    { op: 'test', path: '/spec/size', value: String(40 * 1024 ** 3) },
+    { op: 'test', path: '/spec/snapshotMaxSize', value: String(80 * 1024 ** 3) },
+    { op: 'replace', path: '/spec/snapshotMaxCount', value: 3 },
+  ]);
+  assert.equal(plan.expansionSnapshot.snapshotBytesIncludingHead, 9216);
+  assert.equal(plan.expansionSnapshot.requiredMaxCount, 3);
+  assert.equal(plan.expansionSnapshot.unchangedSnapshotMaxBytes, 80 * 1024 ** 3);
+  assert.equal(plan.physicalBudgetBytes, 226 * 1024 ** 3);
+  assert.equal(plan.executionAuthorized, false);
+  assert.equal(plan.partialDeletionAuthorized, false);
+  snapshot.volume.spec.snapshotMaxCount = 3;
+  assert.deepEqual((planStageExpansion(snapshot, Date.parse(snapshot.observedAt), 56) as any).patches.map((entry: any) => entry.resource), ['storageclass', 'pvc']);
+  snapshot.volume.spec.snapshotMaxCount = 2;
+  snapshot.engine.status.snapshots['expand-34359738368'].removed = true;
+  assert.equal((planStageExpansion(snapshot, Date.parse(snapshot.observedAt), 56) as any).expansionSnapshot.requiredMaxCount, 3);
+});
+
+test('snapshot planning rejects wrong engines, incomplete inventories and exhausted byte or total-count budgets', () => {
+  for (const mutate of [
+    (value: any) => { delete value.engine; },
+    (value: any) => { value.engine.metadata.ownerReferences[0].uid = 'other-volume'; },
+    (value: any) => { value.engine.metadata.resourceVersion = ''; },
+    (value: any) => { value.engine.metadata.deletionTimestamp = 'now'; },
+    (value: any) => { value.engine.spec.volumeName = 'primary'; },
+    (value: any) => { value.engine.spec.volumeSize = String(32 * 1024 ** 3); },
+    (value: any) => { value.engine.status.currentSize = '0'; },
+    (value: any) => { value.engine.status.currentState = 'running'; },
+    (value: any) => { value.engine.status.snapshotsError = 'unavailable'; },
+    (value: any) => { value.engine.status.snapshots = {}; },
+    (value: any) => { value.engine.status.snapshots['volume-head'].name = 'other'; },
+    (value: any) => { value.engine.status.snapshots['volume-head'].removed = true; },
+    (value: any) => { value.engine.status.snapshots['volume-head'].size = '-1'; },
+    (value: any) => { value.engine.status.snapshots['volume-head'].size = '9007199254740992'; },
+    (value: any) => { value.engine.status.snapshots['volume-head'].size = String(56 * 1024 ** 3 + 1); },
+    (value: any) => { value.volume.spec.snapshotMaxCount = 251; },
+    (value: any) => { for (let index = 0; index < 3; index++) value.engine.status.snapshots[`snapshot-${index}`] = { name: `snapshot-${index}`, size: '0', removed: false }; },
+    (value: any) => { value.volume.spec.snapshotMaxCount = 250; for (let index = 0; index < 249; index++) value.engine.status.snapshots[`snapshot-${index}`] = { name: `snapshot-${index}`, size: '0', removed: false }; },
+  ]) {
+    const snapshot = expansionInventory();
+    mutate(snapshot);
+    assert.throws(() => planStageExpansion(snapshot, Date.parse(snapshot.observedAt)));
+  }
 });
 
 test('source substitution, active consumers, expansion already pending, stale inventory and insufficient backing space reject planning', () => {
