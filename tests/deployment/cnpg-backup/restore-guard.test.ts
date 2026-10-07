@@ -151,6 +151,27 @@ test('standalone restore bundle binds source hashes and never invents scratch id
   assert.throws(() => prepareRestoreArtifact(output, { sourceHead: '1'.repeat(40), testedCommit: '2'.repeat(40), runId: '37524816649' }));
 });
 
+test('restore archive selection binds the reviewed directory without requiring a command rewrite', () => {
+  const value = fixture();
+  validateRestorePod(value.pod, value.plan);
+  value.plan.archiveDirectory = '/backup/mtc-pg-logical-20261007-r8';
+  assert.throws(() => validateRestorePod(value.pod, value.plan));
+  const selected = { name: 'BACKUP_ARCHIVE_DIRECTORY', value: value.plan.archiveDirectory };
+  value.pod.spec.containers[0].env.push(selected);
+  validateRestorePod(value.pod, value.plan);
+  const commands: string[][] = [];
+  renewRestoreLease(reader(value, commands), 'backup', value.pod.metadata.name, value.pod.metadata.uid, value.plan);
+  assert.ok(commands.some(command => command.includes('exec')));
+  for (const invalid of ['', '/backup/mtc-pg-logical-20261007-r8/../old', '/tmp/mtc-pg-logical-20261007', '/backup/mtc-pg-logical-20261007\n', '/backup/mtc-pg-logical-20261007;touch /tmp/unreviewed']) {
+    value.plan.archiveDirectory = invalid;
+    selected.value = invalid;
+    assert.throws(() => validateRestorePod(value.pod, value.plan));
+  }
+  value.plan.archiveDirectory = '/backup/mtc-pg-logical-20261007-r8';
+  selected.value = '/backup/mtc-pg-logical-20261007-r9';
+  assert.throws(() => validateRestorePod(value.pod, value.plan));
+});
+
 test('receipt validation never upgrades SHA/TOC or Pod readiness to real restore/application acceptance', () => {
   const value = fixture();
   assert.deepEqual(verifyRestoreReceipt(JSON.stringify(value.receipt), value.plan), value.receipt);

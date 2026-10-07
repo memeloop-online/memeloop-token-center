@@ -7,13 +7,17 @@ import { copyImage, watchCopyLease } from './copy-guard.ts';
 import { archiveIdentity, attestBackupVolume, type InventoryReader, type stageIdentity } from './volume-identity.ts';
 
 export type RestoreSide = 'backup' | 'scratch';
-export type RestorePlan = { commandSHA256: string; archiveSHA256: string; scratch: typeof stageIdentity };
+export type RestorePlan = { commandSHA256: string; archiveSHA256: string; archiveDirectory?: string; scratch: typeof stageIdentity };
+export const defaultRestoreArchiveDirectory = '/backup/mtc-pg-logical-20261004';
 export const restoreSides: RestoreSide[] = ['backup', 'scratch'];
 export const restoreClaim = 'mtc-pg-bounded-scratch-20261005';
 
 export function validateRestorePlan(plan: RestorePlan): void {
   assert.match(plan.commandSHA256, /^[a-f0-9]{64}$/);
   assert.match(plan.archiveSHA256, /^[a-f0-9]{64}$/);
+  const directory = plan.archiveDirectory ?? defaultRestoreArchiveDirectory;
+  assert.equal(directory, directory.trim());
+  assert.match(directory, /^\/backup\/mtc-pg-logical-[0-9]{8}(?:-[a-z0-9]+)*$/);
   const scratch = plan.scratch;
   assert.equal(scratch.name, restoreClaim);
   assert.equal(scratch.namespace, archiveIdentity.namespace);
@@ -71,6 +75,7 @@ export function validateRestorePod(pod: any, plan: RestorePlan, uid?: string, te
   assert.equal(environment('PARENT_REVIEW_APPROVED'), 'true');
   assert.equal(environment('HARD_CAPACITY_REVIEW_APPROVED'), 'true');
   assert.equal(environment('EXPECTED_SOURCE_SHA256'), plan.archiveSHA256);
+  assert.equal(environment('BACKUP_ARCHIVE_DIRECTORY') ?? defaultRestoreArchiveDirectory, plan.archiveDirectory ?? defaultRestoreArchiveDirectory);
   assert.equal(environment('CAPACITY_MIN_FREE_INODES'), '1024');
   assert.equal(environment('HOME'), '/scratch');
   for (const side of restoreSides) {

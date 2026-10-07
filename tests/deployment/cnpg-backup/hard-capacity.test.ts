@@ -521,6 +521,31 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     assert.equal(receipt.physical_wal_protection_verified, false);
     assert.throws(() => shell(candidate, 'pg_ctl -D /scratch/pgdata status'));
   });
+  await context.test('selected non-default archive restores and receipts without reading the old directory', () => {
+    const candidate = fixture();
+    seed(candidate);
+    const selectedDirectory = '/backup/mtc-pg-logical-20261007-r8';
+    shell(candidate, `mv ${archiveDirectory} ${selectedDirectory}; mkdir ${archiveDirectory}; printf decoy > ${archiveDirectory}/${archiveName}`);
+    restoreLeases(candidate);
+    run(candidate, restore.command, { ...restoreEnvironment, PGOPTIONS: '', EXPECTED_SOURCE_SHA256: expectedSha, BACKUP_ARCHIVE_DIRECTORY: selectedDirectory });
+    const receipt = JSON.parse(shell(candidate, 'cat /scratch/RESTORE_SUCCESS.json').toString());
+    assert.equal(receipt.archive_sha256, expectedSha);
+    assert.equal(receipt.archive_bytes, archive.length);
+    assert.equal(receipt.public_relations, 254);
+    assert.equal(receipt.original_ownership_acl_verified, false);
+    assert.equal(receipt.application_acceptance_verified, false);
+    assert.equal(receipt.physical_wal_protection_verified, false);
+    shell(candidate, `cd ${selectedDirectory}; sha256sum -c ${archiveName}.sha256; test -f OFFHOST_COPY_VERIFIED; test "$(cat ${archiveDirectory}/${archiveName})" = decoy`);
+    assert.throws(() => shell(candidate, 'pg_ctl -D /scratch/pgdata status'));
+  });
+  await context.test('invalid archive selections leave scratch and the retained archive untouched', () => {
+    const candidate = fixture();
+    seed(candidate);
+    for (const invalid of ['', '/backup/mtc-pg-logical-20261007-r8/../old', '/tmp/mtc-pg-logical-20261007', '/backup/mtc-pg-logical-20261007\n', '/backup/mtc-pg-logical-20261007;touch /tmp/unreviewed']) {
+      assert.throws(() => run(candidate, restore.command, { PGOPTIONS: '', EXPECTED_SOURCE_SHA256: expectedSha, BACKUP_ARCHIVE_DIRECTORY: invalid }));
+      shell(candidate, `test ! -e /scratch/pgdata; test ! -e /scratch/RESTORE_SUCCESS.json; test ! -e /tmp/unreviewed; cd ${archiveDirectory}; sha256sum -c ${archiveName}.sha256`);
+    }
+  });
   await context.test('only a complete offhost copy, isolated restore and clean stop earn a digest-bound receipt', async () => {
     const candidate = fixture(512);
     const remote: Remote = (side, command, input) => {
