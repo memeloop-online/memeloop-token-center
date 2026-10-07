@@ -56,7 +56,13 @@ test('route list exposes group-only candidate scope and readable models without 
       await mixedTip.waitFor({ state: 'hidden' });
       for (const [width, theme] of [[390, 'light'], [1440, 'dark']] as const) {
         await page.setViewportSize({ width, height: 900 }); await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
-        await range.focus(); await range.press('Shift+Tab'); await page.keyboard.press('Tab');
+        const anchor = page.locator('[data-tooltip-keyboard-anchor]');
+        await anchor.click();
+        assert.equal(await anchor.evaluate(element => element === document.activeElement), true);
+        await page.mouse.move(-10, -10);
+        await mixedTip.waitFor({ state: 'hidden' });
+        for (let index = 0; index < 64 && !await range.evaluate(element => element === document.activeElement); index++) await page.keyboard.press('Tab');
+        await mixedTip.waitFor({ state: 'hidden' });
         assert.equal(await range.evaluate(el => el === document.activeElement), true);
         const tip = await describedTooltip(range, /Kimi personal account/);
         assert.match(await tip.innerText(), /Kimi personal account/); assert.match(await tip.innerText(), /Kimi team account/);
