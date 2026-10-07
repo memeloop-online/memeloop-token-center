@@ -775,6 +775,13 @@ impl ProviderCatalog {
             true,
         );
         kimi.protocols = vec!["openai".to_owned(), "anthropic".to_owned()];
+        kimi.config_schema["properties"]["timeout_seconds"] = json!({
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600,
+            "default": 120,
+            "description": "Request timeout in seconds, including the complete response stream."
+        });
         kimi.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),
             flow_kind: OAuthFlowKind::KimiDevice,
