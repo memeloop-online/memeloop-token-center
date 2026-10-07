@@ -91,7 +91,7 @@ impl Default for CodexTransportPolicy {
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
-            dispatch_max_in_flight: 4,
+            dispatch_max_in_flight: 0,
             dispatch_max_queued: 32,
             dispatch_queue_timeout_millis: 30_000,
             max_sse_event_bytes: SseFramingLimits::DEFAULT_EVENT_BYTES,
@@ -123,7 +123,7 @@ impl CodexTransportPolicy {
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
-            || !(1..=64).contains(&policy.dispatch_max_in_flight)
+            || policy.dispatch_max_in_flight > 64
             || policy.dispatch_max_queued > 1024
             || !(1..=300_000).contains(&policy.dispatch_queue_timeout_millis)
             || !(SseFramingLimits::MIN_EVENT_BYTES..=SseFramingLimits::MAX_EVENT_BYTES)
@@ -293,6 +293,34 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_limits_require_an_explicit_positive_setting() {
+        for config in [
+            json!({}),
+            json!({"connect_attempts": 3}),
+            json!({"dispatch_max_in_flight": 0}),
+        ] {
+            assert_eq!(
+                CodexTransportPolicy::parse(Some(&config))
+                    .unwrap()
+                    .dispatch_max_in_flight,
+                0
+            );
+        }
+        assert_eq!(
+            CodexTransportPolicy::parse(None)
+                .unwrap()
+                .dispatch_max_in_flight,
+            0
+        );
+        assert_eq!(
+            CodexTransportPolicy::parse(Some(&json!({"dispatch_max_in_flight": 4})))
+                .unwrap()
+                .dispatch_max_in_flight,
+            4
+        );
+    }
+
+    #[test]
     fn invalid_policy_never_silently_enables_defaults() {
         for invalid in [
             json!(null),
@@ -319,7 +347,7 @@ mod tests {
             json!({"request_timeout_millis": 1260001}),
             json!({"memory_admission_wait_millis": 99}),
             json!({"memory_admission_wait_millis": 300001}),
-            json!({"dispatch_max_in_flight": 0}),
+            json!({"dispatch_max_in_flight": -1}),
             json!({"dispatch_max_in_flight": 65}),
             json!({"dispatch_max_queued": 1025}),
             json!({"dispatch_queue_timeout_millis": 0}),

@@ -25,8 +25,8 @@ export const codexTransportPolicySchema = {
       description: 'Maximum wait for gateway memory capacity within the request deadline.',
     },
     dispatch_max_in_flight: {
-      type: 'integer', minimum: 1, maximum: 64, default: 4,
-      description: 'Concurrent Codex requests per account and proxy endpoint, including retries and response streams. Runtime decreases drain existing requests.',
+      type: 'integer', minimum: 0, maximum: 64, default: 0,
+      description: 'Optional concurrent-request limit per Codex account and proxy endpoint. Zero (default) disables this dispatch limit and its queue. Positive values include active response streams; lowering a configured limit drains existing requests.',
     },
     dispatch_max_queued: {
       type: 'integer', minimum: 0, maximum: 1024, default: 32,

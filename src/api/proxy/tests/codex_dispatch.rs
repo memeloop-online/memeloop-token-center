@@ -37,6 +37,109 @@ async fn dispatch_route(
 }
 
 #[tokio::test]
+async fn missing_dispatch_limit_allows_responses_with_five_existing_permits() {
+    let fixture = codex_route_fixture("dispatch-default-unlimited").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config["transport_policy"] = json!({
+        "dispatch_max_queued": 0,
+        "dispatch_queue_timeout_millis": 1000
+    });
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let route = ResolvedUpstream {
+        route_id: fixture.route_id,
+        account_id: fixture.upstream_account_id,
+        transport_revision: i64::MIN,
+        credential_generation: 1,
+        driver: codex_transport::DRIVER.to_owned(),
+        base_url: codex_transport::BASE_URL.to_owned(),
+        config,
+        upstream_model: fixture.upstream_model.clone(),
+        credential: UpstreamCredential::None,
+    };
+    let mut held_permits = Vec::new();
+    for _ in 0..5 {
+        held_permits.push(
+            fixture
+                .state
+                .codex_clients
+                .acquire_dispatch(&route, &fixture.state.metrics)
+                .await
+                .unwrap(),
+        );
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(completed_codex_sse("unlimited answer"), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "hello", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "resp-codex");
+    assert_eq!(body["object"], "response");
+    assert_eq!(
+        body["output"],
+        json!([{
+            "id": "item-codex",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "unlimited answer"}]
+        }])
+    );
+    assert_eq!(
+        body["usage"],
+        json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    drop(held_permits);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert!(rows[0].completed_at.is_some());
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let reserved_micros: i64 =
+        sqlx::query_scalar("SELECT reserved_micros FROM credit_accounts WHERE id = $1")
+            .bind(fixture.credit_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reserved_micros, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn invalid_dispatch_policy_is_bad_request_without_retry_after_or_admission() {
     let direct = crate::codex_clients::DispatchError::InvalidPolicy.response();
     assert_eq!(direct.status(), StatusCode::BAD_REQUEST);

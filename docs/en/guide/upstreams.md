@@ -24,6 +24,10 @@ Providers expose different data ranges. Clients should use request results and t
 
 ## Generation settings for Codex accounts
 
+### Request concurrency
+
+Codex accounts have no additional dispatch concurrency limit by default. When `transport_policy.dispatch_max_in_flight` is omitted or `0`, the dispatch queue is inactive. Client credential permissions, budgets, explicitly configured concurrency policies, and gateway memory protection still apply. Set a positive value only when you want to limit simultaneous requests for an account and proxy endpoint. Streaming requests occupy a slot until they finish; a full queue or queue timeout can return 503.
+
 Codex accounts connected through OAuth accept text Chat Completions and Responses requests. MTC translates the request format, but Codex does not support every generation parameter from these APIs.
 
 ### Choose how unsupported parameters are handled
