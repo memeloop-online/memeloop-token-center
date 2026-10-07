@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
-import { archiveDirectory, archiveLimit, archiveName, copyArchive, copyChunk, copyFailureReceipt, type CopyStep, type Remote } from './copy.ts';
+import { archiveDirectory, archiveLimit, archiveName, copyArchive, copyChunk, copyFailureReceipt, readAcknowledgedChunk, sourceChunkAcknowledgement, type CopyStep, type Remote } from './copy.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const directory = dirname(fileURLToPath(import.meta.url));
@@ -125,6 +125,43 @@ test('invalid copy rates fail before any remote operation', async () => {
   assert.equal(calls, 0);
 });
 
+test('source chunks are acknowledged only after all bytes arrive and a successful child close is still required', async () => {
+  let starts = 0;
+  const start = (script: string) => { starts++; return spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] }); };
+  const complete = await readAcknowledgedChunk(() => start(`
+    let acknowledgement = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', value => { acknowledgement += value; });
+    process.stdin.on('end', () => { process.exitCode = acknowledgement === 'MTC_COPY_CHUNK_RECEIVED\\n' ? 0 : 12; });
+    process.stdout.write(Buffer.alloc(${copyChunk}, 71));
+  `), copyChunk);
+  assert.equal(complete.length, copyChunk);
+  assert.ok(complete.every(value => value === 71));
+  assert.equal(starts, 1);
+  const short = () => start("process.stdout.write(Buffer.alloc(8192, 71));");
+  await assert.rejects(readAcknowledgedChunk(short, copyChunk), error => {
+    const receipt = copyFailureReceipt(error);
+    assert.equal(receipt.exit_code, 0);
+    assert.equal(receipt.stdout_bytes, 8192);
+    return true;
+  });
+  await assert.rejects(readAcknowledgedChunk(() => start("process.stdout.write(Buffer.alloc(8193));"), 8192), /exceeded its expected length/);
+  await assert.rejects(readAcknowledgedChunk(() => start("process.stderr.write('private-archive-secret'); process.exitCode = 7;"), 8192), error => {
+    assert.equal(copyFailureReceipt(error).exit_code, 7);
+    assert.doesNotMatch(JSON.stringify(copyFailureReceipt(error)), /private-archive-secret/);
+    return true;
+  });
+  await assert.rejects(readAcknowledgedChunk(() => start("process.stdin.resume(); process.stdin.on('end', () => { process.exitCode = 9; }); process.stdout.write(Buffer.alloc(8192));"), 8192), error => {
+    assert.equal(copyFailureReceipt(error).exit_code, 9);
+    assert.equal(copyFailureReceipt(error).stdout_bytes, 8192);
+    return true;
+  });
+  await assert.rejects(readAcknowledgedChunk(() => start("setInterval(() => {}, 1000);"), 8192, 50), /timed out/);
+  assert.equal(starts, 6);
+  assert.throws(() => readAcknowledgedChunk(() => start(''), copyChunk + 1));
+  assert.equal(starts, 6);
+});
+
 function createContainer(): string {
   const container = docker(['run', '-d', '--network=none', '--read-only', '--user=26:26', '--cap-drop=ALL', '--security-opt=no-new-privileges',
     '--tmpfs', '/tmp:rw,exec,size=64m,uid=26,gid=26', '--tmpfs', '/backup:rw,size=128m,uid=26,gid=26', '--tmpfs', '/scratch:rw,size=256m,uid=26,gid=26',
@@ -187,16 +224,21 @@ test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full r
   shell(source, 'rm /tmp/tmp-overflow');
 
   const destination = createContainer();
-  const remote: Remote = (side, command, input) => {
+  const remote: Remote = (side, command, input, expectedOutputBytes) => {
     const target = side === 'source' ? source : destination;
     const path = shell(target, 'printf %s "$PATH"').toString();
+    if (expectedOutputBytes !== undefined) {
+      assert.equal(side, 'source');
+      assert.equal(input, undefined);
+      return readAcknowledgedChunk(() => spawn('docker', ['exec', '-i', target, '/bin/sh', '-ec', `"$@"; ${sourceChunkAcknowledgement}`, 'copy-source', 'env', `PATH=/tmp/bin:${path}`, ...command], { stdio: ['pipe', 'pipe', 'pipe'] }), expectedOutputBytes);
+    }
     return execute(target, ['env', `PATH=/tmp/bin:${path}`, ...command], input);
   };
   let writes = 0;
   let failedStep: CopyStep | undefined;
-  await assert.rejects(copyArchive((side, command, input) => {
+  await assert.rejects(copyArchive((side, command, input, expectedOutputBytes) => {
     if (input && ++writes === 2) throw new Error('simulated interrupted transfer');
-    return remote(side, command, input);
+    return remote(side, command, input, expectedOutputBytes);
   }, expectedSha, async () => {}, false, archiveDirectory, 1, step => { failedStep = step; }), /interrupted transfer/);
   assert.deepEqual(failedStep, { stage: 'destination_chunk', side: 'destination' });
   assert.equal(Number(shell(destination, `stat -c %s ${archiveDirectory}/${archiveName}.partial`).toString()), copyChunk);
