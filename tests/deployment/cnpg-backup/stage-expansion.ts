@@ -7,9 +7,9 @@ const gib = 1024 ** 3;
 export const stageExpansionClass = 'mtc-cnpg-stage-haixia-data1-20261005';
 export const expandedStageGiB = 32;
 
-export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 32 | 40 = expandedStageGiB): object {
-  assert.ok([32, 40].includes(targetGiB), 'Unknown reviewed expansion target');
-  const oldGiB = targetGiB === 32 ? 28 : 32;
+export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 32 | 40 | 56 = expandedStageGiB): object {
+  assert.ok([32, 40, 56].includes(targetGiB), 'Unknown reviewed expansion target');
+  const oldGiB = targetGiB === 32 ? 28 : targetGiB === 40 ? 32 : 40;
   const age = now - Date.parse(snapshot.observedAt);
   assert.ok(Number.isFinite(age) && age >= 0 && age <= 90_000, 'Expansion inventory must be fresh');
   const { claim, persistent, volume, storageClass, node, replicas, consumers, filesystem, settings } = snapshot;
@@ -106,6 +106,6 @@ export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 3
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  assert.ok([3, 4].includes(process.argv.length), 'stage-expansion.ts REVIEWED_FRESH_INVENTORY_JSON [32|40]; plan only, never applies');
-  console.log(JSON.stringify(planStageExpansion(JSON.parse(readFileSync(process.argv[2]!, 'utf8')), Date.now(), Number(process.argv[3] ?? 32) as 32 | 40), null, 2));
+  assert.ok([3, 4].includes(process.argv.length), 'stage-expansion.ts REVIEWED_FRESH_INVENTORY_JSON [32|40|56]; plan only, never applies');
+  console.log(JSON.stringify(planStageExpansion(JSON.parse(readFileSync(process.argv[2]!, 'utf8')), Date.now(), Number(process.argv[3] ?? 32) as 32 | 40 | 56), null, 2));
 }
