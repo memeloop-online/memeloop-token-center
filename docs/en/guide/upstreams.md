@@ -33,9 +33,11 @@ Administrators can configure chat controls and output limits separately in the C
 | Setting | How requests are handled | When to use it |
 | --- | --- | --- |
 | Use upstream defaults (`provider_default`, the default) | MTC validates parameter format, removes sampling controls and output-limit hints that Codex cannot apply, and lets Codex choose the generation behavior. | Your client includes these parameters, but your application does not require them to take effect. |
-| Strict validation (`strict`) | Chat controls accept only neutral values; output-limit hints are rejected. Existing strict settings are not automatically changed to the default. | You want the client to receive an error for unsupported settings rather than continue with upstream defaults. |
+| Strict validation (`strict`) | Chat controls accept only values that preserve default generation behavior; output-limit hints are rejected. Existing strict settings are not automatically changed to the default. | You want the client to receive an error for unsupported settings rather than continue with upstream defaults. |
 
 Using upstream defaults **does not guarantee** your requested `temperature`, `top_p`, penalties, `seed`, `stop`, or output length. If your application depends on these controls, choose an authorized model route that supports them.
+
+If a request reports an unsupported parameter, have the client omit that parameter. If the application requires it, switch to a route that supports it.
 
 ### Output limits and cost
 
