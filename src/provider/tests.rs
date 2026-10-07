@@ -282,6 +282,23 @@ fn plugin_provider_generation_capabilities_are_versioned_and_extensible() {
 }
 
 #[test]
+fn kimi_oauth_schema_accepts_the_request_timeout_used_by_existing_accounts() {
+    let catalog = ProviderCatalog::builtins();
+    let provider = catalog.get("kimi-oauth").unwrap();
+    let mut config = crate::oauth::managed::kimi::native_import_config();
+    crate::schema::validate_instance(&provider.config_schema, &config).unwrap();
+    for timeout in [1, 120, 600] {
+        config["timeout_seconds"] = json!(timeout);
+        crate::schema::validate_instance(&provider.config_schema, &config).unwrap();
+        assert_eq!(config["timeout_seconds"], timeout);
+    }
+    for invalid in [json!(0), json!(601), json!("600")] {
+        config["timeout_seconds"] = invalid;
+        assert!(crate::schema::validate_instance(&provider.config_schema, &config).is_err());
+    }
+}
+
+#[test]
 fn multi_agent_compatibility_is_explicit_and_provider_scoped() {
     let mut catalog = ProviderCatalog::builtins();
     assert!(catalog.supports_codex_multi_agent_v2("kimi-oauth", &json!({})));
