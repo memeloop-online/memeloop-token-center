@@ -37,7 +37,7 @@ export function authorizationJourneyCopy(locale: string, providerId?: string) {
   } : {
     purpose: 'Sign in to the provider again to update this connection’s authorization. Its connection name and model routes are retained; the new authorization replaces the old one.',
     identityHelp: providerId === 'kimi-oauth'
-      ? 'Check the login account on the Kimi page. Kimi does not provide an account identity to this page. The connection name below is your label for this connection, not a verified Kimi account.',
+      ? 'Check the login account on the Kimi page. Kimi does not provide an account identity to this page. The connection name below is your label for this connection, not a verified Kimi account.'
       : providerId === 'anthropic-claude' ? 'Sign in with the original Anthropic account. Reauthorization requires the same provider identity.'
       : providerId === 'google-antigravity' ? 'Sign in with the original Google identity. Reauthorization requires the same provider identity.' : '',
     setup: 'Choose a provider and sign in to allow the system to call models on behalf of this account. The authorization will be saved for use by model routes.',
