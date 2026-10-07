@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { copyContainerCommand, copyIdentities, copySides, renewCopyLease, validateCopyPod, watchCopyLease, type CopySide } from './copy-guard.ts';
 import { boundedJobs, preparedResources } from './hard-capacity.ts';
+import { failureDetails, observeInventoryFailures } from './volume-identity.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const resources = preparedResources();
@@ -153,7 +154,87 @@ test('replaced identity, wrong mounts and stale observations cannot renew either
   }
 });
 
-test('renewal accounts for elapsed collection time and stops on the first collector failure', async () => {
+test('copy renewal retries only a fresh transient observation without publishing or announcing on failure', async () => {
+  for (const side of copySides) {
+    const value = fixture(side);
+    const commands: string[][] = [];
+    const read = reader(value, commands);
+    let transient = true;
+    let calls = 0;
+    let ready = 0;
+    let now = 0;
+    const reports: number[] = [];
+    const done = new Error('end synthetic observation');
+    await assert.rejects(watchCopyLease(() => {
+      calls++;
+      if (calls === 3) throw done;
+      renewCopyLease(args => {
+        if (transient && args.includes('pvc')) {
+          transient = false;
+          throw Object.assign(new Error('private API detail'), { code: 'ETIMEDOUT' });
+        }
+        return read(args);
+      }, side, value.pod.metadata.name, value.pod.metadata.uid, () => 1_791_309_000_000 + now);
+    }, () => { ready++; }, () => now, async milliseconds => { now += milliseconds; }, attempt => {
+      reports.push(attempt);
+      assert.equal(ready, 0);
+      assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 0);
+    }), done);
+    assert.equal(calls, 3);
+    assert.equal(ready, 1);
+    assert.deepEqual(reports, [1]);
+    assert.equal(commands.filter(args => args.includes('/bin/sh')).length, 1);
+    assert.equal(commands.filter(args => args.includes('blkid')).length, 1);
+    assert.equal(commands.filter(args => args.includes('pod')).length, 3);
+  }
+});
+
+test('persistent renewal transport errors stay bounded and never extend a lease or readiness', async () => {
+  for (const cost of [0, 20_000]) {
+    let now = 0;
+    let calls = 0;
+    let ready = 0;
+    const failure = Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
+    await assert.rejects(watchCopyLease(() => { calls++; now += cost; throw failure; }, () => { ready++; }, () => now, async milliseconds => { now += milliseconds; }), failure);
+    assert.equal(calls, cost === 0 ? 3 : 2);
+    assert.equal(ready, 0);
+  }
+  for (const failure of [new assert.AssertionError({ message: 'identity mismatch' }), new SyntaxError('invalid inventory'), Object.assign(new Error('forbidden'), { stderr: 'Error from server (Forbidden): denied' })]) {
+    let calls = 0;
+    await assert.rejects(watchCopyLease(() => { calls++; throw failure; }, () => assert.fail('must not announce readiness'), () => 0, async () => assert.fail('must not retry safety or permission errors')), failure);
+    assert.equal(calls, 1);
+  }
+});
+
+test('inventory failure diagnostics retain safe phase and category without arguments or error payloads', () => {
+  const sentinel = 'private-sentinel-must-not-appear';
+  for (const [args, phase] of [
+    [['get', 'pvc', sentinel], 'claim'],
+    [['exec', sentinel, '--', 'blkid', sentinel], 'filesystem-identity'],
+    [['exec', sentinel, '--', 'stat', sentinel], 'device-number'],
+    [['exec', sentinel, '--', '/bin/sh', '-ec', sentinel], 'lease-publication'],
+    [['get', sentinel], 'inventory-other'],
+    [['get', 'constructor'], 'inventory-other'],
+  ] as const) {
+    const reports: Record<string, unknown>[] = [];
+    const failure = Object.assign(new Error(sentinel), { code: 'ETIMEDOUT', signal: 'SIGKILL', stderr: sentinel, stdout: sentinel });
+    const read = observeInventoryFailures(() => { throw failure; }, fields => reports.push(fields));
+    assert.throws(() => read([...args]), failure);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0]!.phase, phase);
+    assert.equal(reports[0]!.category, 'API_TIMEOUT');
+    assert.equal(reports[0]!.signal, 'SIGKILL');
+    assert.equal(reports[0]!.processCode, 'ETIMEDOUT');
+    assert.equal(typeof reports[0]!.durationMs, 'number');
+    assert.doesNotMatch(JSON.stringify(reports), new RegExp(sentinel));
+  }
+  const reports: Record<string, unknown>[] = [];
+  assert.equal(observeInventoryFailures(() => 'private-success', fields => reports.push(fields))(['get', 'pod']), 'private-success');
+  assert.deepEqual(reports, []);
+  assert.deepEqual(failureDetails(null), { category: 'COLLECTOR_ERROR', exitStatus: null, processCode: null, signal: null, hasStderr: false });
+});
+
+test('renewal accounts for elapsed collection time and stops on non-transient collector failure', async () => {
   let now = 0;
   let calls = 0;
   let ready = 0;

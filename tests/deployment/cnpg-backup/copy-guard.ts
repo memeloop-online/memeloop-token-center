@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { archiveIdentity, attestBackupVolume, stageIdentity, stageIdentityForPod, type InventoryReader } from './volume-identity.ts';
+import { archiveIdentity, attestBackupVolume, failureDetails, observeInventoryFailures, retryObservation, stageIdentity, stageIdentityForPod, type InventoryReader } from './volume-identity.ts';
 
 export const copyIdentities = { source: stageIdentity, destination: archiveIdentity };
 export const copyImage = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
@@ -82,12 +82,12 @@ export function renewCopyLease(read: InventoryReader, side: CopySide, podName: s
     `umask 077; test "$POD_UID" = '${uid}'; printf '%s\\n' '${lease}' > /tmp/backup-volume.lease.partial; mv /tmp/backup-volume.lease.partial /tmp/backup-volume.lease`]);
 }
 
-export async function watchCopyLease(renew: () => void, ready: () => void, clock: () => number = () => performance.now(), pause: (milliseconds: number) => Promise<void> = delay): Promise<never> {
+export async function watchCopyLease(renew: () => void, ready: () => void, clock: () => number = () => performance.now(), pause: (milliseconds: number) => Promise<void> = delay, report?: (attempt: number) => void): Promise<never> {
   const started = clock();
   let announced = false;
   while (clock() - started < 43_200_000) {
     const cycleStarted = clock();
-    renew();
+    await retryObservation(renew, { clock, pause, report });
     if (!announced) { ready(); announced = true; }
     await pause(Math.max(0, 15_000 - (clock() - cycleStarted)));
   }
@@ -101,11 +101,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   assert.ok(copySides.includes(side));
   assert.ok(process.connected, 'Copy guard requires its owning controller IPC connection');
   process.once('disconnect', () => { process.exitCode = 1; process.exit(); });
-  const read: InventoryReader = args => execFileSync('kubectl', ['--request-timeout=8s', ...args], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] });
+  const read = observeInventoryFailures(args => execFileSync('kubectl', ['--request-timeout=8s', ...args], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 ** 2, stdio: ['ignore', 'pipe', 'pipe'] }), fields => {
+    console.error(JSON.stringify({ event: 'copy-guard-api-failed', side, at: new Date().toISOString(), ...fields }));
+  });
   try {
-    await watchCopyLease(() => renewCopyLease(read, side, podName, uid), () => { console.log('COPY_LEASES_READY'); });
-  } catch {
-    console.error(JSON.stringify({ event: 'copy-guard-stopped', side, at: new Date().toISOString(), leaseSeconds: 45 }));
+    await watchCopyLease(() => renewCopyLease(read, side, podName, uid), () => { console.log('COPY_LEASES_READY'); }, undefined, undefined, attempt => {
+      console.error(JSON.stringify({ event: 'copy-guard-transient-api-retry-no-lease-renewal', side, attempt, at: new Date().toISOString() }));
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'copy-guard-stopped', side, at: new Date().toISOString(), leaseSeconds: 45, ...failureDetails(error) }));
     process.exitCode = 1;
   }
 }

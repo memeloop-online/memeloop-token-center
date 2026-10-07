@@ -1,4 +1,44 @@
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
+
+export async function retryObservation<T>(operation: () => T | Promise<T>, options: {
+  clock?: () => number; pause?: (milliseconds: number) => Promise<unknown>; report?: (attempt: number) => void;
+} = {}): Promise<T> {
+  const clock = options.clock ?? Date.now;
+  const started = clock();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const transient = ['API_TIMEOUT', 'API_TRANSIENT'].includes(failureCategory(error));
+      if (!transient || attempt >= 3 || clock() - started >= 30_000) throw error;
+      options.report?.(attempt);
+      await (options.pause ?? delay)(1000);
+    }
+  }
+}
+
+export function failureCategory(error: unknown): string {
+  const failure = (error && typeof error === 'object' ? error : {}) as { code?: string; stderr?: string | Buffer };
+  if (failure.code === 'SOURCE_STAT_TIMEOUT') return 'SOURCE_STAT_TIMEOUT';
+  if (failure.code === 'ERR_ASSERTION') return 'GUARD_ASSERTION';
+  if (failure.code === 'ETIMEDOUT' || /context deadline exceeded/.test(String(failure.stderr ?? ''))) return 'API_TIMEOUT';
+  if (/Error from server \((?:ServerTimeout|Timeout)\):/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
+  if (/Client.Timeout|TLS handshake timeout|connection reset by peer|i\/o timeout|ServiceUnavailable|TooManyRequests/.test(String(failure.stderr ?? ''))) return 'API_TRANSIENT';
+  if (error instanceof SyntaxError) return 'API_INVALID_JSON';
+  return 'COLLECTOR_ERROR';
+}
+
+export function failureDetails(error: unknown): Record<string, unknown> {
+  const failure = (error && typeof error === 'object' ? error : {}) as { code?: string; status?: number; signal?: string; stderr?: string | Buffer };
+  return {
+    category: failureCategory(error),
+    exitStatus: Number.isInteger(failure.status) ? failure.status : null,
+    processCode: ['ETIMEDOUT', 'ENOENT', 'EACCES', 'ENOBUFS', 'SOURCE_STAT_TIMEOUT', 'ERR_ASSERTION'].includes(failure.code ?? '') ? failure.code : null,
+    signal: ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGABRT', 'SIGSEGV'].includes(failure.signal ?? '') ? failure.signal : null,
+    hasStderr: typeof failure.stderr === 'string' || Buffer.isBuffer(failure.stderr),
+  };
+}
 
 export const stageIdentity = {
   namespace: 'memeloop-token-center', name: 'mtc-pg-bounded-stage-20261005', node: 'haixia',
@@ -13,6 +53,23 @@ export const stageIdentity = {
 };
 
 export type InventoryReader = (args: string[]) => string;
+
+export function observeInventoryFailures(read: InventoryReader, report: (fields: Record<string, unknown>) => void): InventoryReader {
+  return args => {
+    const started = Date.now();
+    try {
+      return read(args);
+    } catch (error) {
+      const kind = args[args.indexOf('get') + 1];
+      const inventoryPhases = new Map([['pod', 'pod'], ['pods', 'csi-pods'], ['pvc', 'claim'], ['pv', 'persistent-volume'], ['volumes.longhorn.io', 'longhorn-volume'], ['replicas.longhorn.io', 'longhorn-replicas']]);
+      const phase = args.includes('exec')
+        ? args.includes('blkid') ? 'filesystem-identity' : args.includes('stat') ? 'device-number' : 'lease-publication'
+        : inventoryPhases.get(kind ?? '') ?? 'inventory-other';
+      report({ phase, durationMs: Math.max(0, Date.now() - started), ...failureDetails(error) });
+      throw error;
+    }
+  };
+}
 
 export function stageIdentityForPod(pod: any, containerName: string): typeof stageIdentity {
   const container = pod.spec.containers.find((entry: any) => entry.name === containerName);
