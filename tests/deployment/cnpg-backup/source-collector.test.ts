@@ -29,9 +29,9 @@ const exportPod = {
   status: { phase: 'Running' },
 };
 type Step = { contains: string[]; reply?: any; delayMs?: number; requestTimeout?: string; stderr?: string; exitCode?: number; leaseOperation?: 'publish' | 'revoke' };
-function sourceCalls(options: { statDelayMs?: number; output?: string; after?: (value: any) => void } = {}): Step[] {
-  const before = sourceInventory();
-  const after = sourceInventory();
+function sourceCalls(options: { statDelayMs?: number; output?: string; capacityGiB?: number; after?: (value: any) => void } = {}): Step[] {
+  const before = sourceInventory(options.capacityGiB);
+  const after = sourceInventory(options.capacityGiB);
   options.after?.(after);
   return [
     { contains: ['get', 'clusters.postgresql.cnpg.io'], reply: before.cluster },
@@ -115,6 +115,38 @@ test('real stat/parser errors and mount races cannot fall back to a cached summa
     assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
     assert.equal(result.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
   }
+});
+
+test('actual collector accepts completed source growth and still rejects a capacity change during the sample', { timeout: 120_000 }, async context => {
+  const output = sourceStatOutput(18 * 262144, 40 * 262144 - 16384);
+  const result = await run(context, sourceCalls({ capacityGiB: 40, output }));
+  assert.equal(result.status, 0);
+  const sample = JSON.parse(result.stdout);
+  assert.equal(sample.sourceIdentity.capacityBytes, 40 * 1024 ** 3);
+  assert.equal(sample.availableBytes, 18 * 1024 ** 3);
+  assert.equal(sample.sourceSpace.leaseSeconds, 45);
+  const changed = await run(context, sourceCalls({ capacityGiB: 40, output, after: value => Object.assign(value, sourceInventory(48)) }));
+  assert.equal(changed.status, 1);
+  assert.equal(changed.events.filter(event => event.event === 'lease-publication-start').length, 0);
+  assert.equal(changed.events.filter(event => event.event === 'transient-api-retry-no-lease-renewal').length, 0);
+});
+
+test('expanded source still loses its lease at the original fixed cumulative drop without rebasing', { timeout: 120_000 }, async context => {
+  const initial = 18 * 1024 ** 3;
+  const available = initial - sourceSpace.maximumDropBytes;
+  const totalBlocks = 40 * 262144 - 16384;
+  const result = await run(context, [
+    ...sourceCalls({ capacityGiB: 40, output: sourceStatOutput(initial / 4096, totalBlocks) }), exportCall(), ...volumeCalls(),
+    ...sourceCalls({ capacityGiB: 40, output: sourceStatOutput(available / 4096, totalBlocks) }), ...revokeCalls(),
+  ], true);
+  assert.equal(result.status, 1);
+  const budget = result.events.findIndex(event => event.event === 'source-budget' && event.category === 'SOURCE_BUDGET_DROP');
+  const revocation = result.events.findIndex(event => event.phase === 'lease-revoke' && event.outcome === 'success');
+  assert.ok(budget >= 0 && revocation > budget);
+  assert.equal(result.events[budget].initialAvailableBytes, initial);
+  assert.equal(result.events[budget].dropBytes, 512 * 1024 ** 2);
+  assert.equal(result.events[budget].minimumAvailableBytes, 8 * 1024 ** 3);
+  assert.equal(result.events.filter(event => event.event === 'lease-publication-start').length, 0);
 });
 
 test('actual collector records rejected capacity before stopping and revoking without a new lease', { timeout: 120_000 }, async context => {

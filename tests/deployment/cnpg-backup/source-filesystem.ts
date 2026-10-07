@@ -60,7 +60,14 @@ export function verifySourceBinding(pod: any, claim: any, persistent: any, clust
   assert.equal(claim.spec.volumeMode, 'Filesystem');
   assert.equal(persistent.status.phase, 'Bound');
   assert.equal(persistent.spec.volumeMode, 'Filesystem');
-  assert.equal(persistent.spec.capacity.storage, '30Gi');
+  const storage = persistent.spec.capacity.storage;
+  assert.match(storage, /^[1-9][0-9]*Gi$/);
+  const capacityBytes = Number(storage.slice(0, -2)) * 1024 ** 3;
+  assert.ok(Number.isSafeInteger(capacityBytes) && capacityBytes >= expected.capacityBytes);
+  assert.equal(cluster.spec.storage.size, storage);
+  assert.equal(claim.spec.resources.requests.storage, storage);
+  assert.equal(claim.status.capacity.storage, storage);
+  assert.ok(!claim.status.conditions?.some((condition: any) => condition.status === 'True'));
   assert.equal(persistent.spec.claimRef.uid, expected.claimUID);
   assert.equal(persistent.spec.claimRef.name, expected.claim);
   assert.equal(persistent.spec.claimRef.namespace, expected.namespace);
@@ -68,10 +75,11 @@ export function verifySourceBinding(pod: any, claim: any, persistent: any, clust
   assert.equal(persistent.spec.csi.volumeHandle, expected.persistent);
   assert.equal(persistent.spec.csi.fsType, 'xfs');
   assert.deepEqual(persistent.spec.nodeAffinity.required.nodeSelectorTerms, [{ matchExpressions: [{ key: 'kubernetes.io/hostname', operator: 'In', values: [expected.node] }] }]);
-  return { podUID: pod.metadata.uid, containerID: status.containerID, restarts: status.restartCount, claimUID: claim.metadata.uid, persistentUID: persistent.metadata.uid, node: pod.spec.nodeName };
+  return { podUID: pod.metadata.uid, containerID: status.containerID, restarts: status.restartCount, claimUID: claim.metadata.uid, persistentUID: persistent.metadata.uid, node: pod.spec.nodeName, capacityBytes };
 }
 
-export function parseSourceStat(output: string) {
+export function parseSourceStat(output: string, expectedCapacityBytes = sourceFilesystem.capacityBytes) {
+  assert.ok(Number.isSafeInteger(expectedCapacityBytes) && expectedCapacityBytes >= sourceFilesystem.capacityBytes);
   assert.ok(output.length <= 2048, 'Source stat output exceeds bounded metadata');
   const lines = output.trim().split('\n');
   assert.equal(lines.length, 3);
@@ -94,7 +102,8 @@ export function parseSourceStat(output: string) {
   assert.ok(totalInodes > 0 && freeInodes <= totalInodes && freeInodes >= sourceFilesystem.minimumFreeInodes);
   const capacityBytes = blockSize * totalBlocks;
   const availableBytes = blockSize * availableBlocks;
-  assert.ok(Number.isSafeInteger(capacityBytes) && capacityBytes <= sourceFilesystem.capacityBytes);
+  assert.ok(Number.isSafeInteger(capacityBytes) && capacityBytes <= expectedCapacityBytes);
+  if (expectedCapacityBytes > sourceFilesystem.capacityBytes) assert.ok(capacityBytes >= expectedCapacityBytes - 2 * 1024 ** 3, 'Expanded source filesystem has not reached the reconciled capacity');
   assert.ok(Number.isSafeInteger(availableBytes) && availableBytes >= 0);
   return { capacityBytes, availableBytes, freeInodes, mount, filesystemId: values[7]! };
 }
@@ -133,7 +142,7 @@ export function readSourceFilesystem(read: (args: string[], timeoutMs?: number) 
   const execStartedAt = new Date(timer.wall()).toISOString();
   const output = read(['-n', expected.namespace, 'exec', expected.pod, '-c', expected.container, '--', ...sourceStatCommand], expected.processTimeoutMs);
   const execCompletedAt = new Date(timer.wall()).toISOString();
-  const counters = parseSourceStat(output);
+  const counters = parseSourceStat(output, before.capacityBytes);
   const after = binding('after');
   assert.deepEqual(after, before, 'Source identity changed across stat; discard sample');
   const sample = { ...counters, method: 'mounted-statfs', time: new Date(startedWallMs).toISOString(), startedWallMs, startedMonotonicMs, execStartedAt, execCompletedAt, collectedAt: new Date(timer.wall()).toISOString(), sourcePodUID: before.podUID, sourceIdentity: before };

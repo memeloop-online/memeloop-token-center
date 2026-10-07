@@ -62,6 +62,36 @@ test('stat freshness uses both clocks, retains 90s and classifies invalid/future
   }
 });
 
+test('reconciled source expansion follows the same bound volume rather than the old literal capacity', () => {
+  for (const capacityGiB of [30, 40, 48]) {
+    const value = sourceInventory(capacityGiB);
+    const identity = verifySourceBinding(value.pod, value.claim, value.persistent, value.cluster);
+    assert.equal(identity.capacityBytes, capacityGiB * 1024 ** 3);
+    const sample = parseSourceStat(sourceStatOutput(2621440, capacityGiB * 262144 - 16384), identity.capacityBytes);
+    assert.equal(sample.availableBytes, 10 * 1024 ** 3);
+  }
+  const old = sourceInventory();
+  const expanded = sourceInventory(40);
+  assert.notDeepEqual(verifySourceBinding(old.pod, old.claim, old.persistent, old.cluster), verifySourceBinding(expanded.pod, expanded.claim, expanded.persistent, expanded.cluster));
+  assert.throws(() => parseSourceStat(sourceStatOutput(), 40 * 1024 ** 3));
+  assert.throws(() => parseSourceStat(sourceStatOutput(2621440, 41 * 262144), 40 * 1024 ** 3));
+  for (const mutate of [
+    (candidate: any) => { candidate.claim.status.capacity.storage = '30Gi'; },
+    (candidate: any) => { candidate.claim.spec.resources.requests.storage = '30Gi'; },
+    (candidate: any) => { candidate.cluster.spec.storage.size = '30Gi'; },
+    (candidate: any) => { candidate.claim.status.conditions = [{ type: 'FileSystemResizePending', status: 'True' }]; },
+    (candidate: any) => { candidate.persistent.spec.capacity.storage = 'NaNGi'; },
+    (candidate: any) => { candidate.persistent.spec.capacity.storage = '9007199254740992Gi'; },
+    (candidate: any) => { candidate.claim.metadata.uid = 'replacement-volume'; },
+  ]) {
+    const candidate = sourceInventory(40);
+    mutate(candidate);
+    assert.throws(() => verifySourceBinding(candidate.pod, candidate.claim, candidate.persistent, candidate.cluster));
+  }
+  const smaller = sourceInventory(29);
+  assert.throws(() => verifySourceBinding(smaller.pod, smaller.claim, smaller.persistent, smaller.cluster));
+});
+
 test('same CNPG image executes the exact stat shell and kills only its timed-out metadata group', { timeout: 240_000 }, context => {
   const image = 'ghcr.io/cloudnative-pg/postgresql@sha256:b1deeed2aa998b2f381e39c5cadb9ec06127708c8bd62965743af19abf21628f';
   execFileSync('docker', ['pull', image], { timeout: 180_000, stdio: ['ignore', 'pipe', 'pipe'] });
