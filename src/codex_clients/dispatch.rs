@@ -108,9 +108,9 @@ impl Lane {
         self.changed.notify_one();
     }
 
-    fn take(self: &Arc<Self>, metrics: &Metrics) -> Option<DispatchPermit> {
+    fn take(self: &Arc<Self>, metrics: &Metrics, unlimited_only: bool) -> Option<DispatchPermit> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.active >= state.maximum {
+        if state.maximum != 0 && (unlimited_only || state.active >= state.maximum) {
             return None;
         }
         state.active += 1;
@@ -121,11 +121,15 @@ impl Lane {
     }
 
     async fn acquire(self: &Arc<Self>, metrics: &Metrics) -> Result<DispatchPermit, DispatchError> {
+        if let Some(permit) = self.take(metrics, true) {
+            metrics.observe_codex_dispatch("admitted");
+            return Ok(permit);
+        }
         // Tokio's fair semaphore is a turnstile, not the dynamic capacity.
         // Only its FIFO head waits for capacity, so shrinking cannot leak
         // permits through cancellation or grant new work above the new limit.
         if let Ok(turn) = self.turn.clone().try_acquire_owned()
-            && let Some(permit) = self.take(metrics)
+            && let Some(permit) = self.take(metrics, false)
         {
             drop(turn);
             metrics.observe_codex_dispatch("admitted");
@@ -155,7 +159,7 @@ impl Lane {
                 .expect("lane never closed");
             loop {
                 let notified = self.changed.notified();
-                if let Some(permit) = self.take(metrics) {
+                if let Some(permit) = self.take(metrics, false) {
                     return permit;
                 }
                 notified.await;
@@ -272,6 +276,61 @@ mod tests {
             upstream_model: String::new(),
             credential: UpstreamCredential::None,
         }
+    }
+
+    #[tokio::test]
+    async fn absent_or_zero_dispatch_limit_admits_more_than_sixty_four_held_requests() {
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"transport_policy": {"connect_attempts": 3}}),
+            serde_json::json!({"transport_policy": {"dispatch_max_in_flight": 0, "dispatch_max_queued": 0, "dispatch_queue_timeout_millis": 1}}),
+        ] {
+            let lanes = DispatchLanes::default();
+            let metrics = Metrics::default();
+            let mut route = route();
+            route.config = config;
+            let mut permits = Vec::new();
+            for _ in 0..128 {
+                let permit =
+                    tokio::time::timeout(Duration::from_secs(1), lanes.acquire(&route, &metrics))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(permit.matches(&route));
+                permits.push(permit);
+            }
+            let lane = permits[0].lane.clone();
+            assert_eq!(lane.state.lock().unwrap().active, 128);
+            assert_eq!(lane.state.lock().unwrap().queued, 0);
+            drop(permits);
+            assert_eq!(lane.state.lock().unwrap().active, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabling_an_explicit_limit_releases_waiters_without_dropping_active_requests() {
+        let lanes = Arc::new(DispatchLanes::default());
+        let metrics = Metrics::default();
+        let mut route = route();
+        route.config["transport_policy"]["dispatch_max_in_flight"] = serde_json::json!(1);
+        let held = lanes.acquire(&route, &metrics).await.unwrap();
+        let waiting = {
+            let (lanes, route, metrics) = (lanes.clone(), route.clone(), metrics.clone());
+            tokio::spawn(async move { lanes.acquire(&route, &metrics).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(held.lane.state.lock().unwrap().queued, 1);
+        route.transport_revision += 1;
+        route.config["transport_policy"]["dispatch_max_in_flight"] = serde_json::json!(0);
+        let newly_admitted = lanes.acquire(&route, &metrics).await.unwrap();
+        let previously_queued = waiting.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&held.lane, &newly_admitted.lane));
+        assert!(Arc::ptr_eq(&held.lane, &previously_queued.lane));
+        assert_eq!(held.lane.state.lock().unwrap().active, 3);
+        assert_eq!(held.lane.state.lock().unwrap().queued, 0);
+        drop(newly_admitted);
+        drop(previously_queued);
+        assert_eq!(held.lane.state.lock().unwrap().active, 1);
     }
 
     #[tokio::test]
