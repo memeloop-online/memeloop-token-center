@@ -22,12 +22,25 @@ Quota observations follow the windows and timestamps supplied by each provider. 
 
 Providers expose different data ranges. Clients should use request results and the current state shown by their deployment as the source of truth.
 
-## Codex OAuth output-limit compatibility
+## Generation settings for Codex accounts
 
-The Codex OAuth route translates text Chat Completions to the Codex Responses transport. The native Codex request does not send `max_tokens`, `max_completion_tokens`, or `max_output_tokens` to that transport. These fields cannot be treated as enforced generation caps.
+Codex accounts connected through OAuth accept text Chat Completions and Responses requests. MTC translates the request format, but Codex does not support every generation parameter from these APIs.
 
-When omitted, `transport_policy.chat_controls` and `transport_policy.responses_output_limits` use `provider_default`. Valid Chat sampling controls and output-limit hints are validated and removed when the Codex transport cannot represent them; the upstream applies its own defaults. This does not promise the requested temperature, top-p, penalties, seed, stop sequences, or output length. Existing explicit `strict` settings remain effective: strict accepts only neutral sampling controls and rejects any output-limit hint. If an application requires an enforced setting or hard cap, use an authorized route that supports it.
+### Choose how unsupported parameters are handled
 
-Administrators may explicitly select either policy independently on the Codex account. In `provider_default` mode MTC validates exactly one positive bounded integer limit, removes it from the upstream request, and lets Codex choose the actual output length. Null, invalid, conflicting, or client-supplied reservation metadata is rejected. This is a compatibility hint, **not** a 16-token (or other) hard limit. Authorization and quota admission still apply. MTC reserves using the operator's trusted model bound, never the smaller client hint, and settles once against observed upstream usage; unknown usage and client cancellation retain their existing conservative settlement behavior.
+Administrators can configure chat controls and output limits separately in the Codex account's edit page. When using the configuration API, the corresponding fields are `transport_policy.chat_controls` and `transport_policy.responses_output_limits`.
 
-When verifying this default or an explicit `provider_default` policy, use a synthetic authorized request to `/v1/responses` with `max_output_tokens: 16` and a synthetic Chat request with `max_tokens: 16`. Confirm an upstream success, a single settled reservation, provider-reported usage, and that neither field is sent on the Codex wire. This is not a replay of any private WorkBuddy request.
+| Setting | How requests are handled | When to use it |
+| --- | --- | --- |
+| Use upstream defaults (`provider_default`, the default) | MTC validates parameter format, removes sampling controls and output-limit hints that Codex cannot apply, and lets Codex choose the generation behavior. | Your client includes these parameters, but your application does not require them to take effect. |
+| Strict validation (`strict`) | Chat controls accept only values that preserve default generation behavior; output-limit hints are rejected. Existing strict settings are not automatically changed to the default. | You want the client to receive an error for unsupported settings rather than continue with upstream defaults. |
+
+Using upstream defaults **does not guarantee** your requested `temperature`, `top_p`, penalties, `seed`, `stop`, or output length. If your application depends on these controls, choose an authorized model route that supports them.
+
+If a request reports an unsupported parameter, have the client omit that parameter. If the application requires it, switch to a route that supports it.
+
+### Output limits and cost
+
+`max_tokens`, `max_completion_tokens`, and `max_output_tokens` are not sent to Codex. The default setting accepts one positive integer hint within the supported range, but **does not cap output at that value**. For example, setting 16 does not restrict generation to 16 tokens. Do not send conflicting limit fields, null or invalid values, or your own reservation metadata.
+
+A smaller limit hint does not reduce the quota MTC reserves using the operator's model bound. Final charges use observed upstream usage; cancelling a request does not guarantee that upstream generation stops or that incurred charges disappear. Unknown usage is not treated as zero. If you need an enforced output limit, including for cost control, choose a route that supports one instead of relying on Codex compatibility hints.
