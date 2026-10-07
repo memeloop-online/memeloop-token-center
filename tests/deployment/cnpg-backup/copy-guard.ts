@@ -46,7 +46,7 @@ export function validateCopyPod(pod: any, side: CopySide, expectedUID?: string):
   assert.equal(claims.length, 1);
   assert.equal(claims[0].name, 'backup');
   assert.equal(claims[0].persistentVolumeClaim.claimName, expected.name);
-  assert.equal(claims[0].persistentVolumeClaim.readOnly, side === 'source');
+  assert.equal(claims[0].persistentVolumeClaim.readOnly ?? false, side === 'source');
   const container = pod.spec.containers[0];
   assert.equal(container.name, 'copy');
   assert.equal(container.image, copyImage);
@@ -56,7 +56,7 @@ export function validateCopyPod(pod: any, side: CopySide, expectedUID?: string):
   assert.equal(container.securityContext.allowPrivilegeEscalation, false);
   assert.equal(container.securityContext.readOnlyRootFilesystem, true);
   assert.deepEqual(container.securityContext.capabilities.drop, ['ALL']);
-  assert.equal(container.volumeMounts.find((mount: any) => mount.name === 'backup').readOnly, side === 'source');
+  assert.equal(container.volumeMounts.find((mount: any) => mount.name === 'backup').readOnly ?? false, side === 'source');
   assert.deepEqual(container.command, ['/bin/sh', '-ec', copyContainerCommand]);
   const status = pod.status.containerStatuses.find((entry: any) => entry.name === 'copy');
   assert.ok(status.ready && status.state.running);
