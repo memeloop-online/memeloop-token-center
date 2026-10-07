@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
-import { archiveDirectory, archiveLimit, archiveName, copyArchive, copyChunk, type Remote } from './copy.ts';
+import { archiveDirectory, archiveLimit, archiveName, copyArchive, copyChunk, copyFailureReceipt, type CopyStep, type Remote } from './copy.ts';
 
 assert.equal(process.env.GITHUB_ACTIONS, 'true', 'Run automated backup contracts only in GitHub Actions');
 const directory = dirname(fileURLToPath(import.meta.url));
@@ -88,6 +88,34 @@ test('reviewed contracts and negative mutations fail closed independently of pro
   execFileSync('/tmp/kubeconform', ['-strict', '-summary', '-exit-on-error', ...names.map(name => join(directory, name))], { timeout: 90_000 });
 });
 
+test('copy failure diagnostics retain the operation and exit category, never command output or credentials', async () => {
+  const secret = 'private-archive-data-and-token';
+  const failure = Object.assign(new Error(secret), { code: 'ETIMEDOUT', status: 1, signal: 'SIGTERM', stdout: Buffer.from(secret), stderr: Buffer.from(secret), command: secret });
+  let step: CopyStep | undefined;
+  await assert.rejects(copyArchive(() => { throw failure; }, '0'.repeat(64), undefined, false, archiveDirectory, 1, current => { step = current; }), error => error === failure);
+  assert.deepEqual(step, { stage: 'source_checksum', side: 'source' });
+  const receipt = copyFailureReceipt(failure, step);
+  assert.equal(receipt.stage, 'source_checksum');
+  assert.equal(receipt.exit_code, 1);
+  assert.equal(receipt.code, 'ETIMEDOUT');
+  assert.equal(receipt.signal, 'SIGTERM');
+  assert.equal(receipt.stdout_bytes, Buffer.byteLength(secret));
+  assert.equal(receipt.stderr_bytes, Buffer.byteLength(secret));
+  assert.equal(receipt.archive_verified, false);
+  assert.equal(receipt.automatic_retry, false);
+  assert.equal(copyFailureReceipt(failure, { ...step!, checkpoint: 'container_identity' }).checkpoint, 'container_identity');
+  assert.doesNotMatch(JSON.stringify(receipt), /private-archive-data|token|command|stack|message/);
+  for (const reason of [null, secret, { message: secret, name: secret, code: secret, signal: secret, status: secret, stdout: secret, stderr: secret }]) {
+    const unknown = copyFailureReceipt(reason, { stage: secret, side: secret, checkpoint: secret } as unknown as CopyStep);
+    assert.equal(unknown.stage, 'preparation');
+    assert.equal(unknown.side, null);
+    assert.equal(unknown.checkpoint, null);
+    assert.equal(unknown.code, null);
+    assert.equal(unknown.exit_code, null);
+    assert.doesNotMatch(JSON.stringify(unknown), /private-archive-data|token/);
+  }
+});
+
 test('invalid copy rates fail before any remote operation', async () => {
   let calls = 0;
   const remote: Remote = () => { calls++; throw new Error('No remote operation expected'); };
@@ -165,14 +193,19 @@ test('real PostgreSQL export, byte bounds, disk abort, resumable copy and full r
     return execute(target, ['env', `PATH=/tmp/bin:${path}`, ...command], input);
   };
   let writes = 0;
+  let failedStep: CopyStep | undefined;
   await assert.rejects(copyArchive((side, command, input) => {
     if (input && ++writes === 2) throw new Error('simulated interrupted transfer');
     return remote(side, command, input);
-  }, expectedSha, async () => {}), /interrupted transfer/);
+  }, expectedSha, async () => {}, false, archiveDirectory, 1, step => { failedStep = step; }), /interrupted transfer/);
+  assert.deepEqual(failedStep, { stage: 'destination_chunk', side: 'destination' });
   assert.equal(Number(shell(destination, `stat -c %s ${archiveDirectory}/${archiveName}.partial`).toString()), copyChunk);
   shell(destination, `test ! -f ${archiveDirectory}/OFFHOST_COPY_VERIFIED`);
   const sleeps: number[] = [];
-  await copyArchive(remote, expectedSha, async milliseconds => { sleeps.push(milliseconds!); });
+  const phases: CopyStep[] = [];
+  await copyArchive(remote, expectedSha, async milliseconds => { sleeps.push(milliseconds!); }, false, archiveDirectory, 1, step => { phases.push(step); });
+  assert.deepEqual(phases[0], { stage: 'source_checksum', side: 'source' });
+  assert.deepEqual(phases.at(-1), { stage: 'destination_finalize', side: 'destination' });
   assert.ok(sleeps.every(milliseconds => milliseconds > 0 && milliseconds <= 4000));
   assert.equal(sleeps.reduce((total, milliseconds) => total + milliseconds, 0), (size - copyChunk) / 1024 / 1024 * 1000);
   shell(destination, `test -f ${archiveDirectory}/OFFHOST_COPY_VERIFIED`);
