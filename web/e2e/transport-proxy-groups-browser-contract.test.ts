@@ -203,7 +203,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.locator('.transport-proxy-management-action [role="status"]').count(), 0);
       const accessReads = await page.evaluate(() => window.proxyGroupFixture.accessReads);
       const row = page.locator('.provider-directory-row');
-      await row.getByRole('button', { name: '查看详情', exact: true }).click();
+      await row.getByRole('button', { name: '管理账号', exact: true }).click();
       const detailAction = page.locator('.provider-detail-workspace .upstream-connection').getByRole('button', { name: '选择代理组', exact: true });
       await detailAction.click();
       const workspace = page.locator('.transport-proxy-workspace');

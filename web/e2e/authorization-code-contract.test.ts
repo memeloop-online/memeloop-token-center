@@ -5,6 +5,32 @@ import { ApiError } from '../src/api.js';
 import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, parseClaudeCompletion, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
+import { providerAccountStatus } from '../src/operator/providerAccountStatus.js';
+
+test('account status derives expiry independently of enabled state and keeps missing expiry uncertain', () => {
+  const account = { status: 'active', auth_kind: 'oauth', credential_expires_at: null } as const;
+  assert.equal(providerAccountStatus(account, 1000).accountLabel, 'providers.accountEnabledUnknown');
+  assert.equal(providerAccountStatus(account, 1000).tone, 'pending');
+  assert.equal(providerAccountStatus({ ...account, credential_expires_at: 1000 }, 1000).accountLabel, 'providers.authorizationExpired');
+  assert.equal(providerAccountStatus({ ...account, credential_expires_at: 999 }, 1000).expired, true);
+  assert.equal(providerAccountStatus({ ...account, credential_expires_at: 1001 }, 1000).accountLabel, 'providers.accountEnabled');
+  assert.equal(providerAccountStatus({ ...account, status: 'disabled', credential_expires_at: 999 }, 1000).accountLabel, 'status.disabled');
+  assert.equal(providerAccountStatus({ ...account, credential_expires_at: NaN }, 1000).credentialLabel, 'providers.credentialExpiryUnknown');
+  assert.equal(providerAccountStatus({ ...account, auth_kind: 'api_key', credential_expires_at: 999 }, 1000).credentialLabel, 'providers.credentialExpired');
+  assert.equal(providerAccountStatus({ ...account, auth_kind: 'api_key' }, 1000).accountLabel, 'providers.accountEnabled');
+});
+
+test('bilingual Kimi reauthorization distinguishes the MTC connection name from unverified provider identity', () => {
+  for (const locale of ['zh-CN', 'en']) {
+    const kimi = authorizationJourneyCopy(locale, 'kimi-oauth');
+    assert.match(kimi.purpose, locale === 'en' ? /connection name.*model routes/ : /连接名称和模型路由/);
+    assert.match(kimi.identityHelp, locale === 'en' ? /Check the login account on the Kimi page.*not a verified Kimi account/ : /Kimi 页面核对登录账号.*不代表已核验的 Kimi 账号/);
+    assert.doesNotMatch(kimi.purpose, /Sign in to the original account|账号必须与原账号一致/);
+    assert.match(authorizationJourneyCopy(locale, 'anthropic-claude').identityHelp, /Anthropic/);
+    assert.match(authorizationJourneyCopy(locale, 'google-antigravity').identityHelp, /Google/);
+    assert.equal(authorizationJourneyCopy(locale, 'fixture-plugin').identityHelp, '');
+  }
+});
 
 test('generic OAuth help does not assume Google and continuation uses user-facing wording', () => {
   for (const locale of ['zh-CN', 'en']) {

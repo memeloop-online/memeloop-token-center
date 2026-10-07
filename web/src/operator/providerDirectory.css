@@ -19,7 +19,7 @@
 .provider-catalog-models li code { overflow-wrap: anywhere; }
 .provider-catalog-models li > button { margin-inline-start: auto; }
 .provider-directory .provider-detail-workspace { padding: 24px; background: var(--picker-bg); border-bottom: 1px solid var(--picker-border); }
-.provider-detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+.provider-detail-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
 .provider-detail-heading h3 { margin: 0; font-size: 18px; }
 .provider-detail-heading > span, .connection-help { color: var(--picker-muted); font-size: 12px; text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
 .connection-help { display: inline-block; margin: 0 16px 12px 0; }

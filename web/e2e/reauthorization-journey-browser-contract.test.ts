@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -38,7 +39,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
       return route.fulfill({ json: { session_token: 'synthetic-claude-session', login_url: `${origin}/mock-provider`, expires_at: Date.now() + 600_000 } });
     });
     await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
-    await page.locator(`[data-inline-edit-trigger="${account.id}"]`).click();
+    await editProviderAccount(page, account.id);
     const reauthorize = page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true });
     await reauthorize.click();
     await page.evaluate(account => {
@@ -187,7 +188,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
         return route.fulfill({ json: account });
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
-      await page.locator('[data-inline-edit-trigger="reauthorization-fixture"]').click();
+      await editProviderAccount(page, 'reauthorization-fixture');
       const reauthorize = page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true });
       await reauthorize.click();
       const workspace = page.locator('.provider-reauthorization-workspace');

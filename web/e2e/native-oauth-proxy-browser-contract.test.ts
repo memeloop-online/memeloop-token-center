@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -42,7 +43,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
     });
     await page.goto(fixtureUrl);
     if (reauthorize) {
-      await page.locator('[data-inline-edit-trigger="existing-account"]').click();
+      await editProviderAccount(page, 'existing-account');
       await page.getByRole('button', { name: '重新授权', exact: true }).click();
     } else {
       await page.locator('.create-journey [data-workspace-toggle]').click();

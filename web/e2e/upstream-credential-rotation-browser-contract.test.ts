@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -6,8 +7,8 @@ import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 const labels = {
-  'zh-CN': { details: '查看详情', manage: '账号设置与授权操作', rotate: '轮换接入凭据', title: '轮换 rotation@example.org 的接入凭据', back: '返回上一级', close: '关闭并返回上一级', key: '新 API 密钥', submit: '保存并替换凭据', acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '但这里不会在提供商端撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
-  en: { details: 'View details', manage: 'Account settings and authorization', rotate: 'Rotate access credential', title: 'Rotate access credential for rotation@example.org', back: 'Back to previous page', close: 'Close and return to previous page', key: 'New API key', submit: 'Save and replace credential', acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
+  'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '轮换接入凭据', title: '轮换 rotation@example.org 的接入凭据', back: '返回上一级', close: '关闭并返回上一级', key: '新 API 密钥', submit: '保存并替换凭据', acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '但这里不会在提供商端撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
+  en: { details: 'Manage account', manage: 'Account settings and authorization', rotate: 'Rotate access credential', title: 'Rotate access credential for rotation@example.org', back: 'Back to previous page', close: 'Close and return to previous page', key: 'New API key', submit: 'Save and replace credential', acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
 };
 
 test('rotation explains replacement, uses Fluent controls, restores its parent and validates only mocked credentials', { timeout: 120_000 }, async () => {
@@ -102,7 +103,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'reopening never retains a submitted secret');
       await form.getByRole('button', { name: copy.close }).click();
       assert.equal(await trigger.isVisible(), true);
-      await page.locator('[data-inline-edit-trigger="rotation-fixture"]').click();
+      await editProviderAccount(page, 'rotation-fixture');
       await trigger.click();
       await form.getByRole('button', { name: copy.back, exact: true }).focus(); await page.keyboard.press('Enter');
       await page.getByRole('heading', { name: copy.settings, exact: true }).waitFor();

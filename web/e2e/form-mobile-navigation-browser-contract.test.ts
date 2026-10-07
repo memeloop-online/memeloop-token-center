@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -28,7 +29,7 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
     await page.waitForFunction(() => document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
     assert.equal(await page.locator('.app-sidebar').evaluate(element => getComputedStyle(element).visibility), 'hidden');
     assert.equal(await page.locator('.app-stage').evaluate(element => (element as HTMLElement).inert), false);
-    await page.getByRole('button', { name: '编辑', exact: true }).click();
+    await editProviderAccount(page);
     assert.equal(await page.getByRole('heading', { name: '编辑 研发订阅', exact: true }).count(), 1);
     assert.equal(await page.locator('.create-journey input:not([type="hidden"])').evaluateAll(elements => elements.filter(element => (element as HTMLInputElement).value.includes('chatgpt.com')).length), 0);
     assert.equal(await page.locator('.create-journey code').filter({ hasText: 'https://chatgpt.com/backend-api/codex' }).count(), 1);

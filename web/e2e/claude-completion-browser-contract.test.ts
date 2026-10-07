@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import { chromium } from 'playwright';
@@ -79,7 +80,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
   const chinese = locale.startsWith('zh');
   const add = page.getByRole('button', { name: chinese ? '新增上游' : 'Add upstream', exact: true });
   if (reauthorize) {
-    await page.locator(`[data-inline-edit-trigger="${account.id}"]`).click();
+    await editProviderAccount(page, account.id);
     await page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true }).click();
   } else {
     await add.click();

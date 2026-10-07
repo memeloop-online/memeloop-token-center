@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 const copy = {
@@ -29,10 +31,10 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
   await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const url = `http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?full-page&scope-controls`;
   const browser = await chromium.launch({ headless: true });
-  const account = { id: 'original-kimi', tenant_external_id: 'fixture-a', driver: 'kimi-oauth', name: 'My Kimi', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 3, updated_at: 4, route_count: 2, config: {}, can_reauthorize: true, has_proxy: false };
+  const account = { id: 'original-kimi', tenant_external_id: 'fixture-a', driver: 'kimi-oauth', name: 'My Kimi', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 3, credential_expires_at: null, updated_at: 4, route_count: 2, config: {}, can_reauthorize: true, has_proxy: false };
   const provider = { id: 'kimi-oauth', display_name: 'Kimi', source: 'builtin', protocols: ['anthropic'], modalities: ['text'], config_schema: { type: 'object' }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'kimi_device' } };
   const initialTime = new Date('2026-09-14T12:00:00Z');
-  async function open(options: { reauthorize?: boolean; locale?: keyof typeof copy; omitExpiry?: boolean } = {}) {
+  async function open(options: { reauthorize?: boolean; locale?: keyof typeof copy; omitExpiry?: boolean; manageOnly?: boolean; expiredAuthorization?: boolean } = {}) {
     const locale = options.locale ?? 'zh-CN';
     const text = copy[locale];
     const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
@@ -63,13 +65,14 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       if (path === '/internal/v1/upstreams') {
         state.listReads += 1;
         if (state.saved && state.holdList) await new Promise<void>(resolve => { releaseList = resolve; });
-        return route.fulfill(state.saved && state.failList ? { status: 503, json: { error: { message: 'mock list read unavailable' } } } : { json: options.reauthorize || state.saved ? [account] : [] });
+        return route.fulfill(state.saved && state.failList ? { status: 503, json: { error: { message: 'mock list read unavailable' } } } : { json: options.reauthorize || state.saved ? [{ ...account, credential_expires_at: options.expiredAuthorization && !state.saved ? initialTime.getTime() - 1000 : null }] : [] });
       }
       return route.fulfill({ json: [] });
     });
     await page.goto(url);
+    if (options.manageOnly) return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
     if (options.reauthorize) {
-      await page.locator('[data-inline-edit-trigger="original-kimi"]').click();
+      await editProviderAccount(page, 'original-kimi');
       await page.getByRole('button', { name: text.reauthorize, exact: true }).click();
     } else {
       await page.locator('.create-journey [data-workspace-toggle]').click();
@@ -78,6 +81,44 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
   }
   try {
+    for (const locale of ['zh-CN', 'en'] as const) {
+      const chinese = locale === 'zh-CN';
+      const journey = await open({ locale, reauthorize: true, manageOnly: true, expiredAuthorization: true });
+      const { page, writes, text } = journey;
+      const row = page.locator('.provider-directory-row');
+      const manage = row.getByRole('button', { name: chinese ? '管理账号' : 'Manage account', exact: true });
+      assert.equal(await manage.count(), 1);
+      assert.equal(await row.getByRole('button', { name: /^(编辑|Edit|查看详情|View details)$/ }).count(), 0, 'the list has one account workspace entry');
+      assert.equal(await row.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1);
+      assert.equal(await row.locator('.status.ok').count(), 0, 'active does not imply valid authorization');
+      await manage.click();
+      const details = page.locator('.provider-detail-workspace');
+      const edit = details.getByRole('button', { name: chinese ? '编辑' : 'Edit', exact: true });
+      await edit.click();
+      await page.locator('.provider-edit-workspace [data-workspace-toggle]').click();
+      await details.waitFor();
+      assert.equal(await edit.evaluate(button => document.activeElement === button), true, 'closing the editor returns focus inside the account workspace');
+      await details.getByRole('button', { name: chinese ? '返回账号列表' : 'Back to account list', exact: true }).click();
+      assert.equal(await details.count(), 0);
+      assert.equal(await manage.evaluate(button => document.activeElement === button), true, 'back returns focus to the single list entry');
+      await row.getByRole('button', { name: text.reauthorize, exact: true }).click();
+      const workspace = page.locator('.provider-reauthorization-workspace');
+      const help = authorizationJourneyCopy(locale, 'kimi-oauth');
+      await workspace.getByText(help.purpose, { exact: true }).waitFor();
+      await workspace.getByText(help.identityHelp, { exact: true }).waitFor();
+      const connectionName = workspace.getByLabel(chinese ? '连接名称' : 'Connection name', { exact: false });
+      assert.equal(await connectionName.inputValue(), 'My Kimi');
+      assert.equal(await connectionName.getAttribute('readonly'), '');
+      await workspace.getByRole('button', { name: help.back, exact: true }).click();
+      await details.waitFor();
+      assert.equal(await row.getByRole('button', { name: text.reauthorize, exact: true }).evaluate(button => document.activeElement === button), true);
+      assert.equal(writes.length, 0, 'navigation never starts login or changes routes');
+      await page.close();
+      const unknown = await open({ locale, reauthorize: true, manageOnly: true });
+      assert.equal(await unknown.page.locator('.provider-directory-row .status.ok').count(), 0);
+      assert.match(await unknown.page.locator('.provider-directory-row').innerText(), chinese ? /有效期未知/ : /expiry unknown/);
+      await unknown.page.close();
+    }
     for (const reauthorize of [false, true]) {
       const { page, writes, state, text, releaseList } = await open({ reauthorize });
       assert.equal(await page.getByRole('button', { name: text.start, exact: true }).isEnabled(), true, 'Kimi permits direct login without a proxy');

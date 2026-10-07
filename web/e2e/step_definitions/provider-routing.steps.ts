@@ -198,7 +198,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
-  await providerAccount.getByRole('button', { name: '查看详情', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '管理账号', exact: true }).click();
   await providerAccount.getByRole('button', { name: '近期可用性', exact: true }).click();
   await providerAccount.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
   // The shared seed includes a routed 429. Do not make this UI assertion
