@@ -29,4 +29,4 @@ window.fetch = async (input, init) => {
   if (!(url.pathname in values)) throw new Error(`Unexpected route list read: ${url.pathname}`);
   return new Response(JSON.stringify(values[url.pathname]), { headers: { 'Content-Type': 'application/json' } });
 };
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><main style={{ padding: 16 }}><RoutesPage token="mock" tenant="fixture" /></main></MtcFluentProvider></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><main style={{ padding: 16 }}>{new URLSearchParams(location.search).has('keyboard-anchor') && <button type="button" data-tooltip-keyboard-anchor>Keyboard traversal anchor</button>}<RoutesPage token="mock" tenant="fixture" /></main></MtcFluentProvider></I18nProvider>);
