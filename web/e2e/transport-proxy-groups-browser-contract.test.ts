@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
 import test from 'node:test';
@@ -203,7 +204,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.locator('.transport-proxy-management-action [role="status"]').count(), 0);
       const accessReads = await page.evaluate(() => window.proxyGroupFixture.accessReads);
       const row = page.locator('.provider-directory-row');
-      await row.getByRole('button', { name: '查看详情', exact: true }).click();
+      await row.getByRole('button', { name: '管理账号', exact: true }).click();
       const detailAction = page.locator('.provider-detail-workspace .upstream-connection').getByRole('button', { name: '选择代理组', exact: true });
       await detailAction.click();
       const workspace = page.locator('.transport-proxy-workspace');
@@ -222,7 +223,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.waitForFunction(() => document.activeElement?.textContent === '选择代理组');
       assert.equal(await detailAction.evaluate(button => document.activeElement === button), true);
       assert.equal(await page.locator('.provider-detail-workspace').isVisible(), true);
-      await row.getByRole('button', { name: '编辑', exact: true }).click();
+      await editProviderAccount(page);
       const settings = page.locator('.provider-edit-workspace');
       const name = settings.getByLabel('上游名称', { exact: false });
       await name.fill('保留账号修改');

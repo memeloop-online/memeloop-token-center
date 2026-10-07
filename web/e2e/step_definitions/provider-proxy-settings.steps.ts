@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from '../support/provider-account-navigation.js';
 import { When } from '@cucumber/cucumber';
 import { requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
@@ -20,8 +21,7 @@ When('管理员通过统一编辑工作区维护真实代理设置', async funct
   await connectOperator(this, 'light', seed.globalServiceCredential, 'visible');
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'providers');
-  const row = page.locator(`[data-upstream-id="${account.id}"]`);
-  await row.getByRole('button', { name: '编辑', exact: true }).click();
+  await editProviderAccount(page, account.id);
   const workspace = page.locator('.provider-edit-workspace');
   const current = workspace.locator('.provider-proxy-value input');
   await current.waitFor();

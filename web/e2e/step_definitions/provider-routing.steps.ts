@@ -198,7 +198,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
-  await providerAccount.getByRole('button', { name: '查看详情', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '管理账号', exact: true }).click();
   await providerAccount.getByRole('button', { name: '近期可用性', exact: true }).click();
   await providerAccount.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
   // The shared seed includes a routed 429. Do not make this UI assertion
@@ -304,7 +304,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   }
   await page.keyboard.press('Escape');
   await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
-  await onboarding.getByLabel('上游名称').fill('codex-primary');
+  await onboarding.getByLabel('连接名称').fill('codex-primary');
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), true, 'Codex supports the server default egress');
   await onboarding.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true, 'the selected proxy waits for a valid address');

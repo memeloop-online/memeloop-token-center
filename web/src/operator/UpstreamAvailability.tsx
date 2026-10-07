@@ -3,6 +3,7 @@ import { useI18n } from '../i18n';
 import type { OperatorMonitoringSnapshot, UpstreamAccount, UpstreamHealth } from '../types';
 import { RoutingStatusBadge } from './MonitoringSnapshot';
 import type { UpstreamAvailabilityWindow } from './upstreamAvailabilityWindow';
+import { ProviderAccountStatus } from './providerAccountStatus';
 
 export function manualHealthLabel(health: UpstreamHealth) {
   switch (health.error_code) {
@@ -50,14 +51,13 @@ export function UpstreamAvailability({ account, snapshot, window, loading = fals
   const attempts = facts?.terminal_outcomes ?? [];
   const range = scopedWindow ? `${new Date(scopedWindow.from_created_at).toLocaleString(locale)} – ${new Date(scopedWindow.to_created_at).toLocaleString(locale)}` : undefined;
   const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
-  const expired = account.credential_expires_at !== null && account.credential_expires_at <= Date.now();
 
   return <section className="provider-availability" aria-label={t('providers.recentAvailability')}>
     <div className="provider-availability-heading">
       <div><b>{t('providers.recentAvailability')}</b>{range && <small>{t('providers.observationWindow', { range })}</small>}</div>
       <div className="provider-availability-states">
-        <span className="provider-availability-state"><small>{t('providers.accountStatus')}</small><span className={`status ${account.status === 'active' ? 'ok' : 'pending'}`}>{account.status === 'active' ? t('status.active') : t('status.disabled')}</span></span>
-        {account.credential_expires_at !== null && <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><span className={`status ${expired ? 'bad' : 'pending'}`}>{expired ? t('providers.credentialExpired') : t('providers.credentialExpires', { time: new Date(account.credential_expires_at).toLocaleString(locale) })}</span></span>}
+        <span className="provider-availability-state"><small>{t('providers.accountStatus')}</small><ProviderAccountStatus account={account} /></span>
+        <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><ProviderAccountStatus account={account} credential /></span>
       </div>
     </div>
     {!facts ? <div className="provider-availability-empty" role={loading ? 'status' : undefined}>{t(loading ? 'common.loading' : 'providers.availabilityUnavailable')}</div> : <>

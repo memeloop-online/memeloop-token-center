@@ -27,6 +27,8 @@ import { ManagedModelSync } from '../ManagedModelSync';
 import { inferManagedRouteProtocol, managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
 import { consumeRouteDraftPrefill, consumeRouteFocus, storeCatalogRouteAction } from '../routePrefill';
 import { providerDisplayName } from '../providerDisplayName';
+import { ProviderAccountStatus, providerAccountStatus } from '../providerAccountStatus';
+import { useQuotaClock } from '../useQuotaClock';
 import '../routeFormScope.css';
 import {
   applyKeyPage, canLoadMoreKeys, canReadCredentialLimits, canWriteCredential,
@@ -169,6 +171,8 @@ function isPositiveDecimal(value: string) {
 
 function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
+  const accountStatusNow = useQuotaClock();
+  const accountReturnFocus = useRef<string | undefined>(undefined);
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
@@ -177,6 +181,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const rotationReturnFocus = useRef<string | undefined>(undefined);
   const reauthorizationOrigin = useRef<'details' | 'settings'>('details');
   const reauthorizationReturnFocus = useRef<string | undefined>(undefined);
+  const reauthorizationTrigger = useRef<HTMLElement | null>(null);
   const [editing, setEditing] = useState<UpstreamAccount>();
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [providerWorkspaceOpen, setProviderWorkspaceOpen] = useState(false);
@@ -193,6 +198,12 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  useLayoutEffect(() => {
+    if (providerDetail || !accountReturnFocus.current) return;
+    const accountId = accountReturnFocus.current;
+    accountReturnFocus.current = undefined;
+    providerList.current?.querySelectorAll<HTMLButtonElement>('[data-manage-account-trigger]').forEach(button => { if (button.dataset.manageAccountTrigger === accountId) button.focus(); });
+  }, [providerDetail]);
   useLayoutEffect(() => { if (message && !providerWorkspaceOpen && !editing && !rotating && !reauthorizing) providerSuccess.current?.focus(); }, [message, providerWorkspaceOpen, editing, rotating, reauthorizing]);
   const providerGroups = useGroups('provider', token, writeTenant);
   const directProviders = providers.filter(supportsDirectConnection);
@@ -243,6 +254,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     },
   };
   useEffect(() => {
+    accountReturnFocus.current = undefined;
+    reauthorizationTrigger.current = null;
     setProviderDetail(undefined);
     setProviderEditDraft(undefined); setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setProviderWorkspaceOpen(false);
     setBusy(''); setHealth({}); setDeletionReadiness({}); setRouteCacheRevisions({}); setMessage(''); setError('');
@@ -278,6 +291,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   function openReauthorization(account: UpstreamAccount, origin: 'details' | 'settings') {
+    reauthorizationTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     reauthorizationOrigin.current = origin;
     setError(''); setMessage('');
     setReauthorizing(account); setEditing(undefined);
@@ -295,6 +309,9 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     if (reauthorizing || !reauthorizationReturnFocus.current) return;
     const accountId = reauthorizationReturnFocus.current;
     reauthorizationReturnFocus.current = undefined;
+    const trigger = reauthorizationTrigger.current;
+    reauthorizationTrigger.current = null;
+    if (trigger?.isConnected && trigger.getClientRects().length) { trigger.focus(); return; }
     providerList.current?.querySelectorAll<HTMLButtonElement>('[data-reauthorization-trigger]').forEach(button => {
       if (button.dataset.reauthorizationTrigger === accountId && button.getClientRects().length) button.focus();
     });
@@ -411,7 +428,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     </>,
     providerAuthentication: <FormSection title={connectionCopy.authentication}>
       <span>{editProvider?.display_name ?? t('providerDirectory.other')} · {editing.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', editing.connection_method)}</span>
-      {editing.credential_expires_at && <p>{t('providers.expires')}: {new Date(editing.credential_expires_at).toLocaleString(locale)}</p>}
+      <p><ProviderAccountStatus account={editing} credential /></p>
       <div className="row-actions">
         {canReauthorizeAccount(editing, providers.find(provider => provider.id === editing.driver)) && <Button data-reauthorization-trigger={editing.id} appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => openReauthorization(editing, 'settings'))}>{t('providers.reauthorize')}</Button>}
         {editing.can_rotate && <Button data-rotation-trigger={editing.id} appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => openRotation(editing, 'settings'))}>{t('providers.rotateCredential')}</Button>}
@@ -439,6 +456,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const currentReadiness = deletionReadiness[value.id];
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
         const detailOpen = providerDetail === value.id;
+        const accountStatus = providerAccountStatus(value, accountStatusNow);
         const providerName = providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other');
         const facts = availabilityWindow && availabilityWindow.tenant_external_id === (value.tenant_external_id ?? tenant) ? availabilityWindow.accounts.find(account => account.upstream_account_id === value.id) : undefined;
         const terminal = facts ? facts.metrics.successful_requests + facts.metrics.failed_requests : 0;
@@ -454,13 +472,13 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             </div>
-            <div className="provider-directory-summary"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
+            <div className="provider-directory-summary"><ProviderAccountStatus account={value} /><span>{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span></div>
             <div className="provider-directory-summary"><small>{t('providers.recentAvailability')}</small><span>{availabilityLoading ? t('common.loading') : !facts ? t('providerDirectory.unavailable') : terminal > 0 ? t('providerDirectory.successful', { percent: formatPercent(facts.metrics.successful_requests / terminal, locale) }) : t('providerDirectory.noRequests')}</span></div>
             <div className="provider-directory-summary" aria-busy={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)}><small>{t('quota.title')}</small><span role="status">{cachedQuota?.generation === generation && cachedQuota.busy ? t('quota.refreshing') : cachedQuota?.generation === generation && cachedQuota.queued ? t('quota.queued') : <QuotaSummary snapshot={quota} refreshFailed={quotaRefreshFailed} showWindowReset showResetCreditExpiryInTooltip={quota?.provider === 'openai-codex'} />}</span></div>
             <div className="provider-directory-actions">
               <Button appearance="secondary" type="button" disabled={!token || !(value.tenant_external_id ?? tenant) || value.status !== 'active' || Boolean(quotaReads.progress?.busy) || Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} onClick={() => void quotaReads.read(value)}>{t('quota.refreshAccount')}</Button>
-              <Button appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => setProviderDetail(detailOpen ? undefined : value.id)}>{t(detailOpen ? 'providerDirectory.close' : 'providerDirectory.open')}</Button>
-              {providerAvailable && <Button appearance="subtle" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderDetail(undefined); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}
+              <Button data-manage-account-trigger={value.id} appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => { accountReturnFocus.current = value.id; setProviderDetail(detailOpen ? undefined : value.id); }}>{t('providerDirectory.open')}</Button>
+              {accountStatus.expired && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => openReauthorization(value, 'details')}>{t('providers.reauthorize')}</Button>}
             </div>
             <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onReconciled={() => {
               setRouteCacheRevisions((current) => ({ ...current, [value.id]: (current[value.id] ?? 0) + 1 }));
@@ -468,11 +486,11 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             }} /></div>
           </div>
           {detailOpen && <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
-            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip></div>
+            <div className="provider-detail-heading"><h3>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip>{providerAvailable && <Button appearance="secondary" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={(event) => { rememberTrigger(value.id, event.currentTarget); setProviderEditDraft(undefined); setEditing(value); }}>{t('providers.edit')}</Button>}<Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => { accountReturnFocus.current = value.id; setProviderDetail(undefined); }}>{t('providerDirectory.close')}</Button></div>
             <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(value, action)} routeActionDisabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[value.id] ?? 0} />
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
-            {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
+            <ProviderAccountStatus account={value} credential />
             <Disclosure title={currentHealth ? `${t('providers.recentAvailability')} · ${t(manualHealthLabel(currentHealth))}` : t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(quotaReads.progress?.busy)} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
@@ -499,7 +517,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     {rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
       returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
       void onChanged().catch(() => setMessage(upstreamRotationCopy(locale).reloadFailed));
-    }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); } }}>
+    }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale, reauthorizing.driver).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } if (!open && editing) { void leaveProviderSettings(() => { setEditing(undefined); setProviderWorkspaceOpen(false); }); return; } setProviderWorkspaceOpen(open); if (open) setProviderDetail(undefined); if (!open) { setEditing(undefined); setRotating(undefined); } }}>
       {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && <div className="notice error" role="alert">{error}</div>}
       {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
@@ -520,7 +538,6 @@ type NativeAuthorizationSession = { login_url?: string; verification_url?: strin
 
 function AuthorizationConnection({ token, tenant, providers, existing, active = true, onChanged, onConnectionChanged = onChanged, onAccountSaved, onEditingChange }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; active?: boolean; onChanged: (account?: UpstreamAccount) => Promise<void>; onConnectionChanged?: () => Promise<void>; onAccountSaved?: (account: UpstreamAccount) => void; onEditingChange?: (editing: boolean) => void }) {
   const { locale, t } = useI18n();
-  const journeyCopy = authorizationJourneyCopy(locale);
   const [connectionEditing, setConnectionEditing] = useState(false);
   useEffect(() => { onEditingChange?.(connectionEditing); }, [connectionEditing, onEditingChange]);
   const oauthProviders = providers.filter((provider) => provider.oauth_adapter);
@@ -530,6 +547,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
   const [nativeLocked, setNativeLocked] = useState(false);
   useEffect(() => { setNativeLocked(false); }, [token, tenant]);
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
+  const journeyCopy = authorizationJourneyCopy(locale, selectedProvider?.id);
   const isClaude = selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce';
   const [name, setName] = useState(existing?.name ?? initialProvider?.display_name ?? '');
   const [session, setSession] = useState<NativeAuthorizationSession>();
@@ -718,6 +736,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
     return () => window.clearTimeout(timer);
   }, [active, isClaude, session, claudePending, polling, pollStopped, nextPollAt]);
   return <div className="authorization-form"><p className="muted">{existing ? t('providers.oauthSecurity') : journeyCopy.setup}</p>
+    {journeyCopy.identityHelp && (existing || isKimi) && <p>{journeyCopy.identityHelp}</p>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {existing && <>
       <p>{journeyCopy.network}</p>
@@ -728,7 +747,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, active = 
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <ModelPicker label={t('providers.provider')} disabled={Boolean(existing) || authorizing || polling || listLoading || Boolean(session) || nativeLocked} value={providerChoice} onChange={(next) => { setProviderChoice(next); setName(oauthProviders.find(value => value.id === next)?.display_name ?? ''); reset(); }} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={oauthProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
     {selectedProvider?.oauth_adapter?.flow_kind === 'authorization_code_pkce' ? <AuthorizationCodeConnection key={`${token}\0${tenant}\0${selectedProvider.id}`} token={token} tenant={tenant} provider={selectedProvider} existing={existing} connectionEditing={connectionEditing} onChanged={onChanged} onLock={setNativeLocked} /> : <>
-    <label>{t('providers.name')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || polling || listLoading || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
+    <label>{t('providers.connectionName')} · {t('connection.required')}<Input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || polling || listLoading || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
     {proxyMode !== 'none' && !existing && !session && <section className="upstream-connection">
       <h3>{t('connection.title')}</h3>
       {!existing && <Checkbox checked={useProxy} disabled={authorizing} label={t('connection.useAccountProxy')} onChange={(_, data) => { setUseProxy(data.checked === true); setProxyUrl(''); }} />}
@@ -2036,7 +2055,10 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
       const now = Date.now();
       const [availability, windowResult] = await Promise.all([
         api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
-          .then((availabilitySnapshot) => ({ availabilitySnapshot, availabilityError: undefined }))
+          .then((availabilitySnapshot) => {
+            if (!availabilitySnapshot || !Array.isArray(availabilitySnapshot.top_upstream_models)) throw new Error(t('providers.availabilityUnavailable'));
+            return { availabilitySnapshot, availabilityError: undefined };
+          })
           .catch((reason) => ({ availabilitySnapshot: undefined, availabilityError: messageOf(reason, t('providers.availabilityUnavailable')) })),
         tenant ? api<UpstreamAvailabilityWindow>(upstreamAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
           .then((availabilityWindow) => ({ availabilityWindow, windowError: undefined }))

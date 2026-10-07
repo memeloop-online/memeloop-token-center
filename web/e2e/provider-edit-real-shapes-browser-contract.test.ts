@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -22,14 +23,14 @@ test('real Codex config shapes localize transport controls and preserve advanced
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
     for (const shape of ['csil', 'lindongwu', 'retry-only']) {
       await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&provider-shape=${shape}`);
-      await page.getByRole('button', { name: '编辑', exact: true }).click();
+      await editProviderAccount(page);
       const workspace = page.locator('.provider-edit-workspace');
       const original = providerEditShape(shape)!.config;
       if (shape === 'retry-only') {
         await workspace.locator('.rjsf > button[type="submit"]').click();
         assert.deepEqual((await page.evaluate(() => window.formJourneyLastProviderWrite))?.config,
           { base_url: 'https://chatgpt.com/backend-api/codex', ...original }, 'opening and saving without edits does not materialize defaults');
-        await page.getByRole('button', { name: '编辑', exact: true }).click();
+        await editProviderAccount(page);
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
@@ -88,7 +89,7 @@ test('real Codex config shapes localize transport controls and preserve advanced
         config: { base_url: 'https://chatgpt.com/backend-api/codex', ...original,
           reservation_token_bounds: { ...original.reservation_token_bounds, [model]: 72000 } },
       }, 'only the edited reservation changes; absent fields, zero queue capacity and policy enum values are retained');
-      await page.getByRole('button', { name: '编辑', exact: true }).click();
+      await editProviderAccount(page);
       await advanced.click();
       assert.equal(await bound.inputValue(), '72000');
       assert.equal(await workspace.getByRole('textbox', { name: 'gpt-6-astra', exact: true }).inputValue(), '64000');
