@@ -5,6 +5,7 @@ import test from 'node:test';
 import { formatMetricNumber } from '../src/format.js';
 import { translationCatalogs } from '../src/i18n.js';
 import { tenantDisplayName } from '../src/tenantDisplayName.js';
+import { formJourneyCopy } from '../src/operator/formJourneyCopy.js';
 
 test('Chinese and English translation catalogs expose the same keys', () => {
   const chineseKeys = Object.keys(translationCatalogs['zh-CN']).sort();
@@ -50,6 +51,25 @@ test('operator guidance gives user actions instead of development reports and ke
   for (const key of ['quota.resetDiscoveryPending', 'quota.resetDiscoveryFailed', 'quota.resetNotIntegrated', 'settings.noEnabledRouteHint', 'settings.filterAssistantRouteHint'] as const) {
     for (const catalog of [chinese, english]) assert.doesNotMatch(catalog[key], /重置能力|展开此处|尚未接入|提供商声明|上游探测|not yet integrated|provider declaration|this control never probes/i);
   }
+});
+
+test('provider settings explain user choices through shared bilingual guidance', async () => {
+  const template = await readFile(new URL('../src/operator/UpstreamFormTemplates.tsx', import.meta.url), 'utf8');
+  for (const key of ['timeouts', 'timeoutsHint', 'advancedConnection', 'advancedConnectionHint']) assert.ok(template.includes(`copy.${key}`));
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const catalog = translationCatalogs[locale];
+    const copy = formJourneyCopy(locale);
+    assert.doesNotMatch([copy.advancedConnectionHint, copy.timeoutsHint, catalog['connection.capabilitiesHint'], catalog['quota.readUnsupported']].join('\n'), /现有字段完整保留|校验失败会自动展开|尚无可用的额度读取能力|Existing fields are preserved|validation errors reveal|not yet available/i);
+    assert.doesNotMatch(catalog['connection.capabilitiesSection'], /契约|contracts/i);
+  }
+  assert.equal(translationCatalogs['zh-CN']['routes.catalogReady'], '选择或输入要使用的模型。');
+  assert.equal(translationCatalogs.en['routes.catalogReady'], 'Select or enter the model to use.');
+  assert.match(formJourneyCopy('zh-CN').advancedConnectionHint, /不确定时保持原值/);
+  assert.match(formJourneyCopy('en').advancedConnectionHint, /Keep the current values if unsure/);
+  assert.match(translationCatalogs['zh-CN']['connection.capabilitiesHint'], /收起后会保留已填写内容/);
+  assert.match(translationCatalogs.en['connection.capabilitiesHint'], /Collapsing keeps your entered values/);
+  assert.match(translationCatalogs['zh-CN']['quota.readUnsupported'], /前往模型服务提供方查看/);
+  assert.match(translationCatalogs.en['quota.readUnsupported'], /Check it with the model service provider/);
 });
 
 test('tenant copy stays action-focused and its active locale keys are not orphaned', async () => {

@@ -31,7 +31,7 @@ test('real Codex config shapes localize transport controls and preserve advanced
           { base_url: 'https://chatgpt.com/backend-api/codex', ...original }, 'opening and saving without edits does not materialize defaults');
         await page.getByRole('button', { name: '编辑', exact: true }).click();
       }
-      const advanced = workspace.getByRole('button', { name: '高级配置与模型预留', exact: true });
+      const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
       const proxy = workspace.getByRole('button', { name: '配置网络代理', exact: true });
       await workspace.locator('.provider-proxy-value input').waitFor();
