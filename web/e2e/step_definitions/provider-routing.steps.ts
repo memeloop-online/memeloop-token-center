@@ -304,7 +304,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   }
   await page.keyboard.press('Escape');
   await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
-  await onboarding.getByLabel('上游名称').fill('codex-primary');
+  await onboarding.getByLabel('连接名称').fill('codex-primary');
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), true, 'Codex supports the server default egress');
   await onboarding.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
   assert.equal(await onboarding.getByRole('button', { name: '开始登录', exact: true }).isDisabled(), true, 'the selected proxy waits for a valid address');
