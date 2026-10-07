@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { mkdir } from 'node:fs/promises';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
@@ -153,6 +154,8 @@ async function assertWorkspaceFocus(page: Page) {
 
 test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissions and bounded exit', { timeout: 120_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
+  const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability/proxy-groups/', import.meta.url));
+  await mkdir(artifacts, { recursive: true });
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
@@ -208,6 +211,13 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await workspace.count(), 1);
       assert.equal(await workspace.getByLabel('账号', { exact: true }).inputValue(), 'account-native');
       assert.equal(await workspace.getByLabel('账号', { exact: true }).locator('option:checked').textContent(), '研发订阅');
+      for (const width of [1440, 390]) {
+        await page.setViewportSize({ width, height: 1000 });
+        const bounds = await page.getByRole('dialog').boundingBox();
+        assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);
+        await page.screenshot({ path: `${artifacts}/account-group-zh-${width}.png`, fullPage: true });
+      }
+      await page.setViewportSize({ width: 1440, height: 1000 });
       await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
       await page.waitForFunction(() => document.activeElement?.textContent === '选择代理组');
       assert.equal(await detailAction.evaluate(button => document.activeElement === button), true);
@@ -241,6 +251,10 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await workspace.getByRole('button', { name: 'Create proxy group', exact: true }).click();
       assert.equal(await workspace.getByLabel('Proxy group name', { exact: false }).count(), 1);
       assert.equal(await workspace.getByLabel('Private proxy address (required)', { exact: true }).getAttribute('type'), 'password');
+      await page.setViewportSize({ width: 390, height: 1000 });
+      const bounds = await page.getByRole('dialog').boundingBox();
+      assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391);
+      await page.screenshot({ path: `${artifacts}/create-group-en-390.png`, fullPage: true });
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
       await page.close();
     });

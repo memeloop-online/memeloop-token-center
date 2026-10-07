@@ -27,6 +27,10 @@ test('proxy group copy explains choices and uncertain saves without permission-s
   const english = transportProxyGroupCopy('en');
   assert.equal(chinese.manage, '管理代理组');
   assert.equal(english.manage, 'Manage proxy groups');
+  assert.equal(chinese.candidate(1), '网络出口 1');
+  assert.equal(english.candidate(1), 'Network exit 1');
+  assert.equal(english.groupSummary('Research', 1, 1), 'Research · 1 exit · 1 account');
+  assert.equal(english.groupSummary('Research', 2, 0), 'Research · 2 exits · 0 accounts');
   assert.match(chinese.purpose, /优先沿用当前出口/);
   assert.match(english.purpose, /current exit stays selected/);
   assert.match(chinese.closePending, /关闭不会取消保存/);
