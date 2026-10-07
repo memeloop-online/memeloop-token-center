@@ -1,4 +1,5 @@
 import { ApiError, api } from '../api.js';
+import { transportProxyGroupCopy } from './transportProxyGroupCopy.js';
 
 export interface TransportProxyMember {
   id: string;
@@ -70,20 +71,20 @@ export async function transportProxyRequest<Result>(path: string, token: string,
   }
 }
 
-export function transportProxyError(reason: unknown): string {
-  if (transportProxyFailureKind(reason) === 'unknown') return '等待已结束，写入结果未知；这不表示服务端已取消。请先刷新读回配置，核对后再决定是否重试，系统不会自动重放写入。';
-  if (!(reason instanceof ApiError)) return '请求未完成，请刷新配置。';
+export function transportProxyError(reason: unknown, locale = 'zh-CN', operation: 'read' | 'write' = 'write'): string {
+  const copy = transportProxyGroupCopy(locale).errors;
+  if (transportProxyFailureKind(reason) === 'unknown') return operation === 'read' ? copy.load : copy.unknown;
+  if (!(reason instanceof ApiError)) return operation === 'read' ? copy.load : copy.unknown;
   switch (reason.code) {
-    case 'proxy_group_version_conflict': return '代理组已被其他操作更新。请刷新配置并重新确认，未覆盖他人的修改。';
-    case 'proxy_group_binding_conflict': return '账号绑定或凭证版本已变化。请刷新配置并重新选择，未覆盖他人的修改。';
-    case 'proxy_group_in_use': return '代理组仍有账号绑定，不能整体删除；请先为这些账号更换组或解绑。';
-    case 'proxy_group_capacity_exceeded': return '代理组或绑定数量已达到配置容量上限，请联系管理员整理配置。';
-    case 'invalid_request': return '配置无效。请检查名称、出口数量、私网 socks5h 地址和替代出口；新出口作为替代项前需先保存。';
-    case 'service_overloaded': return '服务暂时无法写入，尚未确认保存成功。请稍后刷新再操作。';
+    case 'proxy_group_version_conflict': return copy.groupConflict;
+    case 'proxy_group_binding_conflict': return copy.bindingConflict;
+    case 'proxy_group_in_use': return copy.inUse;
+    case 'proxy_group_capacity_exceeded': return copy.capacity;
+    case 'invalid_request': return copy.invalid;
   }
-  if (reason.status === 401 || reason.status === 403) return '当前服务凭据未通过权限校验，管理代理组需要全局提供商管理权限。请联系管理员检查凭据是否有效及其权限范围。';
-  if (reason.status === 400 || reason.status === 422) return '配置校验失败，草稿已保留。请修正输入后重新保存。';
-  if (reason.status === 404) return '当前租户下的账号或代理组已不存在，请刷新配置。';
-  if (reason.status === 409) return '配置发生冲突，请刷新并重新确认后提交。';
-  return '请求未完成，结果尚未确认。请刷新配置后再操作。';
+  if (reason.status === 401 || reason.status === 403) return copy.denied;
+  if (reason.status === 400 || reason.status === 422) return copy.validation;
+  if (reason.status === 404) return copy.missing;
+  if (reason.status === 409) return copy.conflict;
+  return operation === 'read' ? copy.load : copy.unknown;
 }

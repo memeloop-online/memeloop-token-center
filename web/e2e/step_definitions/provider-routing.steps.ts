@@ -186,8 +186,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(proxyAccessResponse.status(), 200);
   assert.equal(new URL(proxyAccessResponse.url()).search, '');
   assert.deepEqual(await proxyAccessResponse.json(), { can_manage: false });
-  await assertVisible(page.getByText('当前服务凭据没有管理代理组的权限。', { exact: true }));
-  assert.equal(await page.getByRole('button', { name: '代理组与账号绑定', exact: true }).isEnabled(), false);
+  await assertVisible(page.getByText('你没有管理代理组的权限，请联系管理员开通。', { exact: true }));
+  assert.equal(await page.getByRole('button', { name: '管理代理组', exact: true }).isEnabled(), false);
   assert.deepEqual(groupListRequests, []);
   const onboarding = page.locator('.create-journey');
   await onboarding.locator('[data-workspace-toggle]').click();

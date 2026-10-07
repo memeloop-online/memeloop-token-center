@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
 import { transportProxyError, transportProxyFailureKind, transportProxyRequest } from '../src/operator/transportProxyGroups.js';
+import { transportProxyGroupCopy } from '../src/operator/transportProxyGroupCopy.js';
 
 test('transport proxy failures distinguish editable validation, CAS, denied and uncertain outcomes without exposing response secrets', () => {
   const secret = 'socks5h://privateProxySecret@10.0.0.1:1080';
@@ -12,13 +13,36 @@ test('transport proxy failures distinguish editable validation, CAS, denied and 
   ] as const) {
     const reason = new ApiError(secret, status, code);
     assert.equal(transportProxyFailureKind(reason), expected);
-    assert.ok(!transportProxyError(reason).includes(secret));
+    for (const locale of ['zh-CN', 'en']) assert.ok(!transportProxyError(reason, locale).includes(secret));
   }
   assert.equal(transportProxyFailureKind(new TypeError(secret)), 'unknown');
-  assert.match(transportProxyError(new TypeError(secret)), /不表示服务端已取消/);
+  assert.match(transportProxyError(new TypeError(secret)), /关闭页面也不会取消保存/);
   const denied = transportProxyError(new ApiError(secret, 403, 'forbidden'));
-  assert.match(denied, /需要全局提供商管理权限/);
+  assert.match(denied, /请联系管理员检查访问权限/);
   assert.doesNotMatch(denied, /providers:write|当前租户的全局操作员|privateProxySecret/);
+});
+
+test('proxy group copy explains choices and uncertain saves without permission-success or delivery reports', () => {
+  const chinese = transportProxyGroupCopy('zh-CN');
+  const english = transportProxyGroupCopy('en');
+  assert.equal(chinese.manage, '管理代理组');
+  assert.equal(english.manage, 'Manage proxy groups');
+  assert.equal(chinese.candidate(1), '网络出口 1');
+  assert.equal(english.candidate(1), 'Network exit 1');
+  assert.equal(english.groupSummary('Research', 1, 1), 'Research · 1 exit · 1 account');
+  assert.equal(english.groupSummary('Research', 2, 0), 'Research · 2 exits · 0 accounts');
+  assert.match(chinese.purpose, /优先沿用当前出口/);
+  assert.match(english.purpose, /current exit stays selected/);
+  assert.match(chinese.closePending, /关闭不会取消保存/);
+  assert.match(english.closePending, /Closing does not cancel the save/);
+  for (const copy of [chinese, english]) {
+    assert.doesNotMatch(JSON.stringify(copy), /已具备代理组管理权限|全局提供商管理权限|异步读回|自动重放|验收矩阵|本轮|待交付|worklog/i);
+  }
+  const failure = new TypeError('privateProxySecret');
+  assert.equal(transportProxyError(failure, 'zh-CN', 'read'), '无法加载代理配置，请重试。');
+  assert.equal(transportProxyError(failure, 'en', 'read'), 'Proxy settings could not be loaded. Try again.');
+  assert.match(transportProxyError(failure, 'en'), /check whether your changes were saved before retrying/);
+  assert.doesNotMatch(JSON.stringify(english), /[\u3400-\u9fff]/);
 });
 
 test('stopping client wait rejects even when fetch ignores abort; late response does not turn the result into success', async () => {
