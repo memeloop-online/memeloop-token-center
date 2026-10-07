@@ -215,7 +215,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
         await page.setViewportSize({ width, height: 1000 });
         const bounds = await page.getByRole('dialog').boundingBox();
         assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);
-        await page.screenshot({ path: `${artifacts}/account-group-zh-${width}.png`, fullPage: true });
+        await page.screenshot({ path: `${artifacts}/account-group-zh-${width}.png`, fullPage: true, animations: 'disabled' });
       }
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
@@ -254,7 +254,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.setViewportSize({ width: 390, height: 1000 });
       const bounds = await page.getByRole('dialog').boundingBox();
       assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391);
-      await page.screenshot({ path: `${artifacts}/create-group-en-390.png`, fullPage: true });
+      await page.screenshot({ path: `${artifacts}/create-group-en-390.png`, fullPage: true, animations: 'disabled' });
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
       await page.close();
     });
