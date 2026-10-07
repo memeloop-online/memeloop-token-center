@@ -301,6 +301,28 @@ test('kernel-enforced block/inode limits and isolated restore receipts fail clos
     assert.equal(execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-c', "SELECT count(*) FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname='public' AND relation.relkind='r'"]).toString().trim(), '254');
     assert.equal(run(candidate, command, { PGOPTIONS: exportOptions }).toString().trim(), 'export_reader|on|f|-1');
   });
+  await context.test('reviewed zstd export is smaller and restores all synthetic rows without changing source or writer bounds', () => {
+    const candidate = fixture();
+    initializeSource(candidate);
+    shell(candidate, 'date +%s > /tmp/source-space.lease');
+    run(candidate, stageCommand(), { BACKUP_COMPRESSION: 'zstd:1', BACKUP_RATE_MIB_PER_SECOND: '4', PGOPTIONS: exportOptions });
+    const compressed = shell(candidate, `cat ${archiveDirectory}/${archiveName}`);
+    assert.ok(compressed.length > 0 && compressed.length < archive.length, 'Compression must reduce the actual synthetic custom archive, not just change a flag');
+    shell(candidate, `cd ${archiveDirectory}; test -f LOCAL_ARCHIVE_CREATED; sha256sum -c ${archiveName}.sha256; pg_restore --list ${archiveName} >/dev/null`);
+    execute(candidate, ['createdb', '-h', '/scratch/socket', '-U', 'postgres', 'restored']);
+    execute(candidate, ['pg_restore', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '--no-owner', '--no-privileges', '--exit-on-error', `${archiveDirectory}/${archiveName}`]);
+    assert.equal(execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-c', 'SELECT count(*), sum(octet_length(body)) FROM payload']).toString().trim(), '8192|8388608');
+    assert.equal(execute(candidate, ['psql', '-h', '/scratch/socket', '-U', 'postgres', '-d', 'restored', '-Atq', '-c', "SELECT count(*) FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace WHERE namespace.nspname='public' AND relation.relkind='r'"]).toString().trim(), '254');
+    shell(candidate, 'pg_ctl -D /scratch/source status');
+    context.diagnostic(`Actual custom archive compression: plain_bytes=${archive.length}, zstd_bytes=${compressed.length}; not a production ratio or duration guarantee`);
+  });
+  await context.test('unsupported compression fails before starting a producer or touching archive files', () => {
+    const candidate = fixture();
+    for (const compression of ['zstd:99', 'gzip:9', 'zstd:1;touch /tmp/injected-compression', '--file=/tmp/override']) {
+      assert.throws(() => run(candidate, stageCommand(), { BACKUP_COMPRESSION: compression, PGOPTIONS: exportOptions }));
+      shell(candidate, `test ! -e /tmp/injected-compression; test ! -e /tmp/dump.pipe; test ! -e ${archiveDirectory}; test ! -e /scratch/source`);
+    }
+  });
   await context.test('actual prepared writer retains default pacing and bounds both reviewed faster rates', () => {
     const candidate = fixture();
     const payload = Buffer.alloc(16 * mib, 0x42);
