@@ -12,7 +12,7 @@ export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 3
   const oldGiB = targetGiB === 32 ? 28 : targetGiB === 40 ? 32 : 40;
   const age = now - Date.parse(snapshot.observedAt);
   assert.ok(Number.isFinite(age) && age >= 0 && age <= 90_000, 'Expansion inventory must be fresh');
-  const { claim, persistent, volume, storageClass, node, replicas, consumers, filesystem, settings } = snapshot;
+  const { claim, persistent, volume, engine, storageClass, node, replicas, consumers, filesystem, settings } = snapshot;
   for (const [resource, uid] of [[claim, stageIdentity.claimUID], [persistent, stageIdentity.persistentUID], [volume, stageIdentity.longhornUID]]) {
     assert.equal(resource.metadata.uid, uid);
     assert.equal(resource.metadata.name, stageIdentity.name);
@@ -39,9 +39,39 @@ export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 3
   assert.equal(volume.metadata.namespace, 'longhorn-system');
   assert.equal(volume.spec.numberOfReplicas, 1);
   assert.equal(volume.spec.dataLocality, 'strict-local');
-  assert.equal(volume.spec.snapshotMaxCount, 2);
+  assert.ok(Number.isSafeInteger(volume.spec.snapshotMaxCount) && volume.spec.snapshotMaxCount >= 2 && volume.spec.snapshotMaxCount <= 250);
   assert.equal(volume.spec.snapshotMaxSize, String(2 * oldGiB * gib));
   assert.equal(volume.status.state, 'detached');
+  assert.equal(engine.metadata.namespace, 'longhorn-system');
+  assert.match(engine.metadata.uid, /^[a-f0-9-]{36}$/);
+  assert.match(engine.metadata.resourceVersion, /^[0-9]+$/);
+  assert.ok(!engine.metadata.deletionTimestamp);
+  assert.ok(engine.metadata.ownerReferences.some((owner: any) => owner.kind === 'Volume' && owner.name === stageIdentity.name && owner.uid === stageIdentity.longhornUID));
+  assert.equal(engine.spec.volumeName, stageIdentity.name);
+  assert.equal(engine.spec.volumeSize, volume.spec.size);
+  assert.equal(engine.status.currentState, 'stopped');
+  assert.equal(engine.status.currentSize, volume.spec.size);
+  assert.equal(engine.status.snapshotsError, '');
+  const snapshots = engine.status.snapshots;
+  assert.ok(snapshots && typeof snapshots === 'object' && !Array.isArray(snapshots));
+  assert.ok(Object.hasOwn(snapshots, 'volume-head'));
+  const entries = Object.entries(snapshots) as [string, any][];
+  assert.ok(entries.length < 250, 'Expansion needs a system snapshot below the engine total-count ceiling');
+  let snapshotBytesIncludingHead = 0;
+  for (const [name, entry] of entries) {
+    assert.equal(entry.name, name);
+    assert.equal(typeof entry.removed, 'boolean');
+    assert.match(entry.size, /^(0|[1-9][0-9]*)$/);
+    const bytes = Number(entry.size);
+    assert.ok(Number.isSafeInteger(bytes));
+    snapshotBytesIncludingHead += bytes;
+    assert.ok(Number.isSafeInteger(snapshotBytesIncludingHead));
+  }
+  assert.equal(snapshots['volume-head'].removed, false);
+  assert.ok(snapshotBytesIncludingHead <= Number(volume.spec.snapshotMaxSize), 'Existing snapshots and head must fit the unchanged snapshot byte ceiling');
+  const snapshotCount = entries.length - 1;
+  assert.ok(snapshotCount <= volume.spec.snapshotMaxCount, 'Unexpected over-limit inventory needs review, not automatic limit growth');
+  const requiredSnapshotMaxCount = Math.max(volume.spec.snapshotMaxCount, snapshotCount + 1);
   assert.equal(replicas.length, 1);
   assert.ok(!replicas[0].metadata.deletionTimestamp);
   assert.equal(replicas[0].spec.volumeName, stageIdentity.name);
@@ -90,17 +120,34 @@ export function planStageExpansion(snapshot: any, now = Date.now(), targetGiB: 3
       { op: 'replace', path, value: after },
     ];
   };
+  const snapshotPatches = requiredSnapshotMaxCount === volume.spec.snapshotMaxCount ? [] : [{
+    resource: 'volumes.longhorn.io', namespace: 'longhorn-system', name: stageIdentity.name,
+    patch: [
+      ...patch(volume, '/spec/snapshotMaxCount', volume.spec.snapshotMaxCount, requiredSnapshotMaxCount).slice(0, -1),
+      { op: 'test', path: '/spec/size', value: volume.spec.size },
+      { op: 'test', path: '/spec/snapshotMaxSize', value: volume.spec.snapshotMaxSize },
+      { op: 'replace', path: '/spec/snapshotMaxCount', value: requiredSnapshotMaxCount },
+    ],
+  }];
   return {
     schema: 1, executionAuthorized: false, oldGiB, targetGiB,
     claimUID: stageIdentity.claimUID, persistentUID: stageIdentity.persistentUID, longhornUID: stageIdentity.longhornUID,
     filesystemUUID: stageIdentity.filesystemUUID, device: stageIdentity.device, node: stageIdentity.node, diskUUID: stageIdentity.diskUUID,
     physicalBudgetBytes: budget, backingReserveFloorBytes: floor, backingAfterWorstCaseBytes: remaining,
+    expansionSnapshot: {
+      engineName: engine.metadata.name, engineUID: engine.metadata.uid, engineResourceVersion: engine.metadata.resourceVersion,
+      existingCountIncludingRemoved: snapshotCount, snapshotBytesIncludingHead,
+      beforeMaxCount: volume.spec.snapshotMaxCount, requiredMaxCount: requiredSnapshotMaxCount,
+      unchangedSnapshotMaxBytes: Number(volume.spec.snapshotMaxSize),
+      precondition: 'Re-read the same stopped engine UID/resourceVersion and detached volume immediately before ordered patches; changed inventory requires a fresh plan. Reserve one system snapshot without deleting snapshots or changing the byte limit.',
+    },
     patches: [
+      ...snapshotPatches,
       { resource: 'storageclass', name: stageExpansionClass, patch: patch(storageClass, '/allowVolumeExpansion', false, true) },
       { resource: 'pvc', namespace: stageIdentity.namespace, name: stageIdentity.name, patch: patch(claim, '/spec/resources/requests/storage', `${oldGiB}Gi`, `${targetGiB}Gi`) },
     ],
     closeout: `Read fresh identities and resourceVersions, require CSI-controlled PV/Longhorn/filesystem growth to${targetGiB}Gi with same UUID and all partials retained; restore dedicated StorageClass allowVolumeExpansion=false using fresh UID/resourceVersion preconditions. No manual PV size patch, format, shrink, primary mount, source SQL or export.`,
-    rollback: 'Before PVC request changes, the sole reversible capability change is disabling expansion with fresh identity/version. After PVC request changes do not shrink or restore old capacity assertions; preserve data, stop and investigate reconciliation. No automatic retry.',
+    rollback: 'Before PVC request changes, disable expansion with fresh identity/version; a newly reserved snapshot slot remains bounded by the unchanged byte ceiling. Never lower the count below actual usage. After PVC request changes do not shrink or restore old capacity assertions; preserve data, stop and investigate reconciliation. No automatic retry.',
     sourceProtectionChanged: false, partialDeletionAuthorized: false, restoreAllocationAuthorized: false,
   };
 }
