@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { editProviderAccount } from './support/provider-account-navigation.js';
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
 import test from 'node:test';
@@ -222,7 +223,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.waitForFunction(() => document.activeElement?.textContent === '选择代理组');
       assert.equal(await detailAction.evaluate(button => document.activeElement === button), true);
       assert.equal(await page.locator('.provider-detail-workspace').isVisible(), true);
-      await row.getByRole('button', { name: '编辑', exact: true }).click();
+      await editProviderAccount(page);
       const settings = page.locator('.provider-edit-workspace');
       const name = settings.getByLabel('上游名称', { exact: false });
       await name.fill('保留账号修改');

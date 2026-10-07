@@ -2055,7 +2055,10 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
       const now = Date.now();
       const [availability, windowResult] = await Promise.all([
         api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
-          .then((availabilitySnapshot) => ({ availabilitySnapshot, availabilityError: undefined }))
+          .then((availabilitySnapshot) => {
+            if (!availabilitySnapshot || !Array.isArray(availabilitySnapshot.top_upstream_models)) throw new Error(t('providers.availabilityUnavailable'));
+            return { availabilitySnapshot, availabilityError: undefined };
+          })
           .catch((reason) => ({ availabilitySnapshot: undefined, availabilityError: messageOf(reason, t('providers.availabilityUnavailable')) })),
         tenant ? api<UpstreamAvailabilityWindow>(upstreamAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
           .then((availabilityWindow) => ({ availabilityWindow, windowError: undefined }))

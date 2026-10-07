@@ -38,6 +38,8 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     const locale = options.locale ?? 'zh-CN';
     const text = copy[locale];
     const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
     page.setDefaultTimeout(5_000);
     await page.clock.install({ time: initialTime });
     await page.addInitScript((value) => localStorage.setItem('mtc-locale', value), locale);
@@ -70,7 +72,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       return route.fulfill({ json: [] });
     });
     await page.goto(url);
-    if (options.manageOnly) return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
+    if (options.manageOnly) return { page, pageErrors, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
     if (options.reauthorize) {
       await editProviderAccount(page, 'original-kimi');
       await page.getByRole('button', { name: text.reauthorize, exact: true }).click();
@@ -78,15 +80,16 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await page.locator('.create-journey [data-workspace-toggle]').click();
       await page.getByRole('button', { name: text.method, exact: true }).click();
     }
-    return { page, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
+    return { page, pageErrors, writes, state, text, releaseStart: () => { assert.ok(releaseStart); releaseStart(); }, releaseList: () => { assert.ok(releaseList); releaseList(); } };
   }
   try {
     for (const locale of ['zh-CN', 'en'] as const) {
       const chinese = locale === 'zh-CN';
       const journey = await open({ locale, reauthorize: true, manageOnly: true, expiredAuthorization: true });
-      const { page, writes, text } = journey;
+      const { page, pageErrors, writes, text } = journey;
       const row = page.locator('.provider-directory-row');
       const manage = row.getByRole('button', { name: chinese ? '管理账号' : 'Manage account', exact: true });
+      await manage.waitFor();
       assert.equal(await manage.count(), 1);
       assert.equal(await row.getByRole('button', { name: /^(编辑|Edit|查看详情|View details)$/ }).count(), 0, 'the list has one account workspace entry');
       assert.equal(await row.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1);
@@ -113,8 +116,10 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await details.waitFor();
       assert.equal(await row.getByRole('button', { name: text.reauthorize, exact: true }).evaluate(button => document.activeElement === button), true);
       assert.equal(writes.length, 0, 'navigation never starts login or changes routes');
+      assert.deepEqual(pageErrors, [], 'unavailable non-critical statistics never crash account navigation');
       await page.close();
       const unknown = await open({ locale, reauthorize: true, manageOnly: true });
+      await unknown.page.locator('.provider-directory-row').waitFor();
       assert.equal(await unknown.page.locator('.provider-directory-row .status.ok').count(), 0);
       assert.match(await unknown.page.locator('.provider-directory-row').innerText(), chinese ? /有效期未知/ : /expiry unknown/);
       await unknown.page.close();

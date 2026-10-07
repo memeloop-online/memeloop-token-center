@@ -97,7 +97,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     assert.equal(await name.inputValue(), '保留名称草稿', 'proxy refresh preserves the independent name draft');
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
     await save.click();
-    await page.locator('.provider-list').getByText('保留名称草稿', { exact: true }).waitFor();
+    await row.getByText('保留名称草稿', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
     await page.evaluate(() => { window.deferNextFormProxyRead = true; });
     await editProviderAccount(page);
