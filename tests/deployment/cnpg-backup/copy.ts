@@ -8,7 +8,45 @@ export const archiveDirectory = '/backup/mtc-pg-logical-20261004';
 export const archiveName = 'memeloop_token_center.dump';
 export const archiveLimit = 25_769_803_776;
 export const copyChunk = 4 * 1024 * 1024;
-export type Remote = (side: 'source' | 'destination', command: string[], input?: Buffer) => Buffer;
+export type Remote = (side: 'source' | 'destination', command: string[], input?: Buffer, expectedOutputBytes?: number) => Buffer | Promise<Buffer>;
+export const sourceChunkAcknowledgement = 'IFS= read -r acknowledgement; test "$acknowledgement" = MTC_COPY_CHUNK_RECEIVED';
+
+export function readAcknowledgedChunk(start: () => ChildProcess, expectedBytes: number, timeoutMs = 1_800_000): Promise<Buffer> {
+  assert.ok(Number.isSafeInteger(expectedBytes) && expectedBytes > 0 && expectedBytes <= copyChunk);
+  return new Promise((resolve, reject) => {
+    const child = start();
+    assert.ok(child.stdin && child.stdout && child.stderr);
+    const output = Buffer.alloc(expectedBytes);
+    let received = 0;
+    let stderrBytes = 0;
+    let failure: Error | undefined;
+    const fail = (message: string, code?: string) => {
+      failure ??= Object.assign(new Error(message), { code });
+      child.kill('SIGKILL');
+    };
+    const timer = setTimeout(() => fail('Source chunk timed out before confirmed completion', 'ETIMEDOUT'), timeoutMs);
+    child.once('error', () => fail('Source chunk process could not start'));
+    child.stdin.on('error', () => fail('Source chunk acknowledgement could not be sent', 'EPIPE'));
+    child.stderr.on('data', (bytes: Buffer) => {
+      stderrBytes += bytes.length;
+      if (stderrBytes > 65_536) fail('Source chunk diagnostic output exceeded its bound', 'ENOBUFS');
+    });
+    child.stdout.on('data', (bytes: Buffer) => {
+      if (failure) return;
+      if (received + bytes.length > expectedBytes) { fail('Source chunk exceeded its expected length', 'ENOBUFS'); return; }
+      bytes.copy(output, received);
+      received += bytes.length;
+      if (received === expectedBytes) child.stdin!.end('MTC_COPY_CHUNK_RECEIVED\n');
+    });
+    child.once('close', (status, signal) => {
+      clearTimeout(timer);
+      if (failure || status !== 0 || signal !== null || received !== expectedBytes) {
+        output.fill(0);
+        reject(Object.assign(failure ?? new Error('Source chunk closed without a complete acknowledged result'), { status, signal, stdoutBytes: received, stderrBytes }));
+      } else resolve(output);
+    });
+  });
+}
 const copyStages = ['capacity', 'source_checksum', 'source_metadata', 'destination_directory', 'destination_markers', 'destination_offset', 'destination_space', 'source_chunk', 'destination_chunk', 'destination_finalize'] as const;
 const copyCheckpoints = ['lease_status', 'pod_read', 'pod_identity', 'pod_spec', 'container_identity', 'exec'] as const;
 export type CopyStep = { stage: typeof copyStages[number]; side: 'source' | 'destination'; checkpoint?: typeof copyCheckpoints[number] };
@@ -25,8 +63,8 @@ export function copyFailureReceipt(reason: unknown, step?: CopyStep) {
     code: typeof error.code === 'string' && knownCodes.includes(error.code) ? error.code : null,
     exit_code: Number.isSafeInteger(error.status) ? error.status : null,
     signal: typeof error.signal === 'string' && ['SIGTERM', 'SIGKILL', 'SIGINT'].includes(error.signal) ? error.signal : null,
-    stdout_bytes: Buffer.isBuffer(error.stdout) ? error.stdout.length : null,
-    stderr_bytes: Buffer.isBuffer(error.stderr) ? error.stderr.length : null,
+    stdout_bytes: Buffer.isBuffer(error.stdout) ? error.stdout.length : Number.isSafeInteger(error.stdoutBytes) && Number(error.stdoutBytes) >= 0 ? error.stdoutBytes : null,
+    stderr_bytes: Buffer.isBuffer(error.stderr) ? error.stderr.length : Number.isSafeInteger(error.stderrBytes) && Number(error.stderrBytes) >= 0 ? error.stderrBytes : null,
     archive_verified: false,
     automatic_retry: false,
   };
@@ -36,40 +74,40 @@ export async function copyArchive(remote: Remote, expectedSha: string, pause: (m
   assert.ok([1, 4, 8].includes(rateMiB), 'Copy rate must be 1, 4 or 8 MiB/s');
   assert.match(expectedSha, /^[0-9a-f]{64}$/);
   assert.match(directory, /^\/backup\/mtc-pg-logical-[0-9]{8}(?:-[a-z0-9]+)*$/);
-  const run = (stage: CopyStep['stage'], side: CopyStep['side'], command: string[], input?: Buffer) => {
+  const run = (stage: CopyStep['stage'], side: CopyStep['side'], command: string[], input?: Buffer, expectedOutputBytes?: number) => {
     observe({ stage, side });
-    return remote(side, command, input);
+    return remote(side, command, input, expectedOutputBytes);
   };
-  const capacityCheck = (side: 'source' | 'destination') => {
-    if (hardCapacity) run('capacity', side, ['/bin/sh', '-ec', '. /policy/capacity.sh; capacity_backup']);
+  const capacityCheck = async (side: 'source' | 'destination') => {
+    if (hardCapacity) await run('capacity', side, ['/bin/sh', '-ec', '. /policy/capacity.sh; capacity_backup']);
   };
-  capacityCheck('source');
-  capacityCheck('destination');
-  const shell = (stage: CopyStep['stage'], side: CopyStep['side'], body: string, input?: Buffer) =>
-    run(stage, side, ['/bin/sh', '-ec', `umask 077; cd ${directory}; ${body}`], input);
+  await capacityCheck('source');
+  await capacityCheck('destination');
+  const shell = (stage: CopyStep['stage'], side: CopyStep['side'], body: string, input?: Buffer, expectedOutputBytes?: number) =>
+    run(stage, side, ['/bin/sh', '-ec', `umask 077; cd ${directory}; ${body}`], input, expectedOutputBytes);
   const archive = archiveName;
-  shell('source_checksum', 'source', `test -f LOCAL_ARCHIVE_CREATED; printf '%s  ${archive}\n' '${expectedSha}' | sha256sum -c - >/dev/null`);
-  const size = Number(shell('source_metadata', 'source', `stat -c %s ${archive}`).toString().trim());
+  await shell('source_checksum', 'source', `test -f LOCAL_ARCHIVE_CREATED; printf '%s  ${archive}\n' '${expectedSha}' | sha256sum -c - >/dev/null`);
+  const size = Number((await shell('source_metadata', 'source', `stat -c %s ${archive}`)).toString().trim());
   assert.ok(Number.isSafeInteger(size) && size > 0 && size <= archiveLimit, 'Source size exceeds bounded archive contract');
-  run('destination_directory', 'destination', ['/bin/sh', '-ec', `umask 077; mkdir -p ${directory}`]);
-  if (hardCapacity) shell('destination_markers', 'destination', 'test ! -e LOCAL_ARCHIVE_CREATED; test ! -e OFFHOST_COPY_VERIFIED');
-  const offset = Number(shell('destination_offset', 'destination', `test ! -e ${archive}; if test -e ${archive}.partial; then stat -c %s ${archive}.partial; else printf 0; fi`).toString().trim());
+  await run('destination_directory', 'destination', ['/bin/sh', '-ec', `umask 077; mkdir -p ${directory}`]);
+  if (hardCapacity) await shell('destination_markers', 'destination', 'test ! -e LOCAL_ARCHIVE_CREATED; test ! -e OFFHOST_COPY_VERIFIED');
+  const offset = Number((await shell('destination_offset', 'destination', `test ! -e ${archive}; if test -e ${archive}.partial; then stat -c %s ${archive}.partial; else printf 0; fi`)).toString().trim());
   assert.ok(Number.isSafeInteger(offset) && offset >= 0 && offset <= size, 'Invalid resume offset');
   for (let position = Math.floor(offset / copyChunk) * copyChunk; position < size; position += copyChunk) {
-    capacityCheck('source');
-    capacityCheck('destination');
-    const availableKiB = Number(shell('destination_space', 'destination', "timeout 5 df -Pk . | awk 'NR == 2 { print $4 }'").toString().trim());
+    await capacityCheck('source');
+    await capacityCheck('destination');
+    const availableKiB = Number((await shell('destination_space', 'destination', "timeout 5 df -Pk . | awk 'NR == 2 { print $4 }'")).toString().trim());
     const reserveKiB = hardCapacity ? 266_240 : 33_558_528;
     assert.ok(Number.isFinite(availableKiB) && availableKiB >= reserveKiB, 'Destination must retain its reviewed reserve plus one chunk; preserve partial');
-    const chunk = shell('source_chunk', 'source', `dd if=${archive} bs=4194304 skip=${position / copyChunk} count=1 iflag=fullblock status=none`);
+    const chunk = await shell('source_chunk', 'source', `dd if=${archive} bs=4194304 skip=${position / copyChunk} count=1 iflag=fullblock status=none`, undefined, Math.min(copyChunk, size - position));
     assert.equal(chunk.length, Math.min(copyChunk, size - position), 'Short source read');
-    shell('destination_chunk', 'destination', `prlimit --core=0:0 --fsize=25769803776:25769803776 -- dd of=${archive}.partial bs=4194304 seek=${position / copyChunk} count=1 iflag=fullblock conv=notrunc,fsync status=none`, chunk);
+    await shell('destination_chunk', 'destination', `prlimit --core=0:0 --fsize=25769803776:25769803776 -- dd of=${archive}.partial bs=4194304 seek=${position / copyChunk} count=1 iflag=fullblock conv=notrunc,fsync status=none`, chunk);
     await pause(chunk.length / 1024 / 1024 / rateMiB * 1000);
   }
-  capacityCheck('destination');
+  await capacityCheck('destination');
   const markerTrap = hardCapacity ? `trap 'marker_status=$?; if test "$marker_status" -ne 0; then rm -f LOCAL_ARCHIVE_CREATED OFFHOST_COPY_VERIFIED; fi; exit "$marker_status"' EXIT; ` : '';
   const receiptGuard = hardCapacity ? '. /policy/capacity.sh; capacity_backup; ' : '';
-  shell('destination_finalize', 'destination', `${markerTrap}test "$(stat -c %s ${archive}.partial)" -eq ${size}; printf '%s  ${archive}.partial\n' '${expectedSha}' | sha256sum -c - >/dev/null; prlimit --core=0:0 --fsize=16777216:16777216 -- pg_restore --list ${archive}.partial > ${archive}.list.partial; test -s ${archive}.list.partial; ${receiptGuard}mv ${archive}.partial ${archive}; mv ${archive}.list.partial ${archive}.list; printf '%s  ${archive}\n' '${expectedSha}' > ${archive}.sha256; sync -f .; ${receiptGuard}touch LOCAL_ARCHIVE_CREATED OFFHOST_COPY_VERIFIED; sync -f .; ${hardCapacity ? 'capacity_backup' : ':'}`);
+  await shell('destination_finalize', 'destination', `${markerTrap}test "$(stat -c %s ${archive}.partial)" -eq ${size}; printf '%s  ${archive}.partial\n' '${expectedSha}' | sha256sum -c - >/dev/null; prlimit --core=0:0 --fsize=16777216:16777216 -- pg_restore --list ${archive}.partial > ${archive}.list.partial; test -s ${archive}.list.partial; ${receiptGuard}mv ${archive}.partial ${archive}; mv ${archive}.list.partial ${archive}.list; printf '%s  ${archive}\n' '${expectedSha}' > ${archive}.sha256; sync -f .; ${receiptGuard}touch LOCAL_ARCHIVE_CREATED OFFHOST_COPY_VERIFIED; sync -f .; ${hardCapacity ? 'capacity_backup' : ':'}`);
 }
 
 async function main(observe: (step: CopyStep) => void): Promise<void> {
@@ -104,7 +142,7 @@ async function main(observe: (step: CopyStep) => void): Promise<void> {
     })));
     let currentStep: CopyStep | undefined;
     const checkpoint = (value: typeof copyCheckpoints[number]) => { if (currentStep) observe({ ...currentStep, checkpoint: value }); };
-    const remote: Remote = (side, command, input) => {
+    const remote: Remote = (side, command, input, expectedOutputBytes) => {
       checkpoint('lease_status');
       assert.ok(guards.every(guard => guard.exitCode === null && guard.signalCode === null && guard.connected), 'Copy lease owner stopped');
       checkpoint('pod_read');
@@ -117,6 +155,14 @@ async function main(observe: (step: CopyStep) => void): Promise<void> {
       assert.deepEqual(pod.status.containerStatuses, identities[side].status.containerStatuses);
       const expected = copyIdentities[side];
       checkpoint('exec');
+      if (expectedOutputBytes !== undefined) {
+        assert.equal(side, 'source');
+        assert.equal(input, undefined);
+        return readAcknowledgedChunk(() => spawn('kubectl', [
+          '--request-timeout=1800s', '-n', expected.namespace, 'exec', '-i', pods[side], '-c', 'copy', '--',
+          '/bin/sh', '-ec', `test "$POD_UID" = "$1"; shift; . /policy/capacity.sh; capacity_backup; "$@"; ${sourceChunkAcknowledgement}`, 'copy-fenced', pod.metadata.uid, ...command,
+        ], { stdio: ['pipe', 'pipe', 'pipe'] }), expectedOutputBytes);
+      }
       return execFileSync('kubectl', [
         '--request-timeout=1800s', '-n', expected.namespace, 'exec', ...(input ? ['-i'] : []), pods[side], '-c', 'copy', '--',
         '/bin/sh', '-ec', 'test "$POD_UID" = "$1"; shift; . /policy/capacity.sh; capacity_backup; exec "$@"', 'copy-fenced', pod.metadata.uid, ...command,
