@@ -127,36 +127,30 @@ test('invalid copy rates fail before any remote operation', async () => {
 
 test('source chunks are acknowledged only after all bytes arrive and a successful child close is still required', async () => {
   let starts = 0;
-  const start = (script: string) => { starts++; return spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'pipe'] }); };
-  const complete = await readAcknowledgedChunk(() => start(`
-    let acknowledgement = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', value => { acknowledgement += value; });
-    process.stdin.on('end', () => { process.exitCode = acknowledgement === 'MTC_COPY_CHUNK_RECEIVED\\n' ? 0 : 12; });
-    process.stdout.write(Buffer.alloc(${copyChunk}, 71));
-  `), copyChunk);
+  const start = (mode: string) => { starts++; return spawn(process.execPath, [join(directory, 'fixtures/source-chunk-child.ts'), mode], { stdio: ['pipe', 'pipe', 'pipe'] }); };
+  const complete = await readAcknowledgedChunk(() => start('complete'), copyChunk);
   assert.equal(complete.length, copyChunk);
   assert.ok(complete.every(value => value === 71));
   assert.equal(starts, 1);
-  const short = () => start("process.stdout.write(Buffer.alloc(8192, 71));");
+  const short = () => start('short');
   await assert.rejects(readAcknowledgedChunk(short, copyChunk), error => {
     const receipt = copyFailureReceipt(error);
     assert.equal(receipt.exit_code, 0);
     assert.equal(receipt.stdout_bytes, 8192);
     return true;
   });
-  await assert.rejects(readAcknowledgedChunk(() => start("process.stdout.write(Buffer.alloc(8193));"), 8192), /exceeded its expected length/);
-  await assert.rejects(readAcknowledgedChunk(() => start("process.stderr.write('private-archive-secret'); process.exitCode = 7;"), 8192), error => {
+  await assert.rejects(readAcknowledgedChunk(() => start('overflow'), 8192), /exceeded its expected length/);
+  await assert.rejects(readAcknowledgedChunk(() => start('failed'), 8192), error => {
     assert.equal(copyFailureReceipt(error).exit_code, 7);
     assert.doesNotMatch(JSON.stringify(copyFailureReceipt(error)), /private-archive-secret/);
     return true;
   });
-  await assert.rejects(readAcknowledgedChunk(() => start("process.stdin.resume(); process.stdin.on('end', () => { process.exitCode = 9; }); process.stdout.write(Buffer.alloc(8192));"), 8192), error => {
+  await assert.rejects(readAcknowledgedChunk(() => start('failed-after-data'), 8192), error => {
     assert.equal(copyFailureReceipt(error).exit_code, 9);
     assert.equal(copyFailureReceipt(error).stdout_bytes, 8192);
     return true;
   });
-  await assert.rejects(readAcknowledgedChunk(() => start("setInterval(() => {}, 1000);"), 8192, 50), /timed out/);
+  await assert.rejects(readAcknowledgedChunk(() => start('timeout'), 8192, 50), /timed out/);
   assert.equal(starts, 6);
   assert.throws(() => readAcknowledgedChunk(() => start(''), copyChunk + 1));
   assert.equal(starts, 6);
