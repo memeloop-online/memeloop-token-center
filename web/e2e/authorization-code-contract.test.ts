@@ -5,7 +5,7 @@ import { ApiError } from '../src/api.js';
 import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, parseClaudeCompletion, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
-import { providerAccountStatus } from '../src/operator/providerAccountStatus.js';
+import { providerAccountStatus } from '../src/operator/providerAccountState.js';
 
 test('account status derives expiry independently of enabled state and keeps missing expiry uncertain', () => {
   const account = { status: 'active', auth_kind: 'oauth', credential_expires_at: null } as const;
