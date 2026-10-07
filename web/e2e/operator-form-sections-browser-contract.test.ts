@@ -36,7 +36,7 @@ test('advanced validation remains discoverable without losing field values or mo
     // Optional capabilities collapse, but adapter-required and unknown plugin
     // fields are never silently hidden. Disclosure retains entered values.
     await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
-    const capabilities = page.getByRole('button', { name: /Optional capabilities/ });
+    const capabilities = page.getByRole('button', { name: 'Image, video and usage settings', exact: true });
     assert.equal(await capabilities.getAttribute('aria-expanded'), 'false');
     await capabilities.focus();
     await page.keyboard.press('Enter');

@@ -137,7 +137,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     // Keep the useful read result and omit the empty reset-action surface.
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=unsupported`);
     await view.click();
-    await page.getByText('Quota reading is not yet available for this upstream.', { exact: true }).waitFor();
+    await page.getByText('Quota for this account cannot be viewed here. Check it with the model service provider.', { exact: true }).waitFor();
     assert.equal(await page.getByRole('region', { name: 'Quota reset', exact: true }).count(), 0);
     assert.deepEqual(await page.evaluate(() => [window.quotaReads, window.quotaWrites, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0, 0]);
     // Read failures are mock-only; no reset/prepare/reconcile calls are made.
