@@ -22,12 +22,23 @@
 
 不同供应商提供的数据范围不同；客户端应以请求结果和部署展示的当前状态为准。
 
-## Codex OAuth 输出上限兼容
+## Codex 账号的生成参数
 
-Codex OAuth 路由会把文本 Chat Completions 转为 Codex Responses。原生 Codex 请求不会向该上游发送 `max_tokens`、`max_completion_tokens` 或 `max_output_tokens`，因此这些字段不能被宣称为已执行的生成硬上限。
+通过 OAuth 登录的 Codex 账号可以接收文本 Chat Completions 和 Responses 请求。MTC 会转换请求格式，但 Codex 不支持这些接口中的所有生成参数。
 
-未设置时，`transport_policy.chat_controls` 与 `transport_policy.responses_output_limits` 均使用 `provider_default`。合法的 Chat 采样字段及输出上限提示经校验后，无法由 Codex transport 表达的控制字段会被剥离，上游采用自身默认行为；不承诺执行用户指定的 temperature、top-p、penalty、seed、stop 或输出长度。已有显式 `strict` 配置继续生效：仅接受中性采样值，并拒绝任何输出上限提示。需要强制执行指定参数或硬上限的业务，应使用真正支持该能力的已授权路由。
+### 选择参数处理方式
 
-管理员可在 Codex 账号上分别显式选择两个策略。`provider_default` 模式只接受一个正整数且有界的上限提示，验证后从上游请求剥离，实际输出长度由 Codex 决定。空值、非法值、冲突字段及客户端提交的预留额度元数据均被拒绝。这是兼容提示，**不是** 16 token 或其他数值的硬限制。认证和额度准入保持不变；预留依据运营方可信的模型上界，而非客户端较小的提示；最终按观测到的上游用量结算一次，未知用量和客户端取消仍保持现有保守结算行为。
+在 Codex 账号的编辑页中，管理员可以分别设置聊天参数和输出上限的处理方式。使用配置 API 时，对应字段为 `transport_policy.chat_controls` 和 `transport_policy.responses_output_limits`。
 
-验收缺省行为或显式 `provider_default` 策略时，以获授权的合成请求验证 `/v1/responses` 的 `max_output_tokens: 16` 和 Chat 的 `max_tokens: 16`，确认上游成功、单笔预留完成结算、用量来自上游，且两个字段都未进入 Codex 上游报文。不要重放私有 WorkBuddy 请求。
+| 方式 | 请求如何处理 | 如何选择 |
+| --- | --- | --- |
+| 使用上游默认值（`provider_default`，默认） | 检查参数格式后，移除 Codex 无法执行的采样参数和输出上限提示，由 Codex 决定实际生成行为。 | 客户端会附带这些参数，但应用不要求它们必须生效时使用。 |
+| 严格检查（`strict`） | 聊天参数只接受中性值，输出上限提示会被拒绝；已有严格设置不会自动改为默认方式。 | 希望客户端明确发现不支持的参数，而不是继续使用上游默认值时使用。 |
+
+使用上游默认值**不代表** Codex 会执行指定的 `temperature`、`top_p`、惩罚参数、`seed`、`stop` 或输出长度。应用必须控制这些参数时，请选择支持相应能力且已授权的模型路由。
+
+### 输出上限与费用
+
+`max_tokens`、`max_completion_tokens` 和 `max_output_tokens` 不会发送给 Codex。默认方式允许提供一个符合范围要求的正整数提示，但**不能保证输出不超过该数值**。例如，填写 16 并不意味着只会生成 16 个词元。不要同时提交冲突的上限字段，也不要提交空值、无效值或自行指定预留额度。
+
+较小的上限提示不会降低 MTC 按运营方模型上界预留的额度。最终费用按观测到的上游用量结算；取消请求不保证停止上游生成或免除已产生的费用。用量未知时，系统不会将其当作零用量。需要严格限制输出长度或据此控制费用时，请改用支持硬性输出上限的路由，而不是依赖 Codex 的兼容提示。
