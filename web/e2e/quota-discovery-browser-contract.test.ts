@@ -38,8 +38,8 @@ test('quota reset discovery survives missing and failed reads without performing
       const reset = section.getByRole('button', { name: 'Reset upstream quota', exact: true });
       assert.equal(await reset.isEnabled(), state === 'snapshot');
       // Never click reset or issue a quota read, preparation, confirmation or reconciliation.
-      if (state === 'pending') assert.match(await section.innerText(), /has not been read/);
-      if (state === 'failed') assert.match(await section.innerText(), /could not be read/);
+      if (state === 'pending') assert.equal(await section.getByText('Select View quota to check whether this account supports resets. Viewing quota does not use a reset credit.', { exact: true }).count(), 1);
+      if (state === 'failed') assert.equal(await section.getByText('Quota could not be loaded. Check the account connection, then select View quota. No reset was performed and no reset credit was used.', { exact: true }).count(), 1);
     }
     for (const theme of ['light', 'dark']) {
       await page.setViewportSize({ width: 390, height: 844 });

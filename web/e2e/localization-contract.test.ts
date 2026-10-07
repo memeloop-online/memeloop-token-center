@@ -28,6 +28,30 @@ test('credential and empty-state copy does not infer bootstrap or candidate-envi
   }
 });
 
+test('operator guidance gives user actions instead of development reports and keeps consequential warnings', () => {
+  const chinese = translationCatalogs['zh-CN'];
+  const english = translationCatalogs.en;
+  for (const catalog of [chinese, english]) {
+    assert.doesNotMatch(Object.values(catalog).join('\n'), /本轮交付|待交付|验收矩阵|工作日志|已具备代理组管理权限|worklog|acceptance matrix/i);
+    assert.ok(catalog['providers.manualHealthNotRun'].includes(catalog['providers.runManualHealthCheck']));
+    assert.ok(catalog['settings.noEnabledRouteHint'].includes(catalog['providers.title']));
+    assert.ok(catalog['settings.noEnabledRouteHint'].includes(catalog['nav.routes']));
+  }
+  assert.match(chinese['quota.resetDiscoveryPending'], /查看额度.*不会消耗重置次数/);
+  assert.match(english['quota.resetDiscoveryPending'], /View quota.*does not use a reset credit/);
+  assert.match(chinese['quota.resetDiscoveryFailed'], /检查账号连接.*未执行重置.*未消耗重置次数/);
+  assert.match(english['quota.resetDiscoveryFailed'], /Check the account connection.*No reset was performed.*no reset credit was used/);
+  assert.match(chinese['quota.resetNotIntegrated'], /通过模型服务提供方重置额度/);
+  assert.match(english['quota.resetNotIntegrated'], /Manage its quota with the model service provider/);
+  assert.match(chinese['quota.resetOperationError'], /尚未确认.*不要重复发起/);
+  assert.match(english['quota.resetOperationError'], /not confirmed.*do not start another reset/i);
+  assert.match(chinese['managedSync.warning.catalog_not_ready'], /路由保持不变.*重新同步模型/);
+  assert.match(english['managedSync.warning.catalog_not_ready'], /Routes are unchanged.*syncing models again/);
+  for (const key of ['quota.resetDiscoveryPending', 'quota.resetDiscoveryFailed', 'quota.resetNotIntegrated', 'settings.noEnabledRouteHint', 'settings.filterAssistantRouteHint'] as const) {
+    for (const catalog of [chinese, english]) assert.doesNotMatch(catalog[key], /重置能力|展开此处|尚未接入|提供商声明|上游探测|not yet integrated|provider declaration|this control never probes/i);
+  }
+});
+
 test('tenant copy stays action-focused and its active locale keys are not orphaned', async () => {
   const operator = await readFile(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
   const manager = await readFile(new URL('../src/operator/TenantManager.tsx', import.meta.url), 'utf8');
