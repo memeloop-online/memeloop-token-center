@@ -19,7 +19,7 @@ export function prepareArtifact(output: string, provenance: { testedCommit: stri
     resource.kind === 'NetworkPolicy' && ['mtc-pg-logical-backup-isolation-20261004', 'mtc-pg-logical-export-egress-20261004'].includes(resource.metadata.name));
   assert.equal(selected.length, 4, 'Export artifact must not allocate storage or include copy/restore Jobs');
   const render = (objects: any[]) => objects.map(resource => stringify(resource)).join('---\n');
-  const expanded = (capacity: 32 | 40) => render(preparedResources(undefined, capacity).filter(resource =>
+  const expanded = (capacity: 32 | 40 | 56) => render(preparedResources(undefined, capacity).filter(resource =>
     resource.kind === 'Job' && [boundedJobs.stage, boundedJobs.source].includes(resource.metadata.name) ||
     resource.kind === 'ConfigMap' && resource.metadata.name === policyName ||
     resource.kind === 'NetworkPolicy' && ['mtc-pg-logical-backup-isolation-20261004', 'mtc-pg-logical-export-egress-20261004'].includes(resource.metadata.name)));
@@ -28,6 +28,7 @@ export function prepareArtifact(output: string, provenance: { testedCommit: stri
     'cnpg-export-preparation.yaml': render(selected),
     'cnpg-expanded-stage-preparation.yaml': expanded(32),
     'cnpg-retained-stage-preparation.yaml': expanded(40),
+    'cnpg-preserved-partials-stage-preparation.yaml': expanded(56),
   };
   for (const name of ['source-space.ts', 'source-filesystem.ts', 'volume-identity.ts', 'copy.ts', 'copy-guard.ts', 'stage-expansion.ts']) files[name] = readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
   const digest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -36,6 +37,8 @@ export function prepareArtifact(output: string, provenance: { testedCommit: stri
     expandedStageManifest: 'cnpg-expanded-stage-preparation.yaml', expansionPlanner: 'stage-expansion.ts', expansionAuthorized: false,
     retainedStageManifest: 'cnpg-retained-stage-preparation.yaml', retainedStageCapacityGiB: 40,
     retainedStageBoundary: 'Separate32-to40Gi stage-only expansion review and actual CSI growth required; preserve all failed partials. Source PG,28Gi offhost archive,64Gi scratch,24Gi archive bound,9Gi/8Gi/512Mi source protection,45s lease and default rates unchanged. No allocation or execution authorization.',
+    preservedPartialsStageManifest: 'cnpg-preserved-partials-stage-preparation.yaml', preservedPartialsStageCapacityGiB: 56,
+    preservedPartialsStageBoundary: 'Separate40-to56Gi stage-only expansion review and actual CSI growth required. Preserve every failed partial on the same filesystem; no source PG resize, partial deletion, new volume, export start or restore authorization. Full24Gi archive cap and start-space reserve, source9Gi/8Gi/512Mi protection and45s leases remain unchanged.',
     expansionBoundary: 'Explicit32Gi stage profile only after separately reviewed physical budget, UID/version-guarded PVC request and actual CSI/filesystem growth. Initial28Gi allocation manifests and old dry-run evidence remain unchanged. No partial deletion, source PG resize, archive cap increase, source budget reset or export approval.',
     runtime: 'Existing Node 24 and kubectl; no npm install, build, product rollout or cluster credentials in artifact',
     watchdog: 'source-space.ts --watch; separate owner approval required before issuing any export lease',

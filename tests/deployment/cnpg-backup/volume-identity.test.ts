@@ -123,6 +123,58 @@ test('32-to40 planning charges the complete new budget and cannot reuse 28Gi or 
   assert.throws(() => planStageExpansion(snapshot, now, 40));
 });
 
+test('stage56 still requires actual capacity, unchanged filesystem identity and explicit matching approval', () => {
+  const candidate = pod();
+  candidate.spec.containers[0]!.env.push(
+    { name: 'REVIEWED_STAGE_CAPACITY_GIB', value: '56' },
+    { name: 'BACKUP_MAX_BYTES', value: String(56 * 1024 ** 3) },
+    { name: 'BACKUP_MIN_BYTES', value: String(54 * 1024 ** 3) },
+    { name: 'HARD_CAPACITY_REVIEW_APPROVED', value: 'true' },
+  );
+  const identity = stageIdentityForPod(candidate, 'export');
+  assert.deepEqual(identity, { ...stageIdentity, capacityGiB: 56 });
+  const resources = inventory();
+  resources.persistent.spec.capacity.storage = '40Gi';
+  resources.volume.spec.size = String(40 * 1024 ** 3);
+  assert.throws(() => verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity));
+  resources.persistent.spec.capacity.storage = '56Gi';
+  resources.volume.spec.size = String(56 * 1024 ** 3);
+  verifyStageBinding(resources.claim, resources.persistent, resources.volume, resources.replicas, identity);
+  for (const [name, value] of [['BACKUP_MIN_BYTES', String(38 * 1024 ** 3)], ['BACKUP_MAX_BYTES', String(40 * 1024 ** 3)], ['HARD_CAPACITY_REVIEW_APPROVED', 'false']] as const) {
+    const altered = structuredClone(candidate);
+    altered.spec.containers[0]!.env.find(entry => entry.name === name)!.value = value;
+    assert.throws(() => stageIdentityForPod(altered, 'export'));
+  }
+});
+
+test('40-to56 planning preserves all partials and charges the entire new backing budget without source changes', () => {
+  const snapshot = expansionInventory();
+  const now = Date.parse(snapshot.observedAt);
+  assert.throws(() => planStageExpansion(snapshot, now, 56));
+  snapshot.claim.spec.resources.requests.storage = '40Gi';
+  snapshot.claim.status.capacity.storage = '40Gi';
+  snapshot.persistent.spec.capacity.storage = '40Gi';
+  snapshot.volume.spec.size = String(40 * 1024 ** 3);
+  snapshot.volume.spec.snapshotMaxSize = String(80 * 1024 ** 3);
+  const plan: any = planStageExpansion(snapshot, now, 56);
+  assert.equal(plan.oldGiB, 40);
+  assert.equal(plan.targetGiB, 56);
+  assert.equal(plan.physicalBudgetBytes, 226 * 1024 ** 3);
+  assert.equal(plan.backingAfterWorstCaseBytes, 474 * 1024 ** 3);
+  for (const field of ['executionAuthorized', 'partialDeletionAuthorized', 'sourceProtectionChanged', 'restoreAllocationAuthorized']) assert.equal(plan[field], false);
+  assert.deepEqual(plan.patches.map((entry: any) => entry.resource), ['storageclass', 'pvc']);
+  assert.deepEqual(plan.patches[1].patch, [
+    { op: 'test', path: '/metadata/uid', value: stageIdentity.claimUID }, { op: 'test', path: '/metadata/resourceVersion', value: '100' },
+    { op: 'test', path: '/spec/resources/requests/storage', value: '40Gi' }, { op: 'replace', path: '/spec/resources/requests/storage', value: '56Gi' },
+  ]);
+  const insufficient = structuredClone(snapshot);
+  insufficient.filesystem.availableBytes = 620 * 1024 ** 3;
+  assert.throws(() => planStageExpansion(insufficient, now, 56));
+  assert.throws(() => planStageExpansion(snapshot, now + 90_001, 56));
+  snapshot.consumers = [{ status: { phase: 'Running', containerStatuses: [{ state: { running: {} } }] } }];
+  assert.throws(() => planStageExpansion(snapshot, now, 56));
+});
+
 test('stage expansion plans only two identity/version guarded changes, never apply or shrink', () => {
   const snapshot = expansionInventory();
   const plan: any = planStageExpansion(snapshot, Date.parse(snapshot.observedAt));

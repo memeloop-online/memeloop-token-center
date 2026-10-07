@@ -15,7 +15,7 @@ test('independent export artifact binds tested revision, includes dependency-fre
   const output = join(parent, 'bundle');
   const revision = { testedCommit: '1'.repeat(40), sourceHead: '2'.repeat(40), runId: '37358304060' };
   prepareArtifact(output, revision);
-  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-expanded-stage-preparation.yaml', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'cnpg-retained-stage-preparation.yaml', 'copy-guard.ts', 'copy.ts', 'provenance.json', 'source-filesystem.ts', 'source-space.ts', 'stage-expansion.ts', 'volume-identity.ts']);
+  assert.deepEqual(readdirSync(output).sort(), ['SHA256SUMS', 'cnpg-expanded-stage-preparation.yaml', 'cnpg-export-preparation.yaml', 'cnpg-hard-capacity-preparation.yaml', 'cnpg-preserved-partials-stage-preparation.yaml', 'cnpg-retained-stage-preparation.yaml', 'copy-guard.ts', 'copy.ts', 'provenance.json', 'source-filesystem.ts', 'source-space.ts', 'stage-expansion.ts', 'volume-identity.ts']);
   const manifest = parseAllDocuments(readFileSync(join(output, 'cnpg-export-preparation.yaml'), 'utf8')).map(document => {
     assert.deepEqual(document.errors, []);
     return document.toJS({ maxAliasCount: 0 });
@@ -70,6 +70,18 @@ test('independent export artifact binds tested revision, includes dependency-fre
     for (const [name, value] of [['REVIEWED_STAGE_CAPACITY_GIB', '40'], ['BACKUP_MAX_BYTES', String(40 * 1024 ** 3)], ['BACKUP_MIN_BYTES', String(38 * 1024 ** 3)]]) environment.find((entry: any) => entry.name === name).value = value;
   }
   assert.deepEqual(retained, expectedRetained, 'Only the reviewed stage capacity profile may differ; commands, caps, rates and approvals stay unchanged');
+  assert.equal(provenance.preservedPartialsStageCapacityGiB, 56);
+  const preservedPartials = parseAllDocuments(readFileSync(join(output, provenance.preservedPartialsStageManifest), 'utf8')).map(document => {
+    assert.deepEqual(document.errors, []);
+    return document.toJS({ maxAliasCount: 0 });
+  });
+  const expectedPreserved = structuredClone(retained);
+  for (const resource of expectedPreserved.filter(entry => entry.kind === 'Job')) {
+    resource.metadata.annotations['recovery.mtc/stage-capacity-profile'] = 'stage56-after-separate-reviewed-expansion-no-source-pg-resize-or-partial-delete';
+    const environment = resource.spec.template.spec.containers[0].env;
+    for (const [name, value] of [['REVIEWED_STAGE_CAPACITY_GIB', '56'], ['BACKUP_MAX_BYTES', String(56 * 1024 ** 3)], ['BACKUP_MIN_BYTES', String(54 * 1024 ** 3)]]) environment.find((entry: any) => entry.name === name).value = value;
+  }
+  assert.deepEqual(preservedPartials, expectedPreserved, 'Retaining partials changes only capacity assertions, never scripts, source protection or execution approval');
   for (const line of readFileSync(join(output, 'SHA256SUMS'), 'utf8').trim().split('\n')) {
     const [expected, name] = line.split('  ');
     assert.equal(createHash('sha256').update(readFileSync(join(output, name!))).digest('hex'), expected);

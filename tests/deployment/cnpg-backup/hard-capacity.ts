@@ -32,8 +32,8 @@ function replaceOnce(script: string, before: string, after: string): string {
   return script.replace(before, after);
 }
 
-export function preparedResources(stageSupervisor: (script: string) => string = superviseExport, stageCapacityGiB: 28 | 32 | 40 = 28): any[] {
-  assert.ok([28, 32, 40].includes(stageCapacityGiB));
+export function preparedResources(stageSupervisor: (script: string) => string = superviseExport, stageCapacityGiB: 28 | 32 | 40 | 56 = 28): any[] {
+  assert.ok([28, 32, 40, 56].includes(stageCapacityGiB));
   const originals = ['mtc-pg-local-stage-20261004.yaml', 'mtc-pg-offhost-copy-20261004.yaml', 'mtc-pg-restore-verification-20261004.yaml']
     .flatMap(name => parseAllDocuments(readFileSync(join(directory, name), 'utf8')).map(document => {
       assert.deepEqual(document.errors, []);
