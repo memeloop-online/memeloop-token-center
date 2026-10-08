@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { RJSFSchema } from '@rjsf/utils';
 import { localizeSchema } from '../src/i18n.js';
-import { providerEditSchema } from '../src/operator/providerEditSchema.js';
+import { providerConfigSchema, providerEditSchema } from '../src/operator/providerEditSchema.js';
 import { connectionSchema } from '../src/operator/upstreamConnectionPolicy.js';
 import { codexTransportPolicySchema, providerEditShape } from './fixtures/provider-edit-shapes.js';
 
@@ -159,4 +159,23 @@ test('provider presentation changes only copy, preserving unknown schemas and co
   const explicitDeny = providerEditSchema({ properties: { config: { type: 'object', additionalProperties: false } } }, 'zh-CN');
   assert.equal((implicit.properties!.config as { additionalProperties: boolean }).additionalProperties, true);
   assert.equal((explicitDeny.properties!.config as { additionalProperties: boolean }).additionalProperties, false);
+});
+
+test('authorization config uses the same presentation without changing payload shape or constraints', () => {
+  const schema: RJSFSchema = { type: 'object', additionalProperties: false, required: ['base_url', 'vendor_setting'], properties: {
+    base_url: { type: 'string', format: 'uri' },
+    vendor_setting: { type: 'string', minLength: 1, description: 'Vendor help' },
+    timeout_seconds: { type: 'integer', minimum: 1, maximum: 600, default: 120 },
+    provider_asset_reads_repeatable: { type: 'boolean', default: false },
+    responses_compact_v2_bridge: { type: 'boolean', default: false },
+  } };
+  const original = structuredClone(schema);
+  for (const locale of ['zh-CN', 'en']) {
+    const projected = providerConfigSchema(schema, locale);
+    assert.deepEqual(withoutPresentation(projected), withoutPresentation(schema));
+    assert.deepEqual(projected.properties!.vendor_setting, schema.properties!.vendor_setting);
+    assert.equal('config' in projected.properties!, false);
+    assert.notEqual((projected.properties!.timeout_seconds as RJSFSchema).description, undefined);
+  }
+  assert.deepEqual(schema, original);
 });

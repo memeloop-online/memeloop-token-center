@@ -10,9 +10,12 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
   // their controls when it is explicit; honor that same permission in the UI.
   if (properties.additionalProperties === undefined) properties.additionalProperties = true;
   const copy: Record<string, [string, string, string, string]> = {
-    network_scope: ['网络访问范围', 'Network access scope', '控制上游可访问的网络范围；通常保持现有值。', 'Controls the network scope available to this upstream. Usually leave unchanged.'],
+    network_scope: ['网络访问范围', 'Network access scope', '公网服务选择 public，私网服务选择 private；连接私网服务需要全局操作员凭据。', 'Choose public for an internet service or private for a private network service. Private destinations require a global operator credential.'],
     reservation_token_bounds: ['模型词元预留上限', 'Model token reservation bounds', '按准确模型名称设置保守的词元预留值，用于请求预算，不代表模型输出上限。', 'Conservative token reservations per exact model name, used for request budgeting rather than model output limits.'],
     transport_policy: ['运行时传输策略', 'Runtime transport policy', '单位见各字段；这些设置影响该账号的所有请求。', 'Units are shown per field. These settings affect every request using this account.'],
+    timeout_seconds: ['请求超时（秒）', 'Request timeout (seconds)', '设置等待上游完成请求的最长时间；不确定时保留默认值。', 'Set how long to wait for an upstream request to finish. Keep the default if unsure.'],
+    provider_asset_reads_repeatable: ['生成文件可重复读取', 'Generated files allow repeated downloads', '仅在生成文件的下载地址可重复使用时启用；一次性下载地址请保持关闭。', 'Enable only when generated file URLs allow repeated downloads. Leave off for single-use URLs.'],
+    responses_compact_v2_bridge: ['Responses 压缩接口', 'Responses compaction endpoint', '仅在提供商支持 POST /v1/responses/compact 时启用，将 Responses 压缩请求交给该接口处理。', 'Enable only if your provider supports POST /v1/responses/compact, to send Responses compaction requests to that endpoint.'],
   };
   for (const [name, [zhTitle, enTitle, zhHint, enHint]] of Object.entries(copy)) {
     const field = properties.properties?.[name];
@@ -39,4 +42,8 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
     }
   }
   return result;
+}
+
+export function providerConfigSchema(schema: RJSFSchema, locale: string): RJSFSchema {
+  return providerEditSchema({ properties: { config: schema } }, locale).properties!.config as RJSFSchema;
 }

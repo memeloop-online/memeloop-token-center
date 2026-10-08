@@ -237,7 +237,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       assert.ok(!stored?.includes('synthetic-device-session') && !stored?.includes('FIXTURE-CODE'), 'only a non-secret recovery reference is persisted');
       const pending = page.waitForResponse(response => response.url().endsWith('/oauth/codex/poll'));
       await page.reload(); await pending;
-      await workspace.getByText(chinese ? '请在提供商页面完成登录；系统会自动检测结果，成功后返回账号页面，无需手动检查。' : 'Finish signing in on the provider page. The system checks automatically and returns to the account page on success; no manual check is needed.', { exact: true }).first().waitFor();
+      await workspace.getByText(chinese ? '请在提供商页面完成登录；系统会自动检测结果并保存连接，无需手动检查。' : 'Finish signing in on the provider page. The system checks automatically and saves the connection; no manual check is needed.', { exact: true }).first().waitFor();
       await page.clock.fastForward(9_000); assert.equal(pollCount, 2);
       await page.clock.fastForward(1_000);
       await workspace.waitFor({ state: 'detached' });

@@ -13,6 +13,7 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
   try {
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const savedAccount = { id: 'saved-fixture-account', name: 'Fixture OAuth', driver: 'fixture-plugin', tenant_external_id: 'fixture-a', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: {}, credential_generation: 1, route_count: 0, created_at: 1, updated_at: 1 };
     let completeCalls = 0; let failedReads = 0; let failAccounts = false;
     await page.route('**/internal/v1/**', async route => {
       const path = new URL(route.request().url()).pathname;
@@ -23,12 +24,12 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
       }] });
       if (path === '/internal/v1/upstreams') {
         if (failAccounts) { failedReads++; return route.fulfill({ status: 503, json: { error: { message: 'fixture account read failed' } } }); }
-        return route.fulfill({ json: [] });
+        return route.fulfill({ json: completeCalls ? [savedAccount] : [] });
       }
       if (path.endsWith('/authorization-code/start')) return route.fulfill({ json: { driver: 'fixture-plugin', login_url: 'https://example.invalid', session_token: 'fixture-session', expires_at: Date.now() + 600_000, recovery_expires_at: Date.now() + 87_000_000 } });
       if (path.endsWith('/authorization-code/complete')) {
         completeCalls++; failAccounts = true;
-        return route.fulfill({ status: 201, json: { id: 'saved-fixture-account', name: 'Fixture OAuth' } });
+        return route.fulfill({ status: 201, json: savedAccount });
       }
       assert.equal(route.request().method(), 'GET', 'no unexpected mutation is allowed');
       if (path.includes('monitoring') || path.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'fixture statistics failed' } } });
@@ -47,7 +48,9 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     failAccounts = false;
     await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
     await readFailure.waitFor({ state: 'detached' });
-    await page.getByText('账号已创建；可在上游列表查看状态和代理配置。', { exact: true }).waitFor();
+    await page.getByText('已保存上游连接 Fixture OAuth。', { exact: true }).waitFor();
+    assert.equal(await page.locator('.create-journey').getAttribute('data-open'), 'false');
+    await page.locator('#provider-details-saved-fixture-account').waitFor();
     assert.equal(completeCalls, 1, 'list retry and continuing statistics failures never resend the authorization code');
   } finally { await browser.close(); await server.close(); }
 });

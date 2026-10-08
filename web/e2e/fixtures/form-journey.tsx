@@ -1,6 +1,6 @@
 import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
-import { I18nProvider } from '../../src/i18n';
+import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { ProvidersPage, RoutesPage } from '../../src/operator/pages/ManagementPages';
 import { AppShell } from '../../src/app/AppShell';
@@ -12,11 +12,15 @@ import '../../src/operator/operator.css';
 import '../../src/app-shell.css';
 
 import type {} from '../support/form-journey-globals';
+import { builtinApiKeyCredential } from './builtin-api-key-credential';
 import { providerEditShape } from './provider-edit-shapes';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.failNextFormWrite = false;
 window.deferNextFormQuotaRead = false;
 window.deferNextFormProxyRead = false;
+let releaseProviderCreate: ((status: number) => void) | undefined;
+window.releaseFormProviderCreate = status => { if (!releaseProviderCreate) throw new Error('No pending provider create'); releaseProviderCreate(status); releaseProviderCreate = undefined; };
+let createdProvider: typeof account | undefined;
 let releaseProxy: (() => void) | undefined;
 window.releaseFormProxyRead = () => { if (!releaseProxy) throw new Error('No pending proxy read'); releaseProxy(); releaseProxy = undefined; };
 let releaseQuota: (() => void) | undefined;
@@ -34,8 +38,19 @@ window.fetch = async (input, init) => {
   if (method !== 'GET') {
     window.formJourneyWrites++;
     if (workflows && new URLSearchParams(location.search).has('provider-workflow') && method === 'POST' && path === '/internal/v1/upstreams') {
+      window.formJourneyLastProviderCreate = JSON.parse(String(init?.body ?? '{}'));
       if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟创建失败，草稿仍在' } }), { status: 400 }); }
-      return new Response(JSON.stringify({ ...account, id: 'account-created', name: '已创建测试上游' }), { status: 201 });
+      const payload = window.formJourneyLastProviderCreate!;
+      const result = { ...account, id: 'account-created', name: payload.name, driver: payload.driver, tenant_external_id: payload.tenant_external_id };
+      if (window.deferNextFormProviderCreate) {
+        window.deferNextFormProviderCreate = false;
+        return new Promise<Response>(resolve => { releaseProviderCreate = status => {
+          if (status === 201) createdProvider = result;
+          resolve(new Response(JSON.stringify(status === 201 ? result : { error: { message: 'Late create failure' } }), { status }));
+        }; });
+      }
+      createdProvider = result;
+      return new Response(JSON.stringify(result), { status: 201 });
     }
     if (workflows && new URLSearchParams(location.search).has('proxy-workflow') && method === 'PUT' &&
       (path === '/internal/v1/upstreams/account-native/transport-proxy' || path === '/internal/v1/upstreams/account-native')) {
@@ -96,13 +111,45 @@ window.fetch = async (input, init) => {
     credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, config_schema: { type: 'object', properties: { base_url: { type: 'string', const: 'https://chatgpt.com/backend-api/codex', readOnly: true } } }, oauth_adapter: { flow_kind: 'openai_device' } },
   { id: 'http-json', display_name: '自部署模型', source: 'builtin', protocols: ['openai'], credential_schema: { type: 'object', properties: { api_key: { type: 'string', title: 'API key', writeOnly: true } } },
     config_schema: { type: 'object', required: ['base_url'], properties: { base_url: { type: 'string', title: 'Base URL' }, timeout_seconds: { type: 'integer', title: 'Timeout seconds', minimum: 1, default: 30 } } } }];
+  if (new URLSearchParams(location.search).has('provider-create-shape')) {
+    Object.assign(providers[1], {
+      credential_schema: { oneOf: [{ title: 'API key through an account proxy', type: 'object', additionalProperties: false,
+        required: ['type', 'value', 'proxy_url', 'proxy_network_scope'], properties: {
+          type: { const: 'api_key_proxy', title: 'Credential type' },
+          value: { type: 'string', minLength: 1, writeOnly: true, title: 'Credential value' },
+          proxy_url: { type: 'string', pattern: '^socks5h?://', minLength: 1, writeOnly: true, title: 'Proxy URL' },
+          proxy_network_scope: { type: 'string', const: 'private' },
+          header: { type: 'string', default: 'authorization' }, prefix: { type: 'string', default: 'Bearer ' },
+        } }] },
+      config_schema: { type: 'object', additionalProperties: true, required: ['base_url', 'vendor_required', 'stream_usage_contract'], properties: {
+        base_url: { type: 'string', format: 'uri', title: 'Base URL' },
+        vendor_required: { type: 'string', minLength: 1, title: 'Vendor setup' },
+        network_scope: { type: 'string', enum: ['public', 'private'], default: 'public' },
+        timeout_seconds: { type: 'integer', minimum: 1, maximum: 600, default: 120 },
+        reservation_token_bounds: { type: 'object', additionalProperties: { type: 'integer', minimum: 1 }, default: { 'model-x': 4096 } },
+        responses_transport: { type: 'string', enum: ['native_responses', 'chat_completions'], default: 'native_responses' },
+        stream_usage_contract: { type: 'string', enum: ['none', 'openai-chat-usage-only'], default: 'none', title: 'Streaming usage contract' },
+        provider_asset_reads_repeatable: { type: 'boolean', default: false },
+      } },
+    });
+  }
+  if (new URLSearchParams(location.search).has('provider-builtin-api-key')) {
+    Object.assign(providers[1], { credential_schema: { oneOf: [
+      { title: 'No authentication', type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'none', title: 'Credential type' } } },
+      builtinApiKeyCredential,
+    ] } });
+  }
+  if (path === '/internal/v1/upstreams' && window.failNextFormAccountRead) {
+    window.failNextFormAccountRead = false;
+    return new Response(JSON.stringify({ error: { message: 'Fixture list read failure' } }), { status: 503 });
+  }
   if (editShape) {
     Object.assign(providers[0].config_schema, { required: editShape.schema.required });
     Object.assign(providers[0].config_schema.properties, editShape.schema.properties);
   }
   let value: unknown = [];
   if (path === '/internal/v1/provider-types') value = providers;
-  else if (path === '/internal/v1/upstreams') value = workflows ? [account] : [];
+  else if (path === '/internal/v1/upstreams') value = workflows ? [account, ...(createdProvider ? [createdProvider] : [])] : [];
   else if (path === '/internal/v1/model-routes') value = workflows ? routeRows : [];
   else if (path.endsWith('/models')) value = { status: 'ready', models: [{ id: 'fixture-model', protocol: 'openai' }] };
   else if (path === '/internal/v1/upstream-models') value = { data: workflows ? [{ id: 'fixture-model', protocol: 'openai', supported_account_count: 1, eligible_account_count: 1, complete_coverage: true }] : [], eligible_account_count: workflows ? 1 : 0, unknown_account_count: 0, stale_account_count: 0 };
@@ -112,8 +159,11 @@ window.fetch = async (input, init) => {
 };
 const routes = new URLSearchParams(location.search).get('view') === 'routes';
 function Preview() {
+  const { locale, setLocale } = useI18n();
   const [view, setView] = useState<AppRouteKey>(routes ? 'routes' : 'providers');
-  const content = view === 'routes' ? <RoutesPage token="mock-only" tenant="fixture" /> : <ProvidersPage token="mock-only" tenant="fixture" />;
-  return workflows ? <AppShell surface="operator" route={view} onNavigate={setView}>{content}</AppShell> : <main style={{ padding: 20, maxWidth: 1100, margin: 'auto' }}>{content}</main>;
+  const [scope, setScope] = useState({ token: 'mock-only', tenant: 'fixture', writeTenant: 'fixture' });
+  window.changeFormProviderScope = field => setScope(current => ({ ...current, [field]: `${current[field]}-next` }));
+  const content = view === 'routes' ? <RoutesPage token="mock-only" tenant="fixture" /> : <ProvidersPage {...scope} />;
+  return <>{new URLSearchParams(location.search).has('provider-create-shape') && <button type="button" data-change-locale onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Change language</button>}{workflows ? <AppShell surface="operator" route={view} onNavigate={setView}>{content}</AppShell> : <main style={{ padding: 20, maxWidth: 1100, margin: 'auto' }}>{content}</main>}</>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Preview /></MtcFluentProvider></I18nProvider>);

@@ -2,15 +2,16 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { api } from '../api';
-import { Button, Checkbox, Input } from '../design-system';
+import { Button, Checkbox, FormSection, Input } from '../design-system';
 import { localizeSchema, useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
-import { schemaFormTemplates } from '../SchemaTemplates';
+import { upstreamFormTemplates } from './UpstreamFormTemplates';
+import { providerConfigSchema } from './providerEditSchema';
 import { safeValidator } from '../safeValidator';
 import { useConfirmDialog } from '../useConfirmDialog';
 import type { ProviderType, UpstreamAccount } from '../types';
 import { ProxyInput } from './UpstreamConnection';
-import { isGenericProxyUrlInput } from './upstreamConnectionPolicy';
+import { connectionSchema, isGenericProxyUrlInput } from './upstreamConnectionPolicy';
 import { authorizationCodeCopy } from './authorizationCodeCopy';
 import { OAuthLoginLinkActions } from './OAuthLoginLinkActions';
 import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, type AuthorizationCodeSession } from './authorizationCode';
@@ -42,7 +43,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   const consumed = useRef(false);
   const live = useRef(true);
   useLayoutEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
-  useEffect(() => { onLock(busy || Boolean(session)); }, [busy, session, onLock]);
+  useEffect(() => { onLock(busy || Boolean(session) || submitted); }, [busy, session, submitted, onLock]);
   if (existing && !canReauthorizeAccount(existing, provider)) return <p role="status">{copy.reauthorize}</p>;
 
   async function start(providerConfig: Record<string, unknown>) {
@@ -94,14 +95,15 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   return <section className="authorization-form">
     {confirmationDialog}<p className="field-hint">{existing ? copy.reauthorizeHelp : copy.help}</p>
     <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenantDisplayName(tenant, locale)}</p>
-    <label>{t('providers.name')}<Input required maxLength={200} disabled={Boolean(existing) || busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label>
+    <FormSection title={t('connection.identitySection')}><label>{t('providers.name')}<Input required maxLength={200} disabled={Boolean(existing) || busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label></FormSection>
     <p>{copy.network}: {existing ? copy.retainedNetwork : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
     {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy || connectionEditing} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
     {!existing && !session && !submitted && <>
-      <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
-      {useProxy && <ProxyInput generic required value={proxy} onChange={setProxy} disabled={busy} hint={t('connection.oauthProxyHint')} />}
-      <h3>{copy.config}</h3>
-      <RjsfForm schema={localizeSchema(provider.config_schema as RJSFSchema, locale)} formData={config} onChange={({ formData }) => setConfig(formData ?? {})} disabled={busy} validator={safeValidator} templates={schemaFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData ?? {})}>
+      <FormSection title={t('connection.title')}>
+        <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
+        {useProxy && <ProxyInput generic required value={proxy} onChange={setProxy} disabled={busy} hint={t('connection.oauthProxyHint')} />}
+      </FormSection>
+      <RjsfForm schema={providerConfigSchema(localizeSchema(connectionSchema(provider.config_schema as RJSFSchema, t('connection.endpointHint')), locale), locale)} formContext={{ providerConfigRoot: true }} formData={config} onChange={({ formData }) => setConfig(formData ?? {})} disabled={busy} validator={safeValidator} templates={upstreamFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData ?? {})}>
         <Button appearance="primary" type="submit" disabled={!token || !tenant || !name.trim() || busy || (useProxy && !isGenericProxyUrlInput(proxy.trim()))}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>
       </RjsfForm>
     </>}

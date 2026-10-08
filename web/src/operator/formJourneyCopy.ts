@@ -2,6 +2,8 @@
 export function formJourneyCopy(locale: string) {
   return locale.startsWith('zh') ? {
     authentication: '认证凭据', authenticationHint: '仅填写所选提供商需要的凭据。网络代理与 API 地址分开配置。',
+    advancedAuthentication: '自定义认证请求头', advancedAuthenticationHint: '仅在提供商要求自定义请求头名称或凭据前缀时修改；否则保留默认值。',
+    authenticationHeaderHint: '填写提供商指定的 HTTP 请求头名称，例如 authorization 或 x-api-key。', authenticationPrefixHint: '填写凭据前的文字，包含所需空格，例如 Bearer 后的空格；不需要前缀时留空。',
     timeouts: '配置超时与重试', timeoutsHint: '设置连接、读取和故障切换的等待时限。只修改代理地址时，无需调整这些设置。',
     advancedConnection: '高级网络与用量设置', advancedConnectionHint: '按需配置网络访问范围、额度预留及提供商专用选项；不确定时保持原值。',
     identity: '身份与归属', policy: '用量与预算', policyHint: '先选择计费方式；只有需要限制用量时再设置预算。',
@@ -16,6 +18,8 @@ export function formJourneyCopy(locale: string) {
     routeAccess: '3. 模型访问授权', protocolHelp: '协议兼容性说明',
   } : {
     authentication: 'Authentication', authenticationHint: 'Use credentials for the selected provider. Configure the network proxy separately from the API endpoint.',
+    advancedAuthentication: 'Custom authentication headers', advancedAuthenticationHint: 'Change the header name or credential prefix only when required by your provider. Otherwise keep the defaults.',
+    authenticationHeaderHint: 'Enter the HTTP header name required by your provider, such as authorization or x-api-key.', authenticationPrefixHint: 'Enter any text before the credential, including required spaces such as the space after Bearer. Leave empty when no prefix is needed.',
     timeouts: 'Configure timeouts and retries', timeoutsHint: 'Set how long to wait for connections, responses and failover. Leave these unchanged when only updating the proxy address.',
     advancedConnection: 'Advanced network and usage settings', advancedConnectionHint: 'Configure network access, credit reservations and provider-specific options as needed. Keep the current values if unsure.',
     identity: 'Identity and ownership', policy: 'Usage and budget', policyHint: 'Choose billing behavior first; add budgets only when you need usage limits.',

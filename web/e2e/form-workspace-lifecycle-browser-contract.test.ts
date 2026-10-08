@@ -164,3 +164,159 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('upstream create groups configuration and retains advanced and secret drafts across locale and method changes', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createServer({ root, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&provider-workflow&provider-create-shape`);
+    const workspace = page.locator('.create-journey');
+    await workspace.locator('[data-workspace-toggle]').click();
+    const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
+    const capabilities = workspace.getByRole('button', { name: '协议、图片与视频设置', exact: true });
+    const headers = workspace.getByRole('button', { name: '自定义认证请求头', exact: true });
+    for (const disclosure of [advanced, capabilities, headers]) assert.equal(await disclosure.getAttribute('aria-expanded'), 'false');
+    assert.equal(await workspace.getByLabel('Vendor setup').isVisible(), true);
+    assert.equal(await workspace.locator('#root_config_stream_usage_contract').isVisible(), true);
+    assert.equal(await workspace.locator('#root_credential_proxy_network_scope').isVisible(), false);
+    assert.equal(await workspace.locator('#root_config_timeout_seconds').isVisible(), false);
+    assert.equal(await workspace.locator('#root_config_responses_transport').isVisible(), false);
+    await workspace.locator('#root_name').fill('Preserved upstream');
+    await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
+    await workspace.locator('#root_config_vendor_required').fill('vendor-value');
+    await workspace.locator('#root_credential_value').fill('fixture-only-api-secret');
+    await workspace.locator('#root_credential_proxy_url').fill('socks5h://10.0.0.20:1080');
+    await advanced.click();
+    await workspace.locator('#root_config_timeout_seconds').fill('75');
+    await workspace.locator('#root_config_reservation_token_bounds_model-x').fill('72000');
+    await advanced.click();
+    await capabilities.click();
+    await workspace.locator('#root_config_responses_transport').selectOption('chat_completions');
+    await capabilities.click();
+    await headers.click();
+    await workspace.locator('#root_credential_header').fill('x-api-key');
+    await workspace.locator('#root_credential_prefix').fill('Token ');
+    await headers.click();
+    await page.locator('[data-change-locale]').click();
+    assert.equal(await workspace.locator('#root_name').inputValue(), 'Preserved upstream');
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
+    await workspace.getByRole('button', { name: 'Account authorization', exact: true }).click();
+    await workspace.getByRole('button', { name: 'API credential', exact: true }).click();
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
+    await workspace.getByRole('button', { name: 'Advanced network and usage settings', exact: true }).click();
+    assert.equal(await workspace.locator('#root_config_timeout_seconds').inputValue(), '75');
+    assert.equal(await workspace.locator('#root_config_reservation_token_bounds_model-x').inputValue(), '72000');
+    await workspace.getByRole('button', { name: 'Advanced network and usage settings', exact: true }).click();
+    await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+    assert.equal(await workspace.locator('#root_credential_header').inputValue(), 'x-api-key');
+    assert.equal(await workspace.locator('#root_credential_prefix').inputValue(), 'Token ');
+    await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+    await page.evaluate(() => { window.failNextFormWrite = true; });
+    const submit = workspace.getByRole('button', { name: 'Add upstream', exact: true });
+    await submit.click();
+    await workspace.getByRole('alert').waitFor();
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await submit.click();
+    await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+    assert.deepEqual(await page.evaluate(() => window.formJourneyLastProviderCreate), {
+      name: 'Preserved upstream', driver: 'http-json', tenant_external_id: 'fixture',
+      config: { base_url: 'https://fixture.invalid/v1', vendor_required: 'vendor-value', network_scope: 'public', timeout_seconds: 75,
+        reservation_token_bounds: { 'model-x': 72000 }, responses_transport: 'chat_completions', stream_usage_contract: 'none', provider_asset_reads_repeatable: false },
+      credential: { type: 'api_key_proxy', value: 'fixture-only-api-secret', proxy_url: 'socks5h://10.0.0.20:1080', proxy_network_scope: 'private', header: 'x-api-key', prefix: 'Token ' },
+    });
+    await workspace.locator('[data-workspace-toggle]').click();
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), '');
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('catalog API-key creation preserves empty prefixes, locks submits and separates saved-list recovery from creation', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createServer({ root, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const fixture = `${origin}/e2e/fixtures/form-journey.html?workflows&provider-workflow&provider-builtin-api-key`;
+    const workspace = page.locator('.create-journey');
+    async function fillDraft(name: string) {
+      await workspace.locator('[data-workspace-toggle]').click();
+      await workspace.locator('#root_name').fill(name);
+      await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
+      await workspace.locator('select').filter({ has: page.locator('option[value="1"]') }).selectOption('1');
+      await workspace.locator('#root_credential_value').fill('fixture-only-api-secret');
+      await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+      await workspace.locator('#root_credential_header').fill('x-api-key');
+      await workspace.locator('#root_credential_prefix').fill('');
+    }
+    await page.goto(fixture);
+    await fillDraft('Saved API connection');
+    const submit = workspace.locator('button[type="submit"]');
+    await page.evaluate(() => { window.deferNextFormProviderCreate = true; });
+    await submit.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+    await page.waitForFunction(() => window.formJourneyWrites === 1);
+    assert.equal(await submit.isEnabled(), false);
+    assert.equal(await workspace.getByRole('button', { name: 'Account authorization', exact: true }).isEnabled(), false);
+    assert.equal(await workspace.getByRole('combobox', { name: 'Service provider', exact: true }).isEnabled(), false);
+    assert.equal(await workspace.locator('[data-workspace-toggle]').isEnabled(), false);
+    await page.evaluate(() => window.releaseFormProviderCreate(400));
+    await workspace.getByRole('alert').waitFor();
+    assert.equal(await workspace.locator('#root_name').inputValue(), 'Saved API connection');
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
+    await page.evaluate(() => { window.failNextFormAccountRead = true; });
+    await submit.click();
+    await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+    await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor();
+    await page.getByText('Saved upstream connection Saved API connection.', { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.formJourneyLastProviderCreate?.credential), {
+      type: 'api_key', value: 'fixture-only-api-secret', header: 'x-api-key', prefix: '',
+    });
+    await page.getByRole('button', { name: 'Reload account list', exact: true }).click();
+    await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
+    await workspace.locator('[data-workspace-toggle]').click();
+    assert.equal(await workspace.locator('#root_name').inputValue(), '');
+    for (const field of ['token', 'tenant', 'writeTenant'] as const) for (const status of [201, 400]) {
+      await page.goto(fixture);
+      await fillDraft(`Old ${field}`);
+      await page.evaluate(() => { window.deferNextFormProviderCreate = true; });
+      await submit.click();
+      await page.waitForFunction(() => window.formJourneyWrites === 1);
+      await page.evaluate(field => window.changeFormProviderScope(field), field);
+      await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+      await workspace.locator('[data-workspace-toggle]').click();
+      await workspace.locator('#root_name').fill(`New ${field}`);
+      await page.evaluate(status => window.releaseFormProviderCreate(status), status);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      assert.equal(await workspace.getAttribute('data-open'), 'true');
+      assert.equal(await workspace.locator('#root_name').inputValue(), `New ${field}`);
+      assert.equal(await page.locator('.notice.success').count(), 0);
+      assert.equal(await page.getByText('Late create failure', { exact: true }).count(), 0);
+      assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
+    }
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});

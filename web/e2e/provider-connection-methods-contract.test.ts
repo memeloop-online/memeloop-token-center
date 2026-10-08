@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
+import type { RJSFSchema } from '@rjsf/utils';
+import { safeValidator } from '../src/safeValidator.js';
+import { builtinApiKeyCredential } from './fixtures/builtin-api-key-credential.js';
 
 import { directCredentialSchema, oauthCreationProxyMode, supportsDirectConnection } from '../src/operator/providerConnectionMethods.js';
 import type { ProviderType } from '../src/types.js';
@@ -50,4 +54,20 @@ test('every interactive adapter receives the same optional account-proxy choice'
     assert.equal(oauthCreationProxyMode({ ...provider, source: 'plugin' }), 'optional');
   }
   assert.equal(oauthCreationProxyMode({ ...dualMethodProvider, id: 'kimi-oauth', oauth_adapter: undefined }), 'none');
+});
+
+test('the catalog API-key branch retains custom headers, empty prefixes and closed object constraints', async () => {
+  const source = await readFile(new URL('../../src/provider/catalog.rs', import.meta.url), 'utf8');
+  const match = source.match(/let credential_schema = json!\((\{[\s\S]*?\n        \})\);/);
+  assert.ok(match);
+  const catalog = JSON.parse(match[1]);
+  assert.deepEqual(builtinApiKeyCredential, catalog.oneOf[1]);
+  const direct = directCredentialSchema(catalog);
+  assert.ok(direct);
+  assert.deepEqual((direct.oneOf as unknown[])[1], builtinApiKeyCredential);
+  const credential = { type: 'api_key', value: 'fixture-only-secret', header: 'x-api-key', prefix: '' };
+  assert.equal(safeValidator.isValid(catalog, credential, catalog), true);
+  assert.equal(safeValidator.isValid(direct as RJSFSchema, credential, direct as RJSFSchema), true);
+  assert.equal(safeValidator.isValid(direct as RJSFSchema, { ...credential, unknown_field: true }, direct as RJSFSchema), false);
+  assert.equal(safeValidator.isValid(direct as RJSFSchema, { ...credential, value: '' }, direct as RJSFSchema), false);
 });
