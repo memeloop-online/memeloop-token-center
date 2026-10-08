@@ -35,6 +35,7 @@ mod routing;
 pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
+mod upstream_error;
 mod upstream_response;
 
 #[cfg(test)]
@@ -1686,6 +1687,16 @@ async fn proxy_with_cancellation_guard(
             .and_then(Value::as_bool)
             == Some(true);
     let responses_anthropic_route = active_route.is_responses_via_anthropic();
+    let status = upstream.status();
+    let (upstream, rejection) = if !status.is_success()
+        && !protocol.is_anthropic()
+        && !responses_anthropic_route
+        && crate::provider::is_openai_compatible_http_driver(&active_route.route.driver)
+    {
+        (None, Some(upstream_error::read_rejection(upstream).await))
+    } else {
+        (Some(upstream), None)
+    };
     drop(request_json);
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
@@ -1695,9 +1706,10 @@ async fn proxy_with_cancellation_guard(
     let codex_downstream_stream = active_route.codex_downstream_stream;
     let upstream_account_id = Some(active_route.route.account_id);
     let route_driver = Some(active_route.route.driver.as_str());
-    let status = upstream.status();
     let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
-        crate::api::anthropic::downstream_response_headers(upstream.headers())
+        crate::api::anthropic::downstream_response_headers(
+            upstream.as_ref().ok_or(AppError::Internal)?.headers(),
+        )
     } else {
         HeaderMap::new()
     };
@@ -1710,6 +1722,7 @@ async fn proxy_with_cancellation_guard(
             status,
         );
         if protocol.is_anthropic() || responses_anthropic_route {
+            let upstream = upstream.ok_or(AppError::Internal)?;
             let content_type = upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
@@ -1766,15 +1779,18 @@ async fn proxy_with_cancellation_guard(
             codex_retry.complete(CodexRetryTerminal::Failed);
             return result;
         }
-        let terminal_cause = if status == StatusCode::BAD_GATEWAY {
-            upstream_response::rejected_response_terminal_cause(upstream).await
+        let (body, terminal_cause) = if let Some(rejection) = rejection {
+            (rejection.body, rejection.terminal_cause)
         } else {
-            drop(upstream);
-            None
+            let upstream = upstream.ok_or(AppError::Internal)?;
+            let terminal_cause = if status == StatusCode::BAD_GATEWAY {
+                upstream_response::rejected_response_terminal_cause(upstream).await
+            } else {
+                drop(upstream);
+                None
+            };
+            (upstream_error::fallback_body(), terminal_cause)
         };
-        let body = Bytes::from_static(
-            b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-        );
         let stored_response = format!(
             "inline-json:{}",
             std::str::from_utf8(&body).map_err(|_| AppError::Internal)?
@@ -1809,6 +1825,7 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
+    let upstream = upstream.ok_or(AppError::Internal)?;
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
         .as_ref()

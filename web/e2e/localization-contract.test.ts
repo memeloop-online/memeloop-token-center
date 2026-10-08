@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { formatMetricNumber } from '../src/format.js';
-import { translationCatalogs } from '../src/i18n.js';
+import { localizeSchema, translationCatalogs } from '../src/i18n.js';
 import { tenantDisplayName } from '../src/tenantDisplayName.js';
 import { formJourneyCopy } from '../src/operator/formJourneyCopy.js';
 
@@ -13,6 +13,107 @@ test('Chinese and English translation catalogs expose the same keys', () => {
 
   assert.ok(chineseKeys.length > 0, 'the translation catalog must not be empty');
   assert.deepEqual(englishKeys, chineseKeys);
+});
+
+test('schema localization preserves instance blobs, literal property names and unknown extensions', () => {
+  const instance = {
+    title: 'API key', description: 'API key',
+    properties: { title: { title: 'API key' }, type: { default: 'API key' } },
+    required: ['title', 'description'], allOf: [{ title: 'API key' }],
+  };
+  const values = [instance, [instance, true, false, null], true, false, null, 'API key', 0];
+  const schema = {
+    title: 'API key', description: 'API key', required: ['title', 'description'],
+    properties: {
+      title: { type: 'object', const: instance, default: instance },
+      description: { type: 'object', enum: [instance], examples: [instance] },
+      type: { type: 'string', const: 'API key' },
+      constructor: { type: 'string' },
+      alias: true, timeout_seconds: false,
+    },
+    const: instance, enum: values, default: instance, examples: values, example: instance,
+    'x-vendor': { title: 'API key', description: 'API key', properties: { type: { title: 'API key' } } },
+    dependentRequired: { title: ['description', 'API key'] },
+  };
+  const original = structuredClone(schema);
+  function freeze(value: unknown) {
+    if (value && typeof value === 'object') {
+      Object.values(value).forEach(freeze);
+      Object.freeze(value);
+    }
+  }
+  freeze(schema);
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const localized = localizeSchema(schema, locale);
+    assert.deepEqual(localized, {
+      ...original,
+      title: translationCatalogs[locale]['schema.API key'],
+      description: translationCatalogs[locale]['schema.API key'],
+      properties: {
+        ...original.properties,
+        type: { ...original.properties.type, title: locale === 'zh-CN' ? '凭据类型' : 'Credential type' },
+      },
+    });
+    for (const value of values) {
+      assert.deepEqual(localizeSchema({ default: value, const: value, enum: [value], examples: [value], example: value }, locale),
+        { default: value, const: value, enum: [value], examples: [value], example: value });
+    }
+    assert.deepEqual(localizeSchema(values, locale), values);
+    assert.equal(localizeSchema(true, locale), true);
+    assert.equal(localizeSchema(false, locale), false);
+  }
+  assert.deepEqual(schema, original, 'localization leaves the frozen input intact');
+});
+
+test('schema localization translates annotations only at declared schema positions in both locales', () => {
+  const node = {
+    title: 'API key', description: 'API key',
+    properties: {
+      title: { title: 'API key', description: 'API key', type: 'string' },
+      description: { title: 'API key', type: 'string' },
+      alias: { type: 'string' },
+    },
+    required: ['title', 'description'],
+    default: { title: 'API key', description: 'API key', properties: { alias: 'API key' } },
+  };
+  const original = structuredClone(node);
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const annotation = translationCatalogs[locale]['schema.API key'];
+    const expected = {
+      ...original, title: annotation, description: annotation,
+      properties: {
+        title: { ...original.properties.title, title: annotation, description: annotation },
+        description: { ...original.properties.description, title: annotation },
+        alias: { type: 'string', title: locale === 'zh-CN' ? '凭据别名' : 'Credential alias' },
+      },
+    };
+    for (const keyword of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas', 'dependencies']) {
+      const schema = { [keyword]: { title: node, description: true, alias: false, type: { type: 'string' } } };
+      const field = keyword === 'properties'
+        ? { type: 'string', title: locale === 'zh-CN' ? '凭据类型' : 'Credential type' }
+        : { type: 'string' };
+      assert.deepEqual(localizeSchema(schema, locale),
+        { [keyword]: { title: expected, description: true, alias: false, type: field } }, `${locale} ${keyword}`);
+    }
+    for (const keyword of [
+      'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'items', 'additionalItems',
+      'unevaluatedItems', 'contains', 'contentSchema', 'not', 'if', 'then', 'else',
+    ]) {
+      assert.deepEqual(localizeSchema({ [keyword]: node }, locale), { [keyword]: expected }, `${locale} ${keyword}`);
+      assert.deepEqual(localizeSchema({ [keyword]: false }, locale), { [keyword]: false });
+      assert.deepEqual(localizeSchema({ [keyword]: true }, locale), { [keyword]: true });
+    }
+    for (const keyword of ['allOf', 'anyOf', 'oneOf', 'prefixItems', 'items']) {
+      assert.deepEqual(localizeSchema({ [keyword]: [node, true, false] }, locale),
+        { [keyword]: [expected, true, false] }, `${locale} ${keyword}`);
+    }
+    assert.deepEqual(localizeSchema({ dependencies: { title: ['description'], description: node } }, locale),
+      { dependencies: { title: ['description'], description: expected } });
+    assert.deepEqual(localizeSchema({ $ref: '#/$defs/title', $defs: { title: node } }, locale),
+      { $ref: '#/$defs/title', $defs: { title: expected } });
+    assert.deepEqual(localizeSchema({ 'x-schema': node }, locale), { 'x-schema': original });
+  }
+  assert.deepEqual(node, original);
 });
 
 test('product copy does not expose legacy migration or adapter terminology', () => {

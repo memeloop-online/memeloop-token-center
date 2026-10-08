@@ -263,6 +263,13 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         Some(value) => Some(value),
         None => integer("completion_tokens")?,
     };
+    let cache_hit = integer("prompt_cache_hit_tokens")?;
+    let cache_miss = integer("prompt_cache_miss_tokens")?;
+    for count in [cache_hit, cache_miss].into_iter().flatten() {
+        if !(0..=MAX_REPORTED_TOKENS).contains(&count) {
+            return Err(());
+        }
+    }
     let (reported_input, output) = match (input, output) {
         (Some(input), Some(output)) => (input, output),
         (Some(input), None) => (input, 0),
@@ -274,22 +281,52 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         (None, None) => return Ok(None),
     };
     let details_integer = |details_field: &str| -> Result<Option<i64>, ()> {
-        let Some(details) = usage.get(details_field) else {
+        let Some(details) = usage
+            .get(details_field)
+            .filter(|details| details_field != "prompt_tokens_details" || !details.is_null())
+        else {
             return Ok(None);
         };
         let details = details.as_object().ok_or(())?;
         details
             .get("cached_tokens")
+            .filter(|value| details_field != "prompt_tokens_details" || !value.is_null())
             .map(|value| value.as_i64().ok_or(()))
             .transpose()
     };
-    let cached_input = match details_integer("input_tokens_details")? {
+    let mut cached_input = match details_integer("input_tokens_details")? {
         Some(value) => value,
         None => match details_integer("prompt_tokens_details")? {
             Some(value) => value,
             None => integer("cache_read_input_tokens")?.unwrap_or_default(),
         },
     };
+    if cache_hit.is_some() || cache_miss.is_some() {
+        let prompt = integer("prompt_tokens")?.ok_or(())?;
+        if input != Some(prompt) || !(0..=MAX_REPORTED_TOKENS).contains(&prompt) {
+            return Err(());
+        }
+        if let Some(hit) = cache_hit {
+            for reported in [
+                details_integer("input_tokens_details")?,
+                details_integer("prompt_tokens_details")?,
+                integer("cache_read_input_tokens")?,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if reported != hit {
+                    return Err(());
+                }
+            }
+            cached_input = hit;
+        }
+        if let Some(miss) = cache_miss
+            && cached_input.checked_add(miss) != Some(prompt)
+        {
+            return Err(());
+        }
+    }
     let cache_write = if let Some(value) = integer("cache_creation_input_tokens")? {
         value
     } else if let Some(details) = usage.get("cache_creation") {
@@ -386,6 +423,111 @@ pub(super) fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize
         capture.drain(..overflow);
     }
     capture.extend_from_slice(chunk);
+}
+
+#[cfg(test)]
+mod compatible_chat_usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(usage: Value) -> ExtractedUsage {
+        extract_buffered_usage_checked(
+            &serde_json::to_vec(&json!({"usage": usage})).unwrap(),
+            "http-json",
+            Protocol::OpenAiChat,
+        )
+    }
+
+    #[test]
+    fn documented_deepseek_cache_aliases_preserve_token_dimensions() {
+        for details in [
+            Value::Null,
+            json!({"cached_tokens": null}),
+            json!({"cached_tokens": 6}),
+        ] {
+            let ExtractedUsage::Valid(usage) = parse(json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_cache_hit_tokens": 6,
+                "prompt_cache_miss_tokens": 4,
+                "prompt_tokens_details": details
+            })) else {
+                panic!("documented cache aliases must retain provider-reported usage")
+            };
+            assert_eq!(usage.input_tokens, 4);
+            assert_eq!(usage.cached_input_tokens, 6);
+            assert_eq!(usage.output_tokens, 2);
+            assert_eq!(usage.cache_write_tokens, 0);
+        }
+        let ExtractedUsage::Valid(usage) = parse(json!({
+            "prompt_tokens": 10, "completion_tokens": 2, "prompt_cache_hit_tokens": 6
+        })) else {
+            panic!("cache hit alias without optional breakdown")
+        };
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (4, 6));
+    }
+
+    #[test]
+    fn nullable_chat_breakdown_does_not_invent_missing_usage() {
+        for details in [Value::Null, json!({"cached_tokens": null})] {
+            let ExtractedUsage::Valid(usage) = parse(json!({
+                "prompt_tokens": 10, "completion_tokens": 2, "prompt_tokens_details": details
+            })) else {
+                panic!("optional nullable Chat breakdown")
+            };
+            assert_eq!((usage.input_tokens, usage.cached_input_tokens), (10, 0));
+        }
+        for usage in [
+            Value::Null,
+            json!({"total_tokens": 12}),
+            json!({"prompt_cache_hit_tokens": 6}),
+        ] {
+            assert!(matches!(parse(usage), ExtractedUsage::Missing));
+        }
+        assert!(matches!(
+            parse(json!({"input_tokens": 10, "output_tokens": 2, "input_tokens_details": null})),
+            ExtractedUsage::Invalid
+        ));
+    }
+
+    #[test]
+    fn cache_aliases_reject_invalid_numbers_conflicts_and_nonconservation() {
+        let base = json!({
+            "prompt_tokens": 10, "completion_tokens": 2,
+            "prompt_cache_hit_tokens": 6, "prompt_cache_miss_tokens": 4
+        });
+        for field in ["prompt_cache_hit_tokens", "prompt_cache_miss_tokens"] {
+            for invalid in [
+                json!(-1),
+                json!(1.5),
+                json!("6"),
+                Value::Null,
+                json!(MAX_REPORTED_TOKENS + 1),
+                json!(u64::MAX),
+            ] {
+                let mut usage = base.clone();
+                usage[field] = invalid;
+                assert!(matches!(parse(usage), ExtractedUsage::Invalid));
+            }
+        }
+        for (field, invalid) in [
+            ("prompt_tokens_details", json!({"cached_tokens": 5})),
+            ("prompt_tokens_details", json!({"cached_tokens": "6"})),
+            ("prompt_tokens_details", json!([])),
+            ("input_tokens_details", json!({"cached_tokens": 5})),
+            ("cache_read_input_tokens", json!(5)),
+            ("prompt_cache_miss_tokens", json!(5)),
+            ("prompt_cache_hit_tokens", json!(11)),
+            ("input_tokens", json!(9)),
+            ("prompt_tokens", Value::Null),
+            ("completion_tokens", json!("2")),
+        ] {
+            let mut usage = base.clone();
+            usage[field] = invalid;
+            assert!(matches!(parse(usage), ExtractedUsage::Invalid));
+        }
+    }
 }
 
 #[cfg(test)]

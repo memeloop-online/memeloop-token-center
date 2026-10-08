@@ -415,14 +415,26 @@ const zh = {
   'providerCatalog.routesRetry': '重试读取路由', 'providerCatalog.routesIncomplete': '无法完整读取现有路由，请重试。',
   'providerCatalog.routeProtocolUnsupported': '暂不支持为此协议添加托管路由',
   'managedSync.sync': '同步模型', 'managedSync.hint': '刷新完整模型目录，并为目录中的模型创建托管路由。',
-  'managedSync.syncing': '正在同步模型与路由…', 'managedSync.done': '同步完成', 'managedSync.partial': '同步完成，部分内容需要关注',
-  'managedSync.failed': '同步未完成，请稍后重试。',
+  'managedSync.syncing': '正在同步模型与路由…', 'managedSync.done': '模型目录与路由已同步', 'managedSync.partial': '模型目录与路由需要检查',
+  'managedSync.failed': '未能取得本次同步结果。请检查账号连接后重试；已提交的操作可能仍在处理。',
+  'managedSync.permissionDenied': '当前凭据无法同步此账号。请检查登录状态和账号权限，或联系管理员。',
   'managedSync.summary': '目录 {{count}} 个模型 · 新增 {{added}} · 停用 {{disabled}} · 恢复 {{restored}} · 保留 {{unchanged}} · 跳过 {{skipped}}',
-  'managedSync.price.ready': '价格同步完成', 'managedSync.price.partial': '部分价格待处理',
+  'managedSync.price.ready': '价格同步完成', 'managedSync.price.partial': '请检查现有模型价格',
   'managedSync.price.error': '价格同步遇到问题', 'managedSync.price.skipped': '本次无价格可同步',
+  'managedSync.price.needsReview': '{{unmatched}} 个价格未匹配 · {{ambiguous}} 个待确认',
+  'managedSync.price.unmatchedHeading': '{{unmatched}} 个价格未匹配',
+  'managedSync.price.ambiguousHeading': '{{ambiguous}} 个价格待确认',
+  'managedSync.price.sourcesUnavailable': '部分价格源暂时无法读取',
   'managedSync.price.summary': '更新 {{imported}} · 保留 {{preserved}} · 未匹配 {{unmatched}} · 待确认 {{ambiguous}}',
-  'managedSync.price.sources': '待恢复的价格源：{{sources}}',
-  'managedSync.priceDeferred': '价格同步服务正在更新',
+  'managedSync.price.sources': '本次未能读取价格源：{{sources}}。可稍后重新同步，或检查现有价格。',
+  'managedSync.priceDeferred': '本次未同步价格，模型目录与路由结果不受影响。',
+  'managedSync.reviewModels': '查看模型与路由', 'managedSync.reviewPricing': '检查模型价格',
+  'managedSync.pending': '同步中…',
+  'managedSync.retry': '重新同步模型', 'managedSync.previous': '以下为上一次收到的结果，本次尚未取得新结果。',
+  'managedSync.price.reviewHelp': '未匹配表示本次没找到新价格，不代表模型不可用。请检查现有价格，补齐缺失价格并确认待定价格。',
+  'managedSync.price.preservedHelp': '原有价格已保留，未被覆盖。',
+  'managedSync.price.deferredHelp': '请检查现有价格，缺失时手动补齐。',
+  'managedSync.warning.unknown': '部分路由未完成核对，请查看模型与路由，核对配置并处理未完成的项目。',
   'managedSync.warning.sync_in_progress': '另一次同步正在进行，本次跳过路由核对，请稍后重试。',
   'managedSync.warning.partial_catalog': '目录不完整，本次跳过路由核对。',
   'managedSync.warning.empty_catalog_protected': '目录为空，已保留现有路由。',
@@ -1120,14 +1132,26 @@ const en = {
   'providerCatalog.routesRetry': 'Retry route list', 'providerCatalog.routesIncomplete': 'The existing route list could not be loaded completely. Try again.',
   'providerCatalog.routeProtocolUnsupported': 'Managed routes are not available for this protocol',
   'managedSync.sync': 'Sync models', 'managedSync.hint': 'Refresh the complete model catalog and create managed routes for catalog models.',
-  'managedSync.syncing': 'Syncing models and routes…', 'managedSync.done': 'Sync complete', 'managedSync.partial': 'Sync finished with items to review',
-  'managedSync.failed': 'Sync did not finish. Try again shortly.',
+  'managedSync.syncing': 'Syncing models and routes…', 'managedSync.done': 'Model catalog and routes synced', 'managedSync.partial': 'Review model catalog and routes',
+  'managedSync.failed': 'No result was received for this sync. Check the account connection before retrying; submitted changes may still be processing.',
+  'managedSync.permissionDenied': 'This credential cannot sync the account. Check your sign-in and account permissions, or contact an administrator.',
   'managedSync.summary': '{{count}} models in catalog · {{added}} added · {{disabled}} disabled · {{restored}} restored · {{unchanged}} kept · {{skipped}} skipped',
-  'managedSync.price.ready': 'Prices synced', 'managedSync.price.partial': 'Some prices need attention',
+  'managedSync.price.ready': 'Prices synced', 'managedSync.price.partial': 'Check existing model prices',
   'managedSync.price.error': 'Price sync encountered a problem', 'managedSync.price.skipped': 'No prices to sync this time',
+  'managedSync.price.needsReview': '{{unmatched}} prices unmatched · {{ambiguous}} need confirmation',
+  'managedSync.price.unmatchedHeading': '{{unmatched}} prices unmatched',
+  'managedSync.price.ambiguousHeading': '{{ambiguous}} prices need confirmation',
+  'managedSync.price.sourcesUnavailable': 'Some price sources could not be read',
   'managedSync.price.summary': '{{imported}} updated · {{preserved}} preserved · {{unmatched}} unmatched · {{ambiguous}} need review',
-  'managedSync.price.sources': 'Price sources awaiting recovery: {{sources}}',
-  'managedSync.priceDeferred': 'Price sync service is updating',
+  'managedSync.price.sources': 'Could not read price sources: {{sources}}. Try syncing later or check existing prices.',
+  'managedSync.priceDeferred': 'Prices were not synced this time. The catalog and route results are unaffected.',
+  'managedSync.reviewModels': 'Review models and routes', 'managedSync.reviewPricing': 'Review model prices',
+  'managedSync.pending': 'Syncing…',
+  'managedSync.retry': 'Sync models again', 'managedSync.previous': 'These are the last received results. No new result has been received for this attempt.',
+  'managedSync.price.reviewHelp': 'Unmatched means no new price was found; the model may still be usable. Check existing prices, add missing prices and confirm uncertain matches.',
+  'managedSync.price.preservedHelp': 'Previous prices were kept and were not overwritten.',
+  'managedSync.price.deferredHelp': 'Check existing prices and add any missing prices manually.',
+  'managedSync.warning.unknown': 'Some routes could not be checked. Review models and routes, confirm their configuration, and address the remaining items.',
   'managedSync.warning.sync_in_progress': 'Another sync is in progress; route reconciliation was skipped. Retry shortly.',
   'managedSync.warning.partial_catalog': 'The catalog is incomplete; route reconciliation was skipped.',
   'managedSync.warning.empty_catalog_protected': 'The catalog is empty; existing routes were kept.',
@@ -1470,22 +1494,36 @@ export function useI18n() {
 }
 
 export function localizeSchema<T>(schema: T, locale: Locale): T {
-  if (!schema || typeof schema !== 'object') return schema;
-  if (Array.isArray(schema)) return schema.map((item) => localizeSchema(item, locale)) as T;
-  const source = schema as Record<string, unknown>;
-  const localized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if ((key === 'title' || key === 'description') && typeof value === 'string') {
-      localized[key] = translationCatalogs[locale][`schema.${value}`] ?? value;
-    } else if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
-      localized[key] = Object.fromEntries(Object.entries(value).map(([property, definition]) => {
-        const next = localizeSchema(definition, locale) as Record<string, unknown>;
-        if (!next.title && schemaFields[property]) next.title = schemaFields[property][locale === 'zh-CN' ? 0 : 1];
-        return [property, next];
-      }));
-    } else {
-      localized[key] = localizeSchema(value, locale);
-    }
+  const schemaKeywords = new Set([
+    'additionalProperties', 'unevaluatedProperties', 'propertyNames',
+    'additionalItems', 'unevaluatedItems', 'contains', 'contentSchema',
+    'not', 'if', 'then', 'else',
+  ]);
+  const schemaMapKeywords = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas', 'dependencies']);
+  const schemaArrayKeywords = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
+  function visit(node: unknown): unknown {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+    return Object.fromEntries(Object.entries(node).map(([key, value]) => {
+      if ((key === 'title' || key === 'description') && typeof value === 'string') {
+        return [key, translationCatalogs[locale][`schema.${value}`] ?? value];
+      }
+      if (schemaMapKeywords.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
+        return [key, Object.fromEntries(Object.entries(value).map(([property, definition]) => {
+          const next = visit(definition);
+          if (key === 'properties' && next && typeof next === 'object' && !Array.isArray(next)
+            && Object.hasOwn(schemaFields, property)) {
+            const field = next as Record<string, unknown>;
+            if (!field.title) field.title = schemaFields[property][locale === 'zh-CN' ? 0 : 1];
+          }
+          return [property, next];
+        }))];
+      }
+      if ((schemaArrayKeywords.has(key) || key === 'items') && Array.isArray(value)) {
+        return [key, value.map(visit)];
+      }
+      if (schemaKeywords.has(key) || key === 'items') return [key, visit(value)];
+      return [key, value];
+    }));
   }
-  return localized as T;
+  return visit(schema) as T;
 }

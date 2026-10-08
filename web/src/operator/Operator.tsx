@@ -184,7 +184,11 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;
-        case 'providers': page = <ProvidersPage {...pageProps} onOpenRequest={openRequestById} />; break;
+        case 'providers': page = <ProvidersPage {...pageProps} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
+          if (!scope.tenants.some(value => value.external_id === tenant)) return;
+          scope.setTenant(tenant);
+          navigate('pricing');
+        }} />; break;
         case 'routes': page = <RoutesPage {...pageProps} />; break;
         case 'pricing': page = <PricingPage {...pageProps} />; break;
         case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;

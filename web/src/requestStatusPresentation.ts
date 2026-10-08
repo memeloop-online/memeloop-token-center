@@ -24,6 +24,16 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
 };
 
+// Localized fixed reasons; archived supplier messages are never UI copy.
+const supplierFailureCopy: Record<string, [string, string]> = {
+  no_active_plan: ['当前上游账号没有可用套餐，需在提供商处开通或更换账号。', 'The upstream account has no active plan. Activate a plan with the provider or use another account.'],
+  insufficient_quota: ['当前上游账号额度不足，需在提供商处补充额度或更换账号。', 'The upstream account has insufficient quota. Add quota with the provider or use another account.'],
+  authentication_invalid: ['上游账号凭据无效，需检查或更换该账号的凭据。', 'The upstream account credentials are invalid. Check or replace the account credentials.'],
+  authentication_expired: ['上游账号凭据已过期，需更新该账号的凭据。', 'The upstream account credentials have expired. Update the account credentials.'],
+  rate_limited: ['上游服务已限制请求频率，请稍后重试。', 'The upstream service has limited the request rate. Try again later.'],
+  model_unavailable: ['上游账号无法使用所请求的模型，需检查模型权限或更换模型。', 'The requested model is unavailable to the upstream account. Check model access or use another model.'],
+};
+
 function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null {
   const cause = recordedFailureCopy[errorCode];
   return cause ? cause[locale === 'zh-CN' ? 0 : 1] : null;
@@ -31,7 +41,12 @@ function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null
 
 export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
   const terminal = request.terminal_cause_code ? recordedCause(request.terminal_cause_code, locale) : null;
-  return terminal ?? (request.error_code ? recordedCause(request.error_code, locale) : null);
+  const transport = terminal ?? (request.error_code ? recordedCause(request.error_code, locale) : null);
+  if (transport) return transport;
+  if (!['failed', 'interrupted'].includes(requestOutcome(request))) return null;
+  const supplier = request.supplier_error?.code;
+  const copy = supplier && Object.hasOwn(supplierFailureCopy, supplier) ? supplierFailureCopy[supplier] : null;
+  return copy ? copy[locale === 'zh-CN' ? 0 : 1] : null;
 }
 
 export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {

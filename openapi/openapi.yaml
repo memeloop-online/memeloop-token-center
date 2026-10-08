@@ -9554,6 +9554,11 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        supplier_error:
+          description: Fixed recorded supplier reason from a bounded native inline error envelope. Null for unknown, legacy, imported and generation records; never inferred from HTTP status or fetched from object storage.
+          oneOf:
+            - $ref: '#/components/schemas/SupplierError'
+            - type: 'null'
         usage_basis:
           type: [string, 'null']
           enum: [provider_reported, provider_estimated, contract_ceiling, not_observed, null]
@@ -9636,6 +9641,17 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RequestSessionContext'
             - type: 'null'
+    SupplierError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [no_active_plan, insufficient_quota, authentication_invalid, authentication_expired, rate_limited, model_unavailable]
+        message:
+          type: string
+          description: Fixed explanation reconstructed from the supported reason; never stored arbitrary supplier text.
     RequestLifecycleState:
       type: string
       enum: [preparing, queued, submitting, running, cancelling, pending, succeeded, failed, cancelled]
