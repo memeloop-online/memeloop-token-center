@@ -55,6 +55,7 @@ mod routing_persistence;
 mod routing_price_snapshot;
 mod soonest_reset;
 mod sse_delivery;
+mod upstream_error_details;
 
 fn pinned_request_envelope_changed(
     pinned_route: Option<Uuid>,

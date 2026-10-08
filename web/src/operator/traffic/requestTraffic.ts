@@ -267,6 +267,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     cost: event.cost,
     error_code: event.error_code,
     terminal_cause_code: event.terminal_cause_code ?? previous?.terminal_cause_code ?? null,
+    supplier_error: event.supplier_error ?? previous?.supplier_error ?? null,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };

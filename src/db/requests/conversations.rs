@@ -1742,6 +1742,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     billing,
                     error_code,
                     terminal_cause_code: row.try_get("terminal_cause_code")?,
+                    supplier_error: None,
                     archive_state: crate::model::RequestArchiveState::from_storage(
                         row.try_get::<String, _>("archive_state")?.as_str(),
                     )

@@ -1,3 +1,9 @@
+/** Fixed semantic reason recorded by the server; never arbitrary upstream text. */
+export interface SupplierError {
+  code: string;
+  message: string;
+}
+
 export interface RequestView {
   /** Recorded token provenance; null/absence is historical unknown, not provider actual. */
   usage_basis?: 'provider_reported' | 'provider_estimated' | 'contract_ceiling' | 'not_observed' | null;
@@ -28,6 +34,7 @@ export interface RequestView {
   credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  supplier_error?: SupplierError | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
@@ -147,6 +154,7 @@ export interface RequestEvent {
   cost: string;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  supplier_error?: SupplierError | null;
   archive_state: RequestArchiveState;
   credential_identity?: RequestCredentialIdentity | null;
 }

@@ -250,6 +250,18 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .await
         .unwrap();
 
+    // An imported response can imitate the native envelope but has no native
+    // provenance. Neither it nor generation history gets a supplier projection.
+    let imported_safe = format!(
+        "inline-json:{}",
+        json!({"error": {
+            "type": "upstream_error", "code": "no_active_plan",
+            "message": "当前账号没有可用套餐", "mtc_safe_reason": "no_active_plan"
+        }})
+    );
+    sqlx::query("UPDATE session_archive_unlinked_requests SET response_object = $1 WHERE archive_request_id = $2 AND tenant_id = $3")
+        .bind(imported_safe).bind(archive_id.to_string()).bind(key.tenant_id.to_string())
+        .execute(&inspection).await.unwrap();
     let self_rows = state.db.list_requests(key.key_id, 10).await.unwrap();
     assert_eq!(self_rows.len(), 3);
     assert!(
@@ -262,6 +274,21 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .find(|row| row.request_id == generation_id)
         .unwrap();
     assert_eq!(generation.status_code, Some(499));
+    assert!(
+        serde_json::to_value(generation)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("supplier_error")
+            .unwrap()
+            .is_null()
+    );
+    let generation_detail = state
+        .db
+        .request_archive_refs(key.key_id, generation_id)
+        .await
+        .unwrap();
+    assert!(serde_json::to_value(&generation_detail.view).unwrap()["supplier_error"].is_null());
     assert_eq!(
         generation.lifecycle_state,
         memeloop_token_center::model::RequestLifecycleState::Cancelled
@@ -285,6 +312,14 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     assert!(archived.usage.tokens.is_none());
     assert!(archived.billing.cost.is_none());
     let archived_json = serde_json::to_value(archived).unwrap();
+    assert!(
+        archived_json
+            .as_object()
+            .unwrap()
+            .get("supplier_error")
+            .unwrap()
+            .is_null()
+    );
     assert!(archived_json["input_tokens"].is_null());
     assert!(archived_json["output_tokens"].is_null());
     assert!(archived_json["cost"].is_null());
@@ -378,6 +413,15 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .find(|event| event.request_id == generation_id)
         .unwrap();
     assert_eq!(cancelled_event.status_code, Some(499));
+    assert!(
+        serde_json::to_value(cancelled_event)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("supplier_error")
+            .unwrap()
+            .is_null()
+    );
     assert_eq!(
         cancelled_event.lifecycle_state,
         memeloop_token_center::model::RequestLifecycleState::Cancelled
@@ -405,6 +449,14 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     assert_eq!(status, StatusCode::OK);
     assert_eq!(historical.as_array().unwrap().len(), 1);
     assert_eq!(historical[0]["request_id"], archive_id.to_string());
+    assert!(
+        historical[0]
+            .as_object()
+            .unwrap()
+            .get("supplier_error")
+            .unwrap()
+            .is_null()
+    );
     let (status, archive_detail) = get_json(
         &state,
         &format!("/internal/v1/requests/{archive_id}"),
@@ -412,6 +464,14 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(
+        archive_detail
+            .as_object()
+            .unwrap()
+            .get("supplier_error")
+            .unwrap()
+            .is_null()
+    );
     assert!(archive_detail["completed_at"].is_null());
     assert_eq!(archive_detail["source_completed_at"], archive_completed_at);
     assert_eq!(archive_detail["archive"]["request"]["complete"], true);
