@@ -457,6 +457,13 @@ td code {
 .fui-Combobox:has(> .fui-Combobox__input) {
   grid-template-columns:minmax(0,1fr) auto
 }
+@media (width <= 768px) {
+  :root .fui-Button,
+  :root :where(button,.button):not([class*="fui-"]) {
+    min-block-size:var(--mtc-touch-target,44px);
+    min-inline-size:var(--mtc-touch-target,44px)
+  }
+}
 .one-time {
   background:#2a1f0d;
   border:1px solid #a7762d;

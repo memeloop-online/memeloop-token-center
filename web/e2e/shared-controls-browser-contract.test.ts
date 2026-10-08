@@ -10,6 +10,10 @@ import { fixtureAssets } from './support/fixture-assets.js';
 const cssFiles = ['styles.css', 'operator/operator.css', 'operator/managementSurfaces.css'];
 const controls = ['refresh', 'save', 'compact', 'icon', 'disabled'];
 
+function actionHeight(fluentHeight: number, viewportWidth: number) {
+  return viewportWidth <= 768 ? Math.max(44, fluentHeight) : fluentHeight;
+}
+
 function targetsLegacyControl(selector: string) {
   return /(?:^|[\s>+~,(])(?:button|input|select|textarea)(?![\w-])|\.(?:button|secondary|compact-button)(?![\w-])/.test(selector);
 }
@@ -112,7 +116,8 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
         for (const control of controls) {
           const measured = await geometry(surface.locator(`[data-control="${control}"]`));
           const expected = references[control];
-          assert.equal(measured.height, expected.height, `${label}/${name}/${control}: Fluent height`);
+          assert.equal(measured.height, actionHeight(expected.height, width), `${label}/${name}/${control}: Fluent height with the narrow touch minimum`);
+          if (width <= 768) assert.ok(measured.width >= 44 && measured.height >= 44, `${label}/${name}/${control}: at least 44x44px without changing Fluent typography or padding`);
           assert.equal(measured.font, expected.font, `${label}/${name}/${control}: Fluent typography`);
           assert.equal(measured.lineHeight, expected.lineHeight, `${label}/${name}/${control}: Fluent line height`);
           assert.deepEqual(measured.paddingBlock, expected.paddingBlock, `${label}/${name}/${control}: Fluent block padding`);
@@ -149,10 +154,10 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${label}: no document overflow`);
       if (width <= 390) {
         assert.equal(await long.evaluate(element => getComputedStyle(element).whiteSpace), 'normal', `${label}: long action may wrap`);
-        assert.ok((await geometry(long)).height > references.refresh.height, `${label}: wrapping grows naturally rather than clipping`);
+        assert.ok((await geometry(long)).height > actionHeight(references.refresh.height, width), `${label}: wrapping grows naturally rather than clipping`);
       }
       const native = page.locator('[data-controls="native"] button').first();
-      assert.ok((await geometry(native)).height >= references.refresh.height, `${label}: native actions retain a usable baseline`);
+      assert.ok((await geometry(native)).height >= actionHeight(references.refresh.height, width), `${label}: native actions retain a usable baseline`);
       const credentialActions = page.locator('[data-controls="combobox-actions"]');
       const credentialInput = credentialActions.getByRole('combobox');
       const loadMore = credentialActions.locator('[data-control="load-more"]');
@@ -181,8 +186,15 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       }
       assert.deepEqual(columns[0], columns[1], `${label}: both credential structures share tracks regardless of action count`);
       const selected = await geometry(page.locator('[data-control="selected"]'));
-      assert.equal(selected.height, references.refresh.height, `${label}: selected state does not change button geometry`);
+      assert.equal(selected.height, actionHeight(references.refresh.height, width), `${label}: selected state does not change button geometry`);
       assert.notEqual(selected.background, references.refresh.background, `${label}: selected state remains visually distinct in the active theme`);
+      if (width <= 768) {
+        for (const action of await page.locator('.fui-Button, button:not([class*="fui-"])').all()) {
+          const measured = await geometry(action);
+          assert.ok(measured.width >= 44 && measured.height >= 44, `${label}/${measured.text}: shared narrow action target is at least 44x44px`);
+          measurements.push({ label, surface: 'narrow-touch-target', ...measured });
+        }
+      }
       await page.screenshot({ path: `${artifacts}/${label}.png`, fullPage: true });
       assert.deepEqual(errors, [], label);
       await page.close(); await baseline.close();
@@ -205,11 +217,12 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       await page.locator(route.ready).first().waitFor();
       const actions = page.locator(route.controls);
       assert.ok(await actions.count() > 0, `${route.name}: real page actions are present`);
-      const expectedHeight = route.native ? (await geometry(actions.first())).height : mediumHeight;
-      assert.ok(expectedHeight >= mediumHeight, `${route.name}: usable action baseline`);
+      const expectedHeight = route.native ? (await geometry(actions.first())).height : actionHeight(mediumHeight, width);
+      assert.ok(expectedHeight >= actionHeight(mediumHeight, width), `${route.name}: usable action baseline`);
       for (const action of await actions.all()) {
         const measured = await geometry(action);
         assert.equal(measured.height, expectedHeight, `${route.name}/${theme}/${width}: same default action height`);
+        if (width <= 768) assert.ok(measured.width >= 44 && measured.height >= 44, `${route.name}/${theme}/${width}: shared narrow target is at least 44x44px`);
         assert.ok(measured.text?.trim(), `${route.name}: visible action label`);
         assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}: action text contained`);
         measurements.push({ page: route.name, theme, viewportWidth: width, ...measured });
