@@ -97,19 +97,19 @@ test('managed sync shows per-account catalog, route, and price outcomes', { time
     });
     await page.goto(url);
 
-    const sync = page.getByRole('button', { name: '同步模型', exact: true });
+    const sync = page.locator('.managed-model-sync-row').getByRole('button');
     await sync.waitFor({ state: 'visible' });
     await sync.click();
-    await page.getByText('同步完成，部分内容需要关注', { exact: true }).waitFor();
+    await page.getByText('模型目录与路由已同步', { exact: true }).waitFor();
     await page.getByText('目录 2 个模型 · 新增 1 · 停用 0 · 恢复 0 · 保留 1 · 跳过 0', { exact: true }).waitFor();
-    await page.getByText('部分价格待处理 · 更新 7 · 保留 2 · 未匹配 1 · 待确认 3', { exact: true }).waitFor();
-    await page.getByText('待恢复的价格源：litellm', { exact: true }).waitFor();
+    await page.getByText('1 个价格未匹配 · 3 个待确认 · 更新 7 · 保留 2 · 未匹配 1 · 待确认 3', { exact: true }).waitFor();
+    await page.getByText('本次未能读取价格源：litellm。可稍后重新同步，或检查现有价格。', { exact: true }).waitFor();
     assert.deepEqual(syncTenants, ['fixture-a']);
     assert.equal(legacyPriceSyncRequests, 0, 'managed sync uses the combined server-side price result');
 
     warnings = ['sync_in_progress', 'operator_route_preserved', 'complete_catalog_unsupported'];
     await sync.click();
-    await page.getByText('同步完成，部分内容需要关注', { exact: true }).waitFor();
+    await page.getByText('模型目录与路由需要检查', { exact: true }).waitFor();
     await page.getByText('另一次同步正在进行，本次跳过路由核对，请稍后重试。', { exact: true }).waitFor();
     await page.getByText('部分路由由管理员手动管理，已保持原样。', { exact: true }).waitFor();
     await page.getByText('此接入方式无法确认目录完整性，本次跳过路由核对。', { exact: true }).waitFor();
@@ -117,7 +117,7 @@ test('managed sync shows per-account catalog, route, and price outcomes', { time
     warnings = [];
     legacyPricing = true;
     await sync.click();
-    await page.getByText('价格同步服务正在更新', { exact: true }).waitFor();
+    await page.getByText('本次未同步价格，模型目录与路由结果不受影响。', { exact: true }).waitFor();
 
     malformed = true;
     await sync.click();
@@ -382,6 +382,258 @@ test('route handoff storage survives scope mismatch and cannot prefill a foreign
     assert.equal(await foreign.getByRole('button', { name: '创建模型路由', exact: true }).getAttribute('aria-expanded'), 'false');
     assert.equal(await foreign.evaluate(() => window.managedHandoffPayloads.length), 0);
     await foreign.close();
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+
+test('managed price review actions are scoped and retries retain prior results without duplicate posts', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    await stubBrowseCatalog(page);
+    let posts = 0;
+    let releaseRetry = () => {};
+    await page.route('**/internal/v1/upstreams/managed-account/models/sync-routes**', async route => {
+      posts += 1;
+      if (posts === 1) {
+        const response = syncResponse({ models: 68 });
+        response.price_sync = { status: 'partial', currency: 'USD', imported: 17, preserved: 2, unmatched: 49, ambiguous: 0, failed_sources: ['models.dev', 'litellm'], error_code: null };
+        return route.fulfill({ json: response });
+      }
+      await new Promise<void>(resolve => { releaseRetry = resolve; });
+      return route.fulfill({ status: 502, json: { error: { code: 'unknown_vendor_error', message: 'private payload must not appear' } } });
+    });
+    await page.goto(url);
+    await page.getByRole('button', { name: '同步模型', exact: true }).click();
+    await page.getByText('模型目录与路由已同步', { exact: true }).waitFor();
+    assert.equal(await page.locator('.managed-model-sync-row button').count(), 1);
+    assert.equal(await page.getByRole('button', { name: '同步模型', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 1);
+    await page.getByText('49 个价格未匹配 · 更新 17 · 保留 2 · 未匹配 49 · 待确认 0', { exact: true }).waitFor();
+    await page.getByText('原有价格已保留，未被覆盖。', { exact: true }).waitFor();
+    await page.getByText('未匹配表示本次没找到新价格', { exact: false }).waitFor();
+    await page.evaluate(() => sessionStorage.setItem('mtc-route-draft-prefill-v1', 'existing-draft'));
+    await page.getByRole('button', { name: '查看模型与路由', exact: true }).click();
+    assert.deepEqual(JSON.parse(await page.locator('#last-action').textContent() ?? '{}'), { kind: 'models', accountId: 'managed-account', tenant: 'fixture-a' });
+    await page.getByRole('button', { name: '检查模型价格', exact: true }).click();
+    assert.deepEqual(JSON.parse(await page.locator('#last-action').textContent() ?? '{}'), { kind: 'pricing', accountId: 'managed-account', tenant: 'fixture-a' });
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-route-draft-prefill-v1')), 'existing-draft', 'review actions do not overwrite route draft handoffs');
+    await page.evaluate(() => {
+      const retry = [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.trim() === '重新同步模型');
+      retry?.click(); retry?.click();
+    });
+    await page.getByText('正在同步模型与路由…', { exact: true }).waitFor();
+    assert.equal(posts, 2);
+    assert.equal(await page.locator('.managed-model-sync-row button').count(), 1);
+    assert.equal(await page.getByRole('button', { name: '同步中…', exact: true }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 0);
+    assert.equal(await page.getByText('目录 68 个模型', { exact: false }).count(), 1);
+    assert.equal(await page.getByRole('button', { name: '检查模型价格', exact: true }).isDisabled(), true);
+    releaseRetry();
+    await page.getByRole('alert').filter({ hasText: '未能取得本次同步结果' }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 1);
+    assert.equal(await page.getByRole('button', { name: '同步模型', exact: true }).count(), 0);
+    assert.equal(await page.getByText('目录 68 个模型', { exact: false }).count(), 1);
+    assert.equal(await page.getByText('unknown_vendor_error', { exact: false }).count(), 0);
+    assert.equal(await page.getByText('private payload', { exact: false }).count(), 0);
+    await page.getByRole('button', { name: '切换租户', exact: true }).click();
+    assert.equal(await page.getByRole('button', { name: '检查模型价格', exact: true }).count(), 0);
+    assert.equal(await page.getByText('目录 68 个模型', { exact: false }).count(), 0);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('success, unmatched, error, and deferred states offer only useful actions', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    await stubBrowseCatalog(page);
+    let price: ManagedModelSyncResponse['price_sync'] = { status: 'ready', currency: 'USD', imported: 2, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: null };
+    await page.route('**/internal/v1/upstreams/managed-account/models/sync-routes**', route => route.fulfill({ json: { ...syncResponse(), price_sync: price } }));
+    await page.goto(url);
+    const sync = page.locator('.managed-model-sync-row').getByRole('button');
+    await sync.click();
+    await page.getByText('价格同步完成', { exact: false }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '检查模型价格', exact: true }).count(), 0);
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 0);
+    price = { ...price, status: 'partial', unmatched: 49 };
+    await sync.click();
+    await page.getByRole('button', { name: '检查模型价格', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 0);
+    price = { ...price, status: 'error', error_code: 'price_sync_failed' };
+    await sync.click();
+    await page.getByRole('alert').filter({ hasText: '价格同步遇到问题' }).waitFor();
+    await page.getByRole('button', { name: '重新同步模型', exact: true }).waitFor();
+    price = { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' };
+    await sync.click();
+    await page.getByText('本次未同步价格，模型目录与路由结果不受影响。', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 0);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+
+test('permission failures and unknown warnings show safe guidance without retrying automatically', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    await stubBrowseCatalog(page);
+    let posts = 0;
+    await page.route('**/internal/v1/upstreams/managed-account/models/sync-routes**', async route => {
+      posts += 1;
+      if (posts === 1) return route.fulfill({ json: syncResponse({ warnings: ['future_private_warning'] }) });
+      return route.fulfill({ status: 403, json: { error: { code: 'private_permission_code', message: 'private permission payload' } } });
+    });
+    await page.goto(url);
+    const sync = page.locator('.managed-model-sync-row').getByRole('button');
+    await sync.click();
+    await page.getByText('部分路由未完成核对', { exact: false }).waitFor();
+    assert.equal(await page.getByText('future_private_warning', { exact: false }).count(), 0);
+    await sync.click();
+    await page.getByRole('alert').filter({ hasText: '当前凭据无法同步此账号' }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '重新同步模型', exact: true }).count(), 0);
+    assert.equal(await page.getByText('private permission', { exact: false }).count(), 0);
+    assert.equal(posts, 2);
+    assert.equal(await sync.isEnabled(), true, 'a manual sync remains available after permissions are corrected outside this page');
+    await sync.click();
+    await page.getByRole('alert').filter({ hasText: '当前凭据无法同步此账号' }).waitFor();
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.managed-model-sync-row button')?.disabled);
+    assert.equal(posts, 3, 'only an explicit user action submits another request after denial');
+    await page.goto(`${url}?readonly=1`);
+    assert.equal(await sync.isDisabled(), true);
+    assert.equal(posts, 3);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+async function stubProvidersPage(page: Page, options: { denySync?: boolean; denyReads?: boolean } = {}) {
+  const reads: URL[] = [];
+  const posts: URL[] = [];
+  const unexpectedWrites: string[] = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('mtc.operator.service-credential.v1', 'fixture-token');
+    localStorage.setItem('mtc.operator.tenant.v1', 'fixture-b');
+  });
+  await page.route('**/internal/v1/**', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (request.method() === 'POST' && path === '/internal/v1/upstreams/managed-account/models/sync-routes') {
+      posts.push(url);
+      if (options.denySync && posts.length > 1) return route.fulfill({ status: 403, json: { error: { message: 'write denied' } } });
+      return route.fulfill({ json: syncResponse({ models: 68 }) });
+    }
+    if (request.method() !== 'GET') {
+      unexpectedWrites.push(path);
+      return route.fulfill({ status: 403, json: { error: { message: 'write denied' } } });
+    }
+    reads.push(url);
+    if (path === '/internal/v1/tenants') return route.fulfill({ json: [
+      { external_id: 'fixture-a', name: 'Tenant A' }, { external_id: 'fixture-b', name: 'Tenant B' },
+    ] });
+    if (path === '/internal/v1/provider-types') return route.fulfill({ json: [{
+      id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'],
+      config_schema: { type: 'object', properties: {} }, credential_schema: { type: 'object', properties: {} },
+    }] });
+    if (path === '/internal/v1/upstreams') return route.fulfill({ json: [{
+      id: 'managed-account', tenant_id: 'fixture-b', tenant_external_id: 'fixture-b', name: 'Managed account',
+      driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1,
+      status: 'active', credential_expires_at: null, can_refresh: false, can_rotate: false, can_reauthorize: false,
+      route_count: 68, config: {}, created_at: 1, updated_at: 2,
+    }] });
+    if (path === '/internal/v1/upstreams/managed-account/models') {
+      if (options.denyReads) return route.fulfill({ status: 403, json: { error: { message: 'No permission to read this model catalog.' } } });
+      return route.fulfill({ json: syncResponse({ models: 68 }).catalog });
+    }
+    if (path === '/internal/v1/model-prices/usage-summary') return route.fulfill({ json: { models: [] } });
+    if (path === '/internal/v1/model-prices' && options.denyReads) return route.fulfill({ status: 403, json: { error: { message: 'price read denied' } } });
+    if (path === '/internal/v1/transport-proxy-groups/access') return route.fulfill({ json: { can_manage: false } });
+    if (path === '/internal/v1/monitoring-snapshot') return route.fulfill({ json: { top_upstream_models: [] } });
+    if (path === '/internal/v1/upstream-availability') return route.fulfill({ json: { tenant_external_id: 'fixture-b', accounts: [] } });
+    return route.fulfill({ json: [] });
+  });
+  return { reads, posts, unexpectedWrites };
+}
+
+test('full ProvidersPage review buttons open account details and the real pricing route in the selected tenant', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    const { reads, posts, unexpectedWrites } = await stubProvidersPage(page, { denySync: true });
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    await page.goto(`${url}?full-page=1`);
+    const account = page.locator('[data-upstream-id="managed-account"]');
+    const sync = account.locator('.managed-model-sync-row').getByRole('button');
+    await sync.click();
+    await account.getByText('模型目录与路由已同步', { exact: true }).waitFor();
+    assert.equal(await account.getByRole('button', { name: '重新同步模型', exact: true }).count(), 1);
+    assert.equal(await account.getByRole('button', { name: '同步模型', exact: true }).count(), 0);
+    await sync.click();
+    await account.getByRole('alert').filter({ hasText: '当前凭据无法同步此账号' }).waitFor();
+    assert.equal(await sync.isDisabled(), true);
+    await page.evaluate(() => sessionStorage.setItem('mtc-route-draft-prefill-v1', 'existing-draft'));
+    const models = account.getByRole('button', { name: '查看模型与路由', exact: true });
+    assert.equal(await models.isEnabled(), true, 'read navigation stays available after write denial');
+    await models.click();
+    const detail = account.getByRole('region', { name: 'Managed account · 管理账号', exact: true });
+    await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/model-routes'),
+      detail.getByRole('button', { name: '查看目录（68）', exact: true }).click(),
+    ]);
+    await detail.getByText('catalog-model-0', { exact: true }).waitFor();
+    await detail.getByRole('button', { name: '返回账号列表', exact: true }).click();
+    assert.equal(await account.locator('[data-manage-account-trigger]').evaluate(element => element === document.activeElement), true);
+    const modelReads = reads.filter(value => value.pathname === '/internal/v1/upstreams/managed-account/models' || value.pathname === '/internal/v1/model-routes');
+    assert.equal(modelReads.length, 2);
+    assert.ok(modelReads.every(value => value.searchParams.get('tenant_external_id') === 'fixture-b'));
+    await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/model-prices/usage-summary'),
+      account.getByRole('button', { name: '检查模型价格', exact: true }).click(),
+    ]);
+    await page.waitForURL('**/operator?view=pricing');
+    await page.locator('#operator-panel-pricing .pricing-page').waitFor();
+    await page.getByText('0 个已使用模型', { exact: true }).waitFor();
+    assert.equal(await page.locator('.tenant-picker select').inputValue(), 'fixture-b');
+    assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.tenant.v1')), 'fixture-b');
+    const usage = reads.filter(value => value.pathname === '/internal/v1/model-prices/usage-summary');
+    assert.ok(usage.length > 0);
+    assert.ok(usage.every(value => value.searchParams.get('tenant_external_id') === 'fixture-b'));
+    assert.ok(reads.some(value => value.pathname === '/internal/v1/model-prices'));
+    assert.equal(new URL(page.url()).searchParams.toString(), 'view=pricing', 'review uses the existing route without unsupported filters');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-route-draft-prefill-v1')), 'existing-draft');
+    assert.equal(posts.length, 2, 'review actions never post another sync');
+    assert.ok(posts.every(value => value.searchParams.get('tenant_external_id') === 'fixture-b'));
+    assert.deepEqual(unexpectedWrites, []);
+    assert.deepEqual(pageErrors, []);
+  } finally {
+    await browser.close();
+    await server.close();
+  }
+});
+
+test('full ProvidersPage read denial uses existing catalog and pricing error states', { timeout: 60_000 }, async () => {
+  const { server, browser, page, url } = await openFixture();
+  try {
+    const { reads, posts, unexpectedWrites } = await stubProvidersPage(page, { denyReads: true });
+    await page.goto(`${url}?full-page=1`);
+    const account = page.locator('[data-upstream-id="managed-account"]');
+    await account.getByRole('button', { name: '同步模型', exact: true }).click();
+    await account.getByRole('button', { name: '查看模型与路由', exact: true }).click();
+    await account.getByRole('alert').filter({ hasText: 'No permission to read this model catalog.' }).waitFor();
+    await account.getByRole('button', { name: '检查模型价格', exact: true }).click();
+    await page.waitForURL('**/operator?view=pricing');
+    await page.getByRole('alert').filter({ hasText: '部分计费数据不可用，请重试。' }).waitFor();
+    await page.locator('.pricing-table-caption').filter({ hasText: '价格目录未完整加载' }).waitFor();
+    assert.equal(reads.filter(value => value.pathname === '/internal/v1/model-prices').length, 1, '403 read denial is not retried');
+    assert.equal(await page.locator('.tenant-picker select').inputValue(), 'fixture-b');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(unexpectedWrites, []);
   } finally {
     await browser.close();
     await server.close();

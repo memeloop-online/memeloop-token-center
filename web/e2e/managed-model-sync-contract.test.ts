@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  findManagedRoute, inferManagedRouteProtocol, managedSyncTone, parseManagedModelSync,
+  findManagedRoute, inferManagedRouteProtocol, managedSyncFeedback, managedSyncTone, parseManagedModelSync,
 } from '../src/operator/managedModelSync.js';
 import type { ManagedModelSyncResponse, ModelRouteView, UpstreamModelPriceSyncResult } from '../src/types.js';
 
@@ -85,4 +85,17 @@ test('managed route lookup matches tenant account, model, and protocol together'
   assert.equal(findManagedRoute([legacy], 'account', 'model-a', 'openai')?.id, 'route-1', 'legacy single-account routes still match');
   const groupOnly = { ...route, upstream_account_ids: [], upstream_account_id: undefined, candidate_upstream_account_ids: ['account'] } as ModelRouteView;
   assert.equal(findManagedRoute([groupOnly], 'account', 'model-a', 'openai')?.id, 'route-1', 'effective provider-group candidates also cover the account');
+});
+
+
+test('managed feedback separates route success from price review and meaningful retry', () => {
+  assert.deepEqual(managedSyncFeedback(response()), { routesComplete: true, reviewPrices: false, retry: false });
+  const unmatched = { ...response(), price_sync: priceSync({ status: 'partial', unmatched: 49, preserved: 2 }) };
+  assert.deepEqual(managedSyncFeedback(unmatched), { routesComplete: true, reviewPrices: true, retry: false });
+  assert.equal(managedSyncFeedback({ ...unmatched, price_sync: { ...unmatched.price_sync, failed_sources: ['models.dev', 'litellm'] } }).retry, true);
+  assert.deepEqual(managedSyncFeedback({ ...response(), price_sync: priceSync({ status: 'error', error_code: 'price_sync_failed' }) }), { routesComplete: true, reviewPrices: true, retry: true });
+  assert.deepEqual(managedSyncFeedback({ ...response(), price_sync: { status: 'deferred', currency: 'USD', imported: 0, preserved: 0, unmatched: 0, ambiguous: 0, failed_sources: [], error_code: 'managed_route_price_sync_deferred' } }), { routesComplete: true, reviewPrices: true, retry: false });
+  assert.equal(managedSyncFeedback(response({ warnings: ['complete_catalog_unsupported'] })).retry, false);
+  assert.equal(managedSyncFeedback(response({ warnings: ['sync_in_progress'] })).retry, true);
+  assert.equal(managedSyncFeedback(response({ warnings: ['future_warning'] })).routesComplete, false);
 });
