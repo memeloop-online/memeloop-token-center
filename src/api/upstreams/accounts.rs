@@ -367,7 +367,7 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct UpstreamAccountReadView {
     #[serde(flatten)]
     account: crate::provider::UpstreamAccountView,
