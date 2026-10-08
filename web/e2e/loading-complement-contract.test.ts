@@ -3,12 +3,18 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const read = (path: string) => readFile(new URL(path, import.meta.url), 'utf8');
-const [overview, plugins, requests, sessions, portal] = await Promise.all([
+const [overview, plugins, requests, sessions, portal, main, selfRequests, selfUsage, selfOverview, selfGenerations, selfGenerate] = await Promise.all([
   read('../src/operator/pages/OperatorPages.tsx'),
   read('../src/operator/pages/PluginsPage.tsx'),
   read('../src/operator/pages/RequestsPage.tsx'),
   read('../src/operator/pages/SessionsPage.tsx'),
   read('../src/self/SelfPortal.tsx'),
+  read('../src/main.tsx'),
+  read('../src/self/RequestsPage.tsx'),
+  read('../src/self/UsagePage.tsx'),
+  read('../src/self/OverviewPage.tsx'),
+  read('../src/self/GenerationsPage.tsx'),
+  read('../src/self/GeneratePage.tsx'),
 ]);
 
 test('page loading regions retain complete authority and route scopes without DOM credentials', () => {
@@ -80,4 +86,27 @@ test('portal lazy and authentication loading preserve authority reset and button
   assert.match(portal, /sequence !== authSequence\.current \|\| controller\.signal\.aborted/);
   assert.match(portal, /expectedScope === credentialScopeRef\.current/);
   assert.match(portal, /credentialView\.key_id.*credentialView\.credential_generation.*credentialScopeGeneration/);
+});
+
+test('root and self-page initial loading reuse the shared state without adding page regions', () => {
+  for (const source of [main, selfRequests, selfUsage, selfOverview, selfGenerations, selfGenerate]) {
+    assert.match(source, /<LoadingState[^>]*level="page"/);
+    assert.doesNotMatch(source, /PageLoadingRegion/);
+    assert.doesNotMatch(source, /<div className="(?:boot|empty)"(?: role="status")?>\{t\('common.loading'\)\}/);
+  }
+  assert.match(selfUsage, /<Suspense fallback=\{<LoadingState[^>]*level="section"[^>]*variant="detail"/);
+  assert.match(selfUsage, /scopedRemote\.status === 'error'/);
+  assert.match(selfUsage, /if \(!stats\) return <div className="empty">\{t\('common.noData'\)\}/);
+});
+
+test('self loading migration preserves button busy text and generation safety', () => {
+  assert.match(selfRequests, /\{loading \? t\('common.loading'\) : t\('traffic.applyFilters'\)\}/);
+  assert.match(selfRequests, /\{loading \? t\('common.loading'\) : t\('traffic.loadOlder'\)\}/);
+  assert.match(selfRequests, /sequence !== requestSequence\.current \|\| controller\.signal\.aborted/);
+  assert.match(selfGenerations, /\{loading \? t\('common.loading'\) : t\('self.refreshGenerations'\)\}/);
+  assert.match(selfGenerations, /cancellingIds\.has\(job\.job_id\) \? t\('common.loading'\) : t\('self.cancelGeneration'\)/);
+  assert.match(selfGenerations, /scope === scopeGeneration\.current && current === refreshSequence\.current/);
+  assert.match(selfGenerate, /\{submitting \? t\('common.loading'\) : t\('self.submitGeneration'\)\}/);
+  assert.match(selfGenerate, /current !== submitSequence\.current \|\| controller\.signal\.aborted/);
+  assert.match(selfGenerate, /'Idempotency-Key': crypto\.randomUUID\(\)/);
 });

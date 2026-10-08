@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { api } from '../api';
 import { Buckets, NumberMetric, RequestTable } from '../components';
-import { Button, Disclosure, Field, Input, Select } from '../design-system';
+import { Button, Disclosure, Field, Input, LoadingState, Select } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { RequestRefreshControl } from '../operator/traffic/RequestRefreshControl';
@@ -198,7 +198,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
         </div>
       </form>
       <div aria-busy={loading || refreshing}>
-        {loading && requests.length === 0 ? <div className="boot">{t('common.loading')}</div> : <RequestTable requests={requests} currency={credentialView.currency} credentialAlias={credentialView.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />}
+        {loading && requests.length === 0 ? <LoadingState label={t('common.loading')} level="page" /> : <RequestTable requests={requests} currency={credentialView.currency} credentialAlias={credentialView.alias} onSelect={onOpenRequest} onOpenSession={onOpenSession} />}
       </div>
       {hasOlder && <div className="load-more"><Button appearance="secondary" type="button" disabled={loading} onClick={() => void fetchPage(appliedFilters.current, 'append')}>{loading ? t('common.loading') : t('traffic.loadOlder')}</Button></div>}
     </article>

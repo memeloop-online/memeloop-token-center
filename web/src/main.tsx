@@ -6,6 +6,7 @@ import { SelfPortal, type SelfPortalRoute } from './self/SelfPortal';
 import type { OperatorRouteKey } from './operator/scope/operatorRoutes';
 import { I18nProvider, useI18n } from './i18n';
 import { MtcFluentProvider } from './design-system/MtcFluentProvider';
+import { LoadingState } from './design-system';
 import type { PluginNavigationSection } from './operator/pluginContributions';
 import './styles.css';
 import './theme.css';
@@ -18,7 +19,7 @@ const Operator = lazy(() => import('./operator/Operator').then((module) => ({ de
 
 function Loading() {
   const { t } = useI18n();
-  return <div className="boot">{t('common.loading')}</div>;
+  return <LoadingState label={t('common.loading')} level="page" />;
 }
 
 function Application() {
