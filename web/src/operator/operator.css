@@ -212,7 +212,7 @@
 }
 
 .typed-filter-row-actions { justify-content: end; }
-.typed-filter-row-actions button { font-size: 13px; min-width: 30px; padding: 6px; }
+.typed-filter-row-actions button:not([class*="fui-"]) { font-size: 13px; min-width: 30px; padding: 6px; }
 .typed-filter-footer { display: flex; gap: 8px; justify-content: space-between; }
 .typed-filter-footer-actions { display: flex; gap: 8px; }
 .typed-filter-presets,
@@ -263,12 +263,13 @@
 
 .filter-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
 }
 
-.filter-actions button {
+.filter-actions > button {
   flex: 1 1 auto;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .load-more {
@@ -339,21 +340,11 @@
   gap: 8px;
 }
 
-.provider-list-actions button {
-  font-size: var(--fontSizeBase200, 12px);
-  padding: 7px 10px;
-}
-
 .resource-list-status-filter {
   align-items: flex-end;
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.resource-list-status-filter button {
-  font-size: var(--fontSizeBase200, 12px);
-  padding: 7px 10px;
 }
 
 @media (width >= 1400px) {
@@ -603,16 +594,23 @@
 }
 
 .row-actions {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
+  min-width: 0;
 }
 
-.row-actions button,
-.account-meta .row-actions button {
-  font-size: var(--fontSizeBase200, 12px);
+.row-actions > span {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.row-actions button {
   margin: 0;
-  padding: 6px 9px;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .inline-editor {
@@ -689,7 +687,7 @@
   overflow-y: auto;
 }
 
-.group-list button {
+.group-list button:not([class*="fui-"]) {
   align-items: flex-start;
   background: transparent;
   border: 0;
@@ -703,7 +701,7 @@
   text-align: left;
 }
 
-.group-list button.active {
+.group-list button:not([class*="fui-"]).active {
   background: #13302f;
   color: #7de1d2;
 }
@@ -765,7 +763,7 @@
   box-shadow: 0 0 0 2px rgb(85 205 187 / 15%);
 }
 
-.multi-combobox-control input {
+.multi-combobox-control input:not([class*="fui-"]) {
   background: transparent;
   border: 0;
   box-shadow: none;
@@ -792,7 +790,7 @@
   border-style: dashed;
 }
 
-.selection-chip button {
+.selection-chip button:not([class*="fui-"]) {
   background: transparent;
   border: 0;
   color: inherit;
@@ -819,7 +817,7 @@
   display: grid;
 }
 
-.combobox-popover button {
+.combobox-popover button:not([class*="fui-"]) {
   align-items: flex-start;
   background: transparent;
   border: 0;
@@ -832,8 +830,8 @@
   text-align: left;
 }
 
-.combobox-popover button.active,
-.combobox-popover button:hover {
+.combobox-popover button:not([class*="fui-"]).active,
+.combobox-popover button:not([class*="fui-"]):hover {
   background: #17302f;
   color: #83dace;
 }
@@ -864,7 +862,7 @@
   color: var(--picker-text);
 }
 
-.combobox-popover .combobox-state button {
+.combobox-popover .combobox-state button:not([class*="fui-"]) {
   border: 1px solid var(--picker-border);
   color: var(--picker-text);
   flex: 0 0 auto;
@@ -899,19 +897,19 @@
   margin: 0;
 }
 
-.catalog-status button {
+.catalog-status button:not([class*="fui-"]) {
   flex: 0 0 auto;
   font-size: var(--fontSizeBase200, 12px);
   margin: 0;
   padding: 5px 8px;
 }
 
-.model-options button > span {
+.model-options button:not([class*="fui-"]) > span {
   display: grid;
   gap: 3px;
 }
 
-.model-options button > span:first-child {
+.model-options button:not([class*="fui-"]) > span:first-child {
   min-width: 0;
 }
 
@@ -1021,9 +1019,9 @@
   min-width: 0;
 }
 
-.managed-resource-header b,
-.managed-resource-header small,
-.managed-resource-header span {
+.managed-resource-header > div:first-child > b:not([class*="fui-"]),
+.managed-resource-header > div:first-child > small:not([class*="fui-"]),
+.managed-resource-header > div:first-child > span:not([class*="fui-"]) {
   display: block;
 }
 
@@ -1035,7 +1033,7 @@
   overflow-wrap: anywhere;
 }
 
-.managed-resource-header span {
+.managed-resource-header > div:first-child > span:not([class*="fui-"]) {
   color: #788d94;
   font-size: var(--fontSizeBase200, 12px);
   overflow-wrap: anywhere;
@@ -1177,15 +1175,15 @@
   margin-top: 0;
 }
 
-.compact-button {
+.compact-button:not([class*="fui-"]) {
   min-width: 34px;
   padding: 9px;
 }
 
 .danger {
   background: transparent;
-  border-color: #6d3333;
-  color: #eb8585;
+  border-color: var(--colorPaletteRedBorder1, #6d3333);
+  color: var(--colorPaletteRedForeground1, #eb8585);
 }
 
 .sync-details {
@@ -1451,9 +1449,9 @@
   gap: 5px;
 }
 
-.usage-presets button,
-.usage-tabs button,
-.usage-trend-points button {
+.usage-presets button:not([class*="fui-"]),
+.usage-tabs button:not([class*="fui-"]),
+.usage-trend-points button:not([class*="fui-"]) {
   background: transparent;
   border-color: #294047;
   color: #81949c;
@@ -1461,11 +1459,18 @@
   padding: 7px 10px;
 }
 
-.usage-presets button.active,
-.usage-tabs button.active {
+.usage-presets button:not([class*="fui-"]).active,
+.usage-tabs button:not([class*="fui-"]).active {
   background: #16312f;
   border-color: #2c6e64;
   color: #79dfcf;
+}
+
+.usage-presets .fui-Button[aria-pressed='true'],
+.usage-tabs .fui-Button[aria-selected='true'] {
+  background: var(--colorBrandBackground2);
+  border-color: var(--colorBrandStroke1);
+  color: var(--colorBrandForeground2);
 }
 
 .usage-custom-range,
@@ -1506,14 +1511,14 @@
   padding: 0 4px;
 }
 
-.usage-tabs button {
+.usage-tabs button:not([class*="fui-"]) {
   border: 0;
   border-bottom: 2px solid transparent;
   flex: 0 0 auto;
   padding: 11px 14px;
 }
 
-.usage-tabs button.active {
+.usage-tabs button:not([class*="fui-"]).active {
   background: transparent;
   border-bottom-color: #55cdbb;
 }
@@ -1721,9 +1726,9 @@
 
 :root[data-theme='light'] .selection-chip,
 :root[data-theme='light'] .table-chip-list span,
-:root[data-theme='light'] .group-list button.active,
-:root[data-theme='light'] .combobox-popover button.active,
-:root[data-theme='light'] .combobox-popover button:hover {
+:root[data-theme='light'] .group-list button:not([class*="fui-"]).active,
+:root[data-theme='light'] .combobox-popover button:not([class*="fui-"]).active,
+:root[data-theme='light'] .combobox-popover button:not([class*="fui-"]):hover {
   background: #dcefeb;
   border-color: #9cc8c0;
   color: #087d70;
@@ -1733,7 +1738,7 @@
   border-color: #c5d6d2;
 }
 
-:root[data-theme='light'] .group-list button {
+:root[data-theme='light'] .group-list button:not([class*="fui-"]) {
   border-bottom-color: #d4e1de;
   color: #37575d;
 }

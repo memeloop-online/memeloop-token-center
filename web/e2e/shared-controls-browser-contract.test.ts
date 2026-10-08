@@ -1,0 +1,186 @@
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import { chromium, type Locator } from 'playwright';
+import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { fixtureAssets } from './support/fixture-assets.js';
+
+const cssFiles = ['styles.css', 'operator/operator.css', 'operator/managementSurfaces.css'];
+const controls = ['refresh', 'save', 'compact', 'icon', 'disabled'];
+
+function selectors(value: string) {
+  const result: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === '(') depth += 1;
+    if (value[index] === ')') depth -= 1;
+    if (value[index] === ',' && depth === 0) {
+      result.push(value.slice(start, index));
+      start = index + 1;
+    }
+  }
+  result.push(value.slice(start));
+  return result;
+}
+
+async function geometry(control: Locator) {
+  return control.evaluate(element => {
+    const style = getComputedStyle(element);
+    const bounds = element.getBoundingClientRect();
+    return {
+      height: bounds.height, width: bounds.width, text: element.textContent,
+      font: style.font, lineHeight: style.lineHeight,
+      paddingBlock: [style.paddingTop, style.paddingBottom],
+      paddingInline: [style.paddingLeft, style.paddingRight],
+      color: style.color, background: style.backgroundColor,
+      border: [style.borderTopWidth, style.borderTopColor],
+    };
+  });
+}
+
+test('shared legacy control selectors cannot size or repaint Fluent slots', async () => {
+  for (const file of cssFiles) {
+    const css = (await readFile(new URL(`../src/${file}`, import.meta.url), 'utf8')).replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (!/(?:^|;)\s*(?:font(?:-size|-weight|-family)?|line-height|padding(?:-block|-inline)?|background|border(?:-color)?|color)\s*:/m.test(match[2])) continue;
+      for (const selector of selectors(match[1].trim())) {
+        if (!/\b(?:button|input|select|textarea)\b|^\s*\.(?:secondary|compact-button)\b/.test(selector)) continue;
+        assert.ok(selector.includes('not([class*="fui-"])') || selector.includes('not(.fui-Button)'), `${file}: legacy control rule must exclude Fluent: ${selector.trim()}`);
+      }
+    }
+  }
+  const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(styles, /:where\(button,\.button,input,select,textarea\):not\(\[class\*="fui-"\]\)/);
+  const operator = await readFile(new URL('../src/operator/operator.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(operator, /\.row-actions button,\s*\.account-meta \.row-actions button/);
+  assert.match(operator, /\.row-actions,\s*\.row-actions button\s*\{\s*width:\s*100%/);
+});
+
+test('shared page action contexts retain Fluent geometry, labels, keyboard focus and theme', async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required for shared controls');
+    context.skip('Chromium required'); return;
+  }
+  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/shared-controls/', import.meta.url));
+  await mkdir(artifacts, { recursive: true });
+  const measurements: unknown[] = [];
+  let mediumHeight = 0;
+  try {
+    for (const locale of ['en', 'zh-CN']) for (const theme of ['light', 'dark']) for (const width of [320, 390, 1440]) {
+      const label = `${locale}-${theme}-${width}`;
+      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      const baseline = await browser.newPage({ viewport: { width, height: 900 } });
+      const errors: string[] = [];
+      for (const target of [page, baseline]) {
+        target.on('pageerror', error => errors.push(error.message));
+        await target.route('**/*', async route => {
+          assert.equal(new URL(route.request().url()).origin, origin, 'fixture makes no external requests');
+          await route.continue();
+        });
+      }
+      const query = `locale=${locale}&theme=${theme}`;
+      await baseline.goto(`${origin}/e2e/fixtures/shared-controls.html?${query}&baseline=1`);
+      await page.goto(`${origin}/e2e/fixtures/shared-controls.html?${query}`);
+      await page.locator('[data-controls="fields"] .fui-Switch').waitFor();
+      await baseline.locator('[data-controls="fields"] .fui-Switch').waitFor();
+      await page.screenshot({ path: `${artifacts}/${label}.png`, fullPage: true });
+      const references = Object.fromEntries(await Promise.all(controls.map(async control => [control, await geometry(baseline.locator(`[data-controls="reference"] [data-control="${control}"]`))])));
+      mediumHeight = references.refresh.height;
+      assert.ok(references.compact.height < references.refresh.height, `${label}: explicit small action remains compact`);
+      assert.ok(references.icon.width < references.refresh.width, `${label}: icon-only action keeps Fluent icon sizing`);
+      const surfaces = page.locator('[data-controls]').filter({ has: page.locator('[data-control="refresh"]') });
+      for (const surface of await surfaces.all()) {
+        const name = await surface.getAttribute('data-controls');
+        for (const control of controls) {
+          const measured = await geometry(surface.locator(`[data-control="${control}"]`));
+          const expected = references[control];
+          assert.equal(measured.height, expected.height, `${label}/${name}/${control}: Fluent height`);
+          assert.equal(measured.font, expected.font, `${label}/${name}/${control}: Fluent typography`);
+          assert.equal(measured.lineHeight, expected.lineHeight, `${label}/${name}/${control}: Fluent line height`);
+          assert.deepEqual(measured.paddingBlock, expected.paddingBlock, `${label}/${name}/${control}: Fluent block padding`);
+          assert.deepEqual(measured.paddingInline, expected.paddingInline, `${label}/${name}/${control}: Fluent inline padding`);
+          assert.equal(measured.color, expected.color, `${label}/${name}/${control}: theme foreground`);
+          assert.equal(measured.background, expected.background, `${label}/${name}/${control}: theme background`);
+          assert.deepEqual(measured.border, expected.border, `${label}/${name}/${control}: theme border`);
+          assert.equal(measured.text, expected.text, `${label}/${name}/${control}: complete label`);
+          measurements.push({ label, surface: name, control, ...measured });
+        }
+        const action = surface.locator('[data-control="refresh"]');
+        await action.focus();
+        await page.keyboard.press('Tab');
+        await page.keyboard.press('Shift+Tab');
+        assert.equal(await action.evaluate(element => document.activeElement === element), true, `${label}/${name}: keyboard target`);
+        assert.equal(await action.evaluate(element => {
+          const styles = [getComputedStyle(element), getComputedStyle(element, '::before'), getComputedStyle(element, '::after')];
+          return styles.some(style => (style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0)
+            || (style.content !== 'none' && style.opacity !== '0' && style.borderTopStyle === 'solid' && parseFloat(style.borderTopWidth) >= 2 && style.borderTopColor !== 'rgba(0, 0, 0, 0)'));
+        }), true, `${label}/${name}: visible Fluent keyboard focus`);
+        await page.keyboard.press('Enter');
+        assert.equal(await surface.locator('output').textContent(), '1', `${label}/${name}: keyboard activates the original action`);
+      }
+      for (const selector of ['.fui-Input__input', '.fui-Select__select', '.fui-Textarea__textarea', '.fui-Combobox__input', '.fui-Dropdown__button', '.fui-Checkbox__input', '.fui-Switch__input']) {
+        const measured = await geometry(page.locator(`[data-controls="fields"] ${selector}`));
+        const expected = await geometry(baseline.locator(`[data-controls="fields"] ${selector}`));
+        assert.equal(measured.height, expected.height, `${label}/${selector}: Fluent field geometry`);
+        assert.equal(measured.font, expected.font, `${label}/${selector}: Fluent field text`);
+        assert.deepEqual(measured.paddingBlock, expected.paddingBlock, `${label}/${selector}: field block padding`);
+        assert.deepEqual(measured.paddingInline, expected.paddingInline, `${label}/${selector}: field inline padding`);
+      }
+      const long = page.locator('[data-controls="long-label"] [data-control="long"]');
+      assert.equal(await long.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${label}: long action text fits its own control`);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${label}: no document overflow`);
+      if (width <= 390) {
+        assert.equal(await long.evaluate(element => getComputedStyle(element).whiteSpace), 'normal', `${label}: long action may wrap`);
+        assert.ok((await geometry(long)).height > references.refresh.height, `${label}: wrapping grows naturally rather than clipping`);
+      }
+      const native = page.locator('[data-controls="native"] button').first();
+      assert.ok((await geometry(native)).height >= references.refresh.height, `${label}: native actions retain a usable baseline`);
+      const selected = await geometry(page.locator('[data-control="selected"]'));
+      assert.equal(selected.height, references.refresh.height, `${label}: selected state does not change button geometry`);
+      assert.notEqual(selected.background, references.refresh.background, `${label}: selected state remains visually distinct in the active theme`);
+      await page.screenshot({ path: `${artifacts}/${label}.png`, fullPage: true });
+      assert.deepEqual(errors, [], label);
+      await page.close(); await baseline.close();
+    }
+    const pages = [
+      { name: 'providers', fixture: 'form-journey.html?workflows', ready: '.provider-directory-actions .fui-Button', controls: '.provider-directory-actions .fui-Button', native: false },
+      { name: 'routes', fixture: 'form-journey.html?workflows&view=routes', ready: '.model-route-list .row-actions button', controls: '.model-route-list .row-actions button', native: true },
+      { name: 'usage', fixture: 'usage-analysis.html', ready: '.usage-heading .fui-Button', controls: '.usage-heading .fui-Button, .usage-presets .fui-Button, .usage-tabs .fui-Button', native: false },
+    ];
+    for (const route of pages) for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
+      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+      await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'en'); });
+      await page.route('**/*', async request => {
+        assert.equal(new URL(request.request().url()).origin, origin, 'real page fixture stays local');
+        await request.continue();
+      });
+      await page.goto(`${origin}/e2e/fixtures/${route.fixture}`);
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      await page.locator(route.ready).first().waitFor();
+      const actions = page.locator(route.controls);
+      assert.ok(await actions.count() > 0, `${route.name}: real page actions are present`);
+      const expectedHeight = route.native ? (await geometry(actions.first())).height : mediumHeight;
+      assert.ok(expectedHeight >= mediumHeight, `${route.name}: usable action baseline`);
+      for (const action of await actions.all()) {
+        const measured = await geometry(action);
+        assert.equal(measured.height, expectedHeight, `${route.name}/${theme}/${width}: same default action height`);
+        assert.ok(measured.text?.trim(), `${route.name}: visible action label`);
+        assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}: action text contained`);
+        measurements.push({ page: route.name, theme, width, ...measured });
+      }
+      await page.screenshot({ path: `${artifacts}/page-${route.name}-${theme}-${width}.png`, fullPage: true });
+      assert.deepEqual(errors, [], route.name);
+      await page.close();
+    }
+    await writeFile(`${artifacts}/measurements.json`, JSON.stringify(measurements, null, 2));
+  } finally { await browser.close(); await server.close(); }
+});
