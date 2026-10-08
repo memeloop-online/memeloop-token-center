@@ -50,6 +50,7 @@ import { authorizationCompleteError, canReauthorizeAccount, claudeCompletionLimi
 import { providerConnectionCopy } from '../providerConnectionCopy';
 import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
+import { useNavigationGuard } from '../../app/NavigationGuard';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
 import { CredentialRouteAuthorization } from '../CredentialRouteAuthorization';
 import { RouteListSource } from '../RouteListSource';
@@ -467,10 +468,20 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   const connectionCopy = providerConnectionCopy(locale);
+  async function requestLeaveProviderWorkspace() {
+    if (proxyEditorOpen || busy || !ownsWorkspace()) return false;
+    const authorizationOpen = Boolean(reauthorizing || (providerWorkspaceOpen && method === 'authorization'));
+    const settingsDirty = editing && providerEditDraft && JSON.stringify(providerEditDraft) !== JSON.stringify({ name: editing.name, config: editing.config });
+    const createDraft = providerCreateDrafts[providerDraftKey];
+    const createDirty = providerWorkspaceOpen && method === 'direct' && createDraft && JSON.stringify(createDraft) !== JSON.stringify(createControlledDraft);
+    if (authorizationOpen) {
+      if (!await confirm(t('providers.confirmLeaveAuthorization'))) return false;
+    } else if ((settingsDirty || createDirty || rotating) && !await confirm(connectionCopy.discard)) return false;
+    return ownsWorkspace();
+  }
+  useNavigationGuard(requestLeaveProviderWorkspace);
   async function leaveProviderSettings(action: () => void) {
-    if (proxyEditorOpen || busy) return;
-    if (providerEditDraft && editing && JSON.stringify(providerEditDraft) !== JSON.stringify({ name: editing.name, config: editing.config }) && !await confirm(connectionCopy.discard)) return;
-    if (!ownsWorkspace()) return;
+    if (!await requestLeaveProviderWorkspace()) return;
     setProviderEditDraft(undefined);
     action();
   }
@@ -554,7 +565,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     </section>;
   }
   const providerWorkspaceActive = providerWorkspaceOpen || Boolean(editing || rotating || reauthorizing);
-  return <TransportProxyGroups key={`${token}\0${writeTenant}`} token={token} tenant={writeTenant} accounts={values} onChanged={onChanged} onNavigate={onOpenProxyGroups ? (accountId?: string) => void leaveProviderSettings(() => onOpenProxyGroups(accountId)) : undefined}>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
+  return <TransportProxyGroups key={`${token}\0${writeTenant}`} token={token} tenant={writeTenant} accounts={values} onChanged={onChanged} onNavigate={onOpenProxyGroups}>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section ref={providerList} className="provider-layout">
     <article className="panel provider-list" hidden={Boolean(workspace)}><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
       <div className="row-actions quota-read-toolbar"><Button appearance="secondary" type="button" disabled={!token || !values.some(account => account.status === 'active' && Boolean(account.tenant_external_id ?? tenant)) || Boolean(quotaReads.progress?.busy) || Object.values(quotaReads.entries).some(entry => entry.busy)} onClick={() => void quotaReads.readAll()}>{t('quota.refreshAll')}</Button>{quotaReads.progress && <span role="status">{t(quotaReads.progress.busy ? 'quota.batchProgress' : 'quota.batchComplete', { done: formatNumber(quotaReads.progress.done, locale), total: formatNumber(quotaReads.progress.total, locale) })}</span>}</div>
       {error && !workspace && <div className="notice error" role="alert">{error}</div>}{providerListRetry && <Button appearance="secondary" type="button" disabled={Boolean(busy)} onClick={() => void reloadCreatedProviderList()}>{t('providers.reloadAccountList')}</Button>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && !workspace && <div ref={providerSuccess} tabIndex={-1} className="notice success" role="status">{message}</div>}
