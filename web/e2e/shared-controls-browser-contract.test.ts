@@ -175,7 +175,7 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
         assert.equal(measured.height, expectedHeight, `${route.name}/${theme}/${width}: same default action height`);
         assert.ok(measured.text?.trim(), `${route.name}: visible action label`);
         assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}: action text contained`);
-        measurements.push({ page: route.name, theme, width, ...measured });
+        measurements.push({ page: route.name, theme, viewportWidth: width, ...measured });
       }
       await page.screenshot({ path: `${artifacts}/page-${route.name}-${theme}-${width}.png`, fullPage: true });
       assert.deepEqual(errors, [], route.name);
