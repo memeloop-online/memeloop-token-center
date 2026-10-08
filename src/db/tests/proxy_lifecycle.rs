@@ -1,5 +1,139 @@
 use super::super::*;
 
+async fn forwarding_admission_state(database: &Database, key: &AuthenticatedKey) -> Vec<i64> {
+    let row = sqlx::query(
+        "SELECT available_micros, reserved_micros,
+            (SELECT reserved_micros FROM key_budget_state WHERE key_id = $1) AS key_reserved,
+            (SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1) AS reservations,
+            (SELECT COUNT(*) FROM request_records WHERE key_id = $1) AS requests,
+            (SELECT COUNT(*) FROM request_record_locators WHERE key_id = $1) AS locators,
+            (SELECT COALESCE(SUM(requests), 0) FROM rate_limit_windows WHERE key_id = $1) AS rate_requests,
+            (SELECT COALESCE(SUM(tokens), 0) FROM rate_limit_windows WHERE key_id = $1) AS rate_tokens
+         FROM credit_accounts WHERE id = $2",
+    )
+    .bind(key.key_id.to_string())
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    (0..8).map(|index| row.get::<i64, _>(index)).collect()
+}
+
+#[tokio::test]
+async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_modes() {
+    for mode in [EnforcementMode::Prepaid, EnforcementMode::MeteredUnlimited] {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("forwarding-admission.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"forwarding admission regression pepper";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "forwarding-admission".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "forwarding-admission".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy {
+                        enforcement_mode: mode,
+                        max_concurrency: 8,
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = database
+            .upsert_model_price("public-model", "USD", Decimal::ONE, Decimal::ONE)
+            .await
+            .unwrap();
+        let before = forwarding_admission_state(&database, &key).await;
+        let request_id = Uuid::now_v7();
+        let input = |request_id| StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 100,
+            output_token_ceiling: 100,
+            protocol: "openai",
+            model: "public-model",
+            request_object: "gap://forwarding-admission/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        };
+        let reservation = database
+            .start_proxy_forwarding_request(input(request_id), Some("selected-upstream-model"))
+            .await
+            .unwrap();
+        let snapshot: (String, i64, i64) = sqlx::query_as(
+            "SELECT r.upstream_model, r.created_at, l.created_at
+             FROM request_records r JOIN request_record_locators l ON l.id = r.id
+             WHERE r.id = $1 AND r.reservation_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(reservation.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot.0, "selected-upstream-model");
+        assert_eq!(snapshot.1, snapshot.2);
+        let admitted = forwarding_admission_state(&database, &key).await;
+        let reserved = if mode == EnforcementMode::Prepaid {
+            200
+        } else {
+            0
+        };
+        assert_eq!(admitted[0], before[0] - reserved);
+        assert_eq!(admitted[1], before[1] + reserved);
+        assert_eq!(admitted[2], before[2] + reserved);
+        assert_eq!(&admitted[3..6], &[1, 1, 1]);
+        assert_eq!(admitted[6], i64::from(mode == EnforcementMode::Prepaid));
+        assert!(matches!(
+            database
+                .start_proxy_forwarding_request(input(request_id), Some("duplicate-model"))
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+        for trigger in [
+            "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
+            "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(IGNORE); END",
+        ] {
+            sqlx::query(trigger).execute(&database.pool).await.unwrap();
+            assert!(matches!(
+                database
+                    .start_proxy_forwarding_request(input(Uuid::now_v7()), Some("failed-model"))
+                    .await,
+                Err(AppError::Overloaded)
+            ));
+            assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+            sqlx::query("DROP TRIGGER admission_snapshot_fault")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        let persisted: String = sqlx::query_scalar(
+            "SELECT upstream_model FROM request_records WHERE id = $1 AND created_at = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(snapshot.1)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, snapshot.0);
+    }
+}
+
 struct CompletedSessionRequest<'a> {
     key: &'a AuthenticatedKey,
     price: &'a ModelPrice,
