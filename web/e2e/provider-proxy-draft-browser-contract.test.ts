@@ -358,6 +358,15 @@ test('account workspace returns without retained details, shares list tracks and
           assert.ok(Math.abs(cell.left - tracks[0][index].left) < 1, `${locale} ${width}px column ${index} shares its left boundary`);
           assert.ok(Math.abs(cell.width - tracks[0][index].width) < 1, `${locale} ${width}px column ${index} shares its width`);
         }
+        const actions = await rows.evaluateAll(elements => elements.map(row => Array.from(row.querySelectorAll('.provider-directory-actions > button'), button => {
+          const bounds = button.getBoundingClientRect();
+          return { left: bounds.left, top: bounds.top, bottom: bounds.bottom };
+        })));
+        assert.deepEqual(actions.map(buttons => buttons.length), [2, 3, 2], 'reauthorization remains available in addition to both common actions');
+        for (const buttons of actions.slice(1)) for (const index of [0, 1]) {
+          assert.ok(Math.abs(buttons[index].left - actions[0][index].left) <= 1, `${locale} ${width}px common action ${index} retains its slot`);
+        }
+        assert.ok(actions[1][2].top >= Math.max(actions[1][0].bottom, actions[1][1].bottom), 'the additional authorization action occupies its own next row');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${locale} ${width}px long names and actions reflow`);
         await page.screenshot({ path: `${artifacts}/normal-${locale}-${width}.png`, fullPage: true });
       }

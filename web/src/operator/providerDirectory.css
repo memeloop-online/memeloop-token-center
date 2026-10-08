@@ -1,5 +1,5 @@
 /* The directory is a list of summaries; one unboxed workspace holds details. */
-.provider-list .account-list.provider-directory { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(95px, .8fr) minmax(120px, 1fr) minmax(110px, 1fr) minmax(190px, 220px); gap: 0 20px; }
+.provider-list .account-list.provider-directory { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(95px, .8fr) minmax(120px, 1fr) minmax(110px, 1fr) minmax(200px, 220px); gap: 0 20px; }
 .provider-directory .account.provider-account { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; gap: 0 20px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; min-width: 0; }
 .provider-directory-row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; gap: 20px; padding: 20px 0; border-bottom: 1px solid var(--picker-border); min-width: 0; }
 .provider-directory > .empty { grid-column: 1 / -1; }
@@ -10,8 +10,9 @@
 .provider-directory-identity > span, .provider-directory-summary small { color: var(--picker-muted); font-size: 12px; }
 .provider-directory-summary { font-size: 13px; }
 .provider-directory-summary > span { overflow-wrap: anywhere; max-width: 100%; }
-.provider-directory-actions { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.provider-directory-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 8px; min-width: 0; }
 .provider-directory-actions > .fui-Button { max-width: 100%; white-space: normal; }
+.provider-directory-actions > [data-reauthorization-trigger] { grid-column: 1 / -1; justify-self: start; }
 .provider-sync-slot { grid-column: 1 / -1; }
 .managed-model-sync { display: grid; gap: 8px; justify-items: start; }
 .managed-model-sync-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
@@ -40,14 +41,15 @@
 @media (max-width: 1100px) {
   .provider-list .account-list.provider-directory { grid-template-columns: minmax(160px, 2fr) minmax(0, 1fr) minmax(0, 1fr); column-gap: 16px; }
   .provider-directory .account.provider-account, .provider-directory-row { column-gap: 16px; }
-  .provider-directory-actions { justify-content: flex-end; grid-column: 2 / -1; }
+  .provider-directory-actions { grid-column: 2 / -1; }
 }
 @media (max-width: 600px) {
   .provider-list .account-list.provider-directory { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
   .provider-directory .account.provider-account, .provider-directory-row { column-gap: 12px; }
   .provider-directory-row { row-gap: 16px; padding-block: 20px; }
   .provider-directory-identity { grid-column: 1 / -1; }
-  .provider-directory-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .provider-directory-actions { grid-column: 1 / -1; }
   .provider-layout > .provider-detail-workspace { padding: 20px 0; }
   .provider-detail-heading { align-items: flex-start; }
+  .provider-detail-heading h3 { flex: 1 0 100%; }
 }
