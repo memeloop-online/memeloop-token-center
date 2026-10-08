@@ -287,7 +287,7 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     await page.waitForFunction(() => window.formJourneyWrites === 1);
     assert.equal(await submit.isEnabled(), false);
     assert.equal(await workspace.getByRole('button', { name: 'Account authorization', exact: true }).isEnabled(), false);
-    assert.equal(await workspace.getByRole('combobox', { name: 'Service provider', exact: true }).isEnabled(), false);
+    assert.equal(await workspace.getByRole('button', { name: 'Service provider 自部署模型', exact: true }).isEnabled(), false);
     assert.equal(await workspace.locator('[data-workspace-toggle]').isEnabled(), false);
     await page.evaluate(() => window.releaseFormProviderCreate(400));
     await workspace.getByRole('alert').waitFor();
