@@ -240,7 +240,9 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
         assert.equal(text.includes('http-json'), false);
       }
       const details = await manageProviderAccount(page, firstId);
-      await details.locator('.provider-detail-heading > span').hover();
+      const accountInformation = details.locator('.provider-detail-heading').getByText(chinese ? '账户信息' : 'Account information', { exact: true });
+      assert.equal(await accountInformation.getAttribute('tabindex'), '0', 'the visible account information label owns the tooltip');
+      await accountInformation.hover();
       await page.getByRole('tooltip').last().waitFor();
       for (const text of await page.getByRole('tooltip').allTextContents()) {
         assert.equal(text.includes(firstId), false);
@@ -409,12 +411,19 @@ test('account workspace returns without retained details, shares list tracks and
         await editProviderAccount(page, 'account-fixture-a');
         await name.fill(refreshFailure ? 'Saved despite refresh failure' : 'Saved account workspace');
         failNextListRead = refreshFailure;
+        const failedRead = refreshFailure ? page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/upstreams' && response.request().method() === 'GET' && response.status() === 503) : undefined;
         await editor.locator('.rjsf > button[type="submit"]').click();
         await details.getByRole('heading', { name: refreshFailure ? 'Saved despite refresh failure' : 'Saved account workspace', exact: true }).waitFor();
         assert.equal(await editor.count(), 0, 'saving returns to the same account layer');
         assert.equal(await rows.first().isVisible(), false);
         await details.getByRole('status').filter({ hasText: chinese ? '已更新' : 'Updated' }).waitFor();
-        if (refreshFailure) await details.getByRole('alert').filter({ hasText: 'Fixture list refresh unavailable' }).waitFor();
+        if (refreshFailure) {
+          await failedRead;
+          await details.getByRole('alert').getByText(chinese ? '请求失败' : 'Request failed', { exact: true }).waitFor();
+          await page.getByRole('alert').filter({ hasText: 'Fixture list refresh unavailable' }).waitFor();
+          assert.equal(await details.getByText('Fixture list refresh unavailable', { exact: true }).count(), 0, 'the account callback retains its safe localized failure message');
+          assert.equal(await details.getByRole('heading', { name: 'Saved despite refresh failure', exact: true }).count(), 1, 'failed directory refresh retains the saved account snapshot');
+        }
         for (const width of [1440, 390]) {
           await page.setViewportSize({ width, height: 1000 });
           await page.screenshot({ path: `${artifacts}/saved-${refreshFailure ? 'refresh-failed' : 'ready'}-${locale}-${width}.png`, fullPage: true });
