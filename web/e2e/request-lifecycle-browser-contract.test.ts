@@ -207,3 +207,67 @@ test('request detail follows terminal events and fences late responses after sel
     await localized.close();
   } finally { await browser.close(); await server.close(); }
 });
+
+
+test('supplier cause stays shared through list, keyboard tooltip, detail and terminal refresh in both locales', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const [locale, reason, prefix, close, label] of [
+      ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因', '关闭', '失败'],
+      ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause', 'Close', 'Failed'],
+    ] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?supplier-error`);
+      const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+      await row.locator('[data-outcome="failed"]').waitFor();
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${prefix}: ${reason}`);
+      assert.equal((await row.innerText()).split(reason).length - 1, 0);
+      await row.locator('.request-outcome').focus();
+      const tooltip = page.getByRole('tooltip').filter({ hasText: reason });
+      await tooltip.waitFor();
+      assert.equal(await tooltip.innerText(), `${prefix}: ${reason}`);
+      assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
+      await row.locator('.table-action').click();
+      const drawer = page.getByRole('dialog', { name: 'model-a' });
+      const visibleCause = drawer.locator('.request-status-cause').and(drawer.getByText(`${prefix}: ${reason}`, { exact: true }));
+      await drawer.locator('.close').focus();
+      await tooltip.waitFor({ state: 'hidden' });
+      await visibleCause.waitFor();
+      assert.equal(await visibleCause.count(), 1);
+      assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
+      assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
+      await drawer.locator('.request-outcome').focus();
+      await tooltip.waitFor();
+      assert.equal(await tooltip.innerText(), `${prefix}: ${reason}`);
+      assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
+      await page.evaluate(() => window.requestLifecycleFixture.finish());
+      await page.waitForFunction(() => window.requestLifecycleFixture.detailCalls === 2);
+      await drawer.locator('.close').focus();
+      await tooltip.waitFor({ state: 'hidden' });
+      await visibleCause.waitFor();
+      assert.equal(await visibleCause.count(), 1);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${prefix}: ${reason}`, 'enriched event preserves the list cause after detail refresh');
+      assert.equal((await row.innerText()).split(reason).length - 1, 0);
+      assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
+      await drawer.locator('.close').focus();
+      await drawer.locator('.request-outcome').press('Shift+Tab');
+      await page.keyboard.press('Tab');
+      assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true);
+      await tooltip.waitFor();
+      assert.equal(await tooltip.innerText(), `${prefix}: ${reason}`);
+      assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2, 'status interaction adds no fetch beyond existing terminal refresh');
+      await drawer.getByRole('button', { name: close, exact: true }).click();
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});

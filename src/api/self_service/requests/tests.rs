@@ -42,6 +42,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             },
             error_code: None,
             terminal_cause_code: None,
+            supplier_error: None,
             archive_state: crate::model::RequestArchiveState::Bound,
             credential_identity: None,
             session_context: None,
@@ -76,6 +77,8 @@ async fn request_detail_response_has_exact_content_length_and_bounded_json_body(
     assert_eq!(detail["upstream_account_id"], Uuid::nil().to_string());
     assert_eq!(detail["route_id"], Uuid::nil().to_string());
     assert_eq!(detail["completed_at"], 2);
+    assert!(detail.as_object().unwrap().contains_key("supplier_error"));
+    assert!(detail["supplier_error"].is_null());
     assert_eq!(detail["currency"], "USD");
     assert_eq!(detail["request_body"]["prompt"], "detail body");
     assert_eq!(detail["response_body"]["output"], "detail body");
@@ -220,5 +223,33 @@ async fn request_archive_content_does_not_expose_policy_metadata_as_body() {
     assert_eq!(
         error["error"]["reason"],
         "media_body_not_archived_by_policy"
+    );
+}
+
+#[tokio::test]
+async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level() {
+    let (state, _directory) = test_state().await;
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.view.status_code = Some(402);
+    refs.view.error_code = Some("http_402".to_owned());
+    refs.view.lifecycle_state = crate::model::RequestLifecycleState::Failed;
+    refs.view.supplier_error = Some(crate::supplier_error::SupplierError {
+        code: "no_active_plan".to_owned(),
+        message: "当前账号没有可用套餐".to_owned(),
+    });
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        detail["supplier_error"],
+        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"})
+    );
+    assert_eq!(detail["status_code"], 402);
+    assert_eq!(detail["error_code"], "http_402");
+    assert!(
+        detail.get("view").is_none(),
+        "RequestDetail flattens the manual RequestView serializer"
     );
 }

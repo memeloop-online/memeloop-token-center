@@ -655,6 +655,8 @@ pub struct RequestView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Fixed supplier reason reconstructed from a bounded native inline envelope.
+    pub supplier_error: Option<crate::supplier_error::SupplierError>,
     /// Current durable archive workflow state. Terminal spool transitions are
     /// also emitted on the request event stream so an open view can converge.
     pub archive_state: RequestArchiveState,
@@ -676,7 +678,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 29)?;
+        let mut state = serializer.serialize_struct("RequestView", 30)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
@@ -712,6 +714,7 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
         state.serialize_field("session_context", &self.session_context)?;
@@ -910,6 +913,8 @@ pub struct RequestEventView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Fixed supplier reason reconstructed from a bounded native inline envelope.
+    pub supplier_error: Option<crate::supplier_error::SupplierError>,
     pub archive_state: RequestArchiveState,
     pub credential_identity: Option<RequestCredentialIdentityView>,
 }
@@ -922,7 +927,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 33)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 34)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -963,6 +968,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
         state.end()

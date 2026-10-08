@@ -13,7 +13,10 @@ import '../../src/operator/operator.css';
 
 declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
-let first = base;
+const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
+  ? { ...base, status_code: 402, completed_at: 3000, duration_ms: 2000, error_code: 'http_402',
+    supplier_error: { code: 'no_active_plan', message: '当前账号没有可用套餐' } } : undefined;
+let first = supplierFailure ?? base;
 const second = { ...base, compaction: null, request_id: 'request-b', model: 'model-b', status_code: 200, completed_at: 3000, duration_ms: 2000 };
 let hold = false;
 let release: (() => void) | undefined;
@@ -61,7 +64,7 @@ function Fixture() {
     failQuery: () => { failQuery?.(); },
     hold: () => { hold = true; }, release: () => { release?.(); }, switchScope: () => setTenant('tenant-b'),
     finish: () => {
-      first = { ...base, compaction: true, status_code: 200, completed_at: 3000, duration_ms: 2000, input_tokens: 20, output_tokens: 10, archive_complete: true };
+      first = supplierFailure ?? { ...base, compaction: true, status_code: 200, completed_at: 3000, duration_ms: 2000, input_tokens: 20, output_tokens: 10, archive_complete: true };
       setEvents(new Map([[first.request_id, { ...first, event_id: `terminal-${revision}`, event_at: 3000, event_kind: 'finished', key_id: 'key' } as RequestEvent]]));
       setRevision((value) => value + 1);
     },

@@ -175,6 +175,54 @@ async fn assert_event_enrichment(database: &Database) {
             "a foreign-tenant event cannot inherit even a true marker"
         );
     }
+    // One persisted native inline channel feeds list/detail/enriched event JSON.
+    // Old, unsafe and object-store bodies are never parsed by the projection.
+    let safe = format!(
+        "inline-json:{}",
+        serde_json::json!({"error": {
+            "type": "upstream_error", "code": "no_active_plan",
+            "message": "当前账号没有可用套餐", "mtc_safe_reason": "no_active_plan"
+        }})
+    );
+    let fixed = serde_json::json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"});
+    let unsafe_body = safe.replace("当前账号没有可用套餐", "private%2Fcanary");
+    for (body, status, completed, expected) in [
+        (Some(safe.clone()), 402_i64, Some(now + 25), fixed.clone()),
+        (Some("inline-json:{\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream rejected the request\"}}".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
+        (Some(unsafe_body), 402, Some(now + 25), serde_json::Value::Null),
+        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::Value::Null),
+        (Some(format!("inline-json:{}", " ".repeat(5000))), 402, Some(now + 25), serde_json::Value::Null),
+        (Some("objects://untrusted-response".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
+        (None, 402, Some(now + 25), serde_json::Value::Null),
+        (Some(safe.clone()), 200, Some(now + 25), serde_json::Value::Null),
+        (Some(safe.clone()), 402, None, serde_json::Value::Null),
+    ] {
+        sqlx::query("UPDATE request_records SET response_object = $1, status_code = $2, completed_at = $3 WHERE id = $4 AND created_at = $5")
+            .bind(body).bind(status).bind(completed).bind(&request).bind(now)
+            .execute(&database.pool).await.unwrap();
+        let list = database.list_requests(key_id, 10).await.unwrap();
+        let operator = database.list_all_requests(&external, 10).await.unwrap();
+        let detail = database.request_archive_refs(key_id, request_id).await.unwrap();
+        let operator_detail = database.request_archive_refs_for_tenant(&external, request_id).await.unwrap();
+        let events = database.request_events_after(&external, now, None, 500).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(operator.len(), 1);
+        assert_eq!(events.len(), 1);
+        for value in [serde_json::to_value(&list[0]).unwrap(), serde_json::to_value(&operator[0]).unwrap(),
+            serde_json::to_value(&detail.view).unwrap(), serde_json::to_value(&operator_detail.view).unwrap(),
+            serde_json::to_value(&events[0]).unwrap()] {
+            assert_eq!(value.as_object().unwrap().get("supplier_error"), Some(&expected));
+            assert_eq!(value["request_id"], request);
+            assert!(!value.to_string().contains("private%2Fcanary"));
+            assert!(!value.to_string().contains("mtc_safe_reason"));
+        }
+        let foreign = database.request_events_after(&foreign_external, now, None, 500).await.unwrap();
+        assert!(serde_json::to_value(&foreign[0]).unwrap()["supplier_error"].is_null());
+        assert!(database.request_archive_refs_for_tenant(&foreign_external, request_id).await.is_err());
+        assert!(database.list_all_requests(&foreign_external, 10).await.unwrap().is_empty());
+    }
+    sqlx::query("UPDATE request_records SET status_code = 200, completed_at = $1, response_object = NULL WHERE id = $2 AND created_at = $3")
+        .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
     // A missing observation is also unknown, independently of the legacy zero.
     sqlx::query("UPDATE conversation_observations SET cluster_id = 'unmatched-compaction-fixture' WHERE request_id = $1 AND key_id = $2")
         .bind(&request).bind(&key).execute(&database.pool).await.unwrap();

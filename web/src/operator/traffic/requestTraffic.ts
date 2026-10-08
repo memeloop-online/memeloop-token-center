@@ -270,6 +270,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
+  const supplierError = event.supplier_error ?? previous?.supplier_error;
+  if (supplierError !== undefined || event.supplier_error === null) request.supplier_error = supplierError ?? null;
   const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
   const firstOutput = event.first_output_ms ?? previous?.first_output_ms;
   const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;
