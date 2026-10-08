@@ -10,6 +10,10 @@ import { fixtureAssets } from './support/fixture-assets.js';
 const cssFiles = ['styles.css', 'operator/operator.css', 'operator/managementSurfaces.css'];
 const controls = ['refresh', 'save', 'compact', 'icon', 'disabled'];
 
+function targetsLegacyControl(selector: string) {
+  return /(?:^|[\s>+~,(])(?:button|input|select|textarea)(?![\w-])|\.(?:button|secondary|compact-button)(?![\w-])/.test(selector);
+}
+
 function selectors(value: string) {
   const result: string[] = [];
   let depth = 0;
@@ -42,12 +46,18 @@ async function geometry(control: Locator) {
 }
 
 test('shared legacy control selectors cannot size or repaint Fluent slots', async () => {
+  for (const selector of ['.tenant-dialog-input', '.button-row', '.selection-chip', '.fui-Dropdown__button']) {
+    assert.equal(targetsLegacyControl(selector), false, `${selector}: a class name is not a native control selector`);
+  }
+  for (const selector of ['.tenant-dialog-input input', '.row-actions > button', ':where(button,.button,input,select,textarea)', '.form-panel :is(button,input)', '.secondary', '.toolbar .compact-button']) {
+    assert.equal(targetsLegacyControl(selector), true, `${selector}: native control selectors remain covered`);
+  }
   for (const file of cssFiles) {
     const css = (await readFile(new URL(`../src/${file}`, import.meta.url), 'utf8')).replace(/\/\*[\s\S]*?\*\//g, '');
     for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       if (!/(?:^|;)\s*(?:font(?:-size|-weight|-family)?|line-height|padding(?:-block|-inline)?|background|border(?:-color)?|color)\s*:/m.test(match[2])) continue;
       for (const selector of selectors(match[1].trim())) {
-        if (!/\b(?:button|input|select|textarea)\b|^\s*\.(?:secondary|compact-button)\b/.test(selector)) continue;
+        if (!targetsLegacyControl(selector)) continue;
         assert.ok(selector.includes('not([class*="fui-"])') || selector.includes('not(.fui-Button)'), `${file}: legacy control rule must exclude Fluent: ${selector.trim()}`);
       }
     }
@@ -143,6 +153,18 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       }
       const native = page.locator('[data-controls="native"] button').first();
       assert.ok((await geometry(native)).height >= references.refresh.height, `${label}: native actions retain a usable baseline`);
+      const credentialActions = page.locator('[data-controls="combobox-actions"]');
+      const credentialInput = credentialActions.getByRole('combobox');
+      const loadMore = credentialActions.locator('[data-control="load-more"]');
+      await credentialInput.click();
+      await credentialActions.getByRole('option', { name: 'Example credential' }).waitFor();
+      await page.keyboard.press('Escape');
+      const inputBounds = await credentialInput.boundingBox();
+      const actionBounds = await loadMore.boundingBox();
+      assert.ok(inputBounds && actionBounds);
+      assert.ok(inputBounds.x + inputBounds.width <= actionBounds.x || inputBounds.y + inputBounds.height <= actionBounds.y, `${label}: credential input does not overlap its paging action`);
+      await loadMore.click();
+      assert.equal(await credentialActions.locator('output').textContent(), '1', `${label}: credential paging receives an ordinary pointer click`);
       const selected = await geometry(page.locator('[data-control="selected"]'));
       assert.equal(selected.height, references.refresh.height, `${label}: selected state does not change button geometry`);
       assert.notEqual(selected.background, references.refresh.background, `${label}: selected state remains visually distinct in the active theme`);

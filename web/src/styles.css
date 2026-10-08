@@ -427,12 +427,12 @@ td code {
   padding:4px 7px;
   color:#59c8b8!important
 }
-.form-panel label,.form-panel fieldset {
+.form-panel label:not([class*="fui-"]),.form-panel fieldset {
   border-color:#293c42;
   margin:12px 0;
   display:block
 }
-.form-panel label>span,.form-panel label {
+.form-panel label:not([class*="fui-"])>span:not([class*="fui-"]),.form-panel label:not([class*="fui-"]) {
   color:#91a5ac;
   font-size:12px
 }
@@ -442,16 +442,20 @@ td code {
 .form-panel ul {
   color:#e77b7b
 }
-.form-panel button {
+.form-panel button:not([class*="fui-"]) {
   margin-top:10px
 }
 .narrow {
   max-width:760px
 }
 .button-row {
+  align-items:center;
   gap:8px;
   display:flex;
   flex-wrap:wrap
+}
+.fui-Combobox:has(> .fui-Combobox__input) {
+  grid-template-columns:minmax(0,1fr) auto
 }
 .one-time {
   background:#2a1f0d;

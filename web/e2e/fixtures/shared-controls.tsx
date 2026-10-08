@@ -46,9 +46,10 @@ function Controls({ surface }: { surface: string }) {
 }
 
 function Preview() {
+  const [pagesLoaded, setPagesLoaded] = useState(0);
   return <main style={{ padding: 16, maxWidth: 960, margin: '0 auto' }}>
     <h1>Shared control surfaces</h1>
-    <section data-controls="reference" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}><Controls surface="reference" /></section>
+    <section data-controls="reference" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}><Controls surface="reference" /></section>
     {surfaces.map(surface => <section key={surface.name} className="app-main-content" data-surface="operator" data-route={surface.name} style={{ marginBlock: 16, minWidth: 0 }}>
       <h2>{surface.name}</h2>
       <div className={surface.className} data-controls={surface.name}>
@@ -61,6 +62,13 @@ function Preview() {
     </section>
     <section data-controls="native" className="row-actions"><button type="button">{labels.refresh}</button><button type="button" className="secondary">{labels.save}</button><button type="button" className="danger">{labels.remove}</button></section>
     <section className="usage-presets"><Button data-control="selected" appearance="secondary" aria-pressed="true">{labels.refresh}</Button></section>
+    <section className="usage-filter-grid" data-controls="combobox-actions">
+      <label>Client credential<span style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+        <Combobox aria-label="Client credential" inlinePopup style={{ flexGrow: 1, minWidth: 0 }} placeholder="Search credentials"><Option>Example credential</Option></Combobox>
+        <Button appearance="subtle" data-control="load-more" onClick={() => setPagesLoaded(value => value + 1)}>{locale === 'zh-CN' ? '加载更多凭据' : 'Load more credentials'}</Button>
+      </span></label>
+      <output>{pagesLoaded}</output>
+    </section>
     <section data-controls="fields" className="form-panel" style={{ display: 'grid', gap: 16 }}>
       <Input aria-label="Account name" defaultValue="Example account" />
       <Select aria-label="Account status" defaultValue="active"><option value="active">Active</option></Select>

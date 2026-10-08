@@ -262,6 +262,7 @@
 }
 
 .filter-actions {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
@@ -1444,6 +1445,7 @@
 
 .usage-presets,
 .usage-tabs {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
@@ -1490,9 +1492,21 @@
   grid-template-columns: repeat(6, minmax(130px, 1fr));
 }
 
-.usage-filter-grid input,
-.usage-filter-grid select,
-.usage-custom-range input {
+.usage-filter-grid > label {
+  min-width: 0;
+}
+
+.usage-filter-grid > label:has(.fui-Combobox) {
+  grid-column: 1 / -1;
+}
+
+.usage-filter-grid > label > span:has(> .fui-Combobox) {
+  flex-wrap: wrap;
+}
+
+.usage-filter-grid input:not([class*="fui-"]),
+.usage-filter-grid select:not([class*="fui-"]),
+.usage-custom-range input:not([class*="fui-"]) {
   margin-top: 5px;
 }
 
