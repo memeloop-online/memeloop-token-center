@@ -1493,22 +1493,36 @@ export function useI18n() {
 }
 
 export function localizeSchema<T>(schema: T, locale: Locale): T {
-  if (!schema || typeof schema !== 'object') return schema;
-  if (Array.isArray(schema)) return schema.map((item) => localizeSchema(item, locale)) as T;
-  const source = schema as Record<string, unknown>;
-  const localized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if ((key === 'title' || key === 'description') && typeof value === 'string') {
-      localized[key] = translationCatalogs[locale][`schema.${value}`] ?? value;
-    } else if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
-      localized[key] = Object.fromEntries(Object.entries(value).map(([property, definition]) => {
-        const next = localizeSchema(definition, locale) as Record<string, unknown>;
-        if (!next.title && schemaFields[property]) next.title = schemaFields[property][locale === 'zh-CN' ? 0 : 1];
-        return [property, next];
-      }));
-    } else {
-      localized[key] = localizeSchema(value, locale);
-    }
+  const schemaKeywords = new Set([
+    'additionalProperties', 'unevaluatedProperties', 'propertyNames',
+    'additionalItems', 'unevaluatedItems', 'contains', 'contentSchema',
+    'not', 'if', 'then', 'else',
+  ]);
+  const schemaMapKeywords = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas', 'dependencies']);
+  const schemaArrayKeywords = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
+  function visit(node: unknown): unknown {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+    return Object.fromEntries(Object.entries(node).map(([key, value]) => {
+      if ((key === 'title' || key === 'description') && typeof value === 'string') {
+        return [key, translationCatalogs[locale][`schema.${value}`] ?? value];
+      }
+      if (schemaMapKeywords.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
+        return [key, Object.fromEntries(Object.entries(value).map(([property, definition]) => {
+          const next = visit(definition);
+          if (key === 'properties' && next && typeof next === 'object' && !Array.isArray(next)
+            && Object.hasOwn(schemaFields, property)) {
+            const field = next as Record<string, unknown>;
+            if (!field.title) field.title = schemaFields[property][locale === 'zh-CN' ? 0 : 1];
+          }
+          return [property, next];
+        }))];
+      }
+      if ((schemaArrayKeywords.has(key) || key === 'items') && Array.isArray(value)) {
+        return [key, value.map(visit)];
+      }
+      if (schemaKeywords.has(key) || key === 'items') return [key, visit(value)];
+      return [key, value];
+    }));
   }
-  return localized as T;
+  return visit(schema) as T;
 }
