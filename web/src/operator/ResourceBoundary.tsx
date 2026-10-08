@@ -3,14 +3,13 @@ import { Button, LoadingProgress, LoadingState, type LoadingLevel, type LoadingV
 import { useI18n } from '../i18n';
 import type { ResourceState } from './hooks/useOperatorResource';
 
-export function ResourceBoundary<T>({ resource, scopeKey, children, level = 'page', variant = 'list', onRetry, refreshErrorPresentation = 'boundary' }: {
+export function ResourceBoundary<T>({ resource, scopeKey, children, level = 'page', variant = 'list', onRetry }: {
   resource: ResourceState<T>;
   scopeKey: string;
   children: (value: T) => ReactNode;
   level?: LoadingLevel;
   variant?: LoadingVariant;
   onRetry?: () => void;
-  refreshErrorPresentation?: 'boundary' | 'caller';
 }) {
   const { t } = useI18n();
   const matchesScope = resource.scopeKey === scopeKey;
@@ -22,7 +21,7 @@ export function ResourceBoundary<T>({ resource, scopeKey, children, level = 'pag
   return <div className={`mtc-resource-boundary mtc-resource-${variant}`} aria-busy={pending || refreshing}>
     <LoadingProgress active={pending || refreshing} label={t('common.loading')} level={level} />
     {ready
-      ? <>{refreshErrorPresentation === 'boundary' && resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}{onRetry && <Button appearance="secondary" onClick={onRetry}>{t('common.retry')}</Button>}</div>}{children(resource.value)}</>
+      ? <>{resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}{onRetry && <Button appearance="secondary" onClick={onRetry}>{t('common.retry')}</Button>}</div>}{children(resource.value)}</>
       : failed
         ? <div className="notice error" role="alert">{resource.message}{onRetry && <Button appearance="secondary" onClick={onRetry}>{t('common.retry')}</Button>}</div>
         : inactive ? null : <LoadingState label={t('common.loading')} variant={variant} />}
