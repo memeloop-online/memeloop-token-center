@@ -176,9 +176,9 @@ function isPositiveDecimal(value: string) {
 
 class AccountListRefreshError extends Error {}
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onChanged: (saved?: boolean) => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onReadFeedbackOwnerChange, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onReadFeedbackOwnerChange: (caller: boolean) => void; onChanged: (saved?: boolean, caller?: boolean) => Promise<void> }) {
   const { locale, t } = useI18n();
-  async function onChanged(saved = true) {
+  async function onChanged(saved = false) {
     try { await reloadAccounts(saved); }
     catch (reason) { if (!(reason instanceof AccountListRefreshError)) throw reason; }
   }
@@ -199,6 +199,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const providerWorkspaceOpen = workspace?.kind === 'create';
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
+  const workspaceAccountId = workspace && workspace.kind !== 'create' ? workspace.account.id : undefined;
+  useEffect(() => { onReadFeedbackOwnerChange(false); }, [providerScopeKey, workspace?.kind, workspaceAccountId, method, onReadFeedbackOwnerChange]);
   const [driver, setDriver] = useState('');
   const quotaReads = useUpstreamQuotaReads(token, tenant, values);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
@@ -296,7 +298,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       setProviderCreateGeneration(generation => generation + 1);
       returnToAccountList();
       setMessage(t('providers.created', { name: result.name || String(formData.name ?? '') }));
-      try { await onChanged(); if (current()) setProviderListRetry(false); }
+      try { await onChanged(true); if (current()) setProviderListRetry(false); }
       catch { if (current()) { setProviderListRetry(true); setError(t('providers.savedListUnavailable')); } }
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally {
@@ -309,7 +311,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     const attempt = providerScope.current;
     providerCreateLock.current = attempt;
     setBusy('reload-created-provider');
-    try { await onChanged(); if (providerScope.current === attempt) { setProviderListRetry(false); setError(''); } }
+    try { await onChanged(true); if (providerScope.current === attempt) { setProviderListRetry(false); setError(''); } }
     catch { if (providerScope.current === attempt) setError(t('providers.savedListUnavailable')); }
     finally {
       if (providerCreateLock.current === attempt) providerCreateLock.current = undefined;
@@ -536,7 +538,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       setBusy('');
       returnToAccount(updated, 'inline-edit');
       const returnedGeneration = workspaceGeneration.current;
-      try { await onChanged(); }
+      try { await onChanged(true); }
       catch (reason) { if (providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setError(messageOf(reason, t('common.requestFailed'))); }
     } catch (reason) { if (ownsWorkspace()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (ownsWorkspace()) setBusy(''); }
@@ -631,13 +633,13 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       if (!ownsWorkspace()) return;
       returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
       const returnedGeneration = workspaceGeneration.current;
-      void onChanged().catch(() => { if (providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setMessage(upstreamRotationCopy(locale).reloadFailed); });
+      void onChanged(true).catch(() => { if (providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setMessage(upstreamRotationCopy(locale).reloadFailed); });
     }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale, reauthorizing.driver).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } if (!open && editing) { void leaveProviderSettings(() => { returnToAccount(editing, 'inline-edit'); }); return; } if (open) { returnFocus.current = undefined; navigateWorkspace({ kind: 'create' }); } else returnToAccountList(); }}>
       {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && providerWorkspaceActive && <div className="notice error" role="alert">{error}</div>}
       {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
       {editing || rotating ? providerEditors : reauthorizing ? <>
-      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onConnectionChanged={onChanged} onAccountSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'reauthorization' && current.account.id === updated.id ? { ...current, account: updated } : current); }} onEditingChange={setProxyEditorOpen} onChanged={async updated => { if (!ownsWorkspace()) return; await onChanged(); if (!ownsWorkspace()) return; returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
+      <AuthorizationConnection key={`${token}\0${writeTenant}\0reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onConnectionChanged={onChanged} onAccountSaved={updated => { if (ownsWorkspace()) setWorkspaceState(current => current?.kind === 'reauthorization' && current.account.id === updated.id ? { ...current, account: updated } : current); }} onEditingChange={setProxyEditorOpen} onChanged={async updated => { if (!ownsWorkspace()) return; await reloadAccounts(Boolean(updated), true); if (!ownsWorkspace()) return; returnFromReauthorization(updated); setProviderEditDraft(undefined); setMessage(authorizationJourneyCopy(locale).saved); }} />
       <Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnFromReauthorization()}>{authorizationJourneyCopy(locale).back}</Button>
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</Button><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</Button></div>
@@ -647,7 +649,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       </> : <AuthorizationConnection key={`${providerScopeKey}-${providerCreateGeneration}`} token={token} tenant={writeTenant} providers={providers} active={providerWorkspaceActive} onLock={setProviderAuthorizationLocked} onChanged={async account => {
         const attempt = providerScope.current;
         if (!ownsWorkspace() || attempt.key !== providerScopeKey) return;
-        await onChanged();
+        await reloadAccounts(Boolean(account), true);
         if (!ownsWorkspace() || providerScope.current !== attempt || !account) return;
         setProviderCreateGeneration(generation => generation + 1);
         openAccount(account);
@@ -2138,6 +2140,7 @@ interface OperatorPageProps {
 export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpenPricing, onOpenProxyGroups }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void }) {
   const { t } = useI18n();
   const savedRefresh = useRef(false);
+  const [callerReadFeedback, setCallerReadFeedback] = useState(false);
   // This page needs an acknowledged account-list refresh after OAuth creation.
   // The shared resource hook intentionally preserves its non-throwing semantics.
   const accountRead = useRef<{ scope: string; failed: boolean }>({ scope: '', failed: false });
@@ -2186,9 +2189,10 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
   const accountResource = resource.state.kind === 'ready' && resource.state.refreshError
     ? { ...resource.state, refreshError: t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
     : resource.state;
-  return <AccountResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onChanged={async (saved = true) => {
+  return <AccountResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()} refreshErrorPresentation={callerReadFeedback ? 'caller' : 'boundary'}>{({ providers, values }) =>
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
       savedRefresh.current = saved;
+      setCallerReadFeedback(caller);
       void statistics.reload();
       await resource.reload();
       if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new AccountListRefreshError();
