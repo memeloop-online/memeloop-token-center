@@ -1,8 +1,8 @@
-import { useEffect, useId, useRef, type ReactNode, type SyntheticEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, type ReactNode, type SyntheticEvent } from 'react';
 import { Tab, TabList } from '../../design-system';
 import { useI18n } from '../../i18n';
 import { useConfirmDialog } from '../../useConfirmDialog';
-import { useNavigationGuard } from '../../app/NavigationGuard';
+import { useGuardedNavigation, useNavigationGuard } from '../../app/NavigationGuard';
 import { identityCopy } from '../identityCopy';
 import './identityWorkspace.css';
 
@@ -16,9 +16,9 @@ export function IdentityPage({ tab, onNavigate, children }: {
   const { locale } = useI18n();
   const copy = identityCopy(locale);
   const prefix = useId();
-  const panels = useRef<Partial<Record<IdentityTab, ReactNode>>>({});
-  panels.current[tab] = children;
-  const drafts = useRef(new Map<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, string>());
+  const navigate = useGuardedNavigation();
+  const workspace = useRef<HTMLElement>(null);
+  const drafts = useRef(new WeakMap<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, string>());
   const { confirm, confirmationDialog } = useConfirmDialog([]);
   const fieldValue = (field: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement) => field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio') ? String(field.checked) : field.value;
   const trackDraft = (event: SyntheticEvent) => {
@@ -31,8 +31,13 @@ export function IdentityPage({ tab, onNavigate, children }: {
       if (!drafts.current.has(field)) drafts.current.set(field, fieldValue(field));
     }
   };
-  const dirty = () => Array.from(drafts.current).some(([field, value]) => field.isConnected && fieldValue(field) !== value);
+  const dirty = () => Array.from(workspace.current?.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input,select,textarea') ?? [])
+    .some(field => drafts.current.has(field) && fieldValue(field) !== drafts.current.get(field));
   useNavigationGuard(async () => !dirty() || await confirm(copy.leaveDraft));
+  useLayoutEffect(() => {
+    drafts.current = new WeakMap();
+    return () => { drafts.current = new WeakMap(); };
+  }, [tab]);
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty()) return;
@@ -42,13 +47,16 @@ export function IdentityPage({ tab, onNavigate, children }: {
     window.addEventListener('beforeunload', beforeUnload);
     return () => window.removeEventListener('beforeunload', beforeUnload);
   }, []);
-  return <section className="identity-workspace" aria-label={copy.title} onFocusCapture={trackDraft} onPointerDownCapture={trackDraft} onKeyDownCapture={trackDraft}>
+  return <section ref={workspace} className="identity-workspace" aria-label={copy.title} onFocusCapture={trackDraft} onPointerDownCapture={trackDraft} onKeyDownCapture={trackDraft}>
     {confirmationDialog}
     <header className="panel-title"><div><h2>{copy.title}</h2><p className="muted">{copy.description}</p></div></header>
-    <TabList selectedValue={tab} aria-label={copy.title} onTabSelect={(_, data) => { if (data.value === 'tenants' || data.value === 'service-credentials') onNavigate(data.value); }}>
+    <TabList selectedValue={tab} aria-label={copy.title} onTabSelect={(_, data) => {
+      const next = data.value;
+      if (next !== tab && (next === 'tenants' || next === 'service-credentials')) void navigate(() => onNavigate(next));
+    }}>
       <Tab id={`${prefix}-tenants`} value="tenants" aria-controls={`${prefix}-tenants-panel`}>{copy.tenants}</Tab>
       <Tab id={`${prefix}-service-credentials`} value="service-credentials" aria-controls={`${prefix}-service-credentials-panel`}>{copy.services}</Tab>
     </TabList>
-    {(['tenants', 'service-credentials'] as const).map(value => panels.current[value] && <div key={value} id={`${prefix}-${value}-panel`} role="tabpanel" aria-labelledby={`${prefix}-${value}`} tabIndex={0} hidden={tab !== value}>{panels.current[value]}</div>)}
+    <div key={tab} id={`${prefix}-${tab}-panel`} role="tabpanel" aria-labelledby={`${prefix}-${tab}`} tabIndex={0}>{children}</div>
   </section>;
 }
