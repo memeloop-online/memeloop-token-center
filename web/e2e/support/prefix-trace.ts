@@ -32,9 +32,6 @@ export function prefixTracePlugin(): Plugin {
         replace('autofocus }: WidgetProps) {', 'autofocus, options } = props;');
         replace("  const text =", `  if (id === 'root_credential_prefix') ${record}('widget-render', value, Object.hasOwn(props, 'value'), options.emptyValue, Object.hasOwn(options, 'emptyValue'));\n  const text =`);
         replace('onChange(data.value)', `(id === 'root_credential_prefix' && ${record}('widget-change', data.value, Object.hasOwn(data, 'value'), options.emptyValue, Object.hasOwn(options, 'emptyValue')), onChange(data.value))`);
-      } else if (path.endsWith('/@rjsf/core/lib/components/fields/StringField.js')) {
-        replace('const Widget = getWidget', `if (fieldPathId.$id === 'root_credential_prefix') ${record}('StringField-render', formData, Object.hasOwn(props, 'formData'), options.emptyValue, Object.hasOwn(options, 'emptyValue'));\n    const Widget = getWidget`);
-        replace('=> onChange(value, fieldPathId.path, errorSchema, id)', `=> (fieldPathId.$id === 'root_credential_prefix' && ${record}('StringField-change', value, true, options.emptyValue, Object.hasOwn(options, 'emptyValue')), onChange(value, fieldPathId.path, errorSchema, id))`);
       } else if (path.endsWith('/src/operator/pages/ManagementPages.tsx')) {
         replace('onChange={({ formData }) => { if (providerCreateScope', `onChange={({ formData }) => { ${record}('form-change', formData?.credential?.prefix, formData?.credential != null && Object.hasOwn(formData.credential, 'prefix'), undefined, false); if (providerCreateScope`);
         replace('onSubmit={({ formData }) => void createProvider(formData)}', `onSubmit={({ formData }) => { ${record}('form-submit', formData?.credential?.prefix, formData?.credential != null && Object.hasOwn(formData.credential, 'prefix'), undefined, false); void createProvider(formData); }}`);

@@ -3,7 +3,7 @@ import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { chromium } from 'playwright';
+import { chromium, type Browser, type Page } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
 import { prefixTraceInit, prefixTracePlugin } from './support/prefix-trace.js';
@@ -247,16 +247,47 @@ test('upstream create groups configuration and retains advanced and secret draft
 
 test('catalog API-key creation preserves empty prefixes, locks submits and separates saved-list recovery from creation', { timeout: 60_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const server = await createServer({ root, configFile: false, plugins: [fixtureAssets(), prefixTracePlugin()], optimizeDeps: { exclude: ['@rjsf/core'] }, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
-  await server.listen();
-  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
-  const origin = `http://127.0.0.1:${address.port}`;
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  let server: Awaited<ReturnType<typeof createServer>> | undefined;
+  let browser: Browser | undefined;
+  let diagnosticPage: Page | undefined;
+  let stage = 'fixture-server-create';
+  const errors: string[] = [];
+  const pageErrors: { stage: string; module: string; name: string; message: string }[] = [];
+  const moduleFailures: { stage: string; module: string; status: number }[] = [];
+  const safeMessage = (message: string) => message.split('\n')[0]
+    .replace(/https?:\/\/[^\s"'<>]+/gi, value => {
+      try { const url = new URL(value); return `${url.origin}${url.pathname}`; } catch { return '[url]'; }
+    })
+    .replace(/[?#][^\s"'<>)]*/g, '[query]')
+    .replace(/\b(?:Bearer|Token)\s+[^\s,;]+/gi, '[auth]')
+    .replace(/\b(?:authorization|token|api[_-]?key|secret|password|credential|value)\b["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '[redacted]')
+    .replace(/fixture-only-[^\s"'<>),;]+/g, '[fixture-secret]')
+    .replace(/\{.*\}|\[.*\]/g, '[structured]')
+    .slice(0, 320);
   try {
+    server = await createServer({ root, configFile: false, plugins: [fixtureAssets(), prefixTracePlugin()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+    stage = 'fixture-server-listen';
+    await server.listen();
+    const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    stage = 'browser-launch';
+    browser = await chromium.launch({ headless: true });
+    stage = 'page-create';
+    const page = await browser.newPage();
+    diagnosticPage = page;
+    page.on('pageerror', error => {
+      errors.push(error.message);
+      pageErrors.push({ stage, module: safeMessage(error.stack?.match(/https?:\/\/[^\s)]+/)?.[0] ?? ''), name: safeMessage(error.name), message: safeMessage(error.message) });
+      if (pageErrors.length > 8) pageErrors.splice(0, pageErrors.length - 8);
+    });
+    page.on('response', response => {
+      const url = new URL(response.url());
+      if (url.origin !== origin || response.request().resourceType() !== 'script' || response.status() < 400) return;
+      moduleFailures.push({ stage, module: safeMessage(url.pathname), status: response.status() });
+      if (moduleFailures.length > 8) moduleFailures.splice(0, moduleFailures.length - 8);
+    });
+    stage = 'trace-init';
     await page.addInitScript(prefixTraceInit);
-    const errors: string[] = [];
-    page.on('pageerror', error => errors.push(error.message));
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
@@ -265,7 +296,9 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     const fixture = `${origin}/e2e/fixtures/form-journey.html?workflows&provider-workflow&provider-builtin-api-key`;
     const workspace = page.locator('.create-journey');
     async function fillDraft(name: string) {
+      stage = 'draft-open';
       await workspace.locator('[data-workspace-toggle]').click();
+      stage = 'draft-fields';
       await workspace.locator('#root_name').fill(name);
       await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
       const credentialBranch = workspace.getByRole('combobox').filter({ has: page.getByRole('option', { name: 'API credential', exact: true }) });
@@ -281,8 +314,10 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       await workspace.locator('#root_credential_header').fill('x-api-key');
       await workspace.locator('#root_credential_prefix').fill('');
     }
+    stage = 'fixture-navigation';
     await page.goto(fixture);
     await fillDraft('Saved API connection');
+    stage = 'deferred-create';
     const submit = workspace.locator('button[type="submit"]');
     await page.evaluate(() => { window.deferNextFormProviderCreate = true; });
     await submit.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
@@ -292,10 +327,12 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     assert.equal(await workspace.getByRole('button', { name: 'Service provider 自部署模型', exact: true }).isEnabled(), false);
     assert.equal(await workspace.locator('[data-workspace-toggle]').isEnabled(), false);
     await page.evaluate(() => window.releaseFormProviderCreate(400));
+    stage = 'failed-create-draft';
     await workspace.getByRole('alert').waitFor();
     assert.equal(await workspace.locator('#root_name').inputValue(), 'Saved API connection');
     assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
     await page.evaluate(() => { window.failNextFormAccountRead = true; });
+    stage = 'successful-create-payload';
     await submit.click();
     await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
     await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor();
@@ -303,14 +340,17 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     assert.deepEqual(await page.evaluate(() => window.formJourneyLastProviderCreate?.credential), {
       type: 'api_key', value: 'fixture-only-api-secret', header: 'x-api-key', prefix: '',
     });
+    stage = 'saved-list-recovery';
     await page.getByRole('button', { name: 'Reload account list', exact: true }).click();
     await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
     await workspace.locator('[data-workspace-toggle]').click();
     assert.equal(await workspace.locator('#root_name').inputValue(), '');
     for (const field of ['token', 'tenant', 'writeTenant'] as const) for (const status of [201, 400]) {
+      stage = 'scope-fixture-navigation';
       await page.goto(fixture);
       await fillDraft(`Old ${field}`);
+      stage = 'scope-deferred-create';
       await page.evaluate(() => { window.deferNextFormProviderCreate = true; });
       await submit.click();
       await page.waitForFunction(() => window.formJourneyWrites === 1);
@@ -326,10 +366,21 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       assert.equal(await page.getByText('Late create failure', { exact: true }).count(), 0);
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
     }
+    stage = 'pageerror-assertion';
     assert.deepEqual(errors, []);
   } catch (error) {
-    const trace = await page.evaluate('window.formPrefixTrace ?? []').catch(() => []);
+    const startup = ['fixture-server-create', 'fixture-server-listen', 'browser-launch', 'page-create', 'trace-init', 'fixture-navigation'].includes(stage);
+    context.diagnostic(`fixture failure: ${JSON.stringify({ stage, name: error instanceof Error ? safeMessage(error.name) : typeof error, ...(startup && error instanceof Error ? { message: safeMessage(error.message) } : {}) })}`);
+    context.diagnostic(`fixture page errors (last 8): ${JSON.stringify(pageErrors)}`);
+    context.diagnostic(`fixture module failures (last 8): ${JSON.stringify(moduleFailures)}`);
+    let trace: unknown = { available: false };
+    if (diagnosticPage) {
+      try { trace = await diagnosticPage.evaluate('window.formPrefixTrace ?? []'); }
+      catch (traceError) {
+        context.diagnostic(`prefix trace read failure: ${JSON.stringify({ stage: 'trace-read', name: traceError instanceof Error ? safeMessage(traceError.name) : typeof traceError })}`);
+      }
+    }
     context.diagnostic(`prefix metadata (last 48): ${JSON.stringify(trace)}`);
     throw error;
-  } finally { await browser.close(); await server.close(); }
+  } finally { await browser?.close(); await server?.close(); }
 });
