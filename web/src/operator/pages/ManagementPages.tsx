@@ -2183,9 +2183,9 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
   const accountResource = resource.state.kind === 'ready' && resource.state.refreshError
-    ? { ...resource.state, refreshError: callerReadFeedback ? undefined : t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
+    ? { ...resource.state, refreshError: t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
     : resource.state;
-  return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
+  return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()} refreshErrorPresentation={callerReadFeedback ? 'caller' : 'boundary'}>{({ providers, values }) =>
     <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
       savedRefresh.current = saved;
       setCallerReadFeedback(caller);
