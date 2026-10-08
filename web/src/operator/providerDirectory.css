@@ -55,6 +55,9 @@
   .provider-directory-row { row-gap: 16px; padding-block: 20px; }
   .provider-directory-identity, .provider-directory-actions { grid-column: 1 / -1; }
 }
+@container provider-directory (max-width: 320px) {
+  .provider-directory-actions { grid-template-columns: minmax(0, 1fr); }
+}
 @media (max-width: 600px) {
   .provider-list .account-list.provider-directory { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
   .provider-directory .account.provider-account, .provider-directory-row { column-gap: 12px; }

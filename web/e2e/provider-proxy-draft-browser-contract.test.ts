@@ -209,7 +209,7 @@ test('account action slots fit English Fluent buttons through the sidebar breakp
       const dimensions = await actions.evaluateAll(buttons => buttons.map(button => {
         const bounds = button.getBoundingClientRect();
         const style = getComputedStyle(button);
-        return { left: bounds.left, width: bounds.width, height: bounds.height, textLength: button.textContent?.trim().length ?? 0, scrollWidth: button.scrollWidth, clientWidth: button.clientWidth, fontSize: style.fontSize, paddingInlineStart: style.paddingInlineStart, paddingInlineEnd: style.paddingInlineEnd };
+        return { left: bounds.left, top: bounds.top, bottom: bounds.bottom, width: bounds.width, height: bounds.height, textLength: button.textContent?.trim().length ?? 0, scrollWidth: button.scrollWidth, clientWidth: button.clientWidth, fontSize: style.fontSize, paddingInlineStart: style.paddingInlineStart, paddingInlineEnd: style.paddingInlineEnd };
       }));
       const stem = `${artifacts}/accounts-list--action-slots--en--${width}x${height}--light`;
       await writeFile(`${stem}.json`, JSON.stringify({ evidence_kind: 'synthetic', integrated_head_sha: process.env.GITHUB_SHA ?? null, viewport: { width, height }, actions: dimensions }, null, 2));
@@ -217,6 +217,11 @@ test('account action slots fit English Fluent buttons through the sidebar breakp
       assert.equal(await actions.nth(0).innerText(), 'Refresh quota');
       assert.equal(await actions.nth(1).innerText(), 'Manage account');
       assert.equal(dimensions.length, 2);
+      if (width === 320) {
+        assert.ok(dimensions[1].top >= dimensions[0].bottom, 'narrow common actions use ordered full-width slots instead of wrapping their labels');
+        assert.ok(Math.abs(dimensions[0].left - dimensions[1].left) <= 1);
+        assert.ok(Math.abs(dimensions[0].width - dimensions[1].width) <= 1);
+      }
       for (const action of dimensions) {
         assert.equal(action.height, width <= 768 ? 44 : 32, `${width}px common actions retain the shared Fluent height`);
         assert.ok(action.scrollWidth <= action.clientWidth, `${width}px action text remains contained`);

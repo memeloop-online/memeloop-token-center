@@ -14,7 +14,7 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
     const savedAccount = { id: 'saved-fixture-account', name: 'Fixture OAuth', driver: 'fixture-plugin', tenant_external_id: 'fixture-a', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: {}, credential_generation: 1, route_count: 0, created_at: 1, updated_at: 1 };
-    let completeCalls = 0; let failedReads = 0; let failAccounts = false;
+    let completeCalls = 0; let failedReads = 0; let failAccounts = false; let catalogReads = 0;
     const mutations: string[] = [];
     await page.route('**/internal/v1/**', async route => {
       const path = new URL(route.request().url()).pathname;
@@ -34,6 +34,10 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
         return route.fulfill({ status: 201, json: savedAccount });
       }
       assert.equal(route.request().method(), 'GET', 'no unexpected mutation is allowed');
+      if (path === `/internal/v1/upstreams/${savedAccount.id}/models`) {
+        catalogReads++;
+        return route.fulfill({ json: { account_id: savedAccount.id, status: 'unknown', credential_generation: savedAccount.credential_generation, last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] } });
+      }
       if (path.includes('monitoring') || path.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'fixture statistics failed' } } });
       return route.fulfill({ json: [] });
     });
@@ -58,13 +62,17 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     assert.equal(await page.getByRole('alert').count(), 1);
     assert.deepEqual(mutations, mutationsBeforeRetry, 'failed retry never replays a write or OAuth exchange');
     failAccounts = false;
+    const catalogRead = page.waitForResponse(response => new URL(response.url()).pathname === `/internal/v1/upstreams/${savedAccount.id}/models` && response.request().method() === 'GET' && response.status() === 200);
     await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
     await readFailure.waitFor({ state: 'detached' });
     await page.getByText('已保存上游连接 Fixture OAuth。', { exact: true }).waitFor();
     assert.equal(await page.locator('.create-journey').getAttribute('data-open'), 'false');
     await page.locator('#provider-details-saved-fixture-account').waitFor();
+    await catalogRead;
+    await page.locator('#provider-details-saved-fixture-account .provider-model-catalog[aria-busy="false"]').waitFor();
+    assert.equal(catalogReads, 1, 'the saved account loads its own valid model catalog without a synthetic malformed-response error');
     assert.equal(completeCalls, 1, 'list retry and continuing statistics failures never resend the authorization code');
     assert.deepEqual(mutations, mutationsBeforeRetry, 'successful retry also performs reads only');
-    assert.equal(await page.getByRole('alert').count(), 0);
+    assert.equal(await page.getByRole('alert').count(), 0, 'successful directory recovery and catalog loading leave no residual failure feedback');
   } finally { await browser.close(); await server.close(); }
 });

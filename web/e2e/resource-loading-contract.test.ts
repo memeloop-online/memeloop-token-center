@@ -17,7 +17,12 @@ test('provider list readiness is independent of bounded account statistics', () 
   assert.match(basic, /return \{ providers, values \}/);
   assert.doesNotMatch(basic, /recentAvailabilityPath|upstreamAvailabilityPath/);
   assert.match(providers, /const statistics = useOperatorResource/);
-  assert.match(providers, /resource=\{resource\.state\}/);
+  assert.match(providers, /const accountResource = resource\.state\.kind === 'ready' && resource\.state\.refreshError/);
+  assert.match(providers, /\{ \.\.\.resource\.state, refreshError: callerReadFeedback \? undefined : t\(savedRefresh\.current \? 'providers\.savedListUnavailable' : 'common\.requestFailed'\) \}/);
+  assert.match(providers, /resource=\{accountResource\}/);
+  assert.match(providers, /onRetry=\{\(\) => void resource\.reload\(\)\}/);
+  assert.match(providers, /void statistics\.reload\(\);\s*await resource\.reload\(\);/);
+  assert.match(providers, /accountRead\.current\.failed\) throw new AccountListRefreshError\(\)/);
   assert.equal((providers.match(/AbortSignal\.any\(\[signal, AbortSignal\.timeout/g) ?? []).length, 4);
 });
 
