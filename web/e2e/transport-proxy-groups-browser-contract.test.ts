@@ -162,6 +162,22 @@ async function assertWorkspaceFocus(page: Page) {
   })), { containsFocus: true, hidden: false }, 'the open workspace keeps focus and stays accessible after its initiating control is removed');
 }
 
+async function assertAccountDirectoryReturn(page: Page) {
+  const directory = page.locator('.provider-directory-row');
+  await directory.waitFor();
+  assert.equal(await directory.isVisible(), true, 'returning from the proxy page loads the account directory');
+  assert.equal(await page.locator('.transport-proxy-workspace').count(), 0);
+  assert.equal(await page.getByRole('dialog').count(), 0);
+  await page.waitForFunction(() => document.activeElement?.id === 'app-main-content');
+  assert.equal(await page.locator('#app-main-content').evaluate(main => main === document.activeElement), true, 'page navigation restores focus to the main content, not a removed dialog trigger');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#app-main-content').evaluate(main => {
+    const active = document.activeElement;
+    return active instanceof HTMLElement && active !== main && main.contains(active)
+      && !active.closest('[hidden], [inert], [aria-hidden="true"]');
+  }), true, 'keyboard navigation can enter the returned account page');
+}
+
 test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissions and bounded exit', { timeout: 120_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/transport-proxy-groups.html')], server: { host: '127.0.0.1', port: 0 } });
@@ -396,7 +412,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.ok(fixture.policies.every(Boolean));
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       assert.equal(await page.locator('.transport-proxy-workspace').count(), 0);
-      assert.equal(await page.locator('.provider-directory-row').isVisible(), true);
+      await assertAccountDirectoryReturn(page);
       await page.close();
     });
 
@@ -459,7 +475,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       await page.getByText(/关闭不会取消保存/).waitFor(); await confirm(page);
-      assert.equal(await page.locator('.provider-directory-row').isVisible(), true);
+      await assertAccountDirectoryReturn(page);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       await openManager(page);
       await page.getByRole('button', { name: '编辑 等待中修改', exact: true }).waitFor();
