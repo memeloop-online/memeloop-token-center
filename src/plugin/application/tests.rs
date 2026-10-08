@@ -163,6 +163,20 @@ fn publish(id: &str, expected: i64) -> PublishApplicationPlugin {
     }
 }
 
+fn pin_work_counts(authority: &ApplicationPlugins) -> [usize; 3] {
+    [
+        authority
+            .inventory_refreshes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        authority
+            .pin_root_inspections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        authority
+            .compilations
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
 async fn exercise_authority(database_url: String, directory: &std::path::Path, concurrent: bool) {
     let a_root = directory.join("inventory-a");
     let b_root = directory.join("inventory-b");
@@ -419,8 +433,116 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     std::fs::write(&manifest, serde_json::to_vec(&changed).unwrap()).unwrap();
     assert!(authority_a.stage("a").await.is_err());
     std::fs::write(&manifest, original).unwrap();
+    let warm_current = authority_a.pin().await.unwrap();
+    let cold_authority = Arc::new(
+        ApplicationPlugins::new(first.db.clone(), trusted.clone(), &first.plugins).unwrap(),
+    );
+    let warm_counts = pin_work_counts(&authority_a);
     std::fs::rename(&a_root, directory.join("removed-inventory-a")).unwrap();
-    assert!(first.clone().pin_application_plugins().await.is_err());
+    let offline_inventory = directory.join("offline-inventory.json");
+    std::fs::rename(&inventory_path, &offline_inventory).unwrap();
+    let warm_state = first.clone().pin_application_plugins().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &warm_current,
+        warm_state.pinned_application_plugins.as_ref().unwrap(),
+    ));
+    assert!(Arc::ptr_eq(
+        &warm_current,
+        &authority_a.pin_if_published().await.unwrap().unwrap(),
+    ));
+    assert!(Arc::ptr_eq(
+        &warm_current,
+        &authority_a
+            .pin_historical(warm_current.receipt.revision)
+            .await
+            .unwrap(),
+    ));
+    assert_eq!(pin_work_counts(&authority_a), warm_counts);
+    assert_policy(&warm_state, false).await;
+    assert_provider_phases(&warm_state, false).await;
+
+    let inspection_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    for (query, original) in [
+        (
+            "UPDATE application_plugin_candidates SET identity_digest = $1 WHERE inventory_id = $2",
+            &warm_current.receipt.identity_digest,
+        ),
+        (
+            "UPDATE application_plugin_candidates SET contract_digest = $1 WHERE inventory_id = $2",
+            &warm_current.receipt.contract_digest,
+        ),
+    ] {
+        sqlx::query(query)
+            .bind("mismatched")
+            .bind(&warm_current.receipt.inventory_id)
+            .execute(&inspection_pool)
+            .await
+            .unwrap();
+        assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
+        assert!(matches!(
+            authority_a
+                .pin_historical(warm_current.receipt.revision)
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        sqlx::query(query)
+            .bind(original)
+            .bind(&warm_current.receipt.inventory_id)
+            .execute(&inspection_pool)
+            .await
+            .unwrap();
+    }
+    for (query, changed, original) in [
+        (
+            "UPDATE application_plugin_revisions SET reason = $1 WHERE revision = $2",
+            "rollback",
+            &warm_current.receipt.reason,
+        ),
+        (
+            "UPDATE application_plugin_revisions SET inventory_id = $1 WHERE revision = $2",
+            "b",
+            &warm_current.receipt.inventory_id,
+        ),
+    ] {
+        sqlx::query(query)
+            .bind(changed)
+            .bind(warm_current.receipt.revision)
+            .execute(&inspection_pool)
+            .await
+            .unwrap();
+        assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
+        assert!(matches!(
+            authority_a
+                .pin_historical(warm_current.receipt.revision)
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        sqlx::query(query)
+            .bind(original)
+            .bind(warm_current.receipt.revision)
+            .execute(&inspection_pool)
+            .await
+            .unwrap();
+    }
+    assert!(Arc::ptr_eq(
+        &warm_current,
+        &authority_a.pin().await.unwrap()
+    ));
+    assert!(authority_a.pin_historical(i64::MAX).await.is_err());
+    assert_eq!(pin_work_counts(&authority_a), warm_counts);
+    assert!(authority_a.status().await.is_err());
+    assert!(authority_a.stage("a").await.is_err());
+    assert!(authority_b.pin().await.is_err());
+    std::fs::rename(&offline_inventory, &inventory_path).unwrap();
+    assert!(cold_authority.pin().await.is_err());
+    assert!(
+        cold_authority
+            .pin_historical(warm_current.receipt.revision)
+            .await
+            .is_err()
+    );
+    assert!(authority_a.pin_historical(1).await.is_err());
+    assert!(authority_a.stage("a").await.is_err());
     for path in [
         "/internal/v1/plugins",
         "/internal/v1/provider-types",
@@ -446,6 +568,32 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             "{path} must not use baseline"
         );
     }
+    std::fs::rename(&b_root, directory.join("removed-inventory-b")).unwrap();
+    sqlx::query("UPDATE application_plugin_head SET revision = 2 WHERE scope = 'global'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    assert!(authority_a.pin().await.is_err());
+    assert!(authority_a.pin_if_published().await.is_err());
+    assert!(authority_a.pin_historical(2).await.is_err());
+    assert_eq!(warm_current.receipt.inventory_id, "a");
+    sqlx::query("DELETE FROM application_plugin_head WHERE scope = 'global'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    assert!(authority_a.pin_if_published().await.unwrap().is_none());
+    assert!(authority_a.pin().await.is_err());
+    sqlx::query("INSERT INTO application_plugin_head (scope, revision) VALUES ('global', $1)")
+        .bind(warm_current.receipt.revision)
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &warm_current,
+        &authority_a.pin().await.unwrap()
+    ));
+    inspection_pool.close().await;
+    std::fs::rename(directory.join("removed-inventory-b"), &b_root).unwrap();
     std::fs::rename(directory.join("removed-inventory-a"), &a_root).unwrap();
     let pinned = first.clone().pin_application_plugins().await.unwrap();
     first.db.close().await;
@@ -829,15 +977,8 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     .await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(connected["id"], replay["id"]);
-    assert!(
-        authority
-            .pin_historical(2)
-            .await
-            .unwrap()
-            .providers
-            .get(PROVIDER)
-            .is_some()
-    );
+    let warm_historical = authority.pin_historical(2).await.unwrap();
+    assert!(warm_historical.providers.get(PROVIDER).is_some());
     let restarted = AppState::initialize(config).await.unwrap();
     assert!(
         restarted
@@ -880,9 +1021,63 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
             .load(std::sync::atomic::Ordering::Relaxed),
         count
     );
-    assert!(authority.pin_historical(2).await.is_err());
+    let offline_inventory = directory.path().join("offline-inventory.json");
+    std::fs::rename(&inventory_path, &offline_inventory).unwrap();
+    let warm_counts = pin_work_counts(&authority);
+    assert!(Arc::ptr_eq(
+        &warm_historical,
+        &authority.pin_historical(2).await.unwrap(),
+    ));
+    let (status, warm_replay) = application_json(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/oauth/cursor/poll",
+        token,
+        json!({"session_token":login["session_token"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{warm_replay}");
+    assert_eq!(connected["id"], warm_replay["id"]);
+    assert_eq!(pin_work_counts(&authority), warm_counts);
+    let inspection_pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE application_plugin_candidates SET contract_digest = 'mismatched' WHERE inventory_id = 'new'")
+        .execute(&inspection_pool).await.unwrap();
     let (status, _) = application_json(
         &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/oauth/cursor/poll",
+        token,
+        json!({"session_token":login["session_token"]}),
+    )
+    .await;
+    assert!(!status.is_success());
+    assert_eq!(pin_work_counts(&authority), warm_counts);
+    sqlx::query(
+        "UPDATE application_plugin_candidates SET contract_digest = $1 WHERE inventory_id = 'new'",
+    )
+    .bind(&warm_historical.receipt.contract_digest)
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    inspection_pool.close().await;
+    assert!(Arc::ptr_eq(
+        &warm_historical,
+        &authority.pin_historical(2).await.unwrap(),
+    ));
+    assert!(authority.status().await.is_err());
+    std::fs::rename(&offline_inventory, &inventory_path).unwrap();
+    let cold_authority = Arc::new(
+        ApplicationPlugins::new(state.db.clone(), trusted.clone(), &state.plugins).unwrap(),
+    );
+    assert!(cold_authority.pin_historical(2).await.is_err());
+    let mut cold_state = state.clone();
+    cold_state.application_plugins = Some(cold_authority);
+    let (status, _) = application_json(
+        &cold_state,
         RuntimeRole::Control,
         "POST",
         "/internal/v1/oauth/cursor/poll",
@@ -896,6 +1091,12 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     trusted.remove("empty");
     std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
     assert!(authority.status().await.is_err());
+    let warm_counts = pin_work_counts(&authority);
+    assert!(Arc::ptr_eq(
+        &warm_historical,
+        &authority.pin_historical(2).await.unwrap(),
+    ));
+    assert_eq!(pin_work_counts(&authority), warm_counts);
 }
 
 #[tokio::test]

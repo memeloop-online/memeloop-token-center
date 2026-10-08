@@ -33,3 +33,30 @@ See [plugin development](development.md) for implementation, manifest, and OCI p
 Plugin requests use identities and permissions produced by the core; sensitive credentials are used only between the core and a provider. When a plugin fails, the core falls back to native behavior, and in-flight requests keep the plugin snapshot captured at admission.
 
 Plugins extend product capabilities without changing client-visible authorization. Installation, approval, and activation are handled by deployment administrators according to their release policy.
+
+## Published snapshot authority
+
+Every new application plugin pin reads its current or requested historical receipt
+from the primary database. A previously fully validated compiled snapshot can be
+reused only when all receipt fields match: revision, inventory ID, reason, package
+identity digest and contract digest. Its complete host grants, executable bytes,
+provenance, manifests, capabilities, stored configurations and provider types were
+validated before the snapshot entered the bounded process-local cache. Tenant
+configuration resolution and hook policy checks continue on their existing paths.
+
+An exact warm pin does not refresh the inventory file or inspect its root. Removing,
+changing or losing access to those files does not revoke an already compiled
+snapshot that the fresh database receipt still authorizes. This applies to current
+requests and authenticated durable work using an exact historical receipt, including
+OAuth consumed-session replay. Publishing a replacement changes authority for new
+current pins; historical work still requires its own database receipt. Database
+errors, absent receipts and mismatched receipts never authorize cached fallback.
+Already pinned in-flight requests retain their existing snapshot.
+
+New, cold or evicted revisions must validate the live inventory, root, complete
+assets and grants before compilation and receipt validation can populate the cache.
+A missing root fails a cold current or historical pin, even when another revision
+is cached. Administrative staging and status retain live filesystem validation;
+staging continues to reject tampered manifests or grants. Immutable inventory IDs
+cannot be edited or removed through inventory refresh. Filesystem removal alone is
+not a revocation mechanism for an exact warm snapshot.
