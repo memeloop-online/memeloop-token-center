@@ -215,7 +215,8 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   assert.equal(journey.starts(), 1, 'reopening continues the original authorization');
   await journey.release(1, 200, journey.account);
   await journey.code.waitFor({ state: 'detached' });
-  await journey.workspace.waitFor({ state: 'detached' });
+  await journey.page.locator('.create-journey[data-open="false"]').waitFor();
+  await journey.workspace.getByRole('region', { includeHidden: true }).waitFor({ state: 'hidden' });
   await journey.page.getByRole('region', { name: `${journey.account.name} · Manage account`, exact: true }).waitFor();
   await journey.page.getByRole('heading', { name: journey.account.name, exact: true }).waitFor();
   assert.equal(await journey.page.locator('.create-journey').getAttribute('data-open'), 'false');
