@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ArchiveChangedError, ArchiveUnavailableError, type ArchiveRangeLoader } from './archiveRange.js';
 import { ArchiveItemStream, type ArchiveStreamItem } from './archiveItemStream.js';
-import { Button, Spinner } from './design-system';
+import { Button, LoadingProgress, LoadingState } from './design-system';
 import { useI18n } from './i18n.js';
 import { projectSessionReplay, type SessionReplayItem } from './sessionReplayProjection.js';
 import type { RequestDetail, RequestView } from './types.js';
@@ -135,13 +135,14 @@ export function ArchiveContentReader({ request, sessionId, side, loadRange, rend
   if (!opened) return <section className="archive-content-reader collapsed" aria-label={t('sessionReplay.content')}>
     <Button appearance="primary" onClick={() => void readPage(0)}>{t('sessionReplay.readFullSide', { side: t(side === 'request' ? 'request.request' : 'request.response') })}</Button>
   </section>;
-  return <section className="archive-content-reader" aria-label={t('sessionReplay.content')}>
+  return <section className="archive-content-reader" aria-label={t('sessionReplay.content')} aria-busy={loading}>
     <header className="archive-content-reader-header">
       <b>{t(side === 'request' ? 'request.request' : 'request.response')}</b>
-      {loading && <Spinner size="extra-small" aria-label={t('sessionReplay.loading')}
-        label={t('sessionReplay.readBytes', { loaded: progress.loaded.toLocaleString(), total: progress.total > 0 ? progress.total.toLocaleString() : '…' })} />}
+      <span className="mtc-loading-counter">{loading ? t('sessionReplay.readBytes', { loaded: progress.loaded.toLocaleString(), total: progress.total > 0 ? progress.total.toLocaleString() : '…' }) : ''}</span>
       <Button appearance="subtle" onClick={() => { controller.current?.abort(); cursor.current = undefined; setLoading(false); setOpened(false); setError(''); setPage({ key, loader: loadRange, offset: 0, items: [], done: false }); setProgress({ loaded: 0, total: 0 }); }}>{t('common.close')}</Button>
     </header>
+    <LoadingProgress active={loading} label={t('sessionReplay.loading')} />
+    {loading && !visible?.items.length && <LoadingState label={t('sessionReplay.loading')} variant="compact" />}
     {error && <div className="archive-content-reader-notice error" role="alert"><span>{error}</span><Button appearance="secondary" disabled={loading} onClick={() => void readPage(visible?.offset ?? 0)}>{t('sessionReplay.retryArchive')}</Button></div>}
     <ol className="session-replay-feed">{visible?.items.map((item, index) => <li key={`${visible.offset + index}:${item.kind}`}>{renderItem(item, index)}</li>)}</ol>
     {visible?.done && !visible.items.length && !loading && <p className="archive-content-reader-end">{t('sessionReplay.archiveEnd')}</p>}

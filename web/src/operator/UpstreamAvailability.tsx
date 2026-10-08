@@ -1,5 +1,6 @@
 import { formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
+import { LoadingState } from '../design-system';
 import type { OperatorMonitoringSnapshot, UpstreamAccount, UpstreamHealth } from '../types';
 import { RoutingStatusBadge } from './MonitoringSnapshot';
 import type { UpstreamAvailabilityWindow } from './upstreamAvailabilityWindow';
@@ -60,7 +61,7 @@ export function UpstreamAvailability({ account, snapshot, window, loading = fals
         <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><ProviderAccountStatus account={account} credential /></span>
       </div>
     </div>
-    {!facts ? <div className="provider-availability-empty" role={loading ? 'status' : undefined}>{t(loading ? 'common.loading' : 'providers.availabilityUnavailable')}</div> : <>
+    {!facts ? loading ? <LoadingState label={t('common.loading')} variant="compact" /> : <div className="provider-availability-empty">{t('providers.availabilityUnavailable')}</div> : <>
       <p className="provider-availability-scope">{t('providers.accountWindowScope')}</p>
       <dl className="provider-availability-metrics provider-account-metrics">
         <div><dt>{t('usage.requests')}</dt><dd>{formatNumber(facts.metrics.requests, locale)}</dd></div>

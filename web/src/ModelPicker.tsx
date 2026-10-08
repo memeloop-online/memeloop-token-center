@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useI18n } from './i18n';
+import { LoadingProgress, LoadingState } from './design-system';
 import { useAnchoredPopover } from './useAnchoredPopover';
 import './modelPicker.css';
 
@@ -119,7 +120,8 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
     }}>
       {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={searchAriaLabel ?? t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={searchPlaceholder ?? t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
       <small className="model-picker-keyboard-hint">{t('modelPicker.keyboardHint')}</small>
-      {loading && <small role="status">{t('common.loading')}</small>}
+      <LoadingProgress active={loading && matching.length > 0} label={t('common.loading')} />
+      {loading && !matching.length && <LoadingState label={t('common.loading')} variant="compact" />}
       {error && <small role="alert" className="error-text">{error}</small>}
       <div id={`${id}-list`} role="listbox" aria-label={label} aria-busy={loading}>
         {(groupBy === 'none' ? [[undefined, matching] as const] : matching.some((option) => option.providerGroup) ? [...groupOptions(matching, 'providerGroup')] : [[undefined, matching] as const]).map(([providerGroup, groupModels]) => <div role={groupBy === 'none' ? undefined : 'group'} aria-label={groupBy === 'none' ? undefined : providerGroup || undefined} key={providerGroup || 'all-providers'}>

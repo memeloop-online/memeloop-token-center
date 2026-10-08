@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
-import { createServer } from 'vite';
+import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 test('plugin configuration is lazy and isolated while resource reads cancel on tenant changes', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {

@@ -6,6 +6,7 @@ import { costCurrencies, costOption, latencyOption, throughputOption, type Usage
 import { formatCurrencyDisplay, formatMetricDisplay, formatPercent } from '../format';
 import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel } from '../LocalSettlementNotice';
 import { useI18n } from '../i18n';
+import { LoadingState } from '../design-system';
 import type { OperatorUsageAnalysisTrends, TypedFilterAst } from '../types';
 import { requestDrilldownForOverviewBucket } from './overviewDrilldown';
 import { useOperatorResource } from './hooks/useOperatorResource';
@@ -87,7 +88,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
   return <section className="overview-trends" aria-label={t('usage.trend')}>
     {state.kind === 'failed' && <div className="notice error" role="alert">{state.message}</div>}
     {state.kind === 'ready' && state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}
-    {!stats && state.kind !== 'failed' && <div className="panel empty" role="status">{t('common.loading')}</div>}
+    {!stats && state.kind !== 'failed' && <LoadingState label={t('common.loading')} className="panel" />}
     {stats && <>
       <p className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</p>
       <p className="analytics-settlement-note"><LocalSettlementNotice /></p>
@@ -97,7 +98,7 @@ export function OverviewTrends({ state, onDrilldown }: { state: ResourceState<Op
           <ChartDataView title={title} metadata={<span>{displayTimeZone()}</span>} data={table}>
           {stats.time_series.length === 0 ? <div className="empty">{t('usage.noData')}</div>
             : id === 'cost' && !hasCostSeries ? <div className="empty">{t('usage.noSettledCostTrend')}</div>
-            : <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
+            : <Suspense fallback={<LoadingState label={t('common.loading')} variant="compact" />}>
               <EChart ariaLabel={title} locale={locale} option={option} timeZone={displayTimeZone()} onClick={({ dataIndex }) => {
                 const point = stats.time_series[dataIndex];
                 if (point) drillDown(point.bucket_start);

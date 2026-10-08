@@ -72,7 +72,8 @@ import '../providerEditLayout.css';
 import '../providerDirectory.css';
 import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
-import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
+import { useOperatorResource } from '../hooks/useOperatorResource';
+import { ResourceBoundary } from '../ResourceBoundary';
 import { loadModelPricePages } from '../pricingLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
 import { PricingTable } from '../PricingTable';
@@ -2100,22 +2101,6 @@ interface OperatorPageProps {
   tenant: string;
   /** Explicit target for every create/update action. */
   writeTenant?: string;
-}
-
-function ResourceBoundary<T>({ resource, scopeKey, children }: {
-  resource: ResourceState<T>;
-  scopeKey: string;
-  children: (value: T) => ReactNode;
-}) {
-  const { t } = useI18n();
-  const previous = useRef<{ scopeKey: string; value: T } | undefined>(undefined);
-  if (previous.current?.scopeKey !== scopeKey) previous.current = undefined;
-  if (resource.kind === 'ready') previous.current = { scopeKey, value: resource.value };
-  const value = resource.kind === 'ready' ? resource.value : previous.current?.value;
-  if (!value) return resource.kind === 'failed'
-    ? <div className="notice error" role="alert">{resource.message}</div>
-    : <div className="empty">{t('common.loading')}</div>;
-  return <>{resource.kind === 'ready' && resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}</div>}{children(value)}</>;
 }
 
 export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpenPricing, onOpenProxyGroups }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void }) {
