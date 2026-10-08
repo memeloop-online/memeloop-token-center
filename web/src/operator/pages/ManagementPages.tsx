@@ -3,6 +3,7 @@ import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
+import { CopyButton } from '../../CopyButton';
 import { formatCurrency, formatNumber, formatPercent } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
 import { tenantDisplayName } from '../../tenantDisplayName';
@@ -449,22 +450,31 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
 
   async function remove(value: UpstreamAccount) {
-    if (!canManage(value)) return;
+    if (!canManage(value) || !ownsWorkspace()) return;
+    let deletionGeneration = renderGeneration;
+    const current = () => providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === deletionGeneration;
     setBusy(`delete-${value.id}`); setError(''); setMessage('');
     try {
       const readiness = await api<UpstreamDeletionReadiness>(`/internal/v1/upstreams/${value.id}/deletion-readiness${queryForTenant(writeTenant)}`, token);
+      if (!current()) return;
       setDeletionReadiness((current) => ({ ...current, [value.id]: readiness }));
       if (!readiness.can_delete) {
         setError(deletionMessages(readiness).join(' '));
         return;
       }
-      if (!await confirm(t('providers.confirmDelete', { name: value.name }))) return;
+      if (!await confirm(t('providers.confirmDelete', { name: value.name })) || !current()) return;
       const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(value.updated_at) });
       await api(`/internal/v1/upstreams/${value.id}?${query}`, token, { method: 'DELETE' });
+      if (!current()) return;
+      if (workspace && workspace.kind !== 'create' && workspace.account.id === value.id) {
+        setProviderEditDraft(undefined);
+        returnToAccountList(value);
+        deletionGeneration = workspaceGeneration.current;
+      }
       setMessage(t('providers.deleted', { name: value.name }));
       await onChanged();
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { setBusy(''); }
+    } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (current()) setBusy(''); }
   }
 
   const connectionCopy = providerConnectionCopy(locale);
@@ -538,7 +548,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     return <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
             {error && <div className="notice error" role="alert">{error}</div>}
             {message && <div className="notice success" role="status">{message}</div>}
-            <div className="provider-detail-heading"><h3 ref={detailHeading} tabIndex={-1}>{value.name}</h3><DetailTooltip content={`ID: ${value.id} · ${t('providers.generation')} ${value.credential_generation}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip>{providerAvailable && <Button appearance="secondary" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderEditDraft(undefined); navigateWorkspace({ kind: 'settings', account: value }); }}>{t('providers.edit')}</Button>}<Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnToAccountList(value)}>{t('providerDirectory.close')}</Button></div>
+            <div className="provider-detail-heading"><h3 ref={detailHeading} tabIndex={-1}>{value.name}</h3><DetailTooltip content={`${providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other')} · ${t('providerDirectory.account')}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip>{providerAvailable && <Button appearance="secondary" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderEditDraft(undefined); navigateWorkspace({ kind: 'settings', account: value }); }}>{t('providers.edit')}</Button>}<Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnToAccountList(value)}>{t('providerDirectory.close')}</Button></div>
             <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(value, action)} routeActionDisabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[value.id] ?? 0} />
             <div className="account-main">
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
@@ -548,6 +558,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
+            <Disclosure title={t('request.technicalDetails')}><dl><div><dt>{t('traffic.upstreamId')}</dt><dd><code>{value.id}</code><CopyButton fluent value={value.id} label={t('common.copy')} /></dd></div><div><dt>{t('providers.provider')}</dt><dd><code>{value.driver}</code></dd></div><div><dt>{t('providers.generation')}</dt><dd>{formatNumber(value.credential_generation, locale)}</dd></div></dl></Disclosure>
             <Disclosure title={t('connection.manageAccount')} defaultOpen={returnFocus.current?.accountId === value.id && ['rotation', 'reauthorization'].includes(returnFocus.current.target)}><div className="row-actions">
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
@@ -586,7 +597,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
           <div className="provider-directory-row">
             <div className="provider-directory-identity">
-            <DetailTooltip content={`${providerName} · ${value.driver} · ID: ${value.id}${value.tenant_external_id ? ` · ${tenantDisplayName(value.tenant_external_id, locale)}` : ''}`}><b tabIndex={0}>{value.name}</b></DetailTooltip>
+            <DetailTooltip content={`${providerName} · ${t('providerDirectory.account')}`}><b tabIndex={0}>{value.name}</b></DetailTooltip>
             <span>{providerName} · {value.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', value.connection_method)}</span>
             {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}

@@ -181,6 +181,108 @@ test('independent proxy save updates concurrency metadata without dropping the p
   } finally { await browser.close(); await server.close(); }
 });
 
+test('account deletion clears only its workspace and ordinary tooltips omit technical identifiers', { timeout: 120_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  const artifacts = `${root}/e2e-artifacts/ui-system/account-workspace`;
+  await mkdir(artifacts, { recursive: true });
+  try {
+    for (const locale of ['zh-CN', 'en'] as const) for (const width of [1440, 390]) {
+      const height = width === 390 ? 844 : 1000;
+      const page = await browser.newPage({ viewport: { width, height } });
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      const chinese = locale === 'zh-CN';
+      const firstId = '11111111-1111-4111-8111-111111111111';
+      const secondId = '22222222-2222-4222-8222-222222222222';
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      let deleted = false;
+      let deletionMode: 'failed' | 'ready' | 'late' = 'failed';
+      let releaseDelete: (() => void) | undefined;
+      let deleteStarted: (() => void) | undefined;
+      const account = (id: string, tenant: string) => ({ id, tenant_external_id: tenant, name: id === firstId ? 'Primary account' : 'Second account', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 7, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 0, config: {}, created_at: 1, updated_at: 2 });
+      await page.route('**/*', async route => {
+        const request = route.request(); const url = new URL(request.url());
+        assert.equal(url.origin, origin, 'deletion contracts only use the isolated fixture');
+        if (!url.pathname.startsWith('/internal/')) return route.continue();
+        if (request.method() !== 'GET') {
+          assert.equal(request.method(), 'DELETE');
+          assert.equal(url.pathname, `/internal/v1/upstreams/${firstId}`);
+          assert.equal(url.searchParams.get('tenant_external_id'), 'fixture-a');
+          assert.equal(url.searchParams.get('expected_updated_at'), '2');
+          if (deletionMode === 'failed') return route.fulfill({ status: 409, json: { error: { message: 'Fixture deletion rejected' } } });
+          if (deletionMode === 'late') await new Promise<void>(resolve => { releaseDelete = resolve; deleteStarted?.(); });
+          deleted = true;
+          return route.fulfill({ json: {} });
+        }
+        if (url.pathname === '/internal/v1/upstreams') {
+          const tenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
+          return route.fulfill({ json: [...(!deleted && tenant === 'fixture-a' ? [account(firstId, tenant)] : []), account(secondId, tenant)] });
+        }
+        if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: {} }, credential_schema: { type: 'object', properties: {} } }] });
+        if (url.pathname.endsWith('/deletion-readiness')) return route.fulfill({ json: { can_delete: true, requires_disabled: false, model_route_count: 0, imported_for_audit: false } });
+        if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 7, status: 'ready', models: [], disabled_models: [] } });
+        if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: false } });
+        if (url.pathname.includes('monitoring')) return route.fulfill({ json: { top_upstream_models: [] } });
+        if (url.pathname.includes('availability')) return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
+        return route.fulfill({ json: [] });
+      });
+      const fixture = `${origin}/e2e/fixtures/authorization-code.html?scope-controls`;
+      await page.goto(fixture);
+      await page.locator(`[data-upstream-id="${firstId}"] .provider-directory-identity b`).hover();
+      await page.getByRole('tooltip').last().waitFor();
+      for (const text of await page.getByRole('tooltip').allTextContents()) {
+        assert.equal(text.includes(firstId), false);
+        assert.equal(text.includes('http-json'), false);
+      }
+      const details = await manageProviderAccount(page, firstId);
+      await details.locator('.provider-detail-heading > span').hover();
+      await page.getByRole('tooltip').last().waitFor();
+      for (const text of await page.getByRole('tooltip').allTextContents()) {
+        assert.equal(text.includes(firstId), false);
+        assert.equal(text.includes('http-json'), false);
+      }
+      assert.equal((await details.locator('.provider-detail-heading').innerText()).includes(firstId), false);
+      await details.getByRole('button', { name: chinese ? '技术详情' : 'Technical details', exact: true }).click();
+      await details.locator('code').filter({ hasText: firstId }).waitFor();
+      assert.equal(await details.getByRole('button', { name: chinese ? '复制' : 'Copy', exact: true }).count(), 1);
+      await details.getByRole('button', { name: chinese ? '危险操作' : 'Danger zone', exact: true }).click();
+      const remove = details.getByRole('button', { name: chinese ? '删除' : 'Remove', exact: true });
+      const proceed = page.getByRole('dialog').getByRole('button', { name: chinese ? '确认继续' : 'Confirm and continue', exact: true });
+      await remove.click(); await proceed.click();
+      await details.getByRole('alert').filter({ hasText: 'Fixture deletion rejected' }).waitFor();
+      assert.equal(await details.count(), 1, 'a rejected deletion retains the account workspace');
+      deletionMode = 'ready';
+      await remove.click(); await proceed.click();
+      await details.waitFor({ state: 'detached' });
+      await page.locator(`[data-upstream-id="${firstId}"]`).waitFor({ state: 'detached' });
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'deleted accounts never remain as fallback details');
+      await page.locator(`[data-manage-account-trigger="${secondId}"]`).waitFor();
+      await page.screenshot({ path: `${artifacts}/accounts-list--deleted--${locale}--${width}x${height}--light.png`, fullPage: true });
+      deleted = false; deletionMode = 'late';
+      await page.goto(fixture);
+      await manageProviderAccount(page, firstId);
+      await details.getByRole('button', { name: chinese ? '危险操作' : 'Danger zone', exact: true }).click();
+      const pending = new Promise<void>(resolve => { deleteStarted = resolve; });
+      await remove.click(); await proceed.click(); await pending;
+      await page.getByRole('button', { name: 'Switch tenant', exact: true }).click();
+      const secondDetails = await manageProviderAccount(page, secondId);
+      const completed = page.waitForResponse(response => response.request().method() === 'DELETE');
+      assert.ok(releaseDelete); releaseDelete(); await completed;
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      assert.equal(await secondDetails.isVisible(), true, 'late deletion of A cannot close the new B workspace');
+      assert.equal(await secondDetails.getByRole('heading', { name: 'Second account', exact: true }).count(), 1);
+      assert.equal(await page.locator('.notice.success').count(), 0, 'late deletion does not publish into another scope');
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('account workspace returns without retained details, shares list tracks and rejects late saves across scopes', { timeout: 120_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
