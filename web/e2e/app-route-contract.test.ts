@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   appHref,
+  isSameAppLocation,
   operatorRouteKeys,
   portalRouteKeys,
   readAppLocation,
@@ -42,6 +43,22 @@ test('proxy group deep links preserve bounded account and tenant context without
   assert.equal(withProxyGroupNavigationContext(appHref('operator', 'providers'), { accountId: 'account/one', tenant: 'research team' }), '/operator?view=providers');
   assert.deepEqual(readProxyGroupNavigationContext('?view=providers&account=account&tenant=tenant'), {});
   assert.deepEqual(readProxyGroupNavigationContext(`?view=proxy-groups&account=${'x'.repeat(201)}&tenant=${'y'.repeat(201)}`), {});
+});
+
+test('same-route proxy locations distinguish account and tenant history entries', () => {
+  const current = readAppLocation(new URL('https://example.test/operator?view=proxy-groups&account=one&tenant=north'));
+  for (const query of ['account=two&tenant=north', 'account=one&tenant=south', '']) {
+    const next = readAppLocation(new URL(`https://example.test/operator?view=proxy-groups&${query}`));
+    assert.equal(isSameAppLocation(current, next), false, 'context changes must not be discarded as same-route navigation');
+    assert.deepEqual(readAppLocation(new URL(appHref(next.surface, next.route, next.context), 'https://example.test')), next);
+  }
+});
+
+test('production entry forwards the live location context to Operator', async () => {
+  const source = await readFile(new URL('../src/main.tsx', import.meta.url), 'utf8');
+  assert.match(source, /const\s*\{[^}]*\bcontext\b[^}]*\}\s*=\s*useAppLocation\(\)/, 'the production entry must subscribe to context changes');
+  assert.match(source, /<Operator\b[^>]*\bnavigationContext=\{context\}/, 'Operator must receive current history context instead of relying on fixture-only wiring');
+  assert.match(source, /<Operator\b[^>]*\bonRouteChange=\{navigate\}/);
 });
 
 test('application shell preserves native links and provides modal mobile navigation', async () => {

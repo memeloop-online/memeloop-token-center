@@ -23,12 +23,12 @@ function Loading() {
 }
 
 function Application() {
-  const { surface, route, navigate } = useAppLocation();
+  const { surface, route, context, navigate } = useAppLocation();
   const [pluginNavigation, setPluginNavigation] = useState<PluginNavigationSection[]>([]);
   const updatePluginNavigation = useCallback((next: PluginNavigationSection[]) => setPluginNavigation(next), []);
   return <AppShell surface={surface} route={route} onNavigate={navigate} pluginNavigation={surface === 'operator' ? pluginNavigation : []}>
     {surface === 'operator'
-      ? <Suspense fallback={<Loading />}><Operator route={route as OperatorRouteKey} onRouteChange={navigate} onPluginNavigation={updatePluginNavigation} embedded showNavigation={false} /></Suspense>
+      ? <Suspense fallback={<Loading />}><Operator route={route as OperatorRouteKey} navigationContext={context} onRouteChange={navigate} onPluginNavigation={updatePluginNavigation} embedded showNavigation={false} /></Suspense>
       : <SelfPortal route={route as SelfPortalRoute} onRouteChange={navigate} embedded showNavigation={false} />}
   </AppShell>;
 }
