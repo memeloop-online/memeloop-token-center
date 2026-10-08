@@ -108,13 +108,15 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       await page.screenshot({ path: `${artifacts}/${label}.png`, fullPage: true });
       const references = Object.fromEntries(await Promise.all(controls.map(async control => [control, await geometry(baseline.locator(`[data-controls="reference"] [data-control="${control}"]`))])));
       mediumHeight = references.refresh.height;
-      assert.ok(references.compact.height < references.refresh.height, `${label}: explicit small action remains compact`);
-      assert.ok(references.icon.width < references.refresh.width, `${label}: icon-only action keeps Fluent icon sizing`);
+      assert.ok(references.compact.height < references.refresh.height, `${label}: clean Fluent baseline without the application touch policy retains intrinsic small/medium sizes`);
+      assert.ok(references.icon.width < references.refresh.width, `${label}: clean Fluent baseline retains intrinsic icon sizing`);
       const surfaces = page.locator('[data-controls]').filter({ has: page.locator('[data-control="refresh"]') });
       for (const surface of await surfaces.all()) {
         const name = await surface.getAttribute('data-controls');
+        const dimensions: Record<string, Awaited<ReturnType<typeof geometry>>> = {};
         for (const control of controls) {
           const measured = await geometry(surface.locator(`[data-control="${control}"]`));
+          dimensions[control] = measured;
           const expected = references[control];
           assert.equal(measured.height, actionHeight(expected.height, width), `${label}/${name}/${control}: Fluent height with the narrow touch minimum`);
           if (width <= 768) assert.ok(measured.width >= 44 && measured.height >= 44, `${label}/${name}/${control}: at least 44x44px without changing Fluent typography or padding`);
@@ -127,6 +129,13 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
           assert.deepEqual(measured.border, expected.border, `${label}/${name}/${control}: theme border`);
           assert.equal(measured.text, expected.text, `${label}/${name}/${control}: complete label`);
           measurements.push({ label, surface: name, control, ...measured });
+        }
+        if (width > 768) {
+          assert.ok(dimensions.compact.height < dimensions.refresh.height, `${label}/${name}: desktop preserves the explicit Fluent small/medium height distinction`);
+        } else {
+          assert.equal(dimensions.refresh.height, 44, `${label}/${name}: narrow single-line medium actions use the shared 44px target`);
+          assert.equal(dimensions.compact.height, dimensions.refresh.height, `${label}/${name}: narrow small actions share the touch height while retaining their verified Fluent font and padding`);
+          assert.equal(dimensions.icon.height, dimensions.refresh.height, `${label}/${name}: narrow icon actions share the touch height`);
         }
         const action = surface.locator('[data-control="refresh"]');
         await action.focus();
