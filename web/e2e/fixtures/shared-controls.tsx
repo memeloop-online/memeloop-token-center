@@ -69,6 +69,23 @@ function Preview() {
       </span></label>
       <output>{pagesLoaded}</output>
     </section>
+    <section className="credential-compact-list" data-controls="credential-list">
+      {['service', 'client'].map(kind => <div className="managed-resource credential-compact-row" data-credential-kind={kind} key={kind}>
+        <div className="managed-resource-header">
+          {kind === 'client' && <Checkbox aria-label="Select credential" />}
+          <div className={kind === 'client' ? 'credential-row-identity' : undefined}>
+            <b>{kind === 'service' ? 'Existing service credential' : 'Existing client credential'}</b>
+            <div className="credential-row-summary"><span>tenant-a · keys:read</span></div>
+          </div>
+          <div className="account-meta"><span>Active</span><span>Generation 1</span></div>
+        </div>
+        <div className="row-actions credential-row-actions">
+          <span><Button appearance="secondary">{locale === 'zh-CN' ? '复制凭据' : 'Copy credential'}</Button></span>
+          <span><Button appearance="secondary">{locale === 'zh-CN' ? kind === 'service' ? '轮换服务凭据' : '轮换客户端凭据' : kind === 'service' ? 'Rotate service credential' : 'Rotate client credential'}</Button></span>
+          {kind === 'service' && <span><Button appearance="secondary">{locale === 'zh-CN' ? '暂停服务凭据' : 'Suspend service credential'}</Button></span>}
+        </div>
+      </div>)}
+    </section>
     <section data-controls="fields" className="form-panel" style={{ display: 'grid', gap: 16 }}>
       <Input aria-label="Account name" defaultValue="Example account" />
       <Select aria-label="Account status" defaultValue="active"><option value="active">Active</option></Select>

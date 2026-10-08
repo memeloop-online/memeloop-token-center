@@ -165,6 +165,21 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       assert.ok(inputBounds.x + inputBounds.width <= actionBounds.x || inputBounds.y + inputBounds.height <= actionBounds.y, `${label}: credential input does not overlap its paging action`);
       await loadMore.click();
       assert.equal(await credentialActions.locator('output').textContent(), '1', `${label}: credential paging receives an ordinary pointer click`);
+      const credentialRows = page.locator('[data-controls="credential-list"] .credential-compact-row');
+      const columns: Array<{ identity: number; actions: number; identityWidth: number; actionsWidth: number }> = [];
+      for (const row of await credentialRows.all()) {
+        const identity = row.locator('.managed-resource-header');
+        const name = identity.locator('b');
+        assert.equal(await name.isVisible(), true, `${label}: credential name remains visible beside full action labels`);
+        const nameBounds = await name.boundingBox();
+        const identityBounds = await identity.boundingBox();
+        const actionsBounds = await row.locator('.credential-row-actions').boundingBox();
+        assert.ok(nameBounds && identityBounds && actionsBounds);
+        assert.ok(nameBounds.width > 0 && nameBounds.height > 0, `${label}: credential identity never collapses to a zero rectangle`);
+        assert.equal(await row.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${label}: credential actions remain inside their row`);
+        columns.push({ identity: identityBounds.x, actions: actionsBounds.x, identityWidth: identityBounds.width, actionsWidth: actionsBounds.width });
+      }
+      assert.deepEqual(columns[0], columns[1], `${label}: both credential structures share tracks regardless of action count`);
       const selected = await geometry(page.locator('[data-control="selected"]'));
       assert.equal(selected.height, references.refresh.height, `${label}: selected state does not change button geometry`);
       assert.notEqual(selected.background, references.refresh.background, `${label}: selected state remains visually distinct in the active theme`);

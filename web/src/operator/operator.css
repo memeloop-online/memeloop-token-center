@@ -602,12 +602,14 @@
   min-width: 0;
 }
 
-.row-actions > span {
+.row-actions > span,
+.credential-row-actions > span {
   min-width: 0;
   max-width: 100%;
 }
 
-.row-actions button {
+.row-actions button,
+.credential-row-actions button {
   margin: 0;
   max-width: 100%;
   white-space: normal;
@@ -1065,7 +1067,7 @@
 
 .credential-compact-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px 24px;
   align-items: center;
   border: 0;
@@ -1085,11 +1087,13 @@
 .credential-compact-row .managed-resource-header {
   align-items: center;
   flex-direction: row;
+  flex-wrap: wrap;
   min-width: 0;
 }
-.credential-compact-row .credential-row-identity { flex: 1; min-width: 0; }
+.credential-compact-row .credential-row-identity,
+.credential-compact-row .managed-resource-header > div:has(> b) { flex: 1 1 min-content; min-width: 0; }
 .credential-compact-row .managed-resource-header > :is(.fui-Checkbox, .account-meta) { flex: 0 0 auto; }
-.credential-compact-row .credential-row-actions { margin: 0; justify-content: flex-end; }
+.credential-compact-row .credential-row-actions { min-width: 0; margin: 0; justify-content: flex-end; }
 .credential-compact-row .managed-resource-header .credential-budget,
 .credential-compact-row .managed-resource-header .credential-group-summary { font-size: 12px; line-height: 1.5; }
 @media (width <= 850px) {
@@ -1102,6 +1106,7 @@
 }
 
 .credential-compact-row .managed-resource-header b {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
