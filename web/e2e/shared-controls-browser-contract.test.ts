@@ -38,8 +38,17 @@ async function geometry(control: Locator) {
   return control.evaluate(element => {
     const style = getComputedStyle(element);
     const bounds = element.getBoundingClientRect();
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    const textRects: { x: number; y: number; width: number; height: number }[] = [];
+    while (walker.nextNode()) {
+      if (!walker.currentNode.textContent?.trim()) continue;
+      const range = document.createRange();
+      range.selectNodeContents(walker.currentNode);
+      textRects.push(...Array.from(range.getClientRects(), rect => ({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })));
+    }
     return {
-      height: bounds.height, width: bounds.width, text: element.textContent,
+      x: bounds.x, y: bounds.y, height: bounds.height, width: bounds.width, text: element.textContent,
+      textRects, textLineCount: new Set(textRects.map(rect => rect.y)).size,
       font: style.font, lineHeight: style.lineHeight,
       paddingBlock: [style.paddingTop, style.paddingBottom],
       paddingInline: [style.paddingLeft, style.paddingRight],
@@ -167,6 +176,29 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       }
       const native = page.locator('[data-controls="native"] button').first();
       assert.ok((await geometry(native)).height >= actionHeight(references.refresh.height, width), `${label}: native actions retain a usable baseline`);
+      const table = page.locator('[data-controls="table-actions"] table');
+      const headerCells = await table.locator('thead th').all();
+      const headerBounds = await Promise.all(headerCells.map(cell => cell.boundingBox()));
+      const tableActions = await table.locator('.row-actions button').all();
+      const tableMeasurements = await Promise.all(tableActions.map(action => geometry(action)));
+      measurements.push(...tableMeasurements.map(measured => ({ label, surface: 'table-actions', ...measured })));
+      await writeFile(`${artifacts}/measurements.json`, JSON.stringify(measurements, null, 2));
+      for (const row of await table.locator('tbody tr').all()) {
+        const cells = await row.locator('td').all();
+        assert.equal(cells.length, headerBounds.length, `${label}: table rows retain their semantic columns`);
+        for (const [index, cell] of cells.entries()) {
+          const bounds = await cell.boundingBox();
+          const heading = headerBounds[index];
+          assert.ok(bounds && heading);
+          assert.ok(Math.abs(bounds.x - heading.x) <= 1 && Math.abs(bounds.width - heading.width) <= 1, `${label}: header and rows share tracks regardless of action count`);
+        }
+      }
+      for (const [index, action] of tableActions.entries()) {
+        const measured = tableMeasurements[index];
+        assert.equal(measured.height, (await geometry(native)).height, `${label}/${measured.text}: table actions retain the native single-line baseline`);
+        assert.equal(measured.textLineCount, 1, `${label}/${measured.text}: intrinsic table width preserves short action words`);
+        assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${label}: table action labels remain contained`);
+      }
       const credentialActions = page.locator('[data-controls="combobox-actions"]');
       const credentialInput = credentialActions.getByRole('combobox');
       const loadMore = credentialActions.locator('[data-control="load-more"]');
@@ -244,17 +276,21 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       await page.locator(route.ready).first().waitFor();
       const actions = page.locator(route.controls);
       assert.ok(await actions.count() > 0, `${route.name}: real page actions are present`);
+      const actionElements = await actions.all();
+      const actionMeasurements = await Promise.all(actionElements.map(action => geometry(action)));
+      measurements.push(...actionMeasurements.map(measured => ({ page: route.name, theme, viewportWidth: width, ...measured })));
+      await writeFile(`${artifacts}/measurements.json`, JSON.stringify(measurements, null, 2));
+      await page.screenshot({ path: `${artifacts}/page-${route.name}-${theme}-${width}.png`, fullPage: true });
       const expectedHeight = route.native ? (await geometry(actions.first())).height : actionHeight(mediumHeight, width);
       assert.ok(expectedHeight >= actionHeight(mediumHeight, width), `${route.name}: usable action baseline`);
-      for (const action of await actions.all()) {
-        const measured = await geometry(action);
-        assert.equal(measured.height, expectedHeight, `${route.name}/${theme}/${width}: same default action height`);
+      for (const [index, action] of actionElements.entries()) {
+        const measured = actionMeasurements[index];
+        assert.equal(measured.height, expectedHeight, `${route.name}/${theme}/${width}/${measured.text}: same default action height`);
+        if (route.native) assert.equal(measured.textLineCount, 1, `${route.name}/${theme}/${width}/${measured.text}: short route actions do not wrap into character columns`);
         if (width <= 768) assert.ok(measured.width >= 44 && measured.height >= 44, `${route.name}/${theme}/${width}: shared narrow target is at least 44x44px`);
         assert.ok(measured.text?.trim(), `${route.name}: visible action label`);
         assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}: action text contained`);
-        measurements.push({ page: route.name, theme, viewportWidth: width, ...measured });
       }
-      await page.screenshot({ path: `${artifacts}/page-${route.name}-${theme}-${width}.png`, fullPage: true });
       assert.deepEqual(errors, [], route.name);
       await page.close();
     }

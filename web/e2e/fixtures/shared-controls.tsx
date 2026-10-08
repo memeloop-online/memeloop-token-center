@@ -61,6 +61,15 @@ function Preview() {
       <Button appearance="primary" data-control="save">{labels.save}</Button>
     </section>
     <section data-controls="native" className="row-actions"><button type="button">{labels.refresh}</button><button type="button" className="secondary">{labels.save}</button><button type="button" className="danger">{labels.remove}</button></section>
+    <section className="table-scroll" data-controls="table-actions">
+      <table>
+        <thead><tr><th>Model</th><th>Upstream model</th><th>Actions</th></tr></thead>
+        <tbody>{[3, 2].map(actionCount => <tr key={actionCount}>
+          <td><code>research-model-{actionCount}</code></td><td><code>upstream-research-model</code></td>
+          <td><div className="row-actions">{(locale === 'zh-CN' ? ['编辑', '停用', '归档'] : ['Edit', 'Disable', 'Archive']).slice(0, actionCount).map((label, index) => <button key={label} type="button" className={index === 2 ? 'danger' : 'secondary'} disabled={index === 2}>{label}</button>)}</div></td>
+        </tr>)}</tbody>
+      </table>
+    </section>
     <section className="usage-presets"><Button data-control="selected" appearance="secondary" aria-pressed="true">{labels.refresh}</Button></section>
     <section className="usage-filter-grid" data-controls="combobox-actions">
       <label>Client credential<span style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
