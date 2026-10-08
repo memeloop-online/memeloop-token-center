@@ -558,7 +558,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
-            <Disclosure title={t('request.technicalDetails')}><dl><div><dt>{t('traffic.upstreamId')}</dt><dd><code>{value.id}</code><CopyButton fluent value={value.id} label={t('common.copy')} /></dd></div><div><dt>{t('providers.provider')}</dt><dd><code>{value.driver}</code></dd></div><div><dt>{t('providers.generation')}</dt><dd>{formatNumber(value.credential_generation, locale)}</dd></div></dl></Disclosure>
+            <Disclosure title={t('request.technicalDetails')}><dl><div><dt>{t('traffic.upstreamId')}</dt><dd><code>{value.id}</code><CopyButton fluent value={value.id} label={t('providers.copyAccountId')} /></dd></div><div><dt>{t('providers.provider')}</dt><dd><code>{value.driver}</code></dd></div><div><dt>{t('providers.generation')}</dt><dd>{formatNumber(value.credential_generation, locale)}</dd></div></dl></Disclosure>
             <Disclosure title={t('connection.manageAccount')} defaultOpen={returnFocus.current?.accountId === value.id && ['rotation', 'reauthorization'].includes(returnFocus.current.target)}><div className="row-actions">
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>

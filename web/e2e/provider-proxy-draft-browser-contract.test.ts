@@ -249,7 +249,7 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
       assert.equal((await details.locator('.provider-detail-heading').innerText()).includes(firstId), false);
       await details.getByRole('button', { name: chinese ? '技术详情' : 'Technical details', exact: true }).click();
       await details.locator('code').filter({ hasText: firstId }).waitFor();
-      assert.equal(await details.getByRole('button', { name: chinese ? '复制' : 'Copy', exact: true }).count(), 1);
+      assert.equal(await details.getByRole('button', { name: chinese ? '复制账号 ID' : 'Copy account ID', exact: true }).count(), 1);
       await details.getByRole('button', { name: chinese ? '危险操作' : 'Danger zone', exact: true }).click();
       const remove = details.getByRole('button', { name: chinese ? '删除' : 'Remove', exact: true });
       const proceed = page.getByRole('dialog').getByRole('button', { name: chinese ? '确认继续' : 'Confirm and continue', exact: true });
