@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdir } from 'node:fs/promises';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { operatorFixturePlugin } from './support/navigation-fixture-server.js';
+import { captureNavigationIdentity, seedNavigationIdentity } from './support/navigation-identity-artifacts.js';
 import type { TransportProxyBinding, TransportProxyGroup } from '../src/operator/transportProxyGroups.js';
 import { transportProxyGroupCopy } from '../src/operator/transportProxyGroupCopy.js';
 
@@ -19,6 +19,9 @@ interface ProxyGroupFixture {
   failure?: { status: number; code: string };
   holdNext: boolean;
   release?: () => void;
+  holdNextRead?: boolean;
+  releaseRead?: () => void;
+  readFailure?: boolean;
   policies: boolean[];
 }
 
@@ -55,7 +58,13 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
       if (!state.allowed) return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
       if (method === 'GET') {
         if (url.searchParams.get('tenant_external_id') !== 'fixture') throw new Error('missing read tenant');
-        return new Response(JSON.stringify(url.pathname.endsWith('/transport-proxy-group') ? state.binding : { items: state.groups }));
+        if (state.readFailure) return new Response(JSON.stringify({ error: { message: secret } }), { status: 503 });
+        const response = new Response(JSON.stringify(url.pathname.endsWith('/transport-proxy-group') ? state.binding : { items: state.groups }));
+        if (state.holdNextRead) {
+          state.holdNextRead = false;
+          return new Promise<Response>(resolve => { state.releaseRead = () => resolve(response); });
+        }
+        return response;
       }
       const body = JSON.parse(String(init?.body));
       state.writes.push({ path: url.pathname, method, body });
@@ -155,8 +164,6 @@ async function assertWorkspaceFocus(page: Page) {
 
 test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissions and bounded exit', { timeout: 120_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/navigation-identity/proxy-groups/', import.meta.url));
-  await mkdir(artifacts, { recursive: true });
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/transport-proxy-groups.html')], server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
@@ -190,52 +197,56 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
     });
-    await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+    await seedNavigationIdentity(page, locale);
     await page.goto(`${origin}/operator?view=proxy-groups`);
     await page.getByText(transportProxyGroupCopy(locale).denied, { exact: true }).waitFor();
     await installFixture(page, allowed, locale);
     return page;
   }
   try {
-    await context.test('desktop and narrow bilingual screenshots cover empty, populated, denied and slow access', async () => {
+    await context.test('desktop and narrow bilingual screenshots cover all applicable proxy workspace states', async () => {
       for (const locale of ['zh-CN', 'en']) {
         const copy = transportProxyGroupCopy(locale);
         const page = await prepare(true, locale);
         await page.getByText(copy.empty, { exact: true }).waitFor();
-        for (const width of [1440, 390]) {
-          await page.setViewportSize({ width, height: 1000 });
-          await page.screenshot({ path: `${artifacts}/empty-${locale}-${width}.png`, fullPage: true, animations: 'disabled' });
-        }
+        await captureNavigationIdentity(page, 'proxy-groups', 'empty', locale);
         await page.evaluate(() => { window.proxyGroupFixture.groups = [{
           id: 'raw-group-id', tenant_external_id: 'fixture', name: 'Research exits', version: 1, bound_account_count: 0,
           members: [{ id: 'raw-member-id-0', label: 'Primary exit', scheme: 'socks5h', remote_dns: true, has_auth: true }],
         }]; });
         await page.getByRole('button', { name: copy.refresh, exact: true }).click();
         await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).waitFor();
-        for (const width of [1440, 390]) {
-          await page.setViewportSize({ width, height: 1000 });
-          const layout = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
-          assert.ok(layout.scroll <= layout.width);
-          await page.screenshot({ path: `${artifacts}/normal-${locale}-${width}.png`, fullPage: true, animations: 'disabled' });
-        }
+        await captureNavigationIdentity(page, 'proxy-groups', 'ready', locale);
+        await page.evaluate(() => { window.proxyGroupFixture.holdNextRead = true; });
+        await page.getByRole('button', { name: copy.refresh, exact: true }).click();
+        await page.waitForFunction(() => Boolean(window.proxyGroupFixture.releaseRead));
+        const retainedGroup = page.getByRole('button', { name: copy.edit('Research exits'), exact: true });
+        assert.equal(await retainedGroup.isVisible(), true, 'refresh keeps the previous real group visible');
+        assert.equal(await retainedGroup.isDisabled(), true, 'refresh prevents stale group writes');
+        await captureNavigationIdentity(page, 'proxy-groups', 'background-refresh', locale);
+        await page.evaluate(() => window.proxyGroupFixture.releaseRead?.());
+        await page.getByRole('button', { name: copy.refresh, exact: true }).waitFor();
+        assert.equal(await retainedGroup.isEnabled(), true);
+        await page.evaluate(() => { window.proxyGroupFixture.readFailure = true; });
+        await page.getByRole('button', { name: copy.refresh, exact: true }).click();
+        await page.locator('.transport-proxy-workspace [role="alert"]').waitFor();
+        assert.equal(await page.locator('.transport-proxy-workspace [role="alert"]').innerText(), copy.errors.load);
+        assert.equal(await retainedGroup.isVisible(), true, 'a failed refresh must not invent an empty collection');
+        assert.doesNotMatch(await page.content(), /privateProxySecret|fixture-user/);
+        await captureNavigationIdentity(page, 'proxy-groups', 'error', locale);
         await page.close();
         const denied = await prepare(false, locale);
         assert.equal(await denied.locator('.transport-proxy-workspace').count(), 0);
         assert.equal(await denied.evaluate(() => window.proxyGroupFixture.reads), 0);
-        for (const width of [1440, 390]) {
-          await denied.setViewportSize({ width, height: 1000 });
-          await denied.screenshot({ path: `${artifacts}/denied-${locale}-${width}.png`, fullPage: true, animations: 'disabled' });
-        }
+        await captureNavigationIdentity(denied, 'proxy-groups', 'permission-failure', locale);
         await denied.close();
         const slow = await browser.newPage();
-        await slow.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+        await seedNavigationIdentity(slow, locale);
         await slow.goto(`${origin}/operator?view=proxy-groups&access=slow`);
         await slow.getByLabel(copy.checking, { exact: true }).waitFor();
-        for (const width of [1440, 390]) {
-          await slow.setViewportSize({ width, height: 1000 });
-          await slow.screenshot({ path: `${artifacts}/slow-${locale}-${width}.png`, fullPage: true, animations: 'disabled' });
-        }
+        await slow.waitForFunction(() => Boolean(window.releaseNavigationProxyAccess));
         assert.equal(await slow.locator('.transport-proxy-workspace').count(), 0);
+        await captureNavigationIdentity(slow, 'proxy-groups', 'initial-loading', locale);
         await slow.evaluate(() => window.releaseNavigationProxyAccess?.());
         await slow.getByText(copy.denied, { exact: true }).waitFor();
         await slow.close();
@@ -259,8 +270,8 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
         await page.setViewportSize({ width, height: 1000 });
         const bounds = await workspace.boundingBox();
         assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= width + 1);
-        await page.screenshot({ path: `${artifacts}/account-group-zh-${width}.png`, fullPage: true, animations: 'disabled' });
       }
+      await captureNavigationIdentity(page, 'proxy-groups', 'account-binding', 'zh-CN');
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       await page.locator('.provider-directory-row').waitFor();
@@ -343,8 +354,8 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.setViewportSize({ width: 390, height: 1000 });
       const bounds = await workspace.boundingBox();
       assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391);
-      await page.screenshot({ path: `${artifacts}/create-group-en-390.png`, fullPage: true, animations: 'disabled' });
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
+      await captureNavigationIdentity(page, 'proxy-groups', 'create-draft', 'en');
       await page.close();
     });
 

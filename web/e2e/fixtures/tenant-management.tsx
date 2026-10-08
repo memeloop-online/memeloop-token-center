@@ -11,7 +11,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/app-shell.css';
 
-type Scenario = 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'services-denied' | 'services-empty';
+type Scenario = 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'management-error' | 'background-refresh' | 'services-denied' | 'services-empty';
 
 interface TenantRecord {
   external_id: string;
@@ -19,7 +19,7 @@ interface TenantRecord {
 }
 
 declare global {
-  interface Window { tenantFixture: { calls: string[]; release?: () => void } }
+  interface Window { tenantFixture: { calls: string[]; holdNext?: boolean; release?: () => void } }
 }
 
 const parameters = new URLSearchParams(location.search);
@@ -54,6 +54,11 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   }
   if (url.pathname === '/internal/v1/tenant-management') {
     if (scenario === 'management-denied') return json({ error: { message: 'Tenant management denied' } }, 403);
+    if (scenario === 'management-error') return json({ error: { message: 'Tenant management temporarily unavailable' } }, 503);
+    if (method === 'GET' && window.tenantFixture.holdNext) {
+      window.tenantFixture.holdNext = false;
+      return new Promise<Response>(resolve => { window.tenantFixture.release = () => resolve(json(tenantRecords)); });
+    }
     if (scenario === 'slow' && method === 'GET') return new Promise<Response>(resolve => { window.tenantFixture.release = () => resolve(json(tenantRecords)); });
     if (scenario === 'empty' && method === 'GET') return json([]);
     if (method === 'GET') return json(tenantRecords);

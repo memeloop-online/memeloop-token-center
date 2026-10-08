@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -8,16 +8,16 @@ import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createServer } from 'vite';
 import { operatorFixturePlugin } from './support/navigation-fixture-server.js';
+import { captureNavigationIdentity, seedNavigationIdentity } from './support/navigation-identity-artifacts.js';
 
 declare global {
   interface Window {
-    tenantFixture: { calls: string[]; release?: () => void };
+    tenantFixture: { calls: string[]; holdNext?: boolean; release?: () => void };
   }
 }
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const screenshotWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
-const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/navigation-identity/identity/', import.meta.url));
 
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();
@@ -32,7 +32,7 @@ async function localChromiumExecutable() {
   return undefined;
 }
 
-function fixture(port: number, scenario: 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'services-denied' | 'services-empty', view = 'tenants') {
+function fixture(port: number, scenario: 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'management-error' | 'background-refresh' | 'services-denied' | 'services-empty', view = 'tenants') {
   return `http://127.0.0.1:${port}/operator?scenario=${scenario}&view=${view}`;
 }
 
@@ -130,12 +130,8 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
-    await mkdir(artifacts, { recursive: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-    await page.addInitScript(() => {
-      // Seed the initial locale without overwriting explicit changes on reload.
-      if (!localStorage.getItem('mtc-locale')) localStorage.setItem('mtc-locale', 'en');
-    });
+    await seedNavigationIdentity(page, 'en', true);
     await page.goto(fixture(address.port, 'multiple'));
     await page.getByRole('heading', { name: 'Tenant management', exact: true }).waitFor();
     await page.evaluate(() => localStorage.setItem('mtc-locale', 'zh-CN'));
@@ -203,8 +199,8 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
       await page.setViewportSize({ width, height: 900 });
       const layout = await page.evaluate(() => ({ document: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
       assert.ok(layout.scroll <= layout.document, `${width}px tenant fixture must not overflow`);
-      assert.ok((await page.screenshot({ path: `${artifacts}/tenant-lifecycle-en-${width}.png`, fullPage: true, animations: 'disabled' })).byteLength > 0, `${width}px tenant screenshot must render`);
     }
+    await captureNavigationIdentity(page, 'identity', 'tenant-lifecycle', 'en');
 
     const denied = await browser.newPage({ viewport: { width: 1024, height: 720 } });
     await denied.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -226,13 +222,12 @@ test('identity tabs retain legacy deep links, separate denial boundaries and bil
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
-  await mkdir(artifacts, { recursive: true });
   try {
     for (const locale of ['zh-CN', 'en']) {
       const title = locale === 'en' ? 'Identity management' : '身份管理';
-      for (const scenario of ['default', 'empty', 'slow', 'management-denied', 'services-denied', 'services-empty'] as const) {
+      for (const scenario of ['default', 'slow', 'management-denied', 'management-error', 'background-refresh', 'services-denied', 'services-empty'] as const) {
         const page = await browser.newPage();
-        await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+        await seedNavigationIdentity(page, locale);
         const view = scenario.startsWith('services-') ? 'service-credentials' : 'tenants';
         await page.goto(fixture(address.port, scenario, view));
         await page.getByRole('heading', { name: title, exact: true }).waitFor();
@@ -240,24 +235,32 @@ test('identity tabs retain legacy deep links, separate denial boundaries and bil
         assert.equal(await selectedTab.getAttribute('aria-selected'), 'true');
         if (scenario === 'slow') await page.waitForFunction(() => Boolean(window.tenantFixture.release));
         else if (scenario === 'management-denied') await page.getByRole('alert').getByText('Tenant management denied', { exact: true }).waitFor();
+        else if (scenario === 'management-error') await page.getByRole('alert').getByText('Tenant management temporarily unavailable', { exact: true }).waitFor();
         else if (scenario === 'services-denied') await page.getByRole('alert').getByText('Service credential access denied', { exact: true }).waitFor();
         else if (scenario === 'services-empty') await page.locator('.credential-compact-list').waitFor();
         else await page.locator('.tenant-list').waitFor();
+        if (scenario === 'background-refresh') {
+          await page.evaluate(() => { window.tenantFixture.holdNext = true; });
+          await page.getByLabel(locale === 'en' ? 'Tenant ID' : '租户标识', { exact: true }).fill('west');
+          await page.getByRole('button', { name: locale === 'en' ? 'Add tenant' : '新增租户', exact: true }).click();
+          await page.waitForFunction(() => Boolean(window.tenantFixture.release));
+          assert.equal(await tenantRow(page, locale === 'en' ? 'default' : '默认').isVisible(), true, 'background lifecycle refresh retains the previous real tenant list');
+          assert.equal(await tenantRow(page, 'west').count(), 0, 'held refresh cannot publish the new list early');
+        }
         assert.equal(await page.locator('.identity-workspace [role="tabpanel"]').count(), 1, 'loading and denial must not preserve an inactive identity panel');
         if (view === 'service-credentials') assert.equal(await page.locator('.tenant-manager').count(), 0);
         else assert.equal(await page.locator('.credential-compact-list').count(), 0);
-        for (const width of [1440, 390]) {
-          await page.setViewportSize({ width, height: 1000 });
-          const layout = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
-          assert.ok(layout.scroll <= layout.width, `${scenario} ${locale} ${width}px must not overflow`);
-          await page.screenshot({ path: `${artifacts}/${scenario}-${locale}-${width}.png`, fullPage: true, animations: 'disabled' });
-        }
         const calls = await fixtureCalls(page);
         if (view === 'tenants') assert.equal(calls.some(call => call.includes('/internal/v1/service-tokens')), false, 'tenant access must not fetch service credentials before that tab is opened');
         else assert.equal(calls.some(call => call.includes('/internal/v1/tenant-management')), false, 'service credential access must not load tenant management');
-        if (scenario === 'slow') {
+        const artifactScenario = scenario === 'default' ? 'ready' : scenario === 'slow' ? 'initial-loading'
+          : scenario.endsWith('-denied') ? 'permission-failure' : scenario === 'management-error' ? 'error'
+            : scenario === 'services-empty' ? 'empty' : scenario;
+        await captureNavigationIdentity(page, scenario === 'services-denied' ? 'identity-service-credentials' : 'identity', artifactScenario, locale);
+        if (scenario === 'slow' || scenario === 'background-refresh') {
           await page.evaluate(() => window.tenantFixture.release?.());
           await page.locator('.tenant-list').waitFor();
+          if (scenario === 'background-refresh') await tenantRow(page, 'west').waitFor();
         }
         await page.reload();
         await page.getByRole('heading', { name: title, exact: true }).waitFor();
