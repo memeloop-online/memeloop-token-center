@@ -1,5 +1,233 @@
 use super::super::*;
 
+const ADMISSION_SNAPSHOT_FAULTS: [(&str, &str, &str); 2] = [
+    (
+        "admission_snapshot_abort",
+        "CREATE TRIGGER admission_snapshot_abort BEFORE UPDATE OF upstream_model ON request_records WHEN NEW.upstream_model = 'abort-model' BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
+        "abort-model",
+    ),
+    (
+        "admission_snapshot_ignore",
+        "CREATE TRIGGER admission_snapshot_ignore BEFORE UPDATE OF upstream_model ON request_records WHEN NEW.upstream_model = 'ignore-model' BEGIN SELECT RAISE(IGNORE); END",
+        "ignore-model",
+    ),
+];
+
+async fn assert_admission_snapshot_fault_schema(
+    database: &Database,
+    mode: EnforcementMode,
+    phase: &str,
+    installed: bool,
+) {
+    let actual: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT name, tbl_name, sql FROM sqlite_schema
+         WHERE type = 'trigger' AND name LIKE 'admission_snapshot_%'
+         ORDER BY name LIMIT 3",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(String, String, String)> = if installed {
+        ADMISSION_SNAPSHOT_FAULTS
+            .iter()
+            .map(|(name, ddl, _)| {
+                (
+                    (*name).to_owned(),
+                    "request_records".to_owned(),
+                    (*ddl).to_owned(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(actual, expected, "mode={mode:?}, phase={phase}");
+}
+
+async fn forwarding_admission_state(database: &Database, key: &AuthenticatedKey) -> Vec<i64> {
+    let row = sqlx::query(
+        "SELECT available_micros, reserved_micros,
+            (SELECT reserved_micros FROM key_budget_state WHERE key_id = $1) AS key_reserved,
+            (SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1) AS reservations,
+            (SELECT COUNT(*) FROM request_records WHERE key_id = $1) AS requests,
+            (SELECT COUNT(*) FROM request_record_locators WHERE key_id = $1) AS locators,
+            (SELECT COALESCE(SUM(requests), 0) FROM rate_limit_windows WHERE key_id = $1) AS rate_requests,
+            (SELECT COALESCE(SUM(tokens), 0) FROM rate_limit_windows WHERE key_id = $1) AS rate_tokens
+         FROM credit_accounts WHERE id = $2",
+    )
+    .bind(key.key_id.to_string())
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    (0..8).map(|index| row.get::<i64, _>(index)).collect()
+}
+
+#[tokio::test]
+async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_modes() {
+    for mode in [EnforcementMode::Prepaid, EnforcementMode::MeteredUnlimited] {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("forwarding-admission.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"forwarding admission regression pepper";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "forwarding-admission".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "forwarding-admission".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy {
+                        enforcement_mode: mode,
+                        max_concurrency: 8,
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = database
+            .upsert_model_price("public-model", "USD", Decimal::ONE, Decimal::ONE)
+            .await
+            .unwrap();
+        let before = forwarding_admission_state(&database, &key).await;
+        let request_id = Uuid::now_v7();
+        let input = |request_id| StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 100,
+            output_token_ceiling: 100,
+            protocol: "openai",
+            model: "public-model",
+            request_object: "gap://forwarding-admission/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        };
+        let reservation = database
+            .start_proxy_forwarding_request(input(request_id), Some("selected-upstream-model"))
+            .await
+            .unwrap();
+        let snapshot: (String, i64, i64) = sqlx::query_as(
+            "SELECT r.upstream_model, r.created_at, l.created_at
+             FROM request_records r JOIN request_record_locators l ON l.id = r.id
+             WHERE r.id = $1 AND r.reservation_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(reservation.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot.0, "selected-upstream-model");
+        assert_eq!(snapshot.1, snapshot.2);
+        let admitted = forwarding_admission_state(&database, &key).await;
+        let reserved = if mode == EnforcementMode::Prepaid {
+            200
+        } else {
+            0
+        };
+        assert_eq!(admitted[0], before[0] - reserved);
+        assert_eq!(admitted[1], before[1] + reserved);
+        assert_eq!(admitted[2], before[2] + reserved);
+        assert_eq!(&admitted[3..6], &[1, 1, 1]);
+        assert_eq!(admitted[6], i64::from(mode == EnforcementMode::Prepaid));
+        assert!(matches!(
+            database
+                .start_proxy_forwarding_request(input(request_id), Some("duplicate-model"))
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+        assert_admission_snapshot_fault_schema(&database, mode, "before installation", false).await;
+        for (_, ddl, _) in ADMISSION_SNAPSHOT_FAULTS {
+            sqlx::raw_sql(ddl).execute(&database.pool).await.unwrap();
+        }
+        assert_admission_snapshot_fault_schema(&database, mode, "after installation", true).await;
+        for (name, _, fault_model) in ADMISSION_SNAPSHOT_FAULTS {
+            assert_admission_snapshot_fault_schema(&database, mode, name, true).await;
+            let mut probe = database.begin_write_transaction().await.unwrap();
+            let fired = sqlx::query(
+                "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4",
+            )
+            .bind(fault_model)
+            .bind(request_id.to_string())
+            .bind(reservation.id.to_string())
+            .bind(snapshot.1)
+            .execute(&mut *probe)
+            .await;
+            if fault_model == "abort-model" {
+                let error = fired.unwrap_err();
+                let sqlx::Error::Database(error) = error else {
+                    panic!("mode={mode:?}, phase={name}: unexpected fault error {error:?}");
+                };
+                assert_eq!(
+                    error.message(),
+                    "snapshot fault",
+                    "mode={mode:?}, phase={name}"
+                );
+            } else {
+                assert_eq!(
+                    fired.unwrap().rows_affected(),
+                    0,
+                    "mode={mode:?}, phase={name}: IGNORE must suppress the matching update"
+                );
+            }
+            let unchanged: String = sqlx::query_scalar(
+                "SELECT upstream_model FROM request_records WHERE id = $1 AND created_at = $2",
+            )
+            .bind(request_id.to_string())
+            .bind(snapshot.1)
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+            assert_eq!(unchanged, snapshot.0, "mode={mode:?}, phase={name}");
+            probe.rollback().await.unwrap();
+            assert!(matches!(
+                database
+                    .start_proxy_forwarding_request(input(Uuid::now_v7()), Some(fault_model))
+                    .await,
+                Err(AppError::Overloaded)
+            ));
+            assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+            assert_admission_snapshot_fault_schema(&database, mode, name, true).await;
+        }
+        let healthy = sqlx::query(
+            "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4",
+        )
+        .bind(&snapshot.0)
+        .bind(request_id.to_string())
+        .bind(reservation.id.to_string())
+        .bind(snapshot.1)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(healthy.rows_affected(), 1);
+        assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+        assert_admission_snapshot_fault_schema(&database, mode, "healthy update", true).await;
+        let persisted: String = sqlx::query_scalar(
+            "SELECT upstream_model FROM request_records WHERE id = $1 AND created_at = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(snapshot.1)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, snapshot.0);
+        database.close().await;
+    }
+}
+
 struct CompletedSessionRequest<'a> {
     key: &'a AuthenticatedKey,
     price: &'a ModelPrice,

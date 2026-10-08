@@ -15,6 +15,70 @@ use crate::archive_staging::{
 use crate::model::MeteredUsageReservation;
 use tracing::Instrument;
 
+const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4";
+
+#[cfg(test)]
+mod admission_partition_tests {
+    use super::ADMISSION_UPSTREAM_MODEL_UPDATE;
+
+    #[tokio::test]
+    async fn postgres_admission_snapshot_update_prunes_to_known_partition() {
+        let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        for statement in [
+            "CREATE TEMP TABLE request_records (id TEXT, reservation_id TEXT, created_at BIGINT, upstream_model TEXT) PARTITION BY RANGE (created_at)",
+            "CREATE TEMP TABLE admission_older PARTITION OF request_records FOR VALUES FROM (0) TO (1000)",
+            "CREATE TEMP TABLE admission_current PARTITION OF request_records FOR VALUES FROM (1000) TO (2000)",
+            "CREATE TEMP TABLE admission_newer PARTITION OF request_records FOR VALUES FROM (2000) TO (3000)",
+            "CREATE TEMP TABLE admission_default PARTITION OF request_records DEFAULT",
+            "INSERT INTO request_records VALUES ('request', 'reservation', 500, 'older'), ('request', 'reservation', 1500, NULL), ('request', 'reservation', 2500, 'newer'), ('request', 'reservation', 3500, 'default')",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+        }
+        let statement =
+            format!("EXPLAIN (FORMAT TEXT, COSTS OFF) {ADMISSION_UPSTREAM_MODEL_UPDATE}");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+            .bind("selected-model")
+            .bind("request")
+            .bind("reservation")
+            .bind(1500_i64)
+            .fetch_all(&mut *transaction)
+            .await
+            .unwrap();
+        let rendered = plan.join("\n");
+        assert!(rendered.contains("admission_current"), "{rendered}");
+        for unrelated in ["admission_older", "admission_newer", "admission_default"] {
+            assert!(!rendered.contains(unrelated), "{rendered}");
+        }
+        let updated = sqlx::query(ADMISSION_UPSTREAM_MODEL_UPDATE)
+            .bind("selected-model")
+            .bind("request")
+            .bind("reservation")
+            .bind(1500_i64)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        let models: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT upstream_model FROM request_records ORDER BY created_at")
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+        assert_eq!(
+            models,
+            ["older", "selected-model", "newer", "default"].map(|model| Some(model.to_owned()))
+        );
+        transaction.rollback().await.unwrap();
+        pool.close().await;
+    }
+}
+
 pub struct NewRequest {
     pub request_id: Uuid,
     pub key_id: Uuid,
@@ -428,12 +492,17 @@ impl Database {
             return Err(error);
         }
         if let Some(upstream_model) = upstream_model {
-            sqlx::query("UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3")
+            let updated = sqlx::query(ADMISSION_UPSTREAM_MODEL_UPDATE)
                 .bind(upstream_model)
                 .bind(input.request_id.to_string())
                 .bind(reservation.id.to_string())
+                .bind(now)
                 .execute(&mut *transaction)
                 .await?;
+            if updated.rows_affected() != 1 {
+                BudgetHold::rollback_optional(transaction, hold).await?;
+                return Err(AppError::Internal);
+            }
         }
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
