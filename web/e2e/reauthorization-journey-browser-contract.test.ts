@@ -63,7 +63,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     const code = workspace.locator('.manual-authorization input');
     const start = workspace.getByRole('button', { name: chinese ? '开始登录' : 'Start login', exact: true });
     const close = workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true });
-    const editHeading = page.getByRole('heading', { name: chinese ? '编辑 Fixture Claude account' : 'Edit Fixture Claude account', exact: true });
+    const accountHeading = page.locator('.provider-detail-workspace').getByRole('heading', { name: 'Fixture Claude account', exact: true });
     const mismatch = chinese
       ? '授权结果与本次登录会话不匹配。请从本次提供商登录页面重新复制完整的授权结果；若已无法获取，请关闭并重新打开授权表单开始登录。'
       : 'The authorization result does not match this login session. Copy the complete result from this provider login again; if it is no longer available, close and reopen the authorization form to start login again.';
@@ -95,13 +95,14 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await page.waitForFunction(() => window.claudeCompletionFixture.calls === 3);
     await close.click();
     await workspace.waitFor({ state: 'detached' });
-    await editHeading.waitFor();
-    assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'reauthorization returns to settings alone');
+    await accountHeading.waitFor();
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 1, 'reauthorization returns to the account alone');
+    assert.equal(await page.locator('.provider-edit-workspace').count(), 0);
     const readsBeforeLateResponse = accountReads;
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     assert.equal(accountReads, readsBeforeLateResponse, 'an abandoned completion cannot refresh or navigate the parent');
-    assert.equal(await editHeading.count(), 1);
+    assert.equal(await accountHeading.count(), 1);
     assert.equal(await page.evaluate(() => window.claudeCompletionFixture.aborted && window.claudeCompletionFixture.hasSignal), true);
     await reauthorize.click();
     await start.click();
@@ -110,7 +111,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await page.waitForFunction(() => window.claudeCompletionFixture.calls === 4);
     await close.click();
     await workspace.waitFor({ state: 'detached' });
-    await editHeading.waitFor();
+    await accountHeading.waitFor();
     await reauthorize.click();
     await workspace.waitFor();
     await page.evaluate(error => window.claudeCompletionFixture.release?.(false, error), knownFailure);
@@ -126,13 +127,19 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await page.waitForFunction(() => window.claudeCompletionFixture.calls === 5);
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await workspace.waitFor({ state: 'detached' });
-    await editHeading.waitFor();
-    const editWorkspace = page.getByRole('region', { name: chinese ? '编辑 Fixture Claude account' : 'Edit Fixture Claude account', exact: true });
-    const successNotice = editWorkspace.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true });
+    await accountHeading.waitFor();
+    const accountWorkspace = page.locator('.provider-detail-workspace');
+    const successNotice = accountWorkspace.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true });
     await successNotice.waitFor();
     assert.equal(await successNotice.count(), 1);
     assert.equal(accountReads, readsBeforeLateResponse + 1);
     assert.equal(starts, 3, 'completion retries and abandoned responses never start another authorization session');
+    const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+    await mkdir(screenshotRoot, { recursive: true });
+    for (const width of [390, 1440]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await page.screenshot({ path: `${screenshotRoot}/claude-reauthorization-saved-${locale}-${width}.png`, fullPage: true });
+    }
   } finally { await browser.close(); await server.close(); }
 });
 
@@ -212,8 +219,9 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       assert.equal(await workspace.locator('.provider-readable-proxy input').inputValue(), 'socks5h://10.0.0.9:1080');
       assert.equal(writes.filter(write => write.path.endsWith('/transport-proxy')).length, 1, 'proxy save is immediate and does not start login');
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
-      await page.getByRole('heading', { name: chinese ? '编辑 reauthorize@example.org' : 'Edit reauthorize@example.org', exact: true }).waitFor();
-      assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
+      await page.locator('.provider-detail-workspace').getByRole('heading', { name: 'reauthorize@example.org', exact: true }).waitFor();
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 1);
+      assert.equal(await page.locator('.provider-edit-workspace').count(), 0);
       assert.equal(await reauthorize.evaluate(button => button === document.activeElement), true);
       await page.screenshot({ path: `${screenshotRoot}/reauthorization-parent-${locale}-390.png`, fullPage: true });
       await reauthorize.click();
@@ -253,6 +261,11 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await workspace.waitFor({ state: 'detached' });
       await page.getByText(chinese ? '已登录，账号授权已更新。' : 'Signed in. Account authorization updated.', { exact: true }).waitFor();
       await page.locator('.provider-detail-workspace').waitFor();
+      assert.equal(await page.locator('.provider-directory-row').isVisible(), false);
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 1000 });
+        await page.screenshot({ path: `${screenshotRoot}/codex-reauthorization-saved-${locale}-${width}.png`, fullPage: true });
+      }
       assert.equal(await page.evaluate(() => sessionStorage.getItem('mtc-codex-device-recovery')), null);
       assert.equal(writes.filter(write => write.path.endsWith('/start')).length, 2);
       assert.equal(pollCount, 3);

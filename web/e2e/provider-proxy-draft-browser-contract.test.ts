@@ -101,7 +101,8 @@ test('independent proxy save updates concurrency metadata without dropping the p
     assert.equal(await name.inputValue(), '保留名称草稿', 'proxy refresh preserves the independent name draft');
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
     await save.click();
-    await row.getByText('保留名称草稿', { exact: true }).waitFor();
+    await page.locator('.provider-detail-workspace').getByRole('heading', { name: '保留名称草稿', exact: true }).waitFor();
+    assert.equal(await row.isVisible(), false, 'a successful settings save returns to the account workspace');
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'provider save succeeds against the new revision without retries');
     await page.evaluate(() => { window.deferNextFormProxyRead = true; });
     await editProviderAccount(page);
@@ -208,6 +209,9 @@ test('account workspace returns without retained details, shares list tracks and
       let readStarted: (() => void) | undefined;
       let saveStarted: (() => void) | undefined;
       let writes = 0;
+      let deferSave = false;
+      let failNextListRead = false;
+      let savedAccount: ReturnType<typeof accounts>[number] | undefined;
       await page.route('**/*', async route => {
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'account contracts never contact a live provider');
@@ -216,14 +220,17 @@ test('account workspace returns without retained details, shares list tracks and
           assert.equal(request.method(), 'PUT');
           assert.equal(url.pathname, '/internal/v1/upstreams/account-fixture-a');
           writes += 1;
-          await new Promise<void>(resolve => { releaseSave = resolve; saveStarted?.(); saveStarted = undefined; });
-          return route.fulfill({ json: { ...accounts('fixture-a')[0], name: 'Late saved account', updated_at: 3 } });
+          if (deferSave) await new Promise<void>(resolve => { releaseSave = resolve; saveStarted?.(); saveStarted = undefined; });
+          const updated = { ...accounts('fixture-a')[0], name: deferSave ? 'Late saved account' : request.postDataJSON().name, updated_at: 3 };
+          if (!deferSave) savedAccount = updated;
+          return route.fulfill({ json: updated });
         }
         if (url.pathname === '/internal/v1/upstreams') {
           const tenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
+          if (failNextListRead) { failNextListRead = false; return route.fulfill({ status: 503, json: { error: { message: 'Fixture list refresh unavailable' } } }); }
           if (state === 'slow') await new Promise<void>(resolve => { releaseRead = resolve; readStarted?.(); readStarted = undefined; });
           if (state === 'denied') return route.fulfill({ status: 403, json: { error: { message: 'Fixture account read denied' } } });
-          return route.fulfill({ json: state === 'empty' ? [] : accounts(tenant) });
+          return route.fulfill({ json: state === 'empty' ? [] : accounts(tenant).map(account => savedAccount?.id === account.id ? savedAccount : account) });
         }
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [
           { id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { type: 'object', properties: { type: { const: 'api_key' }, value: { type: 'string', writeOnly: true } } } },
@@ -260,6 +267,7 @@ test('account workspace returns without retained details, shares list tracks and
       await expiredDetails.getByRole('button', { name: labels.back, exact: true }).click();
       const manage = page.locator('[data-manage-account-trigger="account-fixture-a"]');
       const details = await manageProviderAccount(page, 'account-fixture-a');
+      assert.equal(await rows.first().isVisible(), false, 'account details and the directory are mutually exclusive');
       assert.equal(await page.locator('.provider-directory .provider-detail-workspace').count(), 0, 'details have one standalone mount point');
       assert.equal(await details.locator('.provider-model-catalog').count(), 1);
       await details.getByRole('button', { name: labels.edit, exact: true }).click();
@@ -285,6 +293,25 @@ test('account workspace returns without retained details, shares list tracks and
       await page.screenshot({ path: `${artifacts}/returned-${locale}-320.png`, fullPage: true });
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.screenshot({ path: `${artifacts}/returned-${locale}-1440.png`, fullPage: true });
+      await page.setViewportSize({ width: 320, height: 1000 });
+      for (const refreshFailure of [false, true]) {
+        await editProviderAccount(page, 'account-fixture-a');
+        await name.fill(refreshFailure ? 'Saved despite refresh failure' : 'Saved account workspace');
+        failNextListRead = refreshFailure;
+        await editor.locator('.rjsf > button[type="submit"]').click();
+        await details.getByRole('heading', { name: refreshFailure ? 'Saved despite refresh failure' : 'Saved account workspace', exact: true }).waitFor();
+        assert.equal(await editor.count(), 0, 'saving returns to the same account layer');
+        assert.equal(await rows.first().isVisible(), false);
+        await details.getByRole('status').filter({ hasText: chinese ? '已更新' : 'Updated' }).waitFor();
+        if (refreshFailure) await details.getByRole('alert').filter({ hasText: 'Fixture list refresh unavailable' }).waitFor();
+        for (const width of [1440, 390]) {
+          await page.setViewportSize({ width, height: 1000 });
+          await page.screenshot({ path: `${artifacts}/saved-${refreshFailure ? 'refresh-failed' : 'ready'}-${locale}-${width}.png`, fullPage: true });
+        }
+      }
+      await details.getByRole('button', { name: labels.back, exact: true }).click();
+      assert.equal(await details.count(), 0);
+      deferSave = true;
       await page.setViewportSize({ width: 320, height: 1000 });
       for (const control of ['Switch tenant', 'Switch credential', 'Switch write tenant']) {
         await page.goto(fixture);
@@ -314,7 +341,7 @@ test('account workspace returns without retained details, shares list tracks and
           assert.equal(await details.count(), 0, 'restoring write authority does not reopen the old account');
         }
       }
-      assert.equal(writes, 3, 'only explicitly submitted mocked settings are written');
+      assert.equal(writes, 5, 'only explicitly submitted mocked settings are written');
       for (const width of [1440, 390]) {
         await page.setViewportSize({ width, height: 1000 });
         state = 'empty'; await page.goto(fixture);

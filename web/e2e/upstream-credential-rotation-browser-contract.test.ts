@@ -98,6 +98,12 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await form.getByRole('button', { name: copy.submit }).click();
       await form.waitFor({ state: 'detached' });
       await page.getByText(copy.saved, { exact: true }).waitFor();
+      assert.equal(await page.locator('.provider-directory-row').isVisible(), false);
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 1000 });
+        const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+        await page.screenshot({ path: `${screenshotRoot}/credential-rotation-saved-${locale}-${width}.png`, fullPage: true });
+      }
       assert.equal(await trigger.isVisible(), true);
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
       await trigger.click();
@@ -107,9 +113,10 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await editProviderAccount(page, 'rotation-fixture');
       await trigger.click();
       await form.getByRole('button', { name: copy.back, exact: true }).focus(); await page.keyboard.press('Enter');
-      await page.getByRole('heading', { name: copy.settings, exact: true }).waitFor();
+      await page.locator('.provider-detail-workspace').getByRole('heading', { name: 'rotation@example.org', exact: true }).waitFor();
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
-      assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'nested back returns only the settings workspace');
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 1, 'nested back returns only the account workspace');
+      assert.equal(await page.locator('.provider-edit-workspace').count(), 0);
       assert.equal(writes.length, 3, 'back and close never write credentials or start OAuth');
       await page.close();
     }
