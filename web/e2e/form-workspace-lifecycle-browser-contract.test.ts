@@ -6,6 +6,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
+import { prefixTraceInit, prefixTracePlugin } from './support/prefix-trace.js';
 
 test('AppShell workspaces retain failed drafts, return after success, and prioritize the one-time credential', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -244,15 +245,16 @@ test('upstream create groups configuration and retains advanced and secret draft
   } finally { await browser.close(); await server.close(); }
 });
 
-test('catalog API-key creation preserves empty prefixes, locks submits and separates saved-list recovery from creation', { timeout: 60_000 }, async () => {
+test('catalog API-key creation preserves empty prefixes, locks submits and separates saved-list recovery from creation', { timeout: 60_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const server = await createServer({ root, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  const server = await createServer({ root, configFile: false, plugins: [fixtureAssets(), prefixTracePlugin()], optimizeDeps: { exclude: ['@rjsf/core'] }, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
   const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
   try {
-    const page = await browser.newPage();
+    await page.addInitScript(prefixTraceInit);
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.route('**/*', route => {
@@ -325,5 +327,9 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
     }
     assert.deepEqual(errors, []);
+  } catch (error) {
+    const trace = await page.evaluate('window.formPrefixTrace ?? []').catch(() => []);
+    context.diagnostic(`prefix metadata (last 48): ${JSON.stringify(trace)}`);
+    throw error;
   } finally { await browser.close(); await server.close(); }
 });

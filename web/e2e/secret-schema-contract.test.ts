@@ -2,7 +2,29 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { prepareSecretForm } from '../src/secretSchema.js';
 import { safeValidator } from '../src/safeValidator.js';
-import type { RJSFSchema } from '@rjsf/utils';
+import { createSchemaUtils, type RJSFSchema } from '@rjsf/utils';
+import { builtinApiKeyCredential } from './fixtures/builtin-api-key-credential.js';
+
+test('API-key draft defaults distinguish an explicit empty prefix from an absent prefix', () => {
+  const schema: RJSFSchema = { type: 'object', properties: { credential: builtinApiKeyCredential } };
+  const snapshot = structuredClone(schema);
+  const prepared = prepareSecretForm(schema, safeValidator);
+  const utils = createSchemaUtils(safeValidator, prepared.schema, { emptyObjectFields: 'skipEmptyDefaults' });
+  for (const prefix of [undefined, '', 'Bearer ', 'Token ']) {
+    const credential = { type: 'api_key', value: 'fixture-only-secret', header: 'x-api-key', ...(prefix === undefined ? {} : { prefix }) };
+    const draft = { credential };
+    const draftSnapshot = structuredClone(draft);
+    const normalized = utils.getDefaultFormState(prepared.schema, draft) as typeof draft;
+    assert.equal(normalized.credential.prefix, prefix === undefined ? 'Bearer ' : prefix);
+    assert.equal(normalized.credential.value, credential.value);
+    assert.equal(safeValidator.isValid(prepared.schema, normalized, prepared.schema), true);
+    assert.deepEqual(JSON.parse(JSON.stringify(normalized)).credential, { ...credential, prefix: prefix === undefined ? 'Bearer ' : prefix });
+    assert.deepEqual(draft, draftSnapshot);
+    const edit = prepareSecretForm(schema, safeValidator, draft);
+    assert.deepEqual(edit.formData, { credential: { type: 'api_key', header: 'x-api-key', ...(prefix === undefined ? {} : { prefix }) } });
+  }
+  assert.deepEqual(schema, snapshot);
+});
 
 test('resolved refs, allOf siblings and existing config never prefill secret fields', () => {
   const schema: RJSFSchema = { type: 'object', $defs: { secret: { type: 'string', writeOnly: true } }, properties: {
