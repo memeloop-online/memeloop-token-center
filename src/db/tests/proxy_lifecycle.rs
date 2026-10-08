@@ -1,5 +1,49 @@
 use super::super::*;
 
+const ADMISSION_SNAPSHOT_FAULTS: [(&str, &str, &str); 2] = [
+    (
+        "admission_snapshot_abort",
+        "CREATE TRIGGER admission_snapshot_abort BEFORE UPDATE OF upstream_model ON request_records WHEN NEW.upstream_model = 'abort-model' BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
+        "abort-model",
+    ),
+    (
+        "admission_snapshot_ignore",
+        "CREATE TRIGGER admission_snapshot_ignore BEFORE UPDATE OF upstream_model ON request_records WHEN NEW.upstream_model = 'ignore-model' BEGIN SELECT RAISE(IGNORE); END",
+        "ignore-model",
+    ),
+];
+
+async fn assert_admission_snapshot_fault_schema(
+    database: &Database,
+    mode: EnforcementMode,
+    phase: &str,
+    installed: bool,
+) {
+    let actual: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT name, tbl_name, sql FROM sqlite_schema
+         WHERE type = 'trigger' AND name LIKE 'admission_snapshot_%'
+         ORDER BY name LIMIT 3",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(String, String, String)> = if installed {
+        ADMISSION_SNAPSHOT_FAULTS
+            .iter()
+            .map(|(name, ddl, _)| {
+                (
+                    (*name).to_owned(),
+                    "request_records".to_owned(),
+                    (*ddl).to_owned(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(actual, expected, "mode={mode:?}, phase={phase}");
+}
+
 async fn forwarding_admission_state(database: &Database, key: &AuthenticatedKey) -> Vec<i64> {
     let row = sqlx::query(
         "SELECT available_micros, reserved_micros,
@@ -105,26 +149,72 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
             Err(AppError::BadRequest(_))
         ));
         assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
-        for trigger in [
-            "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
-            "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(IGNORE); END",
-        ] {
-            sqlx::raw_sql(trigger)
-                .execute(&database.pool)
-                .await
-                .unwrap();
+        assert_admission_snapshot_fault_schema(&database, mode, "before installation", false).await;
+        for (_, ddl, _) in ADMISSION_SNAPSHOT_FAULTS {
+            sqlx::raw_sql(ddl).execute(&database.pool).await.unwrap();
+        }
+        assert_admission_snapshot_fault_schema(&database, mode, "after installation", true).await;
+        for (name, _, fault_model) in ADMISSION_SNAPSHOT_FAULTS {
+            assert_admission_snapshot_fault_schema(&database, mode, name, true).await;
+            let mut probe = database.begin_write_transaction().await.unwrap();
+            let fired = sqlx::query(
+                "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4",
+            )
+            .bind(fault_model)
+            .bind(request_id.to_string())
+            .bind(reservation.id.to_string())
+            .bind(snapshot.1)
+            .execute(&mut *probe)
+            .await;
+            if fault_model == "abort-model" {
+                let error = fired.unwrap_err();
+                let sqlx::Error::Database(error) = error else {
+                    panic!("mode={mode:?}, phase={name}: unexpected fault error {error:?}");
+                };
+                assert_eq!(
+                    error.message(),
+                    "snapshot fault",
+                    "mode={mode:?}, phase={name}"
+                );
+            } else {
+                assert_eq!(
+                    fired.unwrap().rows_affected(),
+                    0,
+                    "mode={mode:?}, phase={name}: IGNORE must suppress the matching update"
+                );
+            }
+            let unchanged: String = sqlx::query_scalar(
+                "SELECT upstream_model FROM request_records WHERE id = $1 AND created_at = $2",
+            )
+            .bind(request_id.to_string())
+            .bind(snapshot.1)
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+            assert_eq!(unchanged, snapshot.0, "mode={mode:?}, phase={name}");
+            probe.rollback().await.unwrap();
             assert!(matches!(
                 database
-                    .start_proxy_forwarding_request(input(Uuid::now_v7()), Some("failed-model"))
+                    .start_proxy_forwarding_request(input(Uuid::now_v7()), Some(fault_model))
                     .await,
                 Err(AppError::Overloaded)
             ));
             assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
-            sqlx::raw_sql("DROP TRIGGER admission_snapshot_fault")
-                .execute(&database.pool)
-                .await
-                .unwrap();
+            assert_admission_snapshot_fault_schema(&database, mode, name, true).await;
         }
+        let healthy = sqlx::query(
+            "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4",
+        )
+        .bind(&snapshot.0)
+        .bind(request_id.to_string())
+        .bind(reservation.id.to_string())
+        .bind(snapshot.1)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(healthy.rows_affected(), 1);
+        assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
+        assert_admission_snapshot_fault_schema(&database, mode, "healthy update", true).await;
         let persisted: String = sqlx::query_scalar(
             "SELECT upstream_model FROM request_records WHERE id = $1 AND created_at = $2",
         )
@@ -134,6 +224,7 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
         .await
         .unwrap();
         assert_eq!(persisted, snapshot.0);
+        database.close().await;
     }
 }
 
