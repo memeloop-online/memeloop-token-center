@@ -1,15 +1,17 @@
-import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { AppShell } from '../../src/app/AppShell';
-import { operatorRouteKeys, type OperatorRouteKey } from '../../src/app/routes';
+import { useAppLocation } from '../../src/app/useAppLocation';
+import { isPluginRouteKey } from '../../src/app/routes';
+import { isOperatorRouteKey } from '../../src/operator/scope/operatorRoutes';
 import { I18nProvider } from '../../src/i18n';
 import { Operator } from '../../src/operator/Operator';
+import { MtcFluentProvider } from '../../src/design-system';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/app-shell.css';
 
-type Scenario = 'default' | 'multiple' | 'denied';
+type Scenario = 'default' | 'multiple' | 'denied' | 'empty' | 'slow' | 'management-denied' | 'services-denied' | 'services-empty';
 
 interface TenantRecord {
   external_id: string;
@@ -17,11 +19,12 @@ interface TenantRecord {
 }
 
 declare global {
-  interface Window { tenantFixture: { calls: string[] } }
+  interface Window { tenantFixture: { calls: string[]; release?: () => void } }
 }
 
 const parameters = new URLSearchParams(location.search);
-const scenario = (parameters.get('scenario') ?? 'default') as Scenario;
+const scenario = (parameters.get('scenario') ?? sessionStorage.getItem('tenantFixtureScenario') ?? 'default') as Scenario;
+sessionStorage.setItem('tenantFixtureScenario', scenario);
 const fixtureCredential = 'mts_tenant_fixture';
 let tenantRecords: TenantRecord[] = scenario === 'multiple'
   ? [{ external_id: 'default', status: 'active' }, { external_id: 'north', status: 'active' }]
@@ -34,11 +37,6 @@ function json(value: unknown, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
-}
-
-function currentRoute(): OperatorRouteKey {
-  const route = new URL(location.href).searchParams.get('view');
-  return (operatorRouteKeys as readonly string[]).includes(route ?? '') ? route as OperatorRouteKey : 'overview';
 }
 
 function managementTenant(pathname: string) {
@@ -55,6 +53,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return json(tenantRecords.filter((tenant) => tenant.status === 'active').map(({ external_id }) => ({ external_id })));
   }
   if (url.pathname === '/internal/v1/tenant-management') {
+    if (scenario === 'management-denied') return json({ error: { message: 'Tenant management denied' } }, 403);
+    if (scenario === 'slow' && method === 'GET') return new Promise<Response>(resolve => { window.tenantFixture.release = () => resolve(json(tenantRecords)); });
+    if (scenario === 'empty' && method === 'GET') return json([]);
     if (method === 'GET') return json(tenantRecords);
     if (method === 'POST') {
       const body = JSON.parse(String(init?.body ?? '{}')) as { external_id?: string };
@@ -63,6 +64,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       return json(created);
     }
   }
+  if (url.pathname === '/internal/v1/service-tokens' && scenario === 'services-denied') return json({ error: { message: 'Service credential access denied' } }, 403);
   if (url.pathname.startsWith('/internal/v1/tenant-management/')) {
     const tenantId = managementTenant(url.pathname);
     const action = url.pathname.split('/').at(-1);
@@ -83,25 +85,12 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 };
 
 function Fixture() {
-  const [route, setRoute] = useState<OperatorRouteKey>(currentRoute);
-
-  useEffect(() => {
-    const onPopState = () => setRoute(currentRoute());
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  function navigate(next: OperatorRouteKey) {
-    const url = new URL(location.href);
-    url.searchParams.set('view', next);
-    window.history.pushState(null, '', `${url.pathname}${url.search}`);
-    setRoute(next);
-  }
-
+  const { route, context, navigate } = useAppLocation();
+  if (!isOperatorRouteKey(route) && !isPluginRouteKey(route)) return null;
   return <AppShell surface="operator" route={route} onNavigate={navigate}>
-    <Operator route={route} onRouteChange={navigate} embedded showNavigation={false} />
+    <Operator route={route} navigationContext={context} onRouteChange={navigate} embedded showNavigation={false} />
   </AppShell>;
 }
 
 localStorage.setItem('mtc.operator.service-credential.v1', fixtureCredential);
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
