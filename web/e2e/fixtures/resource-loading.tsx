@@ -2,7 +2,7 @@ import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api } from '../../src/api';
 import { I18nProvider, useI18n } from '../../src/i18n';
-import { Button, MtcFluentProvider, PageLoadingRegion } from '../../src/design-system';
+import { Button, LoadingState, MtcFluentProvider, PageLoadingRegion } from '../../src/design-system';
 import { ResourceBoundary } from '../../src/operator/ResourceBoundary';
 import { Plugins } from '../../src/operator/Plugins';
 import { useOperatorResource } from '../../src/operator/hooks/useOperatorResource';
@@ -94,10 +94,17 @@ function UnifiedFixture() {
 }
 
 const unified = new URLSearchParams(location.search).get('mode') === 'unified';
+const inline = new URLSearchParams(location.search).get('mode') === 'inline';
+function InlineFixture() {
+  const { t } = useI18n();
+  return <main style={{ padding: 16 }}><div data-inline-column style={{ width: 'min(100%, 280px)' }}><LoadingState label={t('common.loading')} variant="inline" /></div></main>;
+}
 if (unified && new URLSearchParams(location.search).get('ignore-abort') === '1') {
   const fetch = globalThis.fetch.bind(globalThis);
   globalThis.fetch = (input, init) => fetch(input, { ...init, signal: undefined });
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider>{unified
+createRoot(document.getElementById('root')!).render(<I18nProvider>{inline
+  ? <MtcFluentProvider><InlineFixture /></MtcFluentProvider>
+  : unified
   ? <StrictMode><MtcFluentProvider><UnifiedFixture /></MtcFluentProvider></StrictMode>
   : <Fixture />}</I18nProvider>);

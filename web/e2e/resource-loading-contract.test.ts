@@ -69,3 +69,44 @@ test('resource lifecycle aborts superseded reads and never exposes stale scope d
   assert.match(hook, /!current\.signal\.aborted && request === sequence\.current/);
   assert.match(hook, /state\.scopeKey === scopeKey/);
 });
+
+test('loading evidence is deterministic, isolated and bound to exact integrated source', async () => {
+  const browser = await read('./unified-loading-browser-contract.test.ts');
+  assert.match(browser, /width: 1440, height: 1000/);
+  assert.match(browser, /width: 390, height: 844/);
+  assert.match(browser, /const locales = \['en', 'zh-CN'\]/);
+  assert.match(browser, /deviceScaleFactor: 1, reducedMotion: 'reduce'/);
+  assert.match(browser, /page\.clock\.setFixedTime/);
+  assert.match(browser, /document\.fonts\.ready/);
+  assert.match(browser, /page\.mouse\.move\(0, 0\)/);
+  assert.match(browser, /e2e-artifacts\/ui-system\/loading\//);
+  assert.match(browser, /integrated_head_sha: integrated/);
+  assert.match(browser, /process\.env\.GITHUB_SHA/);
+  assert.match(browser, /owner_heads:/);
+  assert.match(browser, /applied_source_commits: commits/);
+  assert.match(browser, /file_sha256: createHash\('sha256'\)\.update\(bytes\)/);
+  assert.match(browser, /generation_status: 'missing'/);
+  assert.match(browser, /finally \{\s*await saveManifest\(\)/);
+  assert.match(browser, /measured\.button_height_delta > 1/);
+  assert.match(browser, /button\.width >= 44 && button\.height >= 44/);
+  assert.match(browser, /assert\.deepEqual\(geometryFailures, \[\]/);
+  for (const scenario of ['ready', 'empty', 'error', 'permission-failure', 'initial-loading', 'background-refresh']) {
+    assert.ok(browser.includes(`await screenshot('${scenario}'`), `${scenario} captures completed contracts, not only failures`);
+  }
+});
+
+test('last owned operator loading surfaces reuse skeletons without changing mutation feedback', async () => {
+  for (const path of ['GenerationWorkspace.tsx', 'UsageAnalysis.tsx', 'TenantManager.tsx', 'TypedFilterBuilder.tsx', 'pages/SystemSettingsPage.tsx']) {
+    const source = await read(`../src/operator/${path}`);
+    assert.match(source, /LoadingState/);
+    assert.doesNotMatch(source, /<[^>]*(?:className="(?:empty|notice|muted)"|role="status")[^>]*>\{t\('common.loading'\)\}<\//);
+  }
+  assert.match(loading, /variant !== 'inline'/);
+  assert.match(loading, /variant === 'inline' \? 1/);
+  assert.match(styles, /\.mtc-loading-inline[\s\S]*min-block-size: 20px/);
+  const tenants = await read('../src/operator/TenantManager.tsx');
+  assert.match(tenants, /busy \? t\('common.loading'\) : dialogAction/);
+  const settings = await read('../src/operator/pages/SystemSettingsPage.tsx');
+  assert.match(settings, /billingLoading && <LoadingState[^>]*variant="inline"/);
+  assert.match(settings, /saving \? t\('common.loading'\) : t\('common.save'\)/);
+});

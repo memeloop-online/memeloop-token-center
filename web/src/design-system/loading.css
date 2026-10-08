@@ -84,6 +84,16 @@
   line-height: var(--lineHeightBase200, 16px);
 }
 
+.mtc-loading-inline,
+.mtc-resource-inline {
+  min-block-size: 20px;
+}
+
+.mtc-loading-inline .mtc-loading-skeleton {
+  padding-block: 2px;
+  gap: 0;
+}
+
 .mtc-loading-detail .mtc-loading-row:nth-child(even) {
   inline-size: 72%;
 }

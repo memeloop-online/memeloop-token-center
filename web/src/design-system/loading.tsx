@@ -3,7 +3,7 @@ import { ProgressBar, Skeleton, SkeletonItem } from '@fluentui/react-components'
 import './loading.css';
 
 export type LoadingLevel = 'page' | 'section';
-export type LoadingVariant = 'list' | 'detail' | 'compact';
+export type LoadingVariant = 'list' | 'detail' | 'compact' | 'inline';
 
 const PageLoadingContext = createContext<{
   register: (identity: string) => () => void;
@@ -75,8 +75,8 @@ export function LoadingState({ label, level = 'section', variant = 'list', class
   return <div className={`mtc-loading-state mtc-loading-${variant} ${className}`} role="group" aria-busy="true" aria-label={label}>
     {level === 'page' && <LoadingProgress active label={label} level={level} />}
     <Skeleton animation="pulse" aria-hidden="true" className="mtc-loading-skeleton">
-      <SkeletonItem shape="rectangle" size={16} className="mtc-loading-heading" />
-      {Array.from({ length: variant === 'compact' ? 2 : 4 }, (_, index) => <SkeletonItem key={index} shape="rectangle" size={16} className="mtc-loading-row" />)}
+      {variant !== 'inline' && <SkeletonItem shape="rectangle" size={16} className="mtc-loading-heading" />}
+      {Array.from({ length: variant === 'inline' ? 1 : variant === 'compact' ? 2 : 4 }, (_, index) => <SkeletonItem key={index} shape="rectangle" size={16} className="mtc-loading-row" />)}
     </Skeleton>
   </div>;
 }
