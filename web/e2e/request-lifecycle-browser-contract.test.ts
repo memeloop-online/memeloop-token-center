@@ -239,7 +239,11 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
-      await drawer.getByText(`${prefix}: ${reason}`, { exact: true }).waitFor();
+      const visibleCause = drawer.locator('.request-status-cause').and(drawer.getByText(`${prefix}: ${reason}`, { exact: true }));
+      await drawer.locator('.close').focus();
+      await tooltip.waitFor({ state: 'hidden' });
+      await visibleCause.waitFor();
+      assert.equal(await visibleCause.count(), 1);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
       assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
       await drawer.locator('.request-outcome').focus();
@@ -248,7 +252,10 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
       await page.evaluate(() => window.requestLifecycleFixture.finish());
       await page.waitForFunction(() => window.requestLifecycleFixture.detailCalls === 2);
-      await drawer.getByText(`${prefix}: ${reason}`, { exact: true }).waitFor();
+      await drawer.locator('.close').focus();
+      await tooltip.waitFor({ state: 'hidden' });
+      await visibleCause.waitFor();
+      assert.equal(await visibleCause.count(), 1);
       assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${prefix}: ${reason}`, 'enriched event preserves the list cause after detail refresh');
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
