@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import test, { type TestContext } from 'node:test';
+import test, { after, before, describe, type TestContext } from 'node:test';
 
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
@@ -47,11 +47,12 @@ function tenantRow(page: Page, tenantId: string) {
 }
 
 function recordIdentityProgress(context: TestContext, page: Page) {
+  const started = Date.now();
   let phase = 'opening fixture';
   page.on('pageerror', error => context.diagnostic(`identity page error (${phase}): ${error.message}`));
   context.signal.addEventListener('abort', () => { void page.close().catch(() => {}); }, { once: true });
   context.after(() => context.diagnostic(`last identity phase: ${phase}`));
-  return (next: string) => { phase = next; context.diagnostic(next); };
+  return (next: string) => { phase = next; context.diagnostic(`${next} (${Date.now() - started}ms)`); };
 }
 
 test('tenant management has one sidebar route and single-default scope stays implicit through refresh and history', { timeout: 30_000 }, async context => {
@@ -90,13 +91,15 @@ test('tenant management has one sidebar route and single-default scope stays imp
     await page.keyboard.press('Escape');
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.match(page.url(), /view=tenants/);
+    assert.equal(await page.getByRole('tab', { name: 'Tenants', exact: true }).getAttribute('aria-selected'), 'true');
     assert.equal(await page.getByLabel('Tenant ID', { exact: true }).inputValue(), 'keep-this-draft', 'cancelling retains the mounted form and its draft');
     progress('dirty tab: confirm service credentials and wait for its visible list');
     await page.getByRole('tab', { name: 'Service credentials', exact: true }).click();
     await page.getByRole('dialog').getByRole('button', { name: 'Confirm and continue', exact: true }).click();
-    await page.getByRole('heading', { name: 'Service credentials', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Service credential management', exact: true }).waitFor();
     await page.locator('.credential-compact-list').waitFor();
     assert.match(page.url(), /view=service-credentials/);
+    assert.equal(await page.getByRole('tab', { name: 'Service credentials', exact: true }).getAttribute('aria-selected'), 'true');
     assert.equal(await tenantLink.getAttribute('aria-current'), 'page');
     assert.equal(await page.locator('.identity-workspace [role="tabpanel"]').count(), 1, 'only the current identity panel may remain in the DOM');
     assert.equal(await page.locator('.tenant-manager').count(), 0, 'discard confirmation must unmount tenant business state, not hide it');
@@ -134,8 +137,11 @@ test('tenant management has one sidebar route and single-default scope stays imp
     assert.equal((await fixtureCalls(page)).filter((call) => call === 'GET /internal/v1/tenant-management').length, lifecycleCallsBeforeBack + 1, 'leaving identity must not fetch tenant CRUD');
     progress('sidebar and history contract complete');
   } finally {
+    context.diagnostic('sidebar cleanup: closing browser');
     await browser.close();
+    context.diagnostic('sidebar cleanup: closing fixture server');
     await server.close();
+    context.diagnostic('sidebar cleanup complete');
   }
 });
 
@@ -232,24 +238,48 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
   }
 });
 
-test('identity tabs retain legacy deep links, separate denial boundaries and bilingual screenshots for normal, empty and loading states', { timeout: 30_000 }, async context => {
-  const executablePath = await localChromiumExecutable();
-  if (!executablePath) return test.skip('a Chromium runtime is required for identity navigation assertions');
-  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/tenant-management.html')], server: { host: '127.0.0.1', port: 0, strictPort: false } });
-  await server.listen();
-  const address = server.httpServer?.address();
-  assert.ok(address && typeof address !== 'string');
-  const browser = await chromium.launch({ executablePath, headless: true });
-  try {
-    for (const locale of ['zh-CN', 'en']) {
-      const title = locale === 'en' ? 'Identity management' : '身份管理';
-      for (const scenario of ['default', 'slow', 'management-denied', 'management-error', 'background-refresh', 'services-denied', 'services-empty'] as const) {
+describe('identity tabs retain legacy deep links, separate denial boundaries and bilingual screenshots for normal, empty and loading states', () => {
+  let server: Awaited<ReturnType<typeof createServer>> | undefined;
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let port = 0;
+  before(async context => {
+    const executablePath = await localChromiumExecutable();
+    if (!executablePath) return;
+    context.diagnostic('identity matrix setup: starting shared fixture server and browser');
+    server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/tenant-management.html')], server: { host: '127.0.0.1', port: 0, strictPort: false } });
+    await server.listen();
+    const address = server.httpServer?.address();
+    assert.ok(address && typeof address !== 'string');
+    port = address.port;
+    browser = await chromium.launch({ executablePath, headless: true });
+    context.diagnostic('identity matrix setup complete');
+  });
+  after(async context => {
+    try {
+      context.diagnostic('identity matrix cleanup: closing browser');
+      await browser?.close();
+    } finally {
+      context.diagnostic('identity matrix cleanup: closing fixture server');
+      await server?.close();
+      context.diagnostic('identity matrix cleanup complete');
+    }
+  });
+  for (const locale of ['zh-CN', 'en']) {
+    const title = locale === 'en' ? 'Identity management' : '身份管理';
+    for (const scenario of ['default', 'slow', 'management-denied', 'management-error', 'background-refresh', 'services-denied', 'services-empty'] as const) {
+      test(`${locale}: ${scenario}`, { timeout: 30_000 }, async context => {
+        if (!browser) return context.skip('a Chromium runtime is required for identity navigation assertions');
         const page = await browser.newPage();
         const progress = recordIdentityProgress(context, page);
+        context.after(async () => {
+          progress(`${locale} ${scenario}: closing page`);
+          await page.close();
+          progress(`${locale} ${scenario}: page closed`);
+        });
         progress(`${locale} ${scenario}: open deep link`);
         await seedNavigationIdentity(page, locale);
         const view = scenario.startsWith('services-') ? 'service-credentials' : 'tenants';
-        await page.goto(fixture(address.port, scenario, view));
+        await page.goto(fixture(port, scenario, view));
         await page.getByRole('heading', { name: title, exact: true }).waitFor();
         const selectedTab = page.getByRole('tab', { name: view === 'tenants' ? locale === 'en' ? 'Tenants' : '租户' : locale === 'en' ? 'Service credentials' : '服务凭据', exact: true });
         assert.equal(await selectedTab.getAttribute('aria-selected'), 'true');
@@ -288,8 +318,7 @@ test('identity tabs retain legacy deep links, separate denial boundaries and bil
         await page.getByRole('heading', { name: title, exact: true }).waitFor();
         assert.equal(await selectedTab.getAttribute('aria-selected'), 'true', 'refresh restores the selected identity entity');
         progress(`${locale} ${scenario}: contract complete`);
-        await page.close();
-      }
+      });
     }
-  } finally { await browser.close(); await server.close(); }
+  }
 });
