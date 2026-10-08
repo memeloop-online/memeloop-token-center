@@ -5588,6 +5588,82 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
 }
 
 #[tokio::test]
+async fn buffered_chat_usage_diagnostics_preserve_failure_accounting_and_error_precedence() {
+    for (label, provider_error, expected_error) in [
+        (
+            "usage-rejection-diagnostic",
+            Value::Null,
+            "upstream_invalid_usage",
+        ),
+        (
+            "usage-rejection-provider-error",
+            json!({"message": "private-provider-error"}),
+            "upstream_failed_response",
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "private-output"}}],
+                "error": provider_error,
+                "usage": {"prompt_tokens": "private-token", "completion_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = response_usage_fixture(label, &upstream, 256).await;
+        let response = send_chat_usage_request(
+            &fixture,
+            &json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "Reply only OK."}],
+                "max_tokens": 32,
+                "stream": false
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let request_id =
+            Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":{"message":"upstream request failed","type":"upstream_error"}}"#
+        );
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, request_id);
+        assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
+        assert_eq!(
+            rows[0].usage_basis,
+            Some(crate::model::RequestUsageBasis::NotObserved)
+        );
+        assert_eq!(
+            (
+                rows[0].input_tokens,
+                rows[0].output_tokens,
+                rows[0].cached_input_tokens,
+                rows[0].cache_write_tokens
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(rows[0].cost, "0");
+        assert_exactly_once_side_effects(&fixture, request_id, None).await;
+        assert_response_archives_omit(&fixture, "private").await;
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn streaming_response_error_null_completes_and_non_null_error_fails() {
     for (label, input_tokens, response_error, expected_status, expected_error) in [
         ("stream-null-error", 309, Value::Null, 200, None),
