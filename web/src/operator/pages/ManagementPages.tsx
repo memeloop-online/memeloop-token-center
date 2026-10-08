@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { CopyButton } from '../../CopyButton';
 import { formatCurrency, formatNumber, formatPercent } from '../../format';
@@ -24,7 +24,7 @@ import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import { ProviderModelCatalog } from '../ProviderModelCatalog';
-import { ResourceBoundary as AccountResourceBoundary } from '../ResourceBoundary';
+import { ResourceBoundary } from '../ResourceBoundary';
 import { ManagedModelSync } from '../ManagedModelSync';
 import { inferManagedRouteProtocol, managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
 import { consumeRouteDraftPrefill, consumeRouteFocus, storeCatalogRouteAction } from '../routePrefill';
@@ -76,7 +76,6 @@ import '../providerDirectory.css';
 import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields, credentialPolicySchema, credentialPolicyUiSchema } from '../CredentialForm';
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource } from '../hooks/useOperatorResource';
-import { ResourceBoundary } from '../ResourceBoundary';
 import { loadModelPricePages } from '../pricingLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
 import { PricingTable } from '../PricingTable';
@@ -178,10 +177,7 @@ class AccountListRefreshError extends Error {}
 
 function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onReadFeedbackOwnerChange, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onReadFeedbackOwnerChange: (caller: boolean) => void; onChanged: (saved?: boolean, caller?: boolean) => Promise<void> }) {
   const { locale, t } = useI18n();
-  async function onChanged(saved = false) {
-    try { await reloadAccounts(saved); }
-    catch (reason) { if (!(reason instanceof AccountListRefreshError)) throw reason; }
-  }
+  const onChanged = reloadAccounts;
   const accountStatusNow = useQuotaClock();
   type AccountWorkspace = { kind: 'create' }
     | { kind: 'account' | 'settings' | 'rotation' | 'reauthorization'; account: UpstreamAccount };
@@ -299,7 +295,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       returnToAccountList();
       setMessage(t('providers.created', { name: result.name || String(formData.name ?? '') }));
       try { await onChanged(true); if (current()) setProviderListRetry(false); }
-      catch { if (current()) { setProviderListRetry(true); setError(t('providers.savedListUnavailable')); } }
+      catch (reason) { if (current()) { setProviderListRetry(true); setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); } }
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally {
       if (providerCreateLock.current === attempt) providerCreateLock.current = undefined;
@@ -312,7 +308,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     providerCreateLock.current = attempt;
     setBusy('reload-created-provider');
     try { await onChanged(true); if (providerScope.current === attempt) { setProviderListRetry(false); setError(''); } }
-    catch { if (providerScope.current === attempt) setError(t('providers.savedListUnavailable')); }
+    catch (reason) { if (providerScope.current === attempt) setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); }
     finally {
       if (providerCreateLock.current === attempt) providerCreateLock.current = undefined;
       if (providerScope.current === attempt) setBusy('');
@@ -406,7 +402,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       await api(`/internal/v1/upstreams/${value.id}/oauth/refresh`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } });
       setMessage(t('providers.refreshed', { name: value.name }));
       await onChanged();
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (!(reason instanceof AccountListRefreshError)) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   }
 
@@ -421,7 +417,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       });
       setMessage(t('providers.disconnected', { name: value.name }));
       await onChanged();
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (!(reason instanceof AccountListRefreshError)) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   }
 
@@ -435,7 +431,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       setMessage(t(status === 'active' ? 'providers.enabled' : 'providers.disabled', { name: value.name }));
       await onChanged();
       setHealth((current) => { const next = { ...current }; delete next[value.id]; return next; });
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (!(reason instanceof AccountListRefreshError)) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   }
 
@@ -482,7 +478,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       }
       setMessage(t('providers.deleted', { name: value.name }));
       await onChanged(false);
-    } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
+    } catch (reason) { if (current() && !(reason instanceof AccountListRefreshError)) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (current()) setBusy(''); }
   }
 
@@ -539,7 +535,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       returnToAccount(updated, 'inline-edit');
       const returnedGeneration = workspaceGeneration.current;
       try { await onChanged(true); }
-      catch (reason) { if (providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setError(messageOf(reason, t('common.requestFailed'))); }
+      catch (reason) { if (!(reason instanceof AccountListRefreshError) && providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setError(messageOf(reason, t('common.requestFailed'))); }
     } catch (reason) { if (ownsWorkspace()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (ownsWorkspace()) setBusy(''); }
   }
@@ -621,7 +617,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             </div>
             <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} reviewModelsDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} reviewPricingDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onReviewModels={() => openAccount(value)} onReviewPricing={onOpenPricing ? () => onOpenPricing(value.tenant_external_id ?? tenant) : undefined} onReconciled={() => {
               setRouteCacheRevisions((current) => ({ ...current, [value.id]: (current[value.id] ?? 0) + 1 }));
-              void onChanged();
+              void onChanged().catch(reason => { if (!(reason instanceof AccountListRefreshError) && ownsWorkspace()) setError(messageOf(reason, t('common.requestFailed'))); });
             }} /></div>
           </div>
 
@@ -633,7 +629,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       if (!ownsWorkspace()) return;
       returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
       const returnedGeneration = workspaceGeneration.current;
-      void onChanged(true).catch(() => { if (providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setMessage(upstreamRotationCopy(locale).reloadFailed); });
+      void onChanged(true).catch(reason => { if (!(reason instanceof AccountListRefreshError) && providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setMessage(upstreamRotationCopy(locale).reloadFailed); });
     }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale, reauthorizing.driver).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } if (!open && editing) { void leaveProviderSettings(() => { returnToAccount(editing, 'inline-edit'); }); return; } if (open) { returnFocus.current = undefined; navigateWorkspace({ kind: 'create' }); } else returnToAccountList(); }}>
       {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && providerWorkspaceActive && <div className="notice error" role="alert">{error}</div>}
@@ -2187,9 +2183,9 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
   const accountResource = resource.state.kind === 'ready' && resource.state.refreshError
-    ? { ...resource.state, refreshError: t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
+    ? { ...resource.state, refreshError: callerReadFeedback ? undefined : t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
     : resource.state;
-  return <AccountResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()} refreshErrorPresentation={callerReadFeedback ? 'caller' : 'boundary'}>{({ providers, values }) =>
+  return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
     <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
       savedRefresh.current = saved;
       setCallerReadFeedback(caller);
@@ -2197,7 +2193,7 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
       await resource.reload();
       if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new AccountListRefreshError();
     }} />
-  }</AccountResourceBoundary>;
+  }</ResourceBoundary>;
 }
 
 export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {

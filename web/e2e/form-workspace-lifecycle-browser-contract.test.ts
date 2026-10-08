@@ -344,6 +344,9 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
     await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor();
     await page.getByText('Saved upstream connection Saved API connection.', { exact: true }).waitFor();
+    await page.getByRole('alert').filter({ hasText: 'Account saved. Reload the list to view it.' }).waitFor();
+    assert.equal(await page.getByRole('alert').count(), 1, 'confirmed creation retains its retry state without duplicate read-failure feedback');
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'a failed directory read cannot repeat the confirmed creation');
     assert.deepEqual(await page.evaluate(() => window.formJourneyLastProviderCreate?.credential), {
       type: 'api_key', value: 'fixture-only-api-secret', header: 'x-api-key', prefix: '',
     });
@@ -351,6 +354,7 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     await page.getByRole('button', { name: 'Reload account list', exact: true }).click();
     await page.getByRole('button', { name: 'Reload account list', exact: true }).waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
+    assert.equal(await page.getByRole('alert').count(), 0, 'successful read-only recovery clears the single refresh warning');
     await workspace.locator('[data-workspace-toggle]').click();
     assert.equal(await workspace.locator('#root_name').inputValue(), '');
     stage = 'untouched-default-after-branch-switch';
