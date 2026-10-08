@@ -729,6 +729,11 @@ impl PluginRuntime {
         feature = "plugin-distribution"
     ))]
     fn load_for_inventory(root: &str) -> Result<Self, AppError> {
+        match fs::symlink_metadata(Path::new(root).join("plugin.json")) {
+            Ok(_) => return Err(AppError::Forbidden),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(AppError::Internal),
+        }
         Self::load_with_database(Some(root), None)
     }
 
@@ -3016,6 +3021,36 @@ mod tests {
         assert!(runtime.manifests().is_empty());
         std::fs::create_dir(root.path().join("incomplete")).unwrap();
         assert!(PluginRuntime::load_for_inventory(root.path().to_str().unwrap()).is_err());
+    }
+
+    #[cfg(all(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ))]
+    #[tokio::test]
+    async fn inventory_loader_rejects_root_manifest_hiding_nonempty_child_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child-package");
+        std::fs::create_dir(&child).unwrap();
+        let manifest = serde_json::json!({
+            "id":"child-package", "version":"1.0.0", "wit_version":"0.2.0",
+            "wasm":null, "capabilities":[], "contributions":{}
+        });
+        std::fs::write(
+            child.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::load_for_inventory(root.path().to_str().unwrap()).unwrap();
+        assert_eq!(runtime.manifests()[0].id, "child-package");
+        std::fs::write(
+            root.path().join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(PluginRuntime::load_for_inventory(root.path().to_str().unwrap()).is_err());
+        let compatible = PluginRuntime::load_with_database(root.path().to_str(), None).unwrap();
+        assert_eq!(compatible.manifests()[0].id, "child-package");
     }
 
     #[test]

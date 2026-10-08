@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Write},
     os::{fd::AsRawFd, unix::ffi::OsStrExt},
@@ -13,7 +13,7 @@ use super::{DescriptorInventory, PluginInventoryDescriptor, PreinstalledInventor
 use crate::{
     error::AppError,
     plugin::{PluginRuntime, lifecycle, plugin_configuration_schema_digest},
-    plugin_distribution::{InstallPluginOptions, install_plugin_oci},
+    plugin_distribution::{InstallPluginOptions, RegistryCredentials, install_plugin_oci},
     provider::ProviderCatalog,
 };
 
@@ -55,6 +55,7 @@ pub async fn import_plugin_descriptor(
         PluginInventoryDescriptor::MAX_PARSE_BYTES,
     )?;
     let descriptor = PluginInventoryDescriptor::parse_expected(&bytes, &options.expected_digest)?;
+    validate_credential_scope(&descriptor, &options.installation.credentials)?;
     validate_paths(&descriptor, &options.plugin_dir, &options.output_dir)?;
     let directory = storage(crate::plugin_publication::directory_fd(&options.plugin_dir))?;
     let lock = File::from(storage(openat(
@@ -142,6 +143,27 @@ pub async fn import_plugin_descriptor(
         &receipt,
     )?;
     Ok(receipt)
+}
+
+fn validate_credential_scope(
+    descriptor: &PluginInventoryDescriptor,
+    credentials: &RegistryCredentials,
+) -> Result<(), AppError> {
+    if matches!(credentials, RegistryCredentials::Anonymous) {
+        return Ok(());
+    }
+    let mut registries = BTreeSet::new();
+    for entry in descriptor.inventories.values() {
+        for reference in entry.package_references()?.values() {
+            let reference: oci_client::Reference =
+                reference.parse().map_err(|_| AppError::Forbidden)?;
+            registries.insert(reference.registry().to_owned());
+            if registries.len() > 1 {
+                return Err(AppError::Forbidden);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_inventory(
@@ -508,6 +530,271 @@ mod tests {
                 allow_portable_publication: false,
             },
         }
+    }
+
+    fn registry_descriptor(root: &Path, sources: [&str; 2]) -> PluginInventoryDescriptor {
+        let mut descriptor = PluginInventoryDescriptor {
+            format_version: 1,
+            inventories: BTreeMap::new(),
+        };
+        for (index, source) in sources.into_iter().enumerate() {
+            let inventory_id = format!("inventory-{index}");
+            let identity = crate::plugin::PluginPackageIdentity {
+                component_sha256: None,
+                provenance: Some(crate::plugin::PluginInstallProvenance {
+                    format_version: 1,
+                    source: source.into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    signature_policy: "cosign-public-key".into(),
+                }),
+            };
+            descriptor.inventories.insert(
+                inventory_id.clone(),
+                DescriptorInventory {
+                    inventory: PreinstalledInventory {
+                        root: root.join(inventory_id),
+                        grants: BTreeMap::from([(
+                            "package".into(),
+                            vec![lifecycle::PluginGrant {
+                                version: "1.0.0".into(),
+                                capabilities: Vec::new(),
+                                manifest_digest: "b".repeat(64),
+                                identity: identity.clone(),
+                            }],
+                        )]),
+                    },
+                    packages: BTreeMap::from([("package".into(), identity)]),
+                    identity_digest: "c".repeat(64),
+                    contract_digest: "d".repeat(64),
+                },
+            );
+        }
+        descriptor
+    }
+
+    #[tokio::test]
+    async fn authenticated_multi_registry_descriptor_fails_before_install_or_lock() {
+        for credentials in [
+            RegistryCredentials::Basic {
+                username: "fixture-user".into(),
+                password: "fixture-only".into(),
+            },
+            RegistryCredentials::Bearer("fixture-only".into()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut options = options(root.path());
+            let descriptor = registry_descriptor(
+                root.path(),
+                ["first.invalid/package", "second.invalid/package"],
+            );
+            options.expected_digest = descriptor.digest().unwrap();
+            options.installation.credentials = credentials;
+            std::fs::write(&options.descriptor_file, encoded(&descriptor).unwrap()).unwrap();
+            assert!(matches!(
+                import_plugin_descriptor(&options).await,
+                Err(AppError::Forbidden)
+            ));
+            assert!(!root.path().join(".mtc-descriptor-import.lock").exists());
+            assert!(!root.path().join("inventory-0").exists());
+            assert!(!options.output_dir.exists());
+        }
+    }
+
+    #[test]
+    fn anonymous_multi_registry_and_authenticated_single_registry_preserve_policy() {
+        let multiple = registry_descriptor(
+            Path::new("/plugins"),
+            ["first.invalid/package", "second.invalid/package"],
+        );
+        validate_credential_scope(&multiple, &RegistryCredentials::Anonymous).unwrap();
+        let same = registry_descriptor(
+            Path::new("/plugins"),
+            ["first.invalid/package", "first.invalid/other-package"],
+        );
+        validate_credential_scope(&same, &RegistryCredentials::Bearer("fixture-only".into()))
+            .unwrap();
+        let ports = registry_descriptor(
+            Path::new("/plugins"),
+            ["first.invalid:443/package", "first.invalid:8443/package"],
+        );
+        assert!(
+            validate_credential_scope(&ports, &RegistryCredentials::Bearer("fixture-only".into()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Existing GHA signed-Claude step provides its pinned image, real Cosign and fixture"]
+    async fn privacy_wire_shim_release_component_descriptor_import_roundtrip() {
+        const CHILD_MARKER: &str = "MTC_ID64_SIGNED_IMPORT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            run_signed_import_with_existing_cosign(CHILD_MARKER).await;
+            return;
+        }
+        let fixture =
+            PathBuf::from(std::env::var("MTC_CLAUDE_WIRE_FIXTURE").expect("GHA signed fixture"));
+        let fixture_runtime =
+            PluginRuntime::load_for_inventory(fixture.parent().unwrap().to_str().unwrap()).unwrap();
+        let manifests = fixture_runtime.manifests();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].id, "claude-code-wire");
+        let identities = fixture_runtime.package_identities();
+        let identity = identities["claude-code-wire"].clone();
+        assert!(identity.component_sha256.is_some());
+        let provenance = identity.provenance.as_ref().unwrap();
+        assert_eq!(provenance.source, std::env::var("PLUGIN_SOURCE").unwrap());
+        assert_eq!(provenance.digest, std::env::var("PLUGIN_DIGEST").unwrap());
+        assert_eq!(provenance.signature_policy, "cosign-keyless");
+        let root = tempfile::tempdir().unwrap();
+        let mut options = options(root.path());
+        let entry = DescriptorInventory {
+            inventory: PreinstalledInventory {
+                root: root.path().join("signed"),
+                grants: BTreeMap::from([("claude-code-wire".into(), vec![lifecycle::PluginGrant {
+                    version: manifests[0].version.clone(),
+                    capabilities: manifests[0].capabilities.clone(),
+                    manifest_digest: lifecycle::manifest_digest(&manifests[0]).unwrap(),
+                    identity: identity.clone(),
+                }])]),
+            },
+            packages: identities,
+            identity_digest: plugin_configuration_schema_digest(&serde_json::json!({
+                "manifests": fixture_runtime.manifests(), "identities": fixture_runtime.package_identities()
+            })).unwrap(),
+            contract_digest: super::super::contract_digest(&fixture_runtime).unwrap(),
+        };
+        let descriptor = PluginInventoryDescriptor {
+            format_version: 1,
+            inventories: BTreeMap::from([("signed".into(), entry)]),
+        };
+        options.expected_digest = descriptor.digest().unwrap();
+        options
+            .installation
+            .allowed_sources
+            .insert(provenance.source.clone());
+        options.installation.cosign_keyless = Some(crate::plugin::CosignKeylessIdentity {
+            identity: std::env::var("SIGNING_IDENTITY").unwrap(),
+            issuer: std::env::var("SIGNING_ISSUER").unwrap(),
+        });
+        std::fs::write(&options.descriptor_file, encoded(&descriptor).unwrap()).unwrap();
+        let first = import_plugin_descriptor(&options)
+            .await
+            .expect("real signed nonempty first import");
+        let first_bytes = std::fs::read(options.output_dir.join(RECEIPT_FILE)).unwrap();
+        assert_eq!(first.verified.len(), 1);
+        assert_eq!(
+            first.verified["signed"].identity_digest,
+            descriptor.inventories["signed"].identity_digest
+        );
+        let second = import_plugin_descriptor(&options)
+            .await
+            .expect("real signed nonempty authoritative reimport");
+        assert_eq!(encoded(&first).unwrap(), encoded(&second).unwrap());
+        assert_eq!(
+            first_bytes,
+            std::fs::read(options.output_dir.join(RECEIPT_FILE)).unwrap()
+        );
+        let installed = root.path().join("signed/claude-code-wire");
+        for filename in ["plugin.json", "plugin.wasm", ".mtc-oci-install.json"] {
+            assert_eq!(
+                std::fs::read(installed.join(filename)).unwrap(),
+                std::fs::read(fixture.join(filename)).unwrap()
+            );
+        }
+        std::fs::write(
+            root.path().join("signed/plugin.json"),
+            std::fs::read(installed.join("plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_inventory(
+                &descriptor.inventories["signed"],
+                root.path().join("signed").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    async fn run_signed_import_with_existing_cosign(marker: &str) {
+        use std::process::Stdio;
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let image = format!(
+            "{}@{}",
+            std::env::var("INSTALLER_SOURCE").expect("existing GHA pinned installer source"),
+            std::env::var("INSTALLER_DIGEST").expect("existing GHA pinned installer digest")
+        );
+        let container = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new("docker")
+                .args([
+                    "create",
+                    "--entrypoint",
+                    "/usr/local/bin/cosign",
+                    &image,
+                    "version",
+                    "--json",
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            container.status.success(),
+            "create existing pinned CI fixture container"
+        );
+        let container = String::from_utf8(container.stdout).unwrap();
+        let container = container.trim();
+        assert!(!container.is_empty() && container.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let copy = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new("docker")
+                .args(["cp", &format!("{container}:/usr/local/bin/cosign")])
+                .arg(directory.path().join("cosign"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+        let removed = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new("docker")
+                .args(["rm", container])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            removed.success(),
+            "remove only this test's created container"
+        );
+        assert!(
+            copy.unwrap().unwrap().success(),
+            "copy real fixed Cosign companion"
+        );
+        let executable = directory.path().join("descriptor-import-tests");
+        let current = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&current, &executable).is_err() {
+            std::fs::copy(&current, &executable).unwrap();
+        }
+        let status = tokio::time::timeout(Duration::from_secs(600), tokio::process::Command::new(executable)
+            .args(["--ignored", "--exact", "plugin::application::descriptor_import::tests::privacy_wire_shim_release_component_descriptor_import_roundtrip", "--nocapture"])
+            .env(marker, "1").stdin(Stdio::null()).kill_on_drop(true).status()).await.unwrap().unwrap();
+        assert!(
+            status.success(),
+            "real signed descriptor import/reimport subprocess"
+        );
     }
 
     #[tokio::test]
