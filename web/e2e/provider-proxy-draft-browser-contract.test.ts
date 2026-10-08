@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { editProviderAccount, manageProviderAccount } from './support/provider-account-navigation.js';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -181,6 +181,52 @@ test('independent proxy save updates concurrency metadata without dropping the p
   } finally { await browser.close(); await server.close(); }
 });
 
+test('account action slots fit English Fluent buttons through the sidebar breakpoint', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  const artifacts = `${root}/e2e-artifacts/ui-system/account-workspace`;
+  await mkdir(artifacts, { recursive: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows`);
+    await page.evaluate(async () => { document.documentElement.dataset.theme = 'light'; await document.fonts.ready; });
+    const actions = page.locator('.provider-directory-actions > .fui-Button');
+    await actions.first().waitFor();
+    for (const width of [1440, 1280, 1101, 1100, 1099, 900, 390, 320]) {
+      const height = width <= 768 ? 844 : 1000;
+      await page.setViewportSize({ width, height });
+      const dimensions = await actions.evaluateAll(buttons => buttons.map(button => {
+        const bounds = button.getBoundingClientRect();
+        const style = getComputedStyle(button);
+        return { left: bounds.left, width: bounds.width, height: bounds.height, textLength: button.textContent?.trim().length ?? 0, scrollWidth: button.scrollWidth, clientWidth: button.clientWidth, fontSize: style.fontSize, paddingInlineStart: style.paddingInlineStart, paddingInlineEnd: style.paddingInlineEnd };
+      }));
+      const stem = `${artifacts}/accounts-list--action-slots--en--${width}x${height}--light`;
+      await writeFile(`${stem}.json`, JSON.stringify({ evidence_kind: 'synthetic', integrated_head_sha: process.env.GITHUB_SHA ?? null, viewport: { width, height }, actions: dimensions }, null, 2));
+      await page.screenshot({ path: `${stem}.png`, fullPage: true });
+      assert.equal(await actions.nth(0).innerText(), 'Refresh quota');
+      assert.equal(await actions.nth(1).innerText(), 'Manage account');
+      assert.equal(dimensions.length, 2);
+      for (const action of dimensions) {
+        assert.equal(action.height, width <= 768 ? 44 : 32, `${width}px common actions retain the shared Fluent height`);
+        assert.ok(action.scrollWidth <= action.clientWidth, `${width}px action text remains contained`);
+      }
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px sidebar and directory do not overflow`);
+    }
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('account deletion clears only its workspace and ordinary tooltips omit technical identifiers', { timeout: 120_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
@@ -353,7 +399,7 @@ test('account workspace returns without retained details, shares list tracks and
       const expiredRow = page.locator('[data-upstream-id="expired-fixture-a"]');
       assert.equal(await expiredRow.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1, 'enabled Kimi accounts still expose credential expiry');
       assert.equal(await expiredRow.locator('.status.ok').count(), 0, 'enabled is not proof of valid authorization');
-      for (const width of [1440, 900, 390, 320]) {
+      for (const width of [1440, 1101, 1100, 900, 390, 320]) {
         await page.setViewportSize({ width, height: 1000 });
         const tracks = await rows.evaluateAll(elements => elements.map(row => [...row.children].slice(0, 5).map(cell => { const box = cell.getBoundingClientRect(); return { left: box.left, width: box.width }; })));
         for (const cells of tracks.slice(1)) for (const [index, cell] of cells.entries()) {
@@ -419,14 +465,26 @@ test('account workspace returns without retained details, shares list tracks and
         await details.getByRole('status').filter({ hasText: chinese ? '已更新' : 'Updated' }).waitFor();
         if (refreshFailure) {
           await failedRead;
-          await details.getByRole('alert').getByText(chinese ? '请求失败' : 'Request failed', { exact: true }).waitFor();
-          await page.getByRole('alert').filter({ hasText: 'Fixture list refresh unavailable' }).waitFor();
-          assert.equal(await details.getByText('Fixture list refresh unavailable', { exact: true }).count(), 0, 'the account callback retains its safe localized failure message');
+          await page.getByRole('alert').filter({ hasText: chinese ? '账号已保存。重新读取列表即可查看。' : 'Account saved. Reload the list to view it.' }).waitFor();
+          assert.equal(await page.getByRole('alert').count(), 1, 'a failed read after a successful write has one retryable feedback owner');
+          assert.equal(await details.getByRole('alert').count(), 0, 'a successful save is not reported as a failed write');
+          assert.equal(await page.getByText('Fixture list refresh unavailable', { exact: true }).count(), 0, 'raw read errors are not exposed');
           assert.equal(await details.getByRole('heading', { name: 'Saved despite refresh failure', exact: true }).count(), 1, 'failed directory refresh retains the saved account snapshot');
         }
         for (const width of [1440, 390]) {
           await page.setViewportSize({ width, height: 1000 });
           await page.screenshot({ path: `${artifacts}/saved-${refreshFailure ? 'refresh-failed' : 'ready'}-${locale}-${width}.png`, fullPage: true });
+        }
+        if (refreshFailure) {
+          const writesBeforeRetry = writes;
+          const refreshed = page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/upstreams' && response.request().method() === 'GET' && response.status() === 200);
+          await page.getByRole('alert').getByRole('button', { name: chinese ? '重试' : 'Retry', exact: true }).click();
+          await refreshed;
+          await page.getByRole('alert').waitFor({ state: 'detached' });
+          await details.getByRole('heading', { name: 'Saved despite refresh failure', exact: true }).waitFor();
+          await details.getByRole('status').filter({ hasText: chinese ? '已更新' : 'Updated' }).waitFor();
+          assert.equal(writes, writesBeforeRetry, 'retry only rereads the directory and never repeats the saved mutation');
+          assert.equal(await rows.first().isVisible(), false);
         }
       }
       await details.getByRole('button', { name: labels.back, exact: true }).click();

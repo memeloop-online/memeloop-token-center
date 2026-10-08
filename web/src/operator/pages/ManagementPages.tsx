@@ -24,6 +24,7 @@ import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import { ProviderModelCatalog } from '../ProviderModelCatalog';
+import { ResourceBoundary as AccountResourceBoundary } from '../ResourceBoundary';
 import { ManagedModelSync } from '../ManagedModelSync';
 import { inferManagedRouteProtocol, managedRouteProtocols, type CatalogRouteAction } from '../managedModelSync';
 import { consumeRouteDraftPrefill, consumeRouteFocus, storeCatalogRouteAction } from '../routePrefill';
@@ -173,8 +174,14 @@ function isPositiveDecimal(value: string) {
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onChanged: () => Promise<void> }) {
+class AccountListRefreshError extends Error {}
+
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onChanged: (saved?: boolean) => Promise<void> }) {
   const { locale, t } = useI18n();
+  async function onChanged(saved = true) {
+    try { await reloadAccounts(saved); }
+    catch (reason) { if (!(reason instanceof AccountListRefreshError)) throw reason; }
+  }
   const accountStatusNow = useQuotaClock();
   type AccountWorkspace = { kind: 'create' }
     | { kind: 'account' | 'settings' | 'rotation' | 'reauthorization'; account: UpstreamAccount };
@@ -472,7 +479,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         deletionGeneration = workspaceGeneration.current;
       }
       setMessage(t('providers.deleted', { name: value.name }));
-      await onChanged();
+      await onChanged(false);
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { if (current()) setBusy(''); }
   }
@@ -2130,6 +2137,7 @@ interface OperatorPageProps {
 
 export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpenPricing, onOpenProxyGroups }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void }) {
   const { t } = useI18n();
+  const savedRefresh = useRef(false);
   // This page needs an acknowledged account-list refresh after OAuth creation.
   // The shared resource hook intentionally preserves its non-throwing semantics.
   const accountRead = useRef<{ scope: string; failed: boolean }>({ scope: '', failed: false });
@@ -2175,13 +2183,17 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
     availabilityError: statistics.state.kind === 'failed' ? statistics.state.message : undefined,
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
-  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onChanged={async () => {
+  const accountResource = resource.state.kind === 'ready' && resource.state.refreshError
+    ? { ...resource.state, refreshError: t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
+    : resource.state;
+  return <AccountResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onChanged={async (saved = true) => {
+      savedRefresh.current = saved;
       void statistics.reload();
       await resource.reload();
-      if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new Error(t('common.requestFailed'));
+      if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new AccountListRefreshError();
     }} />
-  }</ResourceBoundary>;
+  }</AccountResourceBoundary>;
 }
 
 export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {

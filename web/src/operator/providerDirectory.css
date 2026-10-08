@@ -1,5 +1,6 @@
 /* The directory is a list of summaries; one unboxed workspace holds details. */
-.provider-list .account-list.provider-directory { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(95px, .8fr) minmax(120px, 1fr) minmax(110px, 1fr) minmax(200px, 220px); gap: 0 20px; }
+.provider-list { container: provider-directory / inline-size; }
+.provider-list .account-list.provider-directory { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(95px, .8fr) minmax(120px, 1fr) minmax(110px, 1fr) 320px; gap: 0 20px; }
 .provider-directory .account.provider-account { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; gap: 0 20px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; min-width: 0; }
 .provider-directory-row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; gap: 20px; padding: 20px 0; border-bottom: 1px solid var(--picker-border); min-width: 0; }
 .provider-directory > .empty { grid-column: 1 / -1; }
@@ -42,6 +43,17 @@
   .provider-list .account-list.provider-directory { grid-template-columns: minmax(160px, 2fr) minmax(0, 1fr) minmax(0, 1fr); column-gap: 16px; }
   .provider-directory .account.provider-account, .provider-directory-row { column-gap: 16px; }
   .provider-directory-actions { grid-column: 2 / -1; }
+}
+@container provider-directory (max-width: 920px) {
+  .provider-list .account-list.provider-directory { grid-template-columns: minmax(160px, 2fr) minmax(0, 1fr) minmax(0, 1fr); column-gap: 16px; }
+  .provider-directory .account.provider-account, .provider-directory-row { column-gap: 16px; }
+  .provider-directory-actions { grid-column: 2 / -1; }
+}
+@container provider-directory (max-width: 600px) {
+  .provider-list .account-list.provider-directory { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
+  .provider-directory .account.provider-account, .provider-directory-row { column-gap: 12px; }
+  .provider-directory-row { row-gap: 16px; padding-block: 20px; }
+  .provider-directory-identity, .provider-directory-actions { grid-column: 1 / -1; }
 }
 @media (max-width: 600px) {
   .provider-list .account-list.provider-directory { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
