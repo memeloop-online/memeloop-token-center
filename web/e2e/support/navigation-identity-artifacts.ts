@@ -20,7 +20,7 @@ const manifests = new Map<Surface, Array<{
 }>>();
 
 export async function seedNavigationIdentity(page: Page, locale: string, preserveLocale = false) {
-  await page.addInitScript(({ locale, preserveLocale }) => {
+  await page.addInitScript({ content: `(({ locale, preserveLocale }) => {
     if (!preserveLocale || !localStorage.getItem('mtc-locale')) localStorage.setItem('mtc-locale', locale);
     localStorage.setItem('mtc-theme', 'light');
     const applyTheme = () => {
@@ -32,7 +32,7 @@ export async function seedNavigationIdentity(page: Page, locale: string, preserv
       const observer = new MutationObserver(() => { if (applyTheme()) observer.disconnect(); });
       observer.observe(document, { childList: true });
     }
-  }, { locale, preserveLocale });
+  })(${JSON.stringify({ locale, preserveLocale })});` });
 }
 
 export async function captureNavigationIdentity(page: Page, surface: Surface, scenario: string, locale: string) {
