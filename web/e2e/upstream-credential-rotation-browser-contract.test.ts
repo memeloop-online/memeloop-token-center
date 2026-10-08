@@ -49,6 +49,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       const trigger = page.getByRole('button', { name: copy.rotate, exact: true });
       await trigger.focus(); await page.keyboard.press('Enter');
       const form = page.locator('.upstream-credential-rotation');
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'rotation replaces the account workspace');
       await form.getByRole('heading', { name: copy.title, exact: true }).waitFor();
       assert.equal(await form.getByRole('heading', { name: copy.title }).evaluate(element => element === document.activeElement), true);
       await form.getByText(copy.old, { exact: false }).waitFor();
@@ -80,7 +81,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
         const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
         assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
         assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
-        const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
+        const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
         await mkdir(screenshotRoot, { recursive: true });
         await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png` });
       }
@@ -108,6 +109,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await form.getByRole('button', { name: copy.back, exact: true }).focus(); await page.keyboard.press('Enter');
       await page.getByRole('heading', { name: copy.settings, exact: true }).waitFor();
       assert.equal(await trigger.evaluate(element => element === document.activeElement), true);
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'nested back returns only the settings workspace');
       assert.equal(writes.length, 3, 'back and close never write credentials or start OAuth');
       await page.close();
     }

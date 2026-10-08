@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { editProviderAccount } from './support/provider-account-navigation.js';
+import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -42,6 +43,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await editProviderAccount(page, account.id);
     const reauthorize = page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true });
     await reauthorize.click();
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'reauthorization has no mounted parallel account details');
     await page.evaluate(account => {
       const previous = window.fetch;
       const state = window.claudeCompletionFixture = { calls: 0, aborted: false, hasSignal: false } as Window['claudeCompletionFixture'];
@@ -94,6 +96,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
     await close.click();
     await workspace.waitFor({ state: 'detached' });
     await editHeading.waitFor();
+    assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'reauthorization returns to settings alone');
     const readsBeforeLateResponse = accountReads;
     await page.evaluate(() => window.claudeCompletionFixture.release?.(true));
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
@@ -192,6 +195,10 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       const reauthorize = page.getByRole('button', { name: chinese ? '重新授权' : 'Authorize again', exact: true });
       await reauthorize.click();
       const workspace = page.locator('.provider-reauthorization-workspace');
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
+      const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+      await mkdir(screenshotRoot, { recursive: true });
+      await page.screenshot({ path: `${screenshotRoot}/reauthorization-${locale}-390.png`, fullPage: true });
       const start = workspace.getByRole('button', { name: chinese ? '开始登录' : 'Start login', exact: true });
       assert.equal(writes.length, 0, 'opening an already-authorized account never starts OAuth');
       await workspace.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).click();
@@ -206,6 +213,9 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       assert.equal(writes.filter(write => write.path.endsWith('/transport-proxy')).length, 1, 'proxy save is immediate and does not start login');
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
       await page.getByRole('heading', { name: chinese ? '编辑 reauthorize@example.org' : 'Edit reauthorize@example.org', exact: true }).waitFor();
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
+      assert.equal(await reauthorize.evaluate(button => button === document.activeElement), true);
+      await page.screenshot({ path: `${screenshotRoot}/reauthorization-parent-${locale}-390.png`, fullPage: true });
       await reauthorize.click();
       await start.click();
       await workspace.getByText(chinese ? '未能获取登录会话。请检查此账号的网络代理和出口连接，然后重试。' : 'Could not obtain a login session. Check this account’s proxy and egress, then retry.').waitFor();
