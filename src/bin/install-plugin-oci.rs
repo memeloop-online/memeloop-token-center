@@ -15,7 +15,35 @@ const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 )]
 struct Arguments {
     /// OCI reference. Tags are rejected; @sha256:<digest> is mandatory.
-    reference: String,
+    #[cfg_attr(
+        feature = "experimental-plugin-revisions",
+        arg(
+            required_unless_present = "descriptor_file",
+            conflicts_with = "descriptor_file"
+        )
+    )]
+    #[cfg_attr(not(feature = "experimental-plugin-revisions"), arg(required = true))]
+    reference: Option<String>,
+
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires_all = ["expected_descriptor_digest", "descriptor_output_dir"], conflicts_with_all = ["reference", "inventory_id", "publication_attempt_id", "inventory_file", "inventory_entry_file"])]
+    descriptor_file: Option<PathBuf>,
+
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires = "descriptor_file")]
+    expected_descriptor_digest: Option<String>,
+
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires = "descriptor_file")]
+    descriptor_output_dir: Option<PathBuf>,
+
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires = "descriptor_file")]
+    previous_bundle_dir: Option<PathBuf>,
+
+    #[cfg(feature = "experimental-plugin-revisions")]
+    #[arg(long, requires = "descriptor_file")]
+    previous_inventory_file: Option<PathBuf>,
 
     /// Read-only-at-runtime plugin root populated by this installer/init container.
     #[arg(long, env = "MTC_PLUGIN_DIR")]
@@ -120,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .iter()
         .map(|path| read_bounded_file(path, "Cosign public key"))
         .collect::<Result<Vec<_>, _>>()?;
-    let installed = install_plugin_oci(&InstallPluginOptions {
-        reference: arguments.reference,
+    let installation = InstallPluginOptions {
+        reference: arguments.reference.unwrap_or_default(),
         plugin_root: plugin_root.clone(),
         allowed_sources: arguments
             .allowed_sources
@@ -134,7 +162,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .zip(arguments.cosign_certificate_oidc_issuer)
             .map(|(identity, issuer)| CosignKeylessIdentity { issuer, identity }),
         allow_portable_publication: arguments.publication_attempt_id.is_some(),
-    })
+    };
+    #[cfg(feature = "experimental-plugin-revisions")]
+    if let Some(descriptor_file) = arguments.descriptor_file {
+        use memeloop_token_center::plugin::application::descriptor_import::{
+            DescriptorImportOptions, import_plugin_descriptor,
+        };
+        let receipt = import_plugin_descriptor(&DescriptorImportOptions {
+            descriptor_file,
+            expected_digest: arguments.expected_descriptor_digest.ok_or("descriptor digest required")?,
+            plugin_dir: arguments.plugin_dir,
+            output_dir: arguments.descriptor_output_dir.ok_or("descriptor output required")?,
+            previous_bundle_dir: arguments.previous_bundle_dir,
+            previous_inventory_file: arguments.previous_inventory_file,
+            installation,
+        }).await.map_err(|error| {
+            eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"descriptor_import","category":error.diagnostic_category()}));
+            "descriptor import failed (see safe diagnostic category)"
+        })?;
+        println!(
+            "{}",
+            serde_json::json!({"descriptor_digest":receipt.descriptor_digest,"inventories":receipt.verified.len()})
+        );
+        return Ok(());
+    }
+    let installed = install_plugin_oci(&installation)
     .await.map_err(|error| {
         eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"install","category":error.diagnostic_category()}));
         "plugin installation failed (see safe diagnostic category)"
@@ -311,6 +363,39 @@ fn read_bounded_file(
 #[cfg(all(test, feature = "experimental-plugin-revisions"))]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    fn descriptor_arguments_require_digest_and_preserve_single_package_mode() {
+        let trust = [
+            "--plugin-dir",
+            "/plugins",
+            "--allowed-source",
+            "ghcr.io/example/plugins",
+            "--cosign-public-key",
+            "/keys/public.pem",
+        ];
+        let mut legacy = vec![
+            "install-plugin-oci",
+            "ghcr.io/example/plugins@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        legacy.extend(trust);
+        assert!(Arguments::try_parse_from(legacy.clone()).is_ok());
+        legacy.extend(["--descriptor-file", "/input/descriptor.json"]);
+        assert!(Arguments::try_parse_from(legacy).is_err());
+        let mut descriptor = vec!["install-plugin-oci"];
+        descriptor.extend(trust);
+        descriptor.extend([
+            "--descriptor-file",
+            "/input/descriptor.json",
+            "--descriptor-output-dir",
+            "/plugins/bundle",
+        ]);
+        assert!(Arguments::try_parse_from(descriptor.clone()).is_err());
+        descriptor.extend(["--expected-descriptor-digest", "expected"]);
+        let parsed = Arguments::try_parse_from(descriptor).unwrap();
+        assert!(parsed.reference.is_none());
+        assert!(parsed.descriptor_file.is_some());
+    }
 
     #[test]
     fn reviewed_registration_appends_once_and_rejects_wrong_artifact() {

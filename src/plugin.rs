@@ -721,6 +721,21 @@ impl PluginRuntime {
     }
 
     pub fn load(root: Option<&str>, database: Database) -> Result<Self, AppError> {
+        Self::load_with_database(root, Some(database))
+    }
+
+    #[cfg(all(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ))]
+    fn load_for_inventory(root: &str) -> Result<Self, AppError> {
+        Self::load_with_database(Some(root), None)
+    }
+
+    fn load_with_database(
+        root: Option<&str>,
+        database: Option<Database>,
+    ) -> Result<Self, AppError> {
         let Some(root) = root else {
             return Ok(Self::default());
         };
@@ -931,7 +946,7 @@ impl PluginRuntime {
             engine: Some(engine),
             http: Some(http),
             runtime: Some(tokio::runtime::Handle::current()),
-            kv: Some(PluginKv { database }),
+            kv: database.map(|database| PluginKv { database }),
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
             configuration_cache: Arc::default(),
@@ -2988,6 +3003,20 @@ fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ))]
+    #[tokio::test]
+    async fn inventory_loader_without_kv_still_rejects_incomplete_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = PluginRuntime::load_for_inventory(root.path().to_str().unwrap()).unwrap();
+        assert!(runtime.kv.is_none());
+        assert!(runtime.manifests().is_empty());
+        std::fs::create_dir(root.path().join("incomplete")).unwrap();
+        assert!(PluginRuntime::load_for_inventory(root.path().to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn privacy_wire_shim_output_rejects_headers_but_not_valid_growth() {
