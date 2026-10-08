@@ -358,7 +358,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
   await comfyForm.locator('#root_config_base_url').fill(mockBaseUrl);
-  await comfyForm.getByRole('button', { name: '3. 高级网络与重试策略', exact: true }).click();
+  await comfyForm.getByRole('button', { name: '高级网络与用量设置', exact: true }).click();
   await comfyForm.locator('#root_config_network_scope').selectOption('public');
   await comfyForm.locator('#root_config_workflow_id').fill('browser-workflow-v1');
   const workflowEditor = comfyForm.getByLabel('工作流模板', { exact: true });
