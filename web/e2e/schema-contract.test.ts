@@ -60,12 +60,14 @@ test('localized object const, enum, defaults and examples retain original-schema
     const branch = localized.oneOf![0];
     assert.ok(branch && typeof branch === 'object');
     const fields = branch.properties!;
+    const examples = (fields.fromExample as RJSFSchema).examples;
+    assert.ok(Array.isArray(examples));
     const data = {
       type: 'none',
       tag: (fields.tag as RJSFSchema).enum![0],
       fixed: (fields.fixed as RJSFSchema).const,
       fromDefault: (fields.fromDefault as RJSFSchema).default,
-      fromExample: (fields.fromExample as RJSFSchema).examples![0],
+      fromExample: examples[0],
     };
     assert.deepEqual(data, { type: 'none', tag: instance, fixed: instance, fromDefault: instance, fromExample: instance });
     assert.equal(safeValidator.isValid(schema, data, schema), true, `${locale} values extracted from localized schema`);
