@@ -12,6 +12,11 @@ mod cursor;
 pub mod kimi_device;
 pub(crate) use cursor::{credential_from_cursor_auth_store, cursor_login_application_revision};
 mod endpoint;
+mod refresh_diagnostics;
+pub(crate) use refresh_diagnostics::{
+    OAuthRefreshDiagnostic, OAuthRefreshMetadata, OAuthRefreshOutcome, OAuthRefreshStatus,
+};
+pub use refresh_diagnostics::{OAuthRefreshFailure, OAuthRefreshFailureKind};
 pub(crate) mod managed;
 
 pub(crate) use adapter::{refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter};

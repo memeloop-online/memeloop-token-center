@@ -4,6 +4,7 @@ mod model_picker;
 mod native_oauth_imports;
 mod native_oauth_sources;
 mod oauth;
+mod oauth_diagnostics;
 #[cfg(test)]
 mod route_counts;
 mod routes;

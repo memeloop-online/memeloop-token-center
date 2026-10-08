@@ -367,6 +367,14 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct UpstreamAccountReadView {
+    #[serde(flatten)]
+    account: crate::provider::UpstreamAccountView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_refresh: Option<crate::oauth::OAuthRefreshStatus>,
+}
+
 pub(in crate::api) async fn list_upstreams(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -389,7 +397,37 @@ pub(in crate::api) async fn list_upstreams(
         super::restrict_transport_proxy_capability(&service, account);
         super::config_secrets::redact_account(&state, account)?;
     }
-    Ok(Json(values))
+    let projected = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.db.upstream_oauth_refresh_statuses(&values),
+    )
+    .await;
+    let mut statuses = match projected {
+        Ok(Ok(statuses)) => statuses,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error_kind = error.diagnostic_category(),
+                "could not read authorization refresh diagnostics"
+            );
+            std::collections::HashMap::new()
+        }
+        Err(_) => {
+            tracing::warn!(
+                error_kind = "timeout",
+                "could not read authorization refresh diagnostics"
+            );
+            std::collections::HashMap::new()
+        }
+    };
+    Ok(Json(
+        values
+            .into_iter()
+            .map(|account| UpstreamAccountReadView {
+                oauth_refresh: statuses.remove(&account.id),
+                account,
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
