@@ -295,7 +295,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       returnToAccountList();
       setMessage(t('providers.created', { name: result.name || String(formData.name ?? '') }));
       try { await onChanged(true); if (current()) setProviderListRetry(false); }
-      catch (reason) { if (current()) { setProviderListRetry(true); setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); } }
+      catch (reason) { if (current()) { setProviderListRetry(!(reason instanceof AccountListRefreshError)); setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); } }
     } catch (reason) { if (current()) setError(messageOf(reason, t('common.requestFailed'))); }
     finally {
       if (providerCreateLock.current === attempt) providerCreateLock.current = undefined;
@@ -308,7 +308,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     providerCreateLock.current = attempt;
     setBusy('reload-created-provider');
     try { await onChanged(true); if (providerScope.current === attempt) { setProviderListRetry(false); setError(''); } }
-    catch (reason) { if (providerScope.current === attempt) setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); }
+    catch (reason) { if (providerScope.current === attempt) { setProviderListRetry(!(reason instanceof AccountListRefreshError)); setError(reason instanceof AccountListRefreshError ? '' : t('providers.savedListUnavailable')); } }
     finally {
       if (providerCreateLock.current === attempt) providerCreateLock.current = undefined;
       if (providerScope.current === attempt) setBusy('');
@@ -2183,9 +2183,9 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
   const accountResource = resource.state.kind === 'ready' && resource.state.refreshError
-    ? { ...resource.state, refreshError: t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
+    ? { ...resource.state, refreshError: callerReadFeedback ? undefined : t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
     : resource.state;
-  return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()} refreshErrorPresentation={callerReadFeedback ? 'caller' : 'boundary'}>{({ providers, values }) =>
+  return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
     <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
       savedRefresh.current = saved;
       setCallerReadFeedback(caller);
