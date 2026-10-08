@@ -73,6 +73,10 @@ pub enum AppError {
     SchemaSecretAnalysisTooComplex,
     #[error("configured upstream is unavailable: {0}")]
     Upstream(String),
+    #[error(
+        "Could not refresh authorization. Check the connection or authorize this account again."
+    )]
+    OAuthRefresh(crate::oauth::OAuthRefreshFailure),
     #[error("service is temporarily overloaded")]
     Overloaded,
     #[error("storage error: {0}")]
@@ -102,6 +106,7 @@ impl AppError {
             Self::BadRequest(_) => "invalid_request",
             Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
             Self::Upstream(_) => "upstream",
+            Self::OAuthRefresh(_) => "oauth_refresh",
             Self::Overloaded => "overloaded",
             Self::Storage(_) => "storage",
             Self::Internal => "internal",
@@ -151,6 +156,11 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 "configured upstream is unavailable".to_owned(),
+            ),
+            Self::OAuthRefresh(_) => (
+                StatusCode::BAD_GATEWAY,
+                "oauth_refresh_failed",
+                self.to_string(),
             ),
             Self::Overloaded => (
                 StatusCode::SERVICE_UNAVAILABLE,
