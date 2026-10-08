@@ -1815,6 +1815,7 @@
   .tenant-scope-switcher { align-items: stretch; }
 
   .tenant-create-row { align-items: stretch; flex-direction: column; }
+  .tenant-create-row > label { flex: none; }
 
   .operator-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
