@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type React
 import { api } from '../api';
 import { CopyButton } from '../CopyButton.js';
 import { Shell } from '../components';
-import { Button, Field, Input } from '../design-system';
+import { Button, Field, Input, LoadingState, PageLoadingRegion } from '../design-system';
 import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../credentialStorage';
 import { useI18n } from '../i18n';
 import type { KeyView, RequestDetail, RequestView } from '../types';
@@ -175,7 +175,7 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
     ? `${credentialView.key_id}:${credentialView.credential_generation}:${credentialScopeGeneration}`
     : `signed-out:${credentialScopeGeneration}`;
 
-  const content = <div className="self-portal" data-self-route={activeRoute}>
+  const content = <PageLoadingRegion scopeKey={`${credential}\0${credentialScopeKey}\0${activeRoute}`} label={t('common.loading')} busy={authenticating && !credentialView}><div className="self-portal" data-self-route={activeRoute}>
     {!credentialView ? <header className="hero self-sign-in">
       <div><h1>{t('self.title')}</h1></div>
       <form className="credential" onSubmit={submitCredential}>
@@ -189,9 +189,9 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
       {showNavigation && <SelfPortalNavigation activeRoute={activeRoute} onNavigate={navigate} />}
     </>}
     {error && <div className="notice error" role="alert">{error}</div>}
-    {page && <Suspense key={credentialScopeKey} fallback={<div className="boot">{t('common.loading')}</div>}>{page}</Suspense>}
+    {page && <Suspense key={credentialScopeKey} fallback={<LoadingState label={t('common.loading')} level="page" />}>{page}</Suspense>}
     {requestDetail && <RequestDetailDrawer detail={requestDetail} currency={credentialView?.currency} onOpenSession={(sessionId) => { setRequestDetail(undefined); openSession(sessionId); }} onClose={() => setRequestDetail(undefined)} />}
-  </div>;
+  </div></PageLoadingRegion>;
 
   return embedded ? content : <Shell>{content}</Shell>;
 }

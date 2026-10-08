@@ -1,4 +1,5 @@
 import { api } from '../../api';
+import { LoadingState, PageLoadingRegion } from '../../design-system';
 import { useI18n } from '../../i18n';
 import type { PluginManifest } from '../../types';
 import { PluginRuntimeManager } from '../PluginRuntimeManager';
@@ -30,7 +31,13 @@ export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog
     ? <p className="notice error" role="alert">{access.state.message}</p>
     : access.state.kind === 'ready' && access.state.value.can_view_runtime
       ? <PluginRuntimeManager key={token} token={token} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
-  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <div className="plugin-management-flow">{manager}<div className="empty">{t('common.loading')}</div></div>;
-  if (catalog.kind === 'failed') return <div className="plugin-management-flow">{manager}<div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div></div>;
-  return <div className="plugin-management-flow">{manager}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} /></div>;
+  const content = !token || (catalog.scopeKey === token && catalog.kind === 'idle' && catalog.disabled)
+    ? null
+    : catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading'
+      ? <LoadingState label={t('common.loading')} level="page" />
+      : catalog.kind === 'failed'
+        ? <div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div>
+        : <Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} />;
+  const refreshing = catalog.scopeKey === token && catalog.kind === 'ready' && catalog.refreshing === true;
+  return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0plugins`} label={t('common.loading')} busy={refreshing}><div className="plugin-management-flow" aria-busy={refreshing}>{manager}{content}</div></PageLoadingRegion>;
 }

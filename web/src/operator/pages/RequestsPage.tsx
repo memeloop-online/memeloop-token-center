@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button, ToggleButton } from '@fluentui/react-components';
-import { DetailTooltip } from '../../design-system';
+import { DetailTooltip, LoadingProgress, LoadingState, PageLoadingRegion } from '../../design-system';
 import { api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components';
 import { formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
@@ -352,7 +352,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     onRequestDrilldownHandled?.(requestDrilldown.revision);
   }, [requestDrilldown?.revision, tenant, token]);
 
-  return <>
+  return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0requests`} label={t('common.loading')}>
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
@@ -364,7 +364,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     </section>}
     {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
-  </>;
+  </PageLoadingRegion>;
 }
 
 function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, filteredResultsStale, onApply, onClear, onLoadOlder, onRefreshFilteredResults, onSelect, onOpenSessions, onOpenSession, requestRefresh, refreshPaused = false, onToggleRefreshPaused, historyLoaded, imageReviewOpen, onToggleImageReview }: {
@@ -398,7 +398,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   const sampling = { timestamps: points.map(point => point.timestamp), timeZone: displayTimeZone() };
   const count = (value: number) => formatMetricDisplay(value, locale);
   const settlementCurrency = summary.localCosts.length === 1 ? summary.localCosts[0].currency : undefined;
-  return <article className="panel request-page-surface"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
+  return <article className="panel request-page-surface" aria-busy={loading}><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><Button appearance="secondary" aria-expanded={imageReviewOpen} onClick={onToggleImageReview}>{t('quarantine.menuItem')}</Button><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><ToggleButton appearance="subtle" checked>{t('sessions.requestsMode')}</ToggleButton><ToggleButton appearance="subtle" checked={false} onClick={onOpenSessions}>{t('sessions.sessionsMode')}</ToggleButton></div></div></div>
     {requestRefresh && <div className="request-refresh-row">
       <RequestRefreshControl intervalMs={requestRefresh.intervalMs} onIntervalChange={requestRefresh.onIntervalChange}
         paused={requestRefresh.paused || refreshPaused}
@@ -418,7 +418,8 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <AnalyticsMetric {...sampling} label={t('usage.average')} value={averageDuration.text} title={averageDuration.title} trend={points.map(point => point.averageDurationMs)} formatSample={value => { const display = formatDurationDisplay(value, locale); return display.title ?? display.text; }} />
     </section>}
     {requests.length > 0 && <p className="request-metrics-scope">{locale === 'zh-CN' ? '仅统计当前已加载请求；背景图按接收时间展示这些记录的分布，不代表全量流量。' : 'Loaded requests only. Background charts group these records by reception time, not total traffic.'}</p>}
-    {loading && requests.length === 0 ? <div className="empty" role="status">{t('common.loading')}</div> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
+    <LoadingProgress active={loading && requests.length > 0} label={t('common.loading')} />
+    {loading && requests.length === 0 ? <LoadingState label={t('common.loading')} level="page" /> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
     {hasOlder && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</Button></div>}
   </article>;
 }
