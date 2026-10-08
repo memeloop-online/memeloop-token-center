@@ -106,8 +106,12 @@ async function initializePage(page: Page, locale: string) {
   await page.addInitScript((value) => {
     localStorage.setItem('mtc-locale', value);
     localStorage.setItem('mtc-theme', 'light');
-    document.documentElement.dataset.theme = 'light';
-    document.documentElement.lang = value;
+    const applyDocumentPreferences = () => {
+      document.documentElement.dataset.theme = 'light';
+      document.documentElement.lang = value;
+    };
+    if (document.documentElement) applyDocumentPreferences();
+    else document.addEventListener('DOMContentLoaded', applyDocumentPreferences, { once: true });
   }, locale);
 }
 
@@ -368,6 +372,8 @@ test('inline loading stays in one existing row without a local live announcement
       const page = await browser.newPage({ viewport, deviceScaleFactor: 1, reducedMotion: 'reduce', colorScheme: 'light' });
       const screenshots: string[] = [];
       const failures: string[] = [];
+      const errors: string[] = [];
+      page.on('pageerror', (error) => errors.push(error.message));
       try {
         await initializePage(page, locale);
         await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/resource-loading.html?mode=inline`);
@@ -382,6 +388,7 @@ test('inline loading stays in one existing row without a local live announcement
         assert.ok(bounds.height <= 20, 'one-line placeholders cannot expand into an 88px card');
         assert.ok(Math.abs(bounds.x - column.x) <= 1 && Math.abs(bounds.width - column.width) <= 1, 'placeholder follows its existing column');
         await capture(page, 'inline-row', 'initial-loading', locale, viewport, screenshots, ['one-fluent-skeleton-row', 'no-local-live-status-or-visible-loading-copy', 'height-at-most-20px', 'column-track-within-1px'], failures);
+        assert.deepEqual(errors, [], 'inline loading must also initialize without runtime errors');
         assert.deepEqual(failures, []);
       } catch (reason) {
         await capture(page, 'inline-row', 'failure-evidence', locale, viewport, screenshots, [], failures).catch(() => undefined);
