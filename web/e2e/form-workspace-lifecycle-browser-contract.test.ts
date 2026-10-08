@@ -3,10 +3,9 @@ import { editProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
-import { prefixTraceInit, prefixTracePlugin } from './support/prefix-trace.js';
 
 test('AppShell workspaces retain failed drafts, return after success, and prioritize the one-time credential', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -249,7 +248,6 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
   const root = fileURLToPath(new URL('..', import.meta.url));
   let server: Awaited<ReturnType<typeof createServer>> | undefined;
   let browser: Browser | undefined;
-  let diagnosticPage: Page | undefined;
   let stage = 'fixture-server-create';
   const errors: string[] = [];
   const pageErrors: { stage: string; module: string; name: string; message: string }[] = [];
@@ -265,7 +263,7 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     .replace(/\{.*\}|\[.*\]/g, '[structured]')
     .slice(0, 320);
   try {
-    server = await createServer({ root, configFile: false, plugins: [fixtureAssets(), prefixTracePlugin()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+    server = await createServer({ root, configFile: false, plugins: [fixtureAssets()], logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
     stage = 'fixture-server-listen';
     await server.listen();
     const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
@@ -274,7 +272,6 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     browser = await chromium.launch({ headless: true });
     stage = 'page-create';
     const page = await browser.newPage();
-    diagnosticPage = page;
     page.on('pageerror', error => {
       errors.push(error.message);
       pageErrors.push({ stage, module: safeMessage(error.stack?.match(/https?:\/\/[^\s)]+/)?.[0] ?? ''), name: safeMessage(error.name), message: safeMessage(error.message) });
@@ -286,8 +283,6 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       moduleFailures.push({ stage, module: safeMessage(url.pathname), status: response.status() });
       if (moduleFailures.length > 8) moduleFailures.splice(0, moduleFailures.length - 8);
     });
-    stage = 'trace-init';
-    await page.addInitScript(prefixTraceInit);
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
@@ -303,6 +298,12 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
       const credentialBranch = workspace.getByRole('combobox').filter({ has: page.getByRole('option', { name: 'API credential', exact: true }) });
       assert.equal(await workspace.locator('#root_credential_value').isVisible(), true, 'API key is the default branch');
+      await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+      const prefix = workspace.locator('#root_credential_prefix');
+      assert.equal(await prefix.inputValue(), 'Bearer ', 'the initial prefix displays its advertised default');
+      await prefix.fill('');
+      assert.equal(await prefix.inputValue(), '', 'a cleared prefix stays explicitly empty');
+      await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
       await workspace.locator('#root_credential_value').fill('fixture-only-discarded-api-secret');
       await credentialBranch.selectOption({ label: 'No authentication' });
       await workspace.locator('#root_credential_value').waitFor({ state: 'detached' });
@@ -311,8 +312,10 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       assert.equal(await workspace.locator('#root_credential_value').inputValue(), '');
       await workspace.locator('#root_credential_value').fill('fixture-only-api-secret');
       await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+      assert.equal(await prefix.inputValue(), 'Bearer ', 'returning to API key displays the default for the cleared branch value');
       await workspace.locator('#root_credential_header').fill('x-api-key');
-      await workspace.locator('#root_credential_prefix').fill('');
+      await prefix.fill('');
+      assert.equal(await prefix.inputValue(), '');
     }
     stage = 'fixture-navigation';
     await page.goto(fixture);
@@ -331,6 +334,10 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     await workspace.getByRole('alert').waitFor();
     assert.equal(await workspace.locator('#root_name').inputValue(), 'Saved API connection');
     assert.equal(await workspace.locator('#root_credential_value').inputValue(), 'fixture-only-api-secret');
+    assert.equal(await workspace.locator('#root_credential_prefix').inputValue(), '');
+    assert.deepEqual(await page.evaluate(() => window.formJourneyLastProviderCreate?.credential), {
+      type: 'api_key', value: 'fixture-only-api-secret', header: 'x-api-key', prefix: '',
+    });
     await page.evaluate(() => { window.failNextFormAccountRead = true; });
     stage = 'successful-create-payload';
     await submit.click();
@@ -346,6 +353,23 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 2);
     await workspace.locator('[data-workspace-toggle]').click();
     assert.equal(await workspace.locator('#root_name').inputValue(), '');
+    stage = 'untouched-default-after-branch-switch';
+    await workspace.locator('#root_name').fill('Default prefix connection');
+    await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
+    const defaultBranch = workspace.getByRole('combobox').filter({ has: page.getByRole('option', { name: 'API credential', exact: true }) });
+    await defaultBranch.selectOption({ label: 'No authentication' });
+    await defaultBranch.selectOption({ label: 'API credential' });
+    assert.equal(await workspace.locator('#root_credential_value').inputValue(), '');
+    await workspace.locator('#root_credential_value').fill('fixture-only-api-secret');
+    await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
+    assert.equal(await workspace.locator('#root_credential_prefix').inputValue(), 'Bearer ');
+    await submit.click();
+    await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
+    const defaultCredential = await page.evaluate(() => window.formJourneyLastProviderCreate?.credential);
+    assert.ok(defaultCredential);
+    assert.equal(Object.hasOwn(defaultCredential, 'prefix'), false, 'untouched undefined retains the backend default rather than sending an empty prefix');
+    assert.equal(defaultCredential.type, 'api_key');
+    assert.equal(defaultCredential.value, 'fixture-only-api-secret');
     for (const field of ['token', 'tenant', 'writeTenant'] as const) for (const status of [201, 400]) {
       stage = 'scope-fixture-navigation';
       await page.goto(fixture);
@@ -369,18 +393,10 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
     stage = 'pageerror-assertion';
     assert.deepEqual(errors, []);
   } catch (error) {
-    const startup = ['fixture-server-create', 'fixture-server-listen', 'browser-launch', 'page-create', 'trace-init', 'fixture-navigation'].includes(stage);
+    const startup = ['fixture-server-create', 'fixture-server-listen', 'browser-launch', 'page-create', 'fixture-navigation'].includes(stage);
     context.diagnostic(`fixture failure: ${JSON.stringify({ stage, name: error instanceof Error ? safeMessage(error.name) : typeof error, ...(startup && error instanceof Error ? { message: safeMessage(error.message) } : {}) })}`);
     context.diagnostic(`fixture page errors (last 8): ${JSON.stringify(pageErrors)}`);
     context.diagnostic(`fixture module failures (last 8): ${JSON.stringify(moduleFailures)}`);
-    let trace: unknown = { available: false };
-    if (diagnosticPage) {
-      try { trace = await diagnosticPage.evaluate('window.formPrefixTrace ?? []'); }
-      catch (traceError) {
-        context.diagnostic(`prefix trace read failure: ${JSON.stringify({ stage: 'trace-read', name: traceError instanceof Error ? safeMessage(traceError.name) : typeof traceError })}`);
-      }
-    }
-    context.diagnostic(`prefix metadata (last 48): ${JSON.stringify(trace)}`);
     throw error;
   } finally { await browser?.close(); await server?.close(); }
 });

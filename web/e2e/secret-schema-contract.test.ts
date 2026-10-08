@@ -4,6 +4,33 @@ import { prepareSecretForm } from '../src/secretSchema.js';
 import { safeValidator } from '../src/safeValidator.js';
 import { createSchemaUtils, type RJSFSchema } from '@rjsf/utils';
 import { builtinApiKeyCredential } from './fixtures/builtin-api-key-credential.js';
+import { schemaTextValue } from '../src/schemaTextValue.js';
+
+test('credential branch clearing removes secrets while undefined prefix displays the API default', () => {
+  const anonymous: RJSFSchema = { type: 'object', additionalProperties: false, required: ['type'], properties: { type: { const: 'none' } } };
+  const schema: RJSFSchema = { type: 'object', properties: { credential: { oneOf: [builtinApiKeyCredential, anonymous] } } };
+  const prepared = prepareSecretForm(schema, safeValidator);
+  const utils = createSchemaUtils(safeValidator, prepared.schema, { emptyObjectFields: 'skipEmptyDefaults' });
+  const credentialSchema = prepared.schema.properties?.credential as RJSFSchema;
+  const apiKey = credentialSchema.oneOf?.[0] as RJSFSchema;
+  const noAuth = credentialSchema.oneOf?.[1] as RJSFSchema;
+  const prefixDefault = (apiKey.properties?.prefix as RJSFSchema).default;
+  for (const prefix of ['Bearer ', '', 'Token ']) {
+    const draft = { type: 'api_key', value: 'fixture-only-discarded-api-secret', header: 'x-api-key', prefix };
+    const snapshot = structuredClone(draft);
+    const cleared = utils.sanitizeDataForNewSchema(noAuth, apiKey, draft);
+    assert.equal(cleared.value, undefined);
+    assert.equal(cleared.prefix, undefined);
+    const returned = utils.getDefaultFormState(apiKey, utils.sanitizeDataForNewSchema(apiKey, noAuth, cleared), 'excludeObjectChildren');
+    assert.equal(returned.value, undefined);
+    assert.equal(returned.prefix, undefined);
+    assert.equal(Object.hasOwn(returned, 'prefix'), true);
+    assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(returned)), 'prefix'), false);
+    assert.equal(schemaTextValue(returned.prefix, prefixDefault, ''), 'Bearer ');
+    assert.equal(schemaTextValue('', prefixDefault, ''), '');
+    assert.deepEqual(draft, snapshot);
+  }
+});
 
 test('API-key draft defaults distinguish an explicit empty prefix from an absent prefix', () => {
   const schema: RJSFSchema = { type: 'object', properties: { credential: builtinApiKeyCredential } };
