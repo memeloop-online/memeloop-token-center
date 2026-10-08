@@ -4,7 +4,7 @@ use super::*;
 
 fn oauth_refresh_outcome_unknown() -> AppError {
     AppError::Conflict(
-        "OAuth refresh outcome is unknown for this credential generation; authorize the upstream again before refreshing it"
+        "The authorization refresh outcome is unknown. You can authorize this account again to restore access."
             .into(),
     )
 }
@@ -25,6 +25,7 @@ pub struct ReauthorizeUpstreamAccountInput {
 #[derive(Debug)]
 pub struct ClaimedUpstreamOAuthRefresh {
     pub credential_generation: i64,
+    pub attempt_created_at: i64,
     pub driver: String,
     pub refresh_url: String,
 }
@@ -976,6 +977,7 @@ impl Database {
         Ok(ClaimUpstreamOAuthRefreshResult::Claimed(
             ClaimedUpstreamOAuthRefresh {
                 credential_generation: generation,
+                attempt_created_at: now,
                 driver,
                 refresh_url,
             },

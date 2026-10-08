@@ -44,6 +44,7 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&115));
     assert!(versions.contains(&118));
     assert!(versions.contains(&119));
+    assert!(versions.contains(&120));
     for statement in [
         "DROP TABLE terminal_projection_outbox",
         "DROP TABLE observability_prune_boundaries",
@@ -74,7 +75,11 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119)")
+    sqlx::query("ALTER TABLE upstream_credentials DROP COLUMN oauth_refresh_diagnostic_json")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120)")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -130,7 +135,7 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119]);
+    assert_eq!(tail, vec![117, 118, 119, 120]);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
@@ -154,7 +159,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119]);
+        assert_eq!(tail, vec![117, 118, 119, 120]);
     }
 }
 

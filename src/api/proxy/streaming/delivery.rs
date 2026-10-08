@@ -144,7 +144,8 @@ fn delivery_error_class(error: &AppError) -> &'static str {
         | AppError::RateLimited
         | AppError::LimitExceeded { .. }
         | AppError::SchemaSecretAnalysisTooComplex
-        | AppError::Upstream(_) => "unexpected",
+        | AppError::Upstream(_)
+        | AppError::OAuthRefresh(_) => "unexpected",
     }
 }
 

@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    error::AppError, network, oauth::OAuthRefreshRequestGuard, provider::UpstreamCredential,
+    error::AppError,
+    network,
+    oauth::{OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshRequestGuard},
+    provider::UpstreamCredential,
 };
 
 pub const PROVIDER_DRIVER: &str = "kimi-oauth";
@@ -42,7 +45,26 @@ fn invalid() -> AppError {
 }
 
 fn failed() -> AppError {
-    AppError::Upstream("Kimi OAuth refresh failed".into())
+    refresh_failure(OAuthRefreshFailureKind::ResponseValidation, Some(200))
+}
+
+fn refresh_failure(kind: OAuthRefreshFailureKind, http_status: Option<u16>) -> AppError {
+    AppError::OAuthRefresh(OAuthRefreshFailure::new(kind, http_status))
+}
+
+fn rejected_refresh(status: u16, bytes: &[u8]) -> AppError {
+    let kind = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(
+            |response| match response.get("error").and_then(Value::as_str) {
+                Some("invalid_grant") => Some(OAuthRefreshFailureKind::InvalidGrant),
+                Some("refresh_revoked") => Some(OAuthRefreshFailureKind::RefreshRevoked),
+                Some("invalid_refresh_token") => Some(OAuthRefreshFailureKind::InvalidRefreshToken),
+                _ => None,
+            },
+        )
+        .unwrap_or(OAuthRefreshFailureKind::HttpRejected);
+    refresh_failure(kind, Some(status))
 }
 
 fn optional_text(value: Option<&str>) -> Result<(), AppError> {
@@ -232,7 +254,8 @@ async fn refresh_at(
     endpoint: &str,
     request_guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
-    validate_credential(credential)?;
+    validate_credential(credential)
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     let client = network::client_for_config_url_no_retry(
         http,
         endpoint,
@@ -241,7 +264,7 @@ async fn refresh_at(
         allow_test_loopback,
     )
     .await
-    .map_err(|_| failed())?;
+    .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     refresh_with_client(&client, credential, endpoint, request_guard).await
 }
 
@@ -258,34 +281,50 @@ async fn refresh_with_client(
         ..
     } = credential
     else {
-        return Err(invalid());
+        return Err(refresh_failure(
+            OAuthRefreshFailureKind::Configuration,
+            None,
+        ));
     };
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
         .append_pair("grant_type", "refresh_token")
         .append_pair("refresh_token", refresh_token)
         .finish();
-    let request = apply_headers(client.post(endpoint), credential)?
+    let request = apply_headers(client.post(endpoint), credential)
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(form)
         .timeout(TIMEOUT)
         .build()
-        .map_err(|_| failed())?;
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     request_guard.mark_request_started().await?;
     let operation = async {
-        let response = client.execute(request).await.map_err(|_| failed())?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(failed());
-        }
-        super::super::bounded_body(response)
+        let response = client.execute(request).await.map_err(|error| {
+            refresh_failure(
+                if error.is_timeout() {
+                    OAuthRefreshFailureKind::Timeout
+                } else {
+                    OAuthRefreshFailureKind::Network
+                },
+                None,
+            )
+        })?;
+        let status = response.status().as_u16();
+        let bytes = super::super::bounded_body(response)
             .await
-            .map_err(|_| failed())
+            .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)))?;
+        if status != 200 {
+            return Err(rejected_refresh(status, &bytes));
+        }
+        Ok(bytes)
     };
     let bytes = tokio::time::timeout(TIMEOUT, operation)
         .await
-        .map_err(|_| failed())??;
-    let response: TokenResponse = serde_json::from_slice(&bytes).map_err(|_| failed())?;
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Timeout, None))??;
+    let response: TokenResponse = serde_json::from_slice(&bytes)
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
     let refreshed_token = response.refresh_token.filter(|v| !v.is_empty());
     super::optional_secret(refreshed_token.as_deref(), "Kimi").map_err(|_| failed())?;
@@ -555,7 +594,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::Upstream(_)));
+        assert!(matches!(error, AppError::OAuthRefresh(_)));
         assert!(guard.0.load(Ordering::SeqCst));
         shutdown.send(()).unwrap();
         server.await.unwrap();
@@ -670,7 +709,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(error, AppError::Upstream(message) if message == "Kimi OAuth refresh failed")
+            matches!(error, AppError::OAuthRefresh(failure) if failure.kind == OAuthRefreshFailureKind::Configuration)
         );
         assert!(!guard.0.load(Ordering::SeqCst));
     }
@@ -707,6 +746,51 @@ mod tests {
             .to_string();
             assert!(!error.contains("fixture-refresh"));
             assert!(!error.contains("remote-secret"));
+        }
+    }
+
+    #[test]
+    fn refresh_rejection_only_recognizes_explicit_allowlisted_codes() {
+        for (status, response, expected) in [
+            (
+                400,
+                json!({"error":"invalid_grant","error_description":"remote-fixture-secret"}),
+                OAuthRefreshFailureKind::InvalidGrant,
+            ),
+            (
+                401,
+                json!({"error":"refresh_revoked"}),
+                OAuthRefreshFailureKind::RefreshRevoked,
+            ),
+            (
+                400,
+                json!({"error":"invalid_refresh_token"}),
+                OAuthRefreshFailureKind::InvalidRefreshToken,
+            ),
+            (
+                401,
+                json!({"error":"remote-fixture-secret"}),
+                OAuthRefreshFailureKind::HttpRejected,
+            ),
+            (
+                403,
+                json!({"error_description":"invalid_grant"}),
+                OAuthRefreshFailureKind::HttpRejected,
+            ),
+            (
+                503,
+                json!({"error":"temporarily_unavailable"}),
+                OAuthRefreshFailureKind::HttpRejected,
+            ),
+        ] {
+            let error = rejected_refresh(status, &serde_json::to_vec(&response).unwrap());
+            assert!(!error.to_string().contains("remote-fixture-secret"));
+            assert!(!format!("{error:?}").contains("remote-fixture-secret"));
+            let AppError::OAuthRefresh(failure) = error else {
+                panic!("expected a typed refresh failure");
+            };
+            assert_eq!(failure.kind, expected);
+            assert_eq!(failure.http_status, Some(status));
         }
     }
 }
