@@ -109,7 +109,6 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
             "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
             "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(IGNORE); END",
         ] {
-            // Fixture DDL must not retain prepared statements across trigger replacement.
             sqlx::raw_sql(trigger)
                 .execute(&database.pool)
                 .await
