@@ -220,9 +220,9 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   try {
-    for (const [locale, reason, prefix, close] of [
-      ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因', '关闭'],
-      ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause', 'Close'],
+    for (const [locale, reason, prefix, close, label] of [
+      ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因', '关闭', '失败'],
+      ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
       const page = await browser.newPage();
       await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
@@ -230,7 +230,8 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?supplier-error`);
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('[data-outcome="failed"]').waitFor();
-      assert.equal((await row.innerText()).split(reason).length - 1, 1);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${prefix}: ${reason}`);
+      assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').focus();
       const tooltip = page.getByRole('tooltip').filter({ hasText: reason });
       await tooltip.waitFor();
@@ -248,7 +249,9 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await page.evaluate(() => window.requestLifecycleFixture.finish());
       await page.waitForFunction(() => window.requestLifecycleFixture.detailCalls === 2);
       await drawer.getByText(`${prefix}: ${reason}`, { exact: true }).waitFor();
-      assert.equal((await row.innerText()).split(reason).length - 1, 1, 'enriched event preserves the list cause after detail refresh');
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${prefix}: ${reason}`, 'enriched event preserves the list cause after detail refresh');
+      assert.equal((await row.innerText()).split(reason).length - 1, 0);
+      assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
       await drawer.locator('.close').focus();
       await drawer.locator('.request-outcome').press('Shift+Tab');
       await page.keyboard.press('Tab');

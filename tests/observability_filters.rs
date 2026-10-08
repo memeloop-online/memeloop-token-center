@@ -14,7 +14,7 @@ use memeloop_token_center::{
     model::KeyPolicy,
 };
 use rust_decimal::Decimal;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::AnyPool;
 use tower::ServiceExt;
 use uuid::Uuid;
