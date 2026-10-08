@@ -185,6 +185,24 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
         columns.push({ identity: identityBounds.x, actions: actionsBounds.x, identityWidth: identityBounds.width, actionsWidth: actionsBounds.width });
       }
       assert.deepEqual(columns[0], columns[1], `${label}: both credential structures share tracks regardless of action count`);
+      if (width > 850) {
+        const credentialList = page.locator('[data-controls="credential-list"]');
+        await credentialList.evaluate(element => { (element as HTMLElement).style.maxWidth = '480px'; });
+        for (const row of await credentialRows.all()) {
+          const name = row.locator('.managed-resource-header b');
+          assert.equal(await name.isVisible(), true, `${label}: narrow desktop card keeps the credential name visible`);
+          const nameBounds = await name.boundingBox();
+          const headerBounds = await row.locator('.managed-resource-header').boundingBox();
+          const actionsBounds = await row.locator('.credential-row-actions').boundingBox();
+          assert.ok(nameBounds && headerBounds && actionsBounds);
+          assert.ok(nameBounds.width > 0 && nameBounds.height > 0, `${label}: narrow desktop card reserves a nonzero identity rectangle`);
+          assert.ok(actionsBounds.y >= headerBounds.y + headerBounds.height, `${label}: narrow card stacks actions based on container width, not viewport`);
+          assert.equal(await row.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${label}: wrapped card actions remain contained`);
+          for (const action of await row.locator('.credential-row-actions button').all()) await action.click();
+        }
+        await page.screenshot({ path: `${artifacts}/${label}-credential-card.png`, fullPage: true });
+        await credentialList.evaluate(element => { (element as HTMLElement).style.removeProperty('max-width'); });
+      }
       const selected = await geometry(page.locator('[data-control="selected"]'));
       assert.equal(selected.height, actionHeight(references.refresh.height, width), `${label}: selected state does not change button geometry`);
       assert.notEqual(selected.background, references.refresh.background, `${label}: selected state remains visually distinct in the active theme`);

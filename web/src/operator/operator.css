@@ -1062,6 +1062,7 @@
 /* Credential lists carry many records. Keep their identifying metadata out of
  * the reading path while retaining it in title tooltips. */
 .credential-compact-list {
+  container: credential-list / inline-size;
   gap: 0;
 }
 
@@ -1096,6 +1097,10 @@
 .credential-compact-row .credential-row-actions { min-width: 0; margin: 0; justify-content: flex-end; }
 .credential-compact-row .managed-resource-header .credential-budget,
 .credential-compact-row .managed-resource-header .credential-group-summary { font-size: 12px; line-height: 1.5; }
+@container credential-list (width <= 40rem) {
+  .credential-compact-row { grid-template-columns: minmax(0, 1fr); }
+  .credential-compact-row .credential-row-actions { justify-content: flex-start; }
+}
 @media (width <= 850px) {
   .credential-compact-row { grid-template-columns: minmax(0, 1fr); }
   .credential-compact-row .credential-row-actions { justify-content: flex-start; padding-inline-start: 44px; }
