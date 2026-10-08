@@ -39,7 +39,7 @@ pub struct PreinstalledInventory {
     pub grants: BTreeMap<String, Vec<PluginGrant>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApplicationRevision {
     pub revision: i64,
     pub inventory_id: String,
@@ -93,6 +93,10 @@ pub struct ApplicationPlugins {
     inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
     #[cfg(test)]
     inventory_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    inventory_refreshes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pin_root_inspections: std::sync::atomic::AtomicUsize,
     snapshots: tokio::sync::Mutex<RevisionCache>,
     #[cfg(test)]
     compilations: std::sync::atomic::AtomicUsize,
@@ -223,6 +227,10 @@ impl ApplicationPlugins {
             inventory_stamp: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             inventory_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            inventory_refreshes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            pin_root_inspections: std::sync::atomic::AtomicUsize::new(0),
             snapshots: tokio::sync::Mutex::new(RevisionCache::default()),
             #[cfg(test)]
             compilations: std::sync::atomic::AtomicUsize::new(0),
@@ -248,6 +256,9 @@ impl ApplicationPlugins {
     }
 
     async fn refresh_inventory(&self) -> Result<(), AppError> {
+        #[cfg(test)]
+        self.inventory_refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(path) = &self.inventory_file else {
             return Ok(());
         };
@@ -529,6 +540,19 @@ impl ApplicationPlugins {
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        {
+            let cache = self.snapshots.lock().await;
+            if let Some(snapshot) = cache
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.receipt.revision == head.revision)
+            {
+                if snapshot.receipt != head {
+                    return Err(AppError::Forbidden);
+                }
+                return Ok(snapshot.clone());
+            }
+        }
         self.refresh_inventory().await?;
         let entry = self
             .inventory
@@ -537,6 +561,9 @@ impl ApplicationPlugins {
             .get(&head.inventory_id)
             .cloned()
             .ok_or(AppError::Forbidden)?;
+        #[cfg(test)]
+        self.pin_root_inspections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let metadata = tokio::fs::symlink_metadata(&entry.root)
             .await
             .map_err(|_| AppError::Internal)?;
@@ -560,12 +587,9 @@ impl ApplicationPlugins {
                     .iter()
                     .find(|snapshot| snapshot.receipt.revision == head.revision)
                 {
-                    if snapshot.receipt.inventory_id != head.inventory_id
-                        || snapshot.receipt.reason != head.reason
-                    {
+                    if snapshot.receipt != head {
                         return Err(AppError::Forbidden);
                     }
-                    validate_receipt(&snapshot.receipt, &head)?;
                     return Ok(snapshot.clone());
                 }
                 if let Some(flight) = &cache.in_flight {
@@ -624,12 +648,9 @@ impl ApplicationPlugins {
             };
             if flight.revision == head.revision {
                 let snapshot = result.map_err(LoadFailure::into_error)?;
-                if snapshot.receipt.inventory_id != head.inventory_id
-                    || snapshot.receipt.reason != head.reason
-                {
+                if snapshot.receipt != head {
                     return Err(AppError::Forbidden);
                 }
-                validate_receipt(&snapshot.receipt, &head)?;
                 return Ok(snapshot);
             }
         }
