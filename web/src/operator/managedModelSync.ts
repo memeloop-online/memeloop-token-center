@@ -120,6 +120,21 @@ export function managedSyncTone(result: ManagedModelSyncResponse): 'success' | '
     ? 'partial' : 'success';
 }
 
+export function managedSyncFeedback(result: ManagedModelSyncResponse) {
+  const price = result.price_sync;
+  const transientWarnings = new Set([
+    'sync_in_progress', 'partial_catalog', 'account_changed', 'account_or_lease_changed',
+    'catalog_not_ready', 'catalog_changed', 'connection_failed', 'rate_limited', 'upstream_unavailable',
+  ]);
+  return {
+    routesComplete: result.catalog.status === 'ready' && result.routes.warnings.length === 0,
+    reviewPrices: price.status === 'deferred' || price.status === 'error' || price.status === 'partial'
+      || price.unmatched > 0 || price.ambiguous > 0,
+    retry: price.status === 'error' || (price.status !== 'deferred' && price.failed_sources.length > 0)
+      || result.routes.warnings.some(warning => transientWarnings.has(warning)),
+  };
+}
+
 /** Route protocols the route form can express; only catalog wildcard entries map to openai. */
 export const managedRouteProtocols = ['openai', 'anthropic', 'openai-audio', 'generation'] as const;
 export type ManagedRouteProtocol = (typeof managedRouteProtocols)[number];

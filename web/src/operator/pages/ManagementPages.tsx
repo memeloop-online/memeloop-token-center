@@ -169,7 +169,7 @@ function isPositiveDecimal(value: string) {
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const accountStatusNow = useQuotaClock();
   const accountReturnFocus = useRef<string | undefined>(undefined);
@@ -480,7 +480,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
               <Button data-manage-account-trigger={value.id} appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => { accountReturnFocus.current = value.id; setProviderDetail(detailOpen ? undefined : value.id); }}>{t('providerDirectory.open')}</Button>
               {accountStatus.expired && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => openReauthorization(value, 'details')}>{t('providers.reauthorize')}</Button>}
             </div>
-            <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onReconciled={() => {
+            <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} reviewModelsDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} reviewPricingDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onReviewModels={() => { accountReturnFocus.current = value.id; setProviderDetail(value.id); }} onReviewPricing={onOpenPricing ? () => onOpenPricing(value.tenant_external_id ?? tenant) : undefined} onReconciled={() => {
               setRouteCacheRevisions((current) => ({ ...current, [value.id]: (current[value.id] ?? 0) + 1 }));
               void onChanged();
             }} /></div>
@@ -2026,7 +2026,7 @@ function ResourceBoundary<T>({ resource, scopeKey, children }: {
   return <>{resource.kind === 'ready' && resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}</div>}{children(value)}</>;
 }
 
-export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void }) {
+export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpenPricing }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void }) {
   const { t } = useI18n();
   // This page needs an acknowledged account-list refresh after OAuth creation.
   // The shared resource hook intentionally preserves its non-throwing semantics.
@@ -2074,7 +2074,7 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
     availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
   };
   return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onChanged={async () => {
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onChanged={async () => {
       void statistics.reload();
       await resource.reload();
       if (accountRead.current.scope === `${token}\0${tenant}` && accountRead.current.failed) throw new Error(t('common.requestFailed'));
