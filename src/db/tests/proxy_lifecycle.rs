@@ -109,7 +109,11 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
             "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(ABORT, 'snapshot fault'); END",
             "CREATE TRIGGER admission_snapshot_fault BEFORE UPDATE OF upstream_model ON request_records BEGIN SELECT RAISE(IGNORE); END",
         ] {
-            sqlx::query(trigger).execute(&database.pool).await.unwrap();
+            // Fixture DDL must not retain prepared statements across trigger replacement.
+            sqlx::raw_sql(trigger)
+                .execute(&database.pool)
+                .await
+                .unwrap();
             assert!(matches!(
                 database
                     .start_proxy_forwarding_request(input(Uuid::now_v7()), Some("failed-model"))
@@ -117,7 +121,7 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
                 Err(AppError::Overloaded)
             ));
             assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
-            sqlx::query("DROP TRIGGER admission_snapshot_fault")
+            sqlx::raw_sql("DROP TRIGGER admission_snapshot_fault")
                 .execute(&database.pool)
                 .await
                 .unwrap();
