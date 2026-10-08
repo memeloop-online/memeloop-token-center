@@ -576,7 +576,7 @@ test('full ProvidersPage review buttons open account details and the real pricin
     assert.equal(await account.getByRole('button', { name: '同步模型', exact: true }).count(), 0);
     await sync.click();
     await account.getByRole('alert').filter({ hasText: '当前凭据无法同步此账号' }).waitFor();
-    assert.equal(await sync.isDisabled(), true);
+    assert.equal(await sync.isEnabled(), true, 'manual retry remains possible after an external permission correction');
     await page.evaluate(() => sessionStorage.setItem('mtc-route-draft-prefill-v1', 'existing-draft'));
     const models = account.getByRole('button', { name: '查看模型与路由', exact: true });
     assert.equal(await models.isEnabled(), true, 'read navigation stays available after write denial');
