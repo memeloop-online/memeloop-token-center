@@ -28,6 +28,9 @@ test('real form composition keeps OAuth proxy optional and route drafts across d
     assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), false, 'local DNS proxy is rejected');
     await page.locator('.authorization-form input[type="password"]').fill('socks5h://100.64.0.20:1080');
     assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).isEnabled(), true);
+    await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).uncheck();
+    await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).check();
+    assert.equal(await page.locator('.authorization-form input[type="password"]').inputValue(), 'socks5h://100.64.0.20:1080');
     // Never click login or any quota action. All writes are forbidden in fixture.
     const artifacts = `${root}/e2e-artifacts/form-journey`; await mkdir(artifacts, { recursive: true });
     for (const [theme, width] of [['light', 390], ['dark', 1440]] as const) {

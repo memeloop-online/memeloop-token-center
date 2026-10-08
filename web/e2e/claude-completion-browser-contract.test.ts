@@ -56,6 +56,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
   const account = { id: 'claude-pending-fixture', tenant_id: 'fixture-tenant-id', tenant_external_id: 'fixture-a', name: 'Fixture Claude account',
     driver: 'anthropic-claude', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 3,
     credential_expires_at: null, can_refresh: true, can_rotate: false, can_reauthorize: true, route_count: 0, config: {}, created_at: 1, updated_at: 3 };
+  let listedAccounts = reauthorize ? [{ ...account, credential_generation: 2 }] : [];
   let reads = 0;
   let statisticsReads = 0;
   let starts = 0;
@@ -66,7 +67,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
     if (request.method() === 'GET') {
       if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) { statisticsReads++; return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } }); }
       if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'anthropic-claude', display_name: 'Fixture Claude', source: 'builtin', protocols: ['anthropic'], modalities: ['text'], config_schema: { type: 'object' }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'claude_manual_pkce' } }] });
-      if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: reauthorize ? [{ ...account, credential_generation: 2 }] : [] }); }
+      if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: listedAccounts }); }
       return route.fulfill({ json: [] });
     }
     assert.equal(request.method(), 'POST');
@@ -95,7 +96,13 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
   await start.click();
   await code.fill('synthetic-code#synthetic-state');
   const calls = () => page.evaluate(() => window.claudePendingFixture.calls);
-  const release = (index: number, status: number, body: unknown) => page.evaluate(value => window.claudePendingFixture.release(value.index, value.status, value.body), { index, status, body });
+  const release = (index: number, status: number, body: unknown) => {
+    if ((status === 200 || status === 201) && body && typeof body === 'object' && 'credential_generation' in body) {
+      assert.deepEqual(body, account, 'only the complete synthetic account may be saved');
+      listedAccounts = [{ ...account }];
+    }
+    return page.evaluate(value => window.claudePendingFixture.release(value.index, value.status, value.body), { index, status, body });
+  };
   const pending = async (index: number, seconds: number) => {
     await release(index, 202, { status: 'pending', retry_after_seconds: seconds });
     await workspace.getByText(copy.completePending, { exact: true }).waitFor();
@@ -215,7 +222,27 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   assert.equal(journey.starts(), 1, 'reopening continues the original authorization');
   await journey.release(1, 200, journey.account);
   await journey.code.waitFor({ state: 'detached' });
-  await journey.workspace.locator('.notice.success').waitFor();
+  await journey.page.locator('.create-journey[data-open="false"]').waitFor();
+  await journey.workspace.getByRole('region', { includeHidden: true }).waitFor({ state: 'hidden' });
+  const savedAccount = journey.page.locator(`[data-upstream-id="${journey.account.id}"]`);
+  await savedAccount.getByRole('region', { name: `${journey.account.name} · Manage account`, exact: true }).waitFor();
+  await savedAccount.getByRole('heading', { name: journey.account.name, exact: true }).waitFor();
+  assert.equal(await savedAccount.count(), 1);
+  const success = journey.page.getByText(`Saved upstream connection ${journey.account.name}.`, { exact: true });
+  await success.waitFor();
+  assert.equal(await success.count(), 1);
+  assert.equal(await journey.page.locator('.create-journey').getAttribute('data-open'), 'false');
+  assert.equal(journey.reads(), reads + 1);
+  await journey.page.clock.runFor(60_000);
+  assert.equal((await journey.calls()).length, 2);
+  assert.equal(journey.starts(), 1);
+  await journey.add.click();
+  await journey.start.waitFor();
+  assert.equal(await journey.code.count(), 0, 'successful completion cannot restore the authorization code on reopen');
+  assert.doesNotMatch(await journey.page.locator('body').innerHTML(), /synthetic-code|synthetic-state|synthetic-pending-session/);
+  assert.doesNotMatch(await journey.page.evaluate(() => JSON.stringify([localStorage, sessionStorage])), /synthetic-code|synthetic-state|synthetic-pending-session/);
+  assert.equal((await journey.calls()).length, 2);
+  assert.equal(journey.starts(), 1);
   assert.equal(journey.reads(), reads + 1);
 });
 

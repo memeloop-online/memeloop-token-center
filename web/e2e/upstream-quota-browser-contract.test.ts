@@ -38,7 +38,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await mkdir(artifacts, { recursive: true });
     await page.goto(url);
     assert.equal(await page.getByLabel('Base URL', { exact: true }).getAttribute('readonly'), '');
-    const advanced = page.getByRole('button', { name: '3. Advanced network and retry policy', exact: true });
+    const advanced = page.getByRole('button', { name: 'Advanced network and usage settings', exact: true });
     await advanced.focus();
     await page.keyboard.press('Enter');
     await page.getByLabel('Connect attempts', { exact: true }).waitFor();

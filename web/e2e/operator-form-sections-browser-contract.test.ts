@@ -19,7 +19,7 @@ test('advanced validation remains discoverable without losing field values or mo
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-form-sections.html`);
     const timeout = page.getByRole('spinbutton', { name: 'Timeout seconds' });
-    const advanced = page.getByRole('button', { name: /Advanced network/ });
+    const advanced = page.getByRole('button', { name: 'Advanced network and usage settings', exact: true });
     await page.getByLabel('Connection name').waitFor();
     assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
     await page.getByLabel('Required network scope').waitFor({ state: 'visible' });
@@ -36,7 +36,7 @@ test('advanced validation remains discoverable without losing field values or mo
     // Optional capabilities collapse, but adapter-required and unknown plugin
     // fields are never silently hidden. Disclosure retains entered values.
     await page.getByLabel('Plugin extension').waitFor({ state: 'visible' });
-    const capabilities = page.getByRole('button', { name: 'Image, video and usage settings', exact: true });
+    const capabilities = page.getByRole('button', { name: 'Protocol, image and video settings', exact: true });
     assert.equal(await capabilities.getAttribute('aria-expanded'), 'false');
     await capabilities.focus();
     await page.keyboard.press('Enter');

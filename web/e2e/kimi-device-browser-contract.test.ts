@@ -143,7 +143,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       const firstPoll = page.waitForResponse(response => response.url().endsWith('/oauth/kimi/poll'));
       await page.clock.fastForward(6_000);
       await firstPoll;
-      await page.getByText('请在提供商页面完成登录；系统会自动检测结果，成功后返回账号页面，无需手动检查。', { exact: true }).first().waitFor();
+      await page.getByText('请在提供商页面完成登录；系统会自动检测结果并保存连接，无需手动检查。', { exact: true }).first().waitFor();
       assert.equal(state.polls, 1);
       await page.clock.fastForward(9_000);
       assert.equal(state.polls, 1, 'the server slow-down interval is honored');
@@ -195,11 +195,14 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     const englishFirstPoll = english.page.waitForResponse(response => response.url().endsWith('/oauth/kimi/poll'));
     await english.page.clock.fastForward(300_000);
     await englishFirstPoll;
-    await english.page.getByText('Finish signing in on the provider page. The system checks automatically and returns to the account page on success; no manual check is needed.', { exact: true }).first().waitFor();
+    await english.page.getByText('Finish signing in on the provider page. The system checks automatically and saves the connection; no manual check is needed.', { exact: true }).first().waitFor();
     assert.equal(await english.page.getByText(english.text.expired).count(), 0, 'a missing expires_at never expires the login');
     assert.equal(await english.page.getByText('MOCK-KIMI', { exact: true }).count(), 1);
     await english.page.clock.fastForward(10_000);
-    await english.page.getByText('Upstream original-kimi is ready', { exact: true }).waitFor();
+    await english.page.getByText('Saved upstream connection My Kimi.', { exact: true }).waitFor();
+    assert.equal(await english.page.locator('.create-journey').getAttribute('data-open'), 'false');
+    await english.page.locator('#provider-details-original-kimi').waitFor();
+    assert.equal(await english.page.getByText('Upstream original-kimi is ready', { exact: true }).count(), 0);
     assert.equal(english.state.polls, 2);
     await english.page.close();
     const englishExpired = await open({ locale: 'en' });
