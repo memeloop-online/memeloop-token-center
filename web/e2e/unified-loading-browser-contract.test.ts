@@ -106,12 +106,13 @@ async function initializePage(page: Page, locale: string) {
   await page.addInitScript((value) => {
     localStorage.setItem('mtc-locale', value);
     localStorage.setItem('mtc-theme', 'light');
-    const applyDocumentPreferences = () => {
+    if (document.documentElement) {
       document.documentElement.dataset.theme = 'light';
       document.documentElement.lang = value;
-    };
-    if (document.documentElement) applyDocumentPreferences();
-    else document.addEventListener('DOMContentLoaded', applyDocumentPreferences, { once: true });
+    } else document.addEventListener('DOMContentLoaded', () => {
+      document.documentElement.dataset.theme = 'light';
+      document.documentElement.lang = value;
+    }, { once: true });
   }, locale);
 }
 
