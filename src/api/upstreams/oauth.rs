@@ -977,6 +977,7 @@ async fn refresh_managed_upstream_oauth_impl(
     };
     let crate::db::ClaimedUpstreamOAuthRefresh {
         credential_generation,
+        attempt_created_at,
         driver,
         refresh_url,
     } = claim;
@@ -1121,6 +1122,22 @@ async fn refresh_managed_upstream_oauth_impl(
     let refreshed = match refreshed {
         Ok(refreshed) => refreshed,
         Err(error) => {
+            let failure = match &error {
+                AppError::OAuthRefresh(failure) => *failure,
+                _ => crate::oauth::OAuthRefreshFailure::new(
+                    crate::oauth::OAuthRefreshFailureKind::Other,
+                    None,
+                ),
+            };
+            record_refresh_failure_best_effort(
+                state,
+                account_id,
+                credential_generation,
+                attempt_created_at,
+                idempotency_key,
+                failure,
+            )
+            .await;
             if let Err(cleanup_error) = state
                 .db
                 .abort_upstream_oauth_refresh(account_id, idempotency_key)
@@ -1134,7 +1151,7 @@ async fn refresh_managed_upstream_oauth_impl(
     // A successful authorization-server refresh may have invalidated the old
     // refresh token. Finalize retries therefore stay local; on exhaustion the
     // encrypted pending result and lease remain for exact same-key recovery.
-    let account = state
+    let finalized = state
         .db
         .finish_upstream_oauth_refresh(
             account_id,
@@ -1142,7 +1159,25 @@ async fn refresh_managed_upstream_oauth_impl(
             idempotency_key,
             state.config.key_pepper.as_bytes(),
         )
-        .await?;
+        .await;
+    let account = match finalized {
+        Ok(account) => account,
+        Err(error) => {
+            record_refresh_failure_best_effort(
+                state,
+                account_id,
+                credential_generation,
+                attempt_created_at,
+                idempotency_key,
+                crate::oauth::OAuthRefreshFailure::new(
+                    crate::oauth::OAuthRefreshFailureKind::LocalPersistence,
+                    None,
+                ),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     if let Some(blocking) = blocking {
         // The worker owns this future: no detached model-sync survives its
         // role's shutdown/join boundary.
@@ -1151,6 +1186,40 @@ async fn refresh_managed_upstream_oauth_impl(
         super::trigger_upstream_model_sync(state.clone(), account.id);
     }
     Ok(account)
+}
+
+async fn record_refresh_failure_best_effort(
+    state: &AppState,
+    account_id: Uuid,
+    generation: i64,
+    attempt_created_at: i64,
+    idempotency_key: &str,
+    failure: crate::oauth::OAuthRefreshFailure,
+) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.db.record_upstream_oauth_refresh_failure(
+            account_id,
+            generation,
+            attempt_created_at,
+            idempotency_key,
+            failure,
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            %account_id,
+            error_kind = error.diagnostic_category(),
+            "could not save authorization refresh diagnostic"
+        ),
+        Err(_) => tracing::warn!(
+            %account_id,
+            error_kind = "timeout",
+            "could not save authorization refresh diagnostic"
+        ),
+    }
 }
 
 fn supports_oauth_refresh_proxy(driver: &str) -> bool {

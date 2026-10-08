@@ -84,6 +84,138 @@ fn contains_proxy_port(value: &Value, proxy_port: u16) -> bool {
     }
 }
 
+#[tokio::test]
+async fn providers_read_refresh_metadata_is_scoped_optional_and_non_blocking() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("refresh-read-projection.db")
+            .display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let mut selected = None;
+    for tenant in ["refresh-visible", "refresh-hidden"] {
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: format!("Account {tenant}"),
+                    driver: "http-json".into(),
+                    config: json!({"base_url":"https://example.test"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "read-projection-fixture-access".into(),
+                        refresh_token: Some("read-projection-fixture-refresh".into()),
+                        expires_at: Some(10),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("cursor".into()),
+                    oauth_refresh_url: Some("https://example.test/refresh".into()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        if tenant == "refresh-visible" {
+            selected = Some(account);
+        }
+    }
+    let selected = selected.unwrap();
+    state
+        .db
+        .claim_upstream_oauth_refresh(selected.id, "projection-claim", pepper)
+        .await
+        .unwrap();
+    state
+        .db
+        .mark_upstream_oauth_refresh_request_started(selected.id, "projection-claim")
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+    )
+    .bind(selected.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "Read diagnostics only".into(),
+                scopes: vec!["providers:read".into()],
+                tenant_external_id: Some("refresh-visible".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let (status, listed) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?limit=1",
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = listed.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], selected.id.to_string());
+    assert_eq!(rows[0]["status"], "active");
+    assert_eq!(rows[0]["can_refresh"], true);
+    assert_eq!(rows[0]["oauth_refresh"]["access_state"], "expired");
+    assert_eq!(rows[0]["oauth_refresh"]["refresh_state"], "outcome_unknown");
+    assert_eq!(rows[0]["oauth_refresh"]["reauthorization_required"], false);
+    for forbidden in [
+        "read-projection-fixture-access",
+        "read-projection-fixture-refresh",
+        "projection-claim",
+        "credential_ciphertext",
+        "pending_credential_ciphertext",
+    ] {
+        assert!(!listed.to_string().contains(forbidden));
+    }
+    let (status, _) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?tenant_external_id=refresh-hidden",
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    sqlx::query("ALTER TABLE upstream_credentials DROP COLUMN oauth_refresh_diagnostic_json")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, listed) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?limit=1",
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed[0].get("oauth_refresh").is_none());
+    assert_eq!(listed[0]["can_refresh"], true);
+}
+
 #[test]
 fn proxy_port_redaction_allows_unrelated_timestamp_uuid_and_fingerprint_digits() {
     let sanitized = json!({

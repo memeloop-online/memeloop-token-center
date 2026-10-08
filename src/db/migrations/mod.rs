@@ -627,6 +627,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request upstream model snapshot",
         sql: include_str!("../../../migrations/common/0119_request_upstream_model_snapshot.sql"),
     },
+    Migration {
+        version: 120,
+        name: "non-secret OAuth refresh diagnostics",
+        sql: include_str!("../../../migrations/common/0120_upstream_oauth_refresh_diagnostic.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1237,6 +1242,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 119,
         name: "request upstream model snapshot",
         sql: include_str!("../../../migrations/common/0119_request_upstream_model_snapshot.sql"),
+    },
+    Migration {
+        version: 120,
+        name: "non-secret OAuth refresh diagnostics",
+        sql: include_str!("../../../migrations/common/0120_upstream_oauth_refresh_diagnostic.sql"),
     },
 ];
 
