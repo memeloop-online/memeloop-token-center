@@ -215,8 +215,14 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   assert.equal(journey.starts(), 1, 'reopening continues the original authorization');
   await journey.release(1, 200, journey.account);
   await journey.code.waitFor({ state: 'detached' });
-  await journey.workspace.locator('.notice.success').waitFor();
+  await journey.workspace.waitFor({ state: 'detached' });
+  await journey.page.getByRole('region', { name: `${journey.account.name} · Manage account`, exact: true }).waitFor();
+  await journey.page.getByRole('heading', { name: journey.account.name, exact: true }).waitFor();
+  assert.equal(await journey.page.locator('.create-journey').getAttribute('data-open'), 'false');
   assert.equal(journey.reads(), reads + 1);
+  await journey.page.clock.runFor(60_000);
+  assert.equal((await journey.calls()).length, 2);
+  assert.equal(journey.starts(), 1);
 });
 
 for (const locale of ['zh-CN', 'en']) for (const status of [200, 202, 403]) for (const deliverWhileClosed of [true, false]) test(`closing a dispatched Claude continuation cannot reuse an older pending result (${locale}, late ${status}, ${deliverWhileClosed ? 'closed' : 'reopened'})`, { timeout: 60_000 }, async context => {

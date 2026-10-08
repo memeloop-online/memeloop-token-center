@@ -236,6 +236,14 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       credential: { ...credential, title: 'Access credential' },
     } } as RJSFSchema, locale), locale);
   }, [provider, locale]);
+  const createControlledDraft = useMemo(() => {
+    const credential = schema?.properties?.credential;
+    if (!credential || typeof credential !== 'object') return undefined;
+    const first = credential.oneOf?.[0];
+    const type = first && typeof first === 'object' ? first.properties?.type : undefined;
+    return type && typeof type === 'object' && type.const !== undefined
+      ? { credential: { type: type.const } } : undefined;
+  }, [schema]);
   const providerDraftKey = JSON.stringify([providerScopeKey, provider?.id]);
   const providerCreateScopeKey = JSON.stringify([providerScopeKey, method, provider?.id]);
   const providerCreateScope = useRef({ key: providerCreateScopeKey });
@@ -580,7 +588,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       <div className="segmented" role="group" aria-label={t('providers.method')}><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</Button><Button appearance="secondary" type="button" disabled={Boolean(busy) || providerAuthorizationLocked} aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</Button></div>
       {method === 'direct' ? <>
         <ModelPicker label={t('providers.provider')} disabled={Boolean(busy)} value={provider?.id ?? ''} onChange={setDriver} groupBy="none" popupLabel={t('providers.directory')} searchPlaceholder={t('providers.searchDirectory')} searchAriaLabel={t('providers.searchDirectory')} emptyText={t('providers.directoryEmpty')} options={directProviders.map(value => ({ key: value.id, value: value.id, label: value.display_name, provider: value.display_name, upstream: '', capabilities: value.protocols }))} />
-        {schema ? <Form key={`${providerDraftKey}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} disabled={Boolean(busy)} formData={providerCreateDrafts[providerDraftKey]} onChange={({ formData }) => { if (providerCreateScope.current.key === providerCreateScopeKey && !providerCreateLock.current) setProviderCreateDrafts(drafts => ({ ...drafts, [providerDraftKey]: formData ?? {} })); }} formContext={{ providerCreate: true, fluentSecrets: true }} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={({ formData }) => void createProvider(formData)}><Button appearance="primary" type="submit" disabled={!writeTenant || !token || Boolean(busy)}>{t(busy === 'create-provider' ? 'common.loading' : 'providers.create')}</Button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${providerDraftKey}-${providerCreateGeneration}`} schema={schema} uiSchema={uiSchema} disabled={Boolean(busy)} formData={providerCreateDrafts[providerDraftKey] ?? createControlledDraft} onChange={({ formData }) => { if (providerCreateScope.current.key === providerCreateScopeKey && !providerCreateLock.current) setProviderCreateDrafts(drafts => ({ ...drafts, [providerDraftKey]: formData ?? {} })); }} formContext={{ providerCreate: true, fluentSecrets: true }} fields={schemaFormFields} validator={validator} widgets={fluentFormWidgets} templates={upstreamFormTemplates} onSubmit={({ formData }) => void createProvider(formData)}><Button appearance="primary" type="submit" disabled={!writeTenant || !token || Boolean(busy)}>{t(busy === 'create-provider' ? 'common.loading' : 'providers.create')}</Button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection key={`${providerScopeKey}-${providerCreateGeneration}`} token={token} tenant={writeTenant} providers={providers} active={providerWorkspaceActive} onLock={setProviderAuthorizationLocked} onChanged={async account => {
         const attempt = providerScope.current;
         if (!providerMounted.current || attempt.key !== providerScopeKey) return;

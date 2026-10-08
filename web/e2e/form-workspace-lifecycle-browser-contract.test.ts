@@ -266,7 +266,11 @@ test('catalog API-key creation preserves empty prefixes, locks submits and separ
       await workspace.locator('[data-workspace-toggle]').click();
       await workspace.locator('#root_name').fill(name);
       await workspace.locator('#root_config_base_url').fill('https://fixture.invalid/v1');
-      await workspace.locator('select').filter({ has: page.locator('option[value="1"]') }).selectOption('1');
+      const credentialBranch = workspace.locator('select').filter({ has: page.locator('option', { hasText: /^API key$/ }) });
+      assert.equal(await workspace.locator('#root_credential_value').isVisible(), true, 'API key is the default branch');
+      await credentialBranch.selectOption({ label: 'No authentication' });
+      await workspace.locator('#root_credential_value').waitFor({ state: 'detached' });
+      await credentialBranch.selectOption({ label: 'API key' });
       await workspace.locator('#root_credential_value').fill('fixture-only-api-secret');
       await workspace.getByRole('button', { name: 'Custom authentication headers', exact: true }).click();
       await workspace.locator('#root_credential_header').fill('x-api-key');

@@ -79,9 +79,7 @@ export function prepareSecretForm(schema: RJSFSchema, validator: ValidatorType, 
         return next.schema;
       });
     }
-    // Object defaults can contain secret descendants even when the object
-    // itself is not writeOnly. Refuse aggregate defaults; leaf defaults remain.
-    if (clean.properties || clean.oneOf || clean.anyOf) { delete clean.default; delete clean.examples; }
+    if ((clean.properties || clean.oneOf || clean.anyOf) && containsSecret(input, root)) { delete clean.default; delete clean.examples; }
     return { schema: clean, data, secret: false };
   }
   const prepared = visit(root, existing);
