@@ -158,7 +158,11 @@ fn bad_request_diagnostic(value: &Value) -> BadRequestDiagnostic {
                 .and_then(|item| item.get("msg"))
                 .and_then(Value::as_str)
         });
-    let error_param = diagnostic_param(raw_param);
+    let error_param = match diagnostic_param(raw_param) {
+        None => rejected_message_param(message),
+        Some("unknown") => rejected_message_param(message).or(Some("unknown")),
+        known => known,
+    };
     let error_code = diagnostic_machine_value(
         error.get("code"),
         &[
@@ -167,6 +171,8 @@ fn bad_request_diagnostic(value: &Value) -> BadRequestDiagnostic {
             "missing_required_parameter",
             "model_not_found",
             "unsupported_parameter",
+            "unsupported_value",
+            "unknown_parameter",
             "invalid_request_error",
             "invalid_encrypted_content",
         ],
@@ -219,30 +225,8 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
         }
         _ => return Some("unknown"),
     }
-    // Match explicit path components before the legacy broad shape buckets:
-    // encrypted_content and tool_choice must not disappear into content/unknown.
-    for known in [
-        "client_metadata",
-        "tool_choice",
-        "encrypted_content",
-        "include",
-        "compaction_trigger",
-    ] {
-        if fields.iter().any(|field| {
-            field
-                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                .any(|component| component == known)
-        }) {
-            return Some(known);
-        }
-    }
-    if fields.iter().any(|field| {
-        field
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .any(|component| matches!(component, "tools" | "namespace" | "parameters"))
-    }) || fields.as_slice() == ["strict"]
-    {
-        return Some("tool_schema");
+    if let Some(param) = explicit_diagnostic_param(&fields) {
+        return Some(param);
     }
     if fields.iter().any(|field| field.contains("instruction")) {
         Some("instructions")
@@ -264,6 +248,143 @@ fn diagnostic_param(value: Option<&Value>) -> Option<&'static str> {
     } else {
         Some("unknown")
     }
+}
+
+fn explicit_diagnostic_param(fields: &[&str]) -> Option<&'static str> {
+    let components: Vec<_> = fields
+        .iter()
+        .flat_map(|field| {
+            field.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        })
+        .filter(|component| !component.is_empty())
+        .collect();
+    for known in [
+        "client_metadata",
+        "tool_choice",
+        "encrypted_content",
+        "include",
+        "compaction_trigger",
+    ] {
+        if components.contains(&known) {
+            return Some(known);
+        }
+    }
+    if components
+        .iter()
+        .any(|component| matches!(*component, "tools" | "namespace" | "parameters"))
+        || fields == ["strict"]
+    {
+        return Some("tool_schema");
+    }
+    for (family, names) in [
+        ("sampling", &["temperature", "top_p", "top_k"][..]),
+        (
+            "penalties",
+            &[
+                "frequency_penalty",
+                "presence_penalty",
+                "repetition_penalty",
+            ][..],
+        ),
+        (
+            "output_limits",
+            &["max_tokens", "max_output_tokens", "max_completion_tokens"][..],
+        ),
+        ("response_format", &["response_format"][..]),
+        ("reasoning", &["reasoning", "reasoning_effort"][..]),
+        ("stream", &["stream", "stream_options"][..]),
+    ] {
+        if components.iter().any(|component| names.contains(component)) {
+            return Some(family);
+        }
+    }
+    if components.windows(2).any(|path| path == ["text", "format"]) {
+        return Some("response_format");
+    }
+    None
+}
+
+fn rejected_message_param(message: Option<&str>) -> Option<&'static str> {
+    let lower = message?.trim().to_ascii_lowercase();
+    let (rest, needs_suffix) = if let Some(rest) = lower.strip_prefix("parameter ") {
+        (rest, true)
+    } else if let Some(rest) = lower.strip_prefix("unsupported value: ") {
+        (rest, true)
+    } else {
+        let rest = [
+            "unsupported parameter",
+            "unknown parameter",
+            "unrecognized parameter",
+            "invalid parameter",
+            "invalid value for parameter",
+            "unsupported value for parameter",
+            "unrecognized request argument supplied",
+        ]
+        .iter()
+        .find_map(|prefix| {
+            let rest = lower.strip_prefix(prefix)?;
+            rest.strip_prefix(':').or_else(|| rest.strip_prefix(' '))
+        })?;
+        (rest, false)
+    };
+    let rest = rest.trim_start();
+    let (name, suffix) = if let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(*character, '\'' | '"'))
+    {
+        let rest = &rest[1..];
+        let end = rest.find(quote)?;
+        (&rest[..end], &rest[end + 1..])
+    } else {
+        let end = rest
+            .find(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '.' | '[' | ']')
+            })
+            .unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
+    if name.is_empty()
+        || name.len() > 128
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '[' | ']')
+        })
+        || (!suffix.is_empty()
+            && !suffix.starts_with(|character: char| {
+                character.is_ascii_whitespace() || matches!(character, ':' | ';' | '.')
+            }))
+    {
+        return None;
+    }
+    if lower.starts_with("unsupported value: ")
+        && !suffix.trim_start().starts_with("does not support ")
+    {
+        return None;
+    }
+    if needs_suffix
+        && ![
+            "is not supported",
+            "is unsupported",
+            "is not allowed",
+            "is not available",
+            "does not support",
+        ]
+        .iter()
+        .any(|phrase| {
+            suffix
+                .trim_start()
+                .strip_prefix(phrase)
+                .is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest.starts_with(|character: char| {
+                            character.is_ascii_whitespace() || character == '.'
+                        })
+                })
+        })
+    {
+        return None;
+    }
+    explicit_diagnostic_param(&[name])
 }
 
 fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str {
@@ -288,6 +409,15 @@ fn diagnostic_reason(message: Option<&str>, param: Option<&str>) -> &'static str
             .any(|term| lower.contains(term))
     {
         return "encrypted_content_rejected";
+    }
+    match param {
+        Some("sampling") => return "sampling_rejected",
+        Some("penalties") => return "penalties_rejected",
+        Some("output_limits") => return "output_limits_rejected",
+        Some("response_format") => return "response_format_rejected",
+        Some("reasoning") => return "reasoning_rejected",
+        Some("stream") => return "stream_rejected",
+        _ => {}
     }
     let structural_rejection = ["invalid", "unsupported", "expected", "required", "missing"]
         .iter()
@@ -853,6 +983,280 @@ mod tests {
             diagnostic_param(Some(&json!("secret_tool_choice_secret"))),
             Some("unknown")
         );
+    }
+
+    #[test]
+    fn ordinary_control_families_share_explicit_path_classification() {
+        for (name, family, reason) in [
+            ("temperature", "sampling", "sampling_rejected"),
+            ("top_p", "sampling", "sampling_rejected"),
+            ("top_k", "sampling", "sampling_rejected"),
+            ("frequency_penalty", "penalties", "penalties_rejected"),
+            ("presence_penalty", "penalties", "penalties_rejected"),
+            ("repetition_penalty", "penalties", "penalties_rejected"),
+            ("max_tokens", "output_limits", "output_limits_rejected"),
+            (
+                "max_output_tokens",
+                "output_limits",
+                "output_limits_rejected",
+            ),
+            (
+                "max_completion_tokens",
+                "output_limits",
+                "output_limits_rejected",
+            ),
+            (
+                "response_format",
+                "response_format",
+                "response_format_rejected",
+            ),
+            ("text.format", "response_format", "response_format_rejected"),
+            ("reasoning", "reasoning", "reasoning_rejected"),
+            ("reasoning_effort", "reasoning", "reasoning_rejected"),
+            ("stream", "stream", "stream_rejected"),
+            ("stream_options", "stream", "stream_rejected"),
+            ("tools", "tool_schema", "tool_schema_rejected"),
+        ] {
+            for param in [
+                json!(name),
+                json!(format!("body.{name}[0]")),
+                json!(["body", name, 0]),
+            ] {
+                for code in ["unsupported_value", "unknown_parameter"] {
+                    let diagnostic = bad_request_diagnostic(&json!({
+                        "error": {"code": code, "param": param, "message": "private-canary"}
+                    }));
+                    assert_eq!(diagnostic.error_code, Some(code));
+                    assert_eq!(diagnostic.error_param, Some(family), "{name}");
+                    assert_eq!(diagnostic.reason, reason, "{name}");
+                    assert!(!format!("{diagnostic:?}").contains("private-canary"));
+                }
+            }
+        }
+        let diagnostic = bad_request_diagnostic(&json!({
+            "detail": [{"loc": ["body", "text", "format", "type"], "msg": "Invalid value"}]
+        }));
+        assert_eq!(diagnostic.error_param, Some("response_format"));
+        assert_eq!(diagnostic.reason, "response_format_rejected");
+    }
+
+    #[test]
+    fn explicit_rejection_grammar_infers_only_bounded_known_families() {
+        for (message, family) in [
+            ("Unsupported parameter: 'temperature'", "sampling"),
+            ("Unknown parameter: top_p", "sampling"),
+            ("Unrecognized parameter 'frequency_penalty'", "penalties"),
+            (
+                "Invalid value for parameter 'max_output_tokens': private-canary",
+                "output_limits",
+            ),
+            (
+                "Unsupported value for parameter 'text.format.type'",
+                "response_format",
+            ),
+            (
+                "Parameter 'reasoning.effort' is not supported for this model",
+                "reasoning",
+            ),
+            (
+                "Unsupported value: 'stream' does not support private-canary",
+                "stream",
+            ),
+            (
+                "Unrecognized request argument supplied: tools[0].type",
+                "tool_schema",
+            ),
+            ("Unsupported parameter: 'tool_choice'", "tool_choice"),
+            (
+                "Unknown parameter: 'input[0].encrypted_content'",
+                "encrypted_content",
+            ),
+        ] {
+            for param in [None, Some(json!("private-canary"))] {
+                let mut error = json!({"message": message});
+                if let Some(param) = param {
+                    error["param"] = param;
+                }
+                assert_eq!(
+                    bad_request_diagnostic(&json!({"error": error})).error_param,
+                    Some(family),
+                    "{message}"
+                );
+            }
+        }
+        let diagnostic = bad_request_diagnostic(&json!({
+            "error": {"param": "client_metadata", "message": "Unsupported parameter: 'temperature'"}
+        }));
+        assert_eq!(diagnostic.error_param, Some("client_metadata"));
+        assert_eq!(diagnostic.reason, "client_metadata_rejected");
+        let diagnostic = bad_request_diagnostic(&json!({
+            "detail": [{"loc": ["body", "private-canary"], "msg": "Unknown parameter: 'top_p'"}]
+        }));
+        assert_eq!(diagnostic.error_param, Some("sampling"));
+        assert_eq!(diagnostic.reason, "sampling_rejected");
+    }
+
+    #[test]
+    fn new_families_do_not_use_unrelated_words_or_quoted_values() {
+        for message in [
+            "Request rejected with temperature top_p frequency_penalty max_tokens response_format tools reasoning stream",
+            "Invalid value: 'temperature'",
+            "Unsupported value: 'reasoning'",
+            "Unsupported value: 'temperature' is not supported",
+            "The supplied value 'stream' is not supported",
+            "Unknown parameter: 'private-canary' value='temperature'",
+            "Unsupported parameter: private_temperature_canary",
+            "Unsupported parameter: 'temperature=private-canary'",
+            "Unsupported parameter: 'https://private-canary/temperature'",
+            "Parameter 'stream' was mentioned; another feature is not supported",
+            "Provider text quotes: Unsupported parameter: 'temperature'",
+        ] {
+            let diagnostic = bad_request_diagnostic(&json!({"error": {"message": message}}));
+            assert_eq!(diagnostic.error_param, None, "{message}");
+            assert_eq!(diagnostic.reason, "unknown", "{message}");
+        }
+        for param in [
+            "private_temperature_canary",
+            "private_frequency_penalty_canary",
+            "private_max_tokens_canary",
+            "private_reasoning_canary",
+        ] {
+            assert_eq!(diagnostic_param(Some(&json!(param))), Some("unknown"));
+        }
+    }
+
+    #[test]
+    fn specific_categories_keep_priority_over_new_families() {
+        for (param, family, reason) in [
+            (
+                "reasoning.encrypted_content",
+                "encrypted_content",
+                "encrypted_content_rejected",
+            ),
+            (
+                "tools[0].parameters.temperature",
+                "tool_schema",
+                "tool_schema_rejected",
+            ),
+            (
+                "response_format.tool_choice",
+                "tool_choice",
+                "tool_choice_rejected",
+            ),
+            ("stream.include", "include", "include_rejected"),
+            (
+                "reasoning.compaction_trigger",
+                "compaction_trigger",
+                "compaction_trigger_rejected",
+            ),
+        ] {
+            let diagnostic = bad_request_diagnostic(&json!({"error": {"param": param}}));
+            assert_eq!(diagnostic.error_param, Some(family));
+            assert_eq!(diagnostic.reason, reason);
+        }
+        for (message, reason) in [
+            ("Collaboration is not enabled", "collaboration_not_enabled"),
+            ("Invalid tool namespace", "tool_namespace_schema_invalid"),
+            ("Invalid encrypted content", "encrypted_content_rejected"),
+        ] {
+            let diagnostic = bad_request_diagnostic(&json!({
+                "error": {"param": "temperature", "message": message}
+            }));
+            assert_eq!(diagnostic.reason, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_control_diagnostics_keep_ordinary_and_transient_dispositions() {
+        for (error_type, code, message, expected) in [
+            (
+                "invalid_request_error",
+                "unsupported_value",
+                "Unsupported parameter: 'temperature'",
+                BadRequestDisposition::DefiniteOrdinary,
+            ),
+            (
+                "invalid_request_error",
+                "unknown_parameter",
+                "Unknown parameter: 'temperature'",
+                BadRequestDisposition::DefiniteOrdinary,
+            ),
+            (
+                "overloaded_error",
+                "unsupported_value",
+                "Unsupported parameter: 'temperature'",
+                BadRequestDisposition::DefiniteTransient,
+            ),
+            (
+                "invalid_request_error",
+                "unknown_parameter",
+                "The service is under high demand",
+                BadRequestDisposition::DefiniteTransient,
+            ),
+        ] {
+            let private = "private-canary".repeat(128);
+            let body = json!({"error": {
+                "type": error_type, "code": code, "param": private,
+                "message": format!("{message}; {private}")
+            }});
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+            let response = UpstreamResponse::Prefetched {
+                status: http::StatusCode::BAD_REQUEST,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from(
+                    serde_json::to_vec(&body).unwrap(),
+                ))])),
+            };
+            let capture = Capture::default();
+            let _other_dispatch = tracing::Dispatch::new(tracing_subscriber::registry());
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .without_time()
+                .with_writer(capture.clone())
+                .finish();
+            assert_eq!(
+                classify_bad_request(response, Uuid::nil())
+                    .with_subscriber(subscriber)
+                    .await,
+                expected
+            );
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logged.lines().count(), 1);
+            assert!(!logged.contains("private-canary"));
+            assert!(!logged.contains("Unsupported parameter"));
+            assert!(!logged.contains("Unknown parameter"));
+            let event: Value = serde_json::from_str(logged.trim()).unwrap();
+            if expected == BadRequestDisposition::DefiniteOrdinary {
+                assert_eq!(event["fields"]["upstream_error_param"], "sampling");
+                assert_eq!(
+                    event["fields"]["upstream_error_reason"],
+                    "sampling_rejected"
+                );
+                assert_eq!(event["fields"]["upstream_error_code"], code);
+                assert_eq!(event["fields"].as_object().unwrap().len(), 8);
+            } else {
+                assert_eq!(
+                    event["fields"]["upstream_error_classification"],
+                    "transient"
+                );
+            }
+        }
+        let private = "private-canary".repeat(256);
+        let diagnostic = bad_request_diagnostic(&json!({"error": {
+            "type": private, "code": private, "param": private,
+            "message": format!("Unsupported parameter: '{private}.temperature'")
+        }}));
+        assert_eq!(diagnostic.error_type, Some("unknown"));
+        assert_eq!(diagnostic.error_code, Some("unknown"));
+        assert_eq!(diagnostic.error_param, Some("unknown"));
+        assert_eq!(diagnostic.reason, "unknown");
+        assert!(!format!("{diagnostic:?}").contains("private-canary"));
     }
 
     #[test]
