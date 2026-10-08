@@ -242,26 +242,26 @@ describe('identity tabs retain legacy deep links, separate denial boundaries and
   let server: Awaited<ReturnType<typeof createServer>> | undefined;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   let port = 0;
-  before(async context => {
+  before(async () => {
     const executablePath = await localChromiumExecutable();
     if (!executablePath) return;
-    context.diagnostic('identity matrix setup: starting shared fixture server and browser');
+    console.info('identity matrix setup: starting shared fixture server and browser');
     server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/tenant-management.html')], server: { host: '127.0.0.1', port: 0, strictPort: false } });
     await server.listen();
     const address = server.httpServer?.address();
     assert.ok(address && typeof address !== 'string');
     port = address.port;
     browser = await chromium.launch({ executablePath, headless: true });
-    context.diagnostic('identity matrix setup complete');
+    console.info('identity matrix setup complete');
   });
-  after(async context => {
+  after(async () => {
     try {
-      context.diagnostic('identity matrix cleanup: closing browser');
+      console.info('identity matrix cleanup: closing browser');
       await browser?.close();
     } finally {
-      context.diagnostic('identity matrix cleanup: closing fixture server');
+      console.info('identity matrix cleanup: closing fixture server');
       await server?.close();
-      context.diagnostic('identity matrix cleanup complete');
+      console.info('identity matrix cleanup complete');
     }
   });
   for (const locale of ['zh-CN', 'en']) {
