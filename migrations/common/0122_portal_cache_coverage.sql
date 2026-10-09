@@ -1,0 +1,10 @@
+ALTER TABLE request_records ADD COLUMN cache_known_read_tokens BIGINT CHECK (cache_known_read_tokens >= 0);
+ALTER TABLE request_records ADD COLUMN cache_known_input_tokens BIGINT CHECK (cache_known_input_tokens >= cache_known_read_tokens AND cache_known_input_tokens <= 3000000000);
+ALTER TABLE terminal_projection_outbox ADD COLUMN cache_known_read_tokens BIGINT CHECK (cache_known_read_tokens >= 0);
+ALTER TABLE terminal_projection_outbox ADD COLUMN cache_known_input_tokens BIGINT CHECK (cache_known_input_tokens >= cache_known_read_tokens AND cache_known_input_tokens <= 3000000000);
+ALTER TABLE request_stats_facts ADD COLUMN cache_known_read_tokens BIGINT CHECK (cache_known_read_tokens >= 0);
+ALTER TABLE request_stats_facts ADD COLUMN cache_known_input_tokens BIGINT CHECK (cache_known_input_tokens >= cache_known_read_tokens AND cache_known_input_tokens <= 3000000000);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_known_read_tokens BIGINT NOT NULL DEFAULT 0 CHECK (cache_known_read_tokens >= 0);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_known_input_tokens BIGINT NOT NULL DEFAULT 0 CHECK (cache_known_input_tokens >= 0);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_eligible_requests BIGINT NOT NULL DEFAULT 0 CHECK (cache_eligible_requests >= 0);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_unknown_requests BIGINT CHECK (cache_unknown_requests >= 0);

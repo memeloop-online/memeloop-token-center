@@ -754,11 +754,15 @@ fn anthropic_usage(value: &Value) -> Result<Value, &'static str> {
     let total = total_input
         .checked_add(output)
         .ok_or("anthropic_usage_invalid")?;
-    Ok(
-        json!({"input_tokens":total_input,"output_tokens":output,"total_tokens":total,
-        "input_tokens_details":{"cached_tokens":cached},
-        "cache_creation_input_tokens":cache_write}),
-    )
+    let mut result = json!({"input_tokens":total_input,"output_tokens":output,"total_tokens":total,
+        "cache_creation_input_tokens":cache_write});
+    result["input_tokens_details"] = json!({"cached_tokens":cached});
+    if value.get("cache_read_input_tokens").is_none()
+        || value.get("cache_creation_input_tokens").is_none()
+    {
+        result["cache_usage_complete"] = Value::Bool(false);
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy)]

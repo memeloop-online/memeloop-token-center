@@ -247,6 +247,9 @@ fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'sta
     let total = value["total_tokens"]
         .as_u64()
         .ok_or("responses_chat_usage_field_type")?;
+    let observed_cached = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -258,10 +261,12 @@ fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'sta
     if cached > input || reasoning > output {
         return Err("usage_detail_exceeds_total");
     }
-    Ok(
-        json!({"input_tokens":input,"output_tokens":output,"total_tokens":total,
-        "input_tokens_details":{"cached_tokens":cached},"output_tokens_details":{"reasoning_tokens":reasoning}}),
-    )
+    let mut result = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total,
+        "output_tokens_details":{"reasoning_tokens":reasoning}});
+    if let Some(cached) = observed_cached {
+        result["input_tokens_details"] = json!({"cached_tokens":cached});
+    }
+    Ok(result)
 }
 
 fn envelope(context: &Context, id: &str, created: i64, outputs: Vec<Value>, usage: Value) -> Value {

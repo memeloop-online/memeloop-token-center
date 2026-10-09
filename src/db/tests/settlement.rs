@@ -982,6 +982,7 @@ async fn settlement_uses_cache_and_service_tier_price_snapshots() {
                 cache_write_tokens: 100_000,
                 output_tokens: 100_000,
                 service_tier: Some("default".to_owned()),
+                cache_coverage: None,
             },
         )
         .await
@@ -1001,6 +1002,7 @@ async fn settlement_uses_cache_and_service_tier_price_snapshots() {
                 cache_write_tokens: 100_000,
                 output_tokens: 100_000,
                 service_tier: Some("flex".to_owned()),
+                cache_coverage: None,
             },
         )
         .await

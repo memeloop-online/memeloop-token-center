@@ -1159,9 +1159,19 @@ pub struct StatsSummary {
     pub failed_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_usage: CacheStats,
     /// Single-currency compatibility value. `None` means the projection spans currencies.
     pub total_cost: Option<String>,
     pub costs: Vec<UsageAnalysisCost>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CacheStats {
+    pub known_read_tokens: i64,
+    pub known_input_tokens: i64,
+    pub eligible_requests: i64,
+    pub unknown_requests: i64,
+    pub hit_rate: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1497,6 +1507,25 @@ pub struct TokenUsage {
     pub cache_write_tokens: i64,
     pub output_tokens: i64,
     pub service_tier: Option<String>,
+    pub cache_coverage: Option<CacheUsageCoverage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheUsageCoverage {
+    pub read_tokens: i64,
+    pub inclusive_input_tokens: i64,
+}
+
+impl CacheUsageCoverage {
+    pub fn new(read_tokens: i64, inclusive_input_tokens: i64) -> Option<Self> {
+        (read_tokens >= 0
+            && inclusive_input_tokens >= read_tokens
+            && inclusive_input_tokens <= 3_000_000_000)
+            .then_some(Self {
+                read_tokens,
+                inclusive_input_tokens,
+            })
+    }
 }
 
 impl TokenUsage {

@@ -443,6 +443,11 @@ fn canonical_chat_usage(
     usage: CanonicalChatUsage,
     service_tier: Option<String>,
 ) -> Option<TokenUsage> {
+    let cache_coverage = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .and_then(|cached| crate::model::CacheUsageCoverage::new(cached, usage.prompt_tokens));
     let cached = usage
         .prompt_tokens_details
         .as_ref()
@@ -509,6 +514,7 @@ fn canonical_chat_usage(
             cache_write_tokens: cache_write,
             output_tokens: usage.completion_tokens,
             service_tier,
+            cache_coverage,
         })
 }
 

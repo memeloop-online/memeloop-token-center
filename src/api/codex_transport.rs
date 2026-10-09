@@ -2278,6 +2278,12 @@ pub(in crate::api) fn canonical_responses_usage(response: &Value) -> Result<Toke
         }
         Some(_) => return Err(()),
     };
+    let cache_coverage = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|_| usage.get("cache_usage_complete") != Some(&Value::Bool(false)))
+        .and_then(|cached| crate::model::CacheUsageCoverage::new(cached, reported_input));
     Ok(TokenUsage {
         input_tokens: reported_input
             .checked_sub(cached_input_tokens)
@@ -2287,6 +2293,7 @@ pub(in crate::api) fn canonical_responses_usage(response: &Value) -> Result<Toke
         cache_write_tokens,
         output_tokens,
         service_tier,
+        cache_coverage,
     })
 }
 
@@ -2965,6 +2972,7 @@ mod tests {
                 cache_write_tokens: 2,
                 output_tokens: 2,
                 service_tier: Some("priority".to_owned()),
+                cache_coverage: crate::model::CacheUsageCoverage::new(3, 10),
             }
         );
         let response: Value = serde_json::from_slice(&parsed.body).unwrap();

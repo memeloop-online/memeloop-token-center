@@ -637,6 +637,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "owned durable conversation semantic payload",
         sql: include_str!("../../../migrations/common/0121_conversation_semantic_payload.sql"),
     },
+    Migration {
+        version: 122,
+        name: "observed Portal cache analytics coverage",
+        sql: include_str!("../../../migrations/common/0122_portal_cache_coverage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1257,6 +1262,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 121,
         name: "owned durable conversation semantic payload",
         sql: include_str!("../../../migrations/common/0121_conversation_semantic_payload.sql"),
+    },
+    Migration {
+        version: 122,
+        name: "observed Portal cache analytics coverage",
+        sql: include_str!("../../../migrations/common/0122_portal_cache_coverage.sql"),
     },
 ];
 

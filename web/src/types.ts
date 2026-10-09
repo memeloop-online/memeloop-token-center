@@ -236,12 +236,21 @@ export interface SelfStats {
     failed_requests: number;
     input_tokens: number;
     output_tokens: number;
+    cache_usage?: CacheStats;
     total_cost: string | null;
     costs: UsageAnalysisCost[];
   };
   by_model: StatsBucket[];
   by_day: StatsBucket[];
   errors: StatsBucket[];
+}
+
+export interface CacheStats {
+  known_read_tokens: number;
+  known_input_tokens: number;
+  eligible_requests: number;
+  unknown_requests: number;
+  hit_rate: number | null;
 }
 
 export interface OperatorStats {

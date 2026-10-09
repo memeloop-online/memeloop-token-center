@@ -1770,6 +1770,12 @@ impl Database {
                     billing_unit: &reservation.billing_unit,
                 }),
             input.terminal_cause,
+            usage.cache_coverage.filter(|coverage| {
+                usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)
+                    && coverage.read_tokens == usage.cached_input_tokens
+                    && coverage.inclusive_input_tokens == usage.total_input_tokens()
+                    && trusted_metered.is_none()
+            }),
         )
         .await?;
         if !finished {
@@ -2164,6 +2170,7 @@ async fn record_request_finished_with_basis_in_transaction(
         usage_basis,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2176,6 +2183,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     usage_basis: Option<crate::model::RequestUsageBasis>,
     metered_usage: Option<MeteredRequestUsage<'_>>,
     terminal_cause: Option<crate::model::RequestTerminalCause>,
+    cache_coverage: Option<crate::model::CacheUsageCoverage>,
 ) -> Result<bool, AppError> {
     if project_aggregates.is_some() {
         lock_request_stats_projection_writer_in_transaction(tx).await?;
@@ -2202,7 +2210,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -2223,6 +2231,8 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .bind(billed_units)
     .bind(billing_unit)
     .bind(terminal_cause.map(crate::model::RequestTerminalCause::as_str))
+    .bind(cache_coverage.map(|value| value.read_tokens))
+    .bind(cache_coverage.map(|value| value.inclusive_input_tokens))
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {
@@ -2244,7 +2254,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .await?;
     }
     let fact_inserted = sqlx::query(
-        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, billed_units, billing_unit, service_tier, currency, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, generation_units, billing_unit, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 AND COALESCE(error_code, '') = '' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, billed_units, billing_unit, service_tier, currency, CASE WHEN ((status_code < 200 OR status_code >= 400) OR COALESCE(error_code, '') <> '') AND COALESCE(usage_basis, '') <> 'provider_reported' THEN 0 ELSE cost_micros END, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(&request_id)
     .bind(created_at)
@@ -2254,7 +2264,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         == 1;
     if fact_inserted && project_aggregates {
         sqlx::query(
-            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
+            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, COALESCE(cache_known_read_tokens, 0), COALESCE(cache_known_input_tokens, 0), CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, cache_known_read_tokens = request_daily_aggregates.cache_known_read_tokens + excluded.cache_known_read_tokens, cache_known_input_tokens = request_daily_aggregates.cache_known_input_tokens + excluded.cache_known_input_tokens, cache_eligible_requests = request_daily_aggregates.cache_eligible_requests + excluded.cache_eligible_requests, cache_unknown_requests = COALESCE(request_daily_aggregates.cache_unknown_requests, request_daily_aggregates.requests) + excluded.cache_unknown_requests, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
         )
         .bind(&request_id)
         .execute(&mut **tx)

@@ -9,7 +9,9 @@ import { createServer } from 'vite';
 const upstreamId = '019f0000-0000-7000-8000-000000000052';
 const routeId = '019f0000-0000-7000-8000-000000000031';
 const bucket = (name: string, requests: number) => ({ name, requests, input_tokens: requests * 10, output_tokens: requests * 2, cost: '0', costs: [] });
-const summary = (count: number) => ({ total_requests: count, successful_requests: count, failed_requests: 0, input_tokens: count * 10, output_tokens: count * 2, total_cost: '0', costs: [] });
+const summary = (count: number) => ({ total_requests: count, successful_requests: count, failed_requests: 0, input_tokens: count * 10, output_tokens: count * 2, total_cost: '0', costs: [],
+  cache_usage: { known_read_tokens: count === 7 ? 0 : count * 4, known_input_tokens: count * 10, eligible_requests: count, unknown_requests: 0, hit_rate: count ? count === 7 ? 0 : 0.4 : null },
+});
 
 test('Portal request statistics use filtered API buckets, localized trends, and readable historical tooltips', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -66,6 +68,7 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
       await page.locator('.self-request-summary .analytics-metric-trend').first().waitFor();
       assert.equal(await page.locator('.self-request-summary .analytics-metric-trend').count(), 2);
       assert.equal(await page.locator('.self-request-summary .metric-exact').first().getAttribute('title'), '123,456', 'summary comes from the whole API scope, not the single loaded row');
+      assert.match(await page.locator('.self-request-summary').innerText(), /40%/);
       await total.focus();
       await total.press('End');
       assert.match(await total.getAttribute('aria-valuetext') ?? '', /UTC.*3,456/);
@@ -99,6 +102,7 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
     assert.equal(await page.getByLabel('Model', { exact: true }).inputValue(), 'Historical model');
     assert.equal(await page.locator('.self-request-summary .analytics-metric-trend').count(), 0, 'one API bucket cannot fabricate a curve');
     assert.equal(reads.at(-1)?.searchParams.get('model'), 'Historical model');
+    assert.match(await page.locator('.self-request-summary').innerText(), /0%/);
     await page.screenshot({ path: `${artifacts}/filtered-single-day.png`, fullPage: true });
     empty = true;
     await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
@@ -106,6 +110,7 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
     assert.equal(await page.locator('.self-request-summary [role="slider"]').count(), 0);
     assert.equal(await page.locator('.self-request-breakdown .empty').count(), 2);
     assert.equal(reads.at(-1)?.searchParams.has('model'), false);
+    assert.match(await page.locator('.self-request-summary').innerText(), /Unknown/);
     await page.screenshot({ path: `${artifacts}/empty.png`, fullPage: true });
   } finally { await browser.close(); await server.close(); }
 });

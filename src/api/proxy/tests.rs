@@ -5963,6 +5963,7 @@ fn optional_service_tier_preserves_usage_and_field_precedence() {
     let expected = TokenUsage {
         input_tokens: 113,
         output_tokens: 22,
+        cache_coverage: crate::model::CacheUsageCoverage::new(0, 113),
         ..TokenUsage::default()
     };
     let usage = json!({
@@ -6172,6 +6173,7 @@ fn upstream_usage_rejects_negative_and_extreme_token_counts() {
             cache_write_tokens: 0,
             output_tokens: 20,
             service_tier: Some("priority".to_owned()),
+            cache_coverage: crate::model::CacheUsageCoverage::new(40, 100),
         })
     );
     assert_eq!(
@@ -6193,6 +6195,7 @@ fn upstream_usage_rejects_negative_and_extreme_token_counts() {
             cache_write_tokens: 10,
             output_tokens: 2,
             service_tier: None,
+            cache_coverage: crate::model::CacheUsageCoverage::new(30, 100),
         })
     );
     assert_eq!(

@@ -2,6 +2,7 @@ use super::super::*;
 use crate::conversation::ConversationHints;
 use std::time::Duration;
 
+mod cache_coverage;
 mod semantic_isolation;
 
 async fn admitted(
