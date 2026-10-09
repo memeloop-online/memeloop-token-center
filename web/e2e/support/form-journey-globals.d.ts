@@ -5,7 +5,7 @@ declare global {
   interface Window {
     formJourneyReads: string[];
     formJourneyWrites: number;
-    formJourneyLastProviderWrite?: { name: string; config: Record<string, unknown>; tenant_external_id: string; expected_updated_at: number };
+    formJourneyLastProviderWrite?: { name: string; config?: Record<string, unknown>; tenant_external_id: string; expected_updated_at: number };
     formJourneyLastProviderCreate?: { name: string; driver: string; config: Record<string, unknown>; credential: Record<string, unknown>; tenant_external_id: string };
     failNextFormWrite: boolean;
     deferNextFormProviderCreate: boolean;

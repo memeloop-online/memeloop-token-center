@@ -3073,3 +3073,451 @@ async fn global_operator_update_still_requires_the_resource_tenant_and_supported
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn upstream_name_only_edit_requires_write_scope_tenant_and_current_revision() {
+    let mock = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("upstream-rename-authorization.db")
+            .display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let mut accounts = Vec::new();
+    for (tenant, name) in [
+        ("rename-a", "original"),
+        ("rename-a", "taken"),
+        ("rename-b", "hidden"),
+    ] {
+        accounts.push(
+            state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: tenant.into(),
+                        name: name.into(),
+                        driver: "http-json".into(),
+                        config: json!({"base_url": mock.uri()}),
+                        credential: UpstreamCredential::ApiKey {
+                            value: "rename-fixture-secret".into(),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                        },
+                        oauth_session_id: None,
+                        oauth_driver: None,
+                        oauth_refresh_url: None,
+                    },
+                    pepper,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let original = &accounts[0];
+    let mut tokens = Vec::new();
+    for (name, tenant, scopes) in [
+        ("rename-writer", "rename-a", vec!["providers:write".into()]),
+        ("rename-reader", "rename-a", vec!["providers:read".into()]),
+        ("hidden-writer", "rename-b", vec!["providers:write".into()]),
+    ] {
+        tokens.push(
+            state
+                .db
+                .create_service_token(
+                    CreateServiceTokenInput {
+                        name: name.into(),
+                        scopes,
+                        tenant_external_id: Some(tenant.into()),
+                    },
+                    pepper,
+                )
+                .await
+                .unwrap()
+                .token,
+        );
+    }
+    let edit = |tenant: &str, name: &str, revision: i64| {
+        json!({
+            "tenant_external_id": tenant, "name": name, "expected_updated_at": revision
+        })
+    };
+    for (token, id, tenant) in [
+        (&tokens[1], original.id, "rename-a"),
+        (&tokens[2], original.id, "rename-a"),
+        (&tokens[2], original.id, "rename-b"),
+        (&tokens[0], accounts[2].id, "rename-a"),
+        (&state.config.service_token, original.id, "rename-b"),
+        (&tokens[0], Uuid::now_v7(), "rename-a"),
+    ] {
+        let (status, _) = json_request(
+            &state,
+            "PUT",
+            &format!("/internal/v1/upstreams/{id}"),
+            token,
+            None,
+            Some(edit(tenant, "not-written", original.updated_at)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    for name in ["", "   ", "control\nname", &"x".repeat(201)] {
+        let (status, _) = json_request(
+            &state,
+            "PUT",
+            &format!("/internal/v1/upstreams/{}", original.id),
+            &tokens[0],
+            None,
+            Some(edit("rename-a", name, original.updated_at)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}", original.id),
+        &tokens[0],
+        None,
+        Some(edit("rename-a", " taken ", original.updated_at)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}", original.id),
+        &tokens[0],
+        None,
+        Some(edit("rename-a", "original", original.updated_at - 1)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    for config in [Value::Null, json!({}), json!([])] {
+        let mut body = edit("rename-a", "not-written", original.updated_at);
+        body["config"] = config;
+        let (status, _) = json_request(
+            &state,
+            "PUT",
+            &format!("/internal/v1/upstreams/{}", original.id),
+            &tokens[0],
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    for field in ["credential", "status", "driver", "proxy_url", "unknown"] {
+        let mut body = edit("rename-a", "not-written", original.updated_at);
+        body[field] = Value::Null;
+        let response = api::router_for_role(state.clone(), RuntimeRole::Control)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/internal/v1/upstreams/{}", original.id))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", tokens[0]))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let unchanged = state
+        .db
+        .upstream_account_for_reauthorization(original.id, "rename-a")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.name, original.name);
+    assert_eq!(unchanged.updated_at, original.updated_at);
+
+    let (status, renamed) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}", original.id),
+        &tokens[0],
+        None,
+        Some(edit("rename-a", " hidden ", original.updated_at)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        renamed,
+        json!({
+            "id": original.id,
+            "tenant_id": original.tenant_id,
+            "tenant_external_id": "rename-a",
+            "name": "hidden",
+            "updated_at": renamed["updated_at"],
+        })
+    );
+    let after = state
+        .db
+        .upstream_account_for_reauthorization(original.id, "rename-a")
+        .await
+        .unwrap();
+    let mut expected = original.clone();
+    expected.name = "hidden".into();
+    expected.updated_at = renamed["updated_at"].as_i64().unwrap();
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert!(renamed["updated_at"].as_i64().unwrap() > original.updated_at);
+    for name in ["stale-name", "hidden"] {
+        let (status, _) = json_request(
+            &state,
+            "PUT",
+            &format!("/internal/v1/upstreams/{}", original.id),
+            &tokens[0],
+            None,
+            Some(edit("rename-a", name, original.updated_at)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET driver = 'unavailable-provider' WHERE id = $1")
+        .bind(original.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, receipt) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}", original.id),
+        &tokens[0],
+        None,
+        Some(edit(
+            "rename-a",
+            "not-written",
+            renamed["updated_at"].as_i64().unwrap(),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        receipt,
+        json!({
+            "id": original.id,
+            "tenant_id": original.tenant_id,
+            "tenant_external_id": "rename-a",
+            "name": "not-written",
+            "updated_at": receipt["updated_at"],
+        })
+    );
+    assert!(receipt["updated_at"].as_i64().unwrap() > renamed["updated_at"].as_i64().unwrap());
+    let retained_driver: String =
+        sqlx::query_scalar("SELECT driver FROM upstream_accounts WHERE id = $1")
+            .bind(original.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained_driver, "unavailable-provider");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_without_decryption() {
+    for disconnected in [false, true] {
+        let mock = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("kimi-rename.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url.clone()))
+            .await
+            .unwrap();
+        let pepper = state.config.key_pepper.as_bytes();
+        let original = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "kimi-rename".into(),
+                    name: "Kimi".into(),
+                    driver: "kimi-oauth".into(),
+                    config: json!({"base_url": mock.uri(), "network_scope": "private"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "rename-kimi-access".into(),
+                        refresh_token: Some("rename-kimi-refresh".into()),
+                        expires_at: Some(10),
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: Some(json!({"account_id": "identity-0142"})),
+                        proxy_url: Some("socks5h://fixture:proxy-secret@127.0.0.1:9".into()),
+                        proxy_network_scope: Some(
+                            memeloop_token_center::network::OutboundScope::Private,
+                        ),
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("kimi-oauth".into()),
+                    oauth_refresh_url: Some(format!("{}/oauth/token", mock.uri())),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: "kimi-rename".into(),
+                public_model: "rename-public".into(),
+                upstream_account_id: original.id,
+                upstream_model: "rename-upstream".into(),
+                protocol: "openai".into(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        if disconnected {
+            state
+                .db
+                .disconnect_upstream_oauth(original.id, "kimi-rename", original.updated_at, pepper)
+                .await
+                .unwrap();
+        }
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let stored_config = json!({
+            "base_url": mock.uri(), "network_scope": "private",
+            "__mtc_transport_proxy_binding": {"binding_version": 7}
+        })
+        .to_string();
+        sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+            .bind(&stored_config)
+            .bind(original.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upstream_credentials SET credential_ciphertext = 'unreadable-fixture-ciphertext' WHERE upstream_account_id = $1")
+            .bind(original.id.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO transport_proxy_bindings (account_id, version, updated_at) VALUES ($1, 7, 42)")
+            .bind(original.id.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO upstream_model_catalog_state (upstream_account_id, tenant_id, credential_generation, status, last_attempt_at, last_error_code) VALUES ($1, $2, 1, 'failed', 42, 'fixture-preserved')")
+            .bind(original.id.to_string()).bind(original.tenant_id.to_string()).execute(&pool).await.unwrap();
+
+        sqlx::query("CREATE TRIGGER rename_account_write_guard BEFORE UPDATE OF tenant_id, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at ON upstream_accounts BEGIN SELECT RAISE(ABORT, 'rename touched protected account state'); END")
+            .execute(&pool).await.unwrap();
+        for table in [
+            "upstream_credentials",
+            "upstream_oauth_refresh_leases",
+            "model_routes",
+            "model_route_upstream_accounts",
+            "upstream_models",
+            "upstream_model_catalog_snapshots",
+            "upstream_model_catalog_state",
+            "transport_proxy_bindings",
+            "transport_proxy_groups",
+            "transport_proxy_management_audit",
+        ] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                sqlx::query(&format!("CREATE TRIGGER rename_guard_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'rename touched unrelated state'); END"))
+                    .execute(&pool).await.unwrap();
+            }
+        }
+        let service = state
+            .db
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: "Kimi rename operator".into(),
+                    scopes: vec!["providers:write".into()],
+                    tenant_external_id: Some("kimi-rename".into()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let before = state
+            .db
+            .upstream_account_for_reauthorization(original.id, "kimi-rename")
+            .await
+            .unwrap();
+        let (status, renamed) = json_request(
+            &state,
+            "PUT",
+            &format!("/internal/v1/upstreams/{}", original.id),
+            &service.token,
+            None,
+            Some(json!({
+                "tenant_external_id": "kimi-rename", "name": " Kimi OAuth 0142 ",
+                "expected_updated_at": before.updated_at
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut expected = before.clone();
+        expected.name = "Kimi OAuth 0142".into();
+        expected.updated_at = renamed["updated_at"].as_i64().unwrap();
+        assert_eq!(
+            renamed,
+            json!({
+                "id": before.id,
+                "tenant_id": before.tenant_id,
+                "tenant_external_id": "kimi-rename",
+                "name": "Kimi OAuth 0142",
+                "updated_at": expected.updated_at,
+            })
+        );
+        let after = state
+            .db
+            .upstream_account_for_reauthorization(original.id, "kimi-rename")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(renamed["updated_at"].as_i64().unwrap() > before.updated_at);
+        for secret in [
+            "rename-kimi-access",
+            "rename-kimi-refresh",
+            "proxy-secret",
+            "identity-0142",
+            "unreadable-fixture-ciphertext",
+            "__mtc_transport_proxy_binding",
+        ] {
+            assert!(!renamed.to_string().contains(secret));
+        }
+        let stored: String =
+            sqlx::query_scalar("SELECT config_json FROM upstream_accounts WHERE id = $1")
+                .bind(original.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, stored_config);
+        let credential = sqlx::query("SELECT credential_ciphertext, generation, expires_at, revoked_at FROM upstream_credentials WHERE upstream_account_id = $1")
+            .bind(original.id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            credential
+                .try_get::<String, _>("credential_ciphertext")
+                .unwrap(),
+            "unreadable-fixture-ciphertext"
+        );
+        assert_eq!(credential.try_get::<i64, _>("generation").unwrap(), 1);
+        assert_eq!(credential.try_get::<i64, _>("expires_at").unwrap(), 10);
+        assert_eq!(
+            credential
+                .try_get::<Option<i64>, _>("revoked_at")
+                .unwrap()
+                .is_some(),
+            disconnected
+        );
+        let route_account: String =
+            sqlx::query_scalar("SELECT upstream_account_id FROM model_routes WHERE id = $1")
+                .bind(route.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(route_account, original.id.to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
+}

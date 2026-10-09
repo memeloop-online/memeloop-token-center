@@ -7,8 +7,8 @@ import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 const labels = {
-  'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '轮换接入凭据', title: '轮换 rotation@example.org 的接入凭据', back: '返回上一级', close: '关闭并返回上一级', key: '新 API 密钥', submit: '保存并替换凭据', acknowledge: '我已了解替换影响，并确认新凭据适用于此账号。', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '但这里不会在提供商端撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
-  en: { details: 'Manage account', manage: 'Account settings and authorization', rotate: 'Rotate access credential', title: 'Rotate access credential for rotation@example.org', back: 'Back to previous page', close: 'Close and return to previous page', key: 'New API key', submit: 'Save and replace credential', acknowledge: 'I understand the impact and confirm that the new credential is intended for this account.', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
+  'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '更换凭据', title: '更换 rotation@example.org 的凭据', back: '取消', close: '关闭', key: '新 API 密钥', submit: '保存', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '这里不会在提供商处撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
+  en: { details: 'Manage account', manage: 'Account settings and authorization', rotate: 'Replace credential', title: 'Replace credential for rotation@example.org', back: 'Cancel', close: 'Close', key: 'New API key', submit: 'Save', invalid: 'Complete all required fields and check the highlighted fields.', failed: 'Could not confirm the replacement. Check the connection and account status before retrying.', saved: 'The new credential is saved. The system will use it for subsequent connections to this account.', settings: 'Edit rotation@example.org', permission: 'You do not have permission to replace this account’s credential. Ask an administrator to check the tenant scope and provider management permission.', old: 'This does not revoke the old key or token at the provider', oauth: 'OAuth token', token: 'Access token', expiry: 'Expiry' },
 };
 
 test('rotation explains replacement, uses Fluent controls, restores its parent and validates only mocked credentials', { timeout: 120_000 }, async () => {
@@ -53,8 +53,20 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await form.getByRole('heading', { name: copy.title, exact: true }).waitFor();
       assert.equal(await form.getByRole('heading', { name: copy.title }).evaluate(element => element === document.activeElement), true);
       await form.getByText(copy.old, { exact: false }).waitFor();
-      await form.getByText(/providers:write/).waitFor();
-      assert.equal(await form.getByRole('button', { name: copy.submit }).isDisabled(), true);
+      assert.equal(await form.getByText(/providers:write/).count(), 0);
+      assert.equal(await form.getByRole('checkbox').count(), 0, 'replacement requires no acknowledgement');
+      assert.equal(await form.getByRole('button', { name: copy.submit, exact: true }).isDisabled(), false);
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 1000 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
+        assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
+        assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
+        assert.equal(await form.locator('input[type="password"]').first().inputValue(), '', 'review screenshots contain no entered secret');
+        const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+        await mkdir(screenshotRoot, { recursive: true });
+        await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png`, fullPage: true });
+      }
       const selector = form.getByRole('combobox');
       await selector.selectOption({ label: copy.oauth });
       await form.getByLabel(copy.token, { exact: false }).first().waitFor();
@@ -65,8 +77,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await expiry.fill('1893456000000');
       await selector.selectOption({ index: 1 });
       const secret = form.locator('input[type="password"]').first();
-      await form.getByRole('checkbox', { name: copy.acknowledge }).focus(); await page.keyboard.press('Space');
-      await form.getByRole('button', { name: copy.submit }).click();
+      await secret.press('Enter');
       await form.getByRole('alert').filter({ hasText: copy.invalid }).waitFor();
       assert.equal(writes.length, 0);
       await secret.fill('synthetic-rotation-secret');
@@ -75,19 +86,12 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       assert.ok(await secret.getAttribute('aria-describedby'));
       const describedBy = (await secret.getAttribute('aria-describedby'))!.split(' ');
       assert.equal(await page.evaluate(ids => ids.some(id => document.getElementById(id)?.textContent?.includes('API') || document.getElementById(id)?.textContent?.includes('provider') || document.getElementById(id)?.textContent?.includes('提供商')), describedBy), true);
-      for (const width of [390, 1440]) {
-        await page.setViewportSize({ width, height: 1000 });
-        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-        const buttonHeights = await form.locator('.journey-heading .fui-Button, .journey-actions .fui-Button').evaluateAll(buttons => buttons.map(button => button.getBoundingClientRect().height));
-        assert.equal(new Set(buttonHeights).size, 1, `heights=${buttonHeights.join(',')} at width=${width}`);
-        assert.ok(buttonHeights[0] >= (width <= 600 ? 44 : 40), `rotation close and action buttons share the journey touch target: heights=${buttonHeights.join(',')} at width=${width}`);
-        const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
-        await mkdir(screenshotRoot, { recursive: true });
-        await page.screenshot({ path: `${screenshotRoot}/credential-rotation-${locale}-${width}.png` });
-      }
-      await secret.press('Enter');
+      await form.getByRole('button', { name: copy.submit, exact: true }).click();
       await form.getByRole('alert').filter({ hasText: copy.failed }).waitFor();
-      assert.equal(writes.length, 1);
+      assert.equal(writes.length, 1, 'a valid key and Save submit once without acknowledgement');
+      assert.equal(await form.getByRole('checkbox').count(), 0);
+      assert.equal(await page.getByRole('dialog').count(), 0, 'replacement opens no confirmation dialog');
+      assert.equal(await secret.inputValue(), 'synthetic-rotation-secret', 'failed saves preserve the draft');
       assert.deepEqual(writes[0].body, { credential: { type: 'api_key', value: 'synthetic-rotation-secret', header: 'authorization', prefix: 'Bearer ' } });
       assert.ok(writes[0].idempotency);
       assert.equal(await page.getByText('must-not-expose-fixture-secret').count(), 0);

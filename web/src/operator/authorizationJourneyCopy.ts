@@ -1,8 +1,10 @@
+import { providerConnectionCopy } from './providerConnectionCopy';
+
 export function authorizationJourneyCopy(locale: string, providerId?: string) {
   return locale.startsWith('zh') ? {
-    purpose: '重新登录提供商以更新此连接的授权。连接名称和模型路由保持不变；原授权将被新授权替换。',
+    purpose: providerId === 'kimi-oauth' ? '新登录会替换当前授权。' : '重新登录提供商以更新此连接的授权。连接名称和模型路由保持不变；原授权将被新授权替换。',
     identityHelp: providerId === 'kimi-oauth'
-      ? '请在 Kimi 页面核对登录账号。Kimi 不向此页面提供账号身份；下方连接名称只是你为连接设置的名称，不代表已核验的 Kimi 账号。'
+      ? providerConnectionCopy(locale).kimiIdentityUnavailable
       : providerId === 'anthropic-claude' ? '请使用原 Anthropic 账号登录；系统要求重新授权的身份与原账号一致。'
       : providerId === 'google-antigravity' ? '请使用原 Google 身份登录；系统要求重新授权的身份与原账号一致。' : '',
     setup: '选择提供商并登录，允许系统代表此账号调用模型。成功后会保存账号授权，供模型路由使用。',
@@ -35,9 +37,9 @@ export function authorizationJourneyCopy(locale: string, providerId?: string) {
     back: '返回上一级',
     saved: '已登录，账号授权已更新。',
   } : {
-    purpose: 'Sign in to the provider again to update this connection’s authorization. Its connection name and model routes are retained; the new authorization replaces the old one.',
+    purpose: providerId === 'kimi-oauth' ? 'Signing in replaces the current authorization.' : 'Sign in to the provider again to update this connection’s authorization. Its connection name and model routes are retained; the new authorization replaces the old one.',
     identityHelp: providerId === 'kimi-oauth'
-      ? 'Check the login account on the Kimi page. Kimi does not provide an account identity to this page. The connection name below is your label for this connection, not a verified Kimi account.'
+      ? providerConnectionCopy(locale).kimiIdentityUnavailable
       : providerId === 'anthropic-claude' ? 'Sign in with the original Anthropic account. Reauthorization requires the same provider identity.'
       : providerId === 'google-antigravity' ? 'Sign in with the original Google identity. Reauthorization requires the same provider identity.' : '',
     setup: 'Choose a provider and sign in to allow the system to call models on behalf of this account. The authorization will be saved for use by model routes.',

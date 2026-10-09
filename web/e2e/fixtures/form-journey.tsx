@@ -28,7 +28,7 @@ window.releaseFormQuotaRead = () => { if (!releaseQuota) throw new Error('No pen
 const workflows = new URLSearchParams(location.search).has('workflows');
 const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', public_model: 'research-model', upstream_model: 'fixture-model', protocol: 'openai', upstream_account_ids: ['account-native'], enabled: true, priority: 0, grant_revision: 1, created_at: 1, updated_at: 1 };
 let routeRows = [existingRoute];
-const account = { id: 'account-native', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: !new URLSearchParams(location.search).has('proxy-no-authority'), credential_generation: 1, route_count: 1, updated_at: 1 };
+const account = { id: 'account-native', tenant_id: 'tenant-fixture', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: !new URLSearchParams(location.search).has('proxy-no-authority'), credential_generation: 1, route_count: 1, updated_at: 1 };
 const editShape = providerEditShape(new URLSearchParams(location.search).get('provider-shape'));
 if (editShape) { Object.assign(account.config, editShape.config); Object.assign(account, { name: 'synthetic.automation.account@example.invalid', proxy_fingerprint: 'synthetic-diagnostic-fingerprint' }); }
 let proxyUrl = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
@@ -63,10 +63,12 @@ window.fetch = async (input, init) => {
       } else {
         window.formJourneyLastProviderWrite = structuredClone(data);
         account.name = data.name;
-        account.config = data.config;
+        if (Object.hasOwn(data, 'config')) account.config = data.config;
       }
       account.updated_at++;
-      return new Response(JSON.stringify(account));
+      return new Response(JSON.stringify(!path.endsWith('/transport-proxy') && !Object.hasOwn(data, 'config')
+        ? { id: account.id, name: account.name, updated_at: account.updated_at, tenant_id: account.tenant_id, tenant_external_id: account.tenant_external_id }
+        : account));
     }
     if (!workflows || !['/internal/v1/model-routes', '/internal/v1/model-routes/route-existing'].includes(path) || !['POST', 'PUT'].includes(method)) throw new Error('Mutation outside the explicit local workflow fixture');
     if (window.failNextFormWrite) { window.failNextFormWrite = false; return new Response(JSON.stringify({ error: { message: '模拟保存失败，草稿仍在' } }), { status: 400 }); }

@@ -53,6 +53,8 @@
 .provider-account { padding: 16px; gap: 12px; }
 .provider-account > .account-main { min-width: 0; }
 .provider-account > .account-main :is(b, span) { overflow-wrap: anywhere; }
+.provider-account-identity { min-width: 0; overflow-wrap: anywhere; }
+.provider-account-identity dd { margin: 4px 0 12px; }
 @media (max-width: 600px) {
   .provider-edit-workspace .fui-Button { min-height: 44px; }
   .provider-edit-workspace .rjsf > .fui-Button { width: 100%; }

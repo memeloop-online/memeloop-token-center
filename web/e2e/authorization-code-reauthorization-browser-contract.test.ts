@@ -51,7 +51,8 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
     }
     assert.equal(starts, 0);
     await page.goto(`${path}?reauthorize=eligible`);
-    assert.equal(await page.getByLabel('上游名称', { exact: true }).isDisabled(), true);
+    assert.equal(await page.getByLabel('上游名称', { exact: true }).count(), 0);
+    await page.getByText('Original account', { exact: true }).waitFor();
     assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理', exact: true }).count(), 0);
     assert.match(await page.locator('body').innerText(), /原来的 Google 身份/);
     const start = page.getByRole('button', { name: '开始登录', exact: true });

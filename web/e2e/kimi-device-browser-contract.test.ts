@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
+import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 const copy = {
   'zh-CN': {
     start: '开始登录', openAuthorization: '打开授权页', check: '检查授权结果', countdown: /秒后可检查/,
-    method: '账户授权', reauthorize: '重新授权', backToSetup: '返回登录设置', reload: '重新读取账号列表',
+    method: '账户授权', reauthorize: '重新登录', backToSetup: '返回登录设置', reload: '重新读取账号列表',
     savedListUnavailable: '账号已保存。重新读取列表即可查看。',
     expired: '本次登录已过期。请返回登录设置后重新开始。',
     hint: '请在 Kimi 页面完成确认，系统会自动检测授权结果。', validUntil: /有效期至/,
@@ -18,13 +19,131 @@ const copy = {
   },
   en: {
     start: 'Start login', openAuthorization: 'Open authorization', check: 'Check authorization', countdown: /Check in \d+s/,
-    method: 'Account authorization', reauthorize: 'Authorize again', backToSetup: 'Back to login setup', reload: 'Reload account list',
+    method: 'Account authorization', reauthorize: 'Sign in again', backToSetup: 'Back to login setup', reload: 'Reload account list',
     savedListUnavailable: 'Account saved. Reload the list to view it.',
     expired: 'This login expired. Return to login setup to start again.',
     hint: 'Confirm on Kimi. The system checks authorization automatically.', validUntil: /Valid until/,
     security: 'Confirm this login on Kimi', openaiSecurity: /Confirm this login on OpenAI/,
   },
 } as const;
+
+test('Kimi display-name editing saves metadata alone and keeps unknown identity and connection state clear', { timeout: 90_000 }, async () => {
+  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const locale of ['zh-CN', 'en'] as const) {
+      const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
+      await page.addInitScript(value => { localStorage.setItem('mtc-locale', value); localStorage.setItem('mtc-theme', 'light'); }, locale);
+      const chinese = locale === 'zh-CN';
+      const text = providerConnectionCopy(locale);
+      const config = { base_url: 'https://api.kimi.com/coding/', _transport_proxy_binding: { revision: 42 } };
+      let account = { id: 'synthetic-kimi-rename', tenant_id: 'synthetic-tenant-a', tenant_external_id: 'fixture-a', driver: 'kimi-oauth', name: 'My Kimi', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 3, credential_expires_at: 1, updated_at: 4, route_count: 2, config, can_reauthorize: true, can_refresh: true, can_rotate: false, can_update_transport_proxy: true, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true };
+      const provider = { id: 'kimi-oauth', display_name: 'Kimi', source: 'builtin', protocols: ['anthropic'], modalities: ['text'], config_schema: {
+        type: 'object', additionalProperties: false, required: ['base_url', 'network_scope', 'reservation_token_bounds'], properties: {
+          base_url: { const: config.base_url, readOnly: true }, network_scope: { const: 'public', readOnly: true },
+          reservation_token_bounds: { type: 'object', default: {}, additionalProperties: { type: 'integer', minimum: 1 } },
+        },
+      }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'kimi_device' } };
+      const writes: Record<string, unknown>[] = [];
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      let failNextSave = true;
+      let holdNextSave = false;
+      let releaseSave: (() => void) | undefined;
+      await page.route('**/*', async route => {
+        const request = route.request(), url = new URL(request.url());
+        assert.equal(url.origin, origin, 'all requests stay in the synthetic fixture');
+        if (!url.pathname.startsWith('/internal/')) return route.continue();
+        if (request.method() !== 'GET') {
+          assert.equal(request.method(), 'PUT', 'renaming never starts OAuth or refreshes authorization');
+          assert.equal(url.pathname, '/internal/v1/upstreams/synthetic-kimi-rename');
+          const body = request.postDataJSON();
+          writes.push(body);
+          assert.deepEqual(Object.keys(body).sort(), ['expected_updated_at', 'name', 'tenant_external_id']);
+          assert.equal(body.tenant_external_id, 'fixture-a');
+          assert.equal(body.expected_updated_at, account.updated_at);
+          if (failNextSave) { failNextSave = false; return route.fulfill({ status: 409, json: { error: { message: 'Synthetic revision conflict' } } }); }
+          const updated = { ...account, name: body.name, updated_at: account.updated_at + 1 };
+          if (holdNextSave) await new Promise<void>(resolve => { releaseSave = resolve; });
+          else account = updated;
+          assert.deepEqual(updated.config, config);
+          assert.equal(updated.credential_generation, 3);
+          return route.fulfill({ json: { id: updated.id, name: updated.name, updated_at: updated.updated_at, tenant_id: updated.tenant_id, tenant_external_id: updated.tenant_external_id } });
+        }
+        if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [provider] });
+        if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: url.searchParams.get('tenant_external_id') === 'fixture-b' ? [] : [account] });
+        if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, proxy_url: 'socks5h://10.0.0.15:1080', supported: true, updated_at: account.updated_at, credential_generation: account.credential_generation } });
+        return route.fulfill({ json: [] });
+      });
+      await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page&scope-controls`);
+      await page.locator(`[data-upstream-id="${account.id}"]`).getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
+      const reauthorization = page.locator('.provider-reauthorization-workspace');
+      await reauthorization.getByText('My Kimi', { exact: true }).waitFor();
+      assert.equal(await reauthorization.getByLabel(chinese ? '连接名称' : 'Connection name', { exact: false }).count(), 0);
+      await reauthorization.getByRole('button', { name: text.editDisplayName, exact: true }).click();
+      assert.equal(await page.getByRole('dialog').count(), 0, 'opening settings before login does not discard an authorization session');
+      assert.equal(writes.length, 0, 'reauthorization-to-settings navigation starts no OAuth request');
+      const editor = page.locator('.provider-edit-workspace');
+      await editor.getByText(text.providerIdentity, { exact: true }).waitFor();
+      await editor.getByText(text.kimiIdentityUnavailable, { exact: true }).waitFor();
+      const name = editor.getByLabel(text.displayName, { exact: false });
+      const save = editor.locator('.rjsf > button[type="submit"]');
+      for (const invalid of ['', 'x'.repeat(201)]) {
+        await name.fill(invalid);
+        await save.click();
+        assert.equal(writes.length, 0, 'invalid display names never reach the API');
+      }
+      await name.fill('Kimi OAuth 0142');
+      await editor.locator('[data-workspace-toggle]').click();
+      const discard = page.getByRole('dialog');
+      await discard.waitFor();
+      await discard.getByRole('button', { name: chinese ? '取消' : 'Cancel', exact: true }).click();
+      assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'dirty confirmation retains the name draft');
+      for (const width of [390, 1440]) {
+        await page.setViewportSize({ width, height: 1000 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        const screenshots = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+        await mkdir(screenshots, { recursive: true });
+        await page.screenshot({ path: `${screenshots}/kimi-rename-${locale}-${width}.png`, fullPage: true });
+      }
+      const rejectedSave = page.waitForResponse(response => response.request().method() === 'PUT' && response.status() === 409);
+      await save.click(); await rejectedSave;
+      await editor.getByText('Synthetic revision conflict', { exact: true }).waitFor();
+      assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'a failed save retains the draft');
+      await save.click();
+      const details = page.locator('.provider-detail-workspace');
+      await details.getByRole('heading', { name: 'Kimi OAuth 0142', exact: true }).waitFor();
+      assert.deepEqual(writes, [
+        { name: 'Kimi OAuth 0142', tenant_external_id: 'fixture-a', expected_updated_at: 4 },
+        { name: 'Kimi OAuth 0142', tenant_external_id: 'fixture-a', expected_updated_at: 4 },
+      ]);
+      await details.getByText(text.kimiIdentityUnavailable, { exact: true }).waitFor();
+      assert.equal(await details.locator('.provider-account-identity time').getAttribute('datetime'), new Date(account.credential_expires_at).toISOString());
+      await details.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).waitFor();
+      assert.equal(await details.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1, 'renaming preserves the expired authorization status');
+      const edit = details.getByRole('button', { name: chinese ? '编辑' : 'Edit', exact: true });
+      assert.equal(await edit.evaluate(button => document.activeElement === button), true, 'successful save returns focus to account editing');
+      await details.getByRole('button', { name: chinese ? '账号设置与授权操作' : 'Account settings and authorization', exact: true }).click();
+      await details.getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
+      await reauthorization.getByText('Kimi OAuth 0142', { exact: true }).waitFor();
+      await reauthorization.getByRole('button', { name: text.editDisplayName, exact: true }).click();
+      await name.fill('Late old-scope name');
+      holdNextSave = true;
+      const started = page.waitForRequest(request => request.method() === 'PUT');
+      await save.click(); await started;
+      await page.getByRole('button', { name: 'Switch tenant', exact: true }).click();
+      const completed = page.waitForResponse(response => response.request().method() === 'PUT');
+      assert.ok(releaseSave); releaseSave(); await completed;
+      assert.equal(await page.locator('.provider-edit-workspace').count(), 0, 'late save cannot reopen a previous-scope editor');
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'late save cannot restore a previous-scope account');
+      assert.equal(await page.getByText(chinese ? '已更新 Late old-scope name' : 'Updated Late old-scope name', { exact: true }).count(), 0);
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('Kimi device login is explicit, respects poll intervals and expiry, and preserves account identity and scope', { timeout: 120_000 }, async () => {
   const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
@@ -36,7 +155,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
   const initialTime = new Date('2026-09-14T12:00:00Z');
   async function open(options: { reauthorize?: boolean; locale?: keyof typeof copy; omitExpiry?: boolean; manageOnly?: boolean; expiredAuthorization?: boolean } = {}) {
     const locale = options.locale ?? 'zh-CN';
-    const text = copy[locale];
+    const text = { ...copy[locale], start: options.reauthorize ? providerConnectionCopy(locale).signInAgain : copy[locale].start };
     const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
@@ -108,10 +227,10 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       const workspace = page.locator('.provider-reauthorization-workspace');
       const help = authorizationJourneyCopy(locale, 'kimi-oauth');
       await workspace.getByText(help.purpose, { exact: true }).waitFor();
-      await workspace.getByText(help.identityHelp, { exact: true }).waitFor();
-      const connectionName = workspace.getByLabel(chinese ? '连接名称' : 'Connection name', { exact: false });
-      assert.equal(await connectionName.inputValue(), 'My Kimi');
-      assert.equal(await connectionName.getAttribute('readonly'), '');
+      await workspace.locator('.provider-account-identity').getByText(help.identityHelp, { exact: true }).waitFor();
+      assert.equal(await workspace.getByLabel(chinese ? '连接名称' : 'Connection name', { exact: false }).count(), 0);
+      await workspace.getByText('My Kimi', { exact: true }).waitFor();
+      await workspace.getByRole('button', { name: providerConnectionCopy(locale).editDisplayName, exact: true }).waitFor();
       await workspace.getByRole('button', { name: help.back, exact: true }).click();
       await details.waitFor();
       assert.equal(await details.getByRole('button', { name: text.reauthorize, exact: true }).evaluate(button => document.activeElement === button), true);
@@ -131,6 +250,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       assert.equal(await page.getByRole('checkbox', { name: '使用账号网络代理' }).count(), reauthorize ? 0 : 1, 'reauthorization reuses the stored transport and never offers a proxy change');
       await page.getByRole('button', { name: text.start, exact: true }).click();
       await page.getByText('MOCK-KIMI', { exact: true }).waitFor();
+      if (reauthorize) assert.equal(await page.getByRole('button', { name: providerConnectionCopy('zh-CN').editDisplayName, exact: true }).isDisabled(), true, 'active login cannot be discarded to rename');
       assert.deepEqual(writes[0].body, { tenant_external_id: 'fixture-a', account_name: reauthorize ? 'My Kimi' : 'Kimi', ...(reauthorize ? { upstream_account_id: 'original-kimi' } : {}) });
       const link = page.getByRole('link', { name: text.openAuthorization, exact: true });
       assert.equal(await link.getAttribute('href'), 'https://www.kimi.com/device?user_code=MOCK-KIMI');
@@ -160,7 +280,8 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await retryRead;
       assert.equal(await page.getByRole('button', { name: text.reload, exact: true }).isDisabled(), true, 'retry cannot queue duplicate reads');
       assert.equal(await page.locator('.authorization-form .model-picker-trigger').isDisabled(), true, 'provider stays locked while the saved account list is loading');
-      assert.equal(await page.locator('.authorization-form input[maxlength="200"]').isDisabled(), true);
+      if (reauthorize) assert.equal(await page.locator('.authorization-form input[maxlength="200"]').count(), 0);
+      else assert.equal(await page.locator('.authorization-form input[maxlength="200"]').isDisabled(), true);
       assert.equal(await page.getByRole('button', { name: text.start, exact: true }).isDisabled(), true);
       assert.equal(state.listReads, readsBeforeRetry + 1);
       state.holdList = false;

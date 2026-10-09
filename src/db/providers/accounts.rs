@@ -29,6 +29,15 @@ pub struct UpdateUpstreamAccountInput {
     pub credential: Option<UpstreamCredential>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct UpstreamProviderNameUpdate {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub tenant_external_id: String,
+    pub name: String,
+    pub updated_at: i64,
+}
+
 impl Database {
     pub async fn create_upstream_account(
         &self,
@@ -296,6 +305,89 @@ impl Database {
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         open_credential(&ciphertext, key_material)
     }
+    pub async fn rename_upstream_account(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        name: &str,
+        expected_updated_at: i64,
+    ) -> Result<UpstreamProviderNameUpdate, AppError> {
+        validate_upstream_account_name(name)?;
+        let name = name.trim();
+        let mut tx = self.begin_write_transaction().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.tenant_id, a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.tenant_id, a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let current = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let tenant_id: String = current.try_get("tenant_id")?;
+        let receipt_tenant_id = Uuid::parse_str(&tenant_id).map_err(|_| AppError::Internal)?;
+        let current_updated_at: i64 = current.try_get("updated_at")?;
+        if current_updated_at != expected_updated_at {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before saving it again".into(),
+            ));
+        }
+        if sqlx::query(
+            "SELECT id FROM upstream_accounts WHERE tenant_id = $1 AND name = $2 AND id <> $3",
+        )
+        .bind(&tenant_id)
+        .bind(name)
+        .bind(account_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
+        {
+            return Err(AppError::Conflict(
+                "another upstream provider already uses this name".into(),
+            ));
+        }
+        let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
+        let changed = sqlx::query(
+            "UPDATE upstream_accounts SET name = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4 AND updated_at = $5",
+        )
+        .bind(name)
+        .bind(updated_at)
+        .bind(account_id.to_string())
+        .bind(&tenant_id)
+        .bind(expected_updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation())
+            {
+                AppError::Conflict("another upstream provider already uses this name".into())
+            } else {
+                AppError::from(error)
+            }
+        })?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before saving it again".into(),
+            ));
+        }
+        let receipt = UpstreamProviderNameUpdate {
+            id: account_id,
+            tenant_id: receipt_tenant_id,
+            tenant_external_id: tenant_external_id.to_owned(),
+            name: name.to_owned(),
+            updated_at,
+        };
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
     pub async fn update_upstream_account(
         &self,
         account_id: Uuid,
@@ -972,6 +1064,157 @@ mod tests {
 
     const PEPPER: &[u8] = b"account-write-admission-pepper-32b";
     const TENANT: &str = "account-write-admission";
+
+    #[tokio::test]
+    async fn name_only_edit_and_config_edit_serialize_on_the_account_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("rename-config-race.db").display()
+        );
+        let renamer = Database::connect_with_max(&database_url, 1).await.unwrap();
+        renamer.migrate().await.unwrap();
+        let editor = Database::connect_with_max(&database_url, 1).await.unwrap();
+        let original = renamer
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.into(),
+                    name: "original".into(),
+                    driver: "http-json".into(),
+                    config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                PEPPER,
+            )
+            .await
+            .unwrap();
+        let changed_config = serde_json::json!({
+            "base_url": "http://127.0.0.1:2", "timeout_seconds": 30
+        });
+        let (renamed, edited) = tokio::join!(
+            renamer.rename_upstream_account(original.id, TENANT, "renamed", original.updated_at),
+            editor.update_upstream_account(
+                original.id,
+                TENANT,
+                UpdateUpstreamAccountInput {
+                    name: original.name.clone(),
+                    config: changed_config.clone(),
+                    expected_updated_at: original.updated_at,
+                    expected_credential_generation: None,
+                    credential: None,
+                },
+                PEPPER,
+            ),
+        );
+        let current = renamer
+            .upstream_account_for_reauthorization(original.id, TENANT)
+            .await
+            .unwrap();
+        match (renamed, edited) {
+            (Ok(renamed), Err(AppError::Conflict(_))) => {
+                assert_eq!(current.name, renamed.name);
+                assert_eq!(current.config, original.config);
+            }
+            (Err(AppError::Conflict(_)), Ok(edited)) => {
+                assert_eq!(current.name, original.name);
+                assert_eq!(current.config, edited.config);
+                assert_eq!(current.config, changed_config);
+            }
+            _ => panic!("exactly one competing edit must win the account revision"),
+        }
+        assert_eq!(
+            current.credential_generation,
+            original.credential_generation
+        );
+        assert!(current.updated_at > original.updated_at);
+        let renamed = renamer
+            .rename_upstream_account(original.id, TENANT, "latest name", current.updated_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&renamed).unwrap(),
+            serde_json::json!({
+                "id": original.id,
+                "tenant_id": original.tenant_id,
+                "tenant_external_id": TENANT,
+                "name": "latest name",
+                "updated_at": renamed.updated_at,
+            })
+        );
+        let after = renamer
+            .upstream_account_for_reauthorization(original.id, TENANT)
+            .await
+            .unwrap();
+        let mut expected = current.clone();
+        expected.name = renamed.name.clone();
+        expected.updated_at = renamed.updated_at;
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(renamed.updated_at > current.updated_at);
+    }
+
+    #[tokio::test]
+    async fn name_only_edit_needs_no_configuration_projection() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
+        let original = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.into(),
+                    name: "original".into(),
+                    driver: "http-json".into(),
+                    config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                PEPPER,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upstream_accounts SET config_json = 'invalid-json' WHERE id = $1")
+            .bind(original.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let receipt = database
+            .rename_upstream_account(original.id, TENANT, "committed", original.updated_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap(),
+            serde_json::json!({
+                "id": original.id,
+                "tenant_id": original.tenant_id,
+                "tenant_external_id": TENANT,
+                "name": "committed",
+                "updated_at": receipt.updated_at,
+            })
+        );
+        let row = sqlx::query(
+            "SELECT name, updated_at, config_json FROM upstream_accounts WHERE id = $1",
+        )
+        .bind(original.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<String, _>("name").unwrap(), receipt.name);
+        assert_eq!(
+            row.try_get::<i64, _>("updated_at").unwrap(),
+            receipt.updated_at
+        );
+        assert_eq!(
+            row.try_get::<String, _>("config_json").unwrap(),
+            "invalid-json"
+        );
+        assert!(receipt.updated_at > original.updated_at);
+    }
 
     #[tokio::test]
     async fn sqlite_account_update_reserves_the_writer_before_reading_current_state() {

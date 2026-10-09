@@ -1494,13 +1494,20 @@ paths:
     put:
       tags: [Upstream providers]
       operationId: replaceUpstreamProviderConfiguration
-      summary: Replace the editable configuration of one unified upstream
+      summary: Edit the display name or replace the configuration of one unified upstream
       description: |
         Keeps the stable upstream identity, provider driver, authentication method,
         routes, and history. `expected_updated_at` provides optimistic concurrency.
-        Repeating an already-applied identical representation is safe; a stale,
-        non-identical representation returns 409. Provider JSON Schema and outbound
-        destination policy are revalidated before the write.
+        Omit `config` to edit only the display name. This requires the current
+        `expected_updated_at`, updates only name and revision, and works for expired
+        or disconnected accounts without decrypting credentials, validating outbound
+        destinations, or triggering OAuth or model synchronization. Explicit null
+        is not a name-only edit. A name-only edit returns only the account ID,
+        tenant ID, tenant external ID, name, and updated revision; no configuration,
+        credential, or proxy metadata is loaded.
+        With `config` present, repeating an already-applied identical representation
+        is safe; a stale, non-identical representation returns 409. Provider JSON
+        Schema and outbound destination policy are revalidated before the write.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters: [{ $ref: '#/components/parameters/AccountId' }]
@@ -1514,7 +1521,10 @@ paths:
           description: Updated upstream account metadata without secrets.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/UpstreamProviderNameUpdate'
+                  - $ref: '#/components/schemas/UpstreamProvider'
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -7810,14 +7820,14 @@ components:
     ReplaceUpstreamProviderRequest:
       type: object
       additionalProperties: false
-      required: [tenant_external_id, name, config, expected_updated_at]
+      required: [tenant_external_id, name, expected_updated_at]
       properties:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         name: { type: string, minLength: 1, maxLength: 200 }
         config:
           type: object
           additionalProperties: true
-          description: Complete provider configuration, validated against the existing driver's JSON Schema. Authentication material is not accepted here.
+          description: Optional complete provider configuration, validated against the existing driver's JSON Schema when present. Omit for a display-name-only edit; null is invalid. Authentication material is not accepted here.
         expected_updated_at: { type: integer, format: int64 }
     SetUpstreamProviderStatusRequest:
       type: object
@@ -7842,6 +7852,16 @@ components:
           description: Private SOCKS endpoint. Codex and remote-DNS socks5h require a private IP literal; generic socks5 may use a hostname resolving only to private addresses. Proxy authentication is returned only by the explicit management GET, never ordinary metadata.
         expected_updated_at: { type: integer, format: int64 }
         expected_credential_generation: { type: integer, format: int64, minimum: 1 }
+    UpstreamProviderNameUpdate:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, tenant_external_id, name, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        name: { type: string }
+        updated_at: { type: integer, format: int64 }
     UpstreamProvider:
       type: object
       additionalProperties: false

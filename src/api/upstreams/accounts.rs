@@ -474,8 +474,16 @@ fn default_upstream_list_limit() -> i64 {
 pub(in crate::api) struct UpdateUpstreamRequest {
     tenant_external_id: String,
     name: String,
-    config: Value,
+    #[serde(default, deserialize_with = "deserialize_supplied_config")]
+    config: Option<Value>,
     expected_updated_at: i64,
+}
+
+fn deserialize_supplied_config<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 pub(in crate::api) async fn update_upstream(
@@ -483,14 +491,26 @@ pub(in crate::api) async fn update_upstream(
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
     Json(mut body): Json<UpdateUpstreamRequest>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
-    let state = state.pin_application_plugins().await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     state
         .db
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
+    let Some(mut config) = body.config.take() else {
+        let receipt = state
+            .db
+            .rename_upstream_account(
+                account_id,
+                &body.tenant_external_id,
+                &body.name,
+                body.expected_updated_at,
+            )
+            .await?;
+        return Ok(Json(receipt).into_response());
+    };
+    let state = state.pin_application_plugins().await?;
     let driver = state.db.upstream_driver(account_id).await?;
     let (current, current_credential, credential_active, oauth_driver) = state
         .db
@@ -504,11 +524,10 @@ pub(in crate::api) async fn update_upstream(
     if driver == crate::provider::antigravity::DRIVER {
         crate::provider::antigravity::authorize_config_update(
             &current.config,
-            &body.config,
+            &config,
             service.tenant_external_id.is_none(),
         )?;
-        if body
-            .config
+        if config
             .get("request_headers")
             .and_then(Value::as_object)
             .is_some_and(serde_json::Map::is_empty)
@@ -517,7 +536,7 @@ pub(in crate::api) async fn update_upstream(
             if let Some(config) = previous_config.as_object_mut() {
                 config.remove("request_headers");
             }
-            if let Some(config) = body.config.as_object_mut() {
+            if let Some(config) = config.as_object_mut() {
                 config.remove("request_headers");
             }
         }
@@ -526,25 +545,21 @@ pub(in crate::api) async fn update_upstream(
         super::config_secrets::preserve_managed_oauth(
             &provider.config_schema,
             &previous_config,
-            &mut body.config,
+            &mut config,
             service.tenant_external_id.is_none(),
         )?;
     } else {
-        super::config_secrets::preserve(
-            &provider.config_schema,
-            &previous_config,
-            &mut body.config,
-        )?;
+        super::config_secrets::preserve(&provider.config_schema, &previous_config, &mut config)?;
     }
-    validate_provider_config_schema(&state, &driver, &body.config)?;
-    validate_upstream_destination(&driver, &body.config, &service, &state).await?;
+    validate_provider_config_schema(&state, &driver, &config)?;
+    validate_upstream_destination(&driver, &config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
-        || codex_model_sync_config(&current.config) != codex_model_sync_config(&body.config);
+        || codex_model_sync_config(&current.config) != codex_model_sync_config(&config);
     let policy_change = if driver == crate::oauth::codex_device::PROVIDER_DRIVER
-        && current.config.get("transport_policy") != body.config.get("transport_policy")
+        && current.config.get("transport_policy") != config.get("transport_policy")
     {
         Some(
-            crate::provider::CodexTransportPolicy::parse(body.config.get("transport_policy"))
+            crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
                 .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?,
         )
     } else {
@@ -552,8 +567,8 @@ pub(in crate::api) async fn update_upstream(
     };
     let credential = if current.auth_kind == "oauth" && provider.oauth_adapter.is_some() {
         let (public_config, secret_patch) =
-            super::config_secrets::split_for_storage(&provider.config_schema, &body.config)?;
-        body.config = public_config;
+            super::config_secrets::split_for_storage(&provider.config_schema, &config)?;
+        config = public_config;
         let current_patch = current_credential
             .provider_adapter_secret_patch()?
             .unwrap_or_else(|| Value::Array(Vec::new()));
@@ -576,7 +591,7 @@ pub(in crate::api) async fn update_upstream(
             &body.tenant_external_id,
             UpdateUpstreamAccountInput {
                 name: body.name,
-                config: body.config,
+                config,
                 expected_updated_at: body.expected_updated_at,
                 expected_credential_generation: credential
                     .as_ref()
@@ -610,9 +625,7 @@ pub(in crate::api) async fn update_upstream(
     if should_sync_models {
         super::trigger_upstream_model_sync(state.clone(), account_id);
     }
-    Ok(Json(super::config_secrets::public_account(
-        &state, account,
-    )?))
+    Ok(Json(super::config_secrets::public_account(&state, account)?).into_response())
 }
 
 fn codex_model_sync_config(config: &Value) -> Value {
@@ -915,6 +928,38 @@ fn require_proxied_rotation_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_edit_distinguishes_omitted_config_from_explicit_null() {
+        let rename = json!({
+            "tenant_external_id": "rename-tenant",
+            "name": "Kimi OAuth 0142",
+            "expected_updated_at": 42
+        });
+        let request: UpdateUpstreamRequest = serde_json::from_value(rename.clone()).unwrap();
+        assert!(request.config.is_none());
+
+        for config in [
+            Value::Null,
+            json!({}),
+            json!({"base_url": "https://example.test"}),
+        ] {
+            let mut edit = rename.clone();
+            edit["config"] = config.clone();
+            let request: UpdateUpstreamRequest = serde_json::from_value(edit).unwrap();
+            assert_eq!(request.config, Some(config));
+        }
+        for field in ["credential", "status", "driver", "proxy_url", "unexpected"] {
+            let mut edit = rename.clone();
+            edit[field] = Value::Null;
+            assert!(serde_json::from_value::<UpdateUpstreamRequest>(edit).is_err());
+        }
+        for field in ["tenant_external_id", "name", "expected_updated_at"] {
+            let mut edit = rename.clone();
+            edit.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<UpdateUpstreamRequest>(edit).is_err());
+        }
+    }
 
     #[test]
     fn codex_transport_policy_does_not_change_model_sync_inputs() {
