@@ -3419,7 +3419,7 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
             "transport_proxy_management_audit",
         ] {
             for operation in ["INSERT", "UPDATE", "DELETE"] {
-                sqlx::query(&format!("CREATE TRIGGER rename_guard_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'rename touched unrelated state'); END"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER rename_guard_{table}_{operation} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, 'rename touched unrelated state'); END")))
                     .execute(&pool).await.unwrap();
             }
         }
