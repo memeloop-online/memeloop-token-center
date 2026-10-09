@@ -236,11 +236,22 @@ async fn invalid_native_supplier_envelopes_cannot_escape_detail_or_archive_conte
         "mtc_provider_code": "model_not_found",
         "mtc_provider_message": "Model not found"
     }});
+    let mut invalid = Vec::new();
     for field in ["mtc_provider_code", "mtc_provider_message", "unknown_field"] {
         let mut tampered = valid.clone();
         tampered["error"][field] = json!("Authorization: Bearer token=private-canary");
+        invalid.push(tampered.to_string());
+    }
+    invalid.extend([
+        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
+        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"},"error":{"message":"legacy"}}"#,
+        r#"{"\u0065rror":{"\u006dtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
+        r#"{"error":{"mtc_provider_message":"Authorization: Bearer private-canary","mtc_provider_message":"Model not found","type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","mtc_safe_reason":"model_unavailable"}}"#,
+        r#"{"error":"legacy","error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}}"#,
+    ].into_iter().map(str::to_owned));
+    for raw in invalid {
         let mut refs = request_detail_refs(Uuid::now_v7());
-        refs.response_object = Some(format!("inline-json:{tampered}"));
+        refs.response_object = Some(format!("inline-json:{raw}"));
         refs.view.status_code = Some(400);
         refs.view.error_code = Some("http_400".to_owned());
         refs.view.supplier_error =
@@ -285,8 +296,10 @@ async fn native_supplier_and_legacy_failed_archives_retain_their_exact_bodies() 
     for raw in [
         r#"{"error":{"type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","mtc_safe_reason":"model_unavailable","mtc_provider_code":"model_not_found","mtc_provider_message":"Model not found"}}"#,
         r#"{"error":{"type":"upstream_error","code":"no_active_plan","message":"当前账号没有可用套餐","mtc_safe_reason":"no_active_plan"}}"#,
+        r#"{"\u0065rror":{"type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","\u006dtc_safe_reason":"model_unavailable","mtc_provider_code":"model_not_found","mtc_provider_message":"Model not found"}}"#,
         r#"{"error":{"type":"upstream_error","message":"upstream rejected the request"}}"#,
         r#"{"error":{"code":"supplier_original_error","message":"original failure body"}}"#,
+        r#"{"error":{"message":"literal mtc_safe_reason inside legacy text","debug":{"mtc_provider_message":"unrelated nested data"}}}"#,
         "data: {\"error\":{\"message\":\"upstream stream failed\"}}\n\n",
     ] {
         let mut refs = request_detail_refs(Uuid::now_v7());

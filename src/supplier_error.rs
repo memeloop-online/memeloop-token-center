@@ -1,4 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 
 const MAX_INLINE_JSON_BYTES: usize = 2048;
 
@@ -141,18 +144,87 @@ pub(crate) fn invalid_native_supplier_envelope(location: &str) -> bool {
     let Some(raw) = location.strip_prefix("inline-json:") else {
         return false;
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    let marked = value
-        .get("error")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|error| {
-            error.contains_key("mtc_safe_reason")
-                || error.contains_key("mtc_provider_code")
-                || error.contains_key("mtc_provider_message")
-        });
+    let mut marked = false;
+    let prefix = &raw.as_bytes()[..raw.len().min(MAX_INLINE_JSON_BYTES)];
+    let mut parser = serde_json::Deserializer::from_slice(prefix);
+    let _ = serde::Deserializer::deserialize_map(&mut parser, NativeEnvelopeMarker(&mut marked));
     marked && supplier_error_from_inline_json(Some(location)).is_none()
+}
+
+struct NativeEnvelopeMarker<'a>(&'a mut bool);
+
+impl<'de> Visitor<'de> for NativeEnvelopeMarker<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an inline envelope")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "error" {
+                map.next_value_seed(NativeErrorMarker(&mut *self.0))?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct NativeErrorMarker<'a>(&'a mut bool);
+
+impl<'de> DeserializeSeed<'de> for NativeErrorMarker<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NativeErrorMarker<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an error value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if matches!(
+                key.as_str(),
+                "mtc_safe_reason" | "mtc_provider_code" | "mtc_provider_message"
+            ) {
+                *self.0 = true;
+            }
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierError> {
@@ -238,6 +310,29 @@ mod tests {
             supplier_error_from_inline_json(Some(&"x".repeat(MAX_INLINE_JSON_BYTES + 1))),
             None
         );
+    }
+
+    #[test]
+    fn native_markers_survive_incomplete_and_duplicate_parsing() {
+        for raw in [
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"},"error":{"message":"legacy"}}"#,
+            r#"{"\u0065rror":{"\u006dtc_provider_message":"Authorization: Bearer private-canary""#,
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_safe_reason":"model_unavailable"}}"#,
+        ] {
+            let location = format!("inline-json:{raw}");
+            assert!(supplier_error_from_inline_json(Some(&location)).is_none());
+            assert!(invalid_native_supplier_envelope(&location));
+        }
+        for raw in [
+            r#"{"error":{"message":"mtc_safe_reason"}} trailing"#,
+            r#"{"error":{"debug":{"mtc_provider_message":"legacy data"}}}"#,
+            "data: {\"error\":{\"mtc_safe_reason\":\"legacy SSE text\"}}\n\n",
+        ] {
+            assert!(!invalid_native_supplier_envelope(&format!(
+                "inline-json:{raw}"
+            )));
+        }
     }
 
     #[test]
