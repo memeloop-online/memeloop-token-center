@@ -1,3 +1,5 @@
+ALTER TABLE conversation_projection_outbox ADD COLUMN semantic_payload_snapshot_json TEXT;
+
 CREATE TABLE conversation_semantic_payloads (
     request_id TEXT PRIMARY KEY REFERENCES conversation_projection_outbox(request_id) ON DELETE CASCADE,
     tenant_id TEXT NOT NULL,

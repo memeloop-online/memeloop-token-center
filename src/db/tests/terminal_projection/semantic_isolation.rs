@@ -18,6 +18,40 @@ async fn recovery_contract(database_url: &str) {
         client_name: None,
         upstream_response_id: None,
     });
+    let reject_payload = match database.backend {
+        DatabaseBackend::Sqlite => {
+            "CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_semantic_payloads BEGIN SELECT RAISE(ABORT, 'injected payload failure'); END;"
+        }
+        DatabaseBackend::PostgreSql => {
+            "CREATE FUNCTION reject_semantic_payload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected payload failure'; END $$; CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_semantic_payloads FOR EACH ROW EXECUTE FUNCTION reject_semantic_payload();"
+        }
+    };
+    sqlx::raw_sql(reject_payload)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .finish_proxy_request_deferred(input.clone())
+            .await
+            .is_err()
+    );
+    let failed = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS charges, (SELECT status FROM usage_reservations WHERE id = $1) AS status, (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $2) AS outboxes, (SELECT completed_at FROM request_records WHERE id = $2) AS completed_at")
+        .bind(reservation.id.to_string()).bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(failed.get::<i64, _>("charges"), 0);
+    assert_eq!(failed.get::<String, _>("status"), "reserved");
+    assert_eq!(failed.get::<i64, _>("outboxes"), 0);
+    assert_eq!(failed.get::<Option<i64>, _>("completed_at"), None);
+    let drop_payload = match database.backend {
+        DatabaseBackend::Sqlite => "DROP TRIGGER reject_semantic_payload",
+        DatabaseBackend::PostgreSql => {
+            "DROP TRIGGER reject_semantic_payload ON conversation_semantic_payloads; DROP FUNCTION reject_semantic_payload();"
+        }
+    };
+    sqlx::raw_sql(drop_payload)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     database
         .finish_proxy_request_deferred(input.clone())
         .await
@@ -35,6 +69,18 @@ async fn recovery_contract(database_url: &str) {
     );
     assert_eq!(payload.get::<i64, _>("encoded_bytes"), encoded.len() as i64);
     assert!(encoded.len() <= 128 * 1024 * 1024);
+    assert!(sqlx::query("UPDATE conversation_semantic_payloads SET encoded_bytes = 134217729 WHERE request_id = $1")
+        .bind(request_id.to_string()).execute(&database.pool).await.is_err());
+    let marker = sqlx::query("SELECT semantic_snapshot_json, semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        marker.get::<Option<String>, _>("semantic_snapshot_json"),
+        None
+    );
+    let snapshot: String = marker.get("semantic_payload_snapshot_json");
+    let legacy_claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR lease_expires_at IS NULL OR lease_expires_at <= 0)")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(legacy_claimable, 0);
     let atoms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
         .bind(key.tenant_id.to_string())
         .fetch_one(&database.pool)
@@ -74,6 +120,31 @@ async fn recovery_contract(database_url: &str) {
             .iter()
             .any(|task| task.request_id == request_id)
     );
+    let mut invalid_snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    invalid_snapshot["payload_digest"] = serde_json::Value::Null;
+    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
+        .bind(invalid_snapshot.to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(stale, request_id)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
+        .bind(&snapshot).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(stale, request_id)
+            .await
+            .is_err()
+    );
+    sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
+        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(encoded.len() as i64).bind(payload.get::<String, _>("digest")).bind(&encoded).execute(&database.pool).await.unwrap();
     for field in ["tenant_id", "key_id", "principal_id"] {
         let original = match field {
             "tenant_id" => key.tenant_id,
@@ -200,6 +271,16 @@ async fn recovery_contract(database_url: &str) {
     .await
     .unwrap();
     assert_eq!(payloads, 0);
+    let restored: String =
+        sqlx::query_scalar("SELECT content_json FROM semantic_atoms WHERE tenant_id = $1")
+            .bind(key.tenant_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+        crate::conversation::extract_atoms(&body)[0].content
+    );
     let lifetime: i64 = sqlx::query_scalar(
         "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
     )

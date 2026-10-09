@@ -48,6 +48,7 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&121));
     for statement in [
         "DROP TABLE conversation_semantic_payloads",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_payload_snapshot_json",
         "DROP TABLE terminal_projection_outbox",
         "DROP TABLE observability_prune_boundaries",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN key_snapshot_json",

@@ -135,7 +135,7 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
             .iter()
             .any(|task| task.reservation_id == reservation.id)
     );
-    let envelope = sqlx::query("SELECT request_json, semantic_snapshot_json, lease_owner FROM conversation_projection_outbox WHERE request_id = $1")
+    let envelope = sqlx::query("SELECT request_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, lease_owner FROM conversation_projection_outbox WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     assert_eq!(envelope.get::<String, _>("request_json"), "{}");
     assert!(envelope.get::<String, _>("semantic_snapshot_json").len() < 71_000);

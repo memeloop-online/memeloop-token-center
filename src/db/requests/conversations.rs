@@ -141,7 +141,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     })
     .to_string();
     let inserted = sqlx::query(
-        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json, lease_owner, lease_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CASE WHEN $11 IS NOT NULL THEN 'terminal-v118' END, CASE WHEN $11 IS NOT NULL THEN 9223372036854775807 END) ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json, semantic_payload_snapshot_json, lease_owner, lease_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CASE WHEN COALESCE($11, $12) IS NOT NULL THEN 'terminal-v118' END, CASE WHEN COALESCE($11, $12) IS NOT NULL THEN 9223372036854775807 END) ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(request_id.to_string())
     .bind(key.tenant_id.to_string())
@@ -153,11 +153,12 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(upstream_response_id)
     .bind(observed_at)
     .bind(&key_snapshot)
-    .bind(&semantic_snapshot)
+    .bind(if payload.is_some() { None } else { semantic_snapshot.as_deref() })
+    .bind(if payload.is_some() { semantic_snapshot.as_deref() } else { None })
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() == 0 {
-        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
         if existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
             || existing.try_get::<String, _>("key_id")? != key.key_id.to_string()
@@ -178,6 +179,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
                 .as_deref()
                 != Some(key_snapshot.as_str())
             || existing.try_get::<Option<String>, _>("semantic_snapshot_json")? != semantic_snapshot
+            || (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some()
         {
             return Err(AppError::Conflict(
                 "conversation projection evidence does not match its owner".into(),
@@ -251,7 +253,7 @@ impl Database {
                 DatabaseBackend::Sqlite => "",
             };
             let statement = format!(
-                "UPDATE conversation_projection_outbox SET terminal_lease_owner = $1, terminal_lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND semantic_snapshot_json IS NOT NULL AND (terminal_lease_owner IS NULL OR terminal_lease_owner <> $1) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3) ORDER BY observed_at, request_id LIMIT $4{suffix}) RETURNING request_id, observed_at"
+                "UPDATE conversation_projection_outbox SET terminal_lease_owner = $1, terminal_lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL) AND (terminal_lease_owner IS NULL OR terminal_lease_owner <> $1) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3) ORDER BY observed_at, request_id LIMIT $4{suffix}) RETURNING request_id, observed_at"
             );
             rows.extend(
                 sqlx::query(sqlx::AssertSqlSafe(statement))
@@ -289,7 +291,7 @@ impl Database {
         let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -303,6 +305,16 @@ impl Database {
                 .try_get::<Option<String>, _>("semantic_snapshot_json")?
                 .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
                 .transpose()?;
+            let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
+            if payload_required
+                != snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.payload_digest.is_some())
+            {
+                return Err(AppError::Conflict(
+                    "conversation semantic payload marker mismatch".into(),
+                ));
+            }
             if snapshot.is_none()
                 || snapshot
                     .as_ref()
@@ -371,15 +383,21 @@ impl Database {
         {
             let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'pruned', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $1")
                 .bind(now).bind(request_id.to_string()).bind(lease_owner.to_string()).execute(&mut *transaction).await?;
+            if skipped.rows_affected() == 1 {
+                sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
+                    .bind(request_id.to_string())
+                    .execute(&mut *transaction)
+                    .await?;
+            }
             transaction.commit().await?;
             return Ok(skipped.rows_affected() == 1);
         }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
             }
         };
         let task = sqlx::query(select)
@@ -452,6 +470,16 @@ impl Database {
             .try_get::<Option<String>, _>("semantic_snapshot_json")?
             .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
             .transpose()?;
+        let payload_required = task.try_get::<i64, _>("payload_required")? != 0;
+        if payload_required
+            != snapshot
+                .as_ref()
+                .is_some_and(|s| s.payload_digest.is_some())
+        {
+            return Err(AppError::Conflict(
+                "conversation semantic payload marker mismatch".into(),
+            ));
+        }
         if snapshot != prepared_snapshot {
             return Err(AppError::Conflict(
                 "conversation semantic snapshot changed during projection".into(),
