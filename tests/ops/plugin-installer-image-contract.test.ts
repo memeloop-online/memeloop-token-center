@@ -18,7 +18,7 @@ function cleanupOwnedImage(
 test('plugin installer image is patched, pinned, and non-root', (context) => {
   const dockerfile = 'Dockerfile.plugin-installer';
   for (const needle of [
-    'ARG GO_IMAGE=golang:1.26.7-bookworm',
+    'ARG GO_IMAGE=golang:1.26.9-bookworm',
     'https://codeload.github.com/sigstore/cosign/tar.gz/11926fa5bbbbde47e88fc006b625a17769b743b2',
     'sha256:3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b',
     'COPY packaging/cosign/v3.1.3-security.patch',
@@ -31,6 +31,7 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
   ]) contains(dockerfile, needle);
   excludes(dockerfile, 'github.com/sigstore/cosign/releases/download/');
   excludes(dockerfile, /^ARG\s+COSIGN_(?:VERSION|SHA|DIGEST|COMMIT)/m);
+  contains('Dockerfile', 'ARG GO_IMAGE=golang:1.26.9-bookworm');
   contains('Dockerfile', '/usr/local/bin/cosign');
   contains('Dockerfile', '/usr/local/bin/install-plugin-oci');
   contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.3"');
@@ -63,7 +64,7 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{index .Config.Labels "io.memeloop.cosign.version"}}', image]).trim(), 'v3.1.3-mtc.3');
     const version = JSON.parse(run('docker', ['run', '--rm', '--entrypoint', '/usr/local/bin/cosign', image, 'version', '--json'])) as { gitVersion?: string; goVersion?: string };
     assert.equal(version.gitVersion, 'v3.1.3-mtc.3');
-    assert.equal(version.goVersion, 'go1.26.7');
+    assert.equal(version.goVersion, 'go1.26.9');
     const help = run('docker', ['run', '--rm', image, '--help']);
     assert.match(help, /--inventory-file/);
     assert.match(help, /--inventory-entry-file/);

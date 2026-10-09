@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 ARG RUST_IMAGE=rust:1.95.0-bookworm
-ARG GO_IMAGE=golang:1.26.7-bookworm
+ARG GO_IMAGE=golang:1.26.9-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
