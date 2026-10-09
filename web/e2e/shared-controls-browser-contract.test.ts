@@ -3,7 +3,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { chromium, type Locator } from 'playwright';
+import { chromium, type Locator, type Page } from 'playwright';
+import { dataThemes } from '../src/design-system/dataTheme.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { fixtureAssets } from './support/fixture-assets.js';
 
@@ -59,6 +60,22 @@ async function geometry(control: Locator) {
   });
 }
 
+async function providerTokens(page: Page, theme: 'light' | 'dark') {
+  const selector = '#root > .mtc-fluent-root.fui-FluentProvider';
+  const provider = page.locator(selector);
+  assert.equal(await provider.count(), 1, `${theme}: the fixture uses the real application Fluent provider`);
+  await page.waitForFunction(({ selector, surface }) => {
+    const element = document.querySelector(selector);
+    return element && getComputedStyle(element).getPropertyValue('--mtc-data-surface').trim() === surface;
+  }, { selector, surface: dataThemes[theme].surface });
+  const tokens = await provider.evaluate(element => {
+    const style = getComputedStyle(element);
+    return Object.fromEntries(['fontFamilyBase', 'fontSizeBase300', 'lineHeightBase300', 'spacingHorizontalM', 'colorNeutralBackground1', 'colorNeutralForeground1', 'colorNeutralStroke1'].map(name => [name, style.getPropertyValue(`--${name}`).trim()]));
+  });
+  for (const [name, value] of Object.entries(tokens)) assert.notEqual(value, '', `${theme}: Fluent token ${name} is defined before geometry measurement`);
+  return tokens;
+}
+
 test('shared legacy control selectors cannot size or repaint Fluent slots', async () => {
   for (const selector of ['.tenant-dialog-input', '.button-row', '.selection-chip', '.fui-Dropdown__button']) {
     assert.equal(targetsLegacyControl(selector), false, `${selector}: a class name is not a native control selector`);
@@ -96,9 +113,10 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
   const artifacts = fileURLToPath(new URL('../e2e-artifacts/ui-system/shared-controls/', import.meta.url));
   await mkdir(artifacts, { recursive: true });
   const measurements: unknown[] = [];
+  const referenceTokens: Partial<Record<'light' | 'dark', Record<string, string>>> = {};
   let mediumHeight = 0;
   try {
-    for (const locale of ['en', 'zh-CN']) for (const theme of ['light', 'dark']) for (const width of [320, 390, 1440]) {
+    for (const locale of ['en', 'zh-CN']) for (const theme of ['light', 'dark'] as const) for (const width of [320, 390, 1440]) {
       const label = `${locale}-${theme}-${width}`;
       const page = await browser.newPage({ viewport: { width, height: 900 } });
       const baseline = await browser.newPage({ viewport: { width, height: 900 } });
@@ -115,6 +133,8 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       await page.goto(`${origin}/e2e/fixtures/shared-controls.html?${query}`);
       await page.locator('[data-controls="fields"] .fui-Switch').waitFor();
       await baseline.locator('[data-controls="fields"] .fui-Switch').waitFor();
+      referenceTokens[theme] = await providerTokens(baseline, theme);
+      assert.deepEqual(await providerTokens(page, theme), referenceTokens[theme], `${label}: application and clean baseline share the active Fluent theme tokens`);
       await page.screenshot({ path: `${artifacts}/${label}.png`, fullPage: true });
       const references = Object.fromEntries(await Promise.all(controls.map(async control => [control, await geometry(baseline.locator(`[data-controls="reference"] [data-control="${control}"]`))])));
       mediumHeight = references.refresh.height;
@@ -264,7 +284,7 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       { name: 'routes', fixture: 'form-journey.html?workflows&view=routes', ready: '.model-route-list .row-actions button', controls: '.model-route-list .row-actions button', native: true },
       { name: 'usage', fixture: 'usage-analysis.html', ready: '.usage-heading .fui-Button', controls: '.usage-heading .fui-Button, .usage-presets .fui-Button, .usage-tabs .fui-Button', native: false },
     ];
-    for (const route of pages) for (const theme of ['light', 'dark']) for (const width of [390, 1440]) {
+    for (const route of pages) for (const theme of ['light', 'dark'] as const) for (const width of [390, 1440]) {
       const page = await browser.newPage({ viewport: { width, height: 900 } });
       const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
       await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'en'); });
@@ -275,8 +295,12 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
       await page.goto(`${origin}/e2e/fixtures/${route.fixture}`);
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
       await page.locator(route.ready).first().waitFor();
+      const tokens = await providerTokens(page, theme);
+      assert.deepEqual(tokens, referenceTokens[theme], `${route.name}/${theme}/${width}: real-page fixture uses the baseline Fluent theme tokens`);
+      measurements.push({ page: route.name, theme, viewportWidth: width, surface: 'provider-tokens', tokens });
       const actions = page.locator(route.controls);
       assert.ok(await actions.count() > 0, `${route.name}: real page actions are present`);
+      assert.equal(await actions.evaluateAll(elements => elements.every(element => Boolean(element.closest('.mtc-fluent-root.fui-FluentProvider')))), true, `${route.name}: measured actions inherit from the application provider`);
       const actionElements = await actions.all();
       const actionMeasurements = await Promise.all(actionElements.map(action => geometry(action)));
       measurements.push(...actionMeasurements.map(measured => ({ page: route.name, theme, viewportWidth: width, ...measured })));
