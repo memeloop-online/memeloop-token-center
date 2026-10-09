@@ -55,6 +55,8 @@ async fn upgrade_contract(database: &Database) {
         "ALTER TABLE request_daily_aggregates DROP COLUMN cache_known_read_tokens",
         "ALTER TABLE request_daily_aggregates DROP COLUMN cache_eligible_requests",
         "ALTER TABLE request_daily_aggregates DROP COLUMN cache_unknown_requests",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_reported_read_tokens",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_reported_requests",
         "DROP TABLE conversation_semantic_payloads",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_payload_snapshot_json",
         "DROP TABLE terminal_projection_outbox",

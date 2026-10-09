@@ -1,4 +1,11 @@
 use super::*;
+
+#[cfg(test)]
+pub(super) fn parse_cache_usage_contract(value: &Value) -> TokenUsage {
+    response_metadata::usage_from_value_checked(value)
+        .unwrap()
+        .unwrap()
+}
 pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,

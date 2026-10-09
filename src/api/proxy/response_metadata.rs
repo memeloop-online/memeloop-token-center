@@ -81,7 +81,9 @@ pub(super) fn merge_streaming_usage(current: &mut TokenUsage, next: TokenUsage) 
     current.output_tokens = current.output_tokens.max(next.output_tokens);
     current.cache_coverage = coverage.filter(|value| {
         value.read_tokens == current.cached_input_tokens
-            && value.inclusive_input_tokens == current.total_input_tokens()
+            && value
+                .inclusive_input_tokens
+                .is_none_or(|input| input == current.total_input_tokens())
     });
     if let Some(next_tier) = next.service_tier {
         match current.service_tier.as_deref() {
@@ -398,10 +400,11 @@ fn usage_from_value_diagnosed(value: &Value) -> Result<Option<TokenUsage>, Usage
             Some(tier.to_owned())
         }
     };
-    let read_observed = details_integer("input_tokens_details")?.is_some()
-        || details_integer("prompt_tokens_details")?.is_some()
-        || integer("cache_read_input_tokens")?.is_some()
-        || cache_hit.is_some();
+    let read_observed = usage.get("cache_read_observed") != Some(&Value::Bool(false))
+        && (details_integer("input_tokens_details")?.is_some()
+            || details_integer("prompt_tokens_details")?.is_some()
+            || integer("cache_read_input_tokens")?.is_some()
+            || cache_hit.is_some());
     let write_observed = integer("cache_creation_input_tokens")?.is_some()
         || usage.get("cache_creation").is_some_and(|value| {
             value
@@ -429,6 +432,8 @@ fn usage_from_value_diagnosed(value: &Value) -> Result<Option<TokenUsage>, Usage
                     .ok_or(UsageRejection::InputArithmeticOverflow)?
             },
         )
+    } else if read_observed {
+        crate::model::CacheUsageCoverage::read_only(cached_input)
     } else {
         None
     };
@@ -488,11 +493,11 @@ mod cache_coverage_tests {
             ),
             (
                 serde_json::json!({"input_tokens":60,"output_tokens":20,"cache_read_input_tokens":30}),
-                None,
+                crate::model::CacheUsageCoverage::read_only(30),
             ),
             (
                 serde_json::json!({"output_tokens":20,"input_tokens_details":{"cached_tokens":0}}),
-                None,
+                crate::model::CacheUsageCoverage::read_only(0),
             ),
             (
                 serde_json::json!({"prompt_tokens":0,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0}}),
@@ -505,7 +510,9 @@ mod cache_coverage_tests {
             assert_eq!(parsed.cache_coverage, coverage);
             assert_eq!(parsed.output_tokens, 20);
             if let Some(coverage) = coverage {
-                assert_eq!(parsed.total_input_tokens(), coverage.inclusive_input_tokens);
+                if let Some(input) = coverage.inclusive_input_tokens {
+                    assert_eq!(parsed.total_input_tokens(), input);
+                }
                 assert_eq!(parsed.cached_input_tokens, coverage.read_tokens);
             }
         }

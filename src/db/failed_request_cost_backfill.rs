@@ -771,7 +771,7 @@ async fn rebuild_request_daily(
                tenant_id, key_id, day_bucket, model, protocol, status_class, error_code,
                upstream_account_id, model_route_id, service_tier, currency, requests,
                input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-               cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests,
+               cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests,
                duration_count, duration_sum_ms, cost_micros)
            SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class,
                   error_code, upstream_account_id, model_route_id, service_tier, currency,
@@ -779,9 +779,9 @@ async fn rebuild_request_daily(
                   SUM(CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END),
                   SUM(CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END),
                   SUM(cached_input_tokens), SUM(cache_write_tokens),
-                  SUM(COALESCE(cache_known_read_tokens, 0)), SUM(COALESCE(cache_known_input_tokens, 0)),
+                  SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_read_tokens ELSE 0 END), SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_input_tokens ELSE 0 END),
                   SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END),
-                  SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), COUNT(*),
+                  SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), SUM(COALESCE(cache_known_read_tokens, 0)), SUM(CASE WHEN cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END), COUNT(*),
                   SUM(duration_ms), SUM(cost_micros)
              FROM request_stats_facts
             WHERE tenant_id = $1 AND key_id = $2 AND created_at / 86400000 = $3
@@ -802,6 +802,8 @@ async fn rebuild_request_daily(
                cache_known_input_tokens = excluded.cache_known_input_tokens,
                cache_eligible_requests = excluded.cache_eligible_requests,
                cache_unknown_requests = excluded.cache_unknown_requests,
+               cache_reported_read_tokens = excluded.cache_reported_read_tokens,
+               cache_reported_requests = excluded.cache_reported_requests,
                duration_count = excluded.duration_count,
                duration_sum_ms = excluded.duration_sum_ms,
                cost_micros = excluded.cost_micros"#,

@@ -1167,6 +1167,8 @@ pub struct StatsSummary {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CacheStats {
+    pub reported_read_tokens: i64,
+    pub reported_requests: i64,
     pub known_read_tokens: i64,
     pub known_input_tokens: i64,
     pub eligible_requests: i64,
@@ -1513,7 +1515,7 @@ pub struct TokenUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheUsageCoverage {
     pub read_tokens: i64,
-    pub inclusive_input_tokens: i64,
+    pub inclusive_input_tokens: Option<i64>,
 }
 
 impl CacheUsageCoverage {
@@ -1523,8 +1525,15 @@ impl CacheUsageCoverage {
             && inclusive_input_tokens <= 3_000_000_000)
             .then_some(Self {
                 read_tokens,
-                inclusive_input_tokens,
+                inclusive_input_tokens: Some(inclusive_input_tokens),
             })
+    }
+
+    pub fn read_only(read_tokens: i64) -> Option<Self> {
+        (0..=1_000_000_000).contains(&read_tokens).then_some(Self {
+            read_tokens,
+            inclusive_input_tokens: None,
+        })
     }
 }
 

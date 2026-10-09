@@ -2282,8 +2282,14 @@ pub(in crate::api) fn canonical_responses_usage(response: &Value) -> Result<Toke
         .get("input_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_i64)
-        .filter(|_| usage.get("cache_usage_complete") != Some(&Value::Bool(false)))
-        .and_then(|cached| crate::model::CacheUsageCoverage::new(cached, reported_input));
+        .filter(|_| usage.get("cache_read_observed") != Some(&Value::Bool(false)))
+        .and_then(|cached| {
+            if usage.get("cache_usage_complete") == Some(&Value::Bool(false)) {
+                crate::model::CacheUsageCoverage::read_only(cached)
+            } else {
+                crate::model::CacheUsageCoverage::new(cached, reported_input)
+            }
+        });
     Ok(TokenUsage {
         input_tokens: reported_input
             .checked_sub(cached_input_tokens)

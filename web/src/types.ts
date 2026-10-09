@@ -246,6 +246,8 @@ export interface SelfStats {
 }
 
 export interface CacheStats {
+  reported_read_tokens: number;
+  reported_requests: number;
   known_read_tokens: number;
   known_input_tokens: number;
   eligible_requests: number;

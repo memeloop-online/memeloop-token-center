@@ -121,7 +121,7 @@ DELETE FROM request_daily_aggregates a
 INSERT INTO request_daily_aggregates (
   tenant_id, key_id, day_bucket, model, protocol, status_class, error_code,
   upstream_account_id, model_route_id, service_tier, currency, requests,
-  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests,
   duration_count, duration_sum_ms, cost_micros
 )
 SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol,
@@ -129,9 +129,9 @@ SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol,
        f.service_tier, f.currency, COUNT(*), COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END), 0),
        COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END), 0), COALESCE(SUM(f.cached_input_tokens), 0),
        COALESCE(SUM(f.cache_write_tokens), 0),
-       COALESCE(SUM(f.cache_known_read_tokens), 0), COALESCE(SUM(f.cache_known_input_tokens), 0),
+       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_read_tokens ELSE 0 END), SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_input_tokens ELSE 0 END),
        SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END),
-       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), COUNT(*),
+       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), COALESCE(SUM(f.cache_known_read_tokens), 0), SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0), COALESCE(SUM(f.cost_micros), 0)
   FROM request_stats_facts f
   CROSS JOIN mtc_reconcile_day_bounds b

@@ -8,3 +8,5 @@ ALTER TABLE request_daily_aggregates ADD COLUMN cache_known_read_tokens BIGINT N
 ALTER TABLE request_daily_aggregates ADD COLUMN cache_known_input_tokens BIGINT NOT NULL DEFAULT 0 CHECK (cache_known_input_tokens >= 0);
 ALTER TABLE request_daily_aggregates ADD COLUMN cache_eligible_requests BIGINT NOT NULL DEFAULT 0 CHECK (cache_eligible_requests >= 0);
 ALTER TABLE request_daily_aggregates ADD COLUMN cache_unknown_requests BIGINT CHECK (cache_unknown_requests >= 0);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_reported_read_tokens BIGINT NOT NULL DEFAULT 0 CHECK (cache_reported_read_tokens >= 0);
+ALTER TABLE request_daily_aggregates ADD COLUMN cache_reported_requests BIGINT NOT NULL DEFAULT 0 CHECK (cache_reported_requests >= 0);

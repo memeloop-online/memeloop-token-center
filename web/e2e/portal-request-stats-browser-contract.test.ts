@@ -10,7 +10,7 @@ const upstreamId = '019f0000-0000-7000-8000-000000000052';
 const routeId = '019f0000-0000-7000-8000-000000000031';
 const bucket = (name: string, requests: number) => ({ name, requests, input_tokens: requests * 10, output_tokens: requests * 2, cost: '0', costs: [] });
 const summary = (count: number) => ({ total_requests: count, successful_requests: count, failed_requests: 0, input_tokens: count * 10, output_tokens: count * 2, total_cost: '0', costs: [],
-  cache_usage: { known_read_tokens: count === 7 ? 0 : count * 4, known_input_tokens: count * 10, eligible_requests: count, unknown_requests: 0, hit_rate: count ? count === 7 ? 0 : 0.4 : null },
+  cache_usage: { reported_read_tokens: count === 7 ? 0 : count * 4, reported_requests: count, known_read_tokens: count === 7 ? 0 : count * 4, known_input_tokens: count * 10, eligible_requests: count, unknown_requests: 0, hit_rate: count ? count === 7 ? 0 : 0.4 : null },
 });
 
 test('Portal request statistics use filtered API buckets, localized trends, and readable historical tooltips', { timeout: 60_000 }, async () => {
@@ -34,6 +34,7 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
     });
     const reads: URL[] = [];
     let empty = false;
+    let cacheState: 'known' | 'partial' | 'unknown' | 'zero' | 'noInput' = 'known';
     await page.route('**/self/v1/**', async route => {
       const url = new URL(route.request().url());
       if (url.pathname.endsWith('/key')) return route.fulfill({ json: {
@@ -43,7 +44,12 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
       const filtered = url.searchParams.get('model') === 'Historical model';
       if (url.pathname.endsWith('/stats')) {
         reads.push(url);
-        return route.fulfill({ json: { key_id: 'fixture-key', summary: summary(empty ? 0 : filtered ? 7 : 123456),
+        const count = empty ? 0 : filtered ? 7 : 123456;
+        const metrics = summary(count);
+        if (cacheState === 'unknown') metrics.cache_usage = { reported_read_tokens: 0, reported_requests: 0, known_read_tokens: 0, known_input_tokens: 0, eligible_requests: 0, unknown_requests: count, hit_rate: null };
+        if (cacheState === 'partial') metrics.cache_usage = { reported_read_tokens: (count - 1) * 4, reported_requests: count - 1, known_read_tokens: (count - 1) * 4, known_input_tokens: (count - 1) * 10, eligible_requests: count - 1, unknown_requests: 1, hit_rate: 0.4 };
+        if (cacheState === 'zero' || cacheState === 'noInput') metrics.cache_usage = { reported_read_tokens: 0, reported_requests: count, known_read_tokens: 0, known_input_tokens: cacheState === 'zero' ? count * 10 : 0, eligible_requests: count, unknown_requests: 0, hit_rate: cacheState === 'zero' ? 0 : null };
+        return route.fulfill({ json: { key_id: 'fixture-key', summary: metrics,
           by_day: empty ? [] : filtered ? [bucket('2026-10-09', 7)] : [bucket('2026-10-07', 100000), bucket('2026-10-08', 20000), bucket('2026-10-09', 3456)],
           by_model: empty ? [] : [bucket('Historical model', filtered ? 7 : 123456)], errors: [],
         } });
@@ -92,6 +98,21 @@ test('Portal request statistics use filtered API buckets, localized trends, and 
         }
       }
     }
+    for (const state of ['partial', 'unknown', 'zero', 'noInput'] as const) {
+      cacheState = state;
+      for (const locale of ['en', 'zh-CN'] as const) {
+        await page.evaluate(value => localStorage.setItem('mtc-locale', value), locale);
+        await page.reload();
+        await page.locator('.self-request-summary .analytics-metric-trend').first().waitFor();
+        const text = await page.locator('.self-request-summary').innerText();
+        if (state === 'partial') assert.match(text, locale === 'en' ? /some requests have incomplete cache data/ : /部分请求未提供完整的缓存用量/);
+        if (state === 'unknown') assert.match(text, locale === 'en' ? /Unknown/ : /未知/);
+        if (state === 'zero') assert.match(text, /0%/);
+        if (state === 'noInput') assert.match(text, locale === 'en' ? /no input tokens available/ : /没有可用于计算命中率的输入词元/);
+        await page.screenshot({ path: `${artifacts}/cache-${state}-${locale}.png`, fullPage: true });
+      }
+    }
+    cacheState = 'known';
     await page.evaluate(() => localStorage.setItem('mtc-locale', 'en'));
     await page.reload();
     await page.locator('.self-request-breakdown .bucket-heading').first().waitFor();

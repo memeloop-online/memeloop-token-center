@@ -757,6 +757,9 @@ fn anthropic_usage(value: &Value) -> Result<Value, &'static str> {
     let mut result = json!({"input_tokens":total_input,"output_tokens":output,"total_tokens":total,
         "cache_creation_input_tokens":cache_write});
     result["input_tokens_details"] = json!({"cached_tokens":cached});
+    if value.get("cache_read_input_tokens").is_none() {
+        result["cache_read_observed"] = Value::Bool(false);
+    }
     if value.get("cache_read_input_tokens").is_none()
         || value.get("cache_creation_input_tokens").is_none()
     {

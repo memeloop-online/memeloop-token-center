@@ -114,6 +114,12 @@ struct MeteredRequestUsage<'a> {
     billing_unit: &'a str,
 }
 
+#[derive(Default)]
+struct TerminalMetadata {
+    cause: Option<crate::model::RequestTerminalCause>,
+    cache_coverage: Option<crate::model::CacheUsageCoverage>,
+}
+
 pub struct StartProxyRequest<'a> {
     pub request_id: Uuid,
     pub key: &'a AuthenticatedKey,
@@ -1769,13 +1775,17 @@ impl Database {
                     billed_units: metered.map(|input| input.billed_units).unwrap_or_default(),
                     billing_unit: &reservation.billing_unit,
                 }),
-            input.terminal_cause,
-            usage.cache_coverage.filter(|coverage| {
-                usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)
-                    && coverage.read_tokens == usage.cached_input_tokens
-                    && coverage.inclusive_input_tokens == usage.total_input_tokens()
-                    && trusted_metered.is_none()
-            }),
+            TerminalMetadata {
+                cause: input.terminal_cause,
+                cache_coverage: usage.cache_coverage.filter(|coverage| {
+                    usage_basis == Some(crate::model::RequestUsageBasis::ProviderReported)
+                        && coverage.read_tokens == usage.cached_input_tokens
+                        && coverage
+                            .inclusive_input_tokens
+                            .is_none_or(|input| input == usage.total_input_tokens())
+                        && trusted_metered.is_none()
+                }),
+            },
         )
         .await?;
         if !finished {
@@ -2169,8 +2179,7 @@ async fn record_request_finished_with_basis_in_transaction(
         Some(project_aggregates),
         usage_basis,
         None,
-        None,
-        None,
+        TerminalMetadata::default(),
     )
     .await
 }
@@ -2182,9 +2191,12 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     project_aggregates: Option<bool>,
     usage_basis: Option<crate::model::RequestUsageBasis>,
     metered_usage: Option<MeteredRequestUsage<'_>>,
-    terminal_cause: Option<crate::model::RequestTerminalCause>,
-    cache_coverage: Option<crate::model::CacheUsageCoverage>,
+    metadata: TerminalMetadata,
 ) -> Result<bool, AppError> {
+    let TerminalMetadata {
+        cause: terminal_cause,
+        cache_coverage,
+    } = metadata;
     if project_aggregates.is_some() {
         lock_request_stats_projection_writer_in_transaction(tx).await?;
     }
@@ -2232,7 +2244,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .bind(billing_unit)
     .bind(terminal_cause.map(crate::model::RequestTerminalCause::as_str))
     .bind(cache_coverage.map(|value| value.read_tokens))
-    .bind(cache_coverage.map(|value| value.inclusive_input_tokens))
+    .bind(cache_coverage.and_then(|value| value.inclusive_input_tokens))
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() == 0 {
@@ -2264,7 +2276,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         == 1;
     if fact_inserted && project_aggregates {
         sqlx::query(
-            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, COALESCE(cache_known_read_tokens, 0), COALESCE(cache_known_input_tokens, 0), CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, cache_known_read_tokens = request_daily_aggregates.cache_known_read_tokens + excluded.cache_known_read_tokens, cache_known_input_tokens = request_daily_aggregates.cache_known_input_tokens + excluded.cache_known_input_tokens, cache_eligible_requests = request_daily_aggregates.cache_eligible_requests + excluded.cache_eligible_requests, cache_unknown_requests = COALESCE(request_daily_aggregates.cache_unknown_requests, request_daily_aggregates.requests) + excluded.cache_unknown_requests, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
+            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_read_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_input_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END, COALESCE(cache_known_read_tokens, 0), CASE WHEN cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, cache_known_read_tokens = request_daily_aggregates.cache_known_read_tokens + excluded.cache_known_read_tokens, cache_known_input_tokens = request_daily_aggregates.cache_known_input_tokens + excluded.cache_known_input_tokens, cache_eligible_requests = request_daily_aggregates.cache_eligible_requests + excluded.cache_eligible_requests, cache_unknown_requests = COALESCE(request_daily_aggregates.cache_unknown_requests, request_daily_aggregates.requests) + excluded.cache_unknown_requests, cache_reported_read_tokens = request_daily_aggregates.cache_reported_read_tokens + excluded.cache_reported_read_tokens, cache_reported_requests = request_daily_aggregates.cache_reported_requests + excluded.cache_reported_requests, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
         )
         .bind(&request_id)
         .execute(&mut **tx)
