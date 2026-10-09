@@ -176,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             previous_bundle_dir: arguments.previous_bundle_dir,
             previous_inventory_file: arguments.previous_inventory_file,
             installation,
-        }).await.map_err(|error| {
-            eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"descriptor_import","category":error.diagnostic_category()}));
+        }).await.map_err(|_| {
+            eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"descriptor_import","category":"descriptor_import_failed"}));
             "descriptor import failed (see safe diagnostic category)"
         })?;
         println!(
