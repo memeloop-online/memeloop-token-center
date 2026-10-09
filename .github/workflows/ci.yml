@@ -380,6 +380,14 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Optional routing SQL cannot delay forwarding or retain lifecycle capacity
         run: cargo test --locked --all-features --lib api::proxy::tests::routing_persistence
+      - name: Buffered delivery must precede PostgreSQL semantic materialization
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: cargo test --locked --all-features --lib -- --ignored --exact api::proxy::tests::persistence_isolation::buffered_semantic_isolation::postgres_buffered_delivery_does_not_wait_for_semantic_content_locks
+      - name: Recover owned semantic payload after PostgreSQL source deletion and failed ACK
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: cargo test --locked --all-features --lib -- --ignored --exact db::tests::terminal_projection::semantic_isolation::postgres_semantic_payload_recovers_without_source_or_duplicate_finance
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test

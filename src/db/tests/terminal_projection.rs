@@ -2,6 +2,8 @@ use super::super::*;
 use crate::conversation::ConversationHints;
 use std::time::Duration;
 
+mod semantic_isolation;
+
 async fn admitted(
     database: &Database,
     metered: bool,

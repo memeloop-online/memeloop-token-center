@@ -632,6 +632,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "non-secret OAuth refresh diagnostics",
         sql: include_str!("../../../migrations/common/0120_upstream_oauth_refresh_diagnostic.sql"),
     },
+    Migration {
+        version: 121,
+        name: "owned durable conversation semantic payload",
+        sql: include_str!("../../../migrations/common/0121_conversation_semantic_payload.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1247,6 +1252,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 120,
         name: "non-secret OAuth refresh diagnostics",
         sql: include_str!("../../../migrations/common/0120_upstream_oauth_refresh_diagnostic.sql"),
+    },
+    Migration {
+        version: 121,
+        name: "owned durable conversation semantic payload",
+        sql: include_str!("../../../migrations/common/0121_conversation_semantic_payload.sql"),
     },
 ];
 

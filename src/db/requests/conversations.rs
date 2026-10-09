@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+mod semantic_payload;
+
 // Candidate selection reads at most 50 observations. Persisting the complete
 // atom list for a near-limit request would otherwise let one ordinary request
 // make the next request materialize hundreds of MiB of JSON. The full Merkle
@@ -84,10 +86,12 @@ pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) content_materialized: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ConversationSemanticSnapshot {
     leaf: Option<String>,
     atom_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_digest: Option<String>,
 }
 
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
@@ -109,26 +113,22 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     } = input;
     // Exact-capacity serialization keeps the retained request envelope bounded
     // while the terminal transaction also owns the response ciphertext.
-    let (request_json, semantic_snapshot) = if content_materialized {
+    let payload = if content_materialized {
+        None
+    } else {
+        Some(semantic_payload::encode(request_id, key, request_json)?)
+    };
+    let (request_json, semantic_snapshot) = {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
         let snapshot = ConversationSemanticSnapshot {
             leaf: nodes.last().map(|node| node.node_hash.clone()),
             atom_hashes: bounded_atom_hashes(&atoms),
+            payload_digest: payload.as_ref().map(|(_, digest)| digest.clone()),
         };
         (
             "{}".to_owned(),
             Some(serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?),
-        )
-    } else {
-        let mut encoded_request = Vec::with_capacity(
-            crate::gateway_body::memory::json_encoded_length(request_json)?,
-        );
-        serde_json::to_writer(&mut encoded_request, request_json)
-            .map_err(|_| AppError::Internal)?;
-        (
-            String::from_utf8(encoded_request).map_err(|_| AppError::Internal)?,
-            None,
         )
     };
     let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
@@ -183,6 +183,9 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
                 "conversation projection evidence does not match its owner".into(),
             ));
         }
+    }
+    if let Some((body, digest)) = payload {
+        semantic_payload::persist(transaction, request_id, key, &body, &digest).await?;
     }
     Ok(())
 }
@@ -283,10 +286,10 @@ impl Database {
         // before taking the explicit-session lock below. A stale lease is
         // rechecked in the final transaction; its durable outbox row makes a
         // committed content-only prefix retryable rather than user-visible.
-        {
+        let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, request_json, observed_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -296,14 +299,43 @@ impl Database {
             let Some(prepare) = prepare else {
                 return Ok(false);
             };
-            if prepare
+            let snapshot: Option<ConversationSemanticSnapshot> = prepare
                 .try_get::<Option<String>, _>("semantic_snapshot_json")?
-                .is_none()
+                .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
+                .transpose()?;
+            if snapshot.is_none()
+                || snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.payload_digest.is_some())
             {
                 let prepare_tenant_id: String = prepare.try_get("tenant_id")?;
-                let prepare_request_json =
+                let prepare_request_json = if let Some(expected) =
+                    snapshot.as_ref().and_then(|s| s.payload_digest.as_deref())
+                {
+                    semantic_payload::load(
+                        self,
+                        request_id,
+                        &prepare_tenant_id,
+                        &prepare.try_get::<String, _>("key_id")?,
+                        &prepare.try_get::<String, _>("principal_id")?,
+                        expected,
+                    )
+                    .await?
+                } else {
                     serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
-                        .map_err(|_| AppError::Internal)?;
+                        .map_err(|_| AppError::Internal)?
+                };
+                if let Some(snapshot) = snapshot.as_ref() {
+                    let atoms = extract_atoms(&prepare_request_json);
+                    let nodes = build_prefix(&atoms);
+                    if snapshot.leaf != nodes.last().map(|node| node.node_hash.clone())
+                        || snapshot.atom_hashes != bounded_atom_hashes(&atoms)
+                    {
+                        return Err(AppError::Conflict(
+                            "conversation semantic snapshot integrity mismatch".into(),
+                        ));
+                    }
+                }
                 self.materialize_conversation_content(
                     &prepare_tenant_id,
                     &prepare_request_json,
@@ -311,7 +343,8 @@ impl Database {
                 )
                 .await?;
             }
-        }
+            snapshot
+        };
 
         let mut transaction = self.begin_write_transaction().await?;
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
@@ -419,6 +452,24 @@ impl Database {
             .try_get::<Option<String>, _>("semantic_snapshot_json")?
             .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
             .transpose()?;
+        if snapshot != prepared_snapshot {
+            return Err(AppError::Conflict(
+                "conversation semantic snapshot changed during projection".into(),
+            ));
+        }
+        if let Some(expected) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.payload_digest.as_deref())
+        {
+            semantic_payload::verify_in_transaction(
+                &mut transaction,
+                self.backend,
+                request_id,
+                &projection_key,
+                expected,
+            )
+            .await?;
+        }
         self.record_conversation_observation_with_snapshot_in_transaction(
             &mut transaction,
             ConversationObservationInput {
@@ -457,6 +508,8 @@ impl Database {
                 "conversation projection lease ownership changed".into(),
             ));
         }
+        sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3")
+            .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(key_id.to_string()).execute(&mut *transaction).await?;
         emit_conversation_projected_event_in_transaction(
             &mut transaction,
             request_id,

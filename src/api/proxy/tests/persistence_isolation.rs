@@ -1,5 +1,7 @@
 use super::*;
 
+mod buffered_semantic_isolation;
+
 #[tokio::test]
 async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding() {
     for mode in [
