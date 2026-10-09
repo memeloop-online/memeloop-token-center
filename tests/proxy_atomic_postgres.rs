@@ -1206,8 +1206,10 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     // Expiring the lease while pre-materialization waits proves that the final
     // session transaction rechecks ownership. The committed content rows have
     // no visible cluster meaning, while the durable outbox remains retryable.
-    sqlx::query(
-        "UPDATE conversation_projection_outbox SET lease_expires_at = $1 WHERE request_id = $2 AND lease_owner = $3",
+    // Semantic tasks use the terminal lease; the legacy lease remains fenced
+    // so an old projector cannot claim a pending semantic payload.
+    let expired = sqlx::query(
+        "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = $1 WHERE request_id = $2 AND terminal_lease_owner = $3",
     )
     .bind(unix_millis().saturating_sub(1))
     .bind(request_id.to_string())
@@ -1215,6 +1217,7 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     .execute(&inspection)
     .await
     .unwrap();
+    assert_eq!(expired.rows_affected(), 1);
     old_writer.commit().await.unwrap();
     assert!(
         !tokio::time::timeout(std::time::Duration::from_secs(30), &mut projection)

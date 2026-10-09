@@ -45,7 +45,10 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&118));
     assert!(versions.contains(&119));
     assert!(versions.contains(&120));
+    assert!(versions.contains(&121));
     for statement in [
+        "DROP TABLE conversation_semantic_payloads",
+        "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_payload_snapshot_json",
         "DROP TABLE terminal_projection_outbox",
         "DROP TABLE observability_prune_boundaries",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN key_snapshot_json",
@@ -79,10 +82,12 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120)")
-        .execute(&database.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&database.pool)
         .await
@@ -135,7 +140,7 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119, 120]);
+    assert_eq!(tail, vec![117, 118, 119, 120, 121]);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
@@ -159,7 +164,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119, 120]);
+        assert_eq!(tail, vec![117, 118, 119, 120, 121]);
     }
 }
 

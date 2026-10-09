@@ -1452,8 +1452,8 @@ impl Database {
                     // never create tenant content. Commit its unique-key locks
                     // before acquiring the session lock, including during rolling
                     // upgrades with older session-before-content writers.
-                    if defer_projection
-                        || trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
+                    if !defer_projection
+                        && trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
                     {
                         let atoms = extract_atoms(conversation.request_json);
                         let nodes = build_prefix(&atoms);
