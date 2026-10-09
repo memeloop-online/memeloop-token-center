@@ -284,7 +284,7 @@ function AppShellContent({ surface, route, onNavigate, children, pluginNavigatio
       </header>
       <p className="app-route-announcement" aria-live="polite" aria-atomic="true">{activeItem.label}</p>
       <main className="app-main-content" id="app-main-content" tabIndex={-1} data-surface={surface} data-route={route}>
-        <RouteErrorBoundary copy={routeErrorCopy} resetKey={`${surface}:${route}`}><PageLoadingRegion scopeKey={`${surface}:${navigationRoute}`} label={t('common.loading')}>{children}</PageLoadingRegion></RouteErrorBoundary>
+        <RouteErrorBoundary copy={routeErrorCopy} resetKey={`${surface}:${route}`}><PageLoadingRegion scopeKey={surface} label={t('common.loading')}>{children}</PageLoadingRegion></RouteErrorBoundary>
       </main>
     </div>
   </div>;
