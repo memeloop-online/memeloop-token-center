@@ -1,4 +1,4 @@
-import type { CacheStats } from '../types';
+import type { CacheStats } from '../types.js';
 
 export const cacheStatisticsCopy = {
   'zh-CN': {
