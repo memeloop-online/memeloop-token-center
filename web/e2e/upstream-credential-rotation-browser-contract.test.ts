@@ -37,6 +37,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
           return route.fulfill(responseStatus === 200 ? { json: { ...account, credential_generation: 2, updated_at: 3 } } : { status: responseStatus, json: { error: { message: 'must-not-expose-fixture-secret' } } });
         }
         if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: [account] });
+        if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, status: 'unknown', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] } });
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { oneOf: [
           { title: 'API key', type: 'object', additionalProperties: false, required: ['type', 'value'], properties: { type: { const: 'api_key' }, value: { type: 'string', minLength: 1, writeOnly: true }, header: { type: 'string', default: 'authorization' }, prefix: { type: 'string', default: 'Bearer ' } } },
           { title: 'OAuth', type: 'object', additionalProperties: false, required: ['type', 'access_token'], properties: { type: { const: 'oauth' }, access_token: { type: 'string', minLength: 1, writeOnly: true }, refresh_token: { type: 'string', writeOnly: true }, expires_at: { type: 'integer' } } },
@@ -103,6 +104,9 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await form.waitFor({ state: 'detached' });
       await page.getByText(copy.saved, { exact: true }).waitFor();
       assert.equal(await page.locator('.provider-directory-row').isVisible(), false);
+      const catalog = page.locator('.provider-detail-workspace .provider-model-catalog');
+      await catalog.getByText(locale === 'zh-CN' ? '待同步' : 'Ready to sync', { exact: true }).waitFor();
+      assert.equal(await catalog.getByRole('alert').count(), 0, 'a saved credential does not make a valid unsynced catalog a read failure');
       for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 1000 });
         const screenshotRoot = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));

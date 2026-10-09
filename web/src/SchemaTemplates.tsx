@@ -68,12 +68,17 @@ export function SchemaArrayItemTemplate({
   </div>;
 }
 
-export function SchemaErrorListTemplate({ errors }: ErrorListProps) {
+export function SchemaErrorListTemplate({ errors, schema }: ErrorListProps) {
   const { t } = useI18n();
   if (!errors.length) return null;
   return <div className="schema-errors" role="alert">
     <b>{t('schemaError.summary', { count: errors.length })}</b>
-    <ul>{errors.map((error, index) => <li key={`${error.property}-${error.name}-${index}`}><code>{error.property?.replace(/^\./, '') || t('schemaError.form')}</code><span>{validationMessage(error, t)}</span></li>)}</ul>
+    <ul>{errors.map((error, index) => {
+      const property = error.property?.replace(/^\./, '') ?? '';
+      const field = schema.properties?.[property];
+      const label = field && typeof field === 'object' && typeof field.title === 'string' ? field.title : property;
+      return <li key={`${error.property}-${error.name}-${index}`}><code>{label || t('schemaError.form')}</code><span>{validationMessage(error, t)}</span></li>;
+    })}</ul>
   </div>;
 }
 
