@@ -24,7 +24,6 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
 };
 
-// Localized fixed reasons; archived supplier messages are never UI copy.
 const supplierFailureCopy: Record<string, [string, string]> = {
   no_active_plan: ['当前上游账号没有可用套餐，需在提供商处开通或更换账号。', 'The upstream account has no active plan. Activate a plan with the provider or use another account.'],
   insufficient_quota: ['当前上游账号额度不足，需在提供商处补充额度或更换账号。', 'The upstream account has insufficient quota. Add quota with the provider or use another account.'],
@@ -33,6 +32,27 @@ const supplierFailureCopy: Record<string, [string, string]> = {
   rate_limited: ['上游服务已限制请求频率，请稍后重试。', 'The upstream service has limited the request rate. Try again later.'],
   model_unavailable: ['上游账号无法使用所请求的模型，需检查模型权限或更换模型。', 'The requested model is unavailable to the upstream account. Check model access or use another model.'],
 };
+
+const supplierVocabulary: Record<string, { base: string; codes: string[]; messages: string[] }> = {
+  no_active_plan: { base: '当前账号没有可用套餐', codes: ['no_active_plan', 'NoAvailablePlan', 'NoActivePlan', 'NoPlan', '402'], messages: ['当前账号没有可用套餐', 'No active plan', 'No available plan'] },
+  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota'] },
+  authentication_invalid: { base: 'The upstream authentication credentials are invalid', codes: ['authentication_invalid', 'invalid_api_key'], messages: ['Invalid API key', 'Invalid authentication credentials'] },
+  authentication_expired: { base: 'The upstream authentication credentials have expired', codes: ['authentication_expired', 'api_key_expired', 'token_expired'], messages: ['API key expired', 'Authentication token expired'] },
+  rate_limited: { base: 'The upstream request rate limit was exceeded', codes: ['rate_limited', 'rate_limit_exceeded'], messages: ['Rate limit exceeded', 'Too many requests'] },
+  model_unavailable: { base: 'The requested upstream model is unavailable', codes: ['model_unavailable', 'model_not_found', 'unsupported_model', '400'], messages: ['Model unavailable', 'Unsupported model', 'Model not found'] },
+};
+
+export function requestSupplierDetail(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+  const supplier = request.supplier_error;
+  if (!supplier || !Object.hasOwn(supplierVocabulary, supplier.code)) return null;
+  const vocabulary = supplierVocabulary[supplier.code];
+  const match = /^(.*?)(?:; provider code: ([^;]+))?(?:; provider message: ([^;]+))?$/.exec(supplier.message);
+  if (!match || match[0] !== supplier.message || match[1] !== vocabulary.base) return null;
+  const [, , code, message] = match;
+  if ((!code && !message) || (code && !vocabulary.codes.includes(code)) || (message && !vocabulary.messages.includes(message))) return null;
+  return [code && `${locale === 'zh-CN' ? '供应商错误码' : 'Provider error code'}: ${code}`,
+    message && `${locale === 'zh-CN' ? '供应商说明' : 'Provider message'}: ${message}`].filter(Boolean).join(' · ');
+}
 
 function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null {
   const cause = recordedFailureCopy[errorCode];
@@ -95,5 +115,6 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? (locale === 'zh-CN' ? '未知（未记录具体原因）' : 'Unknown (no specific cause recorded)')}` : '';
   return { outcome, label, tone: outcome === 'completed' ? 'ok' : ['cancelled', 'interrupted', 'failed'].includes(outcome) ? 'bad' : outcome === 'unknown' ? 'unknown' : 'pending',
     cause: failureDetail,
-    hint: ['failed', 'interrupted'].includes(outcome) ? failureDetail : [explanation, code].filter(Boolean).join(' · ') };
+    supplierDetail: requestSupplierDetail(request, locale),
+    hint: ['failed', 'interrupted'].includes(outcome) ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
 }

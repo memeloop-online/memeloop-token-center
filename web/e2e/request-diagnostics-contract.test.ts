@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { requestFailureCause, requestStatusCopy } from '../src/requestStatusPresentation.js';
+import { requestFailureCause, requestStatusCopy, requestSupplierDetail } from '../src/requestStatusPresentation.js';
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestView, RequestEvent } from '../src/types.js';
 
@@ -12,6 +12,34 @@ const operatorRequests = await readFile(new URL('../src/operator/pages/RequestsP
 const types = await readFile(new URL('../src/types.ts', import.meta.url), 'utf8');
 const copyButton = await readFile(new URL('../src/CopyButton.tsx', import.meta.url), 'utf8');
 const fixture = await readFile(new URL('./fixtures/request-diagnostics.tsx', import.meta.url), 'utf8');
+
+test('canonical supplier messages expose complete bounded provider details without trusting arbitrary text', () => {
+  const request: RequestView = { request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 402, duration_ms: 1, input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402' };
+  for (const [code, base, providerCode, message] of [
+    ['no_active_plan', '当前账号没有可用套餐', '402', '当前账号没有可用套餐'],
+    ['model_unavailable', 'The requested upstream model is unavailable', '400', 'Model not found'],
+    ['model_unavailable', 'The requested upstream model is unavailable', 'model_not_found', 'Model not found'],
+    ['model_unavailable', 'The requested upstream model is unavailable', 'unsupported_model', 'Unsupported model'],
+  ]) {
+    const canonical = `${base}; provider code: ${providerCode}; provider message: ${message}`;
+    const safe = { ...request, supplier_error: { code, message: canonical } };
+    for (const locale of ['zh-CN', 'en'] as const) {
+      const detail = requestSupplierDetail(safe, locale);
+      assert.ok(detail?.includes(providerCode) && detail.includes(message));
+      const copy = requestStatusCopy(safe, locale);
+      assert.equal(copy.hint, `${copy.cause} · ${detail}`);
+      assert.equal(copy.supplierDetail, detail);
+      assert.doesNotMatch(copy.hint, /Recorded status|记录状态码|http_402/);
+      assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code, message: base } }, locale), null);
+      for (const unsafe of ['', `${canonical}\n`, `${canonical}; extra: secret`, canonical.replace(message, 'Authorization: Bearer secret'), `${base}; provider message: https://example.invalid/?X-Amz-Signature=secret`, `${base}; provider code: 01900000-0000-7000-8000-000000000001`, `${base}; provider message: ${'x'.repeat(4096)}`, `${base}; provider message: Too many requests`]) {
+        assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code, message: unsafe } }, locale), null);
+      }
+      assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code: 'unknown', message: canonical } }, locale), null);
+    }
+  }
+  assert.match(components, /request-supplier-detail/);
+  assert.match(components, /<span>\{supplierDetail\}<\/span>/);
+});
 
 test('request table exposes copyable durable IDs and its recorded token billing split', () => {
   assert.match(components, /RequestIdentifier/);
