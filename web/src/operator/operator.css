@@ -1535,10 +1535,13 @@
   padding: 0 4px;
 }
 
+.usage-tabs button {
+  flex: 0 0 auto;
+}
+
 .usage-tabs button:not([class*="fui-"]) {
   border: 0;
   border-bottom: 2px solid transparent;
-  flex: 0 0 auto;
   padding: 11px 14px;
 }
 

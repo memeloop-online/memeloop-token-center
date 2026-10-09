@@ -49,6 +49,7 @@ async function geometry(control: Locator) {
     return {
       x: bounds.x, y: bounds.y, height: bounds.height, width: bounds.width, text: element.textContent,
       textRects, textLineCount: new Set(textRects.map(rect => rect.y)).size,
+      scrollWidth: element.scrollWidth, clientWidth: element.clientWidth, flexShrink: style.flexShrink,
       font: style.font, lineHeight: style.lineHeight,
       paddingBlock: [style.paddingTop, style.paddingBottom],
       paddingInline: [style.paddingLeft, style.paddingRight],
@@ -289,7 +290,12 @@ test('shared page action contexts retain Fluent geometry, labels, keyboard focus
         if (route.native) assert.equal(measured.textLineCount, 1, `${route.name}/${theme}/${width}/${measured.text}: short route actions do not wrap into character columns`);
         if (width <= 768) assert.ok(measured.width >= 44 && measured.height >= 44, `${route.name}/${theme}/${width}: shared narrow target is at least 44x44px`);
         assert.ok(measured.text?.trim(), `${route.name}: visible action label`);
-        assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}: action text contained`);
+        assert.equal(await action.evaluate(element => element.scrollWidth <= element.clientWidth), true, `${route.name}/${theme}/${width}/${measured.text}: action text contained`);
+        if (route.name === 'usage' && await action.evaluate(element => Boolean(element.closest('.usage-tabs')))) {
+          assert.equal(measured.flexShrink, '0', `${route.name}/${theme}/${width}/${measured.text}: the scrolling tab row preserves intrinsic control width`);
+          assert.equal(measured.textLineCount, 1, `${route.name}/${theme}/${width}/${measured.text}: tab labels remain on one line inside the scroll container`);
+          assert.ok(measured.textRects.every(rect => rect.x >= measured.x && rect.x + rect.width <= measured.x + measured.width), `${route.name}/${theme}/${width}/${measured.text}: actual glyph rectangles stay inside the tab`);
+        }
       }
       assert.deepEqual(errors, [], route.name);
       await page.close();
