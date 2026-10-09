@@ -249,6 +249,7 @@ export function RequestDiagnostics({
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
   const failureCause = pending || requestStatusCopy(request, locale).cause ? null : requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
+  const supplierDetail = requestStatusCopy(request, locale).supplierDetail;
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
@@ -262,6 +263,7 @@ export function RequestDiagnostics({
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {failureCause && <div className="request-detail-wide"><b>{t('request.error')}</b><span>{failureCause}</span></div>}
+      {supplierDetail && <div className="request-detail-wide request-supplier-detail"><b>{zh ? '供应商错误详情' : 'Provider error details'}</b><span>{supplierDetail}</span></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>
