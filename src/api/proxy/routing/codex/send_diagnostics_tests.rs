@@ -5,8 +5,6 @@ use super::*;
 
 #[tokio::test]
 async fn body_observation_preserves_frames_length_and_end_stream_without_claiming_delivery() {
-    use http_body_util::BodyExt;
-
     for payload in [Bytes::new(), Bytes::from_static(b"synthetic-body")] {
         let consumption = BodyConsumption::default();
         let mut request = crate::build_codex_http_client()
@@ -28,7 +26,8 @@ async fn body_observation_preserves_frames_length_and_end_stream_without_claimin
         assert_eq!(consumption.bytes(), 0);
         let mut body = request.body_mut().take().unwrap();
         let mut received = Vec::new();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
             let frame = frame.unwrap();
             if let Some(data) = frame.data_ref() {
                 received.extend_from_slice(data);
