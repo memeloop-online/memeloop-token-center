@@ -271,7 +271,16 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
 
-  await openAppRoute(page, 'operator', 'routes');
+  const leaveAuthorization = page.getByRole('dialog', { name: '请确认操作', exact: true });
+  await Promise.all([
+    openAppRoute(page, 'operator', 'routes'),
+    (async () => {
+      await assertVisible(leaveAuthorization);
+      assert.equal(new URL(page.url()).searchParams.get('view'), 'providers');
+      await leaveAuthorization.getByRole('button', { name: '确认继续', exact: true }).click();
+    })(),
+  ]);
+  await assertNoCount(leaveAuthorization);
   page.off('request', trackGroupList);
   assert.deepEqual(groupListRequests, [], 'tenant operator must never probe the global-only group list');
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
