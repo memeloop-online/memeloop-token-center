@@ -38,6 +38,71 @@ test("catalog sync has a complete POST-only response with required pricing outco
   });
 });
 
+test("plugin descriptor export declares global write authority and the complete observation-only response", () => {
+  const document = cloneDocument();
+  const path = "/internal/v1/plugin-runtime/descriptor";
+  const operation = document.paths[path].post;
+  assert.deepEqual(Object.keys(document.paths[path]), ["post"]);
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "plugins:write");
+  assert.equal(operation["x-global-operator-only"], true);
+  assert.equal(operation["x-experimental-feature"], "experimental-plugin-revisions");
+  assert.deepEqual(operation.parameters ?? [], []);
+  assert.equal(operation.requestBody.required, true);
+  assert.equal(operation.requestBody.content["application/json"].schema.$ref, "#/components/schemas/PluginDescriptorExportRequest");
+  const schemas = document.components.schemas;
+  const request = schemas.PluginDescriptorExportRequest;
+  assert.equal(request.additionalProperties, false);
+  assert.deepEqual(request.required, ["expected_revision"]);
+  assert.deepEqual(Object.keys(request.properties).sort(), ["expected_revision", "inventory_id"]);
+  assert.deepEqual(request.properties.inventory_id.type, ["string", "null"]);
+  assert.match(request.properties.inventory_id.description, /existence assertion, never a filter/);
+  assert.equal(request.properties.expected_revision.minimum, 0);
+  assert.match(operation.description, /observation consistency, not a CAS reservation/);
+  assert.match(operation.description, /not gateway readiness or publication approval/);
+  assert.match(operation.description, /without staging or granting capabilities/);
+  const response = operation.responses["200"];
+  assert.equal(response.headers["Cache-Control"].schema.const, "private, no-store");
+  assert.equal(response.content["application/json"].schema.$ref, "#/components/schemas/PluginDescriptorExport");
+  for (const status of ["400", "401", "403", "404", "409", "413", "415", "422", "500", "503"]) {
+    assert.ok(status in operation.responses);
+  }
+  const exported = schemas.PluginDescriptorExport;
+  assert.equal(exported.additionalProperties, false);
+  assert.deepEqual(exported.required, ["descriptor", "descriptor_digest", "observed_head"]);
+  assert.equal(exported.properties.descriptor.$ref, "#/components/schemas/PluginInventoryDescriptor");
+  assert.equal(exported.properties.descriptor_digest.pattern, "^[0-9a-f]{64}$");
+  assert.deepEqual(exported.properties.observed_head.oneOf, [{ $ref: "#/components/schemas/ApplicationPluginRevision" }, { type: "null" }]);
+  const descriptor = schemas.PluginInventoryDescriptor;
+  assert.equal(descriptor.additionalProperties, false);
+  assert.deepEqual(descriptor.required, ["format_version", "inventories"]);
+  assert.equal(descriptor.properties.format_version.const, 1);
+  assert.equal(descriptor.properties.inventories.maxProperties, undefined);
+  assert.equal(descriptor.properties.inventories.minProperties, undefined);
+  assert.equal(descriptor.properties.inventories.additionalProperties.$ref, "#/components/schemas/PluginDescriptorInventory");
+  const inventory = schemas.PluginDescriptorInventory;
+  assert.equal(inventory.additionalProperties, false);
+  assert.deepEqual(inventory.required, ["inventory", "packages", "identity_digest", "contract_digest"]);
+  assert.equal(inventory.properties.inventory.additionalProperties, false);
+  assert.deepEqual(inventory.properties.inventory.required, ["root", "grants"]);
+  assert.equal(inventory.properties.inventory.properties.grants.additionalProperties.items.$ref, "#/components/schemas/PluginDescriptorGrant");
+  assert.equal(inventory.properties.packages.additionalProperties.$ref, "#/components/schemas/PluginDescriptorPackageIdentity");
+  assert.deepEqual(schemas.PluginDescriptorGrant.required, ["version", "capabilities", "manifest_digest", "identity"]);
+  assert.equal(schemas.PluginDescriptorGrant.additionalProperties, false);
+  assert.equal(schemas.PluginDescriptorGrant.properties.identity.$ref, "#/components/schemas/PluginPackageIdentity");
+  assert.equal(schemas.PluginDescriptorPackageIdentity.additionalProperties, false);
+  assert.deepEqual(schemas.PluginDescriptorPackageIdentity.properties.component_sha256.type, ["string", "null"]);
+  const provenance = schemas.PluginDescriptorPackageIdentity.properties.provenance.allOf;
+  assert.equal(provenance[0].$ref, "#/components/schemas/PluginInstallProvenance");
+  assert.deepEqual(provenance[1].properties.signature_policy.enum, ["cosign-public-key", "cosign-keyless"]);
+  assert.deepEqual(schemas.PluginDescriptorCapability.oneOf[0].properties.kind.enum, ["log", "kv", "group_routing_quota"]);
+  assert.deepEqual(schemas.PluginDescriptorCapability.oneOf[1].required, ["kind", "allowed_origins"]);
+  const routes = sourceRoutes(readRustSource(`${repository}/src/api`)).filter((route) => route.path === path);
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0].method, "post");
+  assert.equal(routes[0].source_role, "control");
+});
+
 function sourceWith(controlExtra = "", gatewayExtra = "", commonExtra = ""): string {
   return `
 fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
