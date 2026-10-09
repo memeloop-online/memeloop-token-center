@@ -5625,7 +5625,9 @@ async fn chat_null_and_absent_service_tier_preserve_buffered_and_streaming_settl
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 });
                 (
-                    format!("data: {content}\n\ndata: {finished}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                    format!(
+                        "data: {content}\n\ndata: {finished}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
+                    ),
                     "text/event-stream",
                 )
             } else {
