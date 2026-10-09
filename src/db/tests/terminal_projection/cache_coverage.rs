@@ -1,15 +1,40 @@
 use super::*;
 
 async fn legacy_coverage_contract(database: &Database) {
-    let migrations = match database.backend {
-        DatabaseBackend::PostgreSql => crate::db::migrations::POSTGRES_MIGRATIONS,
-        DatabaseBackend::Sqlite => crate::db::migrations::SQLITE_MIGRATIONS,
-    };
-    let mut transaction = database.pool.begin().await.unwrap();
-    crate::db::migrations::apply_migration_range(&mut transaction, migrations, 1, 121)
+    database.migrate().await.unwrap();
+    for table in [
+        "request_records",
+        "terminal_projection_outbox",
+        "request_stats_facts",
+    ] {
+        for column in ["cache_known_input_tokens", "cache_known_read_tokens"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} DROP COLUMN {column}"
+            )))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        }
+    }
+    for column in [
+        "cache_known_input_tokens",
+        "cache_known_read_tokens",
+        "cache_eligible_requests",
+        "cache_unknown_requests",
+        "cache_reported_read_tokens",
+        "cache_reported_requests",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE request_daily_aggregates DROP COLUMN {column}"
+        )))
+        .execute(&database.pool)
         .await
         .unwrap();
-    transaction.commit().await.unwrap();
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 122")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let unique = Uuid::now_v7().to_string();
     let pepper = b"legacy cache coverage contract pepper";
     let issued = database
@@ -63,6 +88,61 @@ async fn legacy_coverage_contract(database: &Database) {
     .await
     .unwrap();
     assert_eq!(financial, 200);
+    let price = database
+        .upsert_model_price("legacy-cache", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 100,
+            output_token_ceiling: 20,
+            protocol: "openai",
+            model: "legacy-cache",
+            request_object: "gap://cache-coverage/fixture",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE request_records SET created_at = 0 WHERE id = $1",
+        "UPDATE request_record_locators SET created_at = 0 WHERE id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let mut input = finish(&key, &reservation, request_id);
+    input.input_token_ceiling = 100;
+    input.output_token_ceiling = 20;
+    input.usage = crate::api::parse_cache_usage_contract(
+        &serde_json::json!({"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":40}}}),
+    );
+    database.finish_proxy_request(input).await.unwrap();
+    let stats = database
+        .stats_filtered(
+            key.key_id,
+            StatsFilter {
+                from_created_at: Some(0),
+                to_created_at: Some(86_399_999),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.summary.total_requests, 6);
+    assert_eq!(stats.summary.cache_usage.unknown_requests, 5);
+    assert_eq!(stats.summary.cache_usage.eligible_requests, 1);
+    assert_eq!(stats.summary.cache_usage.reported_requests, 1);
+    assert_eq!(stats.summary.cache_usage.reported_read_tokens, 40);
+    assert_eq!(stats.summary.cache_usage.known_input_tokens, 100);
+    assert_eq!(stats.summary.cache_usage.hit_rate, Some(0.4));
 }
 
 async fn coverage_contract(database: &Database) {
