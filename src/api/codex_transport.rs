@@ -870,13 +870,17 @@ fn normalize_prompt_cache_key(
     let session_id = match object.get("prompt_cache_key") {
         None | Some(Value::Null) => request_id.to_string(),
         Some(Value::String(value))
-            if !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control) =>
+            if !value.is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control)
+                && value.trim_matches([' ', '\t']) == value.as_str() =>
         {
             value.clone()
         }
         Some(_) => {
             return Err(AppError::BadRequest(
-                "prompt_cache_key must be a bounded non-empty string".into(),
+                "prompt_cache_key must be a bounded non-empty string without surrounding spaces"
+                    .into(),
             ));
         }
     };
@@ -1093,7 +1097,10 @@ pub(super) fn apply_wreq_wire_headers(
                     "Codex metadata header exceeds its size limit".into(),
                 ));
             }
-            request = request.header(*name, value.clone());
+            let mut forwarded = http::HeaderValue::from_bytes(value.as_bytes().trim_ascii())
+                .map_err(|_| AppError::BadRequest("Codex metadata header is invalid".into()))?;
+            forwarded.set_sensitive(value.is_sensitive());
+            request = request.header(*name, forwarded);
         }
     }
     Ok(request
@@ -1101,8 +1108,14 @@ pub(super) fn apply_wreq_wire_headers(
         .header(header::ACCEPT, "text/event-stream")
         .header(header::ACCEPT_ENCODING, "identity")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("originator", client_identity.originator)
-        .header(header::USER_AGENT, client_identity.user_agent)
+        .header(
+            "originator",
+            client_identity.originator.trim_matches([' ', '\t']),
+        )
+        .header(
+            header::USER_AGENT,
+            client_identity.user_agent.trim_matches([' ', '\t']),
+        )
         .header("session-id", session_id)
         .header("chatgpt-account-id", account_id))
 }
@@ -2556,6 +2569,9 @@ mod tests {
         for invalid in [
             Value::String(String::new()),
             Value::String("x".repeat(257)),
+            json!(" leading"),
+            json!("trailing "),
+            json!(" "),
             json!(7),
         ] {
             let mut request = json!({"model": "public", "input": [], "prompt_cache_key": invalid});

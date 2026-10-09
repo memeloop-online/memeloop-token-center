@@ -6,6 +6,9 @@ pub(super) mod quota;
 mod retry;
 #[path = "codex/send_diagnostics.rs"]
 mod send_diagnostics;
+#[cfg(test)]
+#[path = "codex/wire_contract_tests.rs"]
+mod wire_contract_tests;
 
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
