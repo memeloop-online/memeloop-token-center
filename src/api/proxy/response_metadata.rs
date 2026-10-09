@@ -1,6 +1,10 @@
 use super::conversation_hints::safe_conversation_hint;
 use super::*;
 
+mod diagnostics;
+use diagnostics::UsageRejection;
+pub(super) use diagnostics::observe_buffered_usage_rejection;
+
 /// Result of bounded usage extraction from a buffered JSON or SSE body.
 pub(super) enum ExtractedUsage {
     Missing,
@@ -238,6 +242,10 @@ pub(super) fn extract_response_id(body: &[u8]) -> Option<String> {
 }
 
 pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsage>, ()> {
+    usage_from_value_diagnosed(value).map_err(|_| ())
+}
+
+fn usage_from_value_diagnosed(value: &Value) -> Result<Option<TokenUsage>, UsageRejection> {
     let Some(usage) = value
         .get("usage")
         .or_else(|| value.pointer("/message/usage"))
@@ -248,11 +256,13 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
     if usage.is_null() {
         return Ok(None);
     }
-    let usage = usage.as_object().ok_or(())?;
-    let integer = |field: &str| -> Result<Option<i64>, ()> {
+    let usage = usage
+        .as_object()
+        .ok_or(UsageRejection::InvalidType("usage"))?;
+    let integer = |field: &'static str| -> Result<Option<i64>, UsageRejection> {
         usage
             .get(field)
-            .map(|value| value.as_i64().ok_or(()))
+            .map(|value| value.as_i64().ok_or(UsageRejection::InvalidType(field)))
             .transpose()
     };
     let input = match integer("input_tokens")? {
@@ -265,9 +275,12 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
     };
     let cache_hit = integer("prompt_cache_hit_tokens")?;
     let cache_miss = integer("prompt_cache_miss_tokens")?;
-    for count in [cache_hit, cache_miss].into_iter().flatten() {
-        if !(0..=MAX_REPORTED_TOKENS).contains(&count) {
-            return Err(());
+    for (field, count) in [
+        ("prompt_cache_hit_tokens", cache_hit),
+        ("prompt_cache_miss_tokens", cache_miss),
+    ] {
+        if count.is_some_and(|count| !(0..=MAX_REPORTED_TOKENS).contains(&count)) {
+            return Err(UsageRejection::OutOfRange(field));
         }
     }
     let (reported_input, output) = match (input, output) {
@@ -280,18 +293,24 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         // input/output field with an invalid type still fails above.
         (None, None) => return Ok(None),
     };
-    let details_integer = |details_field: &str| -> Result<Option<i64>, ()> {
+    let details_integer = |details_field: &'static str| -> Result<Option<i64>, UsageRejection> {
         let Some(details) = usage
             .get(details_field)
             .filter(|details| details_field != "prompt_tokens_details" || !details.is_null())
         else {
             return Ok(None);
         };
-        let details = details.as_object().ok_or(())?;
+        let details = details
+            .as_object()
+            .ok_or(UsageRejection::InvalidType(details_field))?;
         details
             .get("cached_tokens")
             .filter(|value| details_field != "prompt_tokens_details" || !value.is_null())
-            .map(|value| value.as_i64().ok_or(()))
+            .map(|value| {
+                value
+                    .as_i64()
+                    .ok_or(UsageRejection::InvalidCachedType(details_field))
+            })
             .transpose()
     };
     let mut cached_input = match details_integer("input_tokens_details")? {
@@ -302,9 +321,9 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         },
     };
     if cache_hit.is_some() || cache_miss.is_some() {
-        let prompt = integer("prompt_tokens")?.ok_or(())?;
+        let prompt = integer("prompt_tokens")?.ok_or(UsageRejection::MissingPromptTokens)?;
         if input != Some(prompt) || !(0..=MAX_REPORTED_TOKENS).contains(&prompt) {
-            return Err(());
+            return Err(UsageRejection::InvalidPromptAlias);
         }
         if let Some(hit) = cache_hit {
             for reported in [
@@ -316,7 +335,7 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
             .flatten()
             {
                 if reported != hit {
-                    return Err(());
+                    return Err(UsageRejection::ConflictingCacheAliases);
                 }
             }
             cached_input = hit;
@@ -324,23 +343,25 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         if let Some(miss) = cache_miss
             && cached_input.checked_add(miss) != Some(prompt)
         {
-            return Err(());
+            return Err(UsageRejection::CacheNonconservation);
         }
     }
     let cache_write = if let Some(value) = integer("cache_creation_input_tokens")? {
         value
     } else if let Some(details) = usage.get("cache_creation") {
-        let details = details.as_object().ok_or(())?;
-        let detail_integer = |field: &str| -> Result<i64, ()> {
+        let details = details
+            .as_object()
+            .ok_or(UsageRejection::InvalidType("cache_creation"))?;
+        let detail_integer = |field: &'static str| -> Result<i64, UsageRejection> {
             details
                 .get(field)
-                .map(|value| value.as_i64().ok_or(()))
+                .map(|value| value.as_i64().ok_or(UsageRejection::InvalidType(field)))
                 .transpose()
                 .map(Option::unwrap_or_default)
         };
         detail_integer("ephemeral_5m_input_tokens")?
             .checked_add(detail_integer("ephemeral_1h_input_tokens")?)
-            .ok_or(())?
+            .ok_or(UsageRejection::CacheWriteOverflow)?
     } else {
         0
     };
@@ -353,7 +374,7 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         reported_input
             .checked_sub(cached_input)
             .and_then(|value| value.checked_sub(cache_write))
-            .ok_or(())?
+            .ok_or(UsageRejection::InputArithmeticOverflow)?
     } else {
         reported_input
     };
@@ -361,11 +382,13 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         .get("service_tier")
         .or_else(|| value.pointer("/response/service_tier"));
     let service_tier = match service_tier_value {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(value) => {
-            let tier = value.as_str().ok_or(())?;
+            let tier = value
+                .as_str()
+                .ok_or(UsageRejection::InvalidType("service_tier"))?;
             if !is_supported_service_tier(tier) {
-                return Err(());
+                return Err(UsageRejection::UnsupportedServiceTier);
             }
             Some(tier.to_owned())
         }
@@ -377,24 +400,22 @@ pub(super) fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsag
         output_tokens: output,
         service_tier,
     };
-    if [
-        parsed.input_tokens,
-        parsed.cached_input_tokens,
-        parsed.cache_write_tokens,
-        parsed.output_tokens,
-    ]
-    .into_iter()
-    .all(|tokens| (0..=MAX_REPORTED_TOKENS).contains(&tokens))
-        && parsed
-            .input_tokens
-            .checked_add(parsed.cached_input_tokens)
-            .and_then(|tokens| tokens.checked_add(parsed.cache_write_tokens))
-            .is_some()
-    {
-        Ok(Some(parsed))
-    } else {
-        Err(())
+    for (field, tokens) in [
+        ("normalized_input_tokens", parsed.input_tokens),
+        ("normalized_cached_input_tokens", parsed.cached_input_tokens),
+        ("normalized_cache_write_tokens", parsed.cache_write_tokens),
+        ("normalized_output_tokens", parsed.output_tokens),
+    ] {
+        if !(0..=MAX_REPORTED_TOKENS).contains(&tokens) {
+            return Err(UsageRejection::OutOfRange(field));
+        }
     }
+    parsed
+        .input_tokens
+        .checked_add(parsed.cached_input_tokens)
+        .and_then(|tokens| tokens.checked_add(parsed.cache_write_tokens))
+        .ok_or(UsageRejection::InputArithmeticOverflow)?;
+    Ok(Some(parsed))
 }
 
 #[cfg(test)]

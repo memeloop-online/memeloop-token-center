@@ -1,4 +1,6 @@
 export { MtcFluentProvider } from './MtcFluentProvider';
+export { LoadingProgress, LoadingState, PageLoadingRegion } from './loading';
+export type { LoadingLevel, LoadingVariant } from './loading';
 export { ActionButton, DataSurface, DetailTooltip, Disclosure, FormSection } from './primitives';
 // Keep ESM named imports: do not pull in Fluent v8, icon bundles, or runtime CDN assets.
 export {

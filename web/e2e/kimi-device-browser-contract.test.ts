@@ -114,7 +114,8 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       assert.equal(await connectionName.getAttribute('readonly'), '');
       await workspace.getByRole('button', { name: help.back, exact: true }).click();
       await details.waitFor();
-      assert.equal(await row.getByRole('button', { name: text.reauthorize, exact: true }).evaluate(button => document.activeElement === button), true);
+      assert.equal(await details.getByRole('button', { name: text.reauthorize, exact: true }).evaluate(button => document.activeElement === button), true);
+      assert.equal(await row.isVisible(), false, 'nested back returns to the account, with the directory inactive');
       assert.equal(writes.length, 0, 'navigation never starts login or changes routes');
       assert.deepEqual(pageErrors, [], 'unavailable non-critical statistics never crash account navigation');
       await page.close();

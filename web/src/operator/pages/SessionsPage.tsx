@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { api } from '../../api.js';
 import { DrawerFrame, RequestDiagnostics } from '../../components.js';
-import { Button, Disclosure, Spinner } from '../../design-system/index.js';
+import { Button, Disclosure, LoadingState, PageLoadingRegion } from '../../design-system/index.js';
 import { useI18n } from '../../i18n.js';
 import type { RequestDetail, RequestView } from '../../types.js';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
@@ -69,7 +69,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
     if (scopedSelection.request) void selectRequest(scopedSelection.request);
   };
 
-  return <>
+  return <PageLoadingRegion scopeKey={`${scopeKey}\0sessions`} label={t('common.loading')}>
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
     <article className="panel sessions-page">
       <div className="panel-title traffic-heading"><div><h2>{t('sessions.recent')}</h2><span>{t('sessions.monitorHint')}</span></div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" aria-pressed="false" onClick={onOpenRequests}>{t('sessions.requestsMode')}</button><button type="button" className="active" aria-pressed="true">{t('sessions.sessionsMode')}</button></div></div>
@@ -88,7 +88,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
     {scopedSelection.request && <DrawerFrame title={scopedSelection.detail?.model ?? scopedSelection.request.model} eyebrow={t('request.operatorDiagnosis')} onClose={closeRequestDetail}>
       {scopedSelection.phase === 'loading' && <>
         <RequestDiagnostics request={scopedSelection.request} />
-        <div className="empty" role="status" aria-live="polite"><Spinner size="extra-small" aria-hidden="true" />{t('common.loading')}</div>
+        <LoadingState label={t('common.loading')} variant="detail" />
       </>}
       {scopedSelection.phase === 'failed' && <>
         <RequestDiagnostics request={scopedSelection.request} />
@@ -107,5 +107,5 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
           </Disclosure>
         </>}
     </DrawerFrame>}
-  </>;
+  </PageLoadingRegion>;
 }

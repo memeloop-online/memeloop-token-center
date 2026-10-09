@@ -145,7 +145,10 @@ Then('插件配置由 Schema 渲染并可保存租户覆盖', async function (th
       && response.request().method() === 'PUT');
   await plugin.getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await saveResponse).status(), 200);
-  await assertContains(page.getByRole('status'), '已保存 browser-configuration 的配置');
+  const savedConfiguration = plugin.getByRole('status').filter({ hasText: '已保存 browser-configuration 的配置' });
+  await assertCount(savedConfiguration, 1);
+  await assertVisible(savedConfiguration);
+  await assertContains(savedConfiguration, '已保存 browser-configuration 的配置');
   await assertContains(plugin, '租户配置');
 });
 

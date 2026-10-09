@@ -1,7 +1,7 @@
 import { LocalSettlementNotice, localSettlementLabel } from '../LocalSettlementNotice';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import { DataSurface, DetailTooltip } from '../design-system';
+import { DataSurface, DetailTooltip, LoadingState } from '../design-system';
 import { Metric, RequestTable } from '../components';
 import { formatCompactCurrency, formatMetricDisplay, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
@@ -58,7 +58,7 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
     return () => { sequence.current += 1; };
   }, [credential]);
 
-  if (loading && !stats && !limits) return <div className="boot">{t('common.loading')}</div>;
+  if (loading && !stats && !limits) return <LoadingState label={t('common.loading')} level="page" variant="detail" />;
   const summary = stats?.summary;
   const balance = formatCompactCurrency(currentKey.available_balance, currentKey.currency, locale);
   const cost = formatCompactCurrency(summary?.total_cost, currentKey.currency, locale);

@@ -1,3 +1,4 @@
+use super::response_metadata::extract_buffered_usage_checked;
 use super::*;
 
 use axum::{
@@ -5588,6 +5589,196 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
 }
 
 #[tokio::test]
+async fn chat_null_and_absent_service_tier_preserve_buffered_and_streaming_settlement() {
+    for stream in [false, true] {
+        for null_tier in [false, true] {
+            let upstream = MockServer::start().await;
+            let usage = json!({
+                "prompt_tokens": 113,
+                "completion_tokens": 22,
+                "total_tokens": 135,
+                "prompt_tokens_details": {"cached_tokens": 0}
+            });
+            let mut terminal = json!({
+                "id": "chatcmpl-null-tier",
+                "object": "chat.completion",
+                "model": "compatible-chat-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": usage
+            });
+            if null_tier {
+                terminal["service_tier"] = Value::Null;
+            }
+            let (body, content_type) = if stream {
+                terminal["object"] = json!("chat.completion.chunk");
+                terminal["choices"] = json!([]);
+                let content = json!({
+                    "id": "chatcmpl-null-tier",
+                    "object": "chat.completion.chunk",
+                    "model": "compatible-chat-model",
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": null}]
+                });
+                let finished = json!({
+                    "id": "chatcmpl-null-tier",
+                    "object": "chat.completion.chunk",
+                    "model": "compatible-chat-model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                });
+                (
+                    format!(
+                        "data: {content}\n\ndata: {finished}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"
+                    ),
+                    "text/event-stream",
+                )
+            } else {
+                (terminal.to_string(), "application/json")
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body.clone(), content_type))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let label = format!("optional-tier-{stream}-{null_tier}");
+            let fixture = response_usage_fixture(&label, &upstream, 256).await;
+            let response = send_chat_usage_request(
+                &fixture,
+                &json!({
+                    "model": fixture.model,
+                    "messages": [{"role": "user", "content": "Reply only OK."}],
+                    "max_tokens": 32,
+                    "stream": stream,
+                    "stream_options": {"include_usage": true}
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let request_id =
+                Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+            let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            assert_eq!(delivered.as_ref(), body.as_bytes());
+            wait_for_request_settlement(&fixture, 1).await;
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].request_id, request_id);
+            assert_eq!(rows[0].status_code, Some(200));
+            assert_eq!(rows[0].error_code, None);
+            assert_eq!(
+                rows[0].usage_basis,
+                Some(crate::model::RequestUsageBasis::ProviderReported)
+            );
+            assert_eq!(
+                (
+                    rows[0].input_tokens,
+                    rows[0].output_tokens,
+                    rows[0].cached_input_tokens,
+                    rows[0].cache_write_tokens
+                ),
+                (113, 22, 0, 0)
+            );
+            assert_eq!(rows[0].cost, "0.000135");
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            let (actual_micros, service_tier, available_micros): (i64, String, i64) = sqlx::query_as(
+                "SELECT r.actual_micros, q.service_tier, c.available_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id JOIN key_records k ON k.id = q.key_id JOIN credit_accounts c ON c.id = k.account_id WHERE q.id = $1",
+            )
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+            assert_eq!(actual_micros, 135);
+            assert_eq!(service_tier, "default");
+            assert_eq!(available_micros, 999_865);
+            assert_exactly_once_side_effects(&fixture, request_id, None).await;
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn buffered_chat_usage_diagnostics_preserve_failure_accounting_and_error_precedence() {
+    for (label, provider_error, expected_error) in [
+        (
+            "usage-rejection-diagnostic",
+            Value::Null,
+            "upstream_invalid_usage",
+        ),
+        (
+            "usage-rejection-provider-error",
+            json!({"message": "private-provider-error"}),
+            "upstream_failed_response",
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "private-output"}}],
+                "error": provider_error,
+                "usage": {"prompt_tokens": "private-token", "completion_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = response_usage_fixture(label, &upstream, 256).await;
+        let response = send_chat_usage_request(
+            &fixture,
+            &json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "Reply only OK."}],
+                "max_tokens": 32,
+                "stream": false
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let request_id =
+            Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":{"message":"upstream request failed","type":"upstream_error"}}"#
+        );
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, request_id);
+        assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
+        assert_eq!(
+            rows[0].usage_basis,
+            Some(crate::model::RequestUsageBasis::NotObserved)
+        );
+        assert_eq!(
+            (
+                rows[0].input_tokens,
+                rows[0].output_tokens,
+                rows[0].cached_input_tokens,
+                rows[0].cache_write_tokens
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(rows[0].cost, "0");
+        assert_exactly_once_side_effects(&fixture, request_id, None).await;
+        assert_response_archives_omit(&fixture, "private").await;
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn streaming_response_error_null_completes_and_non_null_error_fails() {
     for (label, input_tokens, response_error, expected_status, expected_error) in [
         ("stream-null-error", 309, Value::Null, 200, None),
@@ -5717,6 +5908,163 @@ fn responses_sse_strict_terminal_requires_a_matching_completed_response_id() {
         ResponsesSseOutcome::Completed {
             response_id: Some("resp-strict".to_owned())
         }
+    );
+}
+
+#[test]
+fn optional_service_tier_preserves_usage_and_field_precedence() {
+    let expected = TokenUsage {
+        input_tokens: 113,
+        output_tokens: 22,
+        ..TokenUsage::default()
+    };
+    let usage = json!({
+        "prompt_tokens": 113,
+        "completion_tokens": 22,
+        "total_tokens": 135,
+        "prompt_tokens_details": {"cached_tokens": 0}
+    });
+    for (mut value, tier) in [
+        (json!({}), None),
+        (json!({"service_tier": null}), None),
+        (json!({"response": {"service_tier": null}}), None),
+        (
+            json!({"service_tier": null, "response": {"service_tier": "priority"}}),
+            None,
+        ),
+        (
+            json!({"service_tier": "flex", "response": {"service_tier": "priority"}}),
+            Some("flex"),
+        ),
+        (
+            json!({"response": {"service_tier": "priority"}}),
+            Some("priority"),
+        ),
+    ] {
+        value["usage"] = usage.clone();
+        let expected = TokenUsage {
+            service_tier: tier.map(str::to_owned),
+            ..expected.clone()
+        };
+        assert_eq!(usage_from_value_checked(&value), Ok(Some(expected.clone())));
+        let body = serde_json::to_vec(&value).unwrap();
+        let sse = format!("data: {value}\n\ndata: [DONE]\n\n");
+        for extracted in [
+            extract_buffered_usage_checked(&body, "http-json", Protocol::OpenAiChat),
+            extract_usage_checked(sse.as_bytes()),
+        ] {
+            match extracted {
+                ExtractedUsage::Valid(actual) => assert_eq!(actual, expected),
+                _ => panic!("optional service tier must retain valid usage"),
+            }
+        }
+        let mut capture = ResponsesSseCapture::for_delivery();
+        for chunk in sse.as_bytes().chunks(3) {
+            capture.push(chunk);
+        }
+        let summary = capture.finish_summary();
+        assert!(!summary.usage_invalid);
+        assert_eq!(summary.usage, Some(expected));
+    }
+    for tier in [
+        "default",
+        "auto",
+        "priority",
+        "flex",
+        "scale",
+        "batch",
+        "standard_only",
+    ] {
+        for value in [
+            json!({"usage": usage, "service_tier": tier}),
+            json!({"response": {"usage": usage, "service_tier": tier}}),
+        ] {
+            assert_eq!(
+                usage_from_value_checked(&value),
+                Ok(Some(TokenUsage {
+                    service_tier: Some(tier.to_owned()),
+                    ..expected.clone()
+                }))
+            );
+        }
+    }
+    assert_eq!(
+        usage_from_value_checked(&json!({"response": {"usage": usage, "service_tier": null}})),
+        Ok(Some(expected))
+    );
+}
+
+#[test]
+fn optional_service_tier_keeps_wrong_types_and_invalid_counts_rejected() {
+    for tier in [
+        json!(false),
+        json!(0),
+        json!({}),
+        json!([]),
+        json!(""),
+        json!("private-tier"),
+    ] {
+        for value in [
+            json!({"usage": {"prompt_tokens": 113, "completion_tokens": 22}, "service_tier": tier}),
+            json!({"response": {"usage": {"prompt_tokens": 113, "completion_tokens": 22}, "service_tier": tier}}),
+            json!({"usage": {"prompt_tokens": 113}, "service_tier": tier, "response": {"service_tier": "default"}}),
+        ] {
+            assert_eq!(usage_from_value_checked(&value), Err(()));
+            assert!(matches!(
+                extract_usage_checked(format!("data: {value}\n\ndata: [DONE]\n\n").as_bytes()),
+                ExtractedUsage::Invalid
+            ));
+            let mut capture = ResponsesSseCapture::for_delivery();
+            capture.push(format!("data: {value}\n\ndata: [DONE]\n\n").as_bytes());
+            assert!(capture.finish_summary().usage_invalid);
+        }
+    }
+    for usage in [
+        json!({"prompt_tokens": null}),
+        json!({"prompt_tokens": false}),
+        json!({"prompt_tokens": {}}),
+        json!({"prompt_tokens": "113"}),
+        json!({"prompt_tokens": -1}),
+        json!({"prompt_tokens": 1_000_000_001_i64}),
+        json!({"prompt_tokens": 113, "prompt_tokens_details": {"cached_tokens": 114}}),
+        json!({"prompt_tokens": 113, "prompt_cache_hit_tokens": 1, "prompt_cache_miss_tokens": 113}),
+    ] {
+        assert_eq!(
+            usage_from_value_checked(&json!({"usage": usage, "service_tier": null})),
+            Err(())
+        );
+    }
+}
+
+#[test]
+fn streaming_null_service_tier_does_not_erase_or_conflict_with_reported_tier() {
+    let mut usage = TokenUsage {
+        input_tokens: 113,
+        output_tokens: 22,
+        service_tier: Some("priority".to_owned()),
+        ..TokenUsage::default()
+    };
+    let unset = usage_from_value_checked(&json!({
+        "usage": {"prompt_tokens": 113, "completion_tokens": 22},
+        "service_tier": null
+    }))
+    .unwrap()
+    .unwrap();
+    let expected = usage.clone();
+    assert_eq!(
+        super::response_metadata::merge_streaming_usage(&mut usage, unset),
+        Ok(())
+    );
+    assert_eq!(usage, expected);
+    assert!(
+        super::response_metadata::merge_streaming_usage(
+            &mut usage,
+            TokenUsage {
+                service_tier: Some("flex".to_owned()),
+                ..TokenUsage::default()
+            }
+        )
+        .is_err()
     );
 }
 

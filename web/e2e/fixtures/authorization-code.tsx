@@ -36,7 +36,8 @@ function Fixture() {
 function ScopedProvidersFixture() {
   const [tenant, setTenant] = useState('fixture-a');
   const [token, setToken] = useState('fixture-token');
-  return <><button onClick={() => setTenant('fixture-b')}>Switch tenant</button><button onClick={() => setToken('next-fixture-token')}>Switch credential</button><ProvidersPage token={token} tenant={tenant} /></>;
+  const [writeTenant, setWriteTenant] = useState<string>();
+  return <><button onClick={() => setTenant(current => current === 'fixture-a' ? 'fixture-b' : 'fixture-a')}>Switch tenant</button><button onClick={() => setToken('next-fixture-token')}>Switch credential</button><button onClick={() => setWriteTenant(current => current ? undefined : 'fixture-b')}>Switch write tenant</button><ProvidersPage token={token} tenant={tenant} writeTenant={writeTenant} /></>;
 }
 const params = new URLSearchParams(location.search);
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{params.has('scope-controls') ? <ScopedProvidersFixture /> : params.has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);

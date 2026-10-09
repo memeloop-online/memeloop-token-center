@@ -1,0 +1,42 @@
+.identity-workspace {
+  min-width: 0;
+}
+
+.identity-workspace > .panel-title {
+  margin-bottom: 16px;
+}
+
+.identity-workspace > [role="tabpanel"] {
+  margin-top: 16px;
+  min-width: 0;
+}
+
+.proxy-groups-page {
+  min-width: 0;
+}
+
+.proxy-groups-page .transport-proxy-workspace {
+  width: 100%;
+  min-width: 0;
+}
+
+.proxy-groups-page .button-row {
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+}
+
+.proxy-groups-page .proxy-group-list {
+  min-block-size: 112px;
+}
+
+@media (max-width: 600px) {
+  .proxy-groups-page .button-row > span {
+    flex-basis: 100%;
+  }
+
+  .proxy-groups-page .fui-Input,
+  .proxy-groups-page .fui-Select {
+    max-width: 100%;
+    min-width: 0;
+  }
+}

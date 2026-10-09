@@ -1,14 +1,45 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync } from 'node:fs';
-import { readdir } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { chromium } from 'playwright';
+import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
+
+async function waitForInitialServiceCredential(page: Page, scenario: 'service-plaintext' | 'service-scope-aba') {
+  const credential = page.getByText('Existing service credential', { exact: true });
+  try {
+    await credential.waitFor();
+  } catch (reason) {
+    const directory = join(webRoot, 'e2e-artifacts/ui-system/loading/credential-visibility');
+    mkdirSync(directory, { recursive: true });
+    const ancestors = await credential.evaluate((element) => {
+      const chain: Element[] = [];
+      for (let ancestor: Element | null = element; ancestor; ancestor = ancestor.parentElement) chain.push(ancestor);
+      return chain.map((ancestor) => {
+        const style = getComputedStyle(ancestor);
+        const bounds = ancestor.getBoundingClientRect();
+        return {
+          tag: ancestor.tagName, classes: [...ancestor.classList], hidden: ancestor.hasAttribute('hidden'),
+          ariaHidden: ancestor.getAttribute('aria-hidden'), display: style.display, visibility: style.visibility,
+          contentVisibility: style.contentVisibility, overflow: style.overflow, fontSize: style.fontSize,
+          gridTemplateColumns: style.gridTemplateColumns, minWidth: style.minWidth, flex: style.flex,
+          bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+        };
+      });
+    }).catch((error: unknown) => ({ capture_error: error instanceof Error ? error.message : String(error) }));
+    await writeFile(join(directory, `${scenario}.json`), JSON.stringify({
+      evidence_kind: 'synthetic', integrated_sha: process.env.GITHUB_SHA ?? null, scenario,
+      failure: reason instanceof Error ? reason.message : String(reason), ancestors,
+    }, null, 2));
+    await page.screenshot({ path: join(directory, `${scenario}.png`), fullPage: true }).catch(() => undefined);
+    throw reason;
+  }
+}
 
 declare global {
   interface Window {
@@ -225,7 +256,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     plaintext.setDefaultTimeout(10_000);
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await plaintext.goto(fixture('service-plaintext'));
-    await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
+    await waitForInitialServiceCredential(plaintext, 'service-plaintext');
     await plaintext.getByRole('button', { name: 'Create service credential form', exact: true }).click();
     const plaintextForm = plaintext.locator('form.service-credential-create');
     await plaintextForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Plaintext integration');
@@ -262,7 +293,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     aba.setDefaultTimeout(10_000);
     await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await aba.goto(fixture('service-scope-aba'));
-    await aba.getByText('Existing service credential', { exact: true }).waitFor();
+    await waitForInitialServiceCredential(aba, 'service-scope-aba');
     await aba.getByRole('button', { name: 'Create service credential form', exact: true }).click();
     const abaForm = aba.locator('form.service-credential-create');
     await abaForm.getByRole('textbox', { name: 'Name', exact: true }).fill('Scoped integration');

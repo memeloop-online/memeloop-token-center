@@ -1,3 +1,5 @@
+import { readProxyGroupNavigationContext, withProxyGroupNavigationContext, type ProxyGroupNavigationContext } from './proxyGroupNavigation.js';
+
 export const portalRouteKeys = [
   'overview',
   'requests',
@@ -14,6 +16,7 @@ export const operatorRouteKeys = [
   'usage',
   'generations',
   'providers',
+  'proxy-groups',
   'routes',
   'pricing',
   'tenants',
@@ -33,6 +36,7 @@ export type AppRouteKey = PortalRouteKey | OperatorRouteKey | PluginRouteKey;
 export interface AppLocation {
   surface: AppSurface;
   route: AppRouteKey;
+  context?: ProxyGroupNavigationContext;
 }
 
 const routeSets: Record<AppSurface, ReadonlySet<string>> = {
@@ -68,7 +72,8 @@ export function readAppLocation(url: Pick<URL, 'pathname' | 'searchParams'>): Ap
   const route = candidate && (routeSets[surface].has(candidate) || (surface === 'operator' && isPluginRouteKey(candidate)))
     ? candidate as AppRouteKey
     : defaultRoutes[surface];
-  return { surface, route };
+  const context = surface === 'operator' && route === 'proxy-groups' ? readProxyGroupNavigationContext(url.searchParams.toString()) : {};
+  return { surface, route, ...(context.accountId || context.tenant ? { context } : {}) };
 }
 
 /**
@@ -76,11 +81,12 @@ export function readAppLocation(url: Pick<URL, 'pathname' | 'searchParams'>): Ap
  * routes. A `view` query keeps refresh and deep-link behavior real without
  * requiring a catch-all route or leaking any credential into browser history.
  */
-export function appHref(surface: AppSurface, route: AppRouteKey): string {
+export function appHref(surface: AppSurface, route: AppRouteKey, context: ProxyGroupNavigationContext = {}): string {
   if (!routeSets[surface].has(route) && !(surface === 'operator' && isPluginRouteKey(route))) throw new Error(`${route} is not a ${surface} route`);
-  return `/${surface}?${new URLSearchParams({ view: route }).toString()}`;
+  return withProxyGroupNavigationContext(`/${surface}?${new URLSearchParams({ view: route }).toString()}`, context);
 }
 
 export function isSameAppLocation(left: AppLocation, right: AppLocation): boolean {
-  return left.surface === right.surface && left.route === right.route;
+  return left.surface === right.surface && left.route === right.route
+    && left.context?.accountId === right.context?.accountId && left.context?.tenant === right.context?.tenant;
 }

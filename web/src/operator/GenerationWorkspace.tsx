@@ -2,7 +2,7 @@ import { useConfirmDialog } from '../useConfirmDialog';
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
-import { Button, DetailTooltip } from '../design-system';
+import { Button, DetailTooltip, LoadingProgress, LoadingState } from '../design-system';
 import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
@@ -118,7 +118,8 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
     {!detail && message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
       <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><Button appearance="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</Button></div></div>
-      {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll generation-table-scroll"><table className="generation-table">
+      <LoadingProgress active={loading && jobs.length > 0} label={t('common.loading')} level="page" />
+      {jobs.length === 0 ? loading ? <LoadingState label={t('common.loading')} level="page" /> : <div className="empty">{t('generations.empty')}</div> : <div className="table-scroll generation-table-scroll"><table className="generation-table">
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>
         <tbody>{jobs.map((job) => <tr key={job.job_id}>
           <td className="generation-time-cell" data-label={t('request.time')}>{new Date(job.created_at).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}</td>

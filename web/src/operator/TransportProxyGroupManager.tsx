@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
-import { Button, Dialog, DialogBody, DialogContent, DialogSurface, DialogTitle, Disclosure, Field, FormSection, Input, Select } from '../design-system';
+import { Button, Disclosure, Field, FormSection, Input, LoadingProgress, LoadingState, Select } from '../design-system';
 import { SecretInput } from '../SecretInput';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
@@ -12,6 +12,7 @@ interface Props {
   token: string;
   tenant: string;
   accounts: UpstreamAccount[];
+  accountsState?: 'loading' | 'failed' | 'ready';
   onChanged: () => Promise<void>;
 }
 
@@ -28,15 +29,12 @@ const ProxyGroupContext = createContext<{
   reason: string;
   retry: boolean;
   reload: () => void;
-  open: (accountId: string | undefined, trigger: HTMLButtonElement) => void;
-  toolbarTrigger: RefObject<HTMLButtonElement | null>;
+  open: (accountId: string) => void;
 } | null>(null);
 
-export function TransportProxyGroups(props: Props & { children: ReactNode }) {
-  const { locale, t } = useI18n();
+export function TransportProxyGroups(props: Props & { children: ReactNode; onNavigate?: (accountId?: string) => void }) {
+  const { locale } = useI18n();
   const copy = transportProxyGroupCopy(locale);
-  const [open, setOpen] = useState(false);
-  const [initialAccountId, setInitialAccountId] = useState<string>();
   const accessResource = useOperatorResource(Boolean(props.token), props.token, async signal => {
     try {
       const result = await transportProxyRequest<{ can_manage: boolean }>(`${transportProxyGroupsPath}/access`, props.token, { signal });
@@ -49,32 +47,14 @@ export function TransportProxyGroups(props: Props & { children: ReactNode }) {
   const accessState = accessResource.state;
   const access = accessState.kind === 'failed' || accessState.kind === 'ready' && accessState.refreshError
     ? 'unavailable' : accessState.kind === 'ready' ? accessState.value.can_manage ? 'allowed' : 'denied' : 'checking';
-  const toolbarTrigger = useRef<HTMLButtonElement>(null);
-  const returnFocus = useRef<HTMLButtonElement>(null);
-  const previouslyOpen = useRef(false);
-  const closeRequest = useRef<(() => Promise<void>) | null>(null);
-  useLayoutEffect(() => {
-    if (previouslyOpen.current && !open) (returnFocus.current?.isConnected ? returnFocus.current : toolbarTrigger.current)?.focus();
-    previouslyOpen.current = open;
-  }, [open]);
-  const requestClose = () => closeRequest.current ? void closeRequest.current() : setOpen(false);
   return <ProxyGroupContext.Provider value={{
-    allowed: Boolean(props.tenant) && access === 'allowed',
+    allowed: Boolean(props.tenant && props.onNavigate) && access === 'allowed',
     reason: !props.tenant ? copy.selectTenant : access === 'checking' ? copy.checking : access === 'denied' ? copy.denied : access === 'unavailable' ? copy.unavailable : '',
     retry: access === 'denied' || access === 'unavailable',
     reload: () => void accessResource.reload(),
-    open: (accountId, trigger) => { if (props.tenant && access === 'allowed') { returnFocus.current = trigger; setInitialAccountId(accountId); setOpen(true); } },
-    toolbarTrigger,
+    open: accountId => { if (props.tenant && access === 'allowed') props.onNavigate?.(accountId); },
   }}>
     {props.children}
-    <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) requestClose(); }}>
-    <DialogSurface style={{ width: 'min(920px, 96vw)', maxWidth: '96vw' }}>
-      <DialogBody>
-        <DialogTitle action={<Button appearance="subtle" type="button" onClick={requestClose}>{t('common.close')}</Button>}>{copy.title}</DialogTitle>
-        <DialogContent>{open && access === 'allowed' && <ProxyGroupWorkspace {...props} initialAccountId={initialAccountId} key={`${props.token}\0${props.tenant}`} closeRequest={closeRequest} onClose={() => setOpen(false)} />}</DialogContent>
-      </DialogBody>
-    </DialogSurface>
-    </Dialog>
   </ProxyGroupContext.Provider>;
 }
 
@@ -83,21 +63,22 @@ export function TransportProxyGroupAction({ accountId, disabled = false }: { acc
   const { locale } = useI18n();
   const copy = transportProxyGroupCopy(locale);
   const description = useId();
-  if (!context) return null;
+  if (!context || !accountId) return null;
   return <div className="row-actions transport-proxy-management-action">
-    <Button ref={accountId ? undefined : context.toolbarTrigger} appearance="secondary" type="button" disabled={disabled || !context.allowed} aria-describedby={context.reason ? description : undefined} onClick={event => context.open(accountId, event.currentTarget)}>{accountId ? copy.chooseGroup : copy.manage}</Button>
+    <Button appearance="secondary" type="button" disabled={disabled || !context.allowed} aria-describedby={context.reason ? description : undefined} onClick={() => context.open(accountId)}>{copy.chooseGroup}</Button>
     {context.reason && <span id={description} className="muted" role="status">{context.reason}</span>}
-    {!accountId && context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
+    {context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
   </div>;
 }
 
-function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, closeRequest, initialAccountId }: Props & { initialAccountId?: string; onClose: () => void; closeRequest: RefObject<(() => Promise<void>) | null> }) {
+export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = 'ready', onChanged, closeRequest, initialAccountId }: Props & { initialAccountId?: string; closeRequest: RefObject<(() => Promise<boolean>) | null> }) {
   const { locale, t } = useI18n();
   const copy = transportProxyGroupCopy(locale);
   const eligibleAccounts = accounts.filter(account => account.driver === 'openai-codex' && account.auth_kind === 'oauth'
     && account.can_update_transport_proxy === true && (!account.tenant_external_id || account.tenant_external_id === tenant));
   const inputPrefix = useId();
-  const { confirm, confirmationDialog } = useConfirmDialog([token, tenant]);
+  const [failureKind, setFailureKind] = useState<ReturnType<typeof transportProxyFailureKind>>();
+  const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, failureKind === 'denied']);
   const [groups, setGroups] = useState<TransportProxyGroup[]>([]);
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -116,11 +97,11 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
   const locked = useRef(false);
   const pendingWrite = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLDivElement>(null);
-  const [failureKind, setFailureKind] = useState<ReturnType<typeof transportProxyFailureKind>>();
   const bindingRead = useRef(0);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
   const selectedGroup = groups.find(group => group.id === groupId);
   const boundGroup = groups.find(group => group.id === binding?.group_id);
+  const bindingDirty = Boolean(groupId || initialMember || singleMember);
   const requiresReplacement = Boolean(editing?.bound_account_count && editing.members.some(member => {
     const draft = members.find(value => value.id === member.id);
     return !draft || Boolean(draft.proxyUrl.trim());
@@ -134,10 +115,10 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
 
   async function requestClose() {
     if (pendingWrite.current) {
-      if (!await confirm(copy.closePending)) return;
+      if (!await confirm(copy.closePending)) return false;
       pendingWrite.current?.abort();
-    } else if (editing !== undefined && !await confirm(copy.closeDraft)) return;
-    onClose();
+    } else if ((editing !== undefined || bindingDirty) && !await confirm(copy.closeDraft)) return false;
+    return true;
   }
 
   useLayoutEffect(() => {
@@ -155,6 +136,16 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
     return () => { alive.current = false; bindingRead.current += 1; pendingWrite.current?.abort(); };
   }, []);
 
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (editing === undefined && !bindingDirty && !pendingWrite.current) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => window.removeEventListener('beforeunload', beforeUnload);
+  }, [editing, bindingDirty]);
+
   async function refresh() {
     if (locked.current) return;
     locked.current = true;
@@ -168,11 +159,17 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
       setGroups(result.items); setBinding(current); setReady(true);
       if (failureKind === 'unknown') setMessage(copy.refreshedUnknown);
       setFailureKind(undefined);
-    } catch (reason) { if (alive.current) setError(transportProxyError(reason, locale, 'read')); }
+    } catch (reason) {
+      if (alive.current) {
+        setError(transportProxyError(reason, locale, 'read'));
+        if (transportProxyFailureKind(reason) === 'denied') { clearRestrictedState(); setFailureKind('denied'); }
+      }
+    }
     finally { locked.current = false; if (alive.current) setBusy(false); }
   }
 
   async function selectAccount(id: string) {
+    if (bindingDirty && !await confirm(copy.switchAccountDraft)) return;
     const revision = ++bindingRead.current;
     setAccountId(id); setBinding(undefined); setGroupId(''); setInitialMember(''); setSingleMember(''); setError(''); setMessage('');
     if (!id) return;
@@ -197,8 +194,14 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
         const kind = transportProxyFailureKind(reason);
         setError(transportProxyError(reason, locale)); setFailureKind(kind);
         setReady(kind === 'validation');
+        if (kind === 'denied') clearRestrictedState();
       }
     } finally { pendingWrite.current = null; locked.current = false; if (alive.current) setBusy(false); }
+  }
+
+  function clearRestrictedState() {
+    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setReplacement('');
+    setGroupId(''); setInitialMember(''); setSingleMember(''); setAccountId('');
   }
 
   function editGroup(group: TransportProxyGroup | null) {
@@ -224,7 +227,13 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
       });
       if (!alive.current) return;
       setGroups(current => [...current.filter(group => group.id !== saved.id), saved]);
-      setEditing(undefined); setMembers([]); setName(''); setBinding(undefined); setAccountId('');
+      setEditing(undefined); setMembers([]); setName(''); setBinding(undefined);
+      if (accountId) {
+        try {
+          const latest = await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`);
+          if (alive.current) setBinding(latest);
+        } catch { if (alive.current) setError(copy.errors.load); }
+      }
     }, copy.saved);
   }
 
@@ -256,17 +265,19 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
     <p>{copy.purpose}</p>
     <div className="button-row">
       <Button type="button" disabled={busy} onClick={async () => {
-        if (editing !== undefined && !await confirm(copy.refreshDraft)) return;
+        if ((editing !== undefined || bindingDirty) && !await confirm(copy.refreshDraft)) return;
         setMessage(''); void refresh();
       }}>{busy ? t('common.loading') : copy.refresh}</Button>
     </div>
     <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
-      {busy && <p role="status">{t('common.loading')}</p>}
+      <LoadingProgress active={busy} label={t('common.loading')} level={ready ? 'section' : 'page'} />
       {error && <p className="notice error" role="alert">{error}</p>}
       {message && <p className="notice success" role="status">{message}</p>}
     </div>
     <fieldset disabled={!ready || busy} style={{ border: 0, padding: 0, minWidth: 0 }}>
       <FormSection title={copy.title} description={copy.groupsHint}>
+        <div className="proxy-group-list">
+        {!ready && busy && groups.length === 0 && <LoadingState label={t('common.loading')} variant="compact" />}
         {ready && groups.length === 0 && <p>{copy.empty}</p>}
         {groups.map(group => <div className="button-row" key={group.id}>
           <span>{copy.groupSummary(group.name, group.members.length, group.bound_account_count)}</span>
@@ -279,6 +290,7 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
             }, copy.deleted);
           }}>{t('common.remove')}</Button>
         </div>)}
+        </div>
         <Button type="button" disabled={editing !== undefined} onClick={() => editGroup(null)}>{copy.create}</Button>
       </FormSection>
       {editing !== undefined && <form onSubmit={event => { event.preventDefault(); void saveGroup(); }}>
@@ -311,12 +323,13 @@ function ProxyGroupWorkspace({ token, tenant, accounts, onChanged, onClose, clos
       </form>}
       <fieldset disabled={editing !== undefined} style={{ border: 0, padding: 0, minWidth: 0 }}>
         <FormSection title={copy.bindingTitle} description={copy.bindingHint}>
-          <Field label={copy.account}><Select value={accountId} onChange={event => void selectAccount(event.target.value)}>
+          <Field label={copy.account}><Select value={accountId} disabled={accountsState !== 'ready'} onChange={event => void selectAccount(event.target.value)}>
             <option value="">{copy.selectAccount}</option>
             {eligibleAccounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}
           </Select></Field>
-          {ready && eligibleAccounts.length === 0 && <p>{copy.noAccounts}</p>}
-          {accountId && !binding && <p role="status">{copy.loadingBinding}</p>}
+          {accountsState === 'loading' && <LoadingState label={copy.loadingBinding} variant="compact" />}
+          {ready && accountsState === 'ready' && eligibleAccounts.length === 0 && <p>{copy.noAccounts}</p>}
+          {accountId && !binding && !error && <LoadingState label={copy.loadingBinding} variant="compact" />}
           {binding && <>
             <p>{copy.currentGroup}: {binding.group_id ? boundGroup?.name ?? copy.refreshRequired : copy.noGroup}</p>
             <Disclosure title={copy.connectionDetails}>
