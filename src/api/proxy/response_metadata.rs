@@ -382,7 +382,7 @@ fn usage_from_value_diagnosed(value: &Value) -> Result<Option<TokenUsage>, Usage
         .get("service_tier")
         .or_else(|| value.pointer("/response/service_tier"));
     let service_tier = match service_tier_value {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(value) => {
             let tier = value
                 .as_str()
