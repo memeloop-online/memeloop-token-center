@@ -3386,11 +3386,13 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
             .await
             .unwrap();
         let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
-        sqlx::query("UPDATE upstream_credentials SET expires_at = 10 WHERE upstream_account_id = $1")
-            .bind(original.id.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_credentials SET expires_at = 10 WHERE upstream_account_id = $1",
+        )
+        .bind(original.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
         if disconnected {
             state
                 .db
