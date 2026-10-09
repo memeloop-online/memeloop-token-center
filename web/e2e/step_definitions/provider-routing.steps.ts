@@ -186,9 +186,24 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(proxyAccessResponse.status(), 200);
   assert.equal(new URL(proxyAccessResponse.url()).search, '');
   assert.deepEqual(await proxyAccessResponse.json(), { can_manage: false });
-  await assertVisible(page.getByText('你没有管理代理组的权限，请联系管理员开通。', { exact: true }));
-  assert.equal(await page.getByRole('button', { name: '管理代理组', exact: true }).isEnabled(), false);
+  if ((page.viewportSize()?.width ?? 1280) < 900) {
+    const menu = page.locator('.app-mobile-menu');
+    if (await menu.getAttribute('aria-expanded') !== 'true') await menu.click();
+  }
+  const proxyGroupsLink = page.locator('.app-navigation a[href="/operator?view=proxy-groups"]');
+  await proxyGroupsLink.click();
+  const proxyGroups = page.locator('.proxy-groups-page');
+  const proxyGroupDenial = proxyGroups.getByRole('alert');
+  await assertVisible(proxyGroupDenial);
+  await assertExactText(proxyGroupDenial, '你没有管理代理组的权限，请联系管理员开通。');
+  assert.equal(await proxyGroupsLink.getAttribute('aria-current'), 'page');
+  assert.equal(new URL(page.url()).searchParams.get('view'), 'proxy-groups');
+  await assertNoCount(proxyGroups.getByRole('button', { name: '新建代理组', exact: true }));
+  await assertNoCount(proxyGroups.locator('form'));
   assert.deepEqual(groupListRequests, []);
+  await proxyGroups.getByRole('button', { name: '返回上游账号', exact: true }).click();
+  await assertVisible(page.locator('.provider-list'));
+  assert.equal(new URL(page.url()).searchParams.get('view'), 'providers');
   const onboarding = page.locator('.create-journey');
   await onboarding.locator('[data-workspace-toggle]').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
@@ -199,8 +214,11 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
   await providerAccount.getByRole('button', { name: '管理账号', exact: true }).click();
-  await providerAccount.getByRole('button', { name: '近期可用性', exact: true }).click();
-  await providerAccount.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
+  const providerWorkspace = page.locator(`[id="provider-details-${seed.upstreamId}"]`);
+  await assertVisible(providerWorkspace);
+  assert.equal(await page.locator('.provider-list').isVisible(), false);
+  await providerWorkspace.getByRole('button', { name: '近期可用性', exact: true }).click();
+  await providerWorkspace.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
   // The shared seed includes a routed 429. Do not make this UI assertion
   // depend on whether its real-time breaker cooldown has already elapsed.
   const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
@@ -219,8 +237,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
       }),
     });
   });
-  await providerAccount.getByRole('button', { name: '主动健康检查' }).click();
-  const manualHealth = providerAccount.locator('.provider-manual-health');
+  await providerWorkspace.getByRole('button', { name: '主动健康检查' }).click();
+  const manualHealth = providerWorkspace.locator('.provider-manual-health');
   await assertContains(manualHealth, '上游限流中');
   await assertContains(manualHealth, '最早重试时间');
   await assertContains(manualHealth, '未发送额外探测请求');
@@ -230,14 +248,22 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     return response.request().method() === 'PATCH'
       && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
   });
-  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
-  await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
+  await providerWorkspace.getByRole('button', { name: '危险操作', exact: true }).click();
+  await providerWorkspace.getByRole('button', { name: '停用', exact: true }).click();
   assert.equal((await disabledProvider).status(), 200);
+  await assertContains(providerWorkspace, '已停用');
+  await assertNotContains(providerWorkspace, '上游限流中');
+  await providerWorkspace.getByRole('button', { name: '返回账号列表', exact: true }).click();
+  await assertNoCount(providerWorkspace);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '上游限流中');
-  await providerAccount.getByRole('button', { name: '危险操作', exact: true }).click();
-  await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
+  await providerAccount.getByRole('button', { name: '管理账号', exact: true }).click();
+  await providerWorkspace.getByRole('button', { name: '危险操作', exact: true }).click();
+  await providerWorkspace.getByRole('button', { name: '启用', exact: true }).click();
+  await assertContains(providerWorkspace, '正常');
+  await providerWorkspace.getByRole('button', { name: '返回账号列表', exact: true }).click();
+  await assertNoCount(providerWorkspace);
   await assertContains(providerAccount, '正常');
   await onboarding.locator('[data-workspace-toggle]').click();
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
@@ -269,7 +295,9 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await routeEditor.getByRole('button', { name: '保存', exact: true }).click();
   const updatedRouteResponse = await updatedRoute;
   assert.equal(updatedRouteResponse.status(), 200, await updatedRouteResponse.text());
-  await assertContains(page.getByRole('status'), '路由已更新');
+  const routeUpdated = page.getByRole('status').filter({ hasText: '路由已更新' });
+  await assertVisible(routeUpdated);
+  await assertContains(routeUpdated, '路由已更新');
   await assertContains(routeRow, 'mock-provider-model-v2');
   await routeRow.getByRole('button', { name: '停用', exact: true }).click();
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
