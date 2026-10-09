@@ -280,10 +280,35 @@ async fn persistence_contract(database: &Database) {
         .await
         .unwrap();
     assert!(first.advance_after_connect_failure(&[0]).unwrap());
+    let backup = groups.select(account_id, 1, &source).unwrap();
+    assert!(backup.advance_after_connect_failure(&[1]).unwrap());
+    let primary = groups.select(account_id, 1, &source).unwrap();
+    assert!(primary.advance_after_connect_failure(&[0]).unwrap());
     groups.groups[&account_id]
         .synchronize(&database.pool)
         .await
         .unwrap();
+    for _ in 0..3 {
+        groups.groups[&account_id]
+            .synchronize(&database.pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT selected_index, selection_generation FROM upstream_transport_proxy_selections WHERE account_id = $1")
+            .bind(account_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.try_get::<i64, _>("selected_index").unwrap(), 1);
+        assert_eq!(row.try_get::<i64, _>("selection_generation").unwrap(), 2);
+        assert_eq!(
+            first.advance_after_connect_failure_outcome(&[0]).unwrap(),
+            "contended"
+        );
+        assert_eq!(
+            groups.select(account_id, 1, &source).unwrap().member(),
+            Some(1)
+        );
+    }
     let restarted = super::tests::groups(account_id, 1);
     restarted.groups[&account_id]
         .synchronize(&database.pool)
@@ -345,6 +370,10 @@ async fn persistence_contract(database: &Database) {
         .unwrap();
     assert!(groups.select(account_id, 1, &source).is_err());
     assert_eq!(
+        backup.advance_after_connect_failure_outcome(&[1]).unwrap(),
+        "stale"
+    );
+    assert_eq!(
         groups
             .select(account_id, 2, &source)
             .unwrap()
@@ -359,6 +388,7 @@ async fn persistence_contract(database: &Database) {
         .await
         .unwrap();
     let newer = super::tests::groups(account_id, 2);
+    let old_version_ticket = groups.select(account_id, 2, &source).unwrap();
     newer.select(account_id, 2, &source).unwrap();
     newer.groups[&account_id]
         .synchronize(&database.pool)
@@ -369,6 +399,12 @@ async fn persistence_contract(database: &Database) {
         .await
         .unwrap();
     assert!(groups.select(account_id, 2, &source).is_err());
+    assert_eq!(
+        old_version_ticket
+            .advance_after_connect_failure_outcome(&[1])
+            .unwrap(),
+        "stale"
+    );
     let conflict = TransportProxyGroups::parse(
         &serde_json::json!([{
             "account_id":account_id,"version":2,"proxies":[PRIMARY,"socks5h://10.20.30.42:1080"]
