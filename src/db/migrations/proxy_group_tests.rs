@@ -82,10 +82,12 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121)")
-        .execute(&database.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&database.pool)
         .await
