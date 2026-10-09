@@ -42,16 +42,31 @@ fn safe_error_body(raw: &[u8]) -> Bytes {
         (Some(value), None) | (None, Some(value)) => value.as_str(),
         _ => None,
     };
-    let code = error.get("code").and_then(Value::as_str);
+    let numeric_code = error
+        .get("code")
+        .and_then(Value::as_u64)
+        .and_then(|code| match code {
+            400 => Some("400"),
+            402 => Some("402"),
+            _ => None,
+        });
+    let code = error.get("code").and_then(Value::as_str).or(numeric_code);
     let Some(reason) = SafeReason::from_supplier(code, message) else {
         return fallback_body();
     };
-    let envelope = json!({"error": {
+    let mut envelope = json!({"error": {
         "type": "upstream_error",
         "code": reason.code(),
         "message": reason.message(),
         "mtc_safe_reason": reason.code()
     }});
+    let (code, message) = reason.provider_detail(code, message);
+    if let Some(code) = code {
+        envelope["error"]["mtc_provider_code"] = json!(code);
+    }
+    if let Some(message) = message {
+        envelope["error"]["mtc_provider_message"] = json!(message);
+    }
     serde_json::to_vec(&envelope)
         .map(Bytes::from)
         .unwrap_or_else(|_| fallback_body())
@@ -188,18 +203,32 @@ mod tests {
             assert_eq!(
                 value,
                 json!({"error": {"type": "upstream_error",
-                "code": expected.code(), "message": expected.message(), "mtc_safe_reason": expected.code()}})
+                "code": expected.code(), "message": expected.message(), "mtc_safe_reason": expected.code(),
+                "mtc_provider_code": code}})
             );
             let inline = format!("inline-json:{}", std::str::from_utf8(&body).unwrap());
             let projected =
                 crate::supplier_error::supplier_error_from_inline_json(Some(&inline)).unwrap();
             assert_eq!(projected.code, expected.code());
-            assert_eq!(projected.message, expected.message());
+            assert_eq!(
+                projected.message,
+                format!("{}; provider code: {code}", expected.message())
+            );
         }
         let body = safe_error_body(r#"{"message":"当前账号没有可用套餐","code":402}"#.as_bytes());
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "no_active_plan");
         assert_eq!(value["error"]["message"], "当前账号没有可用套餐");
+        assert_eq!(value["error"]["mtc_provider_code"], "402");
+        assert_eq!(
+            value["error"]["mtc_provider_message"],
+            "当前账号没有可用套餐"
+        );
+        let model = safe_error_body(br#"{"error":{"code":400,"message":"Model not found","headers":{"Authorization":"Bearer private-canary"},"url":"https://private.invalid/?signature=private-canary"}}"#);
+        let model: Value = serde_json::from_slice(&model).unwrap();
+        assert_eq!(model["error"]["mtc_provider_code"], "400");
+        assert_eq!(model["error"]["mtc_provider_message"], "Model not found");
+        assert!(!model.to_string().contains("private-canary"));
         assert_eq!(
             safe_error_body(br#"{"error":{"code":"invalid_api_key","message":"No active plan"}}"#),
             fallback_body()
@@ -244,7 +273,9 @@ mod tests {
             );
             let value: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value["error"]["message"], "当前账号没有可用套餐");
-            assert_eq!(value["error"].as_object().unwrap().len(), 4);
+            assert_eq!(value["error"].as_object().unwrap().len(), 5);
+            assert_eq!(value["error"]["mtc_provider_code"], "NoAvailablePlan");
+            assert!(value["error"].get("mtc_provider_message").is_none());
             assert_eq!(value.as_object().unwrap().len(), 1);
             assert!(!String::from_utf8_lossy(&body).contains(text));
         }

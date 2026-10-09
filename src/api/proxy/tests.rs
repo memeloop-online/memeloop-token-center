@@ -3545,13 +3545,16 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0
     });
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/chat/completions",
-        original.clone(),
-    )
-    .await;
+    let response = fixture
+        .state
+        .db
+        .with_request_archive_capture_for_test(send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/chat/completions",
+            original.clone(),
+        ))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
@@ -4097,7 +4100,16 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
         "previous_response_id": "resp-parent",
         "include": ["reasoning.encrypted_content", "reasoning.encrypted_content"]
     });
-    let response = send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()).await;
+    let response = fixture
+        .state
+        .db
+        .with_request_archive_capture_for_test(send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            original.clone(),
+        ))
+        .await;
     let status = response.status();
     if status != StatusCode::OK {
         let failure = to_bytes(response.into_body(), 64 * 1024).await.unwrap();

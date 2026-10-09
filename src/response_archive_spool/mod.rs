@@ -27,6 +27,8 @@ pub(crate) use producer::pause_next_begin_ack_for_test;
 pub(crate) use producer::pause_next_begin_for_test;
 #[cfg(test)]
 pub(crate) use producer::pause_next_request_preseal_for_test;
+#[cfg(test)]
+pub(crate) use producer::scoped_request_preseal_pause_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
 pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement};
 pub(crate) use upload::run;

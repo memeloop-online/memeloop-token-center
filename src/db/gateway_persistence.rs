@@ -20,6 +20,11 @@ const TASK_LIMIT: usize = 16;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const JOB_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CAPTURE_BEFORE_DISPATCH: Arc<GatewayPersistence>;
+}
+
 pub(super) struct GatewayPersistence {
     pub(super) pool: AnyPool,
     slots: Arc<Semaphore>,
@@ -197,6 +202,17 @@ impl Database {
             tracing::warn!(%request_id, reason = "queue_full", "request archive omitted");
             RequestArchiveAdmission::GapCapacity
         };
+        // Byte-exact archive tests must finish optional request capture before
+        // dispatch can race it with settlement on SQLite's single writer.
+        // This barrier is opt-in, task-local and tied to this database instance;
+        // degradation tests and production keep the asynchronous path.
+        #[cfg(test)]
+        if TEST_CAPTURE_BEFORE_DISPATCH
+            .try_with(|persistence| Arc::ptr_eq(persistence, &self.gateway_persistence))
+            .unwrap_or(false)
+        {
+            self.drain_gateway_persistence_for_test().await;
+        }
         Ok(StartedProxyRequest {
             reservation,
             archive_admission,
@@ -253,6 +269,16 @@ impl Database {
         hold.commit(transaction).await?;
         capacity.release().await;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn with_request_archive_capture_for_test<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> F::Output {
+        TEST_CAPTURE_BEFORE_DISPATCH
+            .scope(self.gateway_persistence.clone(), future)
+            .await
     }
 
     #[cfg(test)]

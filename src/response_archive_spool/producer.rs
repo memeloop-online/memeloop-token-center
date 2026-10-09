@@ -139,6 +139,7 @@ impl<'a> BufferedArchive<'a> {
 type RequestPresealPause = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
+    uuid::Uuid,
 );
 
 #[cfg(test)]
@@ -153,13 +154,67 @@ pub(crate) fn pause_next_request_preseal_for_test(
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
 ) {
+    let (entering, release, _) = register_request_preseal_pause_for_test(request_id);
+    (entering, release)
+}
+
+#[cfg(test)]
+pub(crate) struct RequestPresealRegistration {
+    request_id: uuid::Uuid,
+    registration_id: uuid::Uuid,
+}
+
+#[cfg(test)]
+impl Drop for RequestPresealRegistration {
+    fn drop(&mut self) {
+        let mut pauses = PAUSE_REQUEST_PRESEAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pauses
+            .get(&self.request_id)
+            .is_some_and(|(_, _, registration_id)| *registration_id == self.registration_id)
+        {
+            pauses.remove(&self.request_id);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_request_preseal_pause_for_test(
+    request_id: uuid::Uuid,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    RequestPresealRegistration,
+) {
+    let (entering, release, registration_id) = register_request_preseal_pause_for_test(request_id);
+    (
+        entering,
+        release,
+        RequestPresealRegistration {
+            request_id,
+            registration_id,
+        },
+    )
+}
+
+#[cfg(test)]
+fn register_request_preseal_pause_for_test(
+    request_id: uuid::Uuid,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    uuid::Uuid,
+) {
     let (entered, entering) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
+    let registration_id = uuid::Uuid::new_v4();
     let mut pauses = PAUSE_REQUEST_PRESEAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(pauses.insert(request_id, (entered, released)).is_none());
-    (entering, release)
+    assert!(!pauses.contains_key(&request_id));
+    pauses.insert(request_id, (entered, released, registration_id));
+    (entering, release, registration_id)
 }
 
 #[cfg(test)]
@@ -168,7 +223,7 @@ async fn pause_request_preseal_for_test(request_id: uuid::Uuid) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&request_id);
-    if let Some((entered, released)) = pause {
+    if let Some((entered, released, _)) = pause {
         let _ = entered.send(());
         let _ = released.await;
     }
@@ -943,6 +998,86 @@ pub(super) async fn mark_gap_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unreached_preseal_registration_is_cleaned_on_timeout_failure_and_cancellation() {
+        let request_id = uuid::Uuid::new_v4();
+        let other_id = uuid::Uuid::new_v4();
+        let (_other_entered, _other_release, _other_registration) =
+            scoped_request_preseal_pause_for_test(other_id);
+        let assert_cleanup = || {
+            let pauses = PAUSE_REQUEST_PRESEAL.lock().unwrap();
+            assert!(!pauses.contains_key(&request_id));
+            assert!(pauses.contains_key(&other_id));
+        };
+
+        let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (entered, _release, _registration) =
+                scoped_request_preseal_pause_for_test(request_id);
+            entered.await.unwrap();
+        })
+        .await;
+        assert!(timed_out.is_err());
+        assert_cleanup();
+
+        let failed = std::panic::catch_unwind(|| {
+            let (_entered, _release, _registration) =
+                scoped_request_preseal_pause_for_test(request_id);
+            panic!("synthetic fixture failure before preseal entry");
+        });
+        assert!(failed.is_err());
+        assert_cleanup();
+
+        let (registered, registration) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (entered, _release, _registration) =
+                scoped_request_preseal_pause_for_test(request_id);
+            registered.send(()).unwrap();
+            entered.await.unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), registration)
+            .await
+            .expect("bounded registration before cancellation")
+            .unwrap();
+        task.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("bounded cancelled registration task")
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_cleanup();
+    }
+
+    #[tokio::test]
+    async fn consumed_preseal_guard_does_not_remove_a_replacement_registration() {
+        let request_id = uuid::Uuid::new_v4();
+        let (mut entered, release, original) = scoped_request_preseal_pause_for_test(request_id);
+        release.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pause_request_preseal_for_test(request_id),
+        )
+        .await
+        .expect("bounded original preseal entry");
+        entered.try_recv().unwrap();
+        let (_entered, _release, replacement) = scoped_request_preseal_pause_for_test(request_id);
+        drop(original);
+        assert!(
+            PAUSE_REQUEST_PRESEAL
+                .lock()
+                .unwrap()
+                .contains_key(&request_id)
+        );
+        drop(replacement);
+        assert!(
+            !PAUSE_REQUEST_PRESEAL
+                .lock()
+                .unwrap()
+                .contains_key(&request_id)
+        );
+    }
 
     #[test]
     fn writer_observation_preserves_results_and_correlates_safe_database_errors() {

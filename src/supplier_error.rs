@@ -1,4 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 
 const MAX_INLINE_JSON_BYTES: usize = 2048;
 
@@ -23,6 +26,10 @@ struct InlineError<'a> {
     code: &'a str,
     message: &'a str,
     mtc_safe_reason: &'a str,
+    #[serde(default)]
+    mtc_provider_code: Option<&'a str>,
+    #[serde(default)]
+    mtc_provider_message: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +83,9 @@ impl SafeReason {
             }
             "API key expired" | "Authentication token expired" => Some(Self::AuthenticationExpired),
             "Rate limit exceeded" | "Too many requests" => Some(Self::RateLimited),
-            "Model unavailable" | "Unsupported model" => Some(Self::ModelUnavailable),
+            "Model unavailable" | "Unsupported model" | "Model not found" => {
+                Some(Self::ModelUnavailable)
+            }
             _ => None,
         });
         match (code_reason, message_reason) {
@@ -114,6 +123,108 @@ impl SafeReason {
             message: self.message().to_owned(),
         }
     }
+
+    pub(crate) fn provider_detail<'a>(
+        self,
+        code: Option<&'a str>,
+        message: Option<&'a str>,
+    ) -> (Option<&'a str>, Option<&'a str>) {
+        (
+            code.filter(|code| {
+                Self::from_supplier(Some(code), None) == Some(self)
+                    || (*code == "402" && self == Self::NoActivePlan)
+                    || (*code == "400" && self == Self::ModelUnavailable)
+            }),
+            message.filter(|message| Self::from_supplier(None, Some(message)) == Some(self)),
+        )
+    }
+}
+
+pub(crate) fn invalid_native_supplier_envelope(location: &str) -> bool {
+    let Some(raw) = location.strip_prefix("inline-json:") else {
+        return false;
+    };
+    let mut marked = false;
+    let prefix = &raw.as_bytes()[..raw.len().min(MAX_INLINE_JSON_BYTES)];
+    let mut parser = serde_json::Deserializer::from_slice(prefix);
+    let _ = serde::Deserializer::deserialize_map(&mut parser, NativeEnvelopeMarker(&mut marked));
+    marked && supplier_error_from_inline_json(Some(location)).is_none()
+}
+
+struct NativeEnvelopeMarker<'a>(&'a mut bool);
+
+impl<'de> Visitor<'de> for NativeEnvelopeMarker<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an inline envelope")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "error" {
+                map.next_value_seed(NativeErrorMarker(&mut *self.0))?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct NativeErrorMarker<'a>(&'a mut bool);
+
+impl<'de> DeserializeSeed<'de> for NativeErrorMarker<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NativeErrorMarker<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an error value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if matches!(
+                key.as_str(),
+                "mtc_safe_reason" | "mtc_provider_code" | "mtc_provider_message"
+            ) {
+                *self.0 = true;
+            }
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
 }
 
 pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierError> {
@@ -131,7 +242,23 @@ pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierEr
     if error.code != reason.code() || error.message != reason.message() {
         return None;
     }
-    Some(reason.supplier_error())
+    let (code, message) =
+        reason.provider_detail(error.mtc_provider_code, error.mtc_provider_message);
+    if code != error.mtc_provider_code || message != error.mtc_provider_message {
+        return None;
+    }
+    let mut supplier = reason.supplier_error();
+    if let Some(code) = code {
+        supplier
+            .message
+            .push_str(&format!("; provider code: {code}"));
+    }
+    if let Some(message) = message {
+        supplier
+            .message
+            .push_str(&format!("; provider message: {message}"));
+    }
+    Some(supplier)
 }
 
 #[cfg(test)]
@@ -183,6 +310,90 @@ mod tests {
             supplier_error_from_inline_json(Some(&"x".repeat(MAX_INLINE_JSON_BYTES + 1))),
             None
         );
+    }
+
+    #[test]
+    fn native_markers_survive_incomplete_and_duplicate_parsing() {
+        for raw in [
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"},"error":{"message":"legacy"}}"#,
+            r#"{"\u0065rror":{"\u006dtc_provider_message":"Authorization: Bearer private-canary""#,
+            r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_safe_reason":"model_unavailable"}}"#,
+        ] {
+            let location = format!("inline-json:{raw}");
+            assert!(supplier_error_from_inline_json(Some(&location)).is_none());
+            assert!(invalid_native_supplier_envelope(&location));
+        }
+        for raw in [
+            r#"{"error":{"message":"mtc_safe_reason"}} trailing"#,
+            r#"{"error":{"debug":{"mtc_provider_message":"legacy data"}}}"#,
+            "data: {\"error\":{\"mtc_safe_reason\":\"legacy SSE text\"}}\n\n",
+        ] {
+            assert!(!invalid_native_supplier_envelope(&format!(
+                "inline-json:{raw}"
+            )));
+        }
+    }
+
+    #[test]
+    fn provider_detail_is_revalidated_and_legacy_envelopes_remain_readable() {
+        for (reason, code, message) in [
+            (
+                SafeReason::NoActivePlan,
+                "NoAvailablePlan",
+                "No active plan",
+            ),
+            (SafeReason::NoActivePlan, "402", "当前账号没有可用套餐"),
+            (
+                SafeReason::ModelUnavailable,
+                "model_not_found",
+                "Model not found",
+            ),
+            (
+                SafeReason::ModelUnavailable,
+                "unsupported_model",
+                "Unsupported model",
+            ),
+            (SafeReason::ModelUnavailable, "400", "Model unavailable"),
+        ] {
+            let mut envelope: Value =
+                serde_json::from_str(inline(reason).strip_prefix("inline-json:").unwrap()).unwrap();
+            envelope["error"]["mtc_provider_code"] = json!(code);
+            envelope["error"]["mtc_provider_message"] = json!(message);
+            let projected =
+                supplier_error_from_inline_json(Some(&format!("inline-json:{envelope}"))).unwrap();
+            assert_eq!(projected.code, reason.code());
+            assert_eq!(
+                projected.message,
+                format!(
+                    "{}; provider code: {code}; provider message: {message}",
+                    reason.message()
+                )
+            );
+            for field in ["mtc_provider_code", "mtc_provider_message"] {
+                for unsafe_text in [
+                    "Authorization: Bearer private-canary",
+                    "api_key=private-canary",
+                    "https://private.invalid/?X-Amz-Signature=private-canary",
+                    "No active plan private prompt",
+                    "private%20prompt",
+                    "",
+                    &"x".repeat(4096),
+                    "rate_limit_exceeded",
+                ] {
+                    let mut tampered = envelope.clone();
+                    tampered["error"][field] = json!(unsafe_text);
+                    assert_eq!(
+                        supplier_error_from_inline_json(Some(&format!("inline-json:{tampered}"))),
+                        None
+                    );
+                }
+            }
+            assert_eq!(
+                supplier_error_from_inline_json(Some(&inline(reason))),
+                Some(reason.supplier_error())
+            );
+        }
     }
 
     #[test]
