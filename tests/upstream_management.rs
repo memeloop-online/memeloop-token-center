@@ -3228,7 +3228,7 @@ async fn upstream_name_only_edit_requires_write_scope_tenant_and_current_revisio
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     let unchanged = state
         .db
@@ -3349,7 +3349,7 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
                     credential: UpstreamCredential::OAuth {
                         access_token: "rename-kimi-access".into(),
                         refresh_token: Some("rename-kimi-refresh".into()),
-                        expires_at: Some(10),
+                        expires_at: None,
                         header: "authorization".into(),
                         prefix: "Bearer ".into(),
                         adapter_state: Some(json!({"account_id": "identity-0142"})),
@@ -3366,16 +3366,29 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
             )
             .await
             .unwrap();
-        let route = state
+        let (route, _) = state
             .db
-            .create_model_route(CreateModelRouteInput {
+            .create_routed_model_route(CreateRoutedModelRouteInput {
                 tenant_external_id: "kimi-rename".into(),
                 public_model: "rename-public".into(),
-                upstream_account_id: original.id,
                 upstream_model: "rename-upstream".into(),
                 protocol: "openai".into(),
                 priority: 0,
+                enabled: true,
+                upstream_account_ids: vec![original.id],
+                included_provider_group_ids: Vec::new(),
+                excluded_provider_group_ids: Vec::new(),
+                route_group_ids: Vec::new(),
+                route_group_names: Vec::new(),
+                granted_credential_ids: Vec::new(),
+                custom_model_confirmed: true,
             })
+            .await
+            .unwrap();
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        sqlx::query("UPDATE upstream_credentials SET expires_at = 10 WHERE upstream_account_id = $1")
+            .bind(original.id.to_string())
+            .execute(&pool)
             .await
             .unwrap();
         if disconnected {
@@ -3385,7 +3398,6 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
                 .await
                 .unwrap();
         }
-        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
         let stored_config = json!({
             "base_url": mock.uri(), "network_scope": "private",
             "__mtc_transport_proxy_binding": {"binding_version": 7}

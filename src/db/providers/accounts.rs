@@ -1160,7 +1160,12 @@ mod tests {
 
     #[tokio::test]
     async fn name_only_edit_needs_no_configuration_projection() {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("rename-no-projection.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
         database.migrate().await.unwrap();
         let original = database
             .create_upstream_account(
