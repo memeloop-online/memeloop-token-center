@@ -7,6 +7,7 @@ import { chromium } from 'playwright';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { isUpstreamModelCatalog } from '../src/operator/managedModelSync.js';
 
 const copy = {
   'zh-CN': {
@@ -74,7 +75,13 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
         }
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [provider] });
         if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: url.searchParams.get('tenant_external_id') === 'fixture-b' ? [] : [account] });
-        if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, status: 'unknown', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] } });
+        if (url.pathname.endsWith('/models')) {
+          assert.equal(url.pathname, `/internal/v1/upstreams/${account.id}/models`);
+          assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id);
+          const snapshot = { account_id: account.id, credential_generation: account.credential_generation, status: 'unknown', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] };
+          assert.ok(isUpstreamModelCatalog(snapshot), 'the fixture uses the actual catalog response contract');
+          return route.fulfill({ json: snapshot });
+        }
         if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, proxy_url: 'socks5h://10.0.0.15:1080', supported: true, updated_at: account.updated_at, credential_generation: account.credential_generation } });
         return route.fulfill({ json: [] });
       });
@@ -102,7 +109,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       await editor.locator('.schema-errors').waitFor({ state: 'detached' });
       assert.equal(await editor.locator('.schema-field-error').count(), 0, 'correcting the name clears field validation before submission');
       assert.equal(writes.length, 0, 'correcting validation does not submit the draft');
-      await editor.locator('.provider-model-catalog').getByText(chinese ? '待同步' : 'Ready to sync', { exact: true }).waitFor();
+      await editor.locator('.provider-model-catalog').getByText(chinese ? '待同步 · 0 个模型' : 'Ready to sync · 0 models', { exact: true }).waitFor();
       assert.equal(await editor.locator('.provider-model-catalog [role="alert"]').count(), 0, 'the unsynced catalog fixture has a valid response shape');
       await editor.locator('[data-workspace-toggle]').click();
       const discard = page.getByRole('dialog');

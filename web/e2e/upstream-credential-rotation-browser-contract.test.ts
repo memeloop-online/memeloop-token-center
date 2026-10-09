@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { isUpstreamModelCatalog } from '../src/operator/managedModelSync.js';
 
 const labels = {
   'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '更换凭据', title: '更换 rotation@example.org 的凭据', back: '取消', close: '关闭', key: '新 API 密钥', submit: '保存', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '这里不会在提供商处撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
@@ -34,10 +35,21 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
           writes.push({ path: url.pathname, method: request.method(), body: request.postDataJSON(), idempotency: request.headers()['idempotency-key'] });
           assert.equal(url.pathname, '/internal/v1/upstreams/rotation-fixture/credential');
           assert.equal(request.method(), 'PUT');
-          return route.fulfill(responseStatus === 200 ? { json: { ...account, credential_generation: 2, updated_at: 3 } } : { status: responseStatus, json: { error: { message: 'must-not-expose-fixture-secret' } } });
+          if (responseStatus === 200) {
+            account.credential_generation = 2;
+            account.updated_at = 3;
+            return route.fulfill({ json: account });
+          }
+          return route.fulfill({ status: responseStatus, json: { error: { message: 'must-not-expose-fixture-secret' } } });
         }
         if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: [account] });
-        if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, status: 'unknown', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] } });
+        if (url.pathname.endsWith('/models')) {
+          assert.equal(url.pathname, `/internal/v1/upstreams/${account.id}/models`);
+          assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id);
+          const snapshot = { account_id: account.id, credential_generation: account.credential_generation, status: 'unknown', last_attempt_at: null, last_success_at: null, expires_at: null, error_code: null, models: [], disabled_models: [] };
+          assert.ok(isUpstreamModelCatalog(snapshot), 'the fixture uses the actual catalog response contract');
+          return route.fulfill({ json: snapshot });
+        }
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { oneOf: [
           { title: 'API key', type: 'object', additionalProperties: false, required: ['type', 'value'], properties: { type: { const: 'api_key' }, value: { type: 'string', minLength: 1, writeOnly: true }, header: { type: 'string', default: 'authorization' }, prefix: { type: 'string', default: 'Bearer ' } } },
           { title: 'OAuth', type: 'object', additionalProperties: false, required: ['type', 'access_token'], properties: { type: { const: 'oauth' }, access_token: { type: 'string', minLength: 1, writeOnly: true }, refresh_token: { type: 'string', writeOnly: true }, expires_at: { type: 'integer' } } },
@@ -105,7 +117,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       await page.getByText(copy.saved, { exact: true }).waitFor();
       assert.equal(await page.locator('.provider-directory-row').isVisible(), false);
       const catalog = page.locator('.provider-detail-workspace .provider-model-catalog');
-      await catalog.getByText(locale === 'zh-CN' ? '待同步' : 'Ready to sync', { exact: true }).waitFor();
+      await catalog.getByText(locale === 'zh-CN' ? '待同步 · 0 个模型' : 'Ready to sync · 0 models', { exact: true }).waitFor();
       assert.equal(await catalog.getByRole('alert').count(), 0, 'a saved credential does not make a valid unsynced catalog a read failure');
       for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 1000 });
