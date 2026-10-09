@@ -40,6 +40,9 @@ pub(super) async fn request_detail(
         ArchiveValue::pending()
     } else {
         match refs.response_object.as_deref() {
+            Some(location) if crate::supplier_error::invalid_native_supplier_envelope(location) => {
+                ArchiveValue::gap("archive_payload_invalid")
+            }
             Some(location) => archive_value(state, location).await,
             None => match refs.response_json {
                 Some(value) if json_value_structure_is_bounded(&value) => ArchiveValue {
@@ -135,6 +138,11 @@ fn archive_content_source(
         return Err("media_body_not_archived_by_policy");
     }
     if let Some(location) = location {
+        if side == RequestArchiveSide::Response
+            && crate::supplier_error::invalid_native_supplier_envelope(location)
+        {
+            return Err("archive_payload_invalid");
+        }
         if let Some(value) = location.strip_prefix("inline-json:") {
             return Ok(ArchiveContentSource::Inline(Bytes::copy_from_slice(
                 value.as_bytes(),

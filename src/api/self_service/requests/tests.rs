@@ -227,6 +227,97 @@ async fn request_archive_content_does_not_expose_policy_metadata_as_body() {
 }
 
 #[tokio::test]
+async fn invalid_native_supplier_envelopes_cannot_escape_detail_or_archive_content() {
+    let (state, _directory) = test_state().await;
+    let valid = json!({"error": {
+        "type": "upstream_error", "code": "model_unavailable",
+        "message": "The requested upstream model is unavailable",
+        "mtc_safe_reason": "model_unavailable",
+        "mtc_provider_code": "model_not_found",
+        "mtc_provider_message": "Model not found"
+    }});
+    for field in ["mtc_provider_code", "mtc_provider_message", "unknown_field"] {
+        let mut tampered = valid.clone();
+        tampered["error"][field] = json!("Authorization: Bearer token=private-canary");
+        let mut refs = request_detail_refs(Uuid::now_v7());
+        refs.response_object = Some(format!("inline-json:{tampered}"));
+        refs.view.status_code = Some(400);
+        refs.view.error_code = Some("http_400".to_owned());
+        refs.view.supplier_error =
+            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+        assert!(refs.view.supplier_error.is_none());
+        let download = request_archive_content_response(
+            &state,
+            &HeaderMap::new(),
+            &refs,
+            RequestArchiveSide::Response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(download.status(), StatusCode::CONFLICT);
+        let download = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&download).contains("private-canary"));
+        let download: Value = serde_json::from_slice(&download).unwrap();
+        assert_eq!(download["error"]["reason"], "archive_payload_invalid");
+        let response = request_detail_response(&state, refs).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("private-canary"));
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        assert!(detail["response_body"].is_null());
+        assert!(detail["supplier_error"].is_null());
+        assert_eq!(detail["archive"]["response"]["complete"], false);
+        assert_eq!(
+            detail["archive"]["response"]["reason"],
+            "archive_payload_invalid"
+        );
+        assert_eq!(detail["status_code"], 400);
+        assert_eq!(detail["error_code"], "http_400");
+    }
+}
+
+#[tokio::test]
+async fn native_supplier_and_legacy_failed_archives_retain_their_exact_bodies() {
+    let (state, _directory) = test_state().await;
+    for raw in [
+        r#"{"error":{"type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","mtc_safe_reason":"model_unavailable","mtc_provider_code":"model_not_found","mtc_provider_message":"Model not found"}}"#,
+        r#"{"error":{"type":"upstream_error","code":"no_active_plan","message":"当前账号没有可用套餐","mtc_safe_reason":"no_active_plan"}}"#,
+        r#"{"error":{"type":"upstream_error","message":"upstream rejected the request"}}"#,
+        r#"{"error":{"code":"supplier_original_error","message":"original failure body"}}"#,
+        "data: {\"error\":{\"message\":\"upstream stream failed\"}}\n\n",
+    ] {
+        let mut refs = request_detail_refs(Uuid::now_v7());
+        refs.response_object = Some(format!("inline-json:{raw}"));
+        refs.view.status_code = Some(502);
+        refs.view.supplier_error =
+            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+        let projected = refs.view.supplier_error.clone();
+        let download = request_archive_content_response(
+            &state,
+            &HeaderMap::new(),
+            &refs,
+            RequestArchiveSide::Response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        let download = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+            .await
+            .unwrap();
+        assert_eq!(download.as_ref(), raw.as_bytes());
+        let detail = crate::api::request_detail::request_detail(&state, refs).await;
+        assert_eq!(detail.view.supplier_error, projected);
+        assert!(detail.archive.response.complete);
+        let expected =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        assert_eq!(detail.response_body, expected);
+    }
+}
+
+#[tokio::test]
 async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level() {
     let (state, _directory) = test_state().await;
     let mut refs = request_detail_refs(Uuid::now_v7());

@@ -240,6 +240,19 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
         assert_eq!(record.supplier_error, projected);
         assert_eq!(refs.view.supplier_error, projected);
+        let download = crate::api::request_detail::request_archive_content_response(
+            &fixture.state,
+            &http::HeaderMap::new(),
+            &refs,
+            crate::api::request_detail::RequestArchiveSide::Response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(download.status().as_u16(), 200);
+        let downloaded = to_bytes(download.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert_eq!(downloaded, bytes);
         let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
         assert_eq!(detail.view.supplier_error, projected);
         assert_eq!(detail.response_body, delivered);

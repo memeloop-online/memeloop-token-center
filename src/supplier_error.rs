@@ -137,6 +137,24 @@ impl SafeReason {
     }
 }
 
+pub(crate) fn invalid_native_supplier_envelope(location: &str) -> bool {
+    let Some(raw) = location.strip_prefix("inline-json:") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let marked = value
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|error| {
+            error.contains_key("mtc_safe_reason")
+                || error.contains_key("mtc_provider_code")
+                || error.contains_key("mtc_provider_message")
+        });
+    marked && supplier_error_from_inline_json(Some(location)).is_none()
+}
+
 pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierError> {
     let value = value?;
     if value.len() > MAX_INLINE_JSON_BYTES {
