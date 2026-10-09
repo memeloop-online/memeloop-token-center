@@ -5,7 +5,7 @@ import { api } from '../api';
 import { ChartDataView } from '../charts/ChartDataView';
 import { HeatmapDataTable } from '../charts/HeatmapDataTable';
 import { costOption, heatmapOption, latencyOption, throughputOption, totalTokens, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
-import { Button } from '../design-system';
+import { Button, LoadingState } from '../design-system';
 import { formatCurrency, formatMetricDisplay, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { UsageSummaryMetrics } from '../operator/UsageSummaryMetrics';
@@ -102,13 +102,13 @@ export function UsagePage({ credential, credentialView, onError }: {
   const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale, { weekday: 'short', timeZone: heatmapTimeZone })), [locale, heatmapTimeZone]);
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], 'requests', credentialView.currency, weekdays, t('usage.heatmapLabel'), formatters), [stats?.heatmap, credentialView.currency, weekdays, t, formatters]);
 
-  if (scopedRemote.status === 'loading') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div></div><div className="boot" role="status">{t('common.loading')}</div></div>;
+  if (scopedRemote.status === 'loading') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div></div><LoadingState label={t('common.loading')} level="page" /></div>;
   if (scopedRemote.status === 'error') return <div className="self-page usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p></div><Button type="button" appearance="secondary" onClick={() => setRefresh((value) => value + 1)}>{t('usage.refresh')}</Button></div><div className="notice error" role="alert">{scopedRemote.message}</div></div>;
   if (!stats) return <div className="empty">{t('common.noData')}</div>;
   return <div className="self-page self-usage-page usage-page" data-self-page="usage">
     <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('self.usageDescription')}</p><span className="usage-time-zone">{bucketTimeZoneNote(locale, stats.time_zone)}</span></div><div className="usage-presets" role="group" aria-label={t('usage.timeRange')}>{(['24h', '7d', '30d'] as UsageRange[]).map((value) => <Button type="button" key={value} appearance={range === value ? 'primary' : 'secondary'} aria-pressed={range === value} onClick={() => setRange(value)}>{t(`usage.preset.${value}`)}</Button>)}</div></div>
     <UsageSummaryMetrics stats={stats} currency={credentialView.currency} timeZone={timeZone} />
-    <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
+    <Suspense fallback={<LoadingState label={t('common.loading')} level="section" variant="detail" />}>
       <section className="usage-chart-grid self-usage-charts">
         <ChartPanel timeZone={timeZone} title={t('usage.throughput')} values={stats.time_series}><EChart ariaLabel={t('usage.throughput')} locale={locale} option={throughput} timeZone={timeZone} /></ChartPanel>
         <ChartPanel timeZone={timeZone} title={t('usage.latencyTrend')} values={stats.time_series}><EChart ariaLabel={t('usage.latencyTrend')} locale={locale} option={latency} timeZone={timeZone} /></ChartPanel>

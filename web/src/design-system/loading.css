@@ -1,0 +1,110 @@
+.mtc-page-loading-region,
+.mtc-resource-boundary,
+.mtc-loading-state {
+  min-inline-size: 0;
+  inline-size: 100%;
+}
+
+.mtc-page-loading-announcement {
+  display: grid;
+  align-content: start;
+  gap: var(--spacingVerticalXS, 4px);
+  block-size: 32px;
+  color: var(--colorNeutralForeground2, inherit);
+  font-size: var(--fontSizeBase200, 12px);
+  line-height: var(--lineHeightBase200, 16px);
+}
+
+.mtc-page-loading-announcement > span {
+  min-block-size: 16px;
+}
+
+.mtc-loading-track {
+  block-size: 4px;
+  min-inline-size: 0;
+}
+
+.mtc-loading-progress {
+  min-block-size: 4px;
+  margin-block-end: var(--spacingVerticalS, 8px);
+}
+
+.mtc-loading-standalone-announcement {
+  block-size: 24px;
+  color: var(--colorNeutralForeground2, inherit);
+  font-size: var(--fontSizeBase200, 12px);
+  line-height: var(--lineHeightBase200, 16px);
+}
+
+.mtc-resource-boundary,
+.mtc-loading-list {
+  min-block-size: 224px;
+}
+
+.mtc-resource-compact,
+.mtc-loading-compact {
+  min-block-size: 88px;
+}
+
+.mtc-resource-compact {
+  min-block-size: 112px;
+}
+
+.mtc-resource-boundary > .mtc-loading-state {
+  min-block-size: 0;
+}
+
+.mtc-resource-detail,
+.mtc-loading-detail {
+  min-block-size: 192px;
+}
+
+.mtc-loading-state .mtc-loading-skeleton {
+  display: grid;
+  gap: var(--spacingVerticalM, 12px);
+  padding-block: var(--spacingVerticalS, 8px);
+}
+
+.mtc-loading-skeleton .mtc-loading-heading {
+  inline-size: 40%;
+}
+
+.mtc-loading-skeleton .mtc-loading-row {
+  inline-size: 100%;
+}
+
+.mtc-loading-state.session-list-skeleton {
+  display: block;
+}
+
+.mtc-loading-counter {
+  min-block-size: 20px;
+  color: var(--colorNeutralForeground2, inherit);
+  font-size: var(--fontSizeBase200, 12px);
+  line-height: var(--lineHeightBase200, 16px);
+}
+
+.mtc-loading-inline,
+.mtc-resource-inline {
+  min-block-size: 20px;
+}
+
+.mtc-loading-inline .mtc-loading-skeleton {
+  padding-block: 2px;
+  gap: 0;
+}
+
+.mtc-loading-detail .mtc-loading-row:nth-child(even) {
+  inline-size: 72%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mtc-loading-skeleton *,
+  .mtc-loading-skeleton *::before,
+  .mtc-loading-skeleton *::after,
+  .mtc-loading-track *,
+  .mtc-loading-track *::before,
+  .mtc-loading-track *::after {
+    animation: none !important;
+  }
+}

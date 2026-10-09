@@ -655,6 +655,13 @@ async fn finish_non_sse_proxy_response(
                 crate::model::RequestUsageBasis::NotObserved,
             ),
             ExtractedUsage::Invalid => {
+                response_metadata::observe_buffered_usage_rejection(
+                    buffered_request.request_id,
+                    status.as_u16(),
+                    &response_body,
+                    selected_driver,
+                    protocol,
+                );
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())

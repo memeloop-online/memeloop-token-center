@@ -1,6 +1,7 @@
 import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
 import { UsageAnalysis } from '../../src/operator/UsageAnalysis';
 import type { OperatorUsageAnalysis } from '../../src/types';
 import '../../src/styles.css';
@@ -86,5 +87,5 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 };
 
 createRoot(document.getElementById('root')!).render(
-  <I18nProvider><UsageAnalysis token="mts_usage_fixture" tenant="fixture-tenant" upstreams={[]} onOpenSession={() => undefined} /></I18nProvider>,
+  <I18nProvider><MtcFluentProvider><UsageAnalysis token="mts_usage_fixture" tenant="fixture-tenant" upstreams={[]} onOpenSession={() => undefined} /></MtcFluentProvider></I18nProvider>,
 );

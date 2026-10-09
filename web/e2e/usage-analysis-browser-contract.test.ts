@@ -127,7 +127,15 @@ test('usage filter period, credential, saved AST, drilldown, and clear stay sync
     assert.equal(await page.getByRole('option', { name: 'late-client' }).count(), 0, 'the first page stops before the look-ahead row');
     await page.keyboard.press('Escape');
     assert.equal(await filter.getAttribute('aria-expanded'), 'true', 'closing the credential listbox keeps the filter dialog open');
-    await dialog.getByRole('button', { name: 'Load more credentials' }).click();
+    const loadMoreCredentials = dialog.getByRole('button', { name: 'Load more credentials' });
+    await loadMoreCredentials.scrollIntoViewIfNeeded();
+    const paginationTarget = await loadMoreCredentials.evaluate((button) => {
+      const bounds = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+      return { reachable: hit !== null && button.contains(hit), width: bounds.width, height: bounds.height, blocker: hit?.className };
+    });
+    assert.equal(paginationTarget.reachable, true, `credential pagination must receive pointer events: ${JSON.stringify(paginationTarget)}`);
+    await loadMoreCredentials.click();
     await credentialBox.click();
     await page.getByRole('option', { name: 'late-client' }).waitFor();
     await page.keyboard.press('Escape');

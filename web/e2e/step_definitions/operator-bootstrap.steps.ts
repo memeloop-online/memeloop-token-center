@@ -34,9 +34,13 @@ async function waitForTenantPicker(page: Page, expectedTenant: string) {
   });
 }
 
-async function waitForConsoleContext(page: Page, expectedText: RegExp) {
+async function waitForPageLoading(page: Page, expectedText: RegExp) {
+  const announcement = page.locator('.app-main-content [data-page-loading-announcement]');
   await eventually(async () => {
-    assert.match((await page.locator('.console-context').allTextContents()).join(' '), expectedText);
+    assert.equal(await announcement.count(), 1, 'tenant discovery has one shared page loading announcement');
+    assert.equal(await announcement.isVisible(), true);
+    assert.match((await announcement.textContent())?.trim() ?? '', expectedText);
+    assert.equal(await page.locator('form.operator-credential').getAttribute('aria-busy'), 'true');
   });
 }
 
@@ -120,7 +124,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   await singletonDiscovery;
   await eventually(() => assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1));
   assert.equal(observed.find((value) => value.credential === 'singleton-credential')?.path, '/internal/v1/tenants');
-  await waitForConsoleContext(page, /^载入中…$/);
+  await waitForPageLoading(page, /^载入中…$/);
   singletonTenants.resolve();
   await waitForSingleTenantScope(page, 'singleton-tenant');
   // This scenario opens the settings route. Its first tenant-scoped resource
