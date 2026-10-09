@@ -1,7 +1,67 @@
 use super::*;
 use crate::plugin::application::ApplicationRevision;
+use crate::plugin::application::descriptor_export::{
+    DescriptorAuthoritySnapshot, DescriptorCandidateReceipt,
+};
 
 impl Database {
+    pub(crate) async fn plugin_descriptor_authority_snapshot(
+        &self,
+    ) -> Result<DescriptorAuthoritySnapshot, AppError> {
+        let mut transaction = self
+            .pool
+            .begin_with(match self.backend {
+                DatabaseBackend::PostgreSql => "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                DatabaseBackend::Sqlite => "BEGIN",
+            })
+            .await?;
+        let head_revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM application_plugin_head WHERE scope='global'")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let rows = sqlx::query("SELECT inventory_id,identity_digest,contract_digest FROM application_plugin_candidates ORDER BY inventory_id")
+            .fetch_all(&mut *transaction).await?;
+        let mut candidates = std::collections::BTreeMap::new();
+        for row in rows {
+            candidates.insert(
+                row.try_get::<String, _>("inventory_id")?,
+                DescriptorCandidateReceipt {
+                    identity_digest: row.try_get("identity_digest")?,
+                    contract_digest: row.try_get("contract_digest")?,
+                },
+            );
+        }
+        let rows = sqlx::query("SELECT revision,inventory_id,reason FROM application_plugin_revisions ORDER BY revision")
+            .fetch_all(&mut *transaction).await?;
+        let mut revisions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let inventory_id: String = row.try_get("inventory_id")?;
+            let candidate = candidates.get(&inventory_id).ok_or(AppError::Forbidden)?;
+            revisions.push(ApplicationRevision {
+                revision: row.try_get("revision")?,
+                inventory_id,
+                reason: row.try_get("reason")?,
+                identity_digest: candidate.identity_digest.clone(),
+                contract_digest: candidate.contract_digest.clone(),
+            });
+        }
+        let head = head_revision
+            .map(|revision| {
+                revisions
+                    .iter()
+                    .find(|entry| entry.revision == revision)
+                    .cloned()
+                    .ok_or(AppError::Forbidden)
+            })
+            .transpose()?;
+        transaction.commit().await?;
+        Ok(DescriptorAuthoritySnapshot {
+            head,
+            candidates,
+            revisions,
+        })
+    }
+
     pub(crate) async fn begin_empty_plugin_registration(
         &self,
         inventory_id: &str,

@@ -992,6 +992,41 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/plugin-runtime/descriptor:
+    post:
+      tags: [System]
+      operationId: exportApplicationPluginDescriptor
+      summary: Export the complete host-owned plugin inventory descriptor (experimental)
+      description: Requires configured application inventory and existing global plugins:write authority. Optional inventory_id asserts staged-candidate existence, not a filter; export includes all host-owned entries, including unstaged entries, without staging or granting capabilities. Complete candidate/history snapshots are compared before and after local runtime, grants and installed-provenance validation; no database transaction spans asset validation. expected_revision provides observation consistency, not a CAS reservation. Success is not gateway readiness or publication approval. No distribution object is persisted and no guest hook executes. OCI import must still reverify signatures. Roots come only from server configuration; caller roots, grants, approval and readiness assertions are rejected. An unconfigured authority returns 404; configured empty inventory and no published head are supported without installation records.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginDescriptorExportRequest' }
+      responses:
+        '200':
+          description: Complete descriptor, deterministic digest and observed head only; no asset-readiness receipt.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginDescriptorExport' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { description: Request body exceeds the existing control API body limit. }
+        '415': { description: A JSON content type is required. }
+        '422': { description: 'JSON does not match the closed request shape, including unknown fields.' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { description: Export validation capacity or the database is unavailable; no publication occurs. }
+
   /internal/v1/plugin-runtime/installations:
     post:
       tags: [System]
@@ -7122,6 +7157,127 @@ components:
                 additionalProperties:
                   type: array
                   items: { type: string }
+    PluginDescriptorExportRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision]
+      properties:
+        inventory_id:
+          type: [string, 'null']
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+          description: Optional staged-candidate existence assertion, never a filter. Omitted or null still exports the full inventory.
+        expected_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Observed head revision, or zero for no head. The maximum signed int64 value is rejected. This does not reserve a future publication.
+    PluginDescriptorExport:
+      type: object
+      additionalProperties: false
+      required: [descriptor, descriptor_digest, observed_head]
+      properties:
+        descriptor: { $ref: '#/components/schemas/PluginInventoryDescriptor' }
+        descriptor_digest: { type: string, pattern: '^[0-9a-f]{64}$', description: Deterministic BLAKE3 digest of the complete canonical descriptor; not a signature or readiness proof. }
+        observed_head:
+          oneOf:
+            - { $ref: '#/components/schemas/ApplicationPluginRevision' }
+            - { type: 'null' }
+    PluginInventoryDescriptor:
+      type: object
+      additionalProperties: false
+      required: [format_version, inventories]
+      description: Complete versioned distribution data, bounded to 4 MiB when serialized. Includes all retained host inventories without history pagination or truncation. Does not grant installation or publication authority.
+      properties:
+        format_version: { type: integer, const: 1 }
+        inventories:
+          type: object
+          propertyNames: { pattern: '^[A-Za-z0-9_-]{1,64}$' }
+          additionalProperties: { $ref: '#/components/schemas/PluginDescriptorInventory' }
+    PluginDescriptorInventory:
+      type: object
+      additionalProperties: false
+      required: [inventory, packages, identity_digest, contract_digest]
+      properties:
+        inventory:
+          type: object
+          additionalProperties: false
+          required: [root, grants]
+          properties:
+            root:
+              type: string
+              description: Server-mapped absolute destination root, never caller input. Uses the configured plugin directory, or inventory-file parent, plus inventory-<inventory_id>. Hidden empty-registration paths are not exported verbatim.
+            grants:
+              type: object
+              description: Unchanged host-owned grants, keyed by plugin ID; empty for a registered empty inventory.
+              additionalProperties:
+                type: array
+                minItems: 1
+                items: { $ref: '#/components/schemas/PluginDescriptorGrant' }
+        packages:
+          type: object
+          description: Actual complete runtime package identities keyed by plugin ID, with exactly the host-grant keys. Each source plus @ plus digest forms its immutable OCI reference.
+          additionalProperties: { $ref: '#/components/schemas/PluginDescriptorPackageIdentity' }
+        identity_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        contract_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+    PluginDescriptorGrant:
+      type: object
+      additionalProperties: false
+      required: [version, capabilities, manifest_digest, identity]
+      properties:
+        version: { type: string, minLength: 1 }
+        capabilities:
+          type: array
+          items: { $ref: '#/components/schemas/PluginDescriptorCapability' }
+        manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        identity: { $ref: '#/components/schemas/PluginPackageIdentity' }
+    PluginDescriptorCapability:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [log, kv, group_routing_quota] }
+        - type: object
+          additionalProperties: false
+          required: [kind, allowed_origins]
+          properties:
+            kind: { type: string, const: http }
+            allowed_origins: { type: array, items: { type: string } }
+    PluginPackageIdentity:
+      type: object
+      additionalProperties: false
+      required: [component_sha256, provenance]
+      description: Existing host-grant identity representation, including retained grant versions. Export requires a matching grant for every actual runtime package; it does not rewrite other host grants.
+      properties:
+        component_sha256: { type: [string, 'null'] }
+        provenance:
+          oneOf:
+            - { $ref: '#/components/schemas/PluginInstallProvenance' }
+            - { type: 'null' }
+    PluginInstallProvenance:
+      type: object
+      additionalProperties: false
+      required: [format_version, source, digest, signature_policy]
+      properties:
+        format_version: { type: integer, minimum: 0, maximum: 255 }
+        source: { type: string }
+        digest: { type: string }
+        signature_policy: { type: string }
+    PluginDescriptorPackageIdentity:
+      type: object
+      additionalProperties: false
+      required: [component_sha256, provenance]
+      properties:
+        component_sha256: { type: [string, 'null'], pattern: '^sha256:[0-9a-f]{64}$' }
+        provenance:
+          allOf:
+            - { $ref: '#/components/schemas/PluginInstallProvenance' }
+            - type: object
+              properties:
+                format_version: { type: integer, const: 1 }
+                source: { type: string, minLength: 1, description: Installed OCI source without credentials or digest suffix; the complete source@digest reference is bounded to 2048 bytes. }
+                digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+                signature_policy: { type: string, enum: [cosign-public-key, cosign-keyless] }
     ApplicationPluginRevision:
       type: object
       additionalProperties: false

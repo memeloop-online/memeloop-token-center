@@ -20,6 +20,8 @@ use crate::{db::Database, error::AppError, provider::ProviderCatalog};
 const CACHED_REVISIONS: usize = 2;
 pub mod descriptor;
 pub use descriptor::{DescriptorInventory, PluginInventoryDescriptor};
+pub mod descriptor_export;
+pub use descriptor_export::{ExportPluginDescriptor, PluginDescriptorExport};
 #[cfg(feature = "plugin-distribution")]
 pub mod descriptor_import;
 mod empty;

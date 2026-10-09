@@ -60,6 +60,33 @@ async fn application_authority(
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn export_application_plugin_descriptor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::ExportPluginDescriptor>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let destination_root = state
+        .config
+        .plugin_dir
+        .as_deref()
+        .map(std::path::Path::new)
+        .or_else(|| {
+            state
+                .config
+                .plugin_inventory_file
+                .as_deref()
+                .and_then(|path| std::path::Path::new(path).parent())
+        })
+        .ok_or(AppError::NotFound)?;
+    let exported = authority.export_descriptor(body, destination_root).await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(exported),
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
 pub(in crate::api) async fn application_plugin_status(
     State(state): State<AppState>,
     headers: HeaderMap,
