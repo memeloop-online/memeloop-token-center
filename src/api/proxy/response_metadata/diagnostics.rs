@@ -174,7 +174,7 @@ mod tests {
                 UsageRejection::OutOfRange("normalized_output_tokens"),
             ),
             (
-                serde_json::json!({"usage": {"prompt_tokens": 1}, "service_tier": null}),
+                serde_json::json!({"usage": {"prompt_tokens": 1}, "service_tier": false}),
                 UsageRejection::InvalidType("service_tier"),
             ),
             (
