@@ -31,7 +31,7 @@ When('管理员通过统一编辑工作区维护真实代理设置', async funct
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
   await workspace.getByRole('button', { name: '复制代理地址', exact: true }).click();
   assert.ok(await page.evaluate(() => navigator.clipboard.readText()) === original, 'copy returns the original proxy value');
-  const name = workspace.getByLabel('上游名称', { exact: false });
+  const name = workspace.getByLabel('备注名称', { exact: false });
   await name.fill('Browser proxy settings renamed');
   await workspace.getByRole('button', { name: '配置网络代理', exact: true }).click();
   const proxy = workspace.locator('.upstream-proxy-editor input');

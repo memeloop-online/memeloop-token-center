@@ -2,7 +2,7 @@ import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import { ariaDescribedByIds, type RJSFSchema, type WidgetProps } from '@rjsf/utils';
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
-import { Button, Checkbox, FormSection, Input, Select } from '../design-system';
+import { Button, FormSection, Input, Select } from '../design-system';
 import { useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { SecureSchemaField } from '../SecureSchemaField';
@@ -58,7 +58,6 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
   const submitting = useRef(false);
   const controller = useRef<AbortController | null>(null);
   const [busy, setBusy] = useState(false);
-  const [acknowledged, setAcknowledged] = useState(false);
   const [error, setError] = useState<keyof Pick<typeof copy, 'failed' | 'invalid' | 'forbidden' | 'conflict' | 'required'> | ''>('');
   const prepared = useMemo(() => prepareSecretForm(upstreamRotationSchema(provider.credential_schema as RJSFSchema, locale), safeValidator), [provider.credential_schema, locale]);
   useLayoutEffect(() => { title.current?.focus(); }, []);
@@ -67,7 +66,7 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
   const canSubmit = allowed && account.can_rotate && Boolean(token);
 
   async function submit(credential: unknown) {
-    if (!canSubmit || !acknowledged || submitting.current) return;
+    if (!canSubmit || submitting.current) return;
     submitting.current = true;
     setBusy(true); setError('');
     const request = new AbortController();
@@ -93,14 +92,11 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
       <h2 id={`${id}-title`} ref={title} tabIndex={-1}>{t('providers.rotateFor', { name: account.name })}</h2>
       <Button appearance="subtle" type="button" disabled={busy} onClick={onBack}>{copy.close}</Button>
     </header>
-    <p className="create-journey-description">{copy.purpose}</p>
     <div className="create-resource-body form-panel">
-      <FormSection title={copy.impactTitle}>
-        <p>{copy.impact}</p><p>{copy.oldCredential}</p><p>{copy.permission}</p>
-      </FormSection>
+      <p>{copy.oldCredential}</p>
       {!canSubmit && <p role="note">{copy.denied}</p>}
       <div ref={feedback} tabIndex={-1} role={error ? 'alert' : undefined}>{error && copy[error]}</div>
-      <FormSection title={copy.fields} description={copy.options}>
+      <FormSection title={copy.fields}>
         <RjsfForm key={locale} idPrefix={`${id}-credential`} schema={prepared.schema} validator={safeValidator}
           formContext={{ fluentSecrets: true }}
           uiSchema={upstreamRotationUiSchema(locale)} fields={{ SchemaField: SecureSchemaField }}
@@ -109,11 +105,9 @@ export function UpstreamCredentialRotation({ account, provider, token, allowed, 
           experimental_defaultFormStateBehavior={{ emptyObjectFields: 'skipEmptyDefaults' }}
           onError={() => { setError('required'); feedback.current?.focus(); }}
           onSubmit={({ formData }) => void submit(formData)}>
-          <Checkbox checked={acknowledged} disabled={!canSubmit || busy} label={copy.acknowledge}
-            onChange={(_, data) => setAcknowledged(data.checked === true)} />
           <div className="journey-actions">
             <Button appearance="secondary" type="button" disabled={busy} onClick={onBack}>{copy.back}</Button>
-            <Button appearance="primary" type="submit" disabled={!canSubmit || !acknowledged || busy}>{busy ? copy.saving : copy.submit}</Button>
+            <Button appearance="primary" type="submit" disabled={!canSubmit || busy}>{busy ? copy.saving : copy.submit}</Button>
           </div>
         </RjsfForm>
       </FormSection>

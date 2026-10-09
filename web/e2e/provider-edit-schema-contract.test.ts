@@ -6,6 +6,11 @@ import { localizeSchema } from '../src/i18n.js';
 import { providerConfigSchema, providerEditSchema } from '../src/operator/providerEditSchema.js';
 import { connectionSchema } from '../src/operator/upstreamConnectionPolicy.js';
 import { codexTransportPolicySchema, providerEditShape } from './fixtures/provider-edit-shapes.js';
+import { safeValidator } from '../src/safeValidator.js';
+import { prepareSecretForm } from '../src/secretSchema.js';
+import { mergeProviderRenameReceipt, providerSettingsUpdate, providerSettingsValidator } from '../src/operator/providerAccountSettings.js';
+import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
+import type { UpstreamAccount } from '../src/types.js';
 
 function transportPolicy(schema: RJSFSchema): RJSFSchema {
   const config = schema.properties?.config;
@@ -178,4 +183,85 @@ test('authorization config uses the same presentation without changing payload s
     assert.notEqual((projected.properties!.timeout_seconds as RJSFSchema).description, undefined);
   }
   assert.deepEqual(schema, original);
+});
+
+test('display-name saves ignore unchanged provider validation and omit every configuration field', () => {
+  const schema: RJSFSchema = { type: 'object', additionalProperties: false, required: ['name', 'config'], properties: {
+    name: { type: 'string', minLength: 1, maxLength: 200 },
+    config: { type: 'object', additionalProperties: false, required: ['base_url', 'network_scope', 'reservation_token_bounds'], properties: {
+      base_url: { const: 'https://api.kimi.com/coding/', readOnly: true },
+      network_scope: { const: 'public', readOnly: true },
+      reservation_token_bounds: { type: 'object', additionalProperties: { type: 'integer', minimum: 1 } },
+    } },
+  } };
+  const config = { base_url: 'https://api.kimi.com/coding/', _transport_proxy_binding: { revision: 17 }, vendor_extension: { nested: ['retained'] } };
+  const original = structuredClone(config);
+  const form = { name: 'Kimi OAuth 0142', config: { vendor_extension: config.vendor_extension, _transport_proxy_binding: config._transport_proxy_binding, base_url: config.base_url } };
+  assert.ok(safeValidator.validateFormData(form, schema).errors.length > 0);
+  const validator = providerSettingsValidator(safeValidator, config);
+  assert.deepEqual(validator.validateFormData(form, schema).errors, []);
+  assert.deepEqual(providerSettingsUpdate({ ...form, credential: 'must-not-submit', driver: 'must-not-submit' }, config, 'fixture', 9), {
+    name: 'Kimi OAuth 0142', tenant_external_id: 'fixture', expected_updated_at: 9,
+  });
+  for (const name of ['', 'x'.repeat(201)]) {
+    assert.ok(validator.validateFormData({ ...form, name }, schema).errors.some(error => error.property === '.name'), 'name constraints still apply');
+  }
+  const edited = { ...form, config: { ...config, base_url: 'https://unexpected.example' } };
+  assert.ok(validator.validateFormData(edited, schema).errors.some(error => error.property?.startsWith('.config')), 'a changed configuration still gets full validation');
+  assert.deepEqual(providerSettingsUpdate(edited, config, 'fixture', 9).config, edited.config);
+  assert.deepEqual(config, original, 'neither validation nor name submission mutates config/stamps');
+});
+
+test('secret omission in the initial account form does not turn renaming into a config update', () => {
+  const schema: RJSFSchema = { type: 'object', required: ['name', 'config'], properties: {
+    name: { type: 'string', minLength: 1 },
+    config: { type: 'object', required: ['client_secret'], properties: {
+      client_secret: { type: 'string', writeOnly: true }, base_url: { type: 'string', format: 'uri' },
+    } },
+  } };
+  const stored = { name: 'Original', config: { client_secret: 'synthetic-secret', base_url: 'legacy-invalid-url', _internal_binding: { generation: 4 } } };
+  const prepared = prepareSecretForm(schema, safeValidator, stored);
+  const initial = prepared.formData as typeof stored;
+  assert.equal(Object.hasOwn(initial.config, 'client_secret'), false);
+  const renamed = { ...initial, name: 'New display name' };
+  const validator = providerSettingsValidator(safeValidator, initial.config);
+  assert.deepEqual(validator.validateFormData(renamed, prepared.schema).errors, []);
+  assert.equal(Object.hasOwn(providerSettingsUpdate(renamed, initial.config, 'fixture', 4), 'config'), false);
+  assert.equal(stored.config.client_secret, 'synthetic-secret');
+});
+
+test('account copy separates local display name from Kimi identity and describes summary consequences', () => {
+  for (const locale of ['zh-CN', 'en']) {
+    const copy = providerConnectionCopy(locale);
+    assert.equal(copy.displayName, locale === 'zh-CN' ? '备注名称' : 'Display name');
+    assert.equal(copy.editDisplayName, locale === 'zh-CN' ? '修改名称' : 'Rename');
+    assert.equal(copy.signInAgain, locale === 'zh-CN' ? '重新登录' : 'Sign in again');
+    assert.equal(copy.providerIdentity, locale === 'zh-CN' ? '登录账号' : 'Sign-in account');
+    assert.equal(copy.authorizationExpires, locale === 'zh-CN' ? '授权有效期' : 'Authorization expires');
+    assert.equal(copy.kimiIdentityUnavailable, locale === 'zh-CN' ? '未获取' : 'Unavailable');
+    const schema: RJSFSchema = { properties: { config: { properties: { responses_via_chat_compaction: { type: 'boolean', default: false, description: 'opaque implementation detail' } } } } };
+    const field = (providerEditSchema(schema, locale).properties!.config as RJSFSchema).properties!.responses_via_chat_compaction as RJSFSchema;
+    assert.equal(field.default, false);
+    assert.match(field.description!, locale === 'zh-CN' ? /摘要可能遗漏细节.*保持关闭/ : /Summaries can omit details.*leave off if unsure/);
+  }
+});
+
+test('a validated narrow rename receipt preserves proxy, capabilities, config and expired authorization', () => {
+  const account: UpstreamAccount = {
+    id: 'synthetic-account', tenant_id: 'synthetic-tenant-id', tenant_external_id: 'fixture', name: 'Original name', driver: 'kimi-oauth',
+    auth_kind: 'oauth', connection_method: 'oauth', credential_generation: 7, status: 'active', credential_expires_at: 1,
+    can_refresh: true, can_rotate: false, can_reauthorize: true, can_update_transport_proxy: true,
+    has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, proxy_label: 'Stored proxy', proxy_fingerprint: 'synthetic-fingerprint',
+    route_count: 12, config: { _internal_transport_binding: { revision: 42 }, base_url: 'https://api.kimi.com/coding/' }, created_at: 1, updated_at: 4,
+  };
+  const receipt = { id: account.id, tenant_id: account.tenant_id, tenant_external_id: 'fixture', name: 'Kimi OAuth 0142', updated_at: 5 };
+  const original = structuredClone(account);
+  const merged = mergeProviderRenameReceipt(account, { ...receipt, has_proxy: false, can_reauthorize: false, config: {} }, 'fixture', receipt.name);
+  assert.deepEqual(merged, { ...original, name: receipt.name, updated_at: 5 });
+  assert.equal(merged?.config, account.config);
+  assert.deepEqual(account, original);
+  for (const patch of [{ id: 'wrong' }, { tenant_id: 'wrong' }, { tenant_external_id: 'wrong' }, { name: 'Unexpected' }, { updated_at: 3 }, { updated_at: NaN }]) {
+    assert.equal(mergeProviderRenameReceipt(account, { ...receipt, ...patch }, 'fixture', receipt.name), undefined);
+  }
+  assert.equal(mergeProviderRenameReceipt(account, receipt, 'other-tenant', receipt.name), undefined);
 });

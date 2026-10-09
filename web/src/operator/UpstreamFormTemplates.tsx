@@ -17,7 +17,7 @@ function UpstreamObjectTemplate(props: ObjectFieldTemplateProps) {
   if (props.fieldPathId.path.length === 0 && !props.registry.formContext?.providerConfigRoot && props.schema.properties?.name && props.schema.properties?.config) {
     const identity = props.properties.filter((field) => field.name !== 'config' && field.name !== 'credential');
     return <div className="upstream-form-sections">
-      <FormSection title={props.registry.formContext?.providerIdentityTitle ?? t('connection.identitySection')}>{identity.map((field) => field.content)}</FormSection>
+      <FormSection title={props.registry.formContext?.providerIdentityTitle ?? t('connection.identitySection')}>{identity.map((field) => field.content)}{props.registry.formContext?.providerIdentity}</FormSection>
       {props.registry.formContext?.providerAuthentication}
       {props.properties.find((field) => field.name === 'config')?.content}
       {props.registry.formContext?.providerRouting}

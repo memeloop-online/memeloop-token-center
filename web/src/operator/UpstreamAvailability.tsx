@@ -4,7 +4,8 @@ import { LoadingState } from '../design-system';
 import type { OperatorMonitoringSnapshot, UpstreamAccount, UpstreamHealth } from '../types';
 import { RoutingStatusBadge } from './MonitoringSnapshot';
 import type { UpstreamAvailabilityWindow } from './upstreamAvailabilityWindow';
-import { ProviderAccountStatus } from './providerAccountStatus';
+import { ProviderAccountStatus, providerAccountStatus } from './providerAccountStatus';
+import { useQuotaClock } from './useQuotaClock';
 
 export function manualHealthLabel(health: UpstreamHealth) {
   switch (health.error_code) {
@@ -47,6 +48,7 @@ export function UpstreamAvailability({ account, snapshot, window, loading = fals
 }) {
   const { locale, t } = useI18n();
   const models = snapshot?.top_upstream_models.filter((value) => value.upstream_account_id === account.id) ?? [];
+  const status = providerAccountStatus(account, useQuotaClock());
   const scopedWindow = window?.tenant_external_id === account.tenant_external_id ? window : undefined;
   const facts = scopedWindow?.accounts.find((value) => value.upstream_account_id === account.id);
   const attempts = facts?.terminal_outcomes ?? [];
@@ -57,8 +59,7 @@ export function UpstreamAvailability({ account, snapshot, window, loading = fals
     <div className="provider-availability-heading">
       <div><b>{t('providers.recentAvailability')}</b>{range && <small>{t('providers.observationWindow', { range })}</small>}</div>
       <div className="provider-availability-states">
-        <span className="provider-availability-state"><small>{t('providers.accountStatus')}</small><ProviderAccountStatus account={account} /></span>
-        <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><ProviderAccountStatus account={account} credential /></span>
+        {status.credentialLabel !== status.accountLabel && <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><ProviderAccountStatus account={account} credential /></span>}
       </div>
     </div>
     {!facts ? loading ? <LoadingState label={t('common.loading')} variant="compact" /> : <div className="provider-availability-empty">{t('providers.availabilityUnavailable')}</div> : <>

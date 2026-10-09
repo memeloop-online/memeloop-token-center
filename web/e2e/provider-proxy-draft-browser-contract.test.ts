@@ -87,7 +87,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
     await workspace.getByRole('button', { name: '复制代理地址', exact: true }).click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), originalProxy);
-    const name = workspace.getByLabel('上游名称', { exact: false });
+    const name = workspace.getByLabel('备注名称', { exact: false });
     await name.fill('保留名称草稿');
     assert.equal(await proxyValue.getAttribute('type'), 'text', 'editing another field does not conceal an authorized configuration value');
     await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
@@ -352,11 +352,11 @@ test('account workspace returns without retained details, shares list tracks and
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
-      const labels = { edit: chinese ? '编辑' : 'Edit', close: chinese ? '关闭' : 'Close', back: chinese ? '返回账号列表' : 'Back to account list', name: chinese ? '上游名称' : 'Upstream name', cancel: chinese ? '取消' : 'Cancel', proceed: chinese ? '确认继续' : 'Confirm and continue' };
+      const labels = { edit: chinese ? '编辑' : 'Edit', close: chinese ? '关闭' : 'Close', back: chinese ? '返回账号列表' : 'Back to account list', name: chinese ? '备注名称' : 'Display name', cancel: chinese ? '取消' : 'Cancel', proceed: chinese ? '确认继续' : 'Confirm and continue' };
       const accounts = (tenant: string) => [
-        { id: `account-${tenant}`, tenant_external_id: tenant, name: 'Short account', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: true, can_reauthorize: false, can_refresh: false, route_count: 1234, config: { base_url: 'https://provider.example.invalid' }, created_at: 1, updated_at: 2 },
-        { id: `expired-${tenant}`, tenant_external_id: tenant, name: 'Long account name 中文账号名称 '.repeat(5), driver: 'kimi-oauth', auth_kind: 'oauth', connection_method: 'oauth', credential_generation: 1, credential_expires_at: 1, status: 'active', can_rotate: false, can_reauthorize: true, can_refresh: true, route_count: 0, config: {}, created_at: 1, updated_at: 2 },
-        { id: `retired-${tenant}`, tenant_external_id: tenant, name: 'VeryLongUnbrokenAccountName'.repeat(6), driver: 'retired-fixture', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 99, config: {}, created_at: 1, updated_at: 2 },
+        { id: `account-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'Short account', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: true, can_reauthorize: false, can_refresh: false, route_count: 1234, config: { base_url: 'https://provider.example.invalid' }, created_at: 1, updated_at: 2 },
+        { id: `expired-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'Long account name 中文账号名称 '.repeat(5), driver: 'kimi-oauth', auth_kind: 'oauth', connection_method: 'oauth', credential_generation: 1, credential_expires_at: 1, status: 'active', can_rotate: false, can_reauthorize: true, can_refresh: true, route_count: 0, config: {}, created_at: 1, updated_at: 2 },
+        { id: `retired-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'VeryLongUnbrokenAccountName'.repeat(6), driver: 'retired-fixture', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 99, config: {}, created_at: 1, updated_at: 2 },
       ];
       let state: 'normal' | 'empty' | 'denied' | 'slow' = 'normal';
       let releaseRead: (() => void) | undefined;

@@ -4139,6 +4139,41 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
         .request_archive_refs(fixture.key_id, rows[0].request_id)
         .await
         .unwrap();
+    // Draining optional capture jobs proves completion, not successful retention.
+    // Diagnose a missing/gap spool before passing its locator to the object store;
+    // this contract still requires both exact bodies to be durably bound.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let spools = sqlx::query(
+        "SELECT 'request' AS purpose, state, attempts, last_error_code FROM request_archive_spools WHERE request_id = $1 UNION ALL SELECT 'response' AS purpose, state, attempts, last_error_code FROM response_archive_spools WHERE request_id = $1",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("purpose"),
+            row.get::<String, _>("state"),
+            row.get::<i64, _>("attempts"),
+            row.get::<Option<String>, _>("last_error_code"),
+        )
+    })
+    .collect::<Vec<_>>();
+    pool.close().await;
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Bound,
+        "request archive must bind: reason={:?}, spools={spools:?}, persistence={}",
+        refs.request_archive_reason,
+        fixture.state.db.gateway_persistence_metrics()
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Bound,
+        "response archive must bind: reason={:?}, spools={spools:?}",
+        refs.response_archive_reason
+    );
     let archived_request: Value = serde_json::from_slice(
         &fixture
             .state

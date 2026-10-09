@@ -16,6 +16,7 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
     timeout_seconds: ['请求超时（秒）', 'Request timeout (seconds)', '设置等待上游完成请求的最长时间；不确定时保留默认值。', 'Set how long to wait for an upstream request to finish. Keep the default if unsure.'],
     provider_asset_reads_repeatable: ['生成文件可重复读取', 'Generated files allow repeated downloads', '仅在生成文件的下载地址可重复使用时启用；一次性下载地址请保持关闭。', 'Enable only when generated file URLs allow repeated downloads. Leave off for single-use URLs.'],
     responses_compact_v2_bridge: ['Responses 压缩接口', 'Responses compaction endpoint', '仅在提供商支持 POST /v1/responses/compact 时启用，将 Responses 压缩请求交给该接口处理。', 'Enable only if your provider supports POST /v1/responses/compact, to send Responses compaction requests to that endpoint.'],
+    responses_via_chat_compaction: ['Responses 上下文摘要', 'Responses context summaries', '允许用此账号生成长对话的摘要，供后续对话继续使用。摘要可能遗漏细节；仅在提供商能可靠生成摘要时启用，不确定时保持关闭。', 'Allow this account to summarize long conversations so they can continue. Summaries can omit details. Enable only when the provider produces reliable summaries; leave off if unsure.'],
   };
   for (const [name, [zhTitle, enTitle, zhHint, enHint]] of Object.entries(copy)) {
     const field = properties.properties?.[name];

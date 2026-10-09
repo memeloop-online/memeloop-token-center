@@ -23,8 +23,8 @@ test('account status derives expiry independently of enabled state and keeps mis
 test('bilingual Kimi reauthorization distinguishes the MTC connection name from unverified provider identity', () => {
   for (const locale of ['zh-CN', 'en']) {
     const kimi = authorizationJourneyCopy(locale, 'kimi-oauth');
-    assert.match(kimi.purpose, locale === 'en' ? /connection name.*model routes/ : /连接名称和模型路由/);
-    assert.match(kimi.identityHelp, locale === 'en' ? /Check the login account on the Kimi page.*not a verified Kimi account/ : /Kimi 页面核对登录账号.*不代表已核验的 Kimi 账号/);
+    assert.equal(kimi.purpose, locale === 'en' ? 'Signing in replaces the current authorization.' : '新登录会替换当前授权。');
+    assert.equal(kimi.identityHelp, locale === 'en' ? 'Unavailable' : '未获取');
     assert.doesNotMatch(kimi.purpose, /Sign in to the original account|账号必须与原账号一致/);
     assert.match(authorizationJourneyCopy(locale, 'anthropic-claude').identityHelp, /Anthropic/);
     assert.match(authorizationJourneyCopy(locale, 'google-antigravity').identityHelp, /Google/);

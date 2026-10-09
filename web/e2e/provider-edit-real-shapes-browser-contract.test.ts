@@ -28,8 +28,8 @@ test('real Codex config shapes localize transport controls and preserve advanced
       const original = providerEditShape(shape)!.config;
       if (shape === 'retry-only') {
         await workspace.locator('.rjsf > button[type="submit"]').click();
-        assert.deepEqual((await page.evaluate(() => window.formJourneyLastProviderWrite))?.config,
-          { base_url: 'https://chatgpt.com/backend-api/codex', ...original }, 'opening and saving without edits does not materialize defaults');
+        assert.equal(Object.hasOwn((await page.evaluate(() => window.formJourneyLastProviderWrite))!, 'config'), false,
+          'opening and saving without config edits leaves stored config and defaults untouched');
         await editProviderAccount(page);
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
