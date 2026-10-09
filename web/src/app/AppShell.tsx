@@ -3,6 +3,10 @@ import { useI18n, type Locale } from '../i18n';
 import { appHref, type AppRouteKey, type AppSurface } from './routes';
 import { RouteErrorBoundary, type RouteErrorCopy } from './RouteErrorBoundary';
 import type { PluginNavigationSection } from '../operator/pluginContributions';
+import { NavigationGuardProvider, useGuardedNavigation, type NavigationGuard } from './NavigationGuard';
+import { PageLoadingRegion } from '../design-system';
+import { identityCopy } from '../operator/identityCopy';
+import { transportProxyGroupCopy } from '../operator/transportProxyGroupCopy';
 
 interface NavigationItem {
   route: AppRouteKey;
@@ -28,7 +32,7 @@ const labels = {
     errorEyebrow: '页面加载失败', errorTitle: '暂时无法显示此页面', errorDescription: '页面模块未能完成加载。你可以先重试；如果问题仍然存在，请刷新页面。', errorRetry: '重试', errorRefresh: '刷新页面',
     monitoring: '监控', traffic: '流量配置', identity: '身份与权限', system: '系统', creation: '多模态',
     overview: '总览', requests: '请求', sessions: '会话', usage: '用量分析', generations: '生成任务', generate: '创建任务',
-    providers: '上游服务', routes: '模型路由', pricing: '模型计费', tenants: '租户管理', credentials: '客户端凭据',
+    providers: '上游服务', routes: '模型路由', pricing: '模型计费', credentials: '客户端凭据',
     'service-credentials': '服务凭据', plugins: '插件', 'system-settings': '系统设置',
   },
   en: {
@@ -37,7 +41,7 @@ const labels = {
     errorEyebrow: 'Page load failed', errorTitle: 'This page cannot be displayed', errorDescription: 'A page module did not finish loading. Try again, or refresh the page if the problem continues.', errorRetry: 'Try again', errorRefresh: 'Refresh page',
     monitoring: 'Monitoring', traffic: 'Traffic configuration', identity: 'Identity and access', system: 'System', creation: 'Multimodal',
     overview: 'Overview', requests: 'Requests', sessions: 'Sessions', usage: 'Usage', generations: 'Generation jobs', generate: 'Create task',
-    providers: 'Upstream services', routes: 'Model routes', pricing: 'Model pricing', tenants: 'Tenant management', credentials: 'Client credentials',
+    providers: 'Upstream services', routes: 'Model routes', pricing: 'Model pricing', credentials: 'Client credentials',
     'service-credentials': 'Service credentials', plugins: 'Plugins', 'system-settings': 'System settings',
   },
 } as const;
@@ -51,7 +55,7 @@ function navigation(surface: AppSurface, locale: Locale, pluginNavigation: Plugi
     route,
     icon,
     primary,
-    label: label(locale, route as keyof typeof labels.en),
+    label: route === 'tenants' ? identityCopy(locale).title : route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : label(locale, route as keyof typeof labels.en),
   });
   if (surface === 'portal') return [
     { id: 'workspace', label: label(locale, 'workspace'), items: [item('overview'), item('requests'), item('sessions'), item('usage')] },
@@ -59,8 +63,8 @@ function navigation(surface: AppSurface, locale: Locale, pluginNavigation: Plugi
   ];
   const sections: NavigationSection[] = [
     { id: 'monitoring', label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
-    { id: 'traffic', label: label(locale, 'traffic'), items: [item('providers'), item('routes'), item('pricing')] },
-    { id: 'identity', label: label(locale, 'identity'), items: [item('tenants'), item('credentials'), item('service-credentials')] },
+    { id: 'traffic', label: label(locale, 'traffic'), items: [item('providers'), item('proxy-groups', 'plug'), item('routes'), item('pricing')] },
+    { id: 'identity', label: label(locale, 'identity'), items: [item('tenants'), item('credentials')] },
     { id: 'system', label: label(locale, 'system'), items: [item('plugins'), item('system-settings', 'settings')] },
   ];
   for (const pluginSection of pluginNavigation) {
@@ -98,14 +102,21 @@ function NavIcon({ name }: { name: IconName }) {
   return <svg aria-hidden="true" className="app-nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-export function AppShell({ surface, route, onNavigate, children, pluginNavigation = [] }: {
+interface AppShellProps {
   surface: AppSurface;
   route: AppRouteKey;
-  onNavigate: (route: AppRouteKey) => void;
+  onNavigate: ((route: AppRouteKey) => void) & { navigationGuard?: NavigationGuard };
   children: ReactNode;
   pluginNavigation?: PluginNavigationSection[];
-}) {
+}
+
+export function AppShell(props: AppShellProps) {
+  return <NavigationGuardProvider controller={props.onNavigate.navigationGuard}><AppShellContent {...props} /></NavigationGuardProvider>;
+}
+
+function AppShellContent({ surface, route, onNavigate, children, pluginNavigation = [] }: AppShellProps) {
   const { locale, setLocale, t } = useI18n();
+  const guardedNavigation = useGuardedNavigation();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('mtc-sidebar-collapsed') === 'true');
   const [mobileOpen, setMobileOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
@@ -117,7 +128,8 @@ export function AppShell({ surface, route, onNavigate, children, pluginNavigatio
   const mobileCloseRef = useRef<HTMLButtonElement>(null);
   const restoreMobileFocus = useRef(true);
   const previousRoute = useRef(route);
-  const activeItem = navigationItems.find((item) => item.route === route) ?? navigationItems[0];
+  const navigationRoute = surface === 'operator' && route === 'service-credentials' ? 'tenants' : route;
+  const activeItem = navigationItems.find((item) => item.route === navigationRoute) ?? navigationItems[0];
   const routeErrorCopy: RouteErrorCopy = {
     eyebrow: label(locale, 'errorEyebrow'),
     title: label(locale, 'errorTitle'),
@@ -199,12 +211,15 @@ export function AppShell({ surface, route, onNavigate, children, pluginNavigatio
   const changeTheme = () => setTheme((current) => current === 'dark' ? 'light' : 'dark');
   const changeLocale = () => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN');
   const navigate = (nextRoute: AppRouteKey) => {
-    restoreMobileFocus.current = false;
-    setMobileOpen(false);
-    onNavigate(nextRoute);
-    requestAnimationFrame(() => {
-      window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
-      document.getElementById('app-main-content')?.focus({ preventScroll: true });
+    if (nextRoute === route) { setMobileOpen(false); return; }
+    void guardedNavigation(() => {
+      restoreMobileFocus.current = false;
+      setMobileOpen(false);
+      onNavigate(nextRoute);
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+        document.getElementById('app-main-content')?.focus({ preventScroll: true });
+      });
     });
   };
   const onNavigationKeyDown = (event: KeyboardEvent<HTMLAnchorElement>, index: number) => {
@@ -233,7 +248,7 @@ export function AppShell({ surface, route, onNavigate, children, pluginNavigatio
           <h2 id={`app-nav-section-${section.id}`}>{section.label}</h2>
           {section.items.map((item) => {
             const index = itemIndex++;
-            const selected = item.route === route;
+            const selected = item.route === navigationRoute;
             return <a
               href={appHref(surface, item.route)}
               className={`app-nav-item ${item.primary ? 'is-primary' : ''}`}
@@ -269,7 +284,7 @@ export function AppShell({ surface, route, onNavigate, children, pluginNavigatio
       </header>
       <p className="app-route-announcement" aria-live="polite" aria-atomic="true">{activeItem.label}</p>
       <main className="app-main-content" id="app-main-content" tabIndex={-1} data-surface={surface} data-route={route}>
-        <RouteErrorBoundary copy={routeErrorCopy} resetKey={`${surface}:${route}`}>{children}</RouteErrorBoundary>
+        <RouteErrorBoundary copy={routeErrorCopy} resetKey={`${surface}:${route}`}><PageLoadingRegion scopeKey={surface} label={t('common.loading')}>{children}</PageLoadingRegion></RouteErrorBoundary>
       </main>
     </div>
   </div>;

@@ -581,7 +581,9 @@ test('full ProvidersPage review buttons open account details and the real pricin
     const models = account.getByRole('button', { name: '查看模型与路由', exact: true });
     assert.equal(await models.isEnabled(), true, 'read navigation stays available after write denial');
     await models.click();
-    const detail = account.getByRole('region', { name: 'Managed account · 管理账号', exact: true });
+    const detail = page.getByRole('region', { name: 'Managed account · 管理账号', exact: true });
+    assert.equal(await detail.getAttribute('id'), 'provider-details-managed-account');
+    assert.equal(await account.isVisible(), false, 'catalog navigation replaces the account directory');
     await Promise.all([
       page.waitForResponse(response => new URL(response.url()).pathname === '/internal/v1/model-routes'),
       detail.getByRole('button', { name: '查看目录（68）', exact: true }).click(),
@@ -625,7 +627,12 @@ test('full ProvidersPage read denial uses existing catalog and pricing error sta
     const account = page.locator('[data-upstream-id="managed-account"]');
     await account.getByRole('button', { name: '同步模型', exact: true }).click();
     await account.getByRole('button', { name: '查看模型与路由', exact: true }).click();
-    await account.getByRole('alert').filter({ hasText: 'No permission to read this model catalog.' }).waitFor();
+    const detail = page.getByRole('region', { name: 'Managed account · 管理账号', exact: true });
+    assert.equal(await detail.getAttribute('id'), 'provider-details-managed-account');
+    await detail.getByRole('alert').filter({ hasText: 'No permission to read this model catalog.' }).waitFor();
+    await detail.getByRole('button', { name: '返回账号列表', exact: true }).click();
+    assert.equal(await detail.count(), 0);
+    assert.equal(await account.locator('[data-manage-account-trigger]').evaluate(element => element === document.activeElement), true);
     await account.getByRole('button', { name: '检查模型价格', exact: true }).click();
     await page.waitForURL('**/operator?view=pricing');
     await page.getByRole('alert').filter({ hasText: '部分计费数据不可用，请重试。' }).waitFor();

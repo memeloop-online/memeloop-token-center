@@ -331,7 +331,9 @@ Then('生成任务取消请求包含明确租户且页面显示已取消', async
   await assertContains(page.locator('.drawer').getByRole('status'), '已提交取消请求');
   await page.locator('.drawer').getByRole('button', { name: '关闭', exact: true }).click();
   await page.locator('.drawer').waitFor({ state: 'detached' });
-  await assertContains(page.getByRole('status'), '已提交取消请求');
+  const cancellationStatus = page.getByRole('status').filter({ hasText: '已提交取消请求' });
+  await assertContains(cancellationStatus, '已提交取消请求');
+  await assertCount(cancellationStatus, 1);
   const panel = page.locator('.operator-generations');
   assert.equal(await panel.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'closing restores the generation page after the confirmed action');
   await assertContains(panel, '已取消');
@@ -470,7 +472,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(imageRouteResponse.status(), 201, await imageRouteResponse.text());
   const imageRoute = await imageRouteResponse.json() as { id: string };
   assert.match(imageRoute.id, uuidPattern);
-  await assertContains(page.getByRole('status'), '路由已创建');
+  await assertContains(page.getByRole('status').filter({ hasText: '路由已创建' }), '路由已创建');
+  await assertCount(page.getByRole('status').filter({ hasText: '路由已创建' }), 1);
 
   // Reopen a persisted custom route through the real editor. Its saved consent
   // must not survive a candidate change, even when the original scope returns.
@@ -495,7 +498,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(editResponse.status(), 200, await editResponse.text());
   assert.equal(editResponse.request().postDataJSON().custom_model_confirmed, true);
   assert.deepEqual(editResponse.request().postDataJSON().upstream_account_ids, [comfyUpstream.id]);
-  await assertContains(page.getByRole('status'), '路由已更新');
+  await assertContains(page.getByRole('status').filter({ hasText: '路由已更新' }), '路由已更新');
+  await assertCount(page.getByRole('status').filter({ hasText: '路由已更新' }), 1);
 
   await routeForm.locator('[data-workspace-toggle]').click();
   await routeForm.getByLabel('公开模型').fill(videoModel);
@@ -546,7 +550,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(routeResponse.status(), 201);
   const videoRoute = await routeResponse.json() as { id: string };
   assert.match(videoRoute.id, uuidPattern);
-  await assertContains(page.getByRole('status'), '路由已创建');
+  await assertContains(page.getByRole('status').filter({ hasText: '路由已创建' }), '路由已创建');
+  await assertCount(page.getByRole('status').filter({ hasText: '路由已创建' }), 1);
 
   await openAppRoute(page, 'operator', 'pricing');
   const manualPricing = page.locator('.manual-pricing');
@@ -565,7 +570,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const priceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${videoModel}`) && response.request().method() === 'POST');
   await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
   assert.equal((await priceResponsePromise).status(), 200);
-  await assertContains(page.getByRole('status'), '价格已保存');
+  await assertContains(page.getByRole('status').filter({ hasText: '价格已保存' }), '价格已保存');
+  await assertCount(page.getByRole('status').filter({ hasText: '价格已保存' }), 1);
 
   await openAppRoute(page, 'operator', 'credentials');
   const credentialPanel = page.locator('.create-journey');
@@ -891,6 +897,7 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   );
   const afterAbort = new URL(observation.connectionUrls.at(-1)!);
   assert.equal(afterAbort.searchParams.get('after_event_id'), observation.finalCursorId);
+  assert.equal(afterAbort.searchParams.get('after_event_at'), caughtUpReconnect.searchParams.get('after_event_at'), 'switching pages preserves both parts of the last accepted stream cursor');
   await assertNoCount(page.locator('.notice.error'));
   await assertCount(operatorTrafficPanel(page).locator('tbody tr'), observation.finalRowCount);
 

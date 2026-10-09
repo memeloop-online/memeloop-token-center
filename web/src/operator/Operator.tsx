@@ -14,8 +14,14 @@ import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
 import { useRequestRefreshPreference } from './hooks/useRequestRefreshPreference';
 import { OperatorAccessSettings } from './OperatorAccessSettings';
-import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
+import { isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { isPluginRouteKey } from '../app/routes';
+import { useGuardedNavigation } from '../app/NavigationGuard';
+import { IdentityPage } from './pages/IdentityPage';
+import { identityCopy } from './identityCopy';
+import { transportProxyGroupCopy } from './transportProxyGroupCopy';
+import { currentProxyGroupNavigationContext, type ProxyGroupNavigationContext } from '../app/proxyGroupNavigation';
+import { LoadingState, PageLoadingRegion } from '../design-system';
 import {
   PluginContributionPage,
   PluginOverviewCards,
@@ -38,13 +44,15 @@ const RequestsPage = lazy(() => import('./pages/RequestsPage').then((module) => 
 const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })));
 const SystemSettingsPage = lazy(() => import('./pages/SystemSettingsPage').then((module) => ({ default: module.SystemSettingsPage })));
 const TenantManager = lazy(() => import('./TenantManager').then((module) => ({ default: module.TenantManager })));
+const ProxyGroupsPage = lazy(() => import('./pages/ProxyGroupsPage').then((module) => ({ default: module.ProxyGroupsPage })));
 
 type OperatorApplicationRoute = OperatorRouteKey | PluginRouteKey;
 
 export interface OperatorProps {
   route?: OperatorApplicationRoute;
-  onRouteChange?: (route: OperatorApplicationRoute) => void;
+  onRouteChange?: (route: OperatorApplicationRoute, context?: ProxyGroupNavigationContext) => void;
   onPluginNavigation?: (navigation: PluginNavigationSection[]) => void;
+  navigationContext?: ProxyGroupNavigationContext;
   embedded?: boolean;
   showNavigation?: boolean;
 }
@@ -56,22 +64,26 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'usage', label: 'nav.usage', domId: 'usage' },
   { route: 'generations', label: 'nav.generations', domId: 'generations' },
   { route: 'providers', label: 'nav.providers', domId: 'providers' },
+  { route: 'proxy-groups', label: '', domId: 'proxy-groups' },
   { route: 'routes', label: 'nav.routes', domId: 'routes' },
   { route: 'pricing', label: 'nav.pricing', domId: 'pricing' },
   { route: 'tenants', label: 'nav.tenants', domId: 'tenants' },
   { route: 'credentials', label: 'nav.credentials', domId: 'credentials' },
-  { route: 'service-credentials', label: 'nav.services', domId: 'services' },
   { route: 'plugins', label: 'nav.plugins', domId: 'plugins' },
   { route: 'system-settings', label: 'nav.settings', domId: 'system-settings' },
 ];
 
 function pageId(route: OperatorApplicationRoute) {
+  if (route === 'service-credentials') return 'tenants';
   return navigation.find((item) => item.route === route)?.domId ?? route;
 }
 
-export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true }: OperatorProps = {}) {
+export function Operator({ route, onRouteChange, onPluginNavigation, navigationContext, embedded = false, showNavigation = true }: OperatorProps = {}) {
   const { t, locale } = useI18n();
   const scope = useOperatorScope();
+  const guardedNavigation = useGuardedNavigation();
+  const [proxyContext, setProxyContext] = useState<ProxyGroupNavigationContext>(currentProxyGroupNavigationContext);
+  const restoredProxyContext = useRef<string | undefined>(undefined);
   const [internalRoute, setInternalRoute] = useState<OperatorApplicationRoute>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
   const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
@@ -92,7 +104,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     };
   }
   const activeRoute = route ?? internalRoute;
-  const pageScopeKey = `${credentialScope.current.generation}:${scope.tenant}:${activeRoute}`;
+  const pageScopeKey = `${credentialScope.current.generation}:${scope.tenant}:${activeRoute === 'service-credentials' ? 'tenants' : activeRoute}`;
   const requestRefresh = useRequestRefreshPreference();
   const stream = useOperatorRequestStream({
     token: scope.activeCredential,
@@ -111,9 +123,36 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     onPluginNavigation?.(pluginRegistry.navigation);
   }, [onPluginNavigation, pluginRegistry]);
 
-  function navigate(next: OperatorApplicationRoute) {
+  useEffect(() => {
+    setProxyContext(navigationContext ?? currentProxyGroupNavigationContext());
+  }, [activeRoute, navigationContext]);
+
+  useEffect(() => {
+    if (activeRoute !== 'proxy-groups' || !proxyContext.tenant || !scope.validated) return;
+    const key = `${scope.activeCredential}\0${proxyContext.tenant}\0${proxyContext.accountId ?? ''}`;
+    if (restoredProxyContext.current === key || !scope.tenants.some(tenant => tenant.external_id === proxyContext.tenant)) return;
+    restoredProxyContext.current = key;
+    if (scope.tenant !== proxyContext.tenant) scope.setTenant(proxyContext.tenant);
+  }, [activeRoute, proxyContext, scope.activeCredential, scope.validated, scope.tenants, scope.tenant, scope.setTenant]);
+
+  async function navigate(next: OperatorApplicationRoute, context?: ProxyGroupNavigationContext) {
+    if (next === activeRoute) return false;
+    return guardedNavigation(() => {
+      if (route === undefined) setInternalRoute(next);
+      onRouteChange?.(next, context);
+      requestAnimationFrame(() => document.getElementById('app-main-content')?.focus({ preventScroll: true }));
+    });
+  }
+
+  function navigateIdentityTab(next: 'tenants' | 'service-credentials') {
     if (route === undefined) setInternalRoute(next);
     onRouteChange?.(next);
+  }
+
+  function openProxyGroups(accountId?: string) {
+    const context = { accountId, tenant: scope.tenant };
+    setProxyContext(context);
+    navigate('proxy-groups', context);
   }
 
   function navigateFromPlugin(next: string) {
@@ -121,17 +160,19 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   }
 
   function changeRouteByKeyboard(event: KeyboardEvent<HTMLButtonElement>, current: OperatorRouteKey) {
-    const currentIndex = operatorRouteKeys.indexOf(current);
+    const visibleRoutes = navigation.map(item => item.route);
+    const currentIndex = visibleRoutes.indexOf(current);
     let nextIndex = currentIndex;
-    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % operatorRouteKeys.length;
-    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + operatorRouteKeys.length) % operatorRouteKeys.length;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % visibleRoutes.length;
+    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + visibleRoutes.length) % visibleRoutes.length;
     else if (event.key === 'Home') nextIndex = 0;
-    else if (event.key === 'End') nextIndex = operatorRouteKeys.length - 1;
+    else if (event.key === 'End') nextIndex = visibleRoutes.length - 1;
     else return;
     event.preventDefault();
-    const next = operatorRouteKeys[nextIndex];
-    navigate(next);
-    requestAnimationFrame(() => document.getElementById(`operator-tab-${pageId(next)}`)?.focus());
+    const next = visibleRoutes[nextIndex];
+    void navigate(next).then(accepted => {
+      if (accepted) requestAnimationFrame(() => document.getElementById(`operator-tab-${pageId(next)}`)?.focus());
+    });
   }
 
   function openSession(session: UsageAnalysisSessionBucket) {
@@ -184,16 +225,17 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;
-        case 'providers': page = <ProvidersPage {...pageProps} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
+        case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
           if (!scope.tenants.some(value => value.external_id === tenant)) return;
           scope.setTenant(tenant);
           navigate('pricing');
         }} />; break;
+        case 'proxy-groups': page = <ProxyGroupsPage token={scope.activeCredential} tenant={scope.tenant} initialAccountId={!proxyContext.tenant || proxyContext.tenant === scope.tenant ? proxyContext.accountId : undefined} onBack={() => navigate('providers')} />; break;
         case 'routes': page = <RoutesPage {...pageProps} />; break;
         case 'pricing': page = <PricingPage {...pageProps} />; break;
-        case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;
+        case 'tenants': page = <IdentityPage tab="tenants" onNavigate={navigateIdentityTab}><TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} /></IdentityPage>; break;
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
-        case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
+        case 'service-credentials': page = <IdentityPage tab="service-credentials" onNavigate={navigateIdentityTab}><ServiceCredentialsPage {...pageProps} /></IdentityPage>; break;
         case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} reloadCatalog={pluginCatalog.reload} />; break;
         case 'system-settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
@@ -217,17 +259,23 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   } else if (!scope.authenticating || activeRoute === 'system-settings') page = accessSettings;
 
   const content = <>
-    {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
     {scope.activeCredential && scope.tenants.length === 0 && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div></div>}
-    {scope.activeCredential && (scope.tenants.length > 1 || activeRoute === 'credentials') && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
-    {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
+    {scope.activeCredential && (scope.tenants.length > 1 || activeRoute === 'credentials') && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => {
+      const tenant = event.target.value;
+      void guardedNavigation(() => { setProxyContext({}); scope.setTenant(tenant); });
+    }}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
+    {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => {
+      const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants';
+      return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : t(item.label)}</button>;
+    })}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
       {scope.authenticating && activeRoute !== 'system-settings'
-        ? <div className="empty">{t('common.loading')}</div>
-        : <Fragment key={pageScopeKey}><Suspense fallback={<div className="empty">{t('common.loading')}</div>}>{page}</Suspense></Fragment>}
+        ? <LoadingState label={t('common.loading')} level="page" />
+        : <Fragment key={pageScopeKey}><Suspense fallback={<LoadingState label={t('common.loading')} level="page" />}>{page}</Suspense></Fragment>}
     </section>
   </>;
 
-  return embedded ? content : <Shell operator>{content}</Shell>;
+  const workspace = <PageLoadingRegion scopeKey={pageScopeKey} label={t('common.loading')} busy={scope.authenticating}>{content}</PageLoadingRegion>;
+  return embedded ? workspace : <Shell operator>{workspace}</Shell>;
 }

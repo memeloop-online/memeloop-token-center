@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react';
 
 export type ResourceState<T> =
-  | { kind: 'idle'; scopeKey: string }
+  | { kind: 'idle'; scopeKey: string; disabled?: boolean }
   | { kind: 'loading'; scopeKey: string }
-  | { kind: 'ready'; scopeKey: string; value: T; refreshError?: string }
+  | { kind: 'ready'; scopeKey: string; value: T; refreshing?: boolean; refreshError?: string }
   | { kind: 'failed'; scopeKey: string; message: string };
 
 type ResourceAction<T> =
@@ -19,12 +19,12 @@ function reducer<T>(state: ResourceState<T>, action: ResourceAction<T>): Resourc
     // producing a distracting flash, unmounting loses in-progress OAuth state
     // and action confirmations owned by that workspace.
     case 'loading': return state.kind === 'ready' && state.scopeKey === action.scopeKey
-      ? { ...state, refreshError: undefined } : { kind: 'loading', scopeKey: action.scopeKey };
-    case 'ready': return { kind: 'ready', scopeKey: action.scopeKey, value: action.value };
+      ? { ...state, refreshing: true, refreshError: undefined } : { kind: 'loading', scopeKey: action.scopeKey };
+    case 'ready': return { kind: 'ready', scopeKey: action.scopeKey, value: action.value, refreshing: false };
     // Keep an already usable workspace mounted when a background refresh
     // fails. Action-local feedback and OAuth/form state must not disappear.
     case 'failed': return state.kind === 'ready' && state.scopeKey === action.scopeKey
-      ? { ...state, refreshError: action.message }
+      ? { ...state, refreshing: false, refreshError: action.message }
       : { kind: 'failed', scopeKey: action.scopeKey, message: action.message };
   }
 }
@@ -75,8 +75,10 @@ export function useOperatorResource<T>(
 
   // Effects run after paint. Never expose a ready value from the previous
   // tenant/token during the render in which scopeKey changes.
-  const visibleState: ResourceState<T> = state.scopeKey === scopeKey
-    ? state
-    : { kind: 'loading', scopeKey };
+  const visibleState: ResourceState<T> = !enabled
+    ? { kind: 'idle', scopeKey, disabled: true }
+    : state.scopeKey === scopeKey
+      ? state
+      : { kind: 'loading', scopeKey };
   return { state: visibleState, reload };
 }

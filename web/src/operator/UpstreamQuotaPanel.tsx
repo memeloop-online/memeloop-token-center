@@ -8,7 +8,7 @@ import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
 import { UpstreamQuotaReset } from './UpstreamQuotaReset';
-import { DetailTooltip } from '../design-system';
+import { DetailTooltip, LoadingProgress, LoadingState } from '../design-system';
 
 export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { snapshot: UpstreamQuotaSnapshot; refreshError?: 'quota.readFailed' | 'quota.errorPermission'; diagnostic?: UpstreamQuotaDiagnostic }) {
   const { locale, t } = useI18n();
@@ -142,7 +142,8 @@ export function UpstreamQuota({ accountId, accountName = accountId, credentialGe
   return <section className="upstream-quota" aria-label={t('quota.title')} aria-busy={busy}>
     <div className="upstream-quota-heading"><h3>{t('quota.title')}</h3><button type="button" className="secondary" disabled={busy || !tenant || refreshDisabled} onClick={() => void load()}>{t(busy ? 'common.loading' : snapshot ? 'quota.refresh' : 'quota.view')}</button></div>
     {(error || diagnostic?.error_code) && !snapshot && <div className="notice error" role="alert" data-quota-error-code={diagnostic?.error_code ?? undefined} data-quota-cache-hit={String(diagnostic?.cache_hit ?? false)} data-quota-attempt-count={diagnostic?.attempts.length ?? 0}><p>{t(diagnostic?.error_code && diagnostic.error_code !== 'quota_not_authorized' ? quotaReadErrorMessage(diagnostic.error_code) : error ?? quotaReadErrorMessage(diagnostic?.error_code))}</p></div>}
-    {!snapshot && busy && <div className="upstream-quota-loading" role="status"><span>{t('common.loading')}</span><div className="upstream-quota-skeleton" aria-hidden="true"><i /><i /></div></div>}
+    <LoadingProgress active={busy && Boolean(snapshot)} label={t('common.loading')} />
+    {!snapshot && busy && <LoadingState label={t('common.loading')} variant="compact" />}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} refreshError={error} diagnostic={diagnostic} />}
     <UpstreamQuotaResetSection key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} readFailed={Boolean(error || diagnostic?.error_code)} />

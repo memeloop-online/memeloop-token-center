@@ -154,6 +154,13 @@ test('operator guidance gives user actions instead of development reports and ke
   }
 });
 
+test('leaving authorization explains uncertain outcomes without promising cancellation or recovery', () => {
+  assert.equal(translationCatalogs['zh-CN']['providers.confirmLeaveAuthorization'],
+    '离开授权页？授权可能尚未完成。离开不会撤销已提交的请求，其结果可能仍未确认。返回后请先检查账号状态；结果未确认时，不要重复提交。');
+  assert.equal(translationCatalogs.en['providers.confirmLeaveAuthorization'],
+    'Leave the authorization page? Authorization may not be complete. Leaving does not undo submitted requests, and their results may still be unknown. Check the account status when you return; do not resubmit requests with unconfirmed results.');
+});
+
 test('provider settings explain user choices through shared bilingual guidance', async () => {
   const template = await readFile(new URL('../src/operator/UpstreamFormTemplates.tsx', import.meta.url), 'utf8');
   for (const key of ['timeouts', 'timeoutsHint', 'advancedConnection', 'advancedConnectionHint']) assert.ok(template.includes(`copy.${key}`));

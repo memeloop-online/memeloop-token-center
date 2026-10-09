@@ -1,5 +1,5 @@
 import { DrawerFrame } from './components.js';
-import { Button, DetailTooltip, Disclosure } from './design-system';
+import { Button, DetailTooltip, Disclosure, LoadingState } from './design-system';
 import type { CSSProperties } from 'react';
 import { formatCurrencyDisplay, formatMetricDisplay, formatDurationDisplay, formatPercent } from './format.js';
 import type { Locale } from './i18n.js';
@@ -170,9 +170,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
   layout?: 'cards' | 'sidebar';
 }) {
   const { locale, t } = useI18n();
-  if (!values.length && loading) return <div className="session-list-skeleton" role="status" aria-label={t('common.loading')}>
-    {[0, 1, 2, 3].map((value) => <span key={value}><i /><i /><i /></span>)}
-  </div>;
+  if (!values.length && loading) return <LoadingState className="session-list-skeleton" label={t('common.loading')} />;
   if (!values.length) return <div className="empty">{t('sessions.empty')}</div>;
   if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
     {values.map((session) => {

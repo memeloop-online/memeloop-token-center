@@ -17,7 +17,7 @@ const managedModelSync = readFileSync(new URL('../src/operator/managedModelSync.
 test('operator exposes controlled built-in and plugin routing without coupling credentials to the URL', () => {
   assert.match(operator, /type OperatorApplicationRoute = OperatorRouteKey \| PluginRouteKey/);
   assert.match(operator, /route\?: OperatorApplicationRoute/);
-  assert.match(operator, /onRouteChange\?: \(route: OperatorApplicationRoute\)/);
+  assert.match(operator, /onRouteChange\?: \(route: OperatorApplicationRoute, context\?: ProxyGroupNavigationContext\)/);
   assert.match(operator, /embedded\?: boolean/);
   assert.match(operator, /showNavigation\?: boolean/);
   assert.doesNotMatch(operator, /URLSearchParams|location\.|history\./);
@@ -25,11 +25,13 @@ test('operator exposes controlled built-in and plugin routing without coupling c
 
 test('sessions are a first-class operator route and all page keys are explicit', () => {
   assert.deepEqual(operatorRouteKeys, [
-    'overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes',
+    'overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'proxy-groups', 'routes',
     'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'system-settings',
   ]);
   assert.match(operator, /case 'sessions': page = <SessionsPage/);
-  assert.match(operator, /case 'tenants': page = <TenantManager/);
+  assert.match(operator, /case 'tenants': page = <IdentityPage tab="tenants"/);
+  assert.match(operator, /case 'service-credentials': page = <IdentityPage tab="service-credentials"/);
+  assert.match(operator, /case 'proxy-groups': page = <ProxyGroupsPage/);
   assert.doesNotMatch(operator, /trafficMode|onModeChange/);
 });
 

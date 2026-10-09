@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { DrawerFrame } from '../components';
+import { LoadingProgress, LoadingState } from '../design-system';
 import { useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
 import type { TenantManagementView } from '../types';
@@ -188,13 +189,14 @@ export function TenantManager({ token, onChanged }: Props) {
   return <section className="panel tenant-manager" aria-busy={loading || Boolean(busy)}>
     <div className="panel-title tenant-manager-title"><div><h2>{t('tenants.title')}</h2><p className="muted">{t('tenants.description')}</p></div>{values && <ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('tenants.archived')} />}</div>
     <div className="tenant-manager-body">
+      <LoadingProgress active={loading && Boolean(values)} label={t('common.loading')} level="page" />
       {!dialog && error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
       <form className="tenant-create-row" onSubmit={(event) => { event.preventDefault(); void create(); }}>
         <label htmlFor="tenant-external-id">{t('tenants.name')}<input id="tenant-external-id" name="tenant_external_id" autoComplete="off" value={name} maxLength={200} onChange={(event) => setName(event.target.value)} /></label>
         <button type="submit" disabled={loading || busy === 'create' || !name.trim()}>{t('tenants.create')}</button>
       </form>
-      {!values ? <div className="empty tenant-list-state" role={loading ? 'status' : undefined} aria-live="polite">{loading ? t('common.loading') : <button type="button" className="secondary" onClick={() => void load(true)}>{t('common.retry')}</button>}</div> : <div className="account-list tenant-list">
+      {!values ? loading ? <LoadingState label={t('common.loading')} level="page" className="tenant-list-state" /> : <div className="empty tenant-list-state"><button type="button" className="secondary" onClick={() => void load(true)}>{t('common.retry')}</button></div> : <div className="account-list tenant-list">
         {statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('tenants.active')} empty={t('tenants.empty')} />}
         {statusFilter.values.map((value) => {
           const isDefault = value.external_id === 'default';

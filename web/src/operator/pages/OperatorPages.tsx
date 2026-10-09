@@ -1,5 +1,6 @@
 import { api } from '../../api';
 import { RequestTable } from '../../components';
+import { LoadingProgress, LoadingState, PageLoadingRegion } from '../../design-system';
 import { useI18n } from '../../i18n';
 import type { OperatorMonitoringSnapshot, RequestView, TypedFilterAst, UpstreamAccount, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket } from '../../types';
 import { GenerationWorkspace } from '../GenerationWorkspace';
@@ -32,19 +33,19 @@ function monitoringSnapshotPath(tenant: string, now: number) {
 
 function OverviewMonitoringSection({ state, points, token, tenant }: { state: ResourceState<OperatorMonitoringSnapshot>; points?: UsageAnalysisTimeBucket[]; token: string; tenant: string }) {
   const { t } = useI18n();
-  if (state.kind === 'idle' || state.kind === 'loading') return <article className="panel"><div className="panel-title"><h2>{t('monitoring.title')}</h2></div><div className="empty">{t('common.loading')}</div></article>;
+  if (state.kind === 'idle' || state.kind === 'loading') return <article className="panel"><div className="panel-title"><h2>{t('monitoring.title')}</h2></div>{!(state.kind === 'idle' && state.disabled) && <LoadingState label={t('common.loading')} level="page" variant="detail" />}</article>;
   if (state.kind === 'failed') return <article className="panel"><div className="panel-title"><h2>{t('monitoring.title')}</h2></div><div className="notice error" role="alert">{state.message}</div></article>;
-  return <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} quotaSummary={<OverviewUpstreamQuota token={token} tenant={tenant} snapshot={state.value} />} /></>;
+  return <div aria-busy={state.refreshing === true}><LoadingProgress active={state.refreshing === true} label={t('common.loading')} level="page" />{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} quotaSummary={<OverviewUpstreamQuota token={token} tenant={tenant} snapshot={state.value} />} /></div>;
 }
 
 function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string) => void }) {
   const { t } = useI18n();
-  return <article className="panel operator-overview-recent"><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div>
+  return <article className="panel operator-overview-recent" aria-busy={state.kind === 'loading' || (state.kind === 'ready' && state.refreshing === true)}><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div>
     {state.kind === 'idle' || state.kind === 'loading'
-      ? <div className="empty">{t('common.loading')}</div>
+      ? !(state.kind === 'idle' && state.disabled) && <LoadingState label={t('common.loading')} />
       : state.kind === 'failed'
         ? <div className="notice error" role="alert">{state.message}</div>
-        : <>{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<RequestTable requests={state.value} onSelect={(request) => onOpenRequest(request.request_id)} onOpenSession={onOpenSession} /></>}
+        : <><LoadingProgress active={state.refreshing === true} label={t('common.loading')} />{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<RequestTable requests={state.value} onSelect={(request) => onOpenRequest(request.request_id)} onOpenSession={onOpenSession} /></>}
   </article>;
 }
 
@@ -67,11 +68,11 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenS
     t('common.requestFailed'),
   );
   const trends = useOverviewTrendResource(token, tenant);
-  return <div className="operator-overview-dashboard">
+  return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0overview`} label={t('common.loading')}><div className="operator-overview-dashboard">
     <OverviewMonitoringSection state={monitoringResource.state} token={token} tenant={tenant} points={trends.state.kind === 'ready' ? trends.state.value.time_series : undefined} />
     <OverviewTrends state={trends.state} onDrilldown={(ast) => { onRequestDrilldown(ast); onNavigate('requests'); }} />
     <OverviewRecentRequestsSection state={requestResource.state} onOpenRequest={onOpenRequest} onOpenSession={onOpenSession} />
-  </div>;
+  </div></PageLoadingRegion>;
 }
 
 export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & {
@@ -87,11 +88,12 @@ export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & 
   const upstreamMetadataError = resource.state.kind === 'failed'
     ? resource.state.message
     : resource.state.kind === 'ready' ? resource.state.refreshError : undefined;
-  return <>
-    {(resource.state.kind === 'idle' || resource.state.kind === 'loading') && <div className="notice" role="status">{t('usage.upstreams')}: {t('common.loading')}</div>}
+  return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0usage`} label={t('common.loading')}>
+    {(resource.state.kind === 'loading' || (resource.state.kind === 'idle' && !resource.state.disabled)) && <LoadingState label={t('common.loading')} variant="compact" />}
+    <LoadingProgress active={resource.state.kind === 'ready' && resource.state.refreshing === true} label={t('common.loading')} />
     {upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
     <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={onOpenSession} />
-  </>;
+  </PageLoadingRegion>;
 }
 
 export function GenerationsPage({ token, tenant, writeTenant }: OperatorPageProps) {
