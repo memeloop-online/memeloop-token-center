@@ -1,5 +1,5 @@
 import { deepEquals, type ValidatorType } from '@rjsf/utils';
-import type { UpstreamAccount } from '../types';
+import type { UpstreamAccount } from '../types.js';
 
 export function providerSettingsConfigChanged(initialConfig: unknown, formData: Record<string, unknown>) {
   return !deepEquals(initialConfig, formData.config);

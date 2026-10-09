@@ -207,7 +207,7 @@ test('display-name saves ignore unchanged provider validation and omit every con
     assert.ok(validator.validateFormData({ ...form, name }, schema).errors.some(error => error.property === '.name'), 'name constraints still apply');
   }
   const edited = { ...form, config: { ...config, base_url: 'https://unexpected.example' } };
-  assert.ok(validator.validateFormData(edited, schema).errors.some(error => error.property.startsWith('.config')), 'a changed configuration still gets full validation');
+  assert.ok(validator.validateFormData(edited, schema).errors.some(error => error.property?.startsWith('.config')), 'a changed configuration still gets full validation');
   assert.deepEqual(providerSettingsUpdate(edited, config, 'fixture', 9).config, edited.config);
   assert.deepEqual(config, original, 'neither validation nor name submission mutates config/stamps');
 });

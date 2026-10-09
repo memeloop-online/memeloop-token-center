@@ -1,4 +1,4 @@
-import { providerConnectionCopy } from './providerConnectionCopy';
+import { providerConnectionCopy } from './providerConnectionCopy.js';
 
 export function authorizationJourneyCopy(locale: string, providerId?: string) {
   return locale.startsWith('zh') ? {
