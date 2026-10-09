@@ -5616,10 +5616,16 @@ async fn chat_null_and_absent_service_tier_preserve_buffered_and_streaming_settl
                     "id": "chatcmpl-null-tier",
                     "object": "chat.completion.chunk",
                     "model": "compatible-chat-model",
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": null}]
+                });
+                let finished = json!({
+                    "id": "chatcmpl-null-tier",
+                    "object": "chat.completion.chunk",
+                    "model": "compatible-chat-model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 });
                 (
-                    format!("data: {content}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                    format!("data: {content}\n\ndata: {finished}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
                     "text/event-stream",
                 )
             } else {
