@@ -98,10 +98,10 @@ async fn exact_archive_barrier_waits_for_capture_and_is_isolated_to_its_database
     let other = Fixture::new().await;
     let request_id = Uuid::new_v4();
     let other_id = Uuid::new_v4();
-    let (entered, release) =
-        crate::response_archive_spool::pause_next_request_preseal_for_test(request_id);
-    let (other_entered, other_release) =
-        crate::response_archive_spool::pause_next_request_preseal_for_test(other_id);
+    let (entered, release, _registration) =
+        crate::response_archive_spool::scoped_request_preseal_pause_for_test(request_id);
+    let (other_entered, other_release, _other_registration) =
+        crate::response_archive_spool::scoped_request_preseal_pause_for_test(other_id);
 
     fixture
         .database
@@ -110,14 +110,19 @@ async fn exact_archive_barrier_waits_for_capture_and_is_isolated_to_its_database
             // admission. Its capture is held at a deterministic preseal gate.
             let admitted = other.admit(other_id).await.unwrap();
             assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
-            other_entered.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), other_entered)
+                .await
+                .expect("bounded other database preseal entry")
+                .unwrap();
             other.assert_reserved(other_id).await;
 
             let admission = fixture.admit(request_id);
             tokio::pin!(admission);
             tokio::select! {
                 result = &mut admission => panic!("archive barrier returned before capture: {}", result.is_ok()),
-                result = entered => result.unwrap(),
+                result = tokio::time::timeout(Duration::from_secs(5), entered) => {
+                    result.expect("bounded scoped preseal entry").unwrap();
+                },
             }
             fixture.assert_reserved(request_id).await;
             release.send(()).unwrap();
@@ -136,14 +141,53 @@ async fn exact_archive_barrier_waits_for_capture_and_is_isolated_to_its_database
 
     // Leaving the scope restores deferred admission on the very same database.
     let unscoped_id = Uuid::new_v4();
-    let (entered, release) =
-        crate::response_archive_spool::pause_next_request_preseal_for_test(unscoped_id);
+    let (entered, release, _unscoped_registration) =
+        crate::response_archive_spool::scoped_request_preseal_pause_for_test(unscoped_id);
     let admitted = fixture.admit(unscoped_id).await.unwrap();
     assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
-    entered.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("bounded scope exit preseal entry")
+        .unwrap();
     fixture.assert_reserved(unscoped_id).await;
     release.send(()).unwrap();
     fixture.database.drain_gateway_persistence_for_test().await;
+}
+
+#[tokio::test]
+async fn expired_capture_before_preseal_can_clean_its_unreached_registration() {
+    let fixture = Fixture::new().await;
+    let _writer = fixture
+        .database
+        .gateway_persistence
+        .writer
+        .acquire()
+        .await
+        .unwrap();
+    let request_id = Uuid::new_v4();
+    let (mut entered, _release, registration) =
+        crate::response_archive_spool::scoped_request_preseal_pause_for_test(request_id);
+    let admitted = fixture.admit(request_id).await.unwrap();
+    assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
+    fixture.database.drain_gateway_persistence_for_test().await;
+    fixture.assert_reserved(request_id).await;
+    assert_eq!(
+        fixture
+            .database
+            .gateway_persistence
+            .failed
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        entered.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
+    drop(registration);
+    assert_eq!(
+        entered.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    );
 }
 
 #[tokio::test]
