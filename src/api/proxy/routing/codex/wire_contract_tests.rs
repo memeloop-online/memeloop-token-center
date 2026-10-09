@@ -1,4 +1,5 @@
 use super::*;
+use ::http;
 use bytes::Bytes;
 use hyper::body::Body as _;
 use std::sync::{
@@ -133,19 +134,29 @@ async fn strict_peer(
                         .unwrap()
                         .parse::<usize>()
                         .unwrap();
+                    let session_id = request.headers()["session-id"].clone();
                     bodies.spawn(async move {
                         let mut body = request.into_body();
                         let mut total = 0;
+                        let mut received = Vec::new();
                         while let Some(chunk) = body.data().await {
                             let chunk = chunk.unwrap();
                             total += chunk.len();
+                            received.extend_from_slice(&chunk);
                             body.flow_control().release_capacity(chunk.len()).unwrap();
                         }
                         assert!(body.is_end_stream());
                         assert_eq!(total, declared);
+                        let cache_binding = serde_json::from_slice::<Value>(&received)
+                            .ok()
+                            .and_then(|body| body.get("prompt_cache_key").cloned());
+                        if let Some(binding) = cache_binding.as_ref() {
+                            assert_eq!(binding.as_str().unwrap().as_bytes(), session_id.as_bytes());
+                        }
                         let headers = http::Response::builder()
                             .status(200)
                             .header("x-wire-body-bytes", total)
+                            .header("x-wire-cache-binding", cache_binding.is_some().to_string())
                             .body(())
                             .unwrap();
                         response.send_response(headers, true).unwrap();
@@ -164,6 +175,74 @@ async fn strict_peer(
         resets,
         server,
     )
+}
+
+#[tokio::test]
+async fn prepared_opaque_cache_bindings_survive_direct_and_socks_strict_h2_peer() {
+    for use_proxy in [false, true] {
+        let (target, proxy, connections, resets, server) = strict_peer(use_proxy).await;
+        let client = crate::build_codex_http_client().unwrap();
+        let config = json!({
+            "base_url": codex_transport::BASE_URL,
+            "network_scope": "public",
+            "reservation_token_bounds": {"gpt-codex": 10}
+        });
+        let mut distinct = std::collections::HashSet::new();
+        let inputs = [
+            " leading",
+            "leading",
+            "trailing ",
+            "trailing",
+            " ",
+            "  ",
+            "inside space",
+            "%20leading",
+            "%",
+            "a%b",
+        ];
+        for input in inputs.into_iter().map(str::to_owned).chain([
+            " ".repeat(256),
+            "%".repeat(256),
+            "x".repeat(256),
+        ]) {
+            let mut previous = None;
+            for _ in 0..2 {
+                let mut body = json!({"input": [], "prompt_cache_key": input});
+                let plan =
+                    codex_transport::prepare_request(&mut body, "gpt-codex", &config).unwrap();
+                if let Some(previous) = previous.as_ref() {
+                    assert_eq!(previous, &plan.session_id);
+                } else {
+                    previous = Some(plan.session_id.clone());
+                }
+                let serialized = serde_json::to_vec(&body).unwrap();
+                let mut builder = client
+                    .post(&target)
+                    .version(http::Version::HTTP_2)
+                    .body(serialized);
+                if use_proxy {
+                    builder = builder.proxy(wreq::Proxy::all(&proxy).unwrap());
+                }
+                let request = codex_transport::apply_wreq_wire_headers(
+                    builder,
+                    &HeaderMap::new(),
+                    &credential(),
+                    &plan.session_id,
+                    0,
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+                let response = client.execute(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["x-wire-cache-binding"], "true");
+            }
+            assert!(distinct.insert(previous.unwrap()));
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 }
 
 #[tokio::test]
