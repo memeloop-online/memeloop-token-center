@@ -264,7 +264,9 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(providerWorkspace, '正常');
   await providerWorkspace.getByRole('button', { name: '返回账号列表', exact: true }).click();
   await assertNoCount(providerWorkspace);
-  await assertContains(providerAccount, '正常');
+  const enabledAccountStatus = providerAccount.locator('.provider-directory-summary > .status');
+  await assertVisible(enabledAccountStatus);
+  await assertExactText(enabledAccountStatus, '已启用');
   await onboarding.locator('[data-workspace-toggle]').click();
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
