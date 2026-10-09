@@ -276,6 +276,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     openAppRoute(page, 'operator', 'routes'),
     (async () => {
       await assertVisible(leaveAuthorization);
+      await assertExactText(leaveAuthorization.locator('p'), '离开授权页？授权可能尚未完成。离开不会撤销已提交的请求，其结果可能仍未确认。返回后请先检查账号状态；结果未确认时，不要重复提交。');
       assert.equal(new URL(page.url()).searchParams.get('view'), 'providers');
       await leaveAuthorization.getByRole('button', { name: '确认继续', exact: true }).click();
     })(),
