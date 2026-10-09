@@ -296,7 +296,7 @@ async fn sqlite_terminal_replay_survives_source_deletion_and_consumer_order() {
 }
 
 #[tokio::test]
-async fn sqlite_terminal_apply_and_ack_rollback_together() {
+async fn sqlite_terminal_ack_failure_recovers_across_pools_without_recharging() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::connect(&format!(
         "sqlite://{}?mode=rwc",
@@ -344,12 +344,76 @@ async fn sqlite_terminal_apply_and_ack_rollback_together() {
         .execute(&database.pool)
         .await
         .unwrap();
+    database.pool.close().await;
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("rollback.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let recovery_owner = Uuid::now_v7();
     assert!(
         database
+            .claim_terminal_projection_tasks(recovery_owner, 32)
+            .await
+            .unwrap()
+            .contains(&request_id)
+    );
+    assert!(
+        !database
             .project_claimed_terminal_projection_task(owner, request_id)
             .await
             .unwrap()
     );
+    assert!(
+        database
+            .project_claimed_terminal_projection_task(recovery_owner, request_id)
+            .await
+            .unwrap()
+    );
+    database.pool.close().await;
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("rollback.db").display()
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        database
+            .finish_proxy_request_deferred(finish(&key, &reservation, request_id))
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::AlreadyFinished {
+            cost_micros: 10,
+            ..
+        }
+    ));
+    assert!(
+        !database
+            .claim_terminal_projection_tasks(Uuid::now_v7(), 32)
+            .await
+            .unwrap()
+            .contains(&request_id)
+    );
+    assert!(
+        !database
+            .project_claimed_terminal_projection_task(recovery_owner, request_id)
+            .await
+            .unwrap()
+    );
+    let lifetime: i64 = sqlx::query_scalar(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifetime, 10);
     assert_counts(&database, request_id, reservation.id, 1).await;
 }
 
