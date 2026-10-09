@@ -93,6 +93,60 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn exact_archive_barrier_waits_for_capture_and_is_isolated_to_its_database_and_task() {
+    let fixture = Fixture::new().await;
+    let other = Fixture::new().await;
+    let request_id = Uuid::new_v4();
+    let other_id = Uuid::new_v4();
+    let (entered, release) =
+        crate::response_archive_spool::pause_next_request_preseal_for_test(request_id);
+    let (other_entered, other_release) =
+        crate::response_archive_spool::pause_next_request_preseal_for_test(other_id);
+
+    fixture
+        .database
+        .with_request_archive_capture_for_test(async {
+            // Even in the scoped task, another database must retain deferred
+            // admission. Its capture is held at a deterministic preseal gate.
+            let admitted = other.admit(other_id).await.unwrap();
+            assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
+            other_entered.await.unwrap();
+            other.assert_reserved(other_id).await;
+
+            let admission = fixture.admit(request_id);
+            tokio::pin!(admission);
+            tokio::select! {
+                result = &mut admission => panic!("archive barrier returned before capture: {}", result.is_ok()),
+                result = entered => result.unwrap(),
+            }
+            fixture.assert_reserved(request_id).await;
+            release.send(()).unwrap();
+            let admitted = admission.await.unwrap();
+            assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3 AND state = 'pending'")
+                .bind(request_id.to_string())
+                .bind(fixture.key.tenant_id.to_string())
+                .bind(admitted.reservation.id.to_string())
+                .fetch_one(&fixture.database.pool).await.unwrap();
+            assert_eq!(count, 1, "scoped admission must finish the owned request capture");
+            other_release.send(()).unwrap();
+            other.database.drain_gateway_persistence_for_test().await;
+        })
+        .await;
+
+    // Leaving the scope restores deferred admission on the very same database.
+    let unscoped_id = Uuid::new_v4();
+    let (entered, release) =
+        crate::response_archive_spool::pause_next_request_preseal_for_test(unscoped_id);
+    let admitted = fixture.admit(unscoped_id).await.unwrap();
+    assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
+    entered.await.unwrap();
+    fixture.assert_reserved(unscoped_id).await;
+    release.send(()).unwrap();
+    fixture.database.drain_gateway_persistence_for_test().await;
+}
+
+#[tokio::test]
 async fn slow_optional_pool_does_not_wait_or_steal_the_only_safety_connection() {
     let fixture = Fixture::new().await;
     let held = fixture
