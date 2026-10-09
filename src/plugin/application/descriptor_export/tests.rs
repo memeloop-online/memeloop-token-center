@@ -169,6 +169,175 @@ async fn register_nonempty(state: &AppState, directory: &Path) -> PathBuf {
     package
 }
 
+async fn register_single_package(state: &AppState, directory: &Path) -> PreinstalledInventory {
+    let package = register_nonempty(state, directory).await;
+    let authority = state.application_plugins.as_ref().unwrap();
+    let mut entry = authority.inventory.read().await["release"].clone();
+    entry.root = package;
+    installation::append_inventory_file(
+        Path::new(state.config.plugin_inventory_file.as_ref().unwrap()),
+        "single",
+        &entry,
+    )
+    .await
+    .unwrap();
+    authority.stage("single").await.unwrap();
+    entry
+}
+
+#[cfg(feature = "plugin-distribution")]
+#[tokio::test]
+async fn descriptor_export_single_package_source_matches_strict_container_target() {
+    let (directory, state) = fixture().await;
+    let source = register_single_package(&state, directory.path()).await;
+    assert!(PluginRuntime::load_for_inventory(source.root.to_str().unwrap()).is_err());
+    installation::append_inventory_file(
+        Path::new(state.config.plugin_inventory_file.as_ref().unwrap()),
+        "unstaged",
+        &source,
+    )
+    .await
+    .unwrap();
+    let before = state
+        .db
+        .plugin_descriptor_authority_snapshot()
+        .await
+        .unwrap();
+    let response = export(&state, Some("single"), 0).await;
+    let descriptor =
+        PluginInventoryDescriptor::parse(&serde_json::to_vec(&response["descriptor"]).unwrap())
+            .unwrap();
+    assert_eq!(
+        descriptor
+            .inventories
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["release", "single", "unstaged"],
+    );
+    assert!(!before.candidates.contains_key("unstaged"));
+    assert_eq!(
+        state
+            .db
+            .plugin_descriptor_authority_snapshot()
+            .await
+            .unwrap(),
+        before
+    );
+    let entry = &descriptor.inventories["single"];
+    assert_eq!(entry.packages.len(), 1);
+    assert!(entry.packages.contains_key("export-fixture"));
+    assert!(entry.packages["export-fixture"].component_sha256.is_some());
+    let package = entry.inventory.root.join("export-fixture");
+    std::fs::create_dir_all(&package).unwrap();
+    for filename in ["plugin.json", "plugin.wasm", ".mtc-oci-install.json"] {
+        std::fs::copy(source.root.join(filename), package.join(filename)).unwrap();
+    }
+    assert!(!entry.inventory.root.join("plugin.json").exists());
+    let target = PluginRuntime::load_for_inventory(entry.inventory.root.to_str().unwrap()).unwrap();
+    lifecycle::validate_grants(&target, &entry.inventory.grants).unwrap();
+    assert_eq!(target.package_identities(), entry.packages);
+    let mut providers = ProviderCatalog::builtins();
+    providers.extend(target.provider_types()).unwrap();
+    assert_eq!(
+        plugin_configuration_schema_digest(&json!({
+            "manifests": target.manifests(), "identities": target.package_identities()
+        }))
+        .unwrap(),
+        entry.identity_digest,
+    );
+    assert_eq!(contract_digest(&target).unwrap(), entry.contract_digest);
+    let authority = state.application_plugins.as_ref().unwrap();
+    let current = authority.load("single", 1, "initial").await.unwrap();
+    assert_eq!(current.receipt.identity_digest, entry.identity_digest);
+    assert_eq!(current.receipt.contract_digest, entry.contract_digest);
+}
+
+#[tokio::test]
+async fn descriptor_export_mixed_source_preserves_authority_and_rejects_authorized_omissions() {
+    let (directory, state) = fixture().await;
+    let source = register_single_package(&state, directory.path()).await;
+    let child = source.root.join("shadow-child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(
+        child.join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "id":"shadow-child", "version":"1.0.0", "wit_version":"0.2.0",
+            "wasm":null, "capabilities":[], "contributions":{}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        child.join(".mtc-oci-install.json"),
+        serde_json::to_vec(&json!({
+            "format_version":1, "source":"ghcr.io/example/shadow-child",
+            "digest":format!("sha256:{}", "b".repeat(64)), "signature_policy":"cosign-public-key"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_runtime = PluginRuntime::load(source.root.to_str(), state.db.clone()).unwrap();
+    let child_runtime = PluginRuntime::load(child.to_str(), state.db.clone()).unwrap();
+    assert_eq!(root_runtime.manifests().len(), 1);
+    assert_eq!(root_runtime.manifests()[0].id, "export-fixture");
+    assert_eq!(child_runtime.manifests()[0].id, "shadow-child");
+    lifecycle::validate_grants(&root_runtime, &source.grants).unwrap();
+    let response = export(&state, Some("single"), 0).await;
+    let descriptor =
+        PluginInventoryDescriptor::parse(&serde_json::to_vec(&response["descriptor"]).unwrap())
+            .unwrap();
+    let entry = &descriptor.inventories["single"];
+    assert_eq!(entry.packages, root_runtime.package_identities());
+    assert!(!entry.packages.contains_key("shadow-child"));
+    let authority = state.application_plugins.as_ref().unwrap();
+    let current = authority.load("single", 1, "initial").await.unwrap();
+    assert_eq!(current.receipt.identity_digest, entry.identity_digest);
+    assert_eq!(current.receipt.contract_digest, entry.contract_digest);
+    let before = state
+        .db
+        .plugin_descriptor_authority_snapshot()
+        .await
+        .unwrap();
+    let mut complete_grants = source;
+    let manifest = child_runtime.manifests().into_iter().next().unwrap();
+    complete_grants.grants.insert(
+        "shadow-child".into(),
+        vec![lifecycle::PluginGrant {
+            version: manifest.version.clone(),
+            capabilities: manifest.capabilities.clone(),
+            manifest_digest: lifecycle::manifest_digest(&manifest).unwrap(),
+            identity: child_runtime.package_identities()["shadow-child"].clone(),
+        }],
+    );
+    installation::append_inventory_file(
+        Path::new(state.config.plugin_inventory_file.as_ref().unwrap()),
+        "mixed",
+        &complete_grants,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        authority.stage("mixed").await,
+        Err(AppError::Forbidden)
+    ));
+    let (status, _) = call(
+        &state,
+        &state.config.service_token,
+        json!({"inventory_id":"single","expected_revision":0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        state
+            .db
+            .plugin_descriptor_authority_snapshot()
+            .await
+            .unwrap(),
+        before
+    );
+}
+
 #[tokio::test]
 async fn descriptor_export_handles_no_head_empty_head_and_zero_installations() {
     let (directory, state) = fixture().await;

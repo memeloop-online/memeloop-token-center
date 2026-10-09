@@ -60,3 +60,60 @@ is cached. Administrative staging and status retain live filesystem validation;
 staging continues to reject tampered manifests or grants. Immutable inventory IDs
 cannot be edited or removed through inventory refresh. Filesystem removal alone is
 not a revocation mechanism for an exact warm snapshot.
+
+## Protected inventory descriptor export
+
+With `experimental-plugin-revisions`, the control-only endpoint
+`POST /internal/v1/plugin-runtime/descriptor` requires existing **global**
+`plugins:write` authority and a configured application inventory. Its request is:
+
+```json
+{"inventory_id":"release","expected_revision":0}
+```
+
+`inventory_id` is an optional **staged-candidate existence assertion**, not an
+inventory filter or a publication selection. An unknown candidate returns 404.
+Omitting it or supplying `null` removes only that assertion. Every successful
+export includes the **entire host-owned inventory**, including retained historical
+entries and any locally provisioned entries that have not been staged. Export does
+not stage those entries, approve installations, add grants, or publish a revision.
+One invalid inventory fails the whole export, even when another ID was selected.
+
+`expected_revision` must match the observed head; use 0 for no published head.
+Export reads complete candidate and revision history snapshots before and after
+local asset validation, without holding a database transaction during that work.
+A stale expected head or a changed authority snapshot returns 409. This is
+**observation consistency**, not a CAS reservation: the head may change after the
+final observation. Subsequent publication still requires its own existing CAS,
+authorization and validation. Export success is not asset readiness, a gateway
+acknowledgement, or permission to bypass publication checks.
+
+Success returns only `descriptor`, `descriptor_digest` and `observed_head`, with
+`Cache-Control: private, no-store`. An unconfigured application inventory returns
+404; a configured empty map can export with `observed_head:null`; an explicitly
+registered empty inventory has an entry with no packages or grants. No installation
+row is fabricated for these cases. No head does not prove that the separate host
+baseline has no plugins.
+
+Destination roots are server-owned: the configured `MTC_PLUGIN_DIR`, or otherwise
+the parent of `MTC_PLUGIN_INVENTORY_FILE`, plus `inventory-<inventory_id>`. Hidden
+empty-registration directories are not exported verbatim. This mapping remains
+stable for subsequent exports under the same server configuration; an incompatible
+previous bundle still fails the importer's historical-retention checks. The API
+does not accept roots, grants, approval flags, credentials or readiness assertions.
+
+Source loading preserves existing application authority semantics: a root containing
+`plugin.json` is one package, not a container whose children are also activated.
+Otherwise the root is a package container. Exported packages must exactly satisfy
+the host grants and, for staged entries, the database identity/contract receipts.
+A child hidden by a root manifest cannot be silently omitted if host grants require
+it. Import maps each exported package to a child of the destination inventory and
+uses the strict container loader to recheck the complete package set and digests.
+These are equivalent runtime inventories, not identical directory layouts.
+
+Export validates local manifests, component bytes and installed provenance against
+host grants; it compiles components but does not execute guest hooks. It does not
+download artifacts or reverify signatures online. The OCI importer must still
+perform its existing signature verification and complete runtime validation.
+Export persists no distribution object and changes neither the publication head
+nor request pinning. A failed export does not revoke an existing valid warm pin.
