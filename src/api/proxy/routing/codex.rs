@@ -538,9 +538,11 @@ async fn send_codex_attempt_once(
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
+    let body_consumption = send_diagnostics::BodyConsumption::default();
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
-            let request = request?;
+            let mut request = request?;
+            body_consumption.attach(&mut request);
             client.execute(request).await
         }
         .await
@@ -577,6 +579,10 @@ async fn send_codex_attempt_once(
                 group_selection_version = ?transport_identity.group_selection_version,
                 request_local_selection = transport_identity.request_local_selection,
                 transport_cause = wreq_transport_cause(&error),
+                request_body_polls = body_consumption.polls(),
+                request_body_consumed_bytes = body_consumption.bytes(),
+                body_consumption_scope = "transport_body_poll_not_wire_commit",
+                wire_delivery_state = "unknown",
                 send_elapsed_ms = upstream_started.elapsed().as_millis(),
                 stage = "codex_transport_send_failure",
                 "Codex outbound transport send failed"
