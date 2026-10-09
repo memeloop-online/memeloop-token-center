@@ -73,6 +73,8 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     const retainedText = await retained.innerText();
     assert.match(retainedText, /Codex usage · 5-hour limit/);
     assert.match(retainedText, /Last observed balance 0/);
+    assert.match(retainedText, /Last observed: Upstream reports extra credits/);
+    assert.match(retainedText, /Extra credits are separate from plan windows; units are unspecified and requests are not guaranteed/);
     assert.match(retainedText, /Last observed · may be outdated/);
     assert.match(retainedText, /This refresh failed/);
     assert.doesNotMatch(retainedText, /code:primary_window|codex_usage/);

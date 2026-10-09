@@ -173,6 +173,22 @@ export function quotaUnitMessage(unit: string): 'quota.unitRequests' | 'quota.un
 
 export type QuotaObservationState = 'unobserved' | 'current' | 'historical';
 
+export function quotaCreditPresentation(snapshot: UpstreamQuotaSnapshot, locale: string, now = Date.now(), refreshFailed = false) {
+  const observation = quotaObservationState(snapshot, now, refreshFailed);
+  if (observation === 'unobserved' || snapshot.credits.source !== 'codex_usage') return null;
+  const zh = locale === 'zh-CN';
+  const prefix = observation === 'historical' ? (zh ? '上次观测：' : 'Last observed: ') : '';
+  const state = snapshot.credits.has_credits === true ? 'reported' : snapshot.credits.has_credits === false ? 'none' : 'unknown';
+  const message = zh
+    ? { reported: '上游报告有额外点数', none: '上游报告无额外点数', unknown: '额外点数状态未知' }[state]
+    : { reported: 'Upstream reports extra credits', none: 'Upstream reports no extra credits', unknown: 'Extra credit status unknown' }[state];
+  return {
+    state,
+    message: prefix + message,
+    explanation: zh ? '额外点数与套餐窗口分别统计；单位未说明，不代表请求一定可用。' : 'Extra credits are separate from plan windows; units are unspecified and requests are not guaranteed.',
+  };
+}
+
 const QUOTA_ENDPOINT_KINDS = ['usage', 'credits', 'antigravity_quota_summary'] as const;
 const QUOTA_FAILURE_STAGES = [
   'none', 'deadline', 'payload', 'proxy_connect', 'dns', 'tls', 'connect', 'timeout', 'transport',
