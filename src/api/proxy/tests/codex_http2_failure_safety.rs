@@ -7,6 +7,7 @@ use std::sync::{
 #[derive(Clone, Copy)]
 enum Failure {
     PreHeaderReset,
+    PreHeaderRefusedReset,
     PreHeaderSilence,
     PostHeaderSilence,
     RejectedReset,
@@ -51,6 +52,7 @@ async fn http2_failure_upstream(
                             let attempt = count.fetch_add(1, Ordering::SeqCst);
                             match failure {
                                 Failure::PreHeaderReset => response.send_reset(http2::Reason::CANCEL),
+                                Failure::PreHeaderRefusedReset => response.send_reset(http2::Reason::REFUSED_STREAM),
                                 Failure::PreHeaderSilence => held_headers.push(response),
                                 Failure::PostHeaderSilence => {
                                     let headers = http::Response::builder()
@@ -183,7 +185,9 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(rows[0].cost, "0");
     let expected_error = match failure {
-        Failure::PreHeaderReset => "upstream_transport_http2_reset",
+        Failure::PreHeaderReset | Failure::PreHeaderRefusedReset => {
+            "upstream_transport_http2_reset"
+        }
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
         Failure::RejectedReset
@@ -244,6 +248,11 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
 #[tokio::test]
 async fn pre_header_rst_stream_does_not_replay_or_double_settle() {
     assert_terminal_failure(Failure::PreHeaderReset, "h2-pre-header-rst").await;
+}
+
+#[tokio::test]
+async fn pre_header_refused_stream_does_not_replay_or_double_settle() {
+    assert_terminal_failure(Failure::PreHeaderRefusedReset, "h2-pre-header-refused").await;
 }
 
 #[tokio::test]

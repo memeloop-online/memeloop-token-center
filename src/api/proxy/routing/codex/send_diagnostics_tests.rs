@@ -3,6 +3,43 @@ use bytes::Bytes;
 
 use super::*;
 
+#[tokio::test]
+async fn body_observation_preserves_frames_length_and_end_stream_without_claiming_delivery() {
+    for payload in [Bytes::new(), Bytes::from_static(b"synthetic-body")] {
+        let consumption = BodyConsumption::default();
+        let mut request = crate::build_codex_http_client()
+            .unwrap()
+            .post("https://example.test/responses")
+            .body(payload.clone())
+            .build()
+            .unwrap();
+        let headers = request.headers().clone();
+        let original_end = request.body().unwrap().is_end_stream();
+        consumption.attach(&mut request);
+        assert_eq!(request.headers(), &headers);
+        assert_eq!(
+            request.body().unwrap().size_hint().exact(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(request.body().unwrap().is_end_stream(), original_end);
+        assert_eq!(consumption.polls(), 0);
+        assert_eq!(consumption.bytes(), 0);
+        let mut body = request.body_mut().take().unwrap();
+        let mut received = Vec::new();
+        while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            let frame = frame.unwrap();
+            if let Some(data) = frame.data_ref() {
+                received.extend_from_slice(data);
+            }
+        }
+        assert_eq!(received, payload.as_ref());
+        assert!(body.is_end_stream());
+        assert!(consumption.polls() > 0);
+        assert_eq!(consumption.bytes(), payload.len() as u64);
+    }
+}
+
 #[test]
 fn native_request_discards_stale_length_and_forbidden_downstream_headers() {
     let client = crate::build_codex_http_client().unwrap();

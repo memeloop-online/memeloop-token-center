@@ -1,7 +1,74 @@
 use ::http::{Version, header};
 use ::hyper::body::Body;
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 use super::*;
+
+#[derive(Clone, Default)]
+pub(super) struct BodyConsumption {
+    polls: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+}
+
+impl BodyConsumption {
+    pub(super) fn attach(&self, request: &mut wreq::Request) {
+        if let Some(body) = request.body_mut().take() {
+            *request.body_mut() = Some(wreq::Body::wrap(ObservedRequestBody {
+                inner: body,
+                consumption: self.clone(),
+            }));
+        }
+    }
+
+    pub(super) fn polls(&self) -> u64 {
+        self.polls.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+struct ObservedRequestBody {
+    inner: wreq::Body,
+    consumption: BodyConsumption,
+}
+
+impl Body for ObservedRequestBody {
+    type Data = bytes::Bytes;
+    type Error = wreq::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<::hyper::body::Frame<Self::Data>, Self::Error>>> {
+        self.consumption.polls.fetch_add(1, Ordering::Relaxed);
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &result
+            && let Some(data) = frame.data_ref()
+        {
+            self.consumption
+                .bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> ::hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 pub(super) struct TransportIdentity {
     pub(super) client_instance_id: Uuid,
