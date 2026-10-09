@@ -129,6 +129,13 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         ),
         ("rate", 429, "private header-canary", "rate_limit_exceeded"),
         ("model", 400, "private model-canary", "unsupported_model"),
+        ("model-missing", 400, "Model not found", "model_not_found"),
+        (
+            "model-unsupported",
+            400,
+            "Unsupported model",
+            "unsupported_model",
+        ),
         (
             "unknown",
             500,
@@ -169,6 +176,12 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             assert_eq!(delivered["error"]["code"], reason.code());
             assert_eq!(delivered["error"]["message"], reason.message());
             assert_eq!(delivered["error"]["mtc_safe_reason"], reason.code());
+            let (safe_code, safe_message) = reason.provider_detail(Some(code), Some(message));
+            assert_eq!(delivered["error"]["mtc_provider_code"].as_str(), safe_code);
+            assert_eq!(
+                delivered["error"]["mtc_provider_message"].as_str(),
+                safe_message
+            );
         } else {
             assert_eq!(bytes, upstream_error::fallback_body());
         }
@@ -223,7 +236,12 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             .strip_prefix("inline-json:")
             .unwrap();
         assert_eq!(stored.as_bytes(), bytes.as_ref());
+        let projected =
+            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+        assert_eq!(record.supplier_error, projected);
+        assert_eq!(refs.view.supplier_error, projected);
         let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
+        assert_eq!(detail.view.supplier_error, projected);
         assert_eq!(detail.response_body, delivered);
         assert!(detail.archive.response.complete);
         assert_exactly_once_side_effects(&fixture, record.request_id, None).await;
