@@ -872,7 +872,21 @@ fn normalize_prompt_cache_key(
         Some(Value::String(value))
             if !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control) =>
         {
-            value.clone()
+            // Native cache/session identifiers are opaque strings, not UUIDs.
+            // Represent boundary SP without treating distinct keys as OWS-equivalent.
+            // Escape literal '%' as well so e.g. " key" and "%20key" cannot collide.
+            // Both JSON and the header receive this exact, deterministic representation.
+            let start = value.len() - value.trim_start_matches(' ').len();
+            let end = value.trim_end_matches(' ').len();
+            let mut wire_key = String::with_capacity(value.len());
+            for (index, ch) in value.char_indices() {
+                match ch {
+                    '%' => wire_key.push_str("%25"),
+                    ' ' if index < start || index >= end => wire_key.push_str("%20"),
+                    _ => wire_key.push(ch),
+                }
+            }
+            wire_key
         }
         Some(_) => {
             return Err(AppError::BadRequest(
@@ -1093,7 +1107,10 @@ pub(super) fn apply_wreq_wire_headers(
                     "Codex metadata header exceeds its size limit".into(),
                 ));
             }
-            request = request.header(*name, value.clone());
+            let mut forwarded = http::HeaderValue::from_bytes(value.as_bytes().trim_ascii())
+                .map_err(|_| AppError::BadRequest("Codex metadata header is invalid".into()))?;
+            forwarded.set_sensitive(value.is_sensitive());
+            request = request.header(*name, forwarded);
         }
     }
     Ok(request
@@ -1101,8 +1118,14 @@ pub(super) fn apply_wreq_wire_headers(
         .header(header::ACCEPT, "text/event-stream")
         .header(header::ACCEPT_ENCODING, "identity")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("originator", client_identity.originator)
-        .header(header::USER_AGENT, client_identity.user_agent)
+        .header(
+            "originator",
+            client_identity.originator.trim_matches([' ', '\t']),
+        )
+        .header(
+            header::USER_AGENT,
+            client_identity.user_agent.trim_matches([' ', '\t']),
+        )
         .header("session-id", session_id)
         .header("chatgpt-account-id", account_id))
 }
@@ -2556,10 +2579,59 @@ mod tests {
         for invalid in [
             Value::String(String::new()),
             Value::String("x".repeat(257)),
+            json!("\t"),
+            json!("a\nb"),
+            json!("a\rb"),
             json!(7),
         ] {
             let mut request = json!({"model": "public", "input": [], "prompt_cache_key": invalid});
             assert!(prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).is_err());
+        }
+    }
+
+    #[test]
+    fn opaque_cache_keys_have_stable_distinct_wire_bindings() {
+        let inputs = [
+            " leading",
+            "leading",
+            "trailing ",
+            "trailing",
+            " ",
+            "  ",
+            "inside space",
+            "%20leading",
+            "%",
+            "a%b",
+        ];
+        let mut bindings = std::collections::HashSet::new();
+        for input in inputs {
+            let mut first = None;
+            for _ in 0..2 {
+                let mut body = json!({"input": [], "prompt_cache_key": input});
+                let plan =
+                    prepare_request(&mut body, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+                assert_eq!(body["prompt_cache_key"], plan.session_id);
+                assert!(!plan.session_id.starts_with(' '));
+                assert!(!plan.session_id.ends_with(' '));
+                if let Some(previous) = first.as_ref() {
+                    assert_eq!(previous, &plan.session_id);
+                } else {
+                    first = Some(plan.session_id);
+                }
+            }
+            assert!(bindings.insert(first.unwrap()));
+        }
+        for input in ["normal-key", "inside space"] {
+            let mut body = json!({"input": [], "prompt_cache_key": input});
+            let plan = prepare_request(&mut body, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+            assert_eq!(plan.session_id, input);
+        }
+        for input in [" ".repeat(256), "%".repeat(256), "x".repeat(256)] {
+            let mut body = json!({"input": [], "prompt_cache_key": input});
+            let plan = prepare_request(&mut body, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+            assert_eq!(body["prompt_cache_key"], plan.session_id);
+            assert!(!plan.session_id.starts_with(' '));
+            assert!(!plan.session_id.ends_with(' '));
         }
     }
 
