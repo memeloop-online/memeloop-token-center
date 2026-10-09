@@ -192,7 +192,7 @@ fn valid_receipt_digest(value: &str) -> bool {
 fn valid_sha256(value: &str) -> bool {
     value
         .strip_prefix("sha256:")
-        .is_some_and(|digest| valid_receipt_digest(digest))
+        .is_some_and(valid_receipt_digest)
 }
 
 struct UniqueValue(Value);
