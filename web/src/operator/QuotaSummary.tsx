@@ -4,6 +4,20 @@ import { useI18n } from '../i18n';
 import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { useQuotaClock } from './useQuotaClock';
+import { quotaCreditPresentation } from './upstreamQuota';
+
+export function QuotaCredits({ snapshot, now, refreshFailed = false }: { snapshot: UpstreamQuotaSnapshot; now: number; refreshFailed?: boolean }) {
+  const { t, locale } = useI18n();
+  const presentation = quotaCreditPresentation(snapshot, locale, now, refreshFailed);
+  if (!presentation) return null;
+  const historical = quotaObservationState(snapshot, now, refreshFailed) === 'historical';
+  return <div data-quota-extra-credits={presentation.state}>
+    <p>{presentation.message}</p>
+    {typeof snapshot.credits.balance === 'string' && snapshot.credits.balance.trim() !== '' && <p>{t(historical ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</p>}
+    {snapshot.credits.unlimited === true && <p>{t(historical ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</p>}
+    <p>{presentation.explanation}</p>
+  </div>;
+}
 
 /** Compact and expanded quota surfaces share the supplier-window naming contract. */
 export function useQuotaWindowLabel() {
@@ -62,6 +76,7 @@ export function QuotaSummary({
   const content = <div className="quota-summary-tooltip">
     <p>{t(historical ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at!).toLocaleString(locale) })}</p>
     {historical && <p>{text}</p>}
+    <QuotaCredits snapshot={snapshot} now={now} refreshFailed={refreshFailed} />
     {showResetCreditExpiryInTooltip && resetCreditExpiry && <p data-reset-credit-expiry={resetCreditExpiry.state}>{t(
       resetCreditExpiry.state === 'known' ? 'quota.creditExpiresAt' : resetCreditExpiry.state === 'none' ? 'quota.noUnexpiredCredits' : 'quota.creditExpiryUnknown',
       { time: resetCreditExpiry.at === undefined ? '—' : new Date(resetCreditExpiry.at).toLocaleString(locale) },

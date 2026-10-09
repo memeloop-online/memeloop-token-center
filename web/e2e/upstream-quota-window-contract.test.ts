@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { quotaCreditPresentation } from '../src/operator/upstreamQuota.js';
 import { formatCountdown } from '../src/format.js';
 import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaHighestUsageWindow, quotaObservationState, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
@@ -113,6 +114,20 @@ test('quota observation state does not confuse a failed refresh or expired snaps
   assert.equal(quotaObservationState(snapshot, 2_000), 'historical');
   assert.equal(quotaObservationState({ ...snapshot, observed_at: null }, 1_500), 'unobserved');
   const zeroWindow = { id: 'code:primary_window', label: 'code:primary_window', used_percent: 0, used: null, remaining: null, limit: null, unit: null, reset_at: null, period_seconds: 18_000, source: 'codex_usage', reset_is_estimated: false, allowed: true, limit_reached: false };
+  const exhausted = { ...snapshot, windows: [{ ...zeroWindow, used_percent: 100, allowed: false, limit_reached: true, period_seconds: 604_800 }], credits: { balance: '29792.9147550000', unlimited: false, has_credits: true, source: 'codex_usage' as const } };
+  assert.equal(quotaSummaryPresentation(exhausted, 1500).key, 'providerDirectory.used');
+  assert.equal(quotaWindowPresentation(exhausted.provider, exhausted.windows[0]).periodKey, 'quota.periodWeekly');
+  assert.equal(quotaCreditPresentation(exhausted, 'en', 1500)?.state, 'reported', 'an exhausted plan window does not erase independent supplier credits');
+  assert.match(quotaCreditPresentation(exhausted, 'en', 1500)?.explanation ?? '', /units are unspecified and requests are not guaranteed/);
+  for (const historical of [{ ...exhausted, stale: true }, { ...exhausted, status: 'error' as const }, { ...exhausted, error_code: 'quota_timeout' }]) {
+    assert.match(quotaCreditPresentation(historical, 'en', 1500)?.message ?? '', /^Last observed:/);
+  }
+  assert.match(quotaCreditPresentation(exhausted, 'zh-CN', 2000)?.message ?? '', /^上次观测：/);
+  assert.match(quotaCreditPresentation(exhausted, 'en', 1500, true)?.message ?? '', /^Last observed:/);
+  assert.equal(quotaCreditPresentation({ ...exhausted, observed_at: null }, 'en', 1500), null);
+  assert.equal(quotaCreditPresentation(snapshot, 'en', 1500), null);
+  assert.equal(quotaCreditPresentation({ ...exhausted, credits: { ...exhausted.credits, has_credits: false } }, 'en', 1500)?.state, 'none');
+  assert.equal(quotaCreditPresentation({ ...exhausted, credits: { ...exhausted.credits, has_credits: null } }, 'en', 1500)?.state, 'unknown');
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, windows: [zeroWindow], error_code: 'quota_transport_failed' }, 1_500), { key: 'providerDirectory.refreshFailedUsed', usedPercent: 0 });
   assert.deepEqual(quotaSummaryPresentation({ ...snapshot, status: 'error', observed_at: null, windows: [zeroWindow] }, 1_500), { key: 'providerDirectory.readFailed', usedPercent: null });
   const credit: UpstreamQuotaSnapshot['reset_credits'][number] = { status: 'available', granted_at: 1000, expires_at: 9000, source: 'codex_reset_credits' };

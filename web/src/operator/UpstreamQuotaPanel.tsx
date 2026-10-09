@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { formatCountdown, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaObservationState, quotaReadErrorMessage, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaDiagnostic, type UpstreamQuotaSnapshot } from './upstreamQuota';
-import { useQuotaWindowLabel } from './QuotaSummary';
+import { QuotaCredits, useQuotaWindowLabel } from './QuotaSummary';
 import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
@@ -26,9 +26,8 @@ export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { s
       {hasObservation && snapshot.plan_type && <b>{snapshot.plan_type}</b>}
       <span>{snapshot.observed_at === null ? t('quota.notObserved') : t(observation === 'historical' ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
       {observation === 'historical' && <span className="status pending">{t('quota.historical')}</span>}
-      {hasObservation && snapshot.credits.source === 'codex_usage' && typeof snapshot.credits.balance === 'string' && snapshot.credits.balance.trim() !== '' && <span>{t(observation === 'historical' ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</span>}
-      {hasObservation && snapshot.credits.source === 'codex_usage' && snapshot.credits.unlimited === true && <span>{t(observation === 'historical' ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</span>}
     </div>
+    <QuotaCredits snapshot={snapshot} now={now} refreshFailed={readFailed} />
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
     {(snapshot.status !== 'unsupported' || refreshError || refreshDiagnostic.error_code) && readFailed && <div className="notice error" role="alert" data-quota-error-code={refreshDiagnostic.error_code ?? undefined} data-quota-cache-hit={String(refreshDiagnostic.cache_hit)} data-quota-attempt-count={refreshDiagnostic.attempts.length}>
       <p>{t(errorMessage)}</p>
