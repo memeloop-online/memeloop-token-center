@@ -99,8 +99,10 @@ test("plugin descriptor export declares global write authority and the complete 
   assert.deepEqual(schemas.PluginDescriptorCapability.oneOf[1].required, ["kind", "allowed_origins"]);
   const routes = sourceRoutes(readRustSource(`${repository}/src/api`)).filter((route) => route.path === path);
   assert.equal(routes.length, 1);
-  assert.equal(routes[0].method, "post");
-  assert.equal(routes[0].source_role, "control");
+  const route = routes[0];
+  assert.ok(route);
+  assert.equal(route.method, "post");
+  assert.equal(route.source_role, "control");
 });
 
 function sourceWith(controlExtra = "", gatewayExtra = "", commonExtra = ""): string {

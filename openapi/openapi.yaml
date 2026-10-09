@@ -1023,7 +1023,7 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { description: Request body exceeds the existing control API body limit. }
         '415': { description: A JSON content type is required. }
-        '422': { description: JSON does not match the closed request shape, including unknown fields. }
+        '422': { description: 'JSON does not match the closed request shape, including unknown fields.' }
         '500': { $ref: '#/components/responses/InternalError' }
         '503': { description: Export validation capacity or the database is unavailable; no publication occurs. }
 
