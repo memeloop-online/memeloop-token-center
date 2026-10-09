@@ -845,3 +845,117 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
             .contains("declared limit")
     );
 }
+
+#[cfg(all(
+    feature = "plugin-distribution",
+    feature = "experimental-plugin-revisions"
+))]
+mod descriptor_installer_diagnostics {
+    use super::*;
+    use memeloop_token_center::plugin::application::PluginInventoryDescriptor;
+    use std::process::{Command, Output};
+
+    fn run(root: &Path, digest: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_install-plugin-oci"))
+            .env_clear()
+            .arg("--descriptor-file").arg(root.join("input.json"))
+            .args(["--expected-descriptor-digest", digest])
+            .arg("--plugin-dir").arg(root)
+            .arg("--descriptor-output-dir").arg(root.join("bundle"))
+            .args([
+                "--allowed-source", "ghcr.io/example/fixture",
+                "--cosign-certificate-identity",
+                "https://github.com/example/fixture/.github/workflows/publish.yml@refs/heads/master",
+                "--cosign-certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+            ])
+            .output().unwrap()
+    }
+
+    fn assert_failure(output: Output, root: &Path, phase: &str, cause: &str) {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let lines: Vec<_> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let diagnostic: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            diagnostic,
+            json!({
+                "mtc_plugin_install": 1,
+                "stage": "descriptor_import",
+                "category": "descriptor_import_failed",
+                "phase": phase,
+                "cause": cause,
+            })
+        );
+        assert_eq!(
+            lines[1],
+            "Error: \"descriptor import failed (see safe diagnostic category)\""
+        );
+        assert!(!stderr.contains("untrusted-marker"));
+        assert!(!stderr.contains("https://"));
+        assert!(!stderr.contains(root.to_str().unwrap()));
+        assert!(!root.join("bundle").exists());
+    }
+
+    #[test]
+    fn cli_preserves_failure_exit_envelope_message_and_redacts_untrusted_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("untrusted-marker");
+        fs::create_dir(&root).unwrap();
+        assert_failure(
+            run(&root, &"a".repeat(64)),
+            &root,
+            "descriptor_read",
+            "unknown",
+        );
+        fs::write(
+            root.join("input.json"),
+            "https://fixture.invalid/private?value=untrusted-marker",
+        )
+        .unwrap();
+        assert_failure(
+            run(&root, &"a".repeat(64)),
+            &root,
+            "descriptor_validate",
+            "validation",
+        );
+    }
+
+    #[test]
+    fn cli_preserves_empty_success_receipt_stdout_and_identical_reimport() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = PluginInventoryDescriptor {
+            format_version: 1,
+            inventories: BTreeMap::new(),
+        };
+        let digest = descriptor.digest().unwrap();
+        fs::write(
+            root.path().join("input.json"),
+            serde_json::to_vec(&descriptor).unwrap(),
+        )
+        .unwrap();
+        let first = run(root.path(), &digest);
+        assert!(first.status.success());
+        assert!(first.stderr.is_empty());
+        let stdout: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+        assert_eq!(
+            stdout,
+            json!({"descriptor_digest": digest, "inventories": 0})
+        );
+        let receipt = fs::read(root.path().join("bundle/receipt.json")).unwrap();
+        let inventory = fs::read(root.path().join("bundle/inventory.json")).unwrap();
+        let second = run(root.path(), &digest);
+        assert!(second.status.success());
+        assert!(second.stderr.is_empty());
+        assert_eq!(second.stdout, first.stdout);
+        assert_eq!(
+            fs::read(root.path().join("bundle/receipt.json")).unwrap(),
+            receipt
+        );
+        assert_eq!(
+            fs::read(root.path().join("bundle/inventory.json")).unwrap(),
+            inventory
+        );
+    }
+}

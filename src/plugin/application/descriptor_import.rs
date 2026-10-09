@@ -47,50 +47,230 @@ pub struct InventoryDigests {
     pub contract_digest: String,
 }
 
+/// Finite diagnostics for the installer CLI. No error text or import input is retained here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptorImportPhase {
+    Unknown,
+    DescriptorRead,
+    DescriptorValidate,
+    CredentialScope,
+    PathValidate,
+    RootLock,
+    PreviousInventory,
+    PackageWorkspace,
+    PackageInstall,
+    PackagePromote,
+    InventoryValidate,
+    BundlePublish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptorImportCause {
+    Unknown,
+    Validation,
+    Storage,
+    Internal,
+    DigestPin,
+    SourcePolicy,
+    Signature,
+    Registry,
+    Artifact,
+    Package,
+    TargetExists,
+}
+
+impl DescriptorImportCause {
+    fn distribution(category: &str) -> Self {
+        match category {
+            "digest_pin" => Self::DigestPin,
+            "source_policy" => Self::SourcePolicy,
+            "signature" => Self::Signature,
+            "registry" => Self::Registry,
+            "artifact" => Self::Artifact,
+            "package" => Self::Package,
+            "target_exists" => Self::TargetExists,
+            "storage" => Self::Storage,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DescriptorImportDiagnostic {
+    pub phase: DescriptorImportPhase,
+    pub cause: DescriptorImportCause,
+}
+
+/// Carries the original AppError for compatible callers, separately from safe CLI diagnostics.
+/// Debug and Display deliberately exclude that error's potentially sensitive payload.
+pub struct DescriptorImportFailure {
+    error: AppError,
+    diagnostic: DescriptorImportDiagnostic,
+}
+
+impl DescriptorImportFailure {
+    pub fn diagnostic(&self) -> DescriptorImportDiagnostic {
+        self.diagnostic
+    }
+
+    pub fn into_app_error(self) -> AppError {
+        self.error
+    }
+
+    fn at(phase: DescriptorImportPhase, cause: DescriptorImportCause, error: AppError) -> Self {
+        Self {
+            error,
+            diagnostic: DescriptorImportDiagnostic { phase, cause },
+        }
+    }
+
+    fn unknown(phase: DescriptorImportPhase, error: AppError) -> Self {
+        Self::at(phase, DescriptorImportCause::Unknown, error)
+    }
+
+    // Use only at the existing pure validation calls, never as a global AppError classifier.
+    fn validation(phase: DescriptorImportPhase, error: AppError) -> Self {
+        let cause = match &error {
+            AppError::Forbidden | AppError::BadRequest(_) => DescriptorImportCause::Validation,
+            _ => DescriptorImportCause::Unknown,
+        };
+        Self::at(phase, cause, error)
+    }
+
+    fn distribution(error: crate::plugin_distribution::PluginDistributionError) -> Self {
+        Self::at(
+            DescriptorImportPhase::PackageInstall,
+            DescriptorImportCause::distribution(error.diagnostic_category()),
+            AppError::Forbidden,
+        )
+    }
+}
+
+impl std::fmt::Debug for DescriptorImportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.diagnostic, formatter)
+    }
+}
+
+impl std::fmt::Display for DescriptorImportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("descriptor import failed (see safe diagnostic category)")
+    }
+}
+
+impl std::error::Error for DescriptorImportFailure {}
+
 pub async fn import_plugin_descriptor(
     options: &DescriptorImportOptions,
 ) -> Result<DescriptorImportReceipt, AppError> {
+    import_plugin_descriptor_with_diagnostics(options)
+        .await
+        .map_err(DescriptorImportFailure::into_app_error)
+}
+
+/// The shared import flow; the legacy entry point only unwraps its original AppError.
+/// Mixed validation/runtime/publication helpers remain unknown rather than guessing a cause.
+pub async fn import_plugin_descriptor_with_diagnostics(
+    options: &DescriptorImportOptions,
+) -> Result<DescriptorImportReceipt, DescriptorImportFailure> {
+    use DescriptorImportCause as Cause;
+    use DescriptorImportPhase as Phase;
+
     let bytes = read_path(
         &options.descriptor_file,
         PluginInventoryDescriptor::MAX_PARSE_BYTES,
-    )?;
-    let descriptor = PluginInventoryDescriptor::parse_expected(&bytes, &options.expected_digest)?;
-    validate_credential_scope(&descriptor, &options.installation.credentials)?;
-    validate_paths(&descriptor, &options.plugin_dir, &options.output_dir)?;
-    let directory = storage(crate::plugin_publication::directory_fd(&options.plugin_dir))?;
-    let lock = File::from(storage(openat(
-        &directory,
-        ".mtc-descriptor-import.lock",
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::from_bits_truncate(0o600),
-    ))?);
-    if !storage(lock.metadata())?.is_file() {
-        return Err(AppError::Forbidden);
+    )
+    .map_err(|error| DescriptorImportFailure::unknown(Phase::DescriptorRead, error))?;
+    let descriptor = PluginInventoryDescriptor::parse_expected(&bytes, &options.expected_digest)
+        .map_err(|error| DescriptorImportFailure::validation(Phase::DescriptorValidate, error))?;
+    validate_credential_scope(&descriptor, &options.installation.credentials)
+        .map_err(|error| DescriptorImportFailure::validation(Phase::CredentialScope, error))?;
+    validate_paths(&descriptor, &options.plugin_dir, &options.output_dir)
+        .map_err(|error| DescriptorImportFailure::validation(Phase::PathValidate, error))?;
+    let directory = storage(crate::plugin_publication::directory_fd(&options.plugin_dir))
+        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?;
+    let lock = File::from(
+        storage(openat(
+            &directory,
+            ".mtc-descriptor-import.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::from_bits_truncate(0o600),
+        ))
+        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?,
+    );
+    if !storage(lock.metadata())
+        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?
+        .is_file()
+    {
+        return Err(DescriptorImportFailure::validation(
+            Phase::RootLock,
+            AppError::Forbidden,
+        ));
     }
-    storage(lock.try_lock())?;
+    storage(lock.try_lock())
+        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?;
     if let Some(previous) = &options.previous_bundle_dir {
-        direct_child(&options.plugin_dir, previous)?;
-        let prior_directory = storage(crate::plugin_publication::directory_fd(previous))?;
-        let (prior, inventory) = read_bundle(&prior_directory)?;
-        descriptor.validate_extension_of(&prior.descriptor)?;
-        descriptor.validate_retains_inventory(&inventory)?;
+        direct_child(&options.plugin_dir, previous).map_err(|error| {
+            DescriptorImportFailure::validation(Phase::PreviousInventory, error)
+        })?;
+        let prior_directory =
+            storage(crate::plugin_publication::directory_fd(previous)).map_err(|error| {
+                DescriptorImportFailure::at(Phase::PreviousInventory, Cause::Storage, error)
+            })?;
+        let (prior, inventory) = read_bundle(&prior_directory)
+            .map_err(|error| DescriptorImportFailure::unknown(Phase::PreviousInventory, error))?;
+        descriptor
+            .validate_extension_of(&prior.descriptor)
+            .map_err(|error| {
+                DescriptorImportFailure::validation(Phase::PreviousInventory, error)
+            })?;
+        descriptor
+            .validate_retains_inventory(&inventory)
+            .map_err(|error| {
+                DescriptorImportFailure::validation(Phase::PreviousInventory, error)
+            })?;
     }
     if let Some(previous) = &options.previous_inventory_file {
-        let inventory = serde_json::from_slice(&read_path(previous, MAX_BYTES)?)
-            .map_err(|_| AppError::Forbidden)?;
-        descriptor.validate_retains_inventory(&inventory)?;
+        let bytes = read_path(previous, MAX_BYTES)
+            .map_err(|error| DescriptorImportFailure::unknown(Phase::PreviousInventory, error))?;
+        let inventory = serde_json::from_slice(&bytes).map_err(|_| {
+            DescriptorImportFailure::validation(Phase::PreviousInventory, AppError::Forbidden)
+        })?;
+        descriptor
+            .validate_retains_inventory(&inventory)
+            .map_err(|error| {
+                DescriptorImportFailure::validation(Phase::PreviousInventory, error)
+            })?;
     }
     let mut verified = BTreeMap::new();
     for (inventory_id, entry) in &descriptor.inventories {
-        let name = direct_child(&options.plugin_dir, &entry.inventory.root)?;
+        let name = direct_child(&options.plugin_dir, &entry.inventory.root)
+            .map_err(|error| DescriptorImportFailure::validation(Phase::PackageWorkspace, error))?;
         match mkdirat(&directory, name, Mode::from_bits_truncate(0o755)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(_) => return Err(AppError::Internal),
+            Err(_) => {
+                return Err(DescriptorImportFailure::at(
+                    Phase::PackageWorkspace,
+                    Cause::Storage,
+                    AppError::Internal,
+                ));
+            }
         }
-        let root = directory_at(&directory, name)?;
-        for (plugin_id, reference) in entry.package_references()? {
-            same_directory(&directory, &options.plugin_dir)?;
-            same_directory(&root, &entry.inventory.root)?;
+        let root = directory_at(&directory, name).map_err(|error| {
+            DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
+        })?;
+        let references = entry
+            .package_references()
+            .map_err(|error| DescriptorImportFailure::validation(Phase::PackageWorkspace, error))?;
+        for (plugin_id, reference) in references {
+            same_directory(&directory, &options.plugin_dir).map_err(|error| {
+                DescriptorImportFailure::unknown(Phase::PackageWorkspace, error)
+            })?;
+            same_directory(&root, &entry.inventory.root).map_err(|error| {
+                DescriptorImportFailure::unknown(Phase::PackageWorkspace, error)
+            })?;
             let mut installation = options.installation.clone();
             installation.reference = reference;
             let workspace = format!(".mtc-plugin-staging-import-{}", uuid::Uuid::now_v7());
@@ -98,38 +278,61 @@ pub async fn import_plugin_descriptor(
                 &root,
                 workspace.as_str(),
                 Mode::from_bits_truncate(0o700),
-            ))?;
-            let staging = directory_at(&root, std::ffi::OsStr::new(&workspace))?;
+            ))
+            .map_err(|error| {
+                DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
+            })?;
+            let staging =
+                directory_at(&root, std::ffi::OsStr::new(&workspace)).map_err(|error| {
+                    DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
+                })?;
             installation.plugin_root =
                 PathBuf::from(format!("/proc/self/fd/{}/.", staging.as_raw_fd()));
             installation.allow_portable_publication = false;
             let installed = install_plugin_oci(&installation)
                 .await
-                .map_err(|_| AppError::Forbidden)?;
+                .map_err(DescriptorImportFailure::distribution)?;
             if installed.id != plugin_id
                 || installed.path != installation.plugin_root.join(&plugin_id)
             {
-                return Err(AppError::Forbidden);
+                return Err(DescriptorImportFailure::validation(
+                    Phase::PackageInstall,
+                    AppError::Forbidden,
+                ));
             }
-            promote_verified_package(&staging, &root, &plugin_id)?;
+            promote_verified_package(&staging, &root, &plugin_id)
+                .map_err(|error| DescriptorImportFailure::unknown(Phase::PackagePromote, error))?;
             storage(rustix::fs::unlinkat(
                 &root,
                 workspace.as_str(),
                 rustix::fs::AtFlags::REMOVEDIR,
-            ))?;
-            same_directory(&root, &entry.inventory.root)?;
+            ))
+            .map_err(|error| {
+                DescriptorImportFailure::at(Phase::PackagePromote, Cause::Storage, error)
+            })?;
+            same_directory(&root, &entry.inventory.root)
+                .map_err(|error| DescriptorImportFailure::unknown(Phase::PackagePromote, error))?;
         }
-        same_directory(&root, &entry.inventory.root)?;
+        same_directory(&root, &entry.inventory.root)
+            .map_err(|error| DescriptorImportFailure::unknown(Phase::InventoryValidate, error))?;
         let expected = entry.clone();
         let digests = tokio::task::spawn_blocking(move || {
             let path = format!("/proc/self/fd/{}/.", root.as_raw_fd());
             validate_inventory(&expected, &path)
         })
         .await
-        .map_err(|_| AppError::Internal)??;
+        .map_err(|_| {
+            DescriptorImportFailure::at(
+                Phase::InventoryValidate,
+                Cause::Internal,
+                AppError::Internal,
+            )
+        })?
+        .map_err(|error| DescriptorImportFailure::unknown(Phase::InventoryValidate, error))?;
         verified.insert(inventory_id.clone(), digests);
     }
-    same_directory(&directory, &options.plugin_dir)?;
+    same_directory(&directory, &options.plugin_dir)
+        .map_err(|error| DescriptorImportFailure::unknown(Phase::BundlePublish, error))?;
     let receipt = DescriptorImportReceipt {
         format_version: 1,
         descriptor_digest: options.expected_digest.clone(),
@@ -141,7 +344,8 @@ pub async fn import_plugin_descriptor(
         &options.plugin_dir,
         &options.output_dir,
         &receipt,
-    )?;
+    )
+    .map_err(|error| DescriptorImportFailure::unknown(Phase::BundlePublish, error))?;
     Ok(receipt)
 }
 
@@ -572,6 +776,164 @@ mod tests {
         descriptor
     }
 
+    #[test]
+    fn distribution_diagnostics_preserve_all_safe_categories_and_forbidden_semantics() {
+        use crate::plugin_distribution::PluginDistributionError as Error;
+        for error in [
+            Error::DigestPinRequired,
+            Error::SourceDenied,
+            Error::SignatureVerification,
+            Error::Registry,
+            Error::InvalidArtifact("https://fixture.invalid/private?value=untrusted-marker".into()),
+            Error::InvalidPackage("/private/untrusted-marker".into()),
+            Error::TargetExists,
+            Error::Storage,
+        ] {
+            let category = error.diagnostic_category();
+            let failure = DescriptorImportFailure::distribution(error);
+            let diagnostic = serde_json::to_value(failure.diagnostic()).unwrap();
+            assert_eq!(diagnostic["phase"], "package_install");
+            assert_eq!(diagnostic["cause"], category);
+            let safe = format!("{diagnostic} {failure:?} {failure}");
+            assert!(!safe.contains("untrusted-marker"));
+            assert!(!safe.contains("https://"));
+            assert!(!safe.contains("/private/"));
+            assert!(matches!(failure.into_app_error(), AppError::Forbidden));
+        }
+    }
+
+    #[test]
+    fn unknown_diagnostics_do_not_infer_cause_or_disclose_original_error() {
+        use DescriptorImportCause as Cause;
+        use DescriptorImportPhase as Phase;
+        assert_eq!(Cause::distribution("untrusted-marker"), Cause::Unknown);
+        for error in [
+            AppError::Forbidden,
+            AppError::Internal,
+            AppError::BadRequest("https://fixture.invalid/untrusted-marker".into()),
+            AppError::Storage("/private/untrusted-marker".into()),
+            AppError::ProxyGroupConflict("untrusted-marker"),
+        ] {
+            let expected = error.to_string();
+            let failure = DescriptorImportFailure::unknown(Phase::InventoryValidate, error);
+            assert_eq!(failure.diagnostic().cause, Cause::Unknown);
+            let safe = format!(
+                "{} {failure:?} {failure}",
+                serde_json::to_string(&failure.diagnostic()).unwrap()
+            );
+            assert!(!safe.contains("untrusted-marker"));
+            assert!(!safe.contains("https://"));
+            assert!(!safe.contains("/private/"));
+            assert!(std::error::Error::source(&failure).is_none());
+            assert_eq!(failure.into_app_error().to_string(), expected);
+        }
+        let failure =
+            DescriptorImportFailure::validation(Phase::DescriptorValidate, AppError::Internal);
+        assert_eq!(failure.diagnostic().cause, Cause::Unknown);
+        assert!(matches!(failure.into_app_error(), AppError::Internal));
+    }
+
+    #[tokio::test]
+    async fn detailed_errors_report_known_validation_io_and_mixed_read_boundaries() {
+        use DescriptorImportCause as Cause;
+        use DescriptorImportPhase as Phase;
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = options(directory.path());
+        let digest = options.expected_digest.clone();
+        options.expected_digest = "a".repeat(64);
+        let failure = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            failure.diagnostic(),
+            DescriptorImportDiagnostic {
+                phase: Phase::DescriptorValidate,
+                cause: Cause::Validation
+            }
+        );
+        assert!(matches!(failure.into_app_error(), AppError::Forbidden));
+        assert!(matches!(
+            import_plugin_descriptor(&options).await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(
+            !directory
+                .path()
+                .join(".mtc-descriptor-import.lock")
+                .exists()
+        );
+        assert!(!options.output_dir.exists());
+        options.expected_digest = digest;
+        let input = std::fs::read(&options.descriptor_file).unwrap();
+        std::fs::remove_file(&options.descriptor_file).unwrap();
+        let failure = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            failure.diagnostic(),
+            DescriptorImportDiagnostic {
+                phase: Phase::DescriptorRead,
+                cause: Cause::Unknown
+            }
+        );
+        assert!(matches!(failure.into_app_error(), AppError::Internal));
+        assert!(matches!(
+            import_plugin_descriptor(&options).await,
+            Err(AppError::Internal)
+        ));
+        std::fs::write(&options.descriptor_file, input).unwrap();
+        let lock = directory.path().join(".mtc-descriptor-import.lock");
+        std::fs::create_dir(&lock).unwrap();
+        let failure = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            failure.diagnostic(),
+            DescriptorImportDiagnostic {
+                phase: Phase::RootLock,
+                cause: Cause::Storage
+            }
+        );
+        assert!(matches!(failure.into_app_error(), AppError::Internal));
+        assert!(matches!(
+            import_plugin_descriptor(&options).await,
+            Err(AppError::Internal)
+        ));
+        assert!(!options.output_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn package_policy_failure_retains_category_before_original_forbidden_conversion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = options(root.path());
+        let descriptor = registry_descriptor(
+            root.path(),
+            ["first.invalid/package", "first.invalid/other-package"],
+        );
+        options.expected_digest = descriptor.digest().unwrap();
+        std::fs::write(&options.descriptor_file, encoded(&descriptor).unwrap()).unwrap();
+        let failure = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            failure.diagnostic(),
+            DescriptorImportDiagnostic {
+                phase: DescriptorImportPhase::PackageInstall,
+                cause: DescriptorImportCause::SourcePolicy,
+            }
+        );
+        assert!(matches!(failure.into_app_error(), AppError::Forbidden));
+        assert!(matches!(
+            import_plugin_descriptor(&options).await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(!options.output_dir.exists());
+    }
+
     #[tokio::test]
     async fn authenticated_multi_registry_descriptor_fails_before_install_or_lock() {
         for credentials in [
@@ -590,6 +952,18 @@ mod tests {
             options.expected_digest = descriptor.digest().unwrap();
             options.installation.credentials = credentials;
             std::fs::write(&options.descriptor_file, encoded(&descriptor).unwrap()).unwrap();
+            let failure = import_plugin_descriptor_with_diagnostics(&options)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.diagnostic(),
+                DescriptorImportDiagnostic {
+                    phase: DescriptorImportPhase::CredentialScope,
+                    cause: DescriptorImportCause::Validation,
+                }
+            );
+            assert!(matches!(failure.into_app_error(), AppError::Forbidden));
             assert!(matches!(
                 import_plugin_descriptor(&options).await,
                 Err(AppError::Forbidden)
@@ -801,7 +1175,9 @@ mod tests {
     async fn empty_bundle_is_atomic_and_identical_init_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let options = options(directory.path());
-        let first = import_plugin_descriptor(&options).await.unwrap();
+        let first = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .unwrap();
         let original = std::fs::read(options.output_dir.join(RECEIPT_FILE)).unwrap();
         let second = import_plugin_descriptor(&options).await.unwrap();
         assert_eq!(encoded(&first).unwrap(), encoded(&second).unwrap());
@@ -825,7 +1201,22 @@ mod tests {
         wrong.inventories.get_mut("empty").unwrap().identity_digest = "b".repeat(64);
         options.expected_digest = wrong.digest().unwrap();
         std::fs::write(&options.descriptor_file, encoded(&wrong).unwrap()).unwrap();
-        assert!(import_plugin_descriptor(&options).await.is_err());
+        let failure = import_plugin_descriptor_with_diagnostics(&options)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            failure.diagnostic(),
+            DescriptorImportDiagnostic {
+                phase: DescriptorImportPhase::InventoryValidate,
+                cause: DescriptorImportCause::Unknown,
+            }
+        );
+        assert!(matches!(failure.into_app_error(), AppError::Forbidden));
+        assert!(matches!(
+            import_plugin_descriptor(&options).await,
+            Err(AppError::Forbidden)
+        ));
         assert!(!options.output_dir.exists());
         std::fs::write(
             &options.descriptor_file,

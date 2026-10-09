@@ -166,19 +166,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(feature = "experimental-plugin-revisions")]
     if let Some(descriptor_file) = arguments.descriptor_file {
         use memeloop_token_center::plugin::application::descriptor_import::{
-            DescriptorImportOptions, import_plugin_descriptor,
+            DescriptorImportOptions, import_plugin_descriptor_with_diagnostics,
         };
-        let receipt = import_plugin_descriptor(&DescriptorImportOptions {
+        let receipt = import_plugin_descriptor_with_diagnostics(&DescriptorImportOptions {
             descriptor_file,
-            expected_digest: arguments.expected_descriptor_digest.ok_or("descriptor digest required")?,
+            expected_digest: arguments
+                .expected_descriptor_digest
+                .ok_or("descriptor digest required")?,
             plugin_dir: arguments.plugin_dir,
-            output_dir: arguments.descriptor_output_dir.ok_or("descriptor output required")?,
+            output_dir: arguments
+                .descriptor_output_dir
+                .ok_or("descriptor output required")?,
             previous_bundle_dir: arguments.previous_bundle_dir,
             previous_inventory_file: arguments.previous_inventory_file,
             installation,
-        }).await.map_err(|_| {
-            eprintln!("{}", serde_json::json!({"mtc_plugin_install":1,"stage":"descriptor_import","category":"descriptor_import_failed"}));
-            "descriptor import failed (see safe diagnostic category)"
+        })
+        .await
+        .map_err(|error| {
+            let (diagnostic, message) = descriptor_import_failure(&error);
+            eprintln!("{diagnostic}");
+            message
         })?;
         println!(
             "{}",
@@ -201,6 +208,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     println!("{}", serde_json::to_string(&installed)?);
     Ok(())
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn descriptor_import_failure(
+    error: &memeloop_token_center::plugin::application::descriptor_import::DescriptorImportFailure,
+) -> (serde_json::Value, &'static str) {
+    let diagnostic = error.diagnostic();
+    (
+        serde_json::json!({
+            "mtc_plugin_install": 1,
+            "stage": "descriptor_import",
+            "category": "descriptor_import_failed",
+            "phase": diagnostic.phase,
+            "cause": diagnostic.cause,
+        }),
+        "descriptor import failed (see safe diagnostic category)",
+    )
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
