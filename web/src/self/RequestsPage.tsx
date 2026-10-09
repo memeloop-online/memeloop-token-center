@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { api } from '../api';
-import { Buckets, NumberMetric, RequestTable } from '../components';
+import { Buckets, RequestTable } from '../components';
 import { Button, Disclosure, Field, Input, LoadingState, Select } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
@@ -9,6 +9,7 @@ import type { KeyView, RequestView, SelfStats } from '../types';
 import { selfErrorMessage } from './errors';
 import { emptyRequestFilters, requestPageSize, requestsPath, statsPath, type RequestFilters } from './requestPaths';
 import { useSelfRequestRefresh } from './useSelfRequestRefresh';
+import { RequestStatistics } from './RequestStatistics';
 import './requestFilters.css';
 
 type FetchMode = 'replace' | 'append' | 'refresh';
@@ -145,12 +146,7 @@ export function RequestsPage({ credential, credentialView, onError, onOpenReques
   }
 
   return <div className="self-page self-requests-page" data-self-page="requests">
-    {stats && <section className="metrics self-request-summary">
-      <NumberMetric label={t('traffic.total')} value={stats.summary.total_requests} />
-      <NumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" />
-      <NumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" />
-      <NumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} />
-    </section>}
+    {stats && <RequestStatistics stats={stats} onModelSelect={model => filterBy({ model })} />}
     {stats && stats.errors.length > 0 && <article className="panel self-request-errors"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterBy({ status: 'error', errorCode: bucket.name })} /></article>}
     <article className="panel self-history">
       <div className="panel-title self-request-header">
