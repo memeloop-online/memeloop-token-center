@@ -20,6 +20,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
     );
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::for_test(isolated_url.to_string());
+    config.terminal_projection_enabled = true;
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(directory.path().join("archive").display().to_string());
     let state = AppState::initialize(config).await.unwrap();
