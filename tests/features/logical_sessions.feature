@@ -22,6 +22,10 @@ Feature: Stable logical sessions and authoritative usage
     Given a logical session token center backed by SQLite
     Then usage analysis sessions expose key identity and never combine USD with CNY
 
+  Scenario: Session history preserves persisted upstream selection and historical unknowns
+    Given a logical session token center backed by SQLite
+    Then session history preserves persisted account route and model without widening access
+
   @postgres
   Scenario: PostgreSQL satisfies the complete logical-session black-box contract
     Given a logical session token center backed by PostgreSQL

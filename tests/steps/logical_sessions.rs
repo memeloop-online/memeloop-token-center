@@ -750,6 +750,212 @@ async fn usage_by_session_contract(world: &TokenCenterWorld) {
     );
 }
 
+async fn snapshot_request(
+    world: &TokenCenterWorld,
+    key: &AuthenticatedKey,
+    selection: Option<(Uuid, Uuid)>,
+    status_code: i64,
+    explicit_session: Option<&str>,
+) -> (Uuid, String) {
+    let state = world.state.as_ref().expect("logical-session state");
+    let request_id = Uuid::now_v7();
+    state
+        .db
+        .record_request_started(NewRequest {
+            request_id,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai-responses".to_owned(),
+            model: "public-session-model".to_owned(),
+            request_object: format!("memory://snapshot/{request_id}/request"),
+            reservation_id: Uuid::now_v7(),
+            upstream_account_id: selection.map(|value| value.0),
+            model_route_id: selection.map(|value| value.1),
+        })
+        .await
+        .expect("start snapshot request");
+    if selection.is_some() {
+        let pool = AnyPool::connect(&state.config.database_url)
+            .await
+            .expect("connect snapshot fixture database");
+        sqlx::query("UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND key_id = $3")
+            .bind("historical-remapped-model")
+            .bind(request_id.to_string())
+            .bind(key.key_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("set historical model fixture");
+        pool.close().await;
+    }
+    state
+        .db
+        .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            status_code,
+            duration_ms: 20,
+            input_tokens: 4,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 2,
+            service_tier: None,
+            cost_micros: 0,
+            error_code: (status_code >= 400).then(|| "snapshot_failure".to_owned()),
+            response_object: format!("memory://snapshot/{request_id}/response"),
+        })
+        .await
+        .expect("finish snapshot request");
+    let session_id = if let Some(explicit_session) = explicit_session {
+        state
+            .db
+            .record_conversation_observation(
+                key,
+                request_id,
+                &json!({"input": [{"role": "user", "content": explicit_session}]}),
+                &ConversationHints {
+                    session_id: Some(explicit_session.to_owned()),
+                    ..ConversationHints::default()
+                },
+                Some("Cucumber"),
+            )
+            .await
+            .expect("attach snapshot request")
+            .to_string()
+    } else {
+        format!("unlinked:{}", key.key_id)
+    };
+    (request_id, session_id)
+}
+
+async fn session_snapshot_contract(world: &TokenCenterWorld) {
+    let tenant = unique("session-snapshot");
+    let (issued, key) = issue_key(world, &tenant, "owner", "Snapshot owner", "USD").await;
+    let (other_issued, other_key) =
+        issue_key(world, &tenant, "other", "Other credential", "USD").await;
+    let other_tenant = unique("session-snapshot-other-tenant");
+    let other_reader = issue_reader(world, &other_tenant).await;
+    let reader = issue_reader(world, &tenant).await;
+    let account = Uuid::now_v7();
+    let route = Uuid::now_v7();
+    let explicit = unique("snapshot-linked");
+    for linked in [false, true] {
+        let explicit_session = linked.then_some(explicit.as_str());
+        let (known_id, session_id) = snapshot_request(
+            world,
+            &key,
+            Some((account, route)),
+            if linked { 503 } else { 200 },
+            explicit_session,
+        )
+        .await;
+        let (unknown_id, unknown_session) =
+            snapshot_request(world, &key, None, 200, explicit_session).await;
+        assert_eq!(unknown_session, session_id);
+        let archive_id = Uuid::now_v7();
+        let now = unix_millis();
+        let pool = AnyPool::connect(
+            &world
+                .state
+                .as_ref()
+                .expect("logical-session state")
+                .config
+                .database_url,
+        )
+        .await
+        .expect("connect archive snapshot fixture");
+        sqlx::query(
+            "INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, conversation_cluster_id, source_started_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, error_code, request_object, imported_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 'openai-responses', 'archive-model', 429, 0, 0, 0, 'rate_limited', 'memory://snapshot/archive', $8)",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(unique("snapshot-archive-source"))
+        .bind(unique("snapshot-archive-external"))
+        .bind(archive_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(key.principal_id.to_string())
+        .bind(linked.then_some(session_id.clone()))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert archive snapshot fixture");
+        pool.close().await;
+        let path = format!(
+            "/internal/v1/sessions/{session_id}?key_id={}&limit=10",
+            key.key_id
+        );
+        for cursor in [
+            String::new(),
+            format!(
+                "&before_created_at={}&before_request_id={archive_id}",
+                now + 1
+            ),
+        ] {
+            let (status, detail) = get_json(world, &(path.clone() + &cursor), &reader).await;
+            assert_eq!(status, StatusCode::OK, "{detail}");
+            let requests = detail["requests"]
+                .as_array()
+                .expect("snapshot session requests");
+            assert_eq!(requests.len(), 3);
+            let known = requests
+                .iter()
+                .find(|r| r["request_id"] == known_id.to_string())
+                .expect("known snapshot");
+            assert_eq!(known["upstream_account_id"], account.to_string());
+            assert_eq!(known["route_id"], route.to_string());
+            assert_eq!(known["upstream_model"], "historical-remapped-model");
+            assert_eq!(known["model"], "public-session-model");
+            for id in [unknown_id, archive_id] {
+                let unknown = requests
+                    .iter()
+                    .find(|r| r["request_id"] == id.to_string())
+                    .expect("historical unknown snapshot");
+                assert!(unknown["upstream_account_id"].is_null());
+                assert!(unknown["route_id"].is_null());
+                assert!(unknown["upstream_model"].is_null());
+            }
+        }
+        let (status, detail) = get_json(
+            world,
+            &format!("/self/v1/sessions/{session_id}"),
+            &issued.key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let known = detail["requests"]
+            .as_array()
+            .expect("self snapshot requests")
+            .iter()
+            .find(|r| r["request_id"] == known_id.to_string())
+            .expect("self known snapshot");
+        assert_eq!(known["upstream_account_id"], account.to_string());
+        assert_eq!(known["route_id"], route.to_string());
+        let (status, _) = get_json(
+            world,
+            &format!("/self/v1/sessions/{session_id}"),
+            &other_issued.key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_json(world, &path, &other_reader).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_json(
+            world,
+            &format!(
+                "/internal/v1/sessions/{session_id}?key_id={}",
+                other_key.key_id
+            ),
+            &reader,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+#[then("session history preserves persisted account route and model without widening access")]
+async fn session_history_keeps_snapshots(world: &mut TokenCenterWorld) {
+    session_snapshot_contract(world).await;
+}
+
 #[then(
     "rotated credentials retain logical-session history without granting another credential access"
 )]
@@ -784,4 +990,5 @@ async fn all_session_contracts(world: &mut TokenCenterWorld) {
     cursor_contract(world).await;
     archive_only_contract(world).await;
     usage_by_session_contract(world).await;
+    session_snapshot_contract(world).await;
 }
