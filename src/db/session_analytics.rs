@@ -1092,12 +1092,12 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, status_code, duration_ms, first_output_ms, generation_duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, terminal_cause_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1112,7 +1112,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id,
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -1137,12 +1137,12 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, status_code, duration_ms, first_output_ms, generation_duration_ms,
+                r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
                           cost_micros, currency, error_code, terminal_cause_code, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
-                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
+                         SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
                                 r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1157,7 +1157,7 @@ impl Database {
                             AND spool.reservation_id = r.reservation_id
                           WHERE r.key_id = $1 AND r.conversation_cluster_id IS NULL
                          UNION ALL
-                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model,
+                         SELECT archive_request_id, source_started_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id,
                                 status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens,
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
@@ -1248,8 +1248,14 @@ impl Database {
                         protocol,
                         model: row.try_get("model")?,
                         upstream_model: row.try_get("upstream_model")?,
-                        upstream_account_id: None,
-                        route_id: None,
+                        upstream_account_id: row
+                            .try_get::<Option<String>, _>("upstream_account_id")?
+                            .map(parse_uuid)
+                            .transpose()?,
+                        route_id: row
+                            .try_get::<Option<String>, _>("route_id")?
+                            .map(parse_uuid)
+                            .transpose()?,
                         status_code,
                         duration_ms: row.try_get("duration_ms")?,
                         input_tokens: if audio_transcription {
