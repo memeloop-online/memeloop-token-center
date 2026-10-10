@@ -49,6 +49,7 @@ pub(super) struct ResponsesSseCapture {
     independently_observed_protocol_invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
+    supplier_rate_limited: bool,
     terminal_incomplete: bool,
     usage: Option<TokenUsage>,
     usage_invalid: bool,
@@ -89,6 +90,7 @@ pub(super) enum ResponsesSseOutcome {
 
 pub(super) struct ResponsesSseSummary {
     pub(super) outcome: ResponsesSseOutcome,
+    pub(super) supplier_rate_limited: bool,
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
@@ -200,6 +202,10 @@ impl ResponsesSseCapture {
                 }
                 continue;
             }
+            if self.supplier_rate_limited {
+                // A supplier failure cannot be followed by a success/DONE.
+                continue;
+            }
             let has_data = event
                 .lines
                 .iter()
@@ -259,7 +265,9 @@ impl ResponsesSseCapture {
         mut self,
         local_boundary: bool,
     ) -> ResponsesSseSummary {
-        if let Some(chat_usage) = self.chat_usage.as_ref() {
+        if let Some(chat_usage) = self.chat_usage.as_ref()
+            && !self.supplier_rate_limited
+        {
             self.usage = chat_usage.usage();
             let usage_invalid = chat_usage.usage_invalid();
             // A local framing limit can end an otherwise valid Chat prefix
@@ -293,6 +301,7 @@ impl ResponsesSseCapture {
         let protocol_invalid = self.invalid || matches!(&outcome, ResponsesSseOutcome::Incomplete);
         ResponsesSseSummary {
             outcome,
+            supplier_rate_limited: self.supplier_rate_limited,
             usage: self.usage,
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: self.observed_protocol_invalid,
@@ -350,6 +359,11 @@ impl ResponsesSseCapture {
     }
 
     fn delivery_event_bytes(&self, event: &crate::api::sse::BoundedSseEvent) -> Bytes {
+        if let Ok((_, Some(data))) = crate::api::sse::parse_sse_event(event)
+            && let Some(body) = Self::safe_supplier_tpm_body(&data)
+        {
+            return Bytes::from(format!("data: {}\n\n", String::from_utf8_lossy(&body)));
+        }
         let metadata_policy = if Self::event_name_matches_payload(event)
             || (self.chat_usage.is_some() && Self::strict_chat_safe_event_name(event).is_some())
         {
@@ -358,6 +372,26 @@ impl ResponsesSseCapture {
             crate::api::sse::SseEventMetadataPolicy::DataOnly
         };
         crate::api::sse::redacted_sse_event_bytes(event, metadata_policy)
+    }
+
+    fn safe_supplier_tpm_body(data: &[u8]) -> Option<Bytes> {
+        const CODE: &[u8] = b"ModelAccountTpmRateLimitExceeded";
+        if data.len() > upstream_error::MAX_ERROR_BYTES
+            || !data.windows(CODE.len()).any(|part| part == CODE)
+        {
+            return None;
+        }
+        let value = crate::api::sse::parse_unique_json(data).ok()?;
+        if value.pointer("/error/code").and_then(Value::as_str)
+            != Some("ModelAccountTpmRateLimitExceeded")
+        {
+            return None;
+        }
+        let body = upstream_error::safe_error_body(data);
+        let inline = format!("inline-json:{}", String::from_utf8_lossy(&body));
+        crate::supplier_error::supplier_error_from_inline_json(Some(&inline))
+            .filter(|error| error.code == "rate_limited")
+            .map(|_| body)
     }
 
     fn strict_chat_named_control_bytes(event: &crate::api::sse::BoundedSseEvent) -> Bytes {
@@ -467,6 +501,15 @@ impl ResponsesSseCapture {
                 self.terminal_success = true;
             }
             return ChatSseDeliveryClass::Control;
+        }
+        // A standard supplier TPM business error is a failed terminal even
+        // on a Chat usage contract. Never feed it to the Chat chunk schema or
+        // accept a later DONE as success. Parsing rejects duplicate JSON keys.
+        if Self::safe_supplier_tpm_body(&data).is_some() {
+            self.terminal_failure = true;
+            self.supplier_rate_limited = true;
+            // Preserve the compatible failure frame's delivery attribution.
+            return ChatSseDeliveryClass::Billable;
         }
         if let Some(chat_usage) = self.chat_usage.as_mut() {
             return chat_usage.observe_data(&data);

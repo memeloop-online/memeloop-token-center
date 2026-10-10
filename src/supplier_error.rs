@@ -65,7 +65,9 @@ impl SafeReason {
             "authentication_expired" | "api_key_expired" | "token_expired" => {
                 Some(Self::AuthenticationExpired)
             }
-            "rate_limited" | "rate_limit_exceeded" => Some(Self::RateLimited),
+            "rate_limited" | "rate_limit_exceeded" | "ModelAccountTpmRateLimitExceeded" => {
+                Some(Self::RateLimited)
+            }
             "model_unavailable" | "model_not_found" | "unsupported_model" => {
                 Some(Self::ModelUnavailable)
             }
@@ -138,6 +140,19 @@ impl SafeReason {
             message.filter(|message| Self::from_supplier(None, Some(message)) == Some(self)),
         )
     }
+}
+
+/// The stream terminal records this existing safe reason without changing its
+/// archive locator. HTTP rejections retain their native inline projection.
+pub(crate) fn supplier_error_from_record(
+    inline: Option<&str>,
+    status_code: Option<i64>,
+    error_code: Option<&str>,
+) -> Option<SupplierError> {
+    supplier_error_from_inline_json(inline).or_else(|| {
+        (status_code == Some(502) && error_code == Some(SafeReason::RateLimited.code()))
+            .then(|| SafeReason::RateLimited.supplier_error())
+    })
 }
 
 pub(crate) fn invalid_native_supplier_envelope(location: &str) -> bool {

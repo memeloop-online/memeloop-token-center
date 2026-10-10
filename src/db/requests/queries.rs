@@ -1385,11 +1385,13 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
             cost,
             currency,
         },
-        error_code,
+        error_code: error_code.clone(),
         terminal_cause_code,
-        supplier_error: crate::supplier_error::supplier_error_from_inline_json(
+        supplier_error: crate::supplier_error::supplier_error_from_record(
             row.try_get::<Option<String>, _>("supplier_error_inline_json")?
                 .as_deref(),
+            status_code,
+            error_code.as_deref(),
         ),
         archive_state: request_archive_state(row.try_get("archive_state")?)?,
         credential_identity: request_credential_identity_from_row(row)?,
@@ -1656,11 +1658,13 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                     cost,
                     currency,
                 },
-                error_code,
+                error_code: error_code.clone(),
                 terminal_cause_code,
-                supplier_error: crate::supplier_error::supplier_error_from_inline_json(
+                supplier_error: crate::supplier_error::supplier_error_from_record(
                     row.try_get::<Option<String>, _>("supplier_error_inline_json")?
                         .as_deref(),
+                    status_code,
+                    error_code.as_deref(),
                 ),
                 archive_state: request_archive_state(row.try_get("archive_state")?)?,
                 credential_identity: request_credential_identity_from_row(&row)?,
