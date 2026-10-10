@@ -281,6 +281,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
         if (error instanceof Error) error.message += ` keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`;
         throw error;
       }
+      assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
       assert.equal(observed, hint);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
       await row.locator('.table-action').click();
