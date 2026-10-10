@@ -254,13 +254,10 @@ where
             tokio::select! {
                 result = &mut connection => result.expect("synthetic Hyper connection"),
                 accepted = listener.accept() => { accepted.unwrap(); panic!("extra SOCKS connection/replay"); }
-                _ = stopped => {
-                    connection.as_mut().graceful_shutdown();
-                    tokio::select! {
-                        result = &mut connection => result.expect("synthetic Hyper shutdown"),
-                        accepted = listener.accept() => { accepted.unwrap(); panic!("extra SOCKS connection during shutdown"); }
-                    }
-                }
+                // The receipt below covers request END_STREAM, not connection
+                // teardown. Stop the fixture after validation, as upload_case
+                // does, without adding a GOAWAY/PING shutdown experiment.
+                _ = stopped => {}
             }
         });
         let _peer_guard = AbortPeer(server.abort_handle());
@@ -268,9 +265,7 @@ where
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(response.version(), http::Version::HTTP_2);
         assert!(response.bytes().await.unwrap().is_empty());
-        let _ = shutdown.send(());
-        // Keep the client's connection driver alive while the peer drains its
-        // graceful GOAWAY/PING exchange; dropping it first races that write.
+        shutdown.send(()).expect("synthetic peer still active after receipt");
         server.await.expect("synthetic peer invariants");
         drop(client);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
