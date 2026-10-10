@@ -369,7 +369,7 @@ async fn coverage_contract(database: &Database) {
                     );
                     assert_eq!(
                         stats.summary.cache_usage.eligible_requests,
-                        i64::from(read.is_some())
+                        i64::from(eligible)
                     );
                     assert_eq!(stats.summary.cache_usage.hit_rate, rate);
                 }
