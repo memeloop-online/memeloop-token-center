@@ -128,6 +128,12 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             "api_key_expired",
         ),
         ("rate", 429, "private header-canary", "rate_limit_exceeded"),
+        (
+            "tpm",
+            429,
+            "private header-canary",
+            "ModelAccountTpmRateLimitExceeded",
+        ),
         ("model", 400, "private model-canary", "unsupported_model"),
         ("model-missing", 400, "Model not found", "model_not_found"),
         (
@@ -440,4 +446,137 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
             .as_bytes(),
         bytes.as_ref()
     );
+}
+
+#[tokio::test]
+async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_replay_or_success() {
+    for (label, suffix) in [("tpm-eof", ""), ("tpm-done", "data: [DONE]\n\n")] {
+        let upstream = MockServer::start().await;
+        let event = json!({"error": {
+            "type": "TooManyRequests",
+            "code": "ModelAccountTpmRateLimitExceeded",
+            "message": "TPM limit deepseek-v4-1-flash; Authorization: Bearer private-token-canary; private-body-canary",
+            "debug": "private-debug-canary"
+        }});
+        let sse = format!("data: {event}\n\n{suffix}");
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = response_usage_fixture_with_uri(label, upstream.uri(), 0).await;
+        let response = send_chat_usage_request(
+            &fixture,
+            &json!({
+                "model": fixture.model,
+                "messages": [{"role": "user", "content": "private-body-canary"}],
+                "max_tokens": 64, "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let delivered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(delivered.contains("rate_limited"));
+        assert!(delivered.contains("ModelAccountTpmRateLimitExceeded"));
+        for forbidden in [
+            "private-token-canary",
+            "private-body-canary",
+            "private-debug-canary",
+            "[DONE]",
+            "response.completed",
+        ] {
+            assert!(!delivered.contains(forbidden));
+        }
+        wait_for_request_settlement(&fixture, 1).await;
+        let records = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.status_code, Some(502));
+        assert_eq!(record.error_code.as_deref(), Some("rate_limited"));
+        assert_eq!(
+            record.usage_basis,
+            Some(crate::model::RequestUsageBasis::NotObserved)
+        );
+        assert_eq!(record.input_tokens, 0);
+        assert_eq!(record.output_tokens, 0);
+        assert_eq!(record.cost, "0");
+        let supplier = record
+            .supplier_error
+            .as_ref()
+            .expect("safe supplier explanation");
+        assert_eq!(supplier.code, "rate_limited");
+        assert_eq!(
+            supplier.message,
+            crate::supplier_error::SafeReason::RateLimited.message()
+        );
+        assert_exactly_once_side_effects(&fixture, record.request_id, None).await;
+        drain_completed_response_archive(&fixture).await;
+        let refs = fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, record.request_id)
+            .await
+            .unwrap();
+        assert_eq!(refs.view.supplier_error, record.supplier_error);
+        let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
+        assert_eq!(detail.view.supplier_error, record.supplier_error);
+        assert!(detail.archive.response.complete);
+        upstream.verify().await;
+    }
+}
+
+#[test]
+fn unknown_supplier_code_or_type_alone_does_not_invent_a_stream_rate_limit() {
+    for code in [
+        "UnknownTpmCode",
+        "ModelAccountTpmRateLimitExceeded-private-token",
+    ] {
+        let mut capture = ResponsesSseCapture::for_delivery();
+        capture.push(
+            format!(
+                "data: {}\n\n",
+                json!({"error": {
+                    "type": "TooManyRequests", "code": code, "message": "private-token-canary"
+                }})
+            )
+            .as_bytes(),
+        );
+        let summary = capture.finish_summary();
+        assert_eq!(summary.outcome, ResponsesSseOutcome::Failed);
+        assert!(!summary.supplier_rate_limited);
+        assert!(
+            crate::supplier_error::supplier_error_from_record(
+                None,
+                Some(502),
+                Some("upstream_failed_response")
+            )
+            .is_none()
+        );
+    }
+    assert!(
+        crate::supplier_error::supplier_error_from_record(None, Some(429), Some("http_429"))
+            .is_none()
+    );
+}
+
+#[test]
+fn supplier_tpm_is_business_failure_on_strict_chat_usage_contract() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    capture.push(b"data: {\"error\":{\"type\":\"TooManyRequests\",\"code\":\"ModelAccountTpmRateLimitExceeded\",\"message\":\"private-token-canary\"}}\n\ndata: [DONE]\n\n");
+    let summary = capture.finish_summary();
+    assert_eq!(summary.outcome, ResponsesSseOutcome::Failed);
+    assert!(summary.supplier_rate_limited);
+    assert!(!summary.protocol_invalid);
+    assert!(!summary.observed_protocol_invalid);
+    assert!(summary.usage.is_none());
 }

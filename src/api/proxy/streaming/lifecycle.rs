@@ -60,6 +60,11 @@ pub(super) fn classify_streaming_terminal(
             Some(ResponsesSseOutcome::TerminatedIncomplete)
         );
     let protocol_error = match sse_summary.map(|summary| &summary.outcome) {
+        Some(ResponsesSseOutcome::Failed)
+            if sse_summary.is_some_and(|summary| summary.supplier_rate_limited) =>
+        {
+            Some(crate::supplier_error::SafeReason::RateLimited.code())
+        }
         Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
         Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
         Some(ResponsesSseOutcome::TerminatedIncomplete) if !mapped_chat_incomplete => {
@@ -404,6 +409,7 @@ mod tests {
     ) -> ResponsesSseSummary {
         ResponsesSseSummary {
             outcome,
+            supplier_rate_limited: false,
             usage: None,
             usage_invalid: false,
             observed_protocol_invalid,

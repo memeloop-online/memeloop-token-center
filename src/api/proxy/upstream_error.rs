@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::upstream_response::UpstreamResponse;
 use crate::{model::RequestTerminalCause, supplier_error::SafeReason};
 
-const MAX_ERROR_BYTES: usize = 16 * 1024;
+pub(super) const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_ERROR_WAIT: Duration = Duration::from_millis(100);
 
 pub(super) struct Rejection {
@@ -22,7 +22,7 @@ pub(super) fn fallback_body() -> Bytes {
     )
 }
 
-fn safe_error_body(raw: &[u8]) -> Bytes {
+pub(super) fn safe_error_body(raw: &[u8]) -> Bytes {
     if raw.len() > MAX_ERROR_BYTES {
         return fallback_body();
     }
@@ -184,6 +184,11 @@ mod tests {
             ),
             (
                 "rate_limit_exceeded",
+                "cookie=canary",
+                SafeReason::RateLimited,
+            ),
+            (
+                "ModelAccountTpmRateLimitExceeded",
                 "cookie=canary",
                 SafeReason::RateLimited,
             ),

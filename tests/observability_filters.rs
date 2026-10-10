@@ -259,7 +259,7 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
             "message": "当前账号没有可用套餐", "mtc_safe_reason": "no_active_plan"
         }})
     );
-    sqlx::query("UPDATE session_archive_unlinked_requests SET response_object = $1 WHERE archive_request_id = $2 AND tenant_id = $3")
+    sqlx::query("UPDATE session_archive_unlinked_requests SET response_object = $1, status_code = 502, error_code = 'rate_limited' WHERE archive_request_id = $2 AND tenant_id = $3")
         .bind(imported_safe).bind(archive_id.to_string()).bind(key.tenant_id.to_string())
         .execute(&inspection).await.unwrap();
     let self_rows = state.db.list_requests(key.key_id, 10).await.unwrap();
@@ -320,6 +320,56 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
             .unwrap()
             .is_null()
     );
+    // An external error vocabulary cannot impersonate a native stream
+    // terminal, even with the same status/code and a copied safe envelope.
+    assert_eq!(archived.status_code, Some(502));
+    assert_eq!(archived.error_code.as_deref(), Some("rate_limited"));
+    for rows in [
+        state
+            .db
+            .list_all_requests("projection-a", 10)
+            .await
+            .unwrap(),
+        state.db.list_global_requests(10).await.unwrap(),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.request_id == archive_id)
+            .unwrap();
+        assert_eq!(row.supplier_error, archived.supplier_error);
+        assert!(row.supplier_error.is_none());
+        assert!(
+            serde_json::to_value(row)
+                .unwrap()
+                .get("native_terminal")
+                .is_none()
+        );
+    }
+    for refs in [
+        state
+            .db
+            .request_archive_refs(key.key_id, archive_id)
+            .await
+            .unwrap(),
+        state
+            .db
+            .request_archive_refs_for_tenant("projection-a", archive_id)
+            .await
+            .unwrap(),
+        state
+            .db
+            .request_archive_refs_global(archive_id)
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(refs.view.supplier_error, archived.supplier_error);
+        assert!(
+            serde_json::to_value(&refs.view)
+                .unwrap()
+                .get("native_terminal")
+                .is_none()
+        );
+    }
     assert!(archived_json["input_tokens"].is_null());
     assert!(archived_json["output_tokens"].is_null());
     assert!(archived_json["cost"].is_null());
@@ -472,6 +522,14 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
             .unwrap()
             .is_null()
     );
+    assert_eq!(historical[0]["status_code"], 502);
+    assert_eq!(historical[0]["error_code"], "rate_limited");
+    assert_eq!(
+        historical[0]["supplier_error"],
+        archive_detail["supplier_error"]
+    );
+    assert!(historical[0].get("native_terminal").is_none());
+    assert!(archive_detail.get("native_terminal").is_none());
     assert!(archive_detail["completed_at"].is_null());
     assert_eq!(archive_detail["source_completed_at"], archive_completed_at);
     assert_eq!(archive_detail["archive"]["request"]["complete"], true);
