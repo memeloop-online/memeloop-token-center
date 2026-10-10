@@ -238,8 +238,51 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').focus();
       const tooltip = page.getByRole('tooltip').filter({ hasText: reason });
-      await tooltip.waitFor();
-      assert.equal(await tooltip.innerText(), hint);
+      let observed: unknown;
+      try {
+        const handle = await page.waitForFunction(`(() => {
+          const expected = ${JSON.stringify(hint)};
+          const active = document.activeElement;
+          if (!(active instanceof HTMLElement)) return false;
+          const described = (active.getAttribute('aria-describedby') || '').split(/\\s+/);
+          for (const node of document.querySelectorAll('[role="tooltip"]')) {
+            if (!(node instanceof HTMLElement) || described.indexOf(node.id) === -1) continue;
+            const style = getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
+            if (node.innerText === expected) return node.innerText;
+          }
+          return false;
+        })()`);
+        observed = await handle.jsonValue();
+      } catch (error) {
+        const diagnostics = await page.evaluate(`(() => {
+          const expected = ${JSON.stringify(hint)};
+          const active = document.activeElement;
+          return {
+            focus: active instanceof HTMLElement ? active.className : String(active),
+            tooltips: Array.from(document.querySelectorAll('[role="tooltip"]')).map((node) => {
+              const style = getComputedStyle(node);
+              const rect = node.getBoundingClientRect();
+              return {
+                display: style.display,
+                visibility: style.visibility,
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                exactText: node.textContent === expected,
+                described: active instanceof HTMLElement && (active.getAttribute('aria-describedby') || '').split(/\\s+/).indexOf(node.id) !== -1,
+              };
+            }),
+          };
+        })()`);
+        const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
+        await mkdir(artifactRoot, { recursive: true });
+        await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-tooltip-failure.png`, fullPage: true });
+        if (error instanceof Error) error.message += ` keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`;
+        throw error;
+      }
+      assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
+      assert.equal(observed, hint);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
