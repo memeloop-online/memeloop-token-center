@@ -20,7 +20,7 @@ test("statistics cache metadata matches the serialized Rust coverage contract", 
   assert.ok(schemas.StatisticsSummary.required.includes("cache_usage"));
   assert.equal(schemas.StatisticsSummary.properties.cache_usage.$ref, "#/components/schemas/CacheStats");
   const rust = readFileSync(`${repository}/src/model.rs`, "utf8");
-  const fields = [...rust.match(/pub struct CacheStats \{([^}]+)\}/u)![1].matchAll(/pub (\w+):/gu)].map((match) => match[1]).sort();
+  const fields = [...rust.match(/pub struct CacheStats \{([^}]+)\}/u)![1]!.matchAll(/pub (\w+):/gu)].map((match) => match[1]!).sort();
   const cache = schemas.CacheStats;
   assert.deepEqual(Object.keys(cache.properties).sort(), fields);
   assert.deepEqual([...cache.required].sort(), fields);
