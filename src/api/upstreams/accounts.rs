@@ -491,13 +491,20 @@ pub(in crate::api) async fn update_upstream_notes(
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
     Json(body): Json<UpdateUpstreamNotesRequest>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let Some(notes) = body.notes else {
-        return Err(AppError::InvalidRequestShape(
-            "upstream notes field is required; use null to clear it".into(),
-        ));
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: upstream notes field is required; use null to clear it"
+                }
+            })),
+        )
+            .into_response());
     };
     let notes = match notes {
         Value::Null => None,
@@ -518,7 +525,8 @@ pub(in crate::api) async fn update_upstream_notes(
                 body.expected_updated_at,
             )
             .await?,
-    ))
+    )
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]
