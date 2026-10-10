@@ -68,7 +68,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
         for (label, content_type, body, expected_reason, slow_body) in &cases {
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), *content_type))
+                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), content_type))
                 .expect(1)
                 .mount(&upstream)
                 .await;
