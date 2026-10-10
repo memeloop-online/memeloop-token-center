@@ -1317,7 +1317,7 @@ mod tests {
                 Some(RequestUsageBasis::ContractCeiling),
             )
             .await;
-            let created_at =
+            let created_at: i64 =
                 sqlx::query_scalar("SELECT created_at FROM request_records WHERE id = $1")
                     .bind(request_id.to_string())
                     .fetch_one(&fixture.database.pool)
