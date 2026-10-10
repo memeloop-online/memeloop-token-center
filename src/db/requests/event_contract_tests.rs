@@ -221,7 +221,49 @@ async fn assert_event_enrichment(database: &Database) {
         assert!(database.request_archive_refs_for_tenant(&foreign_external, request_id).await.is_err());
         assert!(database.list_all_requests(&foreign_external, 10).await.unwrap().is_empty());
     }
-    sqlx::query("UPDATE request_records SET status_code = 200, completed_at = $1, response_object = NULL WHERE id = $2 AND created_at = $3")
+    // Native TPM terminals keep their safe projection in every scope and
+    // the native event path, independently of the response archive locator.
+    sqlx::query("UPDATE request_records SET status_code = 502, error_code = 'rate_limited', response_object = NULL, completed_at = $1 WHERE id = $2 AND created_at = $3")
+        .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
+    let rate_limited = serde_json::json!({
+        "code": "rate_limited", "message": "The upstream request rate limit was exceeded"
+    });
+    let self_list = database.list_requests(key_id, 10).await.unwrap();
+    let operator_list = database.list_all_requests(&external, 10).await.unwrap();
+    let global_list = database.list_global_requests(10).await.unwrap();
+    let self_detail = database
+        .request_archive_refs(key_id, request_id)
+        .await
+        .unwrap();
+    let operator_detail = database
+        .request_archive_refs_for_tenant(&external, request_id)
+        .await
+        .unwrap();
+    let global_detail = database
+        .request_archive_refs_global(request_id)
+        .await
+        .unwrap();
+    let events = database
+        .request_events_after(&external, now, None, 500)
+        .await
+        .unwrap();
+    let global_request = global_list
+        .iter()
+        .find(|row| row.request_id == request_id)
+        .unwrap();
+    for value in [
+        serde_json::to_value(&self_list[0]).unwrap(),
+        serde_json::to_value(&operator_list[0]).unwrap(),
+        serde_json::to_value(global_request).unwrap(),
+        serde_json::to_value(&self_detail.view).unwrap(),
+        serde_json::to_value(&operator_detail.view).unwrap(),
+        serde_json::to_value(&global_detail.view).unwrap(),
+        serde_json::to_value(&events[0]).unwrap(),
+    ] {
+        assert_eq!(value["supplier_error"], rate_limited);
+        assert!(value.get("native_terminal").is_none());
+    }
+    sqlx::query("UPDATE request_records SET status_code = 200, error_code = NULL, completed_at = $1, response_object = NULL WHERE id = $2 AND created_at = $3")
         .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
     // A missing observation is also unknown, independently of the legacy zero.
     sqlx::query("UPDATE conversation_observations SET cluster_id = 'unmatched-compaction-fixture' WHERE request_id = $1 AND key_id = $2")
