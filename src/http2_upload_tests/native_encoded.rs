@@ -205,7 +205,7 @@ where
         let client = crate::codex_http_client_builder(CodexTransportPolicy::default(), crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
             .tls_cert_store(fixture.roots).build().unwrap();
         let request = build_request(&client, &format!("https://{HOST}/v1/responses"), proxy);
-        assert_eq!(request.version(), http::Version::HTTP_11, "preserve default negotiation");
+        assert_eq!(request.version(), None, "preserve default negotiation");
         let expected_headers = request.headers().clone();
         let length = expected.len();
         let wire = Arc::new(Mutex::new(Wire { started: Instant::now(), frames: Vec::new() }));
