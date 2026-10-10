@@ -81,6 +81,9 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
         continue;
       }
       if (end === -1) noBold = true;
+      text += '**';
+      index += 2;
+      continue;
     }
     if (!noItalic && depth < MAX_INLINE_DEPTH && rest.startsWith('*') && !rest.startsWith('**')) {
       const end = source.indexOf('*', index + 1);

@@ -46,9 +46,10 @@ test('unclosed emphasis delimiters stay literal and parse linearly', () => {
   const blocks = parseSafeMarkdown(pathological);
   assert.equal(blocks.length, 1);
   assert.deepEqual(blocks[0], { kind: 'paragraph', children: [{ kind: 'text', text: pathological }] });
-  const boldPathological = '**a'.repeat(10_000);
+  const boldPathological = '**' + 'a'.repeat(30_000);
   const rendered = render(boldPathological);
   assert.ok(!rendered.includes('<strong'));
+  assert.ok(render('**a'.repeat(10_000)).includes('<strong>a</strong>'));
 });
 
 test('notes write payload carries tenant identity, explicit notes and the revision fence', () => {
