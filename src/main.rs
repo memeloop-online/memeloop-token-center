@@ -54,9 +54,11 @@ enum Command {
     },
     Migrate,
     #[command(
-        about = "Preview an exact USD contract-ceiling cancellation manifest; --apply only changes statistical projections"
+        about = "Preview an exact USD contract-ceiling failure manifest; --apply only changes statistical projections"
     )]
     BackfillExactFailedRequestCosts {
+        /// Each row binds expected_status_code (499/502/504) and expected_error_code together.
+        /// Omit both for legacy 499/client_cancelled; null or empty error means no error code.
         #[arg(long)]
         manifest: std::path::PathBuf,
         #[arg(long)]

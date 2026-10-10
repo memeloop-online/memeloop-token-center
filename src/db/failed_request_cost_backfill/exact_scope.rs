@@ -8,12 +8,69 @@ pub struct FailedRequestCostBackfillExactManifest {
     pub requests: Vec<FailedRequestCostBackfillExpectedRequest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailedRequestCostBackfillExpectedRequest {
     pub request_id: String,
     pub created_at: i64,
     pub expected_cost_micros: i64,
+    pub expected_status_code: i64,
+    /// Explicit null and empty string both mean no error code; no trimming or case folding.
+    pub expected_error_code: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for FailedRequestCostBackfillExpectedRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Preserve the distinction between an omitted error field and explicit JSON null.
+        fn present_error<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Option<String>>, D::Error> {
+            <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Some)
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireRequest {
+            request_id: String,
+            created_at: i64,
+            expected_cost_micros: i64,
+            expected_status_code: Option<i64>,
+            #[serde(default, deserialize_with = "present_error")]
+            expected_error_code: Option<Option<String>>,
+        }
+        let wire = <WireRequest as serde::Deserialize>::deserialize(deserializer)?;
+        let (expected_status_code, expected_error_code) =
+            match (wire.expected_status_code, wire.expected_error_code) {
+                (None, None) => (499, Some("client_cancelled".into())),
+                (Some(status), Some(error)) => (status, error),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "expected status and error must be supplied together",
+                    ));
+                }
+            };
+        Ok(Self {
+            request_id: wire.request_id,
+            created_at: wire.created_at,
+            expected_cost_micros: wire.expected_cost_micros,
+            expected_status_code,
+            expected_error_code,
+        })
+    }
+}
+
+impl FailedRequestCostBackfillExpectedRequest {
+    fn normalized_error_code(&self) -> &str {
+        self.expected_error_code.as_deref().unwrap_or("")
+    }
+}
+
+// Both fresh candidates and replay validate the same terminal evidence.
+fn terminal_predicate(status_parameter: &str, error_parameter: &str) -> String {
+    format!(
+        "AND r.status_code = {status_parameter}
+         AND COALESCE(r.error_code, '') = {error_parameter}
+         AND COALESCE(r.error_code, '') = COALESCE(f.error_code, '')
+         AND f.status_class = 'failure' AND r.usage_basis = 'contract_ceiling'"
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +99,7 @@ impl FailedRequestCostBackfillExactManifest {
                 || request.created_at < 0
                 || request.created_at == i64::MAX
                 || request.expected_cost_micros <= 0
+                || !matches!(request.expected_status_code, 499 | 502 | 504)
             {
                 return Err(AppError::BadRequest(
                     "invalid or duplicate exact projection request".into(),
@@ -92,15 +150,18 @@ impl Database {
         } else {
             ""
         };
+        let terminal = terminal_predicate("$8", "$9");
         let statement = scoped_candidate_statement(
             lock,
             false,
-            "AND f.request_id = $7 AND r.created_at = $1
+            &format!(
+                "AND f.request_id = $7 AND r.created_at = $1
              AND r.tenant_id = f.tenant_id AND r.key_id = f.key_id
-             AND r.currency = f.currency AND r.error_code = f.error_code
+             AND r.currency = f.currency {terminal}
              AND u.key_id = r.key_id
              AND NOT EXISTS (SELECT 1 FROM request_cost_projection_corrections other
-                 WHERE other.request_created_at = $1 AND other.request_id = $7)",
+                 WHERE other.request_created_at = $1 AND other.request_id = $7)"
+            ),
         );
         let mut candidates = Vec::with_capacity(manifest.requests.len());
         let mut already_projected_rows = 0;
@@ -113,6 +174,8 @@ impl Database {
                 .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
                 .bind(1_i64)
                 .bind(&expected.request_id)
+                .bind(expected.expected_status_code)
+                .bind(expected.normalized_error_code())
                 .fetch_all(&mut *transaction)
                 .await?;
             let mut matches = candidates_from_rows(rows)?;
@@ -124,9 +187,9 @@ impl Database {
                     || candidate.cost_micros != expected.expected_cost_micros
                     || candidate.request_cost_micros != expected.expected_cost_micros
                     || candidate.corrected_cost_micros != 0
-                    || candidate.status_code != 499
+                    || candidate.status_code != expected.expected_status_code
                     || candidate.status_class != "failure"
-                    || candidate.error_code != "client_cancelled"
+                    || candidate.error_code != expected.normalized_error_code()
                     || candidate.usage_basis.as_deref() != Some("contract_ceiling")
                 {
                     transaction.rollback().await?;
@@ -175,6 +238,7 @@ async fn already_projected(
     expected: &FailedRequestCostBackfillExpectedRequest,
     lock: &str,
 ) -> Result<bool, AppError> {
+    let terminal = terminal_predicate("$7", "$8");
     let statement = format!(
         "SELECT f.request_id FROM request_stats_facts f
          JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at
@@ -185,16 +249,14 @@ async fn already_projected(
            AND f.tenant_id = $3 AND r.tenant_id = $3
            AND f.currency = $4 AND r.currency = $4
            AND f.key_id = r.key_id AND u.key_id = r.key_id
-           AND r.completed_at IS NOT NULL AND r.status_code = 499
-           AND r.error_code = 'client_cancelled' AND f.error_code = r.error_code
-           AND f.status_class = 'failure' AND r.usage_basis = 'contract_ceiling'
+           AND r.completed_at IS NOT NULL {terminal}
            AND r.cost_micros = $5 AND f.cost_micros = 0
            AND u.status = 'settled' AND u.actual_micros = $5 AND u.reserved_micros = $5
            AND u.reserved_tokens = r.input_tokens + r.output_tokens
            AND correction.request_created_at = $2
            AND correction.evidence_kind = 'reservation_ceiling_without_usage'
-           AND correction.observed_status_code = 499
-           AND correction.observed_error_code = 'client_cancelled'
+           AND correction.observed_status_code = $7
+           AND correction.observed_error_code = $8
            AND correction.observed_usage_basis = 'contract_ceiling'
            AND correction.reservation_id = r.reservation_id
            AND correction.reservation_reserved_micros = $5
@@ -213,6 +275,8 @@ async fn already_projected(
         .bind(&manifest.currency)
         .bind(expected.expected_cost_micros)
         .bind(FAILED_REQUEST_COST_CORRECTION_VERSION)
+        .bind(expected.expected_status_code)
+        .bind(expected.normalized_error_code())
         .fetch_optional(&mut **transaction)
         .await?
         .is_some())
@@ -228,6 +292,8 @@ mod tests {
             request_id: Uuid::now_v7().to_string(),
             created_at: 1,
             expected_cost_micros: 1,
+            expected_status_code: 499,
+            expected_error_code: Some("client_cancelled".into()),
         };
         let valid = FailedRequestCostBackfillExactManifest {
             tenant_id: Uuid::now_v7().to_string(),
@@ -249,6 +315,8 @@ mod tests {
                 request_id: Uuid::now_v7().to_string(),
                 created_at: 1,
                 expected_cost_micros: 1,
+                expected_status_code: 499,
+                expected_error_code: Some("client_cancelled".into()),
             });
         let mut invalid_id = valid.clone();
         invalid_id.requests[0].request_id = "not-a-uuid".into();
@@ -276,5 +344,54 @@ mod tests {
         assert!(serde_json::from_str::<FailedRequestCostBackfillExactManifest>(
             r#"{"tenant_id":"00000000-0000-4000-8000-000000000001","currency":"USD","requests":[],"allow_all":true}"#,
         ).is_err());
+    }
+
+    #[test]
+    fn manifest_rows_bind_terminal_evidence_with_legacy_defaults() {
+        let legacy: FailedRequestCostBackfillExpectedRequest = serde_json::from_str(
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.expected_status_code, 499);
+        assert_eq!(
+            legacy.expected_error_code.as_deref(),
+            Some("client_cancelled")
+        );
+
+        let null_error: FailedRequestCostBackfillExpectedRequest = serde_json::from_str(
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2,"expected_status_code":502,"expected_error_code":null}"#,
+        )
+        .unwrap();
+        assert_eq!(null_error.normalized_error_code(), "");
+        let empty_error: FailedRequestCostBackfillExpectedRequest = serde_json::from_str(
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2,"expected_status_code":504,"expected_error_code":""}"#,
+        )
+        .unwrap();
+        assert_eq!(empty_error.normalized_error_code(), "");
+
+        for partial in [
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2,"expected_status_code":502}"#,
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2,"expected_error_code":"upstream_error"}"#,
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","created_at":1,"expected_cost_micros":2,"expected_status_code":502,"expected_error_code":"x","extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<FailedRequestCostBackfillExpectedRequest>(partial).is_err()
+            );
+        }
+
+        let mut unsupported = FailedRequestCostBackfillExactManifest {
+            tenant_id: Uuid::now_v7().to_string(),
+            currency: "USD".into(),
+            requests: vec![FailedRequestCostBackfillExpectedRequest {
+                request_id: Uuid::now_v7().to_string(),
+                created_at: 1,
+                expected_cost_micros: 1,
+                expected_status_code: 503,
+                expected_error_code: None,
+            }],
+        };
+        assert!(unsupported.validate().is_err());
+        unsupported.requests[0].expected_status_code = 502;
+        assert!(unsupported.validate().is_ok());
     }
 }
