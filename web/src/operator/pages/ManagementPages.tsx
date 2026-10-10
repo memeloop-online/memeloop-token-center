@@ -23,6 +23,7 @@ import { TransportProxyGroups } from '../TransportProxyGroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
+import { UpstreamNotes } from '../UpstreamNotes';
 import { ProviderModelCatalog } from '../ProviderModelCatalog';
 import { ResourceBoundary } from '../ResourceBoundary';
 import { ManagedModelSync } from '../ManagedModelSync';
@@ -210,6 +211,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [routeCacheRevisions, setRouteCacheRevisions] = useState<Record<string, number>>({});
   const [proxyEditorOpen, setProxyEditorOpen] = useState(false);
   const [providerEditDraft, setProviderEditDraft] = useState<Record<string, unknown>>();
+  const [notesDirty, setNotesDirty] = useState(false);
   const providerSuccess = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState('');
   const providerList = useRef<HTMLElement>(null);
@@ -490,7 +492,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   async function requestLeaveProviderWorkspace() {
     if (proxyEditorOpen || busy || !ownsWorkspace()) return false;
     const authorizationOpen = Boolean(reauthorizing || (providerWorkspaceOpen && method === 'authorization'));
-    const settingsDirty = editing && providerEditDraft && (providerEditDraft.name !== editing.name || providerSettingsConfigChanged(providerEditInitialData?.config, providerEditDraft));
+    const settingsDirty = (editing && providerEditDraft && (providerEditDraft.name !== editing.name || providerSettingsConfigChanged(providerEditInitialData?.config, providerEditDraft))) || notesDirty;
     const createDraft = providerCreateDrafts[providerDraftKey];
     const createDirty = providerWorkspaceOpen && method === 'direct' && createDraft && JSON.stringify(createDraft) !== JSON.stringify(createControlledDraft);
     if (authorizationOpen) {
@@ -548,6 +550,12 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   }
   const providerEditors = <>
       {editing && editSchema && <div className="inline-editor"><Form key={`${editing.id}-${locale}`} schema={editSchema} liveValidate formContext={providerFormContext} uiSchema={{ config: { oauth: { 'ui:disabled': true }, ...(editing.driver === 'openai-codex' && editing.auth_kind === 'oauth' ? { base_url: { 'ui:widget': 'hidden' } } : {}) } }} formData={providerEditDraft ?? providerEditInitialData} onChange={({ formData }) => setProviderEditDraft(formData)} validator={providerEditValidator} widgets={providerFormWidgets} templates={upstreamFormTemplates} onSubmit={({ formData }) => void saveProviderSettings(formData)}><Button appearance="primary" type="submit" disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen}>{t('common.save')}</Button></Form></div>}
+      {editing && <UpstreamNotes key={editing.id} account={editing} token={token} tenant={writeTenant} disabled={!canManage(editing) || Boolean(busy) || proxyEditorOpen} onDirtyChange={setNotesDirty} onSaved={(notes, updatedAt) => {
+        if (!ownsWorkspace()) return;
+        setWorkspaceState(current => current?.kind === 'settings' && current.account.id === editing.id ? { ...current, account: { ...current.account, notes, updated_at: updatedAt } } : current);
+        const returnedGeneration = workspaceGeneration.current;
+        void onChanged(false).catch(reason => { if (!(reason instanceof AccountListRefreshError) && providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setError(messageOf(reason, t('common.requestFailed'))); });
+      }} />}
   </>;
   function renderAccountDetails(value: UpstreamAccount) {
     const providerAvailable = providers.some(provider => provider.id === value.driver);

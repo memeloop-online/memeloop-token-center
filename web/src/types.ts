@@ -944,6 +944,8 @@ export interface UpstreamAccount {
   tenant_id: string;
   tenant_external_id?: string;
   name: string;
+  /** Markdown notes; null when cleared. Absent until the backend view ships the field. */
+  notes?: string | null;
   driver: string;
   auth_kind: string;
   connection_method: 'api_key' | 'oauth' | 'legacy' | 'none' | string;
@@ -956,6 +958,13 @@ export interface UpstreamAccount {
   route_count: number;
   config: Record<string, unknown>;
   created_at: number;
+  updated_at: number;
+}
+
+export interface UpstreamAccountNotes {
+  id: string;
+  notes: string | null;
+  notes_format: 'markdown';
   updated_at: number;
 }
 

@@ -1,0 +1,9 @@
+.upstream-notes-editor { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.upstream-notes-editor textarea { min-height: 9rem; max-width: 100%; box-sizing: border-box; font-family: var(--fontFamilyMonospace, monospace); }
+.upstream-notes-toolbar { gap: 4px; }
+.upstream-notes-preview { border: 1px solid var(--colorNeutralStroke1); border-radius: var(--borderRadiusMedium); padding: 4px 12px; overflow-wrap: anywhere; line-height: 1.6; }
+.upstream-notes-preview pre { overflow-x: auto; background: var(--colorNeutralBackground3); padding: 8px; border-radius: var(--borderRadiusMedium); }
+.upstream-notes-preview code { font-family: var(--fontFamilyMonospace, monospace); }
+@media (max-width: 480px) {
+  .upstream-notes-editor .row-actions > .fui-Button { flex: 1 1 auto; }
+}
