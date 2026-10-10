@@ -1350,7 +1350,7 @@ mod tests {
             let converted = anthropic_usage(&source).unwrap();
             let response = json!({"usage":converted});
             let canonical =
-                crate::api::codex_transport::canonical_responses_usage(&response).unwrap();
+                crate::api::proxy::codex_transport::canonical_responses_usage(&response).unwrap();
             let generic = crate::api::parse_cache_usage_contract(&response);
             let coverage = read.and_then(|read| {
                 if let Some(write) = write {

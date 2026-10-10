@@ -818,9 +818,10 @@ mod tests {
                 source["prompt_tokens_details"] = details;
             }
             let converted = usage(&source, ResponsesViaChatDialect::KimiV1).unwrap();
-            let parsed =
-                crate::api::codex_transport::canonical_responses_usage(&json!({"usage":converted}))
-                    .unwrap();
+            let parsed = crate::api::proxy::codex_transport::canonical_responses_usage(
+                &json!({"usage":converted}),
+            )
+            .unwrap();
             assert_eq!(parsed.input_tokens, 7 - read.unwrap_or(0));
             assert_eq!(parsed.cached_input_tokens, read.unwrap_or(0));
             assert_eq!(parsed.output_tokens, 3);
@@ -832,9 +833,10 @@ mod tests {
         for read in [0, 7] {
             let source = json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cached_tokens":read});
             let converted = usage(&source, ResponsesViaChatDialect::KimiV1).unwrap();
-            let parsed =
-                crate::api::codex_transport::canonical_responses_usage(&json!({"usage":converted}))
-                    .unwrap();
+            let parsed = crate::api::proxy::codex_transport::canonical_responses_usage(
+                &json!({"usage":converted}),
+            )
+            .unwrap();
             assert_eq!(
                 parsed.cache_coverage,
                 crate::model::CacheUsageCoverage::new(read, 7)
