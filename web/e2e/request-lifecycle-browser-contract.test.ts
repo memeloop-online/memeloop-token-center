@@ -238,7 +238,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').focus();
       const tooltip = page.getByRole('tooltip').filter({ hasText: reason });
-      let observed: string;
+      let observed: unknown;
       try {
         const handle = await page.waitForFunction(`(() => {
           const expected = ${JSON.stringify(hint)};
