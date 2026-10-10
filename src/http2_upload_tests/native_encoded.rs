@@ -18,6 +18,10 @@ impl Drop for AbortPeer {
     }
 }
 
+pub(crate) fn emit(evidence: serde_json::Value) {
+    super::emit_evidence(evidence);
+}
+
 fn assert_decoded_headers(
     request: &hyper::Request<hyper::body::Incoming>,
     expected: &http::HeaderMap,

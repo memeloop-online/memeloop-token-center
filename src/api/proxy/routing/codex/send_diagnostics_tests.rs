@@ -91,7 +91,7 @@ async fn native_request_991089_tls_encoded_contract() {
     evidence["body_polled_bytes"] = serde_json::json!(consumption.bytes());
     evidence["body_polls"] = serde_json::json!(consumption.polls());
     evidence["body_polling_is_wire_ack"] = serde_json::json!(false);
-    eprintln!("MTC_HTTP2_UPLOAD_EVIDENCE {evidence}");
+    crate::http2_upload_tests::native_encoded::emit(evidence);
 }
 
 #[tokio::test]
