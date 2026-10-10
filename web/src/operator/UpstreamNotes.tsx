@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { ApiError, api } from '../../api';
-import { Button, Textarea } from '../../design-system';
-import { useI18n } from '../../i18n';
-import { SafeMarkdown } from '../../safeMarkdown';
-import type { UpstreamAccount, UpstreamAccountNotes } from '../../types';
+import { ApiError, api } from '../api';
+import { Button, Textarea } from '../design-system';
+import { useI18n } from '../i18n';
+import { SafeMarkdown } from '../safeMarkdown';
+import type { UpstreamAccount, UpstreamAccountNotes } from '../types';
 import { messageOf } from './scope/operatorShared';
 import { FormSection } from './FormSection';
 import { upstreamNotesDirty, upstreamNotesUpdateBody, validateUpstreamNotes } from './upstreamNotes';
