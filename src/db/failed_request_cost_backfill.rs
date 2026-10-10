@@ -1366,7 +1366,7 @@ mod tests {
         ] {
             let columns: Vec<String> = sqlx::query_scalar(match fixture.database.backend {
                 DatabaseBackend::Sqlite => "SELECT name FROM pragma_table_info($1) ORDER BY cid",
-                DatabaseBackend::PostgreSql => "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position",
+                DatabaseBackend::PostgreSql => "SELECT column_name::text FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position",
             }).bind(table).fetch_all(&fixture.database.pool).await.unwrap();
             assert!(!columns.is_empty());
             let selection = columns
