@@ -22,7 +22,7 @@ test('upstream account notes edit, preview, save, failure, conflict, clear, canc
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
     });
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
-    const artifacts = `${root}/e2e-artifacts/upstream-notes`; await mkdir(artifacts, { recursive: true });
+    const artifacts = `${root}/e2e-artifacts/ui-system/upstream-notes`; await mkdir(artifacts, { recursive: true });
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows=1&proxy-workflow=1&notes-workflow=1`);
     await editProviderAccount(page);
     const workspace = page.locator('.provider-edit-workspace');
