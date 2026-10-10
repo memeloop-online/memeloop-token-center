@@ -3668,7 +3668,7 @@ async fn upstream_notes_are_tenant_scoped_markdown_and_do_not_touch_transport() 
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(listed[0]["account"]["notes"], markdown);
+    assert_eq!(listed[0]["notes"], markdown);
 
     let (status, _) = json_request(
         &state,
