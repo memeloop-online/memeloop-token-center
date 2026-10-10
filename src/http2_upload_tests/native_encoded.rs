@@ -154,10 +154,8 @@ fn assert_encoded_upload(wire: &Wire, length: usize) -> serde_json::Value {
                     continuation[side] = Some(frame.stream_id);
                 }
             }
-            9 => {
-                if frame.flags & 4 != 0 {
-                    continuation[side] = None;
-                }
+            9 if frame.flags & 4 != 0 => {
+                continuation[side] = None;
             }
             8 if !frame.from_client => {
                 assert_eq!(frame.length, 4);
