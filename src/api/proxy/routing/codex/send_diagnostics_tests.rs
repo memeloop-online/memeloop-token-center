@@ -54,6 +54,29 @@ async fn native_request_991089_tls_encoded_contract() {
             .unwrap();
             let (_, built) = builder.build_split();
             let mut request = built.unwrap();
+            for (name, value) in &downstream {
+                assert!(
+                    request.headers().get(name) == Some(value),
+                    "native adapter omitted or changed a synthetic input header"
+                );
+            }
+            for (name, value) in [
+                ("authorization", "Bearer synthetic-access"),
+                ("accept", "text/event-stream"),
+                ("accept-encoding", "identity"),
+                ("content-type", "application/json"),
+                ("session-id", "synthetic-session"),
+                ("chatgpt-account-id", "synthetic-account"),
+            ] {
+                assert!(
+                    request
+                        .headers()
+                        .get(name)
+                        .is_some_and(|actual| actual == value),
+                    "native adapter omitted or changed a synthetic wire header"
+                );
+            }
+            assert_eq!(request.headers().len(), 14);
             assert!(!request.headers().contains_key(header::CONTENT_LENGTH));
             assert_eq!(
                 request.body().unwrap().size_hint().exact(),
