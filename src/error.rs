@@ -69,6 +69,8 @@ pub enum AppError {
     ProxyGroupConflict(&'static str),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("invalid request: {0}")]
+    InvalidRequestShape(String),
     #[error("secret schema analysis exceeds the supported complexity limit")]
     SchemaSecretAnalysisTooComplex,
     #[error("configured upstream is unavailable: {0}")]
@@ -103,7 +105,7 @@ impl AppError {
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",
             Self::ProxyGroupConflict(code) => code,
-            Self::BadRequest(_) => "invalid_request",
+            Self::BadRequest(_) | Self::InvalidRequestShape(_) => "invalid_request",
             Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
             Self::Upstream(_) => "upstream",
             Self::OAuthRefresh(_) => "oauth_refresh",
@@ -147,6 +149,11 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
             Self::ProxyGroupConflict(code) => (StatusCode::CONFLICT, *code, self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
+            Self::InvalidRequestShape(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request",
+                self.to_string(),
+            ),
             Self::SchemaSecretAnalysisTooComplex => (
                 StatusCode::BAD_REQUEST,
                 "schema_secret_analysis_too_complex",

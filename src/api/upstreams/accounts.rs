@@ -482,7 +482,7 @@ pub(in crate::api) async fn get_upstream_notes(
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct UpdateUpstreamNotesRequest {
     tenant_external_id: String,
-    notes: Value,
+    notes: Option<Value>,
     expected_updated_at: i64,
 }
 
@@ -494,7 +494,12 @@ pub(in crate::api) async fn update_upstream_notes(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
-    let notes = match body.notes {
+    let Some(notes) = body.notes else {
+        return Err(AppError::InvalidRequestShape(
+            "upstream notes field is required; use null to clear it".into(),
+        ));
+    };
+    let notes = match notes {
         Value::Null => None,
         Value::String(notes) => Some(notes),
         _ => {
