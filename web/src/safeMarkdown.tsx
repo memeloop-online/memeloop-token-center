@@ -1,3 +1,4 @@
+/* @jsxRuntime automatic */
 import { Fragment, createElement, type ReactNode } from 'react';
 
 export type SafeMarkdownInline =

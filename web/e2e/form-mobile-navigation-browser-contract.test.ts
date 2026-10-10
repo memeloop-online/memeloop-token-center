@@ -71,7 +71,7 @@ test('mobile navigation closes before editing and uses an opaque surface', { tim
       await page.screenshot({ path: `${artifacts}/provider-proxy-dark-${width}.png`, fullPage: true });
     }
     console.log('desktop viewport geometry', layout);
-    await page.getByRole('button', { name: '取消', exact: true }).click();
+    await page.getByLabel('服务地址与网络出口', { exact: true }).getByRole('button', { name: '取消', exact: true }).click();
     assert.equal(await providerSave.isEnabled(), true, 'explicit cancellation restores the independent upstream save');
     assert.equal(await closeEditor.isEnabled(), true);
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 0);
