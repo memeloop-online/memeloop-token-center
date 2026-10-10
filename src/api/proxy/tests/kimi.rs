@@ -3,6 +3,307 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
+async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+    let canary = "kimi-upstream-token-prompt-canary";
+    let cases = [
+        (
+            "plan",
+            "application/json",
+            json!({"error":{"code":"NoAvailablePlan","message":canary,"debug":canary}}).to_string(),
+            Some("no_active_plan"),
+            false,
+        ),
+        (
+            "quota",
+            "application/json",
+            json!({"error":{"code":"insufficient_quota","message":canary}}).to_string(),
+            Some("insufficient_quota"),
+            false,
+        ),
+        (
+            "auth",
+            "application/json",
+            json!({"error":{"code":"invalid_api_key","message":canary}}).to_string(),
+            Some("authentication_invalid"),
+            false,
+        ),
+        (
+            "unknown",
+            "application/json",
+            json!({"error":{"code":canary,"message":canary}}).to_string(),
+            None,
+            false,
+        ),
+        (
+            "conflicting",
+            "application/json",
+            json!({"error":{"code":"invalid_api_key","message":"No active plan","debug":canary}}).to_string(),
+            None,
+            false,
+        ),
+        (
+            "duplicate",
+            "application/json",
+            format!(r#"{{"error":{{"code":"insufficient_quota","code":"{canary}"}}}}"#),
+            None,
+            false,
+        ),
+        ("non-json", "text/html", canary.to_owned(), None, false),
+        (
+            "oversized",
+            "application/json",
+            json!({"error":{"code":"insufficient_quota","message":canary.repeat(upstream_error::MAX_ERROR_BYTES)}}).to_string(),
+            None,
+            false,
+        ),
+        (
+            "slow-body",
+            "application/json",
+            json!({"error":{"code":"insufficient_quota","message":canary}}).to_string(),
+            None,
+            true,
+        ),
+    ];
+    for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+        for (label, content_type, body, expected_reason, slow_body) in &cases {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(403).set_body_raw(body.clone(), *content_type))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let fixture = response_usage_fixture(label, &upstream, 0).await;
+            let raw = reqwest::Client::new()
+                .post(upstream.uri())
+                .send()
+                .await
+                .unwrap();
+            let mut parts = UpstreamResponse::from(raw).into_parts();
+            if *slow_body {
+                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    chunk
+                }));
+            }
+            let (retained, rejection) = read_safe_proxy_rejection(
+                UpstreamResponse::Prefetched {
+                    status: parts.status,
+                    headers: parts.headers,
+                    version: parts.version,
+                    content_length: parts.content_length,
+                    stream: parts.stream,
+                },
+                protocol,
+                false,
+                crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            )
+            .await;
+            assert!(retained.is_none());
+            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
+            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
+            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
+            assert_eq!(rejection.terminal_cause, None);
+            if let Some(reason) = expected_reason {
+                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
+                assert_eq!(
+                    delivered["error"]["mtc_safe_reason"].as_str(),
+                    Some(*reason)
+                );
+            } else {
+                assert_eq!(rejection.body, upstream_error::fallback_body());
+            }
+            let key = fixture
+                .state
+                .db
+                .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            let price = fixture
+                .state
+                .db
+                .upsert_model_price_tier(
+                    &fixture.model,
+                    "USD",
+                    "default",
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    false,
+                )
+                .await
+                .unwrap();
+            let request_id = Uuid::now_v7();
+            let reservation = fixture
+                .state
+                .db
+                .start_proxy_request(StartProxyRequest {
+                    request_id,
+                    key: &key,
+                    price: &price,
+                    input_token_ceiling: 20,
+                    output_token_ceiling: 8,
+                    protocol: protocol.name(),
+                    model: &fixture.model,
+                    request_object: &format!("gap://{request_id}/request"),
+                    upstream_account_id: Some(fixture.upstream_account_id),
+                    model_route_id: Some(fixture.route_id),
+                })
+                .await
+                .unwrap();
+            let request = BufferedRequest {
+                session_preference: None,
+                state: &fixture.state,
+                reservation,
+                request_id,
+                started: Instant::now(),
+                input_token_ceiling: 20,
+                output_token_ceiling: 8,
+                requested_service_tier: None,
+                conversation: None,
+                protocol,
+                tenant_id: key.tenant_id,
+                memory: fixture.state.proxy_memory_budget.reservation(),
+            };
+            let stored_response = format!(
+                "inline-json:{}",
+                std::str::from_utf8(&rejection.body).unwrap()
+            );
+            let response = finish_buffered_request_with_upstream_attribution_and_response_object(
+                &request,
+                StatusCode::FORBIDDEN,
+                rejection.body,
+                "application/json",
+                (
+                    TokenUsage::default(),
+                    crate::model::RequestUsageBasis::NotObserved,
+                ),
+                Some("http_403".to_owned()),
+                BufferedFinishPolicy {
+                    upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                    response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+                    terminal_cause: rejection.terminal_cause,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
+            let records = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert_eq!(record.status_code, Some(403));
+            assert_eq!(record.error_code.as_deref(), Some("http_403"));
+            assert_eq!(
+                record.upstream_account_id,
+                Some(fixture.upstream_account_id)
+            );
+            assert_eq!(record.route_id, Some(fixture.route_id));
+            assert_eq!((record.input_tokens, record.output_tokens), (0, 0));
+            assert_eq!(record.cost, "0");
+            let refs = fixture
+                .state
+                .db
+                .request_archive_refs(fixture.key_id, request_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                refs.response_object
+                    .as_deref()
+                    .unwrap()
+                    .strip_prefix("inline-json:")
+                    .unwrap()
+                    .as_bytes(),
+                bytes.as_ref()
+            );
+            let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
+            assert_eq!(detail.response_body, delivered);
+            assert!(
+                !serde_json::to_string(&record.supplier_error)
+                    .unwrap()
+                    .contains(canary)
+            );
+            assert!(
+                !serde_json::to_string(&detail.view.supplier_error)
+                    .unwrap()
+                    .contains(canary)
+            );
+            assert_eq!(record.supplier_error, detail.view.supplier_error);
+            assert_eq!(record.supplier_error.is_some(), expected_reason.is_some());
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
+    for (driver, protocol, anthropic_bridge, status) in [
+        (
+            crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            Protocol::AnthropicMessages,
+            false,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            Protocol::OpenAiResponses,
+            true,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            Protocol::OpenAiChat,
+            false,
+            StatusCode::OK,
+        ),
+        (
+            crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            Protocol::OpenAiResponsesCompact,
+            false,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "openai-codex",
+            Protocol::OpenAiResponses,
+            false,
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let body = Bytes::from_static(b"unmodified provider response");
+        let (upstream, rejection) = read_safe_proxy_rejection(
+            UpstreamResponse::Prefetched {
+                status,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length: Some(body.len() as u64),
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            },
+            protocol,
+            anthropic_bridge,
+            driver,
+        )
+        .await;
+        assert!(rejection.is_none());
+        let upstream = upstream.unwrap();
+        assert_eq!(upstream.status(), status);
+        let chunks = upstream.bytes_stream().collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].as_ref().unwrap().as_ref(),
+            b"unmodified provider response"
+        );
+    }
+}
+
+#[tokio::test]
 async fn translated_kimi_clean_eof_and_done_settle_and_archive_once() {
     for with_done in [false, true] {
         let upstream = MockServer::start().await;
