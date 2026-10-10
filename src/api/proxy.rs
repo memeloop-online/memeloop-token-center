@@ -90,6 +90,25 @@ mod sse_delivery_tests;
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
+async fn read_safe_proxy_rejection(
+    upstream: UpstreamResponse,
+    protocol: Protocol,
+    responses_anthropic_route: bool,
+    driver: &str,
+) -> (Option<UpstreamResponse>, Option<upstream_error::Rejection>) {
+    let native_kimi = driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+        && matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses);
+    if !upstream.status().is_success()
+        && !protocol.is_anthropic()
+        && !responses_anthropic_route
+        && (crate::provider::is_openai_compatible_http_driver(driver) || native_kimi)
+    {
+        (None, Some(upstream_error::read_rejection(upstream).await))
+    } else {
+        (Some(upstream), None)
+    }
+}
+
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
     if openai_chat_choice_count(request)? == 1 {
         Ok(())
@@ -1702,15 +1721,13 @@ async fn proxy_with_cancellation_guard(
             == Some(true);
     let responses_anthropic_route = active_route.is_responses_via_anthropic();
     let status = upstream.status();
-    let (upstream, rejection) = if !status.is_success()
-        && !protocol.is_anthropic()
-        && !responses_anthropic_route
-        && crate::provider::is_openai_compatible_http_driver(&active_route.route.driver)
-    {
-        (None, Some(upstream_error::read_rejection(upstream).await))
-    } else {
-        (Some(upstream), None)
-    };
+    let (upstream, rejection) = read_safe_proxy_rejection(
+        upstream,
+        protocol,
+        responses_anthropic_route,
+        &active_route.route.driver,
+    )
+    .await;
     drop(request_json);
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
