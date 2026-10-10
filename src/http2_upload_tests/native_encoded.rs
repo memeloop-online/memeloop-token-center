@@ -269,8 +269,10 @@ where
         assert_eq!(response.version(), http::Version::HTTP_2);
         assert!(response.bytes().await.unwrap().is_empty());
         let _ = shutdown.send(());
-        drop(client);
+        // Keep the client's connection driver alive while the peer drains its
+        // graceful GOAWAY/PING exchange; dropping it first races that write.
         server.await.expect("synthetic peer invariants");
+        drop(client);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let frames = assert_encoded_upload(&wire.lock().unwrap(), length);
         let decoded_content_length = *content_length.lock().unwrap();
