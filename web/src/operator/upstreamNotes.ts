@@ -26,3 +26,14 @@ export function normalizeUpstreamNotes(source: string): string | null {
 export function upstreamNotesDirty(saved: string | null | undefined, draft: string): boolean {
   return normalizeUpstreamNotes(draft) !== (saved ?? null);
 }
+
+export interface UpstreamNotesUpdateBody {
+  tenant_external_id: string;
+  notes: string | null;
+  expected_updated_at: number;
+}
+
+/** Single place shaping the notes write payload; notes is always explicit (null clears). */
+export function upstreamNotesUpdateBody(draft: string, tenant: string, expectedUpdatedAt: number): UpstreamNotesUpdateBody {
+  return { tenant_external_id: tenant, notes: normalizeUpstreamNotes(draft), expected_updated_at: expectedUpdatedAt };
+}

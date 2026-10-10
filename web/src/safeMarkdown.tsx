@@ -19,6 +19,8 @@ export function safeLinkHref(url: string): string | undefined {
   let parsed: URL;
   try { parsed = new URL(url); } catch { return undefined; }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+  // Documentation links never need embedded credentials.
+  if (parsed.username || parsed.password) return undefined;
   return parsed.href;
 }
 
@@ -31,9 +33,14 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
   let text = '';
   const flush = () => { if (text) { nodes.push({ kind: 'text', text }); text = ''; } };
   let index = 0;
+  // A failed delimiter search proves none exists later, so each delimiter is
+  // scanned at most once and parsing stays linear even without closers.
+  let noCode = false;
+  let noBold = false;
+  let noItalic = false;
   while (index < source.length) {
     const rest = source.slice(index);
-    if (rest.startsWith('`')) {
+    if (!noCode && rest.startsWith('`')) {
       const end = source.indexOf('`', index + 1);
       if (end > index) {
         flush();
@@ -41,6 +48,7 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
         index = end + 1;
         continue;
       }
+      noCode = true;
     }
     const image = rest.match(IMAGE_PATTERN);
     if (image) {
@@ -63,7 +71,7 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
       index += link[0].length;
       continue;
     }
-    if (depth < MAX_INLINE_DEPTH && rest.startsWith('**')) {
+    if (!noBold && depth < MAX_INLINE_DEPTH && rest.startsWith('**')) {
       const end = source.indexOf('**', index + 2);
       if (end > index + 2) {
         flush();
@@ -71,8 +79,9 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
         index = end + 2;
         continue;
       }
+      if (end === -1) noBold = true;
     }
-    if (depth < MAX_INLINE_DEPTH && rest.startsWith('*') && !rest.startsWith('**')) {
+    if (!noItalic && depth < MAX_INLINE_DEPTH && rest.startsWith('*') && !rest.startsWith('**')) {
       const end = source.indexOf('*', index + 1);
       if (end > index + 1) {
         flush();
@@ -80,6 +89,7 @@ export function parseSafeMarkdownInlines(source: string, depth = 0): SafeMarkdow
         index = end + 1;
         continue;
       }
+      if (end === -1) noItalic = true;
     }
     text += source[index];
     index += 1;

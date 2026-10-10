@@ -16,6 +16,9 @@ import { builtinApiKeyCredential } from './builtin-api-key-credential';
 import { providerEditShape } from './provider-edit-shapes';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.failNextFormWrite = false;
+window.failNextFormNotesWrite = false;
+window.conflictNextFormNotesWrite = false;
+window.deferNextFormNotesWrite = false;
 window.deferNextFormQuotaRead = false;
 window.deferNextFormProxyRead = false;
 let releaseProviderCreate: ((status: number) => void) | undefined;
@@ -23,12 +26,14 @@ window.releaseFormProviderCreate = status => { if (!releaseProviderCreate) throw
 let createdProvider: typeof account | undefined;
 let releaseProxy: (() => void) | undefined;
 window.releaseFormProxyRead = () => { if (!releaseProxy) throw new Error('No pending proxy read'); releaseProxy(); releaseProxy = undefined; };
+let releaseNotes: (() => void) | undefined;
+window.releaseFormNotesWrite = () => { if (!releaseNotes) throw new Error('No pending notes write'); releaseNotes(); releaseNotes = undefined; };
 let releaseQuota: (() => void) | undefined;
 window.releaseFormQuotaRead = () => { if (!releaseQuota) throw new Error('No pending quota read'); releaseQuota(); releaseQuota = undefined; };
 const workflows = new URLSearchParams(location.search).has('workflows');
 const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', public_model: 'research-model', upstream_model: 'fixture-model', protocol: 'openai', upstream_account_ids: ['account-native'], enabled: true, priority: 0, grant_revision: 1, created_at: 1, updated_at: 1 };
 let routeRows = [existingRoute];
-const account = { id: 'account-native', tenant_id: 'tenant-fixture', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: !new URLSearchParams(location.search).has('proxy-no-authority'), credential_generation: 1, route_count: 1, updated_at: 1 };
+const account = { id: 'account-native', tenant_id: 'tenant-fixture', tenant_external_id: 'fixture', name: '研发订阅', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', notes: null as string | null, config: { base_url: 'https://chatgpt.com/backend-api/codex' }, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true, can_update_transport_proxy: !new URLSearchParams(location.search).has('proxy-no-authority'), credential_generation: 1, route_count: 1, updated_at: 1 };
 const editShape = providerEditShape(new URLSearchParams(location.search).get('provider-shape'));
 if (editShape) { Object.assign(account.config, editShape.config); Object.assign(account, { name: 'synthetic.automation.account@example.invalid', proxy_fingerprint: 'synthetic-diagnostic-fingerprint' }); }
 let proxyUrl = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
@@ -51,6 +56,29 @@ window.fetch = async (input, init) => {
       }
       createdProvider = result;
       return new Response(JSON.stringify(result), { status: 201 });
+    }
+    if (workflows && new URLSearchParams(location.search).has('notes-workflow') && method === 'PATCH' && path === '/internal/v1/upstreams/account-native/notes') {
+      const data = JSON.parse(String(init?.body ?? '{}'));
+      if (data.tenant_external_id !== account.tenant_external_id) throw new Error('fixture notes tenant mismatch');
+      if (!Object.hasOwn(data, 'notes')) return new Response(JSON.stringify({ error: { message: 'fixture notes field required' } }), { status: 422 });
+      if (window.failNextFormNotesWrite) { window.failNextFormNotesWrite = false; return new Response(JSON.stringify({ error: { message: '模拟备注保存失败，草稿仍在' } }), { status: 400 }); }
+      if (window.conflictNextFormNotesWrite || data.expected_updated_at !== account.updated_at) {
+        window.conflictNextFormNotesWrite = false;
+        return new Response(JSON.stringify({ error: { message: 'fixture notes revision conflict' } }), { status: 409 });
+      }
+      window.formJourneyLastNotesWrite = structuredClone(data);
+      const applyNotes = () => {
+        account.notes = data.notes;
+        account.updated_at++;
+        return { id: account.id, notes: account.notes, notes_format: 'markdown', updated_at: account.updated_at };
+      };
+      if (window.deferNextFormNotesWrite) {
+        window.deferNextFormNotesWrite = false;
+        // Deliberately ignore scope changes: a late response must not publish
+        // into a workspace that no longer owns it.
+        return new Promise<Response>(resolve => { releaseNotes = () => resolve(new Response(JSON.stringify(applyNotes()))); });
+      }
+      return new Response(JSON.stringify(applyNotes()));
     }
     if (workflows && new URLSearchParams(location.search).has('proxy-workflow') && method === 'PUT' &&
       (path === '/internal/v1/upstreams/account-native/transport-proxy' || path === '/internal/v1/upstreams/account-native')) {

@@ -4,9 +4,9 @@ import { Button, Textarea } from '../../design-system';
 import { useI18n } from '../../i18n';
 import { SafeMarkdown } from '../../safeMarkdown';
 import type { UpstreamAccount, UpstreamAccountNotes } from '../../types';
-import { messageOf, queryForTenant } from './scope/operatorShared';
+import { messageOf } from './scope/operatorShared';
 import { FormSection } from './FormSection';
-import { normalizeUpstreamNotes, upstreamNotesDirty, validateUpstreamNotes } from './upstreamNotes';
+import { upstreamNotesDirty, upstreamNotesUpdateBody, validateUpstreamNotes } from './upstreamNotes';
 import { upstreamNotesCopy } from './upstreamNotesCopy';
 import './upstreamNotes.css';
 
@@ -99,9 +99,9 @@ export function UpstreamNotes({ account, token, tenant, disabled, onDirtyChange,
     setError('');
     setSavedNotice(false);
     try {
-      const result = await api<UpstreamAccountNotes>(`/internal/v1/upstreams/${account.id}/notes${queryForTenant(tenant)}`, token, {
+      const result = await api<UpstreamAccountNotes>(`/internal/v1/upstreams/${account.id}/notes`, token, {
         method: 'PATCH',
-        body: JSON.stringify({ notes: normalizeUpstreamNotes(draft), expected_updated_at: account.updated_at }),
+        body: JSON.stringify(upstreamNotesUpdateBody(draft, tenant, account.updated_at)),
       });
       if (result.id !== account.id || typeof result.updated_at !== 'number') throw new Error(copy.saveUnconfirmed);
       const savedNotes = result.notes ?? null;

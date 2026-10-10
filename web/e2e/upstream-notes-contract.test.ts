@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { SafeMarkdown, parseSafeMarkdown, safeLinkHref } from '../src/safeMarkdown.js';
 import {
   normalizeUpstreamNotes, upstreamNotesDirty, upstreamNotesMaxScalars,
-  upstreamNotesMaxUtf8Bytes, upstreamNotesScalarCount, validateUpstreamNotes,
+  upstreamNotesMaxUtf8Bytes, upstreamNotesScalarCount, upstreamNotesUpdateBody, validateUpstreamNotes,
 } from '../src/operator/upstreamNotes.js';
 
 function render(source: string): string {
@@ -29,6 +29,35 @@ test('script, data, file and protocol-relative links never become anchors', () =
   }
   assert.equal(safeLinkHref('https://example.com/a?b=c'), 'https://example.com/a?b=c');
   assert.equal(safeLinkHref(' https://example.com '), undefined);
+});
+
+test('links with embedded credentials never become anchors', () => {
+  for (const url of ['https://user:password@example.com/docs', 'https://user@example.com/docs', 'http://token@evil.example/']) {
+    assert.equal(safeLinkHref(url), undefined, url);
+    assert.ok(!render(`[docs](${url})`).includes('<a'), url);
+  }
+});
+
+test('unclosed emphasis delimiters stay literal and parse linearly', () => {
+  const unclosed = render('**not bold and *not italic');
+  assert.ok(!unclosed.includes('<strong') && !unclosed.includes('<em'));
+  assert.ok(unclosed.includes('**not bold and *not italic'));
+  const pathological = '*'.repeat(20_000);
+  const blocks = parseSafeMarkdown(pathological);
+  assert.equal(blocks.length, 1);
+  assert.deepEqual(blocks[0], { kind: 'paragraph', children: [{ kind: 'text', text: pathological }] });
+  const boldPathological = '**a'.repeat(10_000);
+  const rendered = render(boldPathological);
+  assert.ok(!rendered.includes('<strong'));
+});
+
+test('notes write payload carries tenant identity, explicit notes and the revision fence', () => {
+  assert.deepEqual(upstreamNotesUpdateBody('**docs** https://example.com', 'tenant-a', 42), {
+    tenant_external_id: 'tenant-a', notes: '**docs** https://example.com', expected_updated_at: 42,
+  });
+  assert.deepEqual(upstreamNotesUpdateBody('   ', 'tenant-a', 7), {
+    tenant_external_id: 'tenant-a', notes: null, expected_updated_at: 7,
+  });
 });
 
 test('raw HTML is escaped as text and never rendered', () => {
