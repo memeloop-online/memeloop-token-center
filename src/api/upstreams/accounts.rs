@@ -457,6 +457,66 @@ pub(in crate::api) async fn get_upstream_deletion_readiness(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpstreamNotesQuery {
+    tenant_external_id: String,
+}
+
+pub(in crate::api) async fn get_upstream_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<UpstreamNotesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    require_service_tenant(&service, &query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .get_upstream_account_notes(account_id, &query.tenant_external_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpdateUpstreamNotesRequest {
+    tenant_external_id: String,
+    notes: Value,
+    expected_updated_at: i64,
+}
+
+pub(in crate::api) async fn update_upstream_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<UpdateUpstreamNotesRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let notes = match body.notes {
+        Value::Null => None,
+        Value::String(notes) => Some(notes),
+        _ => {
+            return Err(AppError::BadRequest(
+                "upstream notes must be a Markdown string or null".into(),
+            ));
+        }
+    };
+    Ok(Json(
+        state
+            .db
+            .update_upstream_account_notes(
+                account_id,
+                &body.tenant_external_id,
+                notes,
+                body.expected_updated_at,
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
 pub(in crate::api) struct UpstreamListQuery {
     tenant_external_id: Option<String>,
     before_created_at: Option<i64>,

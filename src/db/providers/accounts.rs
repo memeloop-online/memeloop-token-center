@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use crate::provider::UpstreamDeletionReadiness;
+use crate::provider::{UpstreamAccountNotes, UpstreamDeletionReadiness};
 use sqlx::{Any, Executor};
 
 pub struct CreateUpstreamAccountInput {
@@ -103,7 +103,7 @@ impl Database {
         }
         if let Some(session_id) = input.oauth_session_id {
             let existing = sqlx::query(
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
             )
             .bind(session_id.to_string())
             .fetch_optional(&mut *tx)
@@ -160,6 +160,7 @@ impl Database {
             driver: input.driver.clone(),
             auth_kind: auth_kind.to_owned(),
             connection_method: upstream_connection_method(&input.driver, auth_kind),
+            notes: None,
             credential_generation: 1,
             status: "active".to_owned(),
             config: input.config,
@@ -191,7 +192,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, UpstreamCredential), AppError> {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
@@ -227,7 +228,7 @@ impl Database {
             DatabaseBackend::Sqlite => "SELECT value FROM json_each($2)",
         };
         let statement = format!(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND a.id IN ({selected_accounts}) ORDER BY a.id"
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND a.id IN ({selected_accounts}) ORDER BY a.id"
         );
         // `selected_accounts` is chosen solely from these two audited static
         // fragments above; every caller-controlled value remains a bind.
@@ -270,7 +271,7 @@ impl Database {
         AppError,
     > {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
@@ -388,6 +389,80 @@ impl Database {
         Ok(receipt)
     }
 
+    pub async fn get_upstream_account_notes(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<UpstreamAccountNotes, AppError> {
+        let row = sqlx::query(
+            "SELECT a.notes, a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        Ok(UpstreamAccountNotes {
+            id: account_id,
+            notes: row.try_get("notes")?,
+            notes_format: "markdown",
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    pub async fn update_upstream_account_notes(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        notes: Option<String>,
+        expected_updated_at: i64,
+    ) -> Result<UpstreamAccountNotes, AppError> {
+        let notes = validate_upstream_account_notes(notes)?;
+        let mut tx = self.begin_write_transaction().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let current = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let current_updated_at: i64 = current.try_get("updated_at")?;
+        if current_updated_at != expected_updated_at {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before saving its notes again".into(),
+            ));
+        }
+        let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
+        let changed = sqlx::query(
+            "UPDATE upstream_accounts SET notes = $1, updated_at = $2 WHERE id = $3 AND updated_at = $4",
+        )
+        .bind(&notes)
+        .bind(updated_at)
+        .bind(account_id.to_string())
+        .bind(expected_updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before saving its notes again".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(UpstreamAccountNotes {
+            id: account_id,
+            notes,
+            notes_format: "markdown",
+            updated_at,
+        })
+    }
+
     pub async fn update_upstream_account(
         &self,
         account_id: Uuid,
@@ -404,10 +479,10 @@ impl Database {
         let mut tx = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
             }
         };
         let current = sqlx::query(select)
@@ -551,7 +626,7 @@ impl Database {
         }
         let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -750,7 +825,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             WITH page AS MATERIALIZED (
-                SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind,
+                SELECT a.id, a.tenant_id, a.name, a.notes, a.driver, a.auth_kind,
                        a.config_json, a.status, a.credential_generation,
                        a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url,
                        a.created_at, a.updated_at
@@ -787,7 +862,7 @@ impl Database {
                 GROUP BY tenant_id, upstream_account_id
             )
             SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id,
-                   a.name, a.driver, a.auth_kind, a.config_json, a.status,
+                   a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status,
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
                    COALESCE(receipt.source_identity_hash, source_binding.source_identity_hash) AS import_source_identity_hash,
@@ -837,7 +912,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             WITH page AS MATERIALIZED (
-                SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind,
+                SELECT a.id, a.tenant_id, a.name, a.notes, a.driver, a.auth_kind,
                        a.config_json, a.status, a.credential_generation,
                        a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url,
                        a.created_at, a.updated_at
@@ -861,7 +936,7 @@ impl Database {
                 GROUP BY tenant_id, upstream_account_id
             )
             SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id,
-                   a.name, a.driver, a.auth_kind, a.config_json, a.status,
+                   a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status,
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
                    c.credential_ciphertext,
@@ -924,7 +999,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<UpstreamAccountView, AppError> {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -967,6 +1042,27 @@ where
     ))
 }
 
+fn validate_upstream_account_notes(notes: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(notes) = notes else { return Ok(None) };
+    if notes.trim().is_empty() {
+        return Ok(None);
+    }
+    if notes.chars().count() > 16_384 || notes.len() > 65_536 {
+        return Err(AppError::BadRequest(
+            "upstream notes must fit within 16,384 characters and 65,536 UTF-8 bytes".into(),
+        ));
+    }
+    if notes
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(AppError::BadRequest(
+            "upstream notes contain an unsupported control character".into(),
+        ));
+    }
+    Ok(Some(notes))
+}
+
 pub(super) fn upstream_account_view(
     row: sqlx::any::AnyRow,
 ) -> Result<UpstreamAccountView, AppError> {
@@ -1005,6 +1101,7 @@ pub(super) fn upstream_account_view(
         tenant_external_id: row.try_get("tenant_external_id").ok(),
         name: row.try_get("name")?,
         connection_method: upstream_connection_method(&driver, &auth_kind),
+        notes: row.try_get("notes")?,
         driver,
         auth_kind,
         credential_generation: row.try_get("credential_generation")?,

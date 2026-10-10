@@ -1525,6 +1525,62 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/upstreams/{account_id}/notes:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamProviderNotes
+      summary: Read operator notes for one upstream provider
+      description: |
+        Returns CommonMark source attached to the tenant-owned stable upstream
+        account. Notes are presentation metadata only: they are absent from
+        provider transport configuration, credentials, model-route selection,
+        authorization state, and every /v1 inference request.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Current Markdown notes and account revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProviderNotes' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Upstream providers]
+      operationId: replaceUpstreamProviderNotes
+      summary: Replace operator notes for one upstream provider
+      description: |
+        Replaces CommonMark source without loading or changing configuration or
+        credential material. Send `notes: null`, or an empty/whitespace-only
+        Markdown string, to clear the value. `expected_updated_at` is the
+        current account revision; a stale value returns 409. A successful write
+        updates only notes and `updated_at`, never `transport_revision` or
+        `credential_generation`.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceUpstreamProviderNotesRequest' }
+      responses:
+        '200':
+          description: Stored Markdown notes and new account revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProviderNotes' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: 'JSON does not match the closed request shape, including a missing notes field.' }
+
   /internal/v1/upstreams/{account_id}:
     put:
       tags: [Upstream providers]
@@ -8008,6 +8064,30 @@ components:
           description: Private SOCKS endpoint. Codex and remote-DNS socks5h require a private IP literal; generic socks5 may use a hostname resolving only to private addresses. Proxy authentication is returned only by the explicit management GET, never ordinary metadata.
         expected_updated_at: { type: integer, format: int64 }
         expected_credential_generation: { type: integer, format: int64, minimum: 1 }
+    ReplaceUpstreamProviderNotesRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, notes, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        notes:
+          type: [string, 'null']
+          maxLength: 16384
+          description: UTF-8 CommonMark source; at most 65,536 UTF-8 bytes. Null or whitespace clears the stored value.
+        expected_updated_at: { type: integer, format: int64 }
+    UpstreamProviderNotes:
+      type: object
+      additionalProperties: false
+      required: [id, notes, notes_format, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        notes:
+          type: [string, 'null']
+          maxLength: 16384
+          description: Stored CommonMark source. Clients must render it as untrusted Markdown with raw HTML disabled and no remote fetches.
+        notes_format: { type: string, const: markdown }
+        updated_at: { type: integer, format: int64 }
+
     UpstreamProviderNameUpdate:
       type: object
       additionalProperties: false
@@ -8021,12 +8101,16 @@ components:
     UpstreamProvider:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, notes, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
         tenant_external_id: { type: [string, 'null'] }
         name: { type: string }
+        notes:
+          type: [string, 'null']
+          maxLength: 16384
+          description: Operator-authored CommonMark presentation metadata; never transport configuration, credential material, route input, or /v1 request content.
         driver: { type: string }
         auth_kind: { type: string, enum: [none, api_key, oauth], description: Stored authentication family. }
         connection_method: { type: string, enum: [none, api_key, oauth, legacy], description: Presentation metadata for the unified upstream resource; legacy is read-only historical data. }

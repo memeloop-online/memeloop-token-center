@@ -25,8 +25,9 @@ fn restrict_transport_proxy_capability(
 }
 
 pub(in crate::api) use accounts::{
-    create_upstream, delete_upstream, get_upstream_deletion_readiness, list_upstreams,
-    rotate_codex_transport_proxy, rotate_upstream_credential, set_upstream_status, update_upstream,
+    create_upstream, delete_upstream, get_upstream_deletion_readiness, get_upstream_notes,
+    list_upstreams, rotate_codex_transport_proxy, rotate_upstream_credential, set_upstream_status,
+    update_upstream, update_upstream_notes,
 };
 pub(in crate::api) use availability::upstream_account_availability;
 pub(in crate::api) use health::probe_upstream_health;
