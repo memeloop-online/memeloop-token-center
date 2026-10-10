@@ -3535,3 +3535,295 @@ async fn kimi_name_only_edit_preserves_expired_and_disconnected_account_state_wi
         assert!(mock.received_requests().await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn upstream_notes_are_tenant_scoped_markdown_and_do_not_touch_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upstream-notes.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let upstream = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "notes-tenant".into(),
+                name: "noted upstream".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":"https://api.example.test"}),
+                credential: UpstreamCredential::ApiKey {
+                    value: "notes-fixture-secret".into(),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let expected_config = upstream.config.clone();
+    let expected_generation = upstream.credential_generation;
+    let mut reader = None;
+    let mut writer = None;
+    for (name, scopes) in [
+        ("notes-reader", vec!["providers:read".into()]),
+        ("notes-writer", vec!["providers:write".into()]),
+    ] {
+        let token = state
+            .db
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: name.into(),
+                    scopes,
+                    tenant_external_id: Some("notes-tenant".into()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap()
+            .token;
+        if name == "notes-reader" {
+            reader = Some(token);
+        } else {
+            writer = Some(token);
+        }
+    }
+    let reader = reader.unwrap();
+    let writer = writer.unwrap();
+    let notes_path = format!(
+        "/internal/v1/upstreams/{}/notes?tenant_external_id=notes-tenant",
+        upstream.id
+    );
+    let (status, initial) = json_request(&state, "GET", &notes_path, &reader, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["notes"], Value::Null);
+    assert_eq!(initial["notes_format"], "markdown");
+    assert_eq!(initial["updated_at"], upstream.updated_at);
+
+    let write_path = format!("/internal/v1/upstreams/{}/notes", upstream.id);
+    let markdown =
+        "官网: [Memeloop](https://www.example.test)\n\n文档: https://docs.example.test/setup";
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &reader,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "notes": markdown,
+            "expected_updated_at": upstream.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "expected_updated_at": upstream.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, saved) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "notes": markdown,
+            "expected_updated_at": upstream.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["notes"], markdown);
+    assert_eq!(saved["notes_format"], "markdown");
+    let saved_revision = saved["updated_at"].as_i64().unwrap();
+    assert!(saved_revision > upstream.updated_at);
+
+    let (status, listed) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?tenant_external_id=notes-tenant",
+        &reader,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed[0]["notes"], markdown);
+
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "wrong-tenant",
+            "notes": "must not cross tenants",
+            "expected_updated_at": saved_revision
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "notes": "stale",
+            "expected_updated_at": upstream.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let oversized = "x".repeat(16_385);
+    for invalid in ["contains\u{0007}control", oversized.as_str()] {
+        let (status, _) = json_request(
+            &state,
+            "PATCH",
+            &write_path,
+            &writer,
+            None,
+            Some(json!({
+                "tenant_external_id": "notes-tenant",
+                "notes": invalid,
+                "expected_updated_at": saved_revision
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "notes": 5,
+            "expected_updated_at": saved_revision
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, cleared) = json_request(
+        &state,
+        "PATCH",
+        &write_path,
+        &writer,
+        None,
+        Some(json!({
+            "tenant_external_id": "notes-tenant",
+            "notes": null,
+            "expected_updated_at": saved_revision
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["notes"], Value::Null);
+
+    let (persisted, credential) = state
+        .db
+        .upstream_account_with_credential(upstream.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(persisted.notes, None);
+    assert_eq!(persisted.config, expected_config);
+    assert_eq!(persisted.credential_generation, expected_generation);
+    assert!(matches!(credential, UpstreamCredential::ApiKey { .. }));
+}
+
+#[tokio::test]
+async fn postgres_upstream_notes_cas_fence_when_configured() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let state = AppState::initialize(Config::for_test(url)).await.unwrap();
+    let tenant = format!("notes-pg-{}", Uuid::now_v7());
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.clone(),
+                name: "postgres noted upstream".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":"http://127.0.0.1:1"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(account.notes, None);
+
+    let saved = state
+        .db
+        .update_upstream_account_notes(
+            account.id,
+            &tenant,
+            Some("**markdown**".into()),
+            account.updated_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.notes.as_deref(), Some("**markdown**"));
+    assert!(saved.updated_at > account.updated_at);
+
+    let stale = state
+        .db
+        .update_upstream_account_notes(
+            account.id,
+            &tenant,
+            Some("stale".into()),
+            account.updated_at,
+        )
+        .await;
+    assert!(matches!(
+        stale,
+        Err(memeloop_token_center::error::AppError::Conflict(_))
+    ));
+
+    let cleared = state
+        .db
+        .update_upstream_account_notes(account.id, &tenant, None, saved.updated_at)
+        .await
+        .unwrap();
+    assert_eq!(cleared.notes, None);
+    let reloaded = state
+        .db
+        .get_upstream_account_notes(account.id, &tenant)
+        .await
+        .unwrap();
+    assert_eq!(reloaded.notes, None);
+    assert_eq!(reloaded.updated_at, cleared.updated_at);
+}

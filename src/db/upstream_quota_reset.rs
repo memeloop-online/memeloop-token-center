@@ -688,6 +688,7 @@ mod tests {
             driver: "openai-codex".into(),
             auth_kind: "oauth".into(),
             connection_method: "oauth".into(),
+            notes: None,
             credential_generation: 1,
             status: "active".into(),
             config: serde_json::json!({}),

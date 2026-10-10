@@ -89,6 +89,10 @@ pub struct UpstreamAccountView {
     /// How this provider was connected. This is presentation metadata only;
     /// every connection method uses the same stable upstream account model.
     pub connection_method: String,
+    /// Operator-authored CommonMark source. This is presentation metadata only
+    /// and is deliberately absent from transport configuration and /v1 sends.
+    #[serde(default)]
+    pub notes: Option<String>,
     pub credential_generation: i64,
     pub status: String,
     pub config: Value,
@@ -122,6 +126,14 @@ pub struct UpstreamAccountView {
     /// identity, including disabled routes retained for audit purposes.
     pub route_count: i64,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpstreamAccountNotes {
+    pub id: Uuid,
+    pub notes: Option<String>,
+    pub notes_format: &'static str,
     pub updated_at: i64,
 }
 

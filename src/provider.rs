@@ -30,8 +30,8 @@ pub(crate) use transport_policy::{
     CodexChatControlPolicy, CodexResponsesOutputLimitPolicy, CodexTransportPolicy, SseFramingLimits,
 };
 pub use types::{
-    AuthorizedUpstreamCandidate, ModelRouteView, ResolvedUpstream, UpstreamAccountView,
-    UpstreamDeletionReadiness,
+    AuthorizedUpstreamCandidate, ModelRouteView, ResolvedUpstream, UpstreamAccountNotes,
+    UpstreamAccountView, UpstreamDeletionReadiness,
 };
 pub(crate) use types::{PROXY_ROUTING_POLICY, UpstreamTransportSnapshot};
 

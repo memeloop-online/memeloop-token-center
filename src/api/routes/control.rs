@@ -277,6 +277,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(get_upstream_deletion_readiness),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/notes",
+            get(get_upstream_notes).patch(update_upstream_notes),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}",
             put(update_upstream)
                 .patch(set_upstream_status)

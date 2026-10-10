@@ -642,6 +642,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "observed Portal cache analytics coverage",
         sql: include_str!("../../../migrations/common/0122_portal_cache_coverage.sql"),
     },
+    Migration {
+        version: 123,
+        name: "operator upstream account notes",
+        sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1267,6 +1272,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 122,
         name: "observed Portal cache analytics coverage",
         sql: include_str!("../../../migrations/common/0122_portal_cache_coverage.sql"),
+    },
+    Migration {
+        version: 123,
+        name: "operator upstream account notes",
+        sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
     },
 ];
 

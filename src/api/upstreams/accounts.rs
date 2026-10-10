@@ -457,6 +457,80 @@ pub(in crate::api) async fn get_upstream_deletion_readiness(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpstreamNotesQuery {
+    tenant_external_id: String,
+}
+
+pub(in crate::api) async fn get_upstream_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<UpstreamNotesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    require_service_tenant(&service, &query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .get_upstream_account_notes(account_id, &query.tenant_external_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpdateUpstreamNotesRequest {
+    tenant_external_id: String,
+    #[serde(default, deserialize_with = "deserialize_supplied_config")]
+    notes: Option<Value>,
+    expected_updated_at: i64,
+}
+
+pub(in crate::api) async fn update_upstream_notes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<UpdateUpstreamNotesRequest>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let Some(notes) = body.notes else {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: upstream notes field is required; use null to clear it"
+                }
+            })),
+        )
+            .into_response());
+    };
+    let notes = match notes {
+        Value::Null => None,
+        Value::String(notes) => Some(notes),
+        _ => {
+            return Err(AppError::BadRequest(
+                "upstream notes must be a Markdown string or null".into(),
+            ));
+        }
+    };
+    Ok(Json(
+        state
+            .db
+            .update_upstream_account_notes(
+                account_id,
+                &body.tenant_external_id,
+                notes,
+                body.expected_updated_at,
+            )
+            .await?,
+    )
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
 pub(in crate::api) struct UpstreamListQuery {
     tenant_external_id: Option<String>,
     before_created_at: Option<i64>,
@@ -958,6 +1032,41 @@ mod tests {
             let mut edit = rename.clone();
             edit.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<UpdateUpstreamRequest>(edit).is_err());
+        }
+    }
+
+    #[test]
+    fn upstream_notes_request_distinguishes_missing_notes_from_explicit_null() {
+        let base = json!({
+            "tenant_external_id": "notes-tenant",
+            "expected_updated_at": 42
+        });
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(request.notes.is_none());
+
+        let mut clear = base.clone();
+        clear["notes"] = Value::Null;
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(clear).unwrap();
+        assert_eq!(request.notes, Some(Value::Null));
+
+        let mut save = base.clone();
+        save["notes"] = json!("**markdown**");
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(save).unwrap();
+        assert_eq!(request.notes, Some(json!("**markdown**")));
+
+        for invalid in [json!(7), json!(true), json!({}), json!([])] {
+            let mut edit = base.clone();
+            edit["notes"] = invalid.clone();
+            let request: UpdateUpstreamNotesRequest = serde_json::from_value(edit).unwrap();
+            assert_eq!(request.notes, Some(invalid));
+        }
+        let mut unknown = base.clone();
+        unknown["unexpected"] = Value::Null;
+        assert!(serde_json::from_value::<UpdateUpstreamNotesRequest>(unknown).is_err());
+        for field in ["tenant_external_id", "expected_updated_at"] {
+            let mut edit = base.clone();
+            edit.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<UpdateUpstreamNotesRequest>(edit).is_err());
         }
     }
 
