@@ -389,6 +389,7 @@ fn chat_sse_requires_complete_canonical_usage_and_one_consistent_chat_id() {
         Some(TokenUsage {
             input_tokens: 5,
             cached_input_tokens: 4,
+            cache_coverage: crate::model::CacheUsageCoverage::new(4, 9),
             output_tokens: 3,
             ..TokenUsage::default()
         }),

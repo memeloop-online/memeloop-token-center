@@ -47,6 +47,16 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&120));
     assert!(versions.contains(&121));
     for statement in [
+        "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
+        "ALTER TABLE request_records DROP COLUMN cache_known_read_tokens",
+        "ALTER TABLE request_stats_facts DROP COLUMN cache_known_input_tokens",
+        "ALTER TABLE request_stats_facts DROP COLUMN cache_known_read_tokens",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_known_input_tokens",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_known_read_tokens",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_eligible_requests",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_unknown_requests",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_reported_read_tokens",
+        "ALTER TABLE request_daily_aggregates DROP COLUMN cache_reported_requests",
         "DROP TABLE conversation_semantic_payloads",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_payload_snapshot_json",
         "DROP TABLE terminal_projection_outbox",
@@ -83,7 +93,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122)",
     )
     .execute(&database.pool)
     .await
@@ -140,7 +150,7 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119, 120, 121]);
+    assert_eq!(tail, vec![117, 118, 119, 120, 121, 122]);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
@@ -164,7 +174,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119, 120, 121]);
+        assert_eq!(tail, vec![117, 118, 119, 120, 121, 122]);
     }
 }
 

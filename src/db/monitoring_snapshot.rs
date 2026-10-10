@@ -236,6 +236,7 @@ impl MetricsAccumulator {
             cached_input_tokens: self.cached_input_tokens,
             cache_write_tokens: self.cache_write_tokens,
             service_tier: None,
+            cache_coverage: None,
         };
         MonitoringMetrics {
             requests: self.requests,

@@ -754,11 +754,18 @@ fn anthropic_usage(value: &Value) -> Result<Value, &'static str> {
     let total = total_input
         .checked_add(output)
         .ok_or("anthropic_usage_invalid")?;
-    Ok(
-        json!({"input_tokens":total_input,"output_tokens":output,"total_tokens":total,
-        "input_tokens_details":{"cached_tokens":cached},
-        "cache_creation_input_tokens":cache_write}),
-    )
+    let mut result = json!({"input_tokens":total_input,"output_tokens":output,"total_tokens":total,
+        "cache_creation_input_tokens":cache_write});
+    result["input_tokens_details"] = json!({"cached_tokens":cached});
+    if value.get("cache_read_input_tokens").is_none() {
+        result["cache_read_observed"] = Value::Bool(false);
+    }
+    if value.get("cache_read_input_tokens").is_none()
+        || value.get("cache_creation_input_tokens").is_none()
+    {
+        result["cache_usage_complete"] = Value::Bool(false);
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy)]
@@ -1322,6 +1329,53 @@ pub(in crate::api) fn error_body(value: &Value) -> Result<Value, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_conversion_keeps_observation_and_denominator_separate() {
+        for (read, write) in [
+            (None, None),
+            (None, Some(0)),
+            (Some(0), None),
+            (Some(2), None),
+            (Some(0), Some(0)),
+            (Some(2), Some(3)),
+        ] {
+            let mut source = json!({"input_tokens":7,"output_tokens":3});
+            if let Some(read) = read {
+                source["cache_read_input_tokens"] = json!(read);
+            }
+            if let Some(write) = write {
+                source["cache_creation_input_tokens"] = json!(write);
+            }
+            let converted = anthropic_usage(&source).unwrap();
+            let response = json!({"usage":converted});
+            let canonical =
+                crate::api::proxy::codex_transport::canonical_responses_usage(&response).unwrap();
+            let generic = crate::api::parse_cache_usage_contract(&response);
+            let coverage = read.and_then(|read| {
+                if let Some(write) = write {
+                    crate::model::CacheUsageCoverage::new(read, 7 + read + write)
+                } else {
+                    crate::model::CacheUsageCoverage::read_only(read)
+                }
+            });
+            assert_eq!(canonical.input_tokens, 7 + write.unwrap_or(0));
+            assert_eq!(canonical.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(canonical.cache_write_tokens, 0);
+            assert_eq!(canonical.output_tokens, 3);
+            assert_eq!(canonical.cache_coverage, coverage);
+            assert_eq!(generic.input_tokens, 7);
+            assert_eq!(generic.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(generic.cache_write_tokens, write.unwrap_or(0));
+            assert_eq!(generic.output_tokens, 3);
+            assert_eq!(generic.cache_coverage, coverage);
+        }
+        for field in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
+            let mut source = json!({"input_tokens":7,"output_tokens":3});
+            source[field] = Value::Null;
+            assert!(anthropic_usage(&source).is_err());
+        }
+    }
 
     #[test]
     fn request_preserves_namespaced_custom_tools_images_and_pairing() {

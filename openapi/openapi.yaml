@@ -10088,10 +10088,54 @@ components:
         unlinked: { type: boolean }
         external_request_id: { type: string, minLength: 1, maxLength: 512 }
         proof_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+    CacheStats:
+      type: object
+      additionalProperties: false
+      description: Cache reporting coverage over the complete filtered request population. Historical or omitted reporting remains unknown; zero-valued additive sums alone do not establish observed usage.
+      required: [reported_read_tokens, reported_requests, known_read_tokens, known_input_tokens, eligible_requests, unknown_requests, hit_rate]
+      properties:
+        reported_read_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Observed cached input tokens, including observations without a compatible input denominator. Unknown when reported_requests is zero.
+        reported_requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requests with an observed cached input token count, including explicitly reported zero.
+        known_read_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Cached input tokens from eligible_requests only.
+        known_input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Compatible inclusive input tokens from the same eligible_requests as known_read_tokens.
+        eligible_requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requests with observed cached reads and a compatible inclusive input denominator.
+        unknown_requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Requests without compatible rate coverage, including historical rows and observed reads without known input.
+        hit_rate:
+          description: known_read_tokens divided by known_input_tokens when the denominator is positive; otherwise null. Explicit zero reads with positive known input yield zero. Partial coverage describes only eligible requests.
+          oneOf:
+            - type: number
+              minimum: 0
+              maximum: 1
+            - type: 'null'
     StatisticsSummary:
       type: object
-      required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost, costs]
+      required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost, costs, cache_usage]
       properties:
+        cache_usage: { $ref: '#/components/schemas/CacheStats' }
         total_requests: { type: integer, format: int64 }
         successful_requests: { type: integer, format: int64 }
         failed_requests: { type: integer, format: int64 }

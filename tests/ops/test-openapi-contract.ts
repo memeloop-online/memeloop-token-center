@@ -15,6 +15,26 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+test("statistics cache metadata matches the serialized Rust coverage contract", () => {
+  const schemas = cloneDocument().components.schemas;
+  assert.ok(schemas.StatisticsSummary.required.includes("cache_usage"));
+  assert.equal(schemas.StatisticsSummary.properties.cache_usage.$ref, "#/components/schemas/CacheStats");
+  const rust = readFileSync(`${repository}/src/model.rs`, "utf8");
+  const fields = [...rust.match(/pub struct CacheStats \{([^}]+)\}/u)![1]!.matchAll(/pub (\w+):/gu)].map((match) => match[1]!).sort();
+  const cache = schemas.CacheStats;
+  assert.deepEqual(Object.keys(cache.properties).sort(), fields);
+  assert.deepEqual([...cache.required].sort(), fields);
+  for (const field of fields.filter((field) => field !== "hit_rate")) {
+    assert.equal(cache.properties[field].type, "integer");
+    assert.equal(cache.properties[field].format, "int64");
+    assert.equal(cache.properties[field].minimum, 0);
+  }
+  assert.deepEqual(cache.properties.hit_rate.oneOf, [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }]);
+  assert.match(cache.properties.reported_read_tokens.description, /Unknown when reported_requests is zero/u);
+  assert.match(cache.properties.known_input_tokens.description, /same eligible_requests/u);
+  assert.match(cache.properties.hit_rate.description, /otherwise null/u);
+});
+
 test("catalog sync has a complete POST-only response with required pricing outcome", () => {
   const document = cloneDocument();
   const catalog = document.components.schemas.UpstreamModelCatalog;

@@ -247,6 +247,9 @@ fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'sta
     let total = value["total_tokens"]
         .as_u64()
         .ok_or("responses_chat_usage_field_type")?;
+    let observed_cached = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
     let cached = value
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
@@ -258,10 +261,12 @@ fn usage(value: &Value, dialect: ResponsesViaChatDialect) -> Result<Value, &'sta
     if cached > input || reasoning > output {
         return Err("usage_detail_exceeds_total");
     }
-    Ok(
-        json!({"input_tokens":input,"output_tokens":output,"total_tokens":total,
-        "input_tokens_details":{"cached_tokens":cached},"output_tokens_details":{"reasoning_tokens":reasoning}}),
-    )
+    let mut result = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total,
+        "output_tokens_details":{"reasoning_tokens":reasoning}});
+    if let Some(cached) = observed_cached {
+        result["input_tokens_details"] = json!({"cached_tokens":cached});
+    }
+    Ok(result)
 }
 
 fn envelope(context: &Context, id: &str, created: i64, outputs: Vec<Value>, usage: Value) -> Value {
@@ -797,6 +802,48 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_conversion_preserves_omitted_null_and_zero_cache_reporting() {
+        for (details, read) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!({})), None),
+            (Some(json!({"cached_tokens":null})), None),
+            (Some(json!({"cached_tokens":0})), Some(0)),
+            (Some(json!({"cached_tokens":7})), Some(7)),
+        ] {
+            let mut source = json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10});
+            if let Some(details) = details {
+                source["prompt_tokens_details"] = details;
+            }
+            let converted = usage(&source, ResponsesViaChatDialect::KimiV1).unwrap();
+            let parsed = crate::api::proxy::codex_transport::canonical_responses_usage(
+                &json!({"usage":converted}),
+            )
+            .unwrap();
+            assert_eq!(parsed.input_tokens, 7 - read.unwrap_or(0));
+            assert_eq!(parsed.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(parsed.output_tokens, 3);
+            assert_eq!(
+                parsed.cache_coverage,
+                read.and_then(|read| crate::model::CacheUsageCoverage::new(read, 7))
+            );
+        }
+        for read in [0, 7] {
+            let source = json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cached_tokens":read});
+            let converted = usage(&source, ResponsesViaChatDialect::KimiV1).unwrap();
+            let parsed = crate::api::proxy::codex_transport::canonical_responses_usage(
+                &json!({"usage":converted}),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed.cache_coverage,
+                crate::model::CacheUsageCoverage::new(read, 7)
+            );
+        }
+        assert!(usage(&json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cached_tokens":null}), ResponsesViaChatDialect::KimiV1).is_err());
+    }
 
     fn compaction_context() -> Context {
         Context::for_kimi(&json!({"model":"kimi-k3",

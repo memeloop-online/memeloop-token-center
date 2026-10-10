@@ -12,6 +12,12 @@ SELECT a.day_bucket * 86400000 AS created_at,
        a.error_code,
        a.input_tokens,
        a.output_tokens,
+       a.cache_known_read_tokens,
+       a.cache_known_input_tokens,
+       a.cache_eligible_requests,
+       COALESCE(a.cache_unknown_requests, a.requests) AS cache_unknown_requests,
+       a.cache_reported_read_tokens,
+       a.cache_reported_requests,
        a.currency,
        a.cost_micros,
        a.requests
@@ -42,6 +48,12 @@ SELECT f.created_at,
        f.error_code,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_read_tokens ELSE 0 END AS cache_known_read_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_input_tokens ELSE 0 END AS cache_known_input_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_eligible_requests,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END AS cache_unknown_requests,
+       COALESCE(f.cache_known_read_tokens, 0) AS cache_reported_read_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_reported_requests,
        f.currency,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -72,6 +84,12 @@ SELECT a.day_bucket * 86400000 AS created_at,
        a.error_code,
        0 AS input_tokens,
        0 AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       a.requests AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
        a.currency,
        a.cost_micros,
        a.requests
@@ -102,6 +120,12 @@ SELECT f.created_at,
        f.error_code,
        0 AS input_tokens,
        0 AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
        f.currency,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -134,6 +158,12 @@ SELECT f.created_at,
        f.error_code,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens,
        CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_read_tokens ELSE 0 END AS cache_known_read_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_input_tokens ELSE 0 END AS cache_known_input_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_eligible_requests,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END AS cache_unknown_requests,
+       COALESCE(f.cache_known_read_tokens, 0) AS cache_reported_read_tokens,
+       CASE WHEN f.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_reported_requests,
        f.currency,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -167,6 +197,12 @@ SELECT f.created_at,
        f.error_code,
        0 AS input_tokens,
        0 AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
        f.currency,
        f.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -203,6 +239,12 @@ SELECT r.created_at,
        COALESCE(r.error_code, '') AS error_code,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
        r.currency,
        r.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -234,6 +276,12 @@ SELECT g.created_at,
        COALESCE(g.error_code, '') AS error_code,
        0 AS input_tokens,
        0 AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
        COALESCE(k.currency, '') AS currency,
        g.cost_micros,
        CAST(1 AS BIGINT) AS requests
@@ -287,6 +335,7 @@ struct StatsProjectionAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     costs: BTreeMap<String, i64>,
+    cache_usage: crate::model::CacheStats,
 }
 
 impl StatsProjectionAccumulator {
@@ -304,6 +353,30 @@ impl StatsProjectionAccumulator {
         self.output_tokens = self
             .output_tokens
             .saturating_add(row.try_get("output_tokens")?);
+        self.cache_usage.known_read_tokens = self
+            .cache_usage
+            .known_read_tokens
+            .saturating_add(row.try_get("cache_known_read_tokens")?);
+        self.cache_usage.known_input_tokens = self
+            .cache_usage
+            .known_input_tokens
+            .saturating_add(row.try_get("cache_known_input_tokens")?);
+        self.cache_usage.eligible_requests = self
+            .cache_usage
+            .eligible_requests
+            .saturating_add(row.try_get("cache_eligible_requests")?);
+        self.cache_usage.unknown_requests = self
+            .cache_usage
+            .unknown_requests
+            .saturating_add(row.try_get("cache_unknown_requests")?);
+        self.cache_usage.reported_read_tokens = self
+            .cache_usage
+            .reported_read_tokens
+            .saturating_add(row.try_get("cache_reported_read_tokens")?);
+        self.cache_usage.reported_requests = self
+            .cache_usage
+            .reported_requests
+            .saturating_add(row.try_get("cache_reported_requests")?);
         let currency: String = row.try_get("currency")?;
         if currency.is_empty() {
             return Err(AppError::Internal);
@@ -313,9 +386,13 @@ impl StatsProjectionAccumulator {
         Ok(())
     }
 
-    fn finish_summary(self) -> StatsSummary {
+    fn finish_summary(mut self) -> StatsSummary {
+        self.cache_usage.hit_rate = (self.cache_usage.known_input_tokens > 0).then(|| {
+            self.cache_usage.known_read_tokens as f64 / self.cache_usage.known_input_tokens as f64
+        });
         let (total_cost, costs) = finish_stats_costs(self.costs);
         StatsSummary {
+            cache_usage: self.cache_usage,
             total_requests: self.total_requests,
             successful_requests: self.successful_requests,
             failed_requests: self.failed_requests,
@@ -483,6 +560,12 @@ enriched AS (
            requests,
            input_tokens,
            output_tokens,
+           cache_known_read_tokens,
+           cache_known_input_tokens,
+           cache_eligible_requests,
+           cache_unknown_requests,
+           cache_reported_read_tokens,
+           cache_reported_requests,
            currency,
            cost_micros
       FROM filtered_activity
@@ -505,6 +588,12 @@ grouped AS (
            CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
            CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
            CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
+           CAST(COALESCE(SUM(cache_known_read_tokens), 0) AS BIGINT) AS cache_known_read_tokens,
+           CAST(COALESCE(SUM(cache_known_input_tokens), 0) AS BIGINT) AS cache_known_input_tokens,
+           CAST(COALESCE(SUM(cache_eligible_requests), 0) AS BIGINT) AS cache_eligible_requests,
+           CAST(COALESCE(SUM(cache_unknown_requests), 0) AS BIGINT) AS cache_unknown_requests,
+           CAST(COALESCE(SUM(cache_reported_read_tokens), 0) AS BIGINT) AS cache_reported_read_tokens,
+           CAST(COALESCE(SUM(cache_reported_requests), 0) AS BIGINT) AS cache_reported_requests,
            currency,
            CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros
       FROM enriched
@@ -527,7 +616,7 @@ ranked AS (
       FROM with_bucket_totals
 )
 SELECT bucket_kind, name, day_bucket, requests, successful_requests,
-       failed_requests, input_tokens, output_tokens, currency, cost_micros
+       failed_requests, input_tokens, output_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests, currency, cost_micros
   FROM ranked
  WHERE bucket_kind NOT IN ('model', 'error') OR bucket_rank <= 100
  ORDER BY CASE bucket_kind
@@ -551,6 +640,12 @@ grouped AS (
            CAST(COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS BIGINT) AS failed_requests,
            CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
            CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
+           CAST(COALESCE(SUM(cache_known_read_tokens), 0) AS BIGINT) AS cache_known_read_tokens,
+           CAST(COALESCE(SUM(cache_known_input_tokens), 0) AS BIGINT) AS cache_known_input_tokens,
+           CAST(COALESCE(SUM(cache_eligible_requests), 0) AS BIGINT) AS cache_eligible_requests,
+           CAST(COALESCE(SUM(cache_unknown_requests), 0) AS BIGINT) AS cache_unknown_requests,
+           CAST(COALESCE(SUM(cache_reported_read_tokens), 0) AS BIGINT) AS cache_reported_read_tokens,
+           CAST(COALESCE(SUM(cache_reported_requests), 0) AS BIGINT) AS cache_reported_requests,
            currency,
            CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros
       FROM filtered_activity GROUP BY currency
@@ -558,19 +653,19 @@ grouped AS (
     SELECT 'model', model, -1, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
       FROM filtered_activity GROUP BY model, currency
     UNION ALL
     SELECT 'day', '', created_at / 86400000, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
       FROM filtered_activity GROUP BY created_at / 86400000, currency
     UNION ALL
     SELECT 'error', error_code, -1, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
       FROM filtered_activity WHERE error_code <> '' GROUP BY error_code, currency
 ),
 with_bucket_totals AS (
@@ -587,7 +682,7 @@ ranked AS (
       FROM with_bucket_totals
 )
 SELECT bucket_kind, name, day_bucket, requests, successful_requests,
-       failed_requests, input_tokens, output_tokens, currency, cost_micros
+       failed_requests, input_tokens, output_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests, currency, cost_micros
   FROM ranked
  WHERE bucket_kind NOT IN ('model', 'error') OR bucket_rank <= 100
  ORDER BY CASE bucket_kind

@@ -443,6 +443,11 @@ fn canonical_chat_usage(
     usage: CanonicalChatUsage,
     service_tier: Option<String>,
 ) -> Option<TokenUsage> {
+    let cache_coverage = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .and_then(|cached| crate::model::CacheUsageCoverage::new(cached, usage.prompt_tokens));
     let cached = usage
         .prompt_tokens_details
         .as_ref()
@@ -509,10 +514,43 @@ fn canonical_chat_usage(
             cache_write_tokens: cache_write,
             output_tokens: usage.completion_tokens,
             service_tier,
+            cache_coverage,
         })
 }
 
 #[cfg(test)]
 pub(super) fn canonical_chat_chunk_is_accepted(data: &[u8]) -> bool {
     serde_json::from_slice::<CanonicalChatChunk>(data).is_ok()
+}
+
+#[cfg(test)]
+mod cache_coverage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_chat_cache_presence_preserves_financial_counts() {
+        for (details, read) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!({})), None),
+            (Some(json!({"cached_tokens":null})), None),
+            (Some(json!({"cached_tokens":0})), Some(0)),
+            (Some(json!({"cached_tokens":7})), Some(7)),
+        ] {
+            let mut value = json!({"prompt_tokens":7,"completion_tokens":3,"total_tokens":10});
+            if let Some(details) = details {
+                value["prompt_tokens_details"] = details;
+            }
+            let usage = canonical_chat_usage(serde_json::from_value(value).unwrap(), None).unwrap();
+            assert_eq!(usage.input_tokens, 7 - read.unwrap_or(0));
+            assert_eq!(usage.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(usage.output_tokens, 3);
+            assert_eq!(usage.cache_write_tokens, 0);
+            assert_eq!(
+                usage.cache_coverage,
+                read.and_then(|read| crate::model::CacheUsageCoverage::new(read, 7))
+            );
+        }
+    }
 }

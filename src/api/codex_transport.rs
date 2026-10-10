@@ -2278,6 +2278,18 @@ pub(in crate::api) fn canonical_responses_usage(response: &Value) -> Result<Toke
         }
         Some(_) => return Err(()),
     };
+    let cache_coverage = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|_| usage.get("cache_read_observed") != Some(&Value::Bool(false)))
+        .and_then(|cached| {
+            if usage.get("cache_usage_complete") == Some(&Value::Bool(false)) {
+                crate::model::CacheUsageCoverage::read_only(cached)
+            } else {
+                crate::model::CacheUsageCoverage::new(cached, reported_input)
+            }
+        });
     Ok(TokenUsage {
         input_tokens: reported_input
             .checked_sub(cached_input_tokens)
@@ -2287,6 +2299,7 @@ pub(in crate::api) fn canonical_responses_usage(response: &Value) -> Result<Toke
         cache_write_tokens,
         output_tokens,
         service_tier,
+        cache_coverage,
     })
 }
 
@@ -2302,6 +2315,34 @@ pub(super) fn parse_buffered_sse_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_responses_cache_presence_preserves_financial_validation() {
+        for (details, read) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!({"cached_tokens":0})), Some(0)),
+            (Some(json!({"cached_tokens":7})), Some(7)),
+        ] {
+            let mut response =
+                json!({"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}});
+            if let Some(details) = details {
+                response["usage"]["input_tokens_details"] = details;
+            }
+            let usage = canonical_responses_usage(&response).unwrap();
+            assert_eq!(usage.input_tokens, 7 - read.unwrap_or(0));
+            assert_eq!(usage.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(usage.output_tokens, 3);
+            assert_eq!(usage.cache_write_tokens, 0);
+            assert_eq!(
+                usage.cache_coverage,
+                read.and_then(|read| crate::model::CacheUsageCoverage::new(read, 7))
+            );
+        }
+        for details in [json!({}), json!({"cached_tokens":null})] {
+            assert!(canonical_responses_usage(&json!({"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10,"input_tokens_details":details}})).is_err());
+        }
+    }
 
     #[test]
     fn current_codex_cli_identity_passes_through() {
@@ -2965,6 +3006,7 @@ mod tests {
                 cache_write_tokens: 2,
                 output_tokens: 2,
                 service_tier: Some("priority".to_owned()),
+                cache_coverage: crate::model::CacheUsageCoverage::new(3, 10),
             }
         );
         let response: Value = serde_json::from_slice(&parsed.body).unwrap();

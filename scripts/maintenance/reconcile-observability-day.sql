@@ -41,13 +41,13 @@ SELECT true FROM mtc_reconcile_day_bounds b
 INSERT INTO request_stats_facts (
   request_id, tenant_id, key_id, created_at, model, protocol, status_class,
   error_code, upstream_account_id, model_route_id, duration_ms,
-  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens,
   generation_units, billing_unit, service_tier, currency, cost_micros, session_id
 )
 SELECT t.request_id, t.tenant_id, t.key_id, t.created_at, t.model, t.protocol,
        CASE WHEN t.status_code BETWEEN 200 AND 399 AND t.error_code = '' THEN 'success' ELSE 'failure' END,
        t.error_code, t.upstream_account_id, t.model_route_id, t.duration_ms,
-       t.input_tokens, t.output_tokens, t.cached_input_tokens, t.cache_write_tokens,
+       t.input_tokens, t.output_tokens, t.cached_input_tokens, t.cache_write_tokens, t.cache_known_read_tokens, t.cache_known_input_tokens,
        t.generation_units, t.billing_unit, t.service_tier, t.currency,
        COALESCE((SELECT c.corrected_fact_cost_micros FROM request_cost_projection_corrections c
                   WHERE c.request_id = t.request_id ORDER BY c.applied_at DESC, c.correction_version DESC LIMIT 1),
@@ -62,14 +62,14 @@ ON CONFLICT (request_id) DO NOTHING;
 INSERT INTO request_stats_facts (
   request_id, tenant_id, key_id, created_at, model, protocol, status_class,
   error_code, upstream_account_id, model_route_id, duration_ms,
-  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens,
   service_tier, currency, cost_micros
 )
 SELECT r.id, r.tenant_id, r.key_id, r.created_at, r.model, r.protocol,
        CASE WHEN r.status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END,
        COALESCE(r.error_code, ''), COALESCE(r.upstream_account_id, ''),
        COALESCE(r.model_route_id, ''), COALESCE(r.duration_ms, 0),
-       r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens,
+       r.input_tokens, r.output_tokens, r.cached_input_tokens, r.cache_write_tokens, r.cache_known_read_tokens, r.cache_known_input_tokens,
        r.service_tier, COALESCE(NULLIF(r.currency, ''), k.currency), r.cost_micros
   FROM request_records r
   JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
@@ -92,6 +92,8 @@ ON CONFLICT (request_id) DO UPDATE SET
   output_tokens = excluded.output_tokens,
   cached_input_tokens = excluded.cached_input_tokens,
   cache_write_tokens = excluded.cache_write_tokens,
+  cache_known_read_tokens = excluded.cache_known_read_tokens,
+  cache_known_input_tokens = excluded.cache_known_input_tokens,
   service_tier = excluded.service_tier,
   currency = excluded.currency,
   cost_micros = excluded.cost_micros;
@@ -119,14 +121,17 @@ DELETE FROM request_daily_aggregates a
 INSERT INTO request_daily_aggregates (
   tenant_id, key_id, day_bucket, model, protocol, status_class, error_code,
   upstream_account_id, model_route_id, service_tier, currency, requests,
-  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+  input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests,
   duration_count, duration_sum_ms, cost_micros
 )
 SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.protocol,
        f.status_class, f.error_code, f.upstream_account_id, f.model_route_id,
        f.service_tier, f.currency, COUNT(*), COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END), 0),
        COALESCE(SUM(CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END), 0), COALESCE(SUM(f.cached_input_tokens), 0),
-       COALESCE(SUM(f.cache_write_tokens), 0), COUNT(*),
+       COALESCE(SUM(f.cache_write_tokens), 0),
+       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_read_tokens ELSE 0 END), SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN f.cache_known_input_tokens ELSE 0 END),
+       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END),
+       SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL AND f.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), COALESCE(SUM(f.cache_known_read_tokens), 0), SUM(CASE WHEN f.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END), COUNT(*),
        COALESCE(SUM(f.duration_ms), 0), COALESCE(SUM(f.cost_micros), 0)
   FROM request_stats_facts f
   CROSS JOIN mtc_reconcile_day_bounds b

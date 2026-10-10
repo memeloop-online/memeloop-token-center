@@ -22,6 +22,11 @@ use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+#[cfg(test)]
+pub(crate) fn parse_cache_usage_contract(value: &Value) -> crate::model::TokenUsage {
+    proxy::parse_cache_usage_contract(value)
+}
 use tokio_stream::wrappers::ReceiverStream;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
