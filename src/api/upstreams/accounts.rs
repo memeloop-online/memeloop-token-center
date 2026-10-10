@@ -482,6 +482,7 @@ pub(in crate::api) async fn get_upstream_notes(
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct UpdateUpstreamNotesRequest {
     tenant_external_id: String,
+    #[serde(default, deserialize_with = "deserialize_supplied_config")]
     notes: Option<Value>,
     expected_updated_at: i64,
 }
@@ -1031,6 +1032,41 @@ mod tests {
             let mut edit = rename.clone();
             edit.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<UpdateUpstreamRequest>(edit).is_err());
+        }
+    }
+
+    #[test]
+    fn upstream_notes_request_distinguishes_missing_notes_from_explicit_null() {
+        let base = json!({
+            "tenant_external_id": "notes-tenant",
+            "expected_updated_at": 42
+        });
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(request.notes.is_none());
+
+        let mut clear = base.clone();
+        clear["notes"] = Value::Null;
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(clear).unwrap();
+        assert_eq!(request.notes, Some(Value::Null));
+
+        let mut save = base.clone();
+        save["notes"] = json!("**markdown**");
+        let request: UpdateUpstreamNotesRequest = serde_json::from_value(save).unwrap();
+        assert_eq!(request.notes, Some(json!("**markdown**")));
+
+        for invalid in [json!(7), json!(true), json!({}), json!([])] {
+            let mut edit = base.clone();
+            edit["notes"] = invalid.clone();
+            let request: UpdateUpstreamNotesRequest = serde_json::from_value(edit).unwrap();
+            assert_eq!(request.notes, Some(invalid));
+        }
+        let mut unknown = base.clone();
+        unknown["unexpected"] = Value::Null;
+        assert!(serde_json::from_value::<UpdateUpstreamNotesRequest>(unknown).is_err());
+        for field in ["tenant_external_id", "expected_updated_at"] {
+            let mut edit = base.clone();
+            edit.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<UpdateUpstreamNotesRequest>(edit).is_err());
         }
     }
 
