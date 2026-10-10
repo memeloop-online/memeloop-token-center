@@ -32,6 +32,9 @@ mod multiplex;
 #[path = "http2_upload_tests/tls_fixture.rs"]
 mod tls_fixture;
 
+#[path = "http2_upload_tests/native_encoded.rs"]
+pub(crate) mod native_encoded;
+
 struct Frame {
     from_client: bool,
     kind: u8,
