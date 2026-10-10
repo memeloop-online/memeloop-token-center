@@ -2317,6 +2317,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_responses_cache_presence_preserves_financial_validation() {
+        for (details, read) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!({"cached_tokens":0})), Some(0)),
+            (Some(json!({"cached_tokens":7})), Some(7)),
+        ] {
+            let mut response =
+                json!({"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}});
+            if let Some(details) = details {
+                response["usage"]["input_tokens_details"] = details;
+            }
+            let usage = canonical_responses_usage(&response).unwrap();
+            assert_eq!(usage.input_tokens, 7 - read.unwrap_or(0));
+            assert_eq!(usage.cached_input_tokens, read.unwrap_or(0));
+            assert_eq!(usage.output_tokens, 3);
+            assert_eq!(usage.cache_write_tokens, 0);
+            assert_eq!(
+                usage.cache_coverage,
+                read.and_then(|read| crate::model::CacheUsageCoverage::new(read, 7))
+            );
+        }
+        for details in [json!({}), json!({"cached_tokens":null})] {
+            assert!(canonical_responses_usage(&json!({"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10,"input_tokens_details":details}})).is_err());
+        }
+    }
+
+    #[test]
     fn current_codex_cli_identity_passes_through() {
         for (originator, user_agent) in [
             (

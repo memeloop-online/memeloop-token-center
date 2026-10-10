@@ -206,6 +206,33 @@ async fn coverage_contract(database: &Database) {
                         database.finish_proxy_request(input).await.unwrap(),
                         FinishProxyRequestResult::AlreadyFinished { .. }
                     ));
+                    if metered {
+                        let owner = Uuid::now_v7();
+                        let tasks = database
+                            .claim_metered_usage_projection_tasks(owner, 32)
+                            .await
+                            .unwrap();
+                        assert_eq!(tasks.len(), 1);
+                        assert_eq!(tasks[0].reservation_id, reservation.id);
+                        assert!(
+                            database
+                                .project_claimed_metered_usage_projection_task(
+                                    owner,
+                                    reservation.id
+                                )
+                                .await
+                                .unwrap()
+                        );
+                        assert!(
+                            !database
+                                .project_claimed_metered_usage_projection_task(
+                                    owner,
+                                    reservation.id
+                                )
+                                .await
+                                .unwrap()
+                        );
+                    }
                 }
                 let row = sqlx::query("SELECT created_at, input_tokens, cached_input_tokens, cost_micros, cache_known_read_tokens, cache_known_input_tokens FROM request_stats_facts WHERE request_id = $1")
                     .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
