@@ -4,6 +4,97 @@ use bytes::Bytes;
 use super::*;
 
 #[tokio::test]
+async fn native_request_991089_tls_encoded_contract() {
+    const LENGTH: usize = 991_089;
+    let mut value = serde_json::json!({
+        "model": "synthetic-model", "input": "", "store": false,
+        "prompt_cache_key": "synthetic-session"
+    });
+    let fixed = serde_json::to_vec(&value).unwrap().len();
+    value["input"] = serde_json::Value::String("x".repeat(LENGTH - fixed));
+    let payload = Bytes::from(serde_json::to_vec(&value).unwrap());
+    assert_eq!(payload.len(), LENGTH);
+    let credential = UpstreamCredential::OAuth {
+        access_token: "synthetic-access".into(),
+        refresh_token: None,
+        expires_at: Some(i64::MAX),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: Some(
+            serde_json::json!({"schema": "openai-codex-oauth-v1", "account_id": "synthetic-account"}),
+        ),
+        proxy_url: None,
+        proxy_network_scope: None,
+    };
+    let mut downstream = HeaderMap::new();
+    for (name, value) in [
+        ("version", "synthetic-version"),
+        ("x-codex-beta-features", "synthetic-beta"),
+        ("x-codex-turn-metadata", "{\"synthetic\":true}"),
+        ("x-client-request-id", "synthetic-request"),
+        ("x-codex-window-id", "synthetic-window"),
+        ("thread-id", "synthetic-thread"),
+        ("originator", "codex_cli_rs"),
+        ("user-agent", "codex_cli_rs/0.0.0 synthetic"),
+    ] {
+        downstream.insert(name, HeaderValue::from_static(value));
+    }
+    let consumption = BodyConsumption::default();
+    let observed = consumption.clone();
+    let sent = payload.clone();
+    let mut evidence =
+        crate::http2_upload_tests::native_encoded::verify(payload, move |client, url, proxy| {
+            let builder = codex_transport::apply_wreq_wire_headers(
+                client.post(url).proxy(proxy).body(sent),
+                &downstream,
+                &credential,
+                "synthetic-session",
+                0,
+            )
+            .unwrap();
+            let (_, built) = builder.build_split();
+            let mut request = built.unwrap();
+            for (name, value) in &downstream {
+                assert!(
+                    request.headers().get(name) == Some(value),
+                    "native adapter omitted or changed a synthetic input header"
+                );
+            }
+            for (name, value) in [
+                ("authorization", "Bearer synthetic-access"),
+                ("accept", "text/event-stream"),
+                ("accept-encoding", "identity"),
+                ("content-type", "application/json"),
+                ("session-id", "synthetic-session"),
+                ("chatgpt-account-id", "synthetic-account"),
+            ] {
+                assert!(
+                    request
+                        .headers()
+                        .get(name)
+                        .is_some_and(|actual| actual == value),
+                    "native adapter omitted or changed a synthetic wire header"
+                );
+            }
+            assert_eq!(request.headers().len(), 14);
+            assert!(!request.headers().contains_key(header::CONTENT_LENGTH));
+            assert_eq!(
+                request.body().unwrap().size_hint().exact(),
+                Some(LENGTH as u64)
+            );
+            observed.attach(&mut request);
+            request
+        })
+        .await;
+    assert_eq!(consumption.bytes(), LENGTH as u64);
+    assert!(consumption.polls() > 0);
+    evidence["body_polled_bytes"] = serde_json::json!(consumption.bytes());
+    evidence["body_polls"] = serde_json::json!(consumption.polls());
+    evidence["body_polling_is_wire_ack"] = serde_json::json!(false);
+    crate::http2_upload_tests::native_encoded::emit(evidence);
+}
+
+#[tokio::test]
 async fn body_observation_preserves_frames_length_and_end_stream_without_claiming_delivery() {
     for payload in [Bytes::new(), Bytes::from_static(b"synthetic-body")] {
         let consumption = BodyConsumption::default();

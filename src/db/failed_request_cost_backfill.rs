@@ -1299,25 +1299,41 @@ mod tests {
 
     async fn exact_manifest_for(fixture: &Fixture) -> FailedRequestCostBackfillExactManifest {
         let mut requests = Vec::new();
-        for _ in 0..6 {
+        for (index, (status, error)) in [
+            (499, Some("client_cancelled")),
+            (499, Some("client_cancelled")),
+            (502, Some("upstream_error")),
+            (504, Some("upstream_timeout")),
+            (502, None),
+            (504, Some("")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (request_id, expected_cost_micros) = seed_historical_case(
                 fixture,
-                499,
-                Some("client_cancelled"),
+                status,
+                error,
                 Some(RequestUsageBasis::ContractCeiling),
             )
             .await;
-            let created_at =
+            let created_at: i64 =
                 sqlx::query_scalar("SELECT created_at FROM request_records WHERE id = $1")
                     .bind(request_id.to_string())
                     .fetch_one(&fixture.database.pool)
                     .await
                     .unwrap();
-            requests.push(FailedRequestCostBackfillExpectedRequest {
-                request_id: request_id.to_string(),
-                created_at,
-                expected_cost_micros,
+            let mut row = serde_json::json!({
+                "request_id": request_id.to_string(),
+                "created_at": created_at,
+                "expected_cost_micros": expected_cost_micros,
             });
+            // The first row exercises the original three-field manifest through DB replay.
+            if index != 0 {
+                row["expected_status_code"] = serde_json::json!(status);
+                row["expected_error_code"] = serde_json::json!(error);
+            }
+            requests.push(serde_json::from_value(row).unwrap());
         }
         FailedRequestCostBackfillExactManifest {
             tenant_id: fixture.key.tenant_id.to_string(),
@@ -1326,18 +1342,56 @@ mod tests {
         }
     }
 
-    async fn financial_rows(fixture: &Fixture) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
-        let ledger = sqlx::query_as(
-            "SELECT id, amount_micros FROM ledger_entries WHERE account_id = $1 ORDER BY id",
-        )
-        .bind(fixture.account_id.to_string())
-        .fetch_all(&fixture.database.pool)
-        .await
-        .unwrap();
-        let feed = sqlx::query_as(
-            "SELECT settlement_id, cost_micros FROM account_settlement_feed WHERE key_id = $1 ORDER BY settlement_id",
-        ).bind(fixture.key.key_id.to_string()).fetch_all(&fixture.database.pool).await.unwrap();
-        (ledger, feed)
+    // Capture every original field, including price snapshots, tokens and terminal evidence.
+    async fn financial_rows(fixture: &Fixture) -> Vec<Vec<Vec<Option<String>>>> {
+        let mut snapshot = Vec::new();
+        for (table, scope, value) in [
+            ("request_records", "key_id", fixture.key.key_id.to_string()),
+            (
+                "usage_reservations",
+                "key_id",
+                fixture.key.key_id.to_string(),
+            ),
+            (
+                "ledger_entries",
+                "account_id",
+                fixture.account_id.to_string(),
+            ),
+            (
+                "account_settlement_feed",
+                "key_id",
+                fixture.key.key_id.to_string(),
+            ),
+            ("credit_accounts", "id", fixture.account_id.to_string()),
+        ] {
+            let columns: Vec<String> = sqlx::query_scalar(match fixture.database.backend {
+                DatabaseBackend::Sqlite => "SELECT name FROM pragma_table_info($1) ORDER BY cid",
+                DatabaseBackend::PostgreSql => "SELECT column_name::text FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position",
+            }).bind(table).fetch_all(&fixture.database.pool).await.unwrap();
+            assert!(!columns.is_empty());
+            let selection = columns
+                .iter()
+                .map(|column| format!("CAST(\"{}\" AS TEXT)", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement =
+                format!("SELECT {selection} FROM {table} WHERE {scope} = $1 ORDER BY 1");
+            let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(value)
+                .fetch_all(&fixture.database.pool)
+                .await
+                .unwrap();
+            snapshot.push(
+                rows.into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index).unwrap())
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        snapshot
     }
 
     async fn exercise_exact_manifest(fixture: &Fixture) {
@@ -1374,6 +1428,10 @@ mod tests {
         invalid.requests[5].request_id = Uuid::now_v7().to_string();
         let mut wrong_cost = manifest.clone();
         wrong_cost.requests[5].expected_cost_micros += 1;
+        let mut wrong_status = manifest.clone();
+        wrong_status.requests[5].expected_status_code = 502;
+        let mut wrong_error = manifest.clone();
+        wrong_error.requests[5].expected_error_code = Some("wrong_error".into());
         let mut wrong_time = manifest.clone();
         wrong_time.requests[5].created_at += 1;
         let mut wrong_tenant = manifest.clone();
@@ -1385,6 +1443,8 @@ mod tests {
         for invalid in [
             invalid,
             wrong_cost,
+            wrong_status,
+            wrong_error,
             wrong_time,
             wrong_tenant,
             duplicate,
@@ -1408,24 +1468,84 @@ mod tests {
             }
         }
         let drift_id = &manifest.requests[5].request_id;
-        sqlx::query("UPDATE request_records SET usage_basis = 'provider_reported' WHERE id = $1")
-            .bind(drift_id)
-            .execute(&fixture.database.pool)
-            .await
-            .unwrap();
-        assert!(
-            fixture
-                .database
-                .backfill_failed_request_costs_exact(manifest.clone(), true)
+        // A valid mixed batch must reject every unsupported source or drifting evidence.
+        for (table, field, bad_value, original_value) in [
+            (
+                "request_records",
+                "usage_basis",
+                Some("provider_reported"),
+                Some("contract_ceiling"),
+            ),
+            (
+                "request_records",
+                "usage_basis",
+                Some("provider_estimated"),
+                Some("contract_ceiling"),
+            ),
+            (
+                "request_records",
+                "usage_basis",
+                Some("not_observed"),
+                Some("contract_ceiling"),
+            ),
+            (
+                "request_records",
+                "usage_basis",
+                None,
+                Some("contract_ceiling"),
+            ),
+            ("request_records", "status_code", Some("502"), Some("504")),
+            ("request_records", "error_code", Some("drift"), Some("")),
+            ("request_stats_facts", "error_code", Some("drift"), Some("")),
+            (
+                "request_stats_facts",
+                "tenant_id",
+                Some("00000000-0000-4000-8000-000000000099"),
+                Some(manifest.tenant_id.as_str()),
+            ),
+            ("request_stats_facts", "currency", Some("EUR"), Some("USD")),
+        ] {
+            let id_field = if table == "request_records" {
+                "id"
+            } else {
+                "request_id"
+            };
+            // Numeric status must use a numeric bind on PostgreSQL.
+            let statement = format!(
+                "UPDATE {table} SET {field} = {} WHERE {id_field} = $2",
+                if field == "status_code" {
+                    "CAST($1 AS BIGINT)"
+                } else {
+                    "$1"
+                }
+            );
+            sqlx::query(sqlx::AssertSqlSafe(statement.clone()))
+                .bind(bad_value)
+                .bind(drift_id)
+                .execute(&fixture.database.pool)
                 .await
-                .is_err()
-        );
-        sqlx::query("UPDATE request_records SET usage_basis = 'contract_ceiling' WHERE id = $1")
-            .bind(drift_id)
-            .execute(&fixture.database.pool)
-            .await
-            .unwrap();
-        assert_eq!(aggregate_costs(fixture).await, aggregates_before);
+                .unwrap();
+            for apply in [false, true] {
+                assert!(
+                    fixture
+                        .database
+                        .backfill_failed_request_costs_exact(manifest.clone(), apply)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(aggregate_costs(fixture).await, aggregates_before);
+                let markers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_cost_projection_corrections WHERE request_id = $1")
+                    .bind(&manifest.requests[0].request_id).fetch_one(&fixture.database.pool).await.unwrap();
+                assert_eq!(markers, 0);
+            }
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(original_value)
+                .bind(drift_id)
+                .execute(&fixture.database.pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(financial_rows(fixture).await, financial_before);
 
         if matches!(fixture.database.backend, DatabaseBackend::PostgreSql) {
             let (first, second) = tokio::join!(
@@ -1470,6 +1590,43 @@ mod tests {
             assert_eq!(immutable_snapshot(fixture).await, immutable_before);
             assert_eq!(financial_rows(fixture).await, financial_before);
             assert_eq!(aggregate_costs(fixture).await, aggregates_after);
+        }
+        // Replay uses the same status/error binding and refuses changed marker evidence.
+        for (field, bad_value, original_value) in [
+            ("observed_status_code", "502", "504"),
+            ("observed_error_code", "drift", ""),
+        ] {
+            let statement = format!(
+                "UPDATE request_cost_projection_corrections SET {field} = {} WHERE request_id = $2",
+                if field == "observed_status_code" {
+                    "CAST($1 AS BIGINT)"
+                } else {
+                    "$1"
+                }
+            );
+            sqlx::query(sqlx::AssertSqlSafe(statement.clone()))
+                .bind(bad_value)
+                .bind(drift_id)
+                .execute(&fixture.database.pool)
+                .await
+                .unwrap();
+            for apply in [false, true] {
+                assert!(
+                    fixture
+                        .database
+                        .backfill_failed_request_costs_exact(manifest.clone(), apply)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(financial_rows(fixture).await, financial_before);
+                assert_eq!(aggregate_costs(fixture).await, aggregates_after);
+            }
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(original_value)
+                .bind(drift_id)
+                .execute(&fixture.database.pool)
+                .await
+                .unwrap();
         }
         let outside_fact: i64 =
             sqlx::query_scalar("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
