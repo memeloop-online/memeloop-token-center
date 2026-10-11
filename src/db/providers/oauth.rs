@@ -632,11 +632,10 @@ impl Database {
             current_status.as_str()
         };
         if input.oauth_driver == crate::oauth::authorization_code::FLOW
-            && (current_driver != crate::provider::antigravity::DRIVER
-                || !crate::oauth::authorization_code::same_reauthorization_identity(
-                    &current_credential,
-                    &input.credential,
-                ))
+            && !crate::oauth::authorization_code::same_reauthorization_identity(
+                &current_credential,
+                &input.credential,
+            )
         {
             return Err(AppError::Conflict(
                 "OAuth reauthorization must retain the proven original account identity".into(),
@@ -1535,6 +1534,98 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/support/http1_request.rs"
         ));
+    }
+
+    #[tokio::test]
+    async fn declared_provider_reauthorization_keeps_identity_and_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("declared-reauth.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"declared reauthorization fixture key";
+        let adapter = json!({
+            "api_version":"oauth-adapter-v1","flow_kind":"authorization_code_pkce",
+            "login_url":"https://provider.example/authorize","poll_url":"https://provider.example/token","refresh_url":"https://provider.example/token",
+            "authorization_code":{"token_encoding":"json","include_state":true},
+            "identity":{"url":"https://provider.example/profile","id_pointer":"/account/id"}
+        });
+        let credential = UpstreamCredential::OAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: Some("fixture-refresh".into()),
+            expires_at: Some(unix_millis() + 3_600_000),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            proxy_url: None,
+            proxy_network_scope: None,
+            adapter_state: Some(json!({"authorization_code":{
+                "adapter":adapter,"client_id":"fixture-client","client_secret":null,"refresh_url":"https://provider.example/token","network_scope":"public",
+                "login_client":{"client_id":"fixture-client","client_secret":null,"redirect_uri":"https://provider.example/callback","scopes":["profile"]},
+                "provider_identity":{"url":"https://provider.example/profile","id":"fixture-account"}
+            }})),
+        };
+        let account = db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "declared-reauth".into(),
+                    name: "Declared provider".into(),
+                    driver: "fixture-declared-provider".into(),
+                    config: json!({"base_url":"https://provider.example","network_scope":"public"}),
+                    credential: credential.clone(),
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some(crate::oauth::authorization_code::FLOW.into()),
+                    oauth_refresh_url: Some("https://provider.example/token".into()),
+                },
+                key,
+            )
+            .await
+            .unwrap();
+        let replacement = || ReauthorizeUpstreamAccountInput {
+            tenant_external_id: "declared-reauth".into(),
+            expected_updated_at: account.updated_at,
+            expected_credential_generation: account.credential_generation,
+            driver: "fixture-declared-provider".into(),
+            oauth_session_id: Uuid::now_v7(),
+            oauth_driver: crate::oauth::authorization_code::FLOW.into(),
+            oauth_refresh_url: Some("https://provider.example/token".into()),
+            provider_config: None,
+            credential: credential.clone(),
+        };
+        for pointer in [
+            "/authorization_code/provider_identity/id",
+            "/authorization_code/adapter/authorization_code/token_encoding",
+        ] {
+            let mut invalid = replacement();
+            if let UpstreamCredential::OAuth {
+                adapter_state: Some(state),
+                ..
+            } = &mut invalid.credential
+            {
+                *state.pointer_mut(pointer).unwrap() = json!(if pointer.ends_with("/id") {
+                    "other-account"
+                } else {
+                    "form"
+                });
+            }
+            assert!(matches!(
+                db.reauthorize_upstream_account(account.id, invalid, key)
+                    .await,
+                Err(AppError::Conflict(_))
+            ));
+        }
+        let changed = db
+            .reauthorize_upstream_account(account.id, replacement(), key)
+            .await
+            .unwrap();
+        assert_eq!(changed.id, account.id);
+        assert_eq!(
+            changed.credential_generation,
+            account.credential_generation + 1
+        );
+        assert!(changed.can_reauthorize);
     }
 
     #[tokio::test]

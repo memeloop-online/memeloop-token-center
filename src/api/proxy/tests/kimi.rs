@@ -712,6 +712,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
     fake_provider.component_adapter = None;
     fake_provider.generation_adapter = None;
     fake_provider.request_compatibility = crate::provider::RequestCompatibility {
+        anthropic_messages_headers: Default::default(),
         third_party: true,
         responses_via_chat_v1: true,
         responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::OpenAiChatV1),

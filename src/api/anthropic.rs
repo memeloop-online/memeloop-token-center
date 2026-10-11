@@ -53,6 +53,37 @@ pub(super) fn apply_request_headers(
     request
 }
 
+pub(super) fn apply_declared_request_headers(
+    request: RequestBuilder,
+    inbound: &HeaderMap,
+    fixed: &crate::provider::FixedProtocolHeaders,
+    requires_oauth_capability: bool,
+) -> Result<RequestBuilder, crate::error::AppError> {
+    fixed.validate()?;
+    let mut combined = inbound.clone();
+    for capability in &fixed.anthropic_beta {
+        combined.append(
+            "anthropic-beta",
+            HeaderValue::from_str(capability).map_err(|_| {
+                crate::error::AppError::BadRequest("invalid fixed protocol headers".into())
+            })?,
+        );
+    }
+    if let Some(version) = &fixed.anthropic_version {
+        combined.insert(
+            "anthropic-version",
+            HeaderValue::from_str(version).map_err(|_| {
+                crate::error::AppError::BadRequest("invalid fixed protocol headers".into())
+            })?,
+        );
+    }
+    Ok(apply_request_headers(
+        request,
+        &combined,
+        requires_oauth_capability,
+    ))
+}
+
 /// Select the Messages response headers that Claude Code consumes for retry
 /// decisions and plan-limit display.  They are copied to both buffered and
 /// streamed downstream responses.
@@ -104,6 +135,60 @@ fn combined_beta(inbound: &HeaderMap, requires_oauth_capability: bool) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_headers_merge_features_without_overriding_credentials() {
+        let fixed = crate::provider::FixedProtocolHeaders {
+            anthropic_version: Some("2023-06-01".into()),
+            anthropic_beta: vec!["subscription-v1".into(), "subscription-v1".into()],
+        };
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer downstream-secret"),
+        );
+        inbound.insert(
+            "anthropic-version",
+            HeaderValue::from_static("spoofed-version"),
+        );
+        inbound.insert("anthropic-beta", HeaderValue::from_static("tools-v1"));
+        let request = apply_declared_request_headers(
+            reqwest::Client::new()
+                .post("https://provider.example/messages")
+                .bearer_auth("host-credential"),
+            &inbound,
+            &fixed,
+            false,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["authorization"], "Bearer host-credential");
+        assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+        assert_eq!(
+            request.headers()["anthropic-beta"],
+            "tools-v1,subscription-v1"
+        );
+        assert_eq!(
+            request.headers().get_all("anthropic-beta").iter().count(),
+            1
+        );
+        let malicious = serde_json::json!({"authorization":"Bearer injected"});
+        assert!(
+            serde_json::from_value::<crate::provider::FixedProtocolHeaders>(malicious).is_err()
+        );
+        for value in [
+            "feature\r\nauthorization: injected",
+            "${access_token}",
+            "feature,other",
+        ] {
+            let invalid = crate::provider::FixedProtocolHeaders {
+                anthropic_version: None,
+                anthropic_beta: vec![value.into()],
+            };
+            assert!(invalid.validate().is_err());
+        }
+    }
 
     #[test]
     fn selects_open_set_anthropic_and_claude_code_headers() {

@@ -129,11 +129,23 @@ pub(super) async fn send_reqwest_proxy_route(
             .header("Editor-Plugin-Version", &product);
     }
     if protocol.is_anthropic() || route.responses_anthropic.is_some() {
-        request = crate::api::anthropic::apply_request_headers(
+        let declared = state
+            .providers
+            .get(&route.route.driver)
+            .map(|provider| {
+                provider
+                    .request_compatibility
+                    .anthropic_messages_headers
+                    .clone()
+            })
+            .unwrap_or_default();
+        request = crate::api::anthropic::apply_declared_request_headers(
             request,
             headers,
+            &declared,
             route.route.driver == crate::oauth::claude::PROVIDER_DRIVER,
-        );
+        )
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();

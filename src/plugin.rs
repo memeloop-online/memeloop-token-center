@@ -2837,6 +2837,26 @@ fn validate_provider_contribution(
         )));
     }
     crate::schema::validate_definition(&provider.config_schema)?;
+    provider
+        .request_compatibility
+        .anthropic_messages_headers
+        .validate()?;
+    if !provider
+        .request_compatibility
+        .anthropic_messages_headers
+        .is_empty()
+        && !provider
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "anthropic")
+        && !provider
+            .request_compatibility
+            .responses_via_anthropic_messages_v1
+    {
+        return Err(AppError::BadRequest(
+            "Messages headers require a Messages transport".into(),
+        ));
+    }
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [
         serde_json::json!({"type": "none"}),
@@ -2857,6 +2877,7 @@ fn validate_provider_contribution(
         )));
     }
     if let Some(adapter) = &provider.oauth_adapter {
+        crate::oauth::authorization_code::validate_contribution(adapter)?;
         if adapter.api_version != "oauth-adapter-v1"
             || !matches!(
                 adapter.flow_kind,
@@ -3683,6 +3704,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("forbidden header"), "{error}");
+    }
+
+    #[test]
+    fn signed_oauth_extensions_reject_credentials_and_header_smuggling() {
+        let candidate = serde_json::json!({
+            "id":"fixture-oauth","version":"1.0.0","wit_version":"0.2.0","wasm":null,
+            "contributions":{"providers":[{
+                "id":"fixture-provider","display_name":"Fixture provider","protocols":["anthropic"],"modalities":["text"],
+                "config_schema":{"type":"object"},"credential_schema":{"type":"object"},
+                "oauth_adapter":{
+                    "api_version":"oauth-adapter-v1","flow_kind":"authorization_code_pkce",
+                    "login_url":"https://provider.example/authorize","poll_url":"https://provider.example/token","refresh_url":"https://provider.example/token",
+                    "authorization_code":{"token_encoding":"json","include_state":true,"client_default":{"client_id":"public-client","redirect_uri":"https://provider.example/callback","scopes":["profile"]}},
+                    "identity":{"url":"https://provider.example/profile","id_pointer":"/account/id","headers":{"anthropic_beta":["subscription-v1"]}}
+                },
+                "request_compatibility":{"anthropic_messages_headers":{"anthropic_version":"2023-06-01","anthropic_beta":["subscription-v1"]}}
+            }]}
+        });
+        let manifest: PluginManifest = serde_json::from_value(candidate.clone()).unwrap();
+        validate_manifest(&manifest).unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json")).unwrap();
+        crate::schema::validate_instance(&schema, &candidate).unwrap();
+        for (pointer, value) in [
+            (
+                "/contributions/providers/0/oauth_adapter/authorization_code/client_default",
+                serde_json::json!({"client_id":"public-client","redirect_uri":"https://provider.example/callback","scopes":["profile"],"client_secret":"injected"}),
+            ),
+            (
+                "/contributions/providers/0/oauth_adapter/identity/headers",
+                serde_json::json!({"authorization":"Bearer injected"}),
+            ),
+            (
+                "/contributions/providers/0/request_compatibility/anthropic_messages_headers",
+                serde_json::json!({"cookie":"injected"}),
+            ),
+        ] {
+            let mut invalid = candidate.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(serde_json::from_value::<PluginManifest>(invalid.clone()).is_err());
+            assert!(crate::schema::validate_instance(&schema, &invalid).is_err());
+        }
+        let mut invalid = manifest.clone();
+        invalid.contributions.providers[0]
+            .oauth_adapter
+            .as_mut()
+            .unwrap()
+            .flow_kind = crate::provider::OAuthFlowKind::CursorPkce;
+        assert!(validate_manifest(&invalid).is_err());
+        let mut invalid = manifest.clone();
+        invalid.contributions.providers[0]
+            .request_compatibility
+            .anthropic_messages_headers
+            .anthropic_beta = vec!["feature\r\nAuthorization: injected".into()];
+        assert!(validate_manifest(&invalid).is_err());
+        let mut invalid = manifest;
+        invalid.contributions.providers[0].protocols = vec!["openai".into()];
+        assert!(validate_manifest(&invalid).is_err());
     }
 
     #[test]

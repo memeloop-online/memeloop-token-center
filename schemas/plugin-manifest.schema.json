@@ -5,6 +5,19 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "version", "wit_version"],
+  "$defs": {
+    "fixedProtocolHeaders": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "anthropic_version": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+        "anthropic_beta": {
+          "type": "array", "maxItems": 16,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" }
+        }
+      }
+    }
+  },
   "properties": {
     "id": {
       "type": "string",
@@ -178,6 +191,23 @@
                   "required": ["api_version", "flow_kind", "login_url", "poll_url", "refresh_url"],
                   "properties": {
                     "api_version": { "const": "oauth-adapter-v1" },
+                    "authorization_code": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "token_encoding": { "enum": ["form", "json"], "default": "form" },
+                        "include_state": { "type": "boolean", "default": false },
+                        "client_default": {
+                          "type": "object", "additionalProperties": false,
+                          "required": ["client_id", "redirect_uri", "scopes"],
+                          "properties": {
+                            "client_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                            "redirect_uri": { "type": "string", "format": "uri" },
+                            "scopes": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string", "minLength": 1, "maxLength": 512 } }
+                          }
+                        }
+                      }
+                    },
                     "response_mode": {
                       "enum": ["fragment_manual"],
                       "description": "Absent means the standard query-parameter callback. fragment_manual declares that the provider page displays code#state for manual paste."
@@ -188,6 +218,7 @@
                       "required": ["url", "id_pointer"],
                       "properties": {
                         "url": { "type": "string", "format": "uri" },
+                        "headers": { "$ref": "#/$defs/fixedProtocolHeaders" },
                         "id_pointer": { "type": "string", "minLength": 2, "maxLength": 256 }
                       },
                       "description": "Declared account-identity read used for same-account reauthorization. The URL is reviewed at plugin install time and never accepted from runtime payloads."
@@ -218,6 +249,7 @@
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                  "anthropic_messages_headers": { "$ref": "#/$defs/fixedProtocolHeaders" },
                   "third_party": {
                     "type": "boolean",
                     "default": false,

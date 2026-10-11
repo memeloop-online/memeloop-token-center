@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::error::AppError;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthAdapterContribution {
     /// Versioned host/adapter contract. Keeping this explicit lets future
@@ -22,6 +22,86 @@ pub struct OAuthAdapterContribution {
     /// Optional account-identity binding used for same-account reauthorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<OAuthIdentityContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_code: Option<AuthorizationCodeContribution>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthTokenEncoding {
+    #[default]
+    Form,
+    Json,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationCodeContribution {
+    #[serde(default)]
+    pub token_encoding: OAuthTokenEncoding,
+    #[serde(default)]
+    pub include_state: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_default: Option<OAuthPublicClient>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthPublicClient {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FixedProtocolHeaders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anthropic_beta: Vec<String>,
+}
+
+impl FixedProtocolHeaders {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.anthropic_version.is_none() && self.anthropic_beta.is_empty()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), AppError> {
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.' || byte == b'_'
+                })
+        };
+        if self
+            .anthropic_version
+            .as_deref()
+            .is_some_and(|value| !valid(value))
+            || self.anthropic_beta.len() > 16
+            || self.anthropic_beta.iter().any(|value| !valid(value))
+        {
+            return Err(AppError::BadRequest(
+                "invalid fixed protocol headers".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, AppError> {
+        self.validate()?;
+        if let Some(version) = &self.anthropic_version {
+            request = request.header("anthropic-version", version);
+        }
+        if !self.anthropic_beta.is_empty() {
+            request = request.header("anthropic-beta", self.anthropic_beta.join(","));
+        }
+        Ok(request)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -43,6 +123,8 @@ pub struct OAuthIdentityContribution {
     pub url: String,
     /// RFC 6901 JSON pointer to the stable account id string.
     pub id_pointer: String,
+    #[serde(default, skip_serializing_if = "FixedProtocolHeaders::is_empty")]
+    pub headers: FixedProtocolHeaders,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +287,8 @@ pub const ONE_API_PROVIDER_ALIAS: &str = "one-api";
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestCompatibility {
+    #[serde(default, skip_serializing_if = "FixedProtocolHeaders::is_empty")]
+    pub anthropic_messages_headers: FixedProtocolHeaders,
     #[serde(default)]
     pub third_party: bool,
     /// The provider translates OpenAI Responses requests through the host's
@@ -232,7 +316,8 @@ pub struct RequestCompatibility {
 
 impl RequestCompatibility {
     pub(crate) fn is_default(&self) -> bool {
-        !self.third_party
+        self.anthropic_messages_headers.is_empty()
+            && !self.third_party
             && !self.responses_via_chat_v1
             && self.responses_via_chat_dialect.is_none()
             && !self.responses_transport_configurable
@@ -496,6 +581,7 @@ impl ProviderCatalog {
                 provider_asset_reads_repeatable: false,
             }),
             request_compatibility: RequestCompatibility {
+                anthropic_messages_headers: Default::default(),
                 third_party: true,
                 responses_via_chat_v1: true,
                 responses_via_chat_dialect: Some(ResponsesViaChatDialect::OpenAiChatV1),
@@ -734,6 +820,7 @@ impl ProviderCatalog {
             refresh_url: crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned(),
             response_mode: None,
             identity: None,
+            authorization_code: None,
         });
         let mut claude = builtin_interactive_oauth_provider(
             "anthropic-claude",
@@ -820,8 +907,10 @@ impl ProviderCatalog {
             refresh_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
             response_mode: None,
             identity: None,
+            authorization_code: None,
         });
         kimi.request_compatibility = RequestCompatibility {
+            anthropic_messages_headers: Default::default(),
             third_party: true,
             responses_via_chat_v1: true,
             responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
@@ -1218,6 +1307,7 @@ fn builtin_interactive_oauth_provider(
             refresh_url: oauth.refresh_url.to_owned(),
             response_mode: None,
             identity: None,
+            authorization_code: None,
         }),
         component_adapter: None,
         generation_adapter: None,
