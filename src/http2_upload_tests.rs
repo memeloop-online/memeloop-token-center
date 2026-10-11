@@ -35,6 +35,9 @@ mod tls_fixture;
 #[path = "http2_upload_tests/native_encoded.rs"]
 pub(crate) mod native_encoded;
 
+#[path = "http2_upload_tests/native_reused_window.rs"]
+mod native_reused_window;
+
 struct Frame {
     from_client: bool,
     kind: u8,
