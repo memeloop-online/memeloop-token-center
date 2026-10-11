@@ -113,8 +113,8 @@ impl Context {
 }
 
 /// Self-contained opaque checkpoint blob. The client stores it and echoes it
-/// back verbatim without inspecting it; the version prefix leaves room for a
-/// future readable mapping without invalidating checkpoints already stored.
+/// back verbatim without inspecting it; the version prefix distinguishes the
+/// gateway's readable summary from foreign Responses host state.
 fn compaction_blob(text: &str) -> String {
     use base64::Engine as _;
     format!(
@@ -125,6 +125,27 @@ fn compaction_blob(text: &str) -> String {
 
 pub(in crate::api) fn compaction_item(id: &str, text: &str) -> Value {
     json!({"id":id,"type":"compaction","encrypted_content":compaction_blob(text)})
+}
+
+pub(super) fn compaction_text(item: &Value) -> Result<Option<String>, super::AppError> {
+    use base64::Engine as _;
+    let Some(encoded) = item["encrypted_content"]
+        .as_str()
+        .and_then(|blob| blob.strip_prefix("mtc-compact-v1."))
+    else {
+        return Ok(None);
+    };
+    let invalid = || super::AppError::BadRequest("invalid gateway compaction checkpoint".into());
+    if encoded.len() > MAX_ACCUMULATED_BYTES.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if decoded.is_empty() || decoded.len() > MAX_ACCUMULATED_BYTES {
+        return Err(invalid());
+    }
+    String::from_utf8(decoded).map(Some).map_err(|_| invalid())
 }
 
 #[derive(Deserialize)]
