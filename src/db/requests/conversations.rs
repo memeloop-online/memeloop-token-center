@@ -3,7 +3,10 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+mod projection_retry;
 mod semantic_payload;
+
+use projection_retry::ConversationContentError;
 
 // Candidate selection reads at most 50 observations. Persisting the complete
 // atom list for a near-limit request would otherwise let one ordinary request
@@ -195,6 +198,8 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
 impl Database {
     async fn materialize_conversation_content(
         &self,
+        request_id: Uuid,
+        lease_owner: Uuid,
         tenant_id: &str,
         request_json: &serde_json::Value,
         observed_at: i64,
@@ -202,14 +207,29 @@ impl Database {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
         let mut transaction = self.begin_write_transaction().await?;
-        materialize_conversation_content_in_transaction(
+        let result = materialize_conversation_content_with_statement_error(
             &mut transaction,
             tenant_id,
             &atoms,
             &nodes,
             observed_at,
         )
-        .await?;
+        .await;
+        if let Err(error) = result {
+            let retryable_sqlstate = error.retryable_sqlstate();
+            let rollback_confirmed = transaction.rollback().await.is_ok();
+            tracing::warn!(
+                %request_id,
+                rollback_confirmed,
+                sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
+                "conversation content transaction failed"
+            );
+            if rollback_confirmed && retryable_sqlstate.is_some() {
+                self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await?;
+            }
+            return Err(error.into());
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -349,6 +369,8 @@ impl Database {
                     }
                 }
                 self.materialize_conversation_content(
+                    request_id,
+                    lease_owner,
                     &prepare_tenant_id,
                     &prepare_request_json,
                     prepare.try_get("observed_at")?,
@@ -359,6 +381,7 @@ impl Database {
         };
 
         let mut transaction = self.begin_write_transaction().await?;
+        let result: Result<bool, ConversationContentError> = async {
         lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
         let now = unix_millis();
         let terminal = sqlx::query(
@@ -389,7 +412,6 @@ impl Database {
                     .execute(&mut *transaction)
                     .await?;
             }
-            transaction.commit().await?;
             return Ok(skipped.rows_affected() == 1);
         }
         let select = match self.backend {
@@ -407,7 +429,6 @@ impl Database {
             .fetch_optional(&mut *transaction)
             .await?;
         let Some(task) = task else {
-            transaction.commit().await?;
             return Ok(false);
         };
 
@@ -478,12 +499,12 @@ impl Database {
         {
             return Err(AppError::Conflict(
                 "conversation semantic payload marker mismatch".into(),
-            ));
+                ).into());
         }
         if snapshot != prepared_snapshot {
             return Err(AppError::Conflict(
                 "conversation semantic snapshot changed during projection".into(),
-            ));
+            ).into());
         }
         if let Some(expected) = snapshot
             .as_ref()
@@ -534,7 +555,7 @@ impl Database {
         if acknowledged.rows_affected() != 1 {
             return Err(AppError::Conflict(
                 "conversation projection lease ownership changed".into(),
-            ));
+            ).into());
         }
         sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3")
             .bind(request_id.to_string()).bind(tenant_id.to_string()).bind(key_id.to_string()).execute(&mut *transaction).await?;
@@ -545,8 +566,35 @@ impl Database {
             key_id,
         )
         .await?;
-        transaction.commit().await?;
         Ok(true)
+        }.await;
+        match result {
+            Ok(true) => {
+                transaction.commit().await?;
+                Ok(true)
+            }
+            Ok(false) => {
+                transaction.rollback().await?;
+                self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await?;
+                Ok(false)
+            }
+            Err(error) => {
+                let retryable_sqlstate = error.retryable_sqlstate();
+                let rollback_confirmed = transaction.rollback().await.is_ok();
+                tracing::warn!(
+                    %request_id,
+                    rollback_confirmed,
+                    sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
+                    "conversation projection transaction failed"
+                );
+                if rollback_confirmed && retryable_sqlstate.is_some() {
+                    self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                        .await?;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     pub async fn record_conversation_observation(
@@ -1986,6 +2034,24 @@ pub(crate) async fn materialize_conversation_content_in_transaction(
     nodes: &[PrefixNode],
     observed_at: i64,
 ) -> Result<(), AppError> {
+    materialize_conversation_content_with_statement_error(
+        transaction,
+        tenant_id,
+        atoms,
+        nodes,
+        observed_at,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn materialize_conversation_content_with_statement_error(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    atoms: &[SemanticAtom],
+    nodes: &[PrefixNode],
+    observed_at: i64,
+) -> Result<(), ConversationContentError> {
     for atom_batch in
         atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
     {
