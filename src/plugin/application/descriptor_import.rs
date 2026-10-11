@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Existing GHA signed-Claude step provides its pinned image, real Cosign and fixture"]
+    #[ignore = "Existing GHA signed-Claude step provides current source Cosign and its pinned fixture"]
     async fn privacy_wire_shim_release_component_descriptor_import_roundtrip() {
         const CHILD_MARKER: &str = "MTC_ID64_SIGNED_IMPORT_CHILD";
         if std::env::var_os(CHILD_MARKER).is_none() {
@@ -1093,18 +1093,15 @@ mod tests {
         use std::process::Stdio;
         use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
-        let image = format!(
-            "{}@{}",
-            std::env::var("INSTALLER_SOURCE").expect("existing GHA pinned installer source"),
-            std::env::var("INSTALLER_DIGEST").expect("existing GHA pinned installer digest")
-        );
+        let image = std::env::var("MTC_SIGNED_IMPORT_COSIGN_IMAGE")
+            .expect("GHA current source Cosign builder image");
         let container = tokio::time::timeout(
             Duration::from_secs(60),
             tokio::process::Command::new("docker")
                 .args([
                     "create",
                     "--entrypoint",
-                    "/usr/local/bin/cosign",
+                    "/tmp/cosign",
                     &image,
                     "version",
                     "--json",
@@ -1119,7 +1116,7 @@ mod tests {
         .unwrap();
         assert!(
             container.status.success(),
-            "create existing pinned CI fixture container"
+            "create current source Cosign CI fixture container"
         );
         let container = String::from_utf8(container.stdout).unwrap();
         let container = container.trim();
@@ -1127,7 +1124,7 @@ mod tests {
         let copy = tokio::time::timeout(
             Duration::from_secs(60),
             tokio::process::Command::new("docker")
-                .args(["cp", &format!("{container}:/usr/local/bin/cosign")])
+                .args(["cp", &format!("{container}:/tmp/cosign")])
                 .arg(directory.path().join("cosign"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

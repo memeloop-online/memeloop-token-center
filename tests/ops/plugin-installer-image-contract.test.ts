@@ -48,12 +48,21 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     '+\tgolang.org/x/sys v0.48.0 // indirect',
     '+\tgolang.org/x/term v0.46.0',
     '+\tgolang.org/x/text v0.42.0 // indirect',
+    '+\tgolang.org/x/mod v0.41.0 // indirect',
+    '+golang.org/x/mod v0.41.0 h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=',
+    '+golang.org/x/mod v0.41.0/go.mod h1:Ek9pY8RKWXwsWvd3rQiHYtMqkjSUV+s1Rj7j4H5Ur6o=',
+    '+\tgolang.org/x/sync v0.23.0',
+    '+golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=',
+    '+golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=',
   ]) contains('packaging/cosign/v3.1.3-security.patch', needle);
   excludes('packaging/cosign/v3.1.3-security.patch', /^\+.*golang\.org\/x\/net v0\.58\.0/m);
   for (const builder of ['Dockerfile', dockerfile]) {
     contains(builder, 'go version -m /tmp/cosign');
     contains(builder, 'golang.org/x/net[[:space:]]+v0\\.60\\.0[[:space:]]');
   }
+  contains('.github/workflows/ci.yml', 'docker build --target cosign-builder --tag "$MTC_SIGNED_IMPORT_COSIGN_IMAGE" .');
+  contains('src/plugin/application/descriptor_import.rs', 'std::env::var("MTC_SIGNED_IMPORT_COSIGN_IMAGE")');
+  contains('src/plugin/application/descriptor_import.rs', '&format!("{container}:/tmp/cosign")');
 
   if (process.env.MTC_SKIP_DOCKER_BUILD === '1') {
     context.skip('Docker execution is unchanged for this pull request; static image policy was validated');
