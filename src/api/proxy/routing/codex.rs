@@ -41,6 +41,46 @@ struct CodexRequestDeadline {
     read_inactivity: std::time::Duration,
 }
 
+#[derive(Clone, Copy)]
+enum CandidatePreparationFailure {
+    ProxyGroupSelection,
+    ProxyMemberSelection,
+    TransportSnapshot,
+}
+
+impl CandidatePreparationFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProxyGroupSelection => "proxy_group_selection_unavailable",
+            Self::ProxyMemberSelection => "proxy_member_selection_unavailable",
+            Self::TransportSnapshot => "transport_snapshot_unavailable",
+        }
+    }
+
+    fn map_result<ResultValue, ErrorValue>(
+        self,
+        result: Result<ResultValue, ErrorValue>,
+        route: &ResolvedUpstream,
+        context: CodexAttemptContext,
+    ) -> Result<ResultValue, ProxySendError> {
+        result.map_err(|_| {
+            tracing::warn!(
+                request_id = %context.request_id,
+                route_id = %route.route_id,
+                upstream_account_id = %route.account_id,
+                credential_generation = route.credential_generation,
+                transport_revision = route.transport_revision,
+                candidate_rank = context.candidate_rank,
+                outbound_attempt = context.outbound_attempt,
+                reason = self.label(),
+                stage = "codex_candidate_preparation_failed",
+                "Codex local candidate preparation failed"
+            );
+            ProxySendError::CandidateUnavailable
+        })
+    }
+}
+
 pub(in crate::api::proxy) fn runtime_transport_policy(
     config: &Value,
     default_shared_probe_attempts: u32,
@@ -286,15 +326,16 @@ async fn send_codex_attempt(
     } = context;
     let mut attempted = Vec::with_capacity(4);
     let select_proxy = || {
-        state
-            .transport_proxy_groups
-            .select_config(
+        CandidatePreparationFailure::ProxyGroupSelection.map_result(
+            state.transport_proxy_groups.select_config(
                 route.route.account_id,
                 route.route.credential_generation,
                 &route.route.credential,
                 &route.route.config,
-            )
-            .map_err(|_| ProxySendError::CandidateUnavailable)
+            ),
+            &route.route,
+            context,
+        )
     };
     let mut selection = select_proxy()?;
     let (connect_attempt_limit, connect_budget_source) = match selection.member_count() {
@@ -305,9 +346,11 @@ async fn send_codex_attempt(
         if connect_attempt > 1 {
             selection = select_proxy()?;
         }
-        let has_unattempted = selection
-            .select_unattempted(&attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        let has_unattempted = CandidatePreparationFailure::ProxyMemberSelection.map_result(
+            selection.select_unattempted(&attempted),
+            &route.route,
+            context,
+        )?;
         tracing::debug!(
             %request_id,
             upstream_account_id = %route.route.account_id,
@@ -340,10 +383,13 @@ async fn send_codex_attempt(
         }
         let mut transport_route = route.route.clone();
         transport_route.credential = selection.credential.clone();
-        let client_snapshot = state
-            .codex_clients
-            .transport_snapshot_with_diagnostics(&transport_route, selection.generation)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        let client_snapshot = CandidatePreparationFailure::TransportSnapshot.map_result(
+            state
+                .codex_clients
+                .transport_snapshot_with_diagnostics(&transport_route, selection.generation),
+            &route.route,
+            context,
+        )?;
         let transport_identity = send_diagnostics::TransportIdentity {
             client_instance_id: client_snapshot.instance_id,
             cache_hit: client_snapshot.cache_hit,

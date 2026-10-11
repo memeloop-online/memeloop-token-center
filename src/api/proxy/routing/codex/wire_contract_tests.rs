@@ -23,6 +23,124 @@ fn credential() -> UpstreamCredential {
     }
 }
 
+#[derive(Clone, Default)]
+struct CandidateFailureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CandidateFailureWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn local_candidate_failures_log_only_fixed_reasons_and_preserve_disposition() {
+    let mut private_credential = credential();
+    if let UpstreamCredential::OAuth {
+        access_token,
+        refresh_token,
+        proxy_url,
+        ..
+    } = &mut private_credential
+    {
+        *access_token = "ACCESS_CANARY".into();
+        *refresh_token = Some("REFRESH_CANARY".into());
+        *proxy_url = Some("socks5h://PROXY_CANARY.invalid:1080".into());
+    }
+    let route = ResolvedUpstream {
+        route_id: Uuid::new_v4(),
+        account_id: Uuid::new_v4(),
+        credential_generation: 13,
+        transport_revision: 42,
+        driver: codex_transport::DRIVER.into(),
+        base_url: "https://HOST_CANARY.invalid/PRIVATE_PATH_CANARY".into(),
+        config: json!({"private": "CONFIG_CANARY"}),
+        upstream_model: "MODEL_CANARY".into(),
+        credential: private_credential,
+    };
+    let context = CodexAttemptContext {
+        request_id: Uuid::new_v4(),
+        candidate_rank: 2,
+        outbound_attempt: 1,
+        transport_policy: runtime_transport_policy(&Value::Null, 1).unwrap(),
+        deadline: CodexRequestDeadline {
+            request: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            read_inactivity: std::time::Duration::from_secs(1),
+        },
+    };
+    let writer = CandidateFailureWriter::default();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(move || sink.clone())
+        .finish();
+    let reasons = [
+        CandidatePreparationFailure::ProxyGroupSelection,
+        CandidatePreparationFailure::ProxyMemberSelection,
+        CandidatePreparationFailure::TransportSnapshot,
+    ];
+    tracing::subscriber::with_default(subscriber, || {
+        for reason in reasons {
+            let preserved = reason
+                .map_result(Ok::<_, &str>("BODY_CANARY"), &route, context)
+                .unwrap();
+            assert_eq!(preserved, "BODY_CANARY");
+            let error = reason
+                .map_result(Err::<(), _>("RAW_ERROR_CANARY"), &route, context)
+                .unwrap_err();
+            assert!(matches!(error, ProxySendError::CandidateUnavailable));
+            assert_eq!(
+                super::super::failover_disposition(None, Some(&error)),
+                super::super::FailoverDisposition::CandidateNotDispatched
+            );
+            assert!(super::super::classify_attempt_failure(&Err(error), None).is_none());
+        }
+    });
+    let captured = writer.0.lock().unwrap();
+    let logs = std::str::from_utf8(&captured).unwrap();
+    assert!(!logs.contains("CANARY"));
+    let events: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), reasons.len());
+    for (event, reason) in events.iter().zip(reasons) {
+        let fields = event["fields"].as_object().unwrap();
+        assert_eq!(fields.len(), 10);
+        for name in fields.keys() {
+            assert!(
+                [
+                    "message",
+                    "request_id",
+                    "route_id",
+                    "upstream_account_id",
+                    "credential_generation",
+                    "transport_revision",
+                    "candidate_rank",
+                    "outbound_attempt",
+                    "reason",
+                    "stage"
+                ]
+                .contains(&name.as_str())
+            );
+        }
+        assert_eq!(fields["reason"], reason.label());
+        assert_eq!(fields["stage"], "codex_candidate_preparation_failed");
+        assert_eq!(fields["request_id"], context.request_id.to_string());
+        assert_eq!(fields["route_id"], route.route_id.to_string());
+        assert_eq!(fields["upstream_account_id"], route.account_id.to_string());
+        assert_eq!(fields["credential_generation"], 13);
+        assert_eq!(fields["transport_revision"], 42);
+        assert_eq!(fields["candidate_rank"], 2);
+        assert_eq!(fields["outbound_attempt"], 1);
+    }
+}
+
 #[test]
 fn native_metadata_ows_is_removed_without_changing_the_payload_or_sensitive_marker() {
     let client = crate::build_codex_http_client().unwrap();
