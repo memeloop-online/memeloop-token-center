@@ -60,6 +60,7 @@
   .provider-directory-actions { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 600px) {
+  .provider-detail-navigation h2 { flex: 1 0 100%; }
   .provider-list .account-list.provider-directory { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
   .provider-directory .account.provider-account, .provider-directory-row { column-gap: 12px; }
   .provider-directory-row { row-gap: 16px; padding-block: 20px; }
