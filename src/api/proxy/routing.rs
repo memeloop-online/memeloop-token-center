@@ -112,14 +112,22 @@ pub(super) fn plan_proxy_route(
             anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
         (forwarded, None, Some(context))
     } else {
-        let (forwarded, context) = kimi::prepare_forwarded_request(
-            &route,
-            protocol,
-            request_json,
-            bridge_multi_agent && responses_via_chat_dialect.is_some(),
-            bridge_multi_agent && responses_via_chat_dialect.is_some(),
-            responses_via_chat_dialect,
-        )?;
+        let (forwarded, context) =
+            crate::api::kimi_transport::responses_request::with_input_rejection_diagnostics(
+                request_id,
+                route.account_id,
+                route.credential_generation,
+                || {
+                    kimi::prepare_forwarded_request(
+                        &route,
+                        protocol,
+                        request_json,
+                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                        responses_via_chat_dialect,
+                    )
+                },
+            )?;
         (forwarded, context, None)
     };
     let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
