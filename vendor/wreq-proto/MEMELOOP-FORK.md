@@ -8,6 +8,9 @@ LICENSE, are retained. UPSTREAM-SHA256.json inventories authenticated files.
 MEMELOOP-SOURCE.patch is the complete, reversible local source/manifest delta.
 The ops contract authenticates the official archive and reverses the patch;
 unlisted changes, removed upstream files and added runtime files fail closed.
+The review patch uses LF. Only the temporary reversed-copy's two patched CRLF
+source files are normalized and restored before exact archive-byte comparison;
+the checked-in source retains official line endings and no fuzz is allowed.
 
 Only this dependency is patched. Versions, wreq, http2, codec, pool behavior,
 HTTP policy, timeouts, cancellation and concurrency are unchanged.

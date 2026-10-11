@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, relative } from 'node:path';
 import test from 'node:test';
@@ -48,10 +48,21 @@ test('wreq-proto source is authenticated upstream plus only reviewed binding pat
     assert.equal(digest(patch), '841a7ea7c4d7e8282f89ee15e4fa1d2cd4cd665c1f1b3018f086c09e1aebed42');
     const changed = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map((match) => match[1]);
     assert.deepEqual(changed.sort(), ['Cargo.toml', 'src/ext.rs', 'src/ext/h2_attempt_observer.rs', 'src/proto/http2/client.rs']);
+    const crlfSources = ['src/ext.rs', 'src/proto/http2/client.rs'];
+    for (const path of crlfSources) {
+      const bytes = readFileSync(resolve(patched, path), 'utf8');
+      assert(bytes.includes('\r\n') && !/(?<!\r)\n/.test(bytes), 'upstream CRLF must remain intact');
+      writeFileSync(resolve(patched, path), bytes.replaceAll('\r\n', '\n'));
+    }
     const reversed = spawnSync('patch', ['-p1', '--reverse', '--batch', '--fuzz=0'], {
       cwd: patched, input: patch, encoding: 'utf8',
     });
     assert.equal(reversed.status, 0, reversed.stdout + reversed.stderr);
+    for (const path of crlfSources) {
+      const bytes = readFileSync(resolve(patched, path), 'utf8');
+      assert(!bytes.includes('\r'));
+      writeFileSync(resolve(patched, path), bytes.replaceAll('\n', '\r\n'));
+    }
     assert.deepEqual(inventory(patched), upstream, 'unreviewed upstream source difference');
     const cargo = readFileSync(resolve(repository, 'Cargo.toml'), 'utf8');
     assert(cargo.includes('wreq-proto = { path = "vendor/wreq-proto" }'));
