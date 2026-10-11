@@ -236,7 +236,9 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await row.locator('[data-outcome="failed"]').waitFor();
       assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
-      await row.locator('.request-outcome').focus();
+      await row.locator('.request-outcome').press('Shift+Tab');
+      await page.keyboard.press('Tab');
+      assert.equal(await row.locator('.request-outcome').evaluate(element => element === document.activeElement), true, 'keyboard navigation focuses the list status');
       const tooltip = page.getByRole('tooltip').filter({ hasText: reason });
       let observed: unknown;
       try {
@@ -299,7 +301,9 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-narrow.png`, fullPage: true });
       assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
-      await drawer.locator('.request-outcome').focus();
+      await drawer.locator('.request-outcome').press('Shift+Tab');
+      await page.keyboard.press('Tab');
+      assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true, 'keyboard navigation focuses the detail status');
       await tooltip.waitFor();
       assert.equal(await tooltip.innerText(), hint);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
