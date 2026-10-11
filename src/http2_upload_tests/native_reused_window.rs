@@ -252,7 +252,7 @@ fn assert_paced_wire(wire: &Wire) -> serde_json::Value {
     );
     let big_times = &update_times[big_id];
     assert_eq!(big_times.len(), big.window_updates);
-    let spread = big_times.last().unwrap() - big_times[0];
+    let spread = big_times.last().copied().unwrap() - big_times[0];
     assert!(
         spread >= Duration::from_secs(1),
         "window updates were not paced over time"
