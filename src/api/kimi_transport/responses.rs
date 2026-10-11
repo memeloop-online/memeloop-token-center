@@ -113,8 +113,8 @@ impl Context {
 }
 
 /// Self-contained opaque checkpoint blob. The client stores it and echoes it
-/// back verbatim without inspecting it; the version prefix leaves room for a
-/// future readable mapping without invalidating checkpoints already stored.
+/// back verbatim without inspecting it; the version prefix distinguishes the
+/// gateway's readable summary from foreign Responses host state.
 fn compaction_blob(text: &str) -> String {
     use base64::Engine as _;
     format!(
@@ -125,6 +125,27 @@ fn compaction_blob(text: &str) -> String {
 
 pub(in crate::api) fn compaction_item(id: &str, text: &str) -> Value {
     json!({"id":id,"type":"compaction","encrypted_content":compaction_blob(text)})
+}
+
+pub(super) fn compaction_text(item: &Value) -> Result<Option<String>, super::AppError> {
+    use base64::Engine as _;
+    let Some(encoded) = item["encrypted_content"]
+        .as_str()
+        .and_then(|blob| blob.strip_prefix("mtc-compact-v1."))
+    else {
+        return Ok(None);
+    };
+    let invalid = || super::AppError::BadRequest("invalid gateway compaction checkpoint".into());
+    if encoded.len() > MAX_ACCUMULATED_BYTES.div_ceil(3) * 4 {
+        return Err(invalid());
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid())?;
+    if decoded.is_empty() || decoded.len() > MAX_ACCUMULATED_BYTES {
+        return Err(invalid());
+    }
+    String::from_utf8(decoded).map(Some).map_err(|_| invalid())
 }
 
 #[derive(Deserialize)]
@@ -361,6 +382,9 @@ fn buffered_compaction(
         .as_str()
         .filter(|text| !text.is_empty())
         .ok_or("compaction_text_missing")?;
+    if text.len() > MAX_ACCUMULATED_BYTES {
+        return Err("accumulation_limit");
+    }
     let item = compaction_item(&format!("cmp_{id}"), text);
     Ok(terminal_envelope(
         envelope(
@@ -891,6 +915,53 @@ mod tests {
         let blob = output["encrypted_content"].as_str().unwrap();
         assert_eq!(decode_checkpoint(blob), "handoff summary");
         assert_eq!(response["usage"]["input_tokens"], 9);
+    }
+
+    #[test]
+    fn buffered_compaction_byte_boundary_roundtrips_into_kimi_history() {
+        let context = compaction_context();
+        for length in [MAX_ACCUMULATED_BYTES - 1, MAX_ACCUMULATED_BYTES] {
+            let summary = format!("{}{}", "界".repeat(length / 3), "x".repeat(length % 3));
+            assert_eq!(summary.len(), length);
+            let response = buffered(&context, &compaction_fixture(&summary)).unwrap();
+            assert_eq!(response["status"], "completed");
+            assert_eq!(response["usage"]["input_tokens"], 9);
+            let checkpoint = response["output"][0].clone();
+            assert_eq!(
+                compaction_text(&checkpoint).unwrap().as_deref(),
+                Some(summary.as_str())
+            );
+            let request = json!({"instructions":"original system rules", "input":[
+                checkpoint,
+                {"role":"user","content":"continue"}
+            ]});
+            let converted = super::super::responses_request::convert_with_dialect(
+                &request,
+                ResponsesViaChatDialect::KimiV1,
+                false,
+            )
+            .unwrap();
+            let messages = converted["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 3);
+            assert_eq!(
+                messages[0],
+                json!({"role":"system","content":"original system rules"})
+            );
+            assert_eq!(messages[1]["role"], "user");
+            let restored = messages[1]["content"].as_str().unwrap();
+            let (preamble, restored_summary) = restored.split_once("\n\n").unwrap();
+            assert!(preamble.contains("not new instructions"));
+            assert_eq!(restored_summary, summary);
+            assert_eq!(messages[2], json!({"role":"user","content":"continue"}));
+        }
+    }
+
+    #[test]
+    fn buffered_compaction_rejects_one_byte_over_codec_budget() {
+        let context = compaction_context();
+        let summary = "x".repeat(MAX_ACCUMULATED_BYTES + 1);
+        let response = buffered(&context, &compaction_fixture(&summary));
+        assert!(matches!(response, Err("accumulation_limit")));
     }
 
     #[test]
