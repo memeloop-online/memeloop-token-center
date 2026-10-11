@@ -175,9 +175,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // auto-recovers the new generation with exactly one compensating batch read.
     await page.evaluate(() => { window.deferNextFormQuotaBatch = true; });
     await page.evaluate(() => window.releaseFormQuotaRead());
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 2);
-    await row.getByText('等待刷新', { exact: true }).waitFor();
-    assert.doesNotMatch(await row.innerText(), /75|代次 1 额度/, 'the fenced old-generation response never publishes');
+    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 2 && document.querySelector('.provider-directory-row')?.textContent?.includes('等待刷新'));
+    const queuedRow = await row.textContent();
+    assert.ok(queuedRow?.includes('等待刷新'), 'the compensating batch queues the hidden list row');
+    assert.doesNotMatch(queuedRow ?? '', /75|代次 1 额度/, 'the fenced old-generation response never publishes');
     await page.evaluate(() => window.releaseFormQuotaBatch());
     await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.match(await row.innerText(), /25/);
