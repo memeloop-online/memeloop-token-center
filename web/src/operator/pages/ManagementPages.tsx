@@ -200,6 +200,8 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   useEffect(() => { onReadFeedbackOwnerChange(false); }, [providerScopeKey, workspace?.kind, workspaceAccountId, method, onReadFeedbackOwnerChange]);
   const [driver, setDriver] = useState('');
   const quotaReads = useUpstreamQuotaReads(token, tenant, values);
+  const quotaReadSignature = JSON.stringify(values.map(account => [account.id, account.credential_generation, account.tenant_external_id, account.status]));
+  useEffect(() => { void quotaReads.readAll(); }, [token, tenant, quotaReadSignature]);
   const [providerCreateGeneration, setProviderCreateGeneration] = useState(0);
   const [providerCreateDrafts, setProviderCreateDrafts] = useState<Record<string, Record<string, unknown>>>({});
   const providerScope = useRef({ key: providerScopeKey });
@@ -566,9 +568,10 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     const generation = value.credential_generation;
     const cachedQuota = quotaReads.entries[value.id];
     return <section id={`provider-details-${value.id}`} className="provider-detail-workspace" aria-label={t('providerDirectory.details', { name: value.name })}>
+            <header className="journey-heading provider-detail-navigation"><h2>{t('providerDirectory.details', { name: value.name })}</h2><Button appearance="subtle" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnToAccountList(value)}>{t('providerDirectory.close')}</Button></header>
             {error && <div className="notice error" role="alert">{error}</div>}
             {message && <div className="notice success" role="status">{message}</div>}
-            <div className="provider-detail-heading"><h3 ref={detailHeading} tabIndex={-1}>{value.name}</h3><DetailTooltip content={`${providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other')} · ${t('providerDirectory.account')}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip>{providerAvailable && <Button appearance="secondary" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderEditDraft(undefined); navigateWorkspace({ kind: 'settings', account: value }); }}>{t('providers.edit')}</Button>}<Button appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => returnToAccountList(value)}>{t('providerDirectory.close')}</Button></div>
+            <div className="provider-detail-heading"><h3 ref={detailHeading} tabIndex={-1}>{value.name}</h3><DetailTooltip content={`${providers.find(provider => provider.id === value.driver)?.display_name ?? t('providerDirectory.other')} · ${t('providerDirectory.account')}`}><span tabIndex={0}>{t('providerDirectory.account')}</span></DetailTooltip>{providerAvailable && <Button appearance="secondary" type="button" data-inline-edit-trigger={value.id} disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => { setProviderEditDraft(undefined); navigateWorkspace({ kind: 'settings', account: value }); }}>{t('providers.edit')}</Button>}</div>
             <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(value, action)} routeActionDisabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[value.id] ?? 0} />
             <div className="account-main">
             <ProviderAccountStatus account={value} />
