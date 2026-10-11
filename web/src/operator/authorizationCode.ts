@@ -3,7 +3,7 @@ import type { ProviderType, UpstreamAccount } from '../types.js';
 
 export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
   if (!account.can_reauthorize || !provider || provider.id !== account.driver) return false;
-  return provider.oauth_adapter?.flow_kind !== 'authorization_code_pkce' || provider.id === 'google-antigravity';
+  return Boolean(provider.oauth_adapter);
 }
 
 export function isAuthorizationIdentityMismatch(reason: unknown): boolean {
@@ -78,6 +78,15 @@ export function validAuthorizationCallback(value: string): boolean {
       && url.searchParams.getAll('code').length === 1 && Boolean(url.searchParams.get('code'))
       && url.searchParams.getAll('state').length === 1 && Boolean(url.searchParams.get('state'));
   } catch { return false; }
+}
+
+/** Fragment-manual paste: the provider page displays exactly code#state; both parts are non-empty and bounded. */
+export function validFragmentManualCode(value: string): boolean {
+  const pasted = value.trim();
+  const separator = pasted.indexOf('#');
+  if (separator <= 0 || separator !== pasted.lastIndexOf('#')) return false;
+  const state = pasted.length - separator - 1;
+  return state >= 1 && state <= 8192 && separator <= 8192;
 }
 
 // Never display arbitrary server/network errors: they may contain callback or token data.

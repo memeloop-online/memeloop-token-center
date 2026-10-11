@@ -110,3 +110,42 @@ test('plugin OAuth uses default client, full callback once, safe errors and isol
     assert.equal(await page.getByRole('button', { name: '继续完成接入', exact: true }).count(), 0);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('fragment-manual providers paste code#state into the same bounded once-only completion', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    let completes = 0;
+    await page.route('**/internal/v1/upstreams', route => route.fulfill({ json: [] }));
+    await page.route('**/internal/v1/oauth/**', async route => {
+      const body = route.request().postDataJSON();
+      if (route.request().url().endsWith('/start')) {
+        return route.fulfill({ json: { driver: 'fixture-plugin', login_url: 'https://login.example.invalid/authorize', session_token: 'fixture-session-secret', expires_at: Date.now() + 600_000, recovery_expires_at: Date.now() + 87_000_000 } });
+      }
+      assert.ok(route.request().url().endsWith('/complete')); completes++;
+      assert.equal(body.callback_url, 'fixture-code#fixture-state', 'the pasted code#state travels in the existing bounded field');
+      assert.deepEqual(Object.keys(body).sort(), ['callback_url', 'session_token']);
+      return route.fulfill({ status: 201, json: { id: 'fixture-account', name: 'Fixture OAuth' } });
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?fragment=1`);
+    await page.getByRole('button', { name: '开始登录', exact: true }).click();
+    const paste = page.getByLabel('提供商页面显示的授权码', { exact: true });
+    await paste.waitFor();
+    assert.equal(await page.getByLabel('完整回调地址', { exact: true }).count(), 0, 'fragment providers never ask for a callback URL');
+    const finish = page.getByRole('button', { name: '完成授权', exact: true });
+    assert.equal(await finish.isDisabled(), true);
+    await paste.fill('code-only-without-state');
+    assert.equal(await finish.isDisabled(), true, 'shape validation reuses the existing disabled protection');
+    await paste.fill('fixture-code#fixture-state');
+    assert.equal(await finish.isEnabled(), true);
+    await finish.click();
+    await page.getByText('账号已创建；可在上游列表查看状态和代理配置。', { exact: true }).waitFor();
+    assert.equal(completes, 1);
+    assert.doesNotMatch(await page.locator('body').innerText(), /fixture-code|fixture-session-secret/);
+  } finally { await browser.close(); await server.close(); }
+});

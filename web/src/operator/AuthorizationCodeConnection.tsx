@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { api } from '../api';
+import { ApiError, api } from '../api';
 import { Button, Checkbox, FormSection, Input } from '../design-system';
 import { localizeSchema, useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
@@ -14,7 +14,7 @@ import { ProxyInput } from './UpstreamConnection';
 import { connectionSchema, isGenericProxyUrlInput } from './upstreamConnectionPolicy';
 import { authorizationCodeCopy } from './authorizationCodeCopy';
 import { OAuthLoginLinkActions } from './OAuthLoginLinkActions';
-import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, type AuthorizationCodeSession } from './authorizationCode';
+import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, validFragmentManualCode, type AuthorizationCodeSession } from './authorizationCode';
 import { fluentFormWidgets } from './FluentFormWidgets';
 import { providerConnectionCopy } from './providerConnectionCopy';
 
@@ -27,6 +27,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
 }) {
   const { locale, t } = useI18n();
   const copy = authorizationCodeCopy(locale, provider.id, Boolean(existing));
+  const fragmentManual = provider.oauth_adapter?.response_mode === 'fragment_manual';
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, provider.id]);
   const [name, setName] = useState(existing?.name ?? provider.display_name);
   const [config, setConfig] = useState<Record<string, unknown>>({});
@@ -67,7 +68,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   async function complete(continueIssued = false) {
     if (!session || inFlight.current || (continueIssued ? !submitted : consumed.current)) return;
     if (continueIssued && (recoveryDeadline === undefined || Date.now() >= recoveryDeadline)) { setError(copy.continueExpired); return; }
-    if (!continueIssued && !validAuthorizationCallback(callback)) { setError(copy.invalid); return; }
+    if (!continueIssued && !(fragmentManual ? validFragmentManualCode(callback) : validAuthorizationCallback(callback))) { setError(fragmentManual ? copy.invalidCode : copy.invalid); return; }
     inFlight.current = true; consumed.current = true; setSubmitted(true); setBusy(true); setError(''); setNotice('');
     // Explicit continuation can only complete already-issued server state. Never retain or replay a code.
     const callbackUrl = continueIssued ? '' : callback.trim(); setCallback('');
@@ -88,6 +89,8 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       if (live.current) {
         if (existing && isAuthorizationIdentityMismatch(reason)) {
           setSession(undefined); setRecoveryDeadline(undefined); setError(copy.identityMismatch);
+        } else if (fragmentManual && !continueIssued && reason instanceof ApiError && reason.status === 400 && reason.code === 'invalid_request' && reason.message === 'invalid request: OAuth completion must be code#state') {
+          setError(copy.codeRejected);
         } else setError(continueIssued ? copy.continueFailed : copy.uncertain);
       }
     }
@@ -112,9 +115,9 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     {session && !submitted && <>
       <p role="status">{copy.waiting}</p><p>{copy.expires}: {new Date(session.expires_at).toLocaleString(locale)}</p>
       <OAuthLoginLinkActions url={session.login_url} />
-      <label>{copy.callback}<Input type="password" autoComplete="off" spellCheck={false} value={callback} disabled={busy} onChange={event => setCallback(event.target.value)} /></label>
-      <p className="field-hint">{copy.callbackHelp}</p>
-      <Button appearance="primary" type="button" disabled={busy || !validAuthorizationCallback(callback)} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button>
+      <label>{fragmentManual ? copy.codePaste : copy.callback}<Input type="password" autoComplete="off" spellCheck={false} value={callback} disabled={busy} onChange={event => setCallback(event.target.value)} /></label>
+      <p className="field-hint">{fragmentManual ? copy.codePasteHelp : copy.callbackHelp}</p>
+      <Button appearance="primary" type="button" disabled={busy || !(fragmentManual ? validFragmentManualCode(callback) : validAuthorizationCallback(callback))} onClick={() => void complete()}>{t('providers.completeAuthorization')}</Button>
     </>}
     {recoveryDeadline !== undefined && <div className="field-hint"><p>{copy.recoveryExpires}: {new Date(recoveryDeadline).toLocaleString(locale)}</p>{!saved.current && <p>{copy.recoveryHint}</p>}</div>}
     {error && <p className="notice error" role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}

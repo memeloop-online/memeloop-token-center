@@ -803,6 +803,8 @@ export interface ProviderType {
     login_url: string;
     poll_url: string;
     refresh_url: string;
+    /** Absent means the standard query-parameter callback; fragment_manual declares the provider page displays code#state for manual paste. */
+    response_mode?: 'fragment_manual';
   };
   component_adapter?: {
     api_version: 'buffered-v1';

@@ -44,12 +44,14 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
       return route.fulfill({ status: 200, json: { id: 'original-account', name: 'Original account', credential_generation: 5 } });
     });
     const path = `${origin}/e2e/fixtures/authorization-code.html`;
-    for (const mode of ['legacy', 'other']) {
-      await page.goto(`${path}?reauthorize=${mode}`);
-      await page.getByRole('status').filter({ hasText: '保持账号连接唯一' }).waitFor();
-      assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).count(), 0);
-    }
-    assert.equal(starts, 0);
+    await page.goto(`${path}?reauthorize=legacy`);
+    await page.getByRole('status').filter({ hasText: '保持账号连接唯一' }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).count(), 0);
+    await page.goto(`${path}?reauthorize=other`);
+    await page.getByRole('button', { name: '开始登录', exact: true }).waitFor();
+    assert.doesNotMatch(await page.locator('body').innerText(), /Google|保持账号连接唯一/);
+    assert.match(await page.locator('body').innerText(), /原来的身份登录/);
+    assert.equal(starts, 0, 'inspecting eligibility never starts a session');
     await page.goto(`${path}?reauthorize=eligible`);
     assert.equal(await page.getByLabel('上游名称', { exact: true }).count(), 0);
     await page.getByText('Original account', { exact: true }).waitFor();
