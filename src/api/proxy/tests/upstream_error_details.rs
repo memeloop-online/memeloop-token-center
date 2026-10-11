@@ -122,6 +122,18 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             "insufficient_quota",
         ),
         (
+            "user-quota",
+            403,
+            "用户额度不足, 剩余额度: ＄-0.000160 (request id: quota-fixture)",
+            "insufficient_user_quota",
+        ),
+        (
+            "user-quota-safe",
+            403,
+            "用户额度不足",
+            "insufficient_user_quota",
+        ),
+        (
             "expired",
             401,
             "private credential fragment%2Fcanary",
@@ -176,6 +188,19 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             .unwrap();
         let delivered: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(delivered["error"]["type"], "upstream_error");
+        if code == "insufficient_user_quota" {
+            assert_eq!(delivered["error"]["code"], "insufficient_quota");
+            assert_eq!(
+                delivered["error"]["message"],
+                "The upstream account has insufficient quota"
+            );
+            assert_eq!(
+                delivered["error"]["mtc_provider_code"],
+                "insufficient_user_quota"
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("-0.000160"));
+            assert!(!String::from_utf8_lossy(&bytes).contains("quota-fixture"));
+        }
         if let Some(reason) =
             crate::supplier_error::SafeReason::from_supplier(Some(code), Some(message))
         {
