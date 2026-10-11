@@ -177,7 +177,17 @@ fn only_explicit_valid_buffered_incomplete_counters_are_trusted() {
 
 #[tokio::test]
 async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_once() {
-    for valid in [true, false] {
+    for case in [
+        "valid",
+        "invalid-usage",
+        "malformed-message-content",
+        "malformed-output-text",
+        "malformed-reasoning-summary",
+        "malformed-function-call",
+        "extension",
+    ] {
+        let valid_usage = case != "invalid-usage";
+        let valid_output = matches!(case, "valid" | "extension");
         let upstream = MockServer::start().await;
         let fixture = response_usage_fixture("buffered-incomplete", &upstream, 0).await;
         fixture
@@ -196,11 +206,33 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .await
             .unwrap();
         let mut body = incomplete("max_output_tokens");
-        if !valid {
-            body["usage"]
-                .as_object_mut()
-                .unwrap()
-                .remove("total_tokens");
+        match case {
+            "invalid-usage" => {
+                body["usage"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("total_tokens");
+            }
+            "malformed-message-content" => body["output"][0]["content"] = json!("invalid"),
+            "malformed-output-text" => body["output"][0]["content"][0]["text"] = json!(7),
+            "malformed-reasoning-summary" => {
+                body["output"] = json!([{"type":"reasoning","summary":"invalid"}]);
+            }
+            "malformed-function-call" => {
+                body["output"] = json!([{"type":"function_call","call_id":"call_partial",
+                    "name":"partial","arguments":{}}]);
+            }
+            "extension" => {
+                body["provider_extension"] = json!({"opaque":true});
+                body["output"].as_array_mut().unwrap().push(json!({
+                    "type":"provider_extension","payload":{"opaque":true}}));
+                body["output"][0]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                    "type":"provider_content_extension","payload":{"opaque":true}}));
+            }
+            _ => {}
         }
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -213,7 +245,7 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .await;
         assert_eq!(
             response.status(),
-            if valid {
+            if valid_usage && valid_output {
                 StatusCode::OK
             } else {
                 StatusCode::BAD_GATEWAY
@@ -223,7 +255,7 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .await
             .unwrap();
         let delivered_json: Value = serde_json::from_slice(&delivered).unwrap();
-        if valid {
+        if valid_usage && valid_output {
             assert_eq!(delivered_json, body);
         } else {
             assert!(delivered_json["error"].is_object());
@@ -237,14 +269,21 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.status_code, Some(if valid { 200 } else { 502 }));
+        assert_eq!(
+            row.status_code,
+            Some(if valid_usage && valid_output {
+                200
+            } else {
+                502
+            })
+        );
         assert_eq!(
             row.lifecycle_state,
             crate::model::RequestLifecycleState::Failed
         );
         assert_eq!(
             row.usage_basis,
-            Some(if valid {
+            Some(if valid_usage {
                 crate::model::RequestUsageBasis::ProviderReported
             } else {
                 crate::model::RequestUsageBasis::NotObserved
@@ -252,11 +291,11 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
         );
         assert_eq!(
             (row.input_tokens, row.cached_input_tokens, row.output_tokens),
-            if valid { (10, 6, 2) } else { (0, 0, 0) }
+            if valid_usage { (10, 6, 2) } else { (0, 0, 0) }
         );
         assert_eq!(
             row.cost.parse::<Decimal>().unwrap(),
-            if valid {
+            if valid_usage {
                 Decimal::new(20, 6)
             } else {
                 Decimal::ZERO
@@ -264,10 +303,12 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
         );
         assert_eq!(
             row.error_code.as_deref(),
-            Some(if valid {
-                "upstream_incomplete_response"
-            } else {
+            Some(if !valid_usage {
                 "upstream_failed_response"
+            } else if !valid_output {
+                "upstream_invalid_response"
+            } else {
+                "upstream_incomplete_response"
             })
         );
         let events = fixture
@@ -294,7 +335,7 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
         assert_eq!(refs.view.status_code, row.status_code);
         assert_eq!(refs.view.lifecycle_state, row.lifecycle_state);
         let locator = refs.response_object.unwrap();
-        if valid {
+        if valid_usage {
             assert!(!locator.starts_with("gap://"));
             assert_eq!(
                 fixture.state.archive.get(&locator).await.unwrap(),

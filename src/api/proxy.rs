@@ -642,17 +642,33 @@ async fn finish_non_sse_proxy_response(
             && matches!(protocol, Protocol::OpenAiResponses)
             && let Some(usage) = trusted_buffered_responses_incomplete_usage(&response_body)
         {
+            let valid_output = buffered_responses_incomplete_output_is_valid(&response_body);
+            let (response_status, response_body, terminal_error) = if valid_output {
+                (status, response_body, "upstream_incomplete_response")
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
+                    ),
+                    "upstream_invalid_response",
+                )
+            };
             let result = finish_buffered_request(
                 buffered_request,
-                status,
+                response_status,
                 response_body,
                 "application/json",
                 (usage, crate::model::RequestUsageBasis::ProviderReported),
-                Some("upstream_incomplete_response".to_owned()),
+                Some(terminal_error.to_owned()),
             )
             .await;
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .complete(if valid_output {
+                    UpstreamAttemptTerminal::Inconclusive
+                } else {
+                    UpstreamAttemptTerminal::invalid_response()
+                })
                 .await;
             return result;
         }
@@ -2128,6 +2144,73 @@ fn trusted_buffered_responses_incomplete_usage(body: &[u8]) -> Option<TokenUsage
     // Reuse the typed terminal accounting contract from streaming incomplete
     // and Codex buffered Responses, not the permissive generic JSON extractor.
     codex_transport::canonical_responses_usage(&value).ok()
+}
+
+fn buffered_responses_incomplete_output_is_valid(body: &[u8]) -> bool {
+    let Ok(value) = crate::api::sse::parse_unique_json(body) else {
+        return false;
+    };
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return false;
+    };
+    output.iter().all(|item| {
+        let Some(kind) = item.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        match kind {
+            "message" => {
+                item.get("role").and_then(Value::as_str) == Some("assistant")
+                    && item
+                        .get("content")
+                        .is_some_and(buffered_responses_content_is_valid)
+                    && item.get("status").is_none_or(|status| {
+                        matches!(
+                            status.as_str(),
+                            Some("in_progress" | "completed" | "incomplete")
+                        )
+                    })
+            }
+            "reasoning" => {
+                item.get("summary")
+                    .is_none_or(buffered_responses_content_is_valid)
+                    && item
+                        .get("content")
+                        .is_none_or(buffered_responses_content_is_valid)
+                    && item
+                        .get("encrypted_content")
+                        .is_none_or(|content| content.is_null() || content.is_string())
+            }
+            "function_call" => ["call_id", "name", "arguments"]
+                .iter()
+                .all(|field| item.get(*field).is_some_and(Value::is_string)),
+            "custom_tool_call" => ["call_id", "name", "input"]
+                .iter()
+                .all(|field| item.get(*field).is_some_and(Value::is_string)),
+            _ => !kind.is_empty(),
+        }
+    })
+}
+
+fn buffered_responses_content_is_valid(content: &Value) -> bool {
+    content.as_array().is_some_and(|parts| {
+        parts.iter().all(|part| {
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            match kind {
+                "output_text" | "summary_text" | "reasoning_text" => {
+                    part.get("text").is_some_and(Value::is_string)
+                        && part.get("annotations").is_none_or(|annotations| {
+                            annotations
+                                .as_array()
+                                .is_some_and(|items| items.iter().all(Value::is_object))
+                        })
+                }
+                "refusal" => part.get("refusal").is_some_and(Value::is_string),
+                _ => !kind.is_empty(),
+            }
+        })
+    })
 }
 
 fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
