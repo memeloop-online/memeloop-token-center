@@ -230,8 +230,7 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                 .get(&ready.provider_driver)
                 .and_then(|provider| provider.oauth_adapter.as_ref())
                 .and_then(|adapter| adapter.identity.clone());
-            let identity_supported = ready.provider_driver
-                == crate::provider::antigravity::DRIVER
+            let identity_supported = ready.provider_driver == crate::provider::antigravity::DRIVER
                 || declared_identity.is_some();
             if ready.provider_driver == crate::provider::antigravity::DRIVER {
                 // The token is durably staged already. A transient identity read

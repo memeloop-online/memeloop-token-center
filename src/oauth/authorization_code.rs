@@ -141,7 +141,9 @@ fn valid_provider_identity_id(id: &str) -> bool {
 /// credentials, no fragment, bounded length, and a bounded RFC 6901 pointer.
 fn validate_identity_contribution(identity: &OAuthIdentityContribution) -> Result<(), AppError> {
     if identity.url.len() > 2048 {
-        return Err(AppError::BadRequest("OAuth identity URL is too long".into()));
+        return Err(AppError::BadRequest(
+            "OAuth identity URL is too long".into(),
+        ));
     }
     let url = Url::parse(&identity.url)
         .map_err(|_| AppError::BadRequest("invalid OAuth identity URL".into()))?;
@@ -172,7 +174,9 @@ fn validate_identity_contribution(identity: &OAuthIdentityContribution) -> Resul
 /// operator pastes it verbatim. There is no reachable redirect to match.
 fn fragment_manual_code(pasted: &str, state: &str) -> Result<String, AppError> {
     let invalid = || AppError::BadRequest("OAuth completion must be code#state".into());
-    let (code, pasted_state) = pasted.split_once('#').ok_or_else(invalid)?;
+    let Some((code, pasted_state)) = pasted.split_once('#') else {
+        return Err(invalid());
+    };
     if code.is_empty()
         || code.len() > 8192
         || pasted_state.is_empty()
@@ -705,12 +709,12 @@ pub async fn complete(
             "OAuth code exchange outcome is unknown; start a new login".into(),
         ));
     }
-    let parsed_code = if login.input.adapter.response_mode == Some(OAuthResponseMode::FragmentManual)
-    {
-        fragment_manual_code(callback_url, &login.state)
-    } else {
-        callback_code(callback_url, &login.input.client.redirect_uri, &login.state)
-    };
+    let parsed_code =
+        if login.input.adapter.response_mode == Some(OAuthResponseMode::FragmentManual) {
+            fragment_manual_code(callback_url, &login.state)
+        } else {
+            callback_code(callback_url, &login.input.client.redirect_uri, &login.state)
+        };
     let code = match parsed_code {
         Ok(code) => code,
         Err(error) => {
@@ -1079,7 +1083,10 @@ mod tests {
             "the-code#the-state#extra",
             "the-code#the-state\n",
         ] {
-            assert!(fragment_manual_code(invalid, "the-state").is_err(), "{invalid}");
+            assert!(
+                fragment_manual_code(invalid, "the-state").is_err(),
+                "{invalid}"
+            );
         }
         let long = format!("{}#the-state", "a".repeat(8193));
         assert!(fragment_manual_code(&long, "the-state").is_err());
