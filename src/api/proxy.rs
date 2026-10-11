@@ -1934,8 +1934,21 @@ async fn proxy_with_cancellation_guard(
         };
         if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
             let buffered_body_length = buffered.body.len();
-            let (response_status, response_body) = if status == StatusCode::OK {
+            let valid_output = buffered_responses_incomplete_output_is_valid(&buffered.body);
+            let terminal_error = if valid_output {
+                "upstream_incomplete_response"
+            } else {
+                "upstream_invalid_response"
+            };
+            let (response_status, response_body) = if status == StatusCode::OK && valid_output {
                 (StatusCode::OK, buffered.body)
+            } else if !valid_output {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
+                    ),
+                )
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
@@ -1944,11 +1957,7 @@ async fn proxy_with_cancellation_guard(
                     ),
                 )
             };
-            buffer_phase.finish(
-                "upstream_incomplete_response",
-                Some(200),
-                Some(buffered_body_length),
-            );
+            buffer_phase.finish(terminal_error, Some(200), Some(buffered_body_length));
             let result = finish_buffered_request(
                 &buffered_request,
                 response_status,
@@ -1958,11 +1967,15 @@ async fn proxy_with_cancellation_guard(
                     buffered.usage,
                     crate::model::RequestUsageBasis::ProviderReported,
                 ),
-                Some("upstream_incomplete_response".to_owned()),
+                Some(terminal_error.to_owned()),
             )
             .await;
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .complete(if valid_output {
+                    UpstreamAttemptTerminal::Inconclusive
+                } else {
+                    UpstreamAttemptTerminal::invalid_response()
+                })
                 .await;
             codex_retry.complete(CodexRetryTerminal::Failed);
             return result;
