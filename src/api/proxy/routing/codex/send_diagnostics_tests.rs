@@ -144,7 +144,7 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             evidence.body_consumption.attach(&mut request);
             let result = client.execute(request).await;
             if before_headers {
-                let error = result.err().expect("peer reset must precede headers");
+                let error = result.expect_err("peer reset must precede headers");
                 evidence.observe_error(&error, true);
                 assert!(matches!(
                     classify_wreq_send_error(error),
