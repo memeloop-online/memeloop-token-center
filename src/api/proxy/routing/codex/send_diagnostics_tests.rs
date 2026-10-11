@@ -3,6 +3,267 @@ use bytes::Bytes;
 
 use super::*;
 
+#[derive(Clone, Default)]
+struct Http2EvidenceWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Http2EvidenceWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn http2_attempt_evidence() -> Http2AttemptEvidence {
+    let route = ResolvedUpstream {
+        route_id: Uuid::new_v4(),
+        account_id: Uuid::new_v4(),
+        credential_generation: 13,
+        transport_revision: 42,
+        driver: codex_transport::DRIVER.into(),
+        base_url: "https://HOST_CANARY.invalid/PRIVATE_PATH_CANARY".into(),
+        config: serde_json::json!({
+            (crate::db::transport_proxy_management::CONFIG_KEY): {
+                "group_id": Uuid::new_v4().to_string()
+            },
+            "private": "CONFIG_CANARY"
+        }),
+        upstream_model: "MODEL_CANARY".into(),
+        credential: UpstreamCredential::OAuth {
+            access_token: "ACCESS_CANARY".into(),
+            refresh_token: Some("REFRESH_CANARY".into()),
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: Some("socks5h://PROXY_CANARY.invalid:1080".into()),
+            proxy_network_scope: None,
+        },
+    };
+    Http2AttemptEvidence::capture(
+        &route,
+        TransportIdentity {
+            client_instance_id: Uuid::new_v4(),
+            cache_hit: true,
+            selected_proxy_matches_client_key: Some(true),
+            connect_attempt: 2,
+            proxy_member_index: Some(1),
+            proxy_member_count: 3,
+            selection_epoch: 21,
+            group_selection_version: Some(2),
+            request_local_selection: false,
+        },
+        CodexAttemptContext {
+            request_id: Uuid::new_v4(),
+            candidate_rank: 2,
+            outbound_attempt: 1,
+            transport_policy: runtime_transport_policy(&Value::Null, 1).unwrap(),
+            deadline: CodexRequestDeadline {
+                request: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                read_inactivity: std::time::Duration::from_secs(5),
+            },
+        },
+        true,
+        BodyConsumption::default(),
+    )
+}
+
+#[tokio::test]
+async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets() {
+    use futures_util::StreamExt;
+    use tracing::instrument::WithSubscriber;
+
+    for before_headers in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let request_count = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = http2::server::handshake(socket).await.unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), ::http::Method::POST);
+            request_count.fetch_add(1, Ordering::SeqCst);
+            let response_task = tokio::spawn(async move {
+                let mut body = request.into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    received.extend_from_slice(&chunk);
+                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+                assert_eq!(received, b"BODY_CANARY");
+                if before_headers {
+                    response.send_reset(http2::Reason::PROTOCOL_ERROR);
+                } else {
+                    let headers = ::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .header("x-private", "HEADER_CANARY")
+                        .body(())
+                        .unwrap();
+                    let mut stream = response.send_response(headers, false).unwrap();
+                    stream
+                        .send_data(Bytes::from_static(b"BODY_CANARY"), false)
+                        .unwrap();
+                    released.await.unwrap();
+                    stream.send_reset(http2::Reason::PROTOCOL_ERROR);
+                }
+            });
+            assert!(
+                connection.accept().await.is_none(),
+                "unexpected replay POST"
+            );
+            response_task.await.unwrap();
+        });
+        let evidence = http2_attempt_evidence();
+        let expected_request = evidence.request_id;
+        let expected_account = evidence.upstream_account_id;
+        let expected_client = evidence.identity.client_instance_id;
+        let expected_group = evidence.binding_group_id;
+        let writer = Http2EvidenceWriter::default();
+        let sink = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .finish();
+        let client = crate::build_codex_http_client().unwrap();
+        let operation = async {
+            let mut request = client
+                .post(format!("http://{address}/responses"))
+                .version(Version::HTTP_2)
+                .header("authorization", "Bearer ACCESS_CANARY")
+                .body(Bytes::from_static(b"BODY_CANARY"))
+                .build()
+                .unwrap();
+            evidence.body_consumption.attach(&mut request);
+            let result = client.execute(request).await;
+            if before_headers {
+                let error = result.err().expect("peer reset must precede headers");
+                evidence.observe_error(&error, true);
+                assert!(matches!(
+                    classify_wreq_send_error(error),
+                    ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset)
+                ));
+                drop(release);
+            } else {
+                let response = result.unwrap();
+                let expected_headers = response.headers().clone();
+                let expected_length = response.content_length();
+                let parts = evidence.observe_response(response).into_parts();
+                assert_eq!(parts.status, ::http::StatusCode::OK);
+                assert_eq!(parts.version, Version::HTTP_2);
+                assert_eq!(parts.headers, expected_headers);
+                assert_eq!(parts.content_length, expected_length);
+                let mut stream = parts.stream;
+                assert_eq!(stream.next().await.unwrap().unwrap(), b"BODY_CANARY"[..]);
+                release.send(()).unwrap();
+                assert_eq!(
+                    stream.next().await.unwrap(),
+                    Err(upstream_response::UPSTREAM_HTTP2_RESET)
+                );
+                drop(stream);
+            }
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            operation.with_subscriber(subscriber),
+        )
+        .await
+        .unwrap();
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let captured = writer.0.lock().unwrap();
+        let logs = std::str::from_utf8(&captured).unwrap();
+        for secret in [
+            "BODY_CANARY",
+            "ACCESS_CANARY",
+            "REFRESH_CANARY",
+            "HEADER_CANARY",
+            "PROXY_CANARY",
+            "CONFIG_CANARY",
+            "MODEL_CANARY",
+            "HOST_CANARY",
+            "PRIVATE_PATH_CANARY",
+        ] {
+            assert!(!logs.contains(secret));
+        }
+        let events: Vec<Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let fields: Vec<_> = events
+            .iter()
+            .map(|event| &event["fields"])
+            .filter(|fields| {
+                fields["stage"]
+                    == if before_headers {
+                        "codex_http2_before_response_headers"
+                    } else {
+                        "codex_http2_response_body"
+                    }
+            })
+            .collect();
+        assert_eq!(fields.len(), 1);
+        let fields = fields[0];
+        assert_eq!(fields["request_id"], expected_request.to_string());
+        assert_eq!(fields["upstream_account_id"], expected_account.to_string());
+        assert_eq!(fields["credential_generation"], 13);
+        assert_eq!(fields["transport_revision"], 42);
+        assert_eq!(fields["candidate_rank"], 2);
+        assert_eq!(fields["outbound_attempt"], 1);
+        assert_eq!(fields["connect_attempt"], 2);
+        assert_eq!(fields["client_instance_id"], expected_client.to_string());
+        assert_eq!(fields["client_cache_hit"], true);
+        assert_eq!(fields["proxy_member_index"], "Some(1)");
+        assert_eq!(fields["proxy_member_count"], 3);
+        assert_eq!(fields["selection_epoch"], 21);
+        assert_eq!(fields["group_selection_version"], "Some(2)");
+        assert_eq!(fields["binding_group_id"], format!("{expected_group:?}"));
+        assert_eq!(fields["http2_remote"], true);
+        assert_eq!(fields["http2_library"], false);
+        assert_eq!(fields["http2_reset"], true);
+        assert_eq!(fields["http2_goaway"], false);
+        assert_eq!(fields["http2_reason"], "Some(1)");
+        assert_eq!(fields["wire_delivery_state"], "unknown");
+        assert_eq!(fields["request_body_consumed_bytes"], 11);
+        assert_eq!(
+            fields["body_consumption_scope"],
+            "transport_body_poll_not_wire_commit"
+        );
+        assert_eq!(
+            fields["client_identity_scope"],
+            "cached_client_not_connection_or_stream"
+        );
+    }
+}
+
+#[tokio::test]
+async fn generic_errors_do_not_create_h2_origin_or_log_raw_error() {
+    let evidence = http2_attempt_evidence();
+    let writer = Http2EvidenceWriter::default();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let error = std::io::Error::other("RAW_ERROR_CANARY");
+        evidence.observe_error(&error, true);
+        evidence.observe_error(&error, false);
+    });
+    assert!(writer.0.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn native_request_991089_tls_encoded_contract() {
     const LENGTH: usize = 991_089;
