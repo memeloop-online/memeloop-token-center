@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use super::*;
 
+mod cost_only;
 mod exact_scope;
 pub use exact_scope::{
     FailedRequestCostBackfillExactManifest, FailedRequestCostBackfillExactReport,
@@ -214,15 +215,25 @@ impl Database {
             input.batch_size.saturating_add(1),
         )
         .await?;
-        apply_candidates(transaction, candidates, input.batch_size, false).await
+        apply_candidates(
+            transaction,
+            candidates,
+            input.batch_size,
+            false,
+            false,
+            std::future::ready(()),
+        )
+        .await
     }
 }
 
-async fn apply_candidates(
+async fn apply_candidates<BeforeCommit: std::future::Future<Output = ()>>(
     mut transaction: Transaction<'_, Any>,
     candidates: Vec<Candidate>,
     batch_size: i64,
     exact: bool,
+    cost_only: bool,
+    before_commit: BeforeCommit,
 ) -> Result<FailedRequestCostBackfillReport, AppError> {
     let (candidates, mut report) = prepare_batch(candidates, batch_size, true);
     if candidates.is_empty() {
@@ -295,6 +306,13 @@ async fn apply_candidates(
                 .saturating_sub(candidate.cost_micros),
         );
         changed.push(candidate);
+    }
+
+    if cost_only {
+        cost_only::subtract_costs(&mut transaction, &changed).await?;
+        before_commit.await;
+        transaction.commit().await?;
+        return Ok(report);
     }
 
     let usage_daily_keys = changed
@@ -950,6 +968,8 @@ async fn rebuild_analysis(
 
 #[cfg(test)]
 mod tests {
+    mod cost_only_concurrency;
+
     use rust_decimal::Decimal;
     use url::Url;
 
@@ -1613,6 +1633,23 @@ mod tests {
                 fixture.key.key_id.to_string(),
             ),
             ("credit_accounts", "id", fixture.account_id.to_string()),
+            ("generation_jobs", "key_id", fixture.key.key_id.to_string()),
+            ("key_budget_state", "key_id", fixture.key.key_id.to_string()),
+            (
+                "key_budget_daily_rollups",
+                "key_id",
+                fixture.key.key_id.to_string(),
+            ),
+            (
+                "key_budget_usage_events",
+                "key_id",
+                fixture.key.key_id.to_string(),
+            ),
+            (
+                "account_usage_state",
+                "account_id",
+                fixture.account_id.to_string(),
+            ),
         ] {
             let columns: Vec<String> = sqlx::query_scalar(match fixture.database.backend {
                 DatabaseBackend::Sqlite => "SELECT name FROM pragma_table_info($1) ORDER BY cid",
@@ -1907,6 +1944,202 @@ mod tests {
         );
         let fixture = fixture(&database_url, Some(directory)).await;
         exercise_exact_manifest(&fixture).await;
+        exercise_cost_only_manifest(&fixture).await;
+    }
+
+    async fn statistics_non_cost_rows(fixture: &Fixture) -> Vec<Vec<Vec<Option<String>>>> {
+        let mut snapshot = Vec::new();
+        for table in cost_only::TABLES.into_iter().chain(["request_stats_facts"]) {
+            let columns: Vec<String> = sqlx::query_scalar(match fixture.database.backend {
+                DatabaseBackend::Sqlite => "SELECT name FROM pragma_table_info($1) WHERE name <> 'cost_micros' ORDER BY cid",
+                DatabaseBackend::PostgreSql => "SELECT column_name::text FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name <> 'cost_micros' ORDER BY ordinal_position",
+            }).bind(table).fetch_all(&fixture.database.pool).await.unwrap();
+            assert!(!columns.is_empty());
+            let selection = columns
+                .iter()
+                .map(|column| format!("CAST(\"{}\" AS TEXT)", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ordering = (1..=columns.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT {selection} FROM {table} WHERE key_id = $1 ORDER BY {ordering}"
+            )))
+            .bind(fixture.key.key_id.to_string())
+            .fetch_all(&fixture.database.pool)
+            .await
+            .unwrap();
+            snapshot.push(
+                rows.into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index).unwrap())
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
+        snapshot
+    }
+
+    async fn exercise_cost_only_manifest(fixture: &Fixture) {
+        let manifest = exact_manifest_for(fixture).await;
+        let financial_before = financial_rows(fixture).await;
+        let non_cost_before = statistics_non_cost_rows(fixture).await;
+        let costs_before = aggregate_costs(fixture).await;
+        let reduction = manifest
+            .requests
+            .iter()
+            .map(|row| row.expected_cost_micros)
+            .sum::<i64>();
+        let preview = fixture
+            .database
+            .backfill_failed_request_costs_exact_cost_only(manifest.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(preview.projection_mode, "cost-only");
+        assert_eq!(preview.backfill.candidate_rows, 6);
+        assert_eq!(financial_rows(fixture).await, financial_before);
+        let mut drift = manifest.clone();
+        drift.requests[0].expected_cost_micros += 1;
+        assert!(
+            fixture
+                .database
+                .backfill_failed_request_costs_exact_cost_only(drift, true)
+                .await
+                .is_err()
+        );
+        for usage_basis in [None, Some("provider_reported"), Some("not_observed")] {
+            sqlx::query("UPDATE request_records SET usage_basis = $1 WHERE id = $2")
+                .bind(usage_basis)
+                .bind(&manifest.requests[0].request_id)
+                .execute(&fixture.database.pool)
+                .await
+                .unwrap();
+            let rejected_financial = financial_rows(fixture).await;
+            assert!(
+                fixture
+                    .database
+                    .backfill_failed_request_costs_exact_cost_only(manifest.clone(), true)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(financial_rows(fixture).await, rejected_financial);
+            assert_eq!(aggregate_costs(fixture).await, costs_before);
+        }
+        sqlx::query("UPDATE request_records SET usage_basis = 'contract_ceiling' WHERE id = $1")
+            .bind(&manifest.requests[0].request_id)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE usage_analysis_daily SET cost_micros = 0 WHERE key_id = $1")
+            .bind(fixture.key.key_id.to_string())
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        let insufficient_costs = aggregate_costs(fixture).await;
+        let error = fixture
+            .database
+            .backfill_failed_request_costs_exact_cost_only(manifest.clone(), true)
+            .await
+            .unwrap_err();
+        let AppError::Conflict(message) = error else {
+            panic!("expected bounded aggregate conflict")
+        };
+        assert!(message.contains("stage=aggregate_cost_delta"));
+        assert!(message.contains("dimension=usage_analysis_daily"));
+        assert!(!message.contains(&fixture.model));
+        assert!(!message.contains(&manifest.tenant_id));
+        assert!(
+            manifest
+                .requests
+                .iter()
+                .all(|request| !message.contains(&request.request_id))
+        );
+        assert_eq!(aggregate_costs(fixture).await, insufficient_costs);
+        assert_eq!(statistics_non_cost_rows(fixture).await, non_cost_before);
+        assert_eq!(financial_rows(fixture).await, financial_before);
+        let markers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_cost_projection_corrections WHERE request_id = $1",
+        )
+        .bind(&manifest.requests[0].request_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .unwrap();
+        assert_eq!(markers, 0);
+        let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
+        let candidates = select_candidates(
+            &mut transaction,
+            fixture.database.backend,
+            0,
+            i64::MAX,
+            &[],
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        let keys = candidates
+            .iter()
+            .map(|candidate| AnalysisKey::from_candidate(candidate, 86_400_000))
+            .collect::<HashSet<_>>();
+        for key in &keys {
+            rebuild_analysis(
+                &mut transaction,
+                key,
+                "usage_analysis_daily",
+                "day_bucket",
+                86_400_000,
+            )
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+        assert_eq!(aggregate_costs(fixture).await, costs_before);
+        let writer = if matches!(fixture.database.backend, DatabaseBackend::PostgreSql) {
+            let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
+            lock_request_stats_projection_writer_in_transaction(&mut transaction)
+                .await
+                .unwrap();
+            Some(transaction)
+        } else {
+            None
+        };
+        let applied = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture
+                .database
+                .backfill_failed_request_costs_exact_cost_only(manifest.clone(), true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(applied.backfill.changed_rows, 6);
+        assert_eq!(applied.backfill.request_daily_dimensions_rebuilt, 0);
+        if let Some(transaction) = writer {
+            transaction.commit().await.unwrap();
+        }
+        assert_eq!(
+            aggregate_costs(fixture).await,
+            costs_before
+                .iter()
+                .map(|cost| cost - reduction)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(financial_rows(fixture).await, financial_before);
+        assert_eq!(statistics_non_cost_rows(fixture).await, non_cost_before);
+        let costs_after = aggregate_costs(fixture).await;
+        let replay = fixture
+            .database
+            .backfill_failed_request_costs_exact_cost_only(manifest, true)
+            .await
+            .unwrap();
+        assert_eq!(replay.already_projected_rows, 6);
+        assert_eq!(replay.backfill.changed_rows, 0);
+        assert_eq!(aggregate_costs(fixture).await, costs_after);
+        assert_eq!(financial_rows(fixture).await, financial_before);
     }
 
     async fn exercise_provider_reported_fact_repair(fixture: &Fixture) {
@@ -2049,8 +2282,40 @@ mod tests {
         fixture: &Fixture,
         database_url: &str,
         observer: &AnyPool,
+        cost_only: bool,
     ) {
-        seed_historical_case(fixture, 503, None, Some(RequestUsageBasis::ContractCeiling)).await;
+        let (historical_id, historical_cost) = seed_historical_case(
+            fixture,
+            if cost_only { 499 } else { 503 },
+            if cost_only {
+                Some("client_cancelled")
+            } else {
+                None
+            },
+            Some(RequestUsageBasis::ContractCeiling),
+        )
+        .await;
+        let manifest = if cost_only {
+            let created_at: i64 =
+                sqlx::query_scalar("SELECT created_at FROM request_records WHERE id = $1")
+                    .bind(historical_id.to_string())
+                    .fetch_one(&fixture.database.pool)
+                    .await
+                    .unwrap();
+            Some(FailedRequestCostBackfillExactManifest {
+                tenant_id: fixture.key.tenant_id.to_string(),
+                currency: "USD".into(),
+                requests: vec![FailedRequestCostBackfillExpectedRequest {
+                    request_id: historical_id.to_string(),
+                    created_at,
+                    expected_cost_micros: historical_cost,
+                    expected_status_code: 499,
+                    expected_error_code: Some("client_cancelled".into()),
+                }],
+            })
+        } else {
+            None
+        };
         let writer_request_id = Uuid::now_v7();
         let writer = Database::connect_with_max(database_url, 1).await.unwrap();
         let reservation = writer
@@ -2083,9 +2348,11 @@ mod tests {
             .execute(&fixture.database.pool)
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TRIGGER mtc_pause_failed_cost_writer AFTER INSERT ON request_stats_facts FOR EACH ROW EXECUTE FUNCTION mtc_pause_failed_cost_writer()",
-        )
+        sqlx::query(if cost_only {
+            "CREATE TRIGGER mtc_pause_failed_cost_writer AFTER UPDATE ON usage_daily_aggregates FOR EACH ROW WHEN (NEW.requests > OLD.requests) EXECUTE FUNCTION mtc_pause_failed_cost_writer()"
+        } else {
+            "CREATE TRIGGER mtc_pause_failed_cost_writer AFTER INSERT ON request_stats_facts FOR EACH ROW EXECUTE FUNCTION mtc_pause_failed_cost_writer()"
+        })
         .execute(&fixture.database.pool)
         .await
         .unwrap();
@@ -2117,14 +2384,18 @@ mod tests {
                     input_token_ceiling: 10,
                     output_token_ceiling: 10,
                     requested_service_tier: None,
-                    status_code: 503,
+                    status_code: if cost_only { 499 } else { 503 },
                     duration_ms: 25,
                     usage: TokenUsage {
                         input_tokens: 7,
                         output_tokens: 3,
                         ..TokenUsage::default()
                     },
-                    error_code: None,
+                    error_code: if cost_only {
+                        Some("client_cancelled")
+                    } else {
+                        None
+                    },
                     response_object,
                     routing_session_id: None,
                     routing_terminal_observed_at: None,
@@ -2140,6 +2411,12 @@ mod tests {
             .await
             .unwrap();
         let backfill_task = tokio::spawn(async move {
+            if let Some(manifest) = manifest {
+                return backfill
+                    .backfill_failed_request_costs_exact_cost_only(manifest, true)
+                    .await
+                    .map(|report| report.backfill);
+            }
             backfill
                 .backfill_failed_request_costs(FailedRequestCostBackfillInput {
                     apply: true,
@@ -2166,10 +2443,14 @@ mod tests {
                 .into_iter()
                 .all(|cost| cost == writer_cost)
         );
-        sqlx::query("DROP TRIGGER mtc_pause_failed_cost_writer ON request_stats_facts")
-            .execute(&fixture.database.pool)
-            .await
-            .unwrap();
+        sqlx::query(if cost_only {
+            "DROP TRIGGER mtc_pause_failed_cost_writer ON usage_daily_aggregates"
+        } else {
+            "DROP TRIGGER mtc_pause_failed_cost_writer ON request_stats_facts"
+        })
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
         sqlx::query("DROP FUNCTION mtc_pause_failed_cost_writer()")
             .execute(&fixture.database.pool)
             .await
@@ -2500,6 +2781,7 @@ mod tests {
             .append_pair("options", &format!("-c search_path={exact_schema}"));
         let exact_fixture = fixture(exact_isolated.as_str(), None).await;
         exercise_exact_manifest(&exact_fixture).await;
+        exercise_cost_only_manifest(&exact_fixture).await;
         exact_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SCHEMA {exact_schema} CASCADE"
@@ -2510,15 +2792,30 @@ mod tests {
         let provider_fixture = fixture(isolated.as_str(), None).await;
         exercise_provider_reported_fact_repair(&provider_fixture).await;
         let concurrency_fixture = fixture(isolated.as_str(), None).await;
-        exercise_postgres_projection_serialization(&concurrency_fixture, isolated.as_str(), &admin)
-            .await;
+        exercise_postgres_projection_serialization(
+            &concurrency_fixture,
+            isolated.as_str(),
+            &admin,
+            false,
+        )
+        .await;
+        let cost_only_concurrency_fixture = fixture(isolated.as_str(), None).await;
+        exercise_postgres_projection_serialization(
+            &cost_only_concurrency_fixture,
+            isolated.as_str(),
+            &admin,
+            true,
+        )
+        .await;
         contract_fixture.database.close().await;
         provider_fixture.database.close().await;
         concurrency_fixture.database.close().await;
+        cost_only_concurrency_fixture.database.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await
             .unwrap();
+        cost_only_concurrency::exercise_postgres_contribution_matrix(&database_url, &admin).await;
         admin.close().await;
     }
 }
