@@ -54,6 +54,7 @@ async fn receive_paced_upload(
         assert!(!request.headers().contains_key(forbidden));
     }
     let big = expected == PROD_MAGNITUDE;
+    let sibling = expected == SIBLING;
     let mut body = request.into_body();
     let stream_id = body.stream_id().as_u32();
     let mut received_bytes = 0;
@@ -76,9 +77,10 @@ async fn receive_paced_upload(
     assert!(body.trailers().await.unwrap().is_none());
     assert!(body.is_end_stream());
     assert_eq!(received_bytes, expected);
-    if !big {
-        // The sibling must respond while the big upload is still in flight,
-        // proving real stream overlap on the reused connection.
+    if sibling {
+        // Only the concurrent sibling waits for overlap; the prime request
+        // opens the connection before the big upload exists and must respond
+        // immediately.
         big_started.notified().await;
         sleep(Duration::from_millis(200)).await;
         assert!(
