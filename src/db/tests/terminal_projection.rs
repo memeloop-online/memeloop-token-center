@@ -4,6 +4,7 @@ use std::time::Duration;
 
 mod cache_coverage;
 mod semantic_isolation;
+mod semantic_retry;
 
 async fn admitted(
     database: &Database,
