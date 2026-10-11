@@ -69,6 +69,11 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).click();
     await page.setViewportSize({ width: 1440, height: 1000 });
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
+    await page.locator('.provider-detail-workspace').waitFor();
+    assert.equal(await page.locator('.create-journey').count(), 0, 'the list-level add entry is not rendered while an account workspace is shown');
+    assert.equal(await page.locator('.provider-layout > *:visible').first().getAttribute('class'), 'provider-detail-workspace', 'the account workspace with its return navigation is the first content layer');
+    await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).click();
+    await page.locator('.create-journey [data-workspace-toggle]').waitFor();
     await page.locator('.create-journey [data-workspace-toggle]').click();
     assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'creating uses the sole work area');
     assert.equal(await row.isVisible(), false, 'the directory is hidden while creating');

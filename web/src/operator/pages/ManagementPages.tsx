@@ -652,7 +652,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       })}</div>
     </article>
     {detailAccount && renderAccountDetails(detailAccount)}
-    {rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
+    {!detailAccount && (rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
       if (!ownsWorkspace()) return;
       returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
       const returnedGeneration = workspaceGeneration.current;
@@ -678,7 +678,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         openAccount(account);
         setMessage(t('providers.created', { name: account.name }));
       }} />}</>}
-    </CreateJourney>}
+    </CreateJourney>)}
   </section></TransportProxyGroups>;
 }
 
