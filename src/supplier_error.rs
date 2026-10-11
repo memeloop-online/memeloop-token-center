@@ -60,7 +60,7 @@ impl SafeReason {
             "no_active_plan" | "NoAvailablePlan" | "NoActivePlan" | "NoPlan" => {
                 Some(Self::NoActivePlan)
             }
-            "insufficient_quota" => Some(Self::InsufficientQuota),
+            "insufficient_quota" | "insufficient_user_quota" => Some(Self::InsufficientQuota),
             "authentication_invalid" | "invalid_api_key" => Some(Self::AuthenticationInvalid),
             "authentication_expired" | "api_key_expired" | "token_expired" => {
                 Some(Self::AuthenticationExpired)
@@ -77,9 +77,10 @@ impl SafeReason {
             "当前账号没有可用套餐" | "No active plan" | "No available plan" => {
                 Some(Self::NoActivePlan)
             }
-            "Quota exhausted" | "Quota exhausted for this account" | "Insufficient quota" => {
-                Some(Self::InsufficientQuota)
-            }
+            "Quota exhausted"
+            | "Quota exhausted for this account"
+            | "Insufficient quota"
+            | "用户额度不足" => Some(Self::InsufficientQuota),
             "Invalid API key" | "Invalid authentication credentials" => {
                 Some(Self::AuthenticationInvalid)
             }
@@ -351,8 +352,37 @@ mod tests {
     }
 
     #[test]
+    fn user_quota_code_retains_only_verified_provider_detail() {
+        let message = "用户额度不足, 剩余额度: ＄-0.000160 (request id: quota-fixture)";
+        assert_eq!(SafeReason::from_supplier(None, Some(message)), None);
+        assert_eq!(
+            SafeReason::from_supplier(Some("insufficient_user_quota"), Some(message)),
+            Some(SafeReason::InsufficientQuota)
+        );
+        assert_eq!(
+            SafeReason::InsufficientQuota
+                .provider_detail(Some("insufficient_user_quota"), Some(message)),
+            (Some("insufficient_user_quota"), None)
+        );
+        assert_eq!(
+            SafeReason::InsufficientQuota
+                .provider_detail(Some("insufficient_user_quota"), Some("用户额度不足")),
+            (Some("insufficient_user_quota"), Some("用户额度不足"))
+        );
+        assert_eq!(
+            SafeReason::from_supplier(Some("insufficient_user_quota"), Some("Invalid API key")),
+            None
+        );
+    }
+
+    #[test]
     fn provider_detail_is_revalidated_and_legacy_envelopes_remain_readable() {
         for (reason, code, message) in [
+            (
+                SafeReason::InsufficientQuota,
+                "insufficient_user_quota",
+                "用户额度不足",
+            ),
             (
                 SafeReason::NoActivePlan,
                 "NoAvailablePlan",

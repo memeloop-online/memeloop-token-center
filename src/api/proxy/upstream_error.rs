@@ -173,6 +173,11 @@ mod tests {
                 SafeReason::InsufficientQuota,
             ),
             (
+                "insufficient_user_quota",
+                "private partial prompt",
+                SafeReason::InsufficientQuota,
+            ),
+            (
                 "invalid_api_key",
                 "Bearer caller-canary",
                 SafeReason::AuthenticationInvalid,
@@ -308,6 +313,48 @@ mod tests {
             fallback_body()
         );
         assert_eq!(safe_error_body(&serde_json::to_vec(&json!({"error": {"code": "NoAvailablePlan", "message": "x".repeat(MAX_ERROR_BYTES)}})).unwrap()), fallback_body());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_user_quota_json_reaches_allowlist_without_a_read_timeout() {
+        let message = "用户额度不足, 剩余额度: ＄-0.000160 (request id: quota-fixture)";
+        assert_eq!(SafeReason::from_supplier(None, Some(message)), None);
+        for code in ["insufficient_user_quota", "unknown_user_quota"] {
+            let raw = serde_json::to_vec(&json!({"error": {
+                "code":code,"message":message,"type":"openai_error",
+                "debug":"Authorization: Bearer private-canary"
+            }}))
+            .unwrap();
+            let started = tokio::time::Instant::now();
+            let length = raw.len() as u64;
+            let result = read_rejection(response(
+                StatusCode::FORBIDDEN,
+                "application/json",
+                Some(length),
+                Box::pin(stream::iter(vec![Ok(Bytes::from(raw))])),
+            ))
+            .await;
+            assert_eq!(tokio::time::Instant::now(), started);
+            assert_eq!(result.terminal_cause, None);
+            if code == "insufficient_user_quota" {
+                let value: Value = serde_json::from_slice(&result.body).unwrap();
+                assert_eq!(value["error"]["code"], "insufficient_quota");
+                assert_eq!(
+                    value["error"]["message"],
+                    "The upstream account has insufficient quota"
+                );
+                assert_eq!(
+                    value["error"]["mtc_provider_code"],
+                    "insufficient_user_quota"
+                );
+                assert!(value["error"].get("mtc_provider_message").is_none());
+                for private in ["private-canary", "-0.000160", "quota-fixture"] {
+                    assert!(!String::from_utf8_lossy(&result.body).contains(private));
+                }
+            } else {
+                assert_eq!(result.body, fallback_body());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
