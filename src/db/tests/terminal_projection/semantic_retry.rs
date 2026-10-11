@@ -261,6 +261,34 @@ async fn retry_contract(database_url: &str) {
         .unwrap();
         complete(&database, request_id, &reservation, owner).await;
     }
+    let (_key, reservation, request_id, owner) = pending(&database).await;
+    let original_expiry = expiry(&database, request_id).await;
+    sqlx::raw_sql("CREATE FUNCTION reject_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '55P03', MESSAGE = 'injected retryable observation statement'; END $$; CREATE TRIGGER reject_observation BEFORE INSERT ON conversation_observations FOR EACH ROW EXECUTE FUNCTION reject_observation();")
+        .execute(&blockers).await.unwrap();
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .is_err()
+    );
+    let retry_expiry = expiry(&database, request_id).await;
+    assert!(retry_expiry < original_expiry);
+    assert!(retry_expiry > unix_millis() && retry_expiry <= unix_millis() + 1000);
+    retained(&database, request_id, retry_expiry).await;
+    sqlx::raw_sql("DROP TRIGGER reject_observation ON conversation_observations; DROP FUNCTION reject_observation();")
+        .execute(&blockers).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let next_owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(next_owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+    );
+    complete(&database, request_id, &reservation, next_owner).await;
+
     let (key, reservation, request_id, owner) = pending(&database).await;
     let original_expiry = expiry(&database, request_id).await;
     sqlx::raw_sql("CREATE FUNCTION reject_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '55P03', MESSAGE = 'injected retryable ACK statement'; END $$; CREATE TRIGGER reject_ack BEFORE UPDATE OF projected_at ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_ack();")

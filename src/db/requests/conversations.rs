@@ -633,6 +633,7 @@ impl Database {
     ) -> Result<Uuid, AppError> {
         self.record_conversation_observation_with_snapshot_in_transaction(transaction, input, None)
             .await
+            .map_err(Into::into)
     }
 
     async fn record_conversation_observation_with_snapshot_in_transaction(
@@ -640,7 +641,7 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         input: ConversationObservationInput<'_>,
         snapshot: Option<&ConversationSemanticSnapshot>,
-    ) -> Result<Uuid, AppError> {
+    ) -> Result<Uuid, ConversationContentError> {
         let ConversationObservationInput {
             key,
             request_id,
@@ -679,7 +680,7 @@ impl Database {
             if locator.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
                 || locator.try_get::<String, _>("key_id")? != key.key_id.to_string()
             {
-                return Err(AppError::NotFound);
+                return Err(AppError::NotFound.into());
             }
             Some(locator.try_get::<i64, _>("created_at")?)
         } else {
@@ -697,7 +698,7 @@ impl Database {
                 .await?;
                 if source.is_none() && sqlx::query("SELECT request_id FROM terminal_projection_outbox WHERE request_id = $1 AND created_at = $2")
                     .bind(&request_id).bind(request_created_at).fetch_optional(&mut **transaction).await?.is_none() {
-                    return Err(AppError::NotFound);
+                    return Err(AppError::NotFound.into());
                 }
             }
             sqlx::query_scalar::<_, i64>(
@@ -1056,7 +1057,7 @@ impl Database {
             let snapshot = sqlx::query("UPDATE terminal_projection_outbox SET session_id = $1 WHERE request_id = $2 AND created_at = $3")
                 .bind(cluster_id.to_string()).bind(&request_id).bind(request_created_at).execute(&mut **transaction).await?;
             if attached.rows_affected() != 1 && snapshot.rows_affected() != 1 {
-                return Err(AppError::Internal);
+                return Err(AppError::Internal.into());
             }
             if request_fact_exists {
                 reclassify_request_session_in_transaction(
