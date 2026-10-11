@@ -237,6 +237,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').scrollIntoViewIfNeeded();
+      await row.locator('.request-token-total').hover();
       await page.evaluate(`(() => {
         const started = performance.now();
         const events = [];
