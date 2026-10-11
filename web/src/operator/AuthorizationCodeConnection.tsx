@@ -90,6 +90,8 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
         if (existing && isAuthorizationIdentityMismatch(reason)) {
           setSession(undefined); setRecoveryDeadline(undefined); setError(copy.identityMismatch);
         } else if (fragmentManual && !continueIssued && isFragmentManualCodeRejection(reason)) {
+          // Exact pre-exchange rejection: the host released the lease without exchanging, so the same session stays paste-ready. Never reopened for unknown, network, or post-exchange outcomes.
+          consumed.current = false; setSubmitted(false);
           setError(copy.codeRejected);
         } else setError(continueIssued ? copy.continueFailed : copy.uncertain);
       }

@@ -41,7 +41,7 @@ test('generic OAuth help does not assume Google and continuation uses user-facin
     assert.match(authorizationCodeCopy(locale, 'google-antigravity', true).reauthorizeHelp, /Google/);
     assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin', true).identityMismatch, /Google/);
     assert.match(authorizationCodeCopy(locale, 'google-antigravity', true).identityMismatch, /Google/);
-    assert.match(authorizationCodeCopy(locale, 'fixture-plugin').codePasteHelp, /code#state/);
+    assert.match(authorizationCodeCopy(locale, 'fixture-plugin').codePasteHelp, locale === 'en' ? /code#state/ : /授权码#状态/);
     assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin').codeRejected, /invalid_request|OAuth completion must be/);
   }
 });
