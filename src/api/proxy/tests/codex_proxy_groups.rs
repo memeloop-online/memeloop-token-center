@@ -351,6 +351,68 @@ async fn connection_failures_visit_each_group_member_once() {
 }
 
 #[tokio::test]
+async fn unavailable_proxy_selection_never_sends_or_marks_account_failure() {
+    let mut fixture = fixture("unavailable-proxy-selection").await;
+    fixture.state.transport_proxy_groups = std::sync::Arc::new(
+        crate::db::TransportProxyGroups::parse(
+            &json!([{
+                "account_id": fixture.upstream_account_id,
+                "version": 1,
+                "proxies": [BACKUP]
+            }])
+            .to_string(),
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .unwrap(),
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT credential_generation FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (response, remaining) = routing::with_test_send_failures(
+        vec![ProxySendError::AmbiguousResponse(
+            "POST_MUST_NOT_BE_SENT_CANARY",
+        )],
+        send_codex_route_to_endpoint(
+            &fixture,
+            codex_transport::BASE_URL.to_owned(),
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "BODY_CANARY", "stream": false}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(remaining, 1);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("no healthy upstream"));
+    assert!(!text.contains("CANARY"));
+    assert!(!text.contains(PRIMARY));
+    assert!(!text.contains(BACKUP));
+    let after: i64 =
+        sqlx::query_scalar("SELECT credential_generation FROM upstream_accounts WHERE id = $1")
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failures, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn ambiguous_delivery_never_replays_or_changes_group_selection() {
     for (index, error) in [
         ProxySendError::NonRetryableTransport(routing::TransportFailureKind::Timeout),
