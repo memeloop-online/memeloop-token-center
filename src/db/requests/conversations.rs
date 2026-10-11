@@ -1850,6 +1850,13 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     lifecycle_state: match status_code {
                         None => crate::model::RequestLifecycleState::Pending,
                         Some(499) => crate::model::RequestLifecycleState::Cancelled,
+                        Some(code)
+                            if (200..400).contains(&code)
+                                && row.try_get::<Option<String>, _>("error_code")?.as_deref()
+                                    == Some("upstream_incomplete_response") =>
+                        {
+                            crate::model::RequestLifecycleState::Failed
+                        }
                         Some(code) if (200..400).contains(&code) => {
                             crate::model::RequestLifecycleState::Succeeded
                         }

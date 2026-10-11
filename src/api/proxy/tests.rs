@@ -3964,7 +3964,13 @@ async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
         json!({"model": fixture.model, "input": "long response", "stream": false}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "incomplete");
+    assert_eq!(value["incomplete_details"]["reason"], "max_output_tokens");
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
@@ -3972,7 +3978,11 @@ async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(
+        rows[0].lifecycle_state,
+        crate::model::RequestLifecycleState::Failed
+    );
     assert_eq!(
         rows[0].error_code.as_deref(),
         Some("upstream_incomplete_response")

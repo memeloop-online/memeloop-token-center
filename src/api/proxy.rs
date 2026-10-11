@@ -638,19 +638,14 @@ async fn finish_non_sse_proxy_response(
         _ => Ok(()),
     };
     if let Err(error_code) = validation {
-        if matches!(protocol, Protocol::OpenAiResponses)
+        if status == StatusCode::OK
+            && matches!(protocol, Protocol::OpenAiResponses)
             && let Some(usage) = trusted_buffered_responses_incomplete_usage(&response_body)
         {
-            // A provider-declared terminal is not a successful completion, but
-            // its complete counters must not be discarded as unobserved usage.
-            // This is the same atomic buffered settlement used for success;
-            // neither the response status nor retry eligibility is promoted.
             let result = finish_buffered_request(
                 buffered_request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
-                ),
+                status,
+                response_body,
                 "application/json",
                 (usage, crate::model::RequestUsageBasis::ProviderReported),
                 Some("upstream_incomplete_response".to_owned()),
@@ -1922,6 +1917,16 @@ async fn proxy_with_cancellation_guard(
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
+            let (response_status, response_body) = if status == StatusCode::OK {
+                (StatusCode::OK, buffered.body)
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
+                    ),
+                )
+            };
             buffer_phase.finish(
                 "upstream_incomplete_response",
                 Some(200),
@@ -1929,10 +1934,8 @@ async fn proxy_with_cancellation_guard(
             );
             let result = finish_buffered_request(
                 &buffered_request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
-                ),
+                response_status,
+                response_body,
                 "application/json",
                 (
                     buffered.usage,
