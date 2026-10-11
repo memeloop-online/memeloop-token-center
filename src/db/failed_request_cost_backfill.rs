@@ -729,12 +729,21 @@ fn canonical_protocol(protocol: &str) -> &str {
     }
 }
 
-async fn rebuild_usage_daily(
-    tx: &mut Transaction<'_, Any>,
-    key: &UsageDailyKey,
-) -> Result<(), AppError> {
-    sqlx::query(
-        r#"INSERT INTO usage_daily_aggregates (
+fn bucket_time_bounds(bucket: i64, divisor: i64) -> (i64, i64) {
+    let bucket = i128::from(bucket);
+    let divisor = i128::from(divisor);
+    let (start, end) = if bucket > 0 {
+        (bucket * divisor, (bucket + 1) * divisor - 1)
+    } else if bucket < 0 {
+        ((bucket - 1) * divisor + 1, bucket * divisor)
+    } else {
+        (1 - divisor, divisor - 1)
+    };
+    let clamp = |value: i128| value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    (clamp(start), clamp(end))
+}
+
+const REBUILD_USAGE_DAILY_SQL: &str = r#"INSERT INTO usage_daily_aggregates (
                key_id, day_bucket, model, status_class, error_code, requests,
                input_tokens, output_tokens, cost_micros)
            SELECT key_id, created_at / 86400000, model, status_class, error_code,
@@ -743,22 +752,29 @@ async fn rebuild_usage_daily(
                   SUM(CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END),
                   SUM(cost_micros)
              FROM request_stats_facts
-            WHERE key_id = $1 AND created_at / 86400000 = $2 AND model = $3
+            WHERE key_id = $1 AND created_at BETWEEN $2 AND $6 AND model = $3
               AND status_class = $4 AND error_code = $5
             GROUP BY key_id, created_at / 86400000, model, status_class, error_code
            ON CONFLICT (key_id, day_bucket, model, status_class, error_code) DO UPDATE SET
                requests = excluded.requests,
                input_tokens = excluded.input_tokens,
                output_tokens = excluded.output_tokens,
-               cost_micros = excluded.cost_micros"#,
-    )
-    .bind(&key.key_id)
-    .bind(key.day_bucket)
-    .bind(&key.model)
-    .bind(&key.status_class)
-    .bind(&key.error_code)
-    .execute(&mut **tx)
-    .await?;
+               cost_micros = excluded.cost_micros"#;
+
+async fn rebuild_usage_daily(
+    tx: &mut Transaction<'_, Any>,
+    key: &UsageDailyKey,
+) -> Result<(), AppError> {
+    let (from_created_at, through_created_at) = bucket_time_bounds(key.day_bucket, 86_400_000);
+    sqlx::query(REBUILD_USAGE_DAILY_SQL)
+        .bind(&key.key_id)
+        .bind(from_created_at)
+        .bind(&key.model)
+        .bind(&key.status_class)
+        .bind(&key.error_code)
+        .bind(through_created_at)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -766,6 +782,7 @@ async fn rebuild_request_daily(
     tx: &mut Transaction<'_, Any>,
     key: &RequestDailyKey,
 ) -> Result<(), AppError> {
+    let (from_created_at, through_created_at) = bucket_time_bounds(key.day_bucket, 86_400_000);
     sqlx::query(
         r#"INSERT INTO request_daily_aggregates (
                tenant_id, key_id, day_bucket, model, protocol, status_class, error_code,
@@ -784,7 +801,7 @@ async fn rebuild_request_daily(
                   SUM(CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END), SUM(COALESCE(cache_known_read_tokens, 0)), SUM(CASE WHEN cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END), COUNT(*),
                   SUM(duration_ms), SUM(cost_micros)
              FROM request_stats_facts
-            WHERE tenant_id = $1 AND key_id = $2 AND created_at / 86400000 = $3
+            WHERE tenant_id = $1 AND key_id = $2 AND created_at BETWEEN $3 AND $12
               AND model = $4 AND protocol = $5 AND status_class = $6 AND error_code = $7
               AND upstream_account_id = $8 AND model_route_id = $9 AND service_tier = $10
               AND currency = $11
@@ -810,7 +827,7 @@ async fn rebuild_request_daily(
     )
     .bind(&key.tenant_id)
     .bind(&key.key_id)
-    .bind(key.day_bucket)
+    .bind(from_created_at)
     .bind(&key.model)
     .bind(&key.protocol)
     .bind(&key.status_class)
@@ -819,6 +836,7 @@ async fn rebuild_request_daily(
     .bind(&key.model_route_id)
     .bind(&key.service_tier)
     .bind(&key.currency)
+    .bind(through_created_at)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -831,6 +849,7 @@ async fn rebuild_analysis(
     bucket_column: &str,
     divisor: i64,
 ) -> Result<(), AppError> {
+    let (from_created_at, through_created_at) = bucket_time_bounds(key.bucket, divisor);
     let statement = format!(
         r#"INSERT INTO {table} (
                tenant_id, key_id, {bucket_column}, source_kind, model, protocol, status_class,
@@ -867,7 +886,7 @@ async fn rebuild_analysis(
                   SUM(CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END),
                   SUM(cost_micros)
              FROM request_stats_facts
-            WHERE tenant_id = $1 AND key_id = $2 AND created_at / {divisor} = $3
+            WHERE tenant_id = $1 AND key_id = $2 AND created_at BETWEEN $3 AND $13
               AND (CASE WHEN protocol = 'audio-transcription' THEN 'generation' ELSE 'request' END) = $4
               AND model = $5
               AND (CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%' THEN 'anthropic'
@@ -913,7 +932,7 @@ async fn rebuild_analysis(
     sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(&key.tenant_id)
         .bind(&key.key_id)
-        .bind(key.bucket)
+        .bind(from_created_at)
         .bind(&key.source_kind)
         .bind(&key.model)
         .bind(&key.protocol)
@@ -923,6 +942,7 @@ async fn rebuild_analysis(
         .bind(&key.model_route_id)
         .bind(&key.service_tier)
         .bind(&key.currency)
+        .bind(through_created_at)
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -943,6 +963,233 @@ mod tests {
         key: AuthenticatedKey,
         model: String,
         price: ModelPrice,
+    }
+
+    #[test]
+    fn bucket_bounds_preserve_truncated_division_at_signed_time_limits() {
+        for divisor in [3_600_000, 86_400_000] {
+            assert_eq!(bucket_time_bounds(0, divisor), (1 - divisor, divisor - 1));
+            assert_eq!(bucket_time_bounds(1, divisor), (divisor, 2 * divisor - 1));
+            assert_eq!(bucket_time_bounds(-1, divisor), (1 - 2 * divisor, -divisor));
+            for created_at in [
+                i64::MIN,
+                i64::MIN + 1,
+                -2 * divisor - 1,
+                -2 * divisor,
+                -divisor - 1,
+                -divisor,
+                -divisor + 1,
+                -1,
+                0,
+                1,
+                divisor - 1,
+                divisor,
+                divisor + 1,
+                2 * divisor - 1,
+                2 * divisor,
+                i64::MAX - 1,
+                i64::MAX,
+            ] {
+                let bucket = created_at / divisor;
+                let (start, end) = bucket_time_bounds(bucket, divisor);
+                assert!((start..=end).contains(&created_at));
+                assert_eq!(start / divisor, bucket);
+                assert_eq!(end / divisor, bucket);
+                if let Some(previous) = start.checked_sub(1) {
+                    assert_ne!(previous / divisor, bucket);
+                }
+                if let Some(next) = end.checked_add(1) {
+                    assert_ne!(next / divisor, bucket);
+                }
+            }
+        }
+    }
+
+    async fn exercise_usage_daily_index_plan(fixture: &Fixture) {
+        let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
+        let explain = match fixture.database.backend {
+            DatabaseBackend::Sqlite => "EXPLAIN QUERY PLAN",
+            DatabaseBackend::PostgreSql => {
+                sqlx::query("SET LOCAL enable_seqscan = off")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                "EXPLAIN (COSTS OFF)"
+            }
+        };
+        let (start, end) = bucket_time_bounds(20_714, 86_400_000);
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{explain} {REBUILD_USAGE_DAILY_SQL}"
+        )))
+        .bind(fixture.key.key_id.to_string())
+        .bind(start)
+        .bind(&fixture.model)
+        .bind("failure")
+        .bind("bucket-boundary")
+        .bind(end)
+        .fetch_all(&mut *transaction)
+        .await
+        .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>(match fixture.database.backend {
+                    DatabaseBackend::Sqlite => "detail",
+                    DatabaseBackend::PostgreSql => "QUERY PLAN",
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("request_stats_facts_key_created_idx")),
+            "{plan:?}"
+        );
+        let bounded = match fixture.database.backend {
+            DatabaseBackend::Sqlite => plan
+                .iter()
+                .any(|line| line.contains("key_id=? AND created_at>? AND created_at<?")),
+            DatabaseBackend::PostgreSql => plan.iter().any(|line| {
+                line.contains("Index Cond:")
+                    && line.contains("key_id")
+                    && line.contains("created_at >=")
+                    && line.contains("created_at <=")
+            }),
+        };
+        assert!(bounded, "{plan:?}");
+        transaction.rollback().await.unwrap();
+    }
+
+    async fn exercise_bucket_rebuild_boundaries(fixture: &Fixture) {
+        let mut timestamps = std::collections::BTreeSet::from([i64::MIN, -1, 0, 1, i64::MAX]);
+        for divisor in [3_600_000, 86_400_000] {
+            for bucket in [
+                -2,
+                -1,
+                0,
+                1,
+                2,
+                20_714,
+                i64::MIN / divisor,
+                i64::MAX / divisor,
+            ] {
+                let (start, end) = bucket_time_bounds(bucket, divisor);
+                timestamps.extend([start, end]);
+                timestamps.extend(start.checked_sub(1));
+                timestamps.extend(end.checked_add(1));
+            }
+        }
+        for (index, created_at) in timestamps.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO request_stats_facts (
+                    request_id, tenant_id, key_id, created_at, model, protocol, status_class,
+                    error_code, upstream_account_id, model_route_id, duration_ms,
+                    input_tokens, output_tokens, currency, cost_micros)
+                 VALUES ($1, $2, $3, $4, $5, 'openai', 'failure', 'bucket-boundary', '', '',
+                         25, 10, 10, 'USD', $6)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(fixture.key.tenant_id.to_string())
+            .bind(fixture.key.key_id.to_string())
+            .bind(*created_at)
+            .bind(&fixture.model)
+            .bind(index as i64 + 1)
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        }
+        let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
+        for (divisor, table, bucket_column) in [
+            (3_600_000, "usage_analysis_hourly", "hour_bucket"),
+            (86_400_000, "usage_analysis_daily", "day_bucket"),
+        ] {
+            let buckets = timestamps
+                .iter()
+                .map(|created_at| created_at / divisor)
+                .collect::<std::collections::BTreeSet<_>>();
+            for bucket in buckets {
+                let expected: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*), CAST(SUM(cost_micros) AS BIGINT) FROM request_stats_facts
+                     WHERE key_id = $1 AND created_at / {divisor} = $2
+                       AND error_code = 'bucket-boundary'"
+                )))
+                .bind(fixture.key.key_id.to_string())
+                .bind(bucket)
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+                let analysis_key = AnalysisKey {
+                    tenant_id: fixture.key.tenant_id.to_string(),
+                    key_id: fixture.key.key_id.to_string(),
+                    bucket,
+                    source_kind: "request".into(),
+                    model: fixture.model.clone(),
+                    protocol: "openai".into(),
+                    status_class: "failure".into(),
+                    error_code: "bucket-boundary".into(),
+                    upstream_account_id: String::new(),
+                    model_route_id: String::new(),
+                    service_tier: "default".into(),
+                    currency: "USD".into(),
+                };
+                rebuild_analysis(
+                    &mut transaction,
+                    &analysis_key,
+                    table,
+                    bucket_column,
+                    divisor,
+                )
+                .await
+                .unwrap();
+                let mut targets = vec![(table, bucket_column)];
+                if divisor == 86_400_000 {
+                    let usage_key = UsageDailyKey {
+                        key_id: analysis_key.key_id.clone(),
+                        day_bucket: bucket,
+                        model: analysis_key.model.clone(),
+                        status_class: analysis_key.status_class.clone(),
+                        error_code: analysis_key.error_code.clone(),
+                    };
+                    let request_key = RequestDailyKey {
+                        tenant_id: analysis_key.tenant_id.clone(),
+                        key_id: analysis_key.key_id.clone(),
+                        day_bucket: bucket,
+                        model: analysis_key.model.clone(),
+                        protocol: analysis_key.protocol.clone(),
+                        status_class: analysis_key.status_class.clone(),
+                        error_code: analysis_key.error_code.clone(),
+                        upstream_account_id: analysis_key.upstream_account_id.clone(),
+                        model_route_id: analysis_key.model_route_id.clone(),
+                        service_tier: analysis_key.service_tier.clone(),
+                        currency: analysis_key.currency.clone(),
+                    };
+                    rebuild_usage_daily(&mut transaction, &usage_key)
+                        .await
+                        .unwrap();
+                    rebuild_request_daily(&mut transaction, &request_key)
+                        .await
+                        .unwrap();
+                    targets.extend([
+                        ("usage_daily_aggregates", "day_bucket"),
+                        ("request_daily_aggregates", "day_bucket"),
+                    ]);
+                }
+                for (target, target_bucket) in targets {
+                    let actual: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                        "SELECT requests, cost_micros FROM {target}
+                         WHERE key_id = $1 AND {target_bucket} = $2
+                           AND error_code = 'bucket-boundary'"
+                    )))
+                    .bind(&analysis_key.key_id)
+                    .bind(bucket)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .unwrap();
+                    assert_eq!(actual, expected, "{target} bucket {bucket}");
+                }
+            }
+        }
+        transaction.rollback().await.unwrap();
     }
 
     async fn fixture(database_url: &str, directory: Option<tempfile::TempDir>) -> Fixture {
@@ -2049,6 +2296,8 @@ mod tests {
         );
         let fixture = fixture(&database_url, Some(directory)).await;
         exercise_backfill(&fixture).await;
+        exercise_usage_daily_index_plan(&fixture).await;
+        exercise_bucket_rebuild_boundaries(&fixture).await;
     }
 
     #[tokio::test]
@@ -2235,6 +2484,8 @@ mod tests {
             .append_pair("options", &format!("-c search_path={schema}"));
         let contract_fixture = fixture(isolated.as_str(), None).await;
         exercise_backfill(&contract_fixture).await;
+        exercise_usage_daily_index_plan(&contract_fixture).await;
+        exercise_bucket_rebuild_boundaries(&contract_fixture).await;
         let exact_schema = format!("exact_failed_cost_backfill_{}", Uuid::now_v7().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {exact_schema}")))
             .execute(&admin)
