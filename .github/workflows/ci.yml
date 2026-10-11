@@ -297,6 +297,7 @@ jobs:
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
         env:
+          MTC_SIGNED_IMPORT_COSIGN_IMAGE: mtc-signed-import-cosign:${{ github.run_id }}
           INSTALLER_SOURCE: ghcr.io/memeloop-online/memeloop-token-center
           INSTALLER_DIGEST: sha256:7f04c3c5e65225bc4ea64243e52c51a37020927ff0fae00a66adabb552b141ed
           INSTALLER_SOURCE_REVISION: d72b3ad5c75efd8634390ce55a2e33d47cfa79f2
@@ -306,6 +307,7 @@ jobs:
           SIGNING_ISSUER: https://token.actions.githubusercontent.com
         run: |
           set -euo pipefail
+          docker build --target cosign-builder --tag "$MTC_SIGNED_IMPORT_COSIGN_IMAGE" .
           mkdir -p "$RUNNER_TEMP/claude-code-wire-fixture" "$RUNNER_TEMP/claude-wire-evidence"
           docker pull "$INSTALLER_SOURCE@$INSTALLER_DIGEST"
           revision=$(docker image inspect "$INSTALLER_SOURCE@$INSTALLER_DIGEST" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
