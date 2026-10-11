@@ -3,5 +3,6 @@
   "commit": "6aa65466c298ca9b22168f95ba60aec7efcc2990",
   "path": "scripts/watch-mtc-vs-standby.ts",
   "sha256": "9ecaf212ff3934d99df773160174479d835daf496819afec120b90d2b2048ba8",
-  "execution": "GitHub Actions command mocks only; no cluster credentials or operational execution"
+  "execution": "GitHub Actions command mocks only; no cluster credentials or operational execution",
+  "provenance": "Byte-identical GitOps6aa65466 source imported in the isolated author worktree; GitHub tests this frozen SHA, not live Forgejo connectivity"
 }
