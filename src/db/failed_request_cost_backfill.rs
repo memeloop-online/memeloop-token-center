@@ -2815,6 +2815,7 @@ mod tests {
             .execute(&admin)
             .await
             .unwrap();
+        cost_only_concurrency::exercise_postgres_contribution_matrix(&database_url, &admin).await;
         admin.close().await;
     }
 }

@@ -1,4 +1,13 @@
 use super::*;
+use std::io::Write;
+
+fn record_stage(case: &str, stage: &str, outcome: &str) {
+    writeln!(
+        std::io::stderr().lock(),
+        "cost-only PG case={case} stage={stage} {outcome}"
+    )
+    .unwrap();
+}
 
 fn unexpected_completion<Output>(
     outcome: Result<Result<Output, AppError>, tokio::task::JoinError>,
@@ -21,12 +30,45 @@ async fn observe_blocker<Output>(
     case: &str,
     stage: &str,
 ) {
-    eprintln!("cost-only PG case={case} stage={stage} waiting");
+    record_stage(case, stage, "waiting");
     tokio::select! {
-        _ = wait_for_postgres_blocker(observer, waiter_pid, blocker_pid) => {
-            eprintln!("cost-only PG case={case} stage={stage} reached");
-        },
+        biased;
         outcome = task => unexpected_completion(outcome, case, stage),
+        outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active' AND wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(waiter_pid)
+                .bind(blocker_pid)
+                .fetch_one(observer)
+                .await
+                .unwrap();
+                if waiting {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }) => {
+            if outcome.is_err() {
+                let activity = sqlx::query(
+                    "SELECT state, COALESCE(wait_event_type, '') AS wait_type, COALESCE(wait_event, '') AS wait_event, CAST(pg_blocking_pids(pid) AS TEXT) AS blockers, COALESCE((SELECT string_agg(locktype || ':' || mode, ',' ORDER BY locktype, mode) FROM pg_locks WHERE pg_locks.pid = pg_stat_activity.pid AND NOT granted), '') AS waiting_locks FROM pg_stat_activity WHERE pid = $1",
+                )
+                .bind(waiter_pid)
+                .fetch_one(observer)
+                .await
+                .unwrap();
+                panic!(
+                    "cost-only PG case={case} stage={stage} expected_blocker={blocker_pid} state={} wait_type={} wait_event={} blockers={} waiting_locks={}",
+                    activity.try_get::<String, _>("state").unwrap(),
+                    activity.try_get::<String, _>("wait_type").unwrap(),
+                    activity.try_get::<String, _>("wait_event").unwrap(),
+                    activity.try_get::<String, _>("blockers").unwrap(),
+                    activity.try_get::<String, _>("waiting_locks").unwrap(),
+                );
+            }
+            record_stage(case, stage, "reached");
+        },
     }
 }
 
@@ -40,7 +82,7 @@ async fn observe_precommit(
         outcome = task => unexpected_completion(outcome, case, "correction_precommit"),
         outcome = reached => outcome.expect("precommit notification must be acknowledged"),
     }
-    eprintln!("cost-only PG case={case} stage=correction_precommit reached");
+    record_stage(case, "correction_precommit", "reached");
 }
 
 async fn exercise_concurrent_contribution(
@@ -56,7 +98,7 @@ async fn exercise_concurrent_contribution(
         (true, true) => "generation_writer_first",
         (true, false) => "generation_correction_first",
     };
-    eprintln!("cost-only PG case={case} stage=fixture begin");
+    record_stage(case, "fixture", "begin");
     let (historical_id, historical_cost) = seed_historical_case(
         fixture,
         499,
@@ -195,7 +237,7 @@ async fn exercise_concurrent_contribution(
             "writer fixture must retain its locator"
         );
     }
-    eprintln!("cost-only PG case={case} stage=production_lookup matched");
+    record_stage(case, "production_lookup", "matched");
     let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&writer.pool)
         .await
@@ -447,28 +489,20 @@ async fn exercise_concurrent_contribution(
         non_cost_before_replay
     );
     assert_eq!(aggregate_costs(fixture).await, costs_before_replay);
-    eprintln!("cost-only PG case={case} stage=cost_count_finance_and_replay PASS");
+    record_stage(case, "cost_count_finance_and_replay", "PASS");
     writer.close().await;
     correction.close().await;
     writer_gate.close().await;
 }
 
-#[tokio::test]
-async fn postgres_cost_only_concurrent_request_and_generation_preserve_cost_count_and_finance() {
-    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-        eprintln!(
-            "MTC_TEST_POSTGRES_URL is unset; skipping cost-only concurrent contribution contract"
-        );
-        return;
-    };
-    sqlx::any::install_default_drivers();
-    let admin = AnyPool::connect(&database_url).await.unwrap();
+pub(super) async fn exercise_postgres_contribution_matrix(database_url: &str, admin: &AnyPool) {
+    record_stage("matrix", "existing_contracts", "PASS");
     let schema = format!("cost_only_concurrent_{}", Uuid::now_v7().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
+        .execute(admin)
         .await
         .unwrap();
-    let mut isolated = Url::parse(&database_url).unwrap();
+    let mut isolated = Url::parse(database_url).unwrap();
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-c search_path={schema}"));
@@ -480,7 +514,7 @@ async fn postgres_cost_only_concurrent_request_and_generation_preserve_cost_coun
                 exercise_concurrent_contribution(
                     &fixture,
                     isolated.as_str(),
-                    &admin,
+                    admin,
                     generation,
                     writer_first,
                 ),
@@ -491,8 +525,8 @@ async fn postgres_cost_only_concurrent_request_and_generation_preserve_cost_coun
         }
     }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&admin)
+        .execute(admin)
         .await
         .unwrap();
-    admin.close().await;
+    record_stage("matrix", "four_cases_and_cleanup", "PASS");
 }
