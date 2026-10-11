@@ -29,7 +29,7 @@ interface RuntimeDeployment {
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
@@ -43,6 +43,9 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const render = (name: string, flags: string[] = []): string => run(helm, ['template', `token-center-${name}`, chart, '--namespace', 'token-center', ...flags]);
     const output: Record<string, string> = {
       default: render('default'),
+      terminalProjectionDisabled: render('default', ['--set', 'config.terminalProjectionEnabled=false']),
+      terminalProjectionEnabled: render('default', ['--set', 'config.terminalProjectionEnabled=true']),
+      terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       runtime: render('runtime', runtimeFlags),
       runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
       runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
@@ -81,6 +84,27 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
     const lacks = (key: string, pattern: string | RegExp): void => assert.ok(typeof pattern === 'string' ? !output[key]!.includes(pattern) : !pattern.test(output[key]!), `${key} render contains forbidden ${String(pattern)}`);
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
+
+    assert.equal(output.terminalProjectionDisabled, output.default);
+    count('default', 'name: MTC_TERMINAL_PROJECTION_ENABLED', 0);
+    count('terminalProjectionEnabled', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
+    count('terminalProjectionAll', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
+    const enabledProjectionDocuments = parseAllDocuments(output.terminalProjectionEnabled!).map(document => document.toJSON() as RuntimeDeployment);
+    for (const deployment of enabledProjectionDocuments.filter(document => document?.kind === 'Deployment')) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const container = deployment.spec.template.spec.containers[0]!;
+      const flag = container.env.filter(variable => variable.name === 'MTC_TERMINAL_PROJECTION_ENABLED');
+      assert.deepEqual(flag, role === 'gateway' ? [{ name: 'MTC_TERMINAL_PROJECTION_ENABLED', value: 'true' }] : []);
+      container.env = container.env.filter(variable => variable.name !== 'MTC_TERMINAL_PROJECTION_ENABLED');
+    }
+    assert.deepEqual(enabledProjectionDocuments, parseAllDocuments(output.default!).map(document => document.toJSON()));
+    const allProjectionDeployment = parseAllDocuments(output.terminalProjectionAll!).map(document => document.toJSON() as RuntimeDeployment).find(document => document?.kind === 'Deployment')!;
+    assert.equal(allProjectionDeployment.spec.template.metadata.labels['app.kubernetes.io/component'], 'all');
+    assert.deepEqual(allProjectionDeployment.spec.template.spec.containers[0]!.env.filter(variable => variable.name === 'MTC_TERMINAL_PROJECTION_ENABLED'), [{ name: 'MTC_TERMINAL_PROJECTION_ENABLED', value: 'true' }]);
+    const projectionConfigSchema = JSON.parse(read('charts/memeloop-token-center/values.schema.json')).properties.config;
+    assert.deepEqual(projectionConfigSchema.properties.terminalProjectionEnabled, { type: 'boolean' });
+    assert.ok(!projectionConfigSchema.required.includes('terminalProjectionEnabled'));
+    assert.match(read('charts/memeloop-token-center/values.yaml'), /^  terminalProjectionEnabled: false$/m);
 
     count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
     count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
@@ -217,6 +241,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['roles.control.service.type=NodePort'], ['roles.control.service.type=LoadBalancer'], ['roles.all.service.type=NodePort'], ['roles.all.service.type=LoadBalancer'],
       ['serviceAccount.automount=true'], ['plugins.mountpath=/plugins'], ['hostAliases[0].ip=10.28.0.22'], ['config.databaseMaxConnection=8'], ['config.gatewayBodyReadConcurrency=8193'], ['config.responsesBodyMaxBytes=67108865'], ['config.audioBodyMaxBytes=-1'], ['config.responsesBodyReadConcurrency=9'],
       ['config.runtimeProfiling.enabled=not-a-boolean'], ['config.runtimeProfiling.unknown=true'],
+      ['config.terminalProjectionEnabled=not-a-boolean'], ['config.terminalProjectionEnabled=1'],
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],

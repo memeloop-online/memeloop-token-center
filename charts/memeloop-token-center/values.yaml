@@ -121,6 +121,7 @@ requestSpool:
   sizeLimit: 160Mi
 
 config:
+  terminalProjectionEnabled: false
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
   databaseMaxConnections: 4
   # Per-gateway active proxy lifecycles. Capacity exhaustion is a service 503;

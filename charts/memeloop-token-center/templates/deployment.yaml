@@ -184,6 +184,10 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
+            {{- if and $.Values.config.terminalProjectionEnabled (or (eq $role "gateway") (eq $role "all")) }}
+            - name: MTC_TERMINAL_PROJECTION_ENABLED
+              value: "true"
+            {{- end }}
             {{- include "memeloop-token-center.runtimeInventory.env" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
             - name: MTC_GATEWAY_POD_NAME
               valueFrom:
