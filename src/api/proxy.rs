@@ -1917,6 +1917,7 @@ async fn proxy_with_cancellation_guard(
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
+            let buffered_body_length = buffered.body.len();
             let (response_status, response_body) = if status == StatusCode::OK {
                 (StatusCode::OK, buffered.body)
             } else {
@@ -1930,7 +1931,7 @@ async fn proxy_with_cancellation_guard(
             buffer_phase.finish(
                 "upstream_incomplete_response",
                 Some(200),
-                Some(buffered.body.len()),
+                Some(buffered_body_length),
             );
             let result = finish_buffered_request(
                 &buffered_request,
