@@ -11,6 +11,7 @@ async fn readiness_outer_timeout_preserves_a_real_pool_acquire_wait() {
     database.migrate().await.unwrap();
     let held = database.pool.acquire().await.unwrap();
     tokio::time::pause();
+    let started_at = tokio::time::Instant::now();
     let progress = DatabaseReadinessProgress::new();
     let mut check = Box::pin(tokio::time::timeout(
         Duration::from_secs(6),
@@ -21,10 +22,12 @@ async fn readiness_outer_timeout_preserves_a_real_pool_acquire_wait() {
     assert!(futures_util::poll!(&mut check).is_pending());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(check.await.is_err());
+    let elapsed = started_at.elapsed();
+    assert!((6000..=6001).contains(&elapsed.as_millis()));
     let snapshot = progress.snapshot(&database);
     assert_eq!(snapshot.stage, "ping");
     assert_eq!(snapshot.phase, "acquire");
-    assert_eq!(snapshot.elapsed_ms, 6000);
+    assert_eq!(snapshot.elapsed_ms, elapsed.as_millis() as u64);
     assert_eq!(snapshot.pool_size, 1);
     assert_eq!(snapshot.pool_idle, 0);
     tokio::time::resume();
