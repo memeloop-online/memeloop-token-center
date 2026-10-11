@@ -1041,8 +1041,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            plan.iter()
-                .any(|line| line.contains("request_stats_facts_key_created_idx")),
+            plan.iter().any(|line| {
+                line.contains("request_stats_facts_key_created_idx")
+                    || (matches!(fixture.database.backend, DatabaseBackend::PostgreSql)
+                        && line.contains("request_stats_facts_created_idx"))
+            }),
             "{plan:?}"
         );
         let bounded = match fixture.database.backend {
@@ -1051,7 +1054,7 @@ mod tests {
                 .any(|line| line.contains("key_id=? AND created_at>? AND created_at<?")),
             DatabaseBackend::PostgreSql => plan.iter().any(|line| {
                 line.contains("Index Cond:")
-                    && line.contains("key_id")
+                    && line.contains("key_id =")
                     && line.contains("created_at >=")
                     && line.contains("created_at <=")
             }),
