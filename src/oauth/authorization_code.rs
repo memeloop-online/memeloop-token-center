@@ -408,6 +408,12 @@ pub(crate) fn same_reauthorization_identity(
 ) -> bool {
     supports_reauthorization(current)
         && supports_reauthorization(next)
+        && installed_state(next).is_ok_and(|state| match state.adapter {
+            Some(adapter) => validate_installed_contribution(current, &adapter).is_ok(),
+            None => installed_state(current).is_ok_and(|state| state.adapter.is_none()),
+        })
+        && installed_state(current).ok().map(|state| state.refresh_url)
+            == installed_state(next).ok().map(|state| state.refresh_url)
         && installed_state(current)
             .ok()
             .and_then(|state| state.login_client)

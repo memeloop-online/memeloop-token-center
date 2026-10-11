@@ -910,6 +910,7 @@ impl ProviderCatalog {
             authorization_code: None,
         });
         kimi.request_compatibility = RequestCompatibility {
+            anthropic_messages_headers: Default::default(),
             third_party: true,
             responses_via_chat_v1: true,
             responses_via_chat_dialect: Some(ResponsesViaChatDialect::KimiV1),
