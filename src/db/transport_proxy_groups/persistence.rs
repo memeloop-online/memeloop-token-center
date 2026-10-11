@@ -4,7 +4,7 @@ impl TransportProxyGroups {
     pub(crate) fn start(self: &Arc<Self>, database_url: &str) -> Result<(), sqlx::Error> {
         let pool = AnyPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(Duration::from_millis(200))
+            .acquire_timeout(Duration::from_secs(10))
             .connect_lazy(database_url)?;
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {

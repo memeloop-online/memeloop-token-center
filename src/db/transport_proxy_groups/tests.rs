@@ -443,6 +443,159 @@ async fn postgres_recovery_preserves_active_stickiness_and_rejects_stale_version
 }
 
 #[tokio::test]
+async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_selection() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let schema = format!("proxy_bootstrap_{}", Uuid::new_v4().simple());
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated_url = url::Url::parse(&database_url).unwrap();
+    isolated_url
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let database = Database::connect(isolated_url.as_str()).await.unwrap();
+    database.migrate().await.unwrap();
+    let source = credential();
+    let account = database
+        .create_upstream_account(
+            crate::db::CreateUpstreamAccountInput {
+                tenant_external_id: format!("bootstrap-{}", Uuid::now_v7()),
+                name: "bootstrap-proxy-test".into(),
+                driver: "openai-codex".into(),
+                config: serde_json::json!({"base_url":"https://chatgpt.com/backend-api/codex"}),
+                credential: source.clone(),
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+    let account_id = account.id;
+    let tenant = account.tenant_external_id.clone().unwrap();
+    let group = database
+        .create_transport_group(
+            crate::db::transport_proxy_management::CreateGroup {
+                tenant_external_id: tenant.clone(),
+                name: "bootstrap".into(),
+                members: vec![crate::db::transport_proxy_management::MemberInput {
+                    id: None,
+                    label: "primary".into(),
+                    proxy_url: Some(PRIMARY.into()),
+                }],
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    database
+        .bind_transport_group(
+            account_id,
+            crate::db::transport_proxy_management::BindGroup {
+                tenant_external_id: tenant,
+                group_id: Uuid::parse_str(group["id"].as_str().unwrap()).unwrap(),
+                expected_group_version: 1,
+                initial_member_id: Uuid::parse_str(group["members"][0]["id"].as_str().unwrap())
+                    .unwrap(),
+                expected_binding_version: 0,
+                expected_credential_generation: account.credential_generation,
+                expected_updated_at: account.updated_at,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    let (bound_account, _) = database
+        .upstream_account_with_credential(account_id, KEY)
+        .await
+        .unwrap();
+    let upstream_address = (
+        isolated_url.host_str().unwrap().to_owned(),
+        isolated_url.port().unwrap_or(5432),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, receive) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        drop(listener);
+        accepted.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let mut upstream = tokio::net::TcpStream::connect(upstream_address)
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    });
+    isolated_url.set_host(Some("127.0.0.1")).unwrap();
+    isolated_url.set_port(Some(address.port())).unwrap();
+    let cached_account_id = Uuid::new_v4();
+    let runtime = Arc::new(groups(cached_account_id, 1));
+    runtime.start(isolated_url.as_str()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), receive)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        runtime
+            .select_config(
+                account_id,
+                bound_account.credential_generation,
+                &source,
+                &bound_account.config,
+            )
+            .is_err()
+    );
+    let cached = runtime.select(cached_account_id, 1, &source).unwrap();
+    assert!(cached.advance_after_connect_failure(&[0]).unwrap());
+    for _ in 0..1000 {
+        assert_eq!(
+            runtime
+                .select(cached_account_id, 1, &source)
+                .unwrap()
+                .credential
+                .proxy()
+                .unwrap()
+                .0,
+            BACKUP
+        );
+    }
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(selected) = runtime.select_config(
+                account_id,
+                bound_account.credential_generation,
+                &source,
+                &bound_account.config,
+            ) {
+                break selected;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(selected.credential.proxy().unwrap().0, PRIMARY);
+    drop(selected);
+    drop(cached);
+    drop(runtime);
+    proxy.abort();
+    let _ = proxy.await;
+    database.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
 async fn locked_database_cannot_block_cached_selection_or_local_failover() {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
