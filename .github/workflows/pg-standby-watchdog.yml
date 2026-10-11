@@ -1,0 +1,48 @@
+name: PG standby watchdog command mocks
+
+on:
+  pull_request:
+    paths:
+      - ops/watch-mtc-vs-standby.ts
+      - tests/ops/mtc-vs-standby-watchdog*
+      - .github/workflows/pg-standby-watchdog.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pg-standby-watchdog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  command-mocks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      KUBECONFIG: /dev/null
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+      - name: Verify byte-identical exact GitOps source pin
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import assert from 'node:assert/strict';
+          const pin = JSON.parse(readFileSync('tests/ops/mtc-vs-standby-watchdog-source.json', 'utf8'));
+          const response = await fetch(`https://git.k3s.onetwo.website/api/v1/repos/llm/k3s-gitops/contents/scripts/watch-mtc-vs-standby.ts?ref=${pin.commit}`, { signal: AbortSignal.timeout(15000) });
+          assert.equal(response.status, 200);
+          const document = await response.json();
+          assert.equal(document.encoding, 'base64');
+          const source = Buffer.from(document.content, 'base64');
+          assert.equal(createHash('sha256').update(source).digest('hex'), pin.sha256);
+          assert.deepEqual(readFileSync('ops/watch-mtc-vs-standby.ts'), source);
+          NODE
+      - name: Run isolated command mocks only, no kubectl SQL or credentials
+        run: node --test tests/ops/mtc-vs-standby-watchdog.test.ts
