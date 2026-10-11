@@ -115,16 +115,22 @@ function bindSourceConnections(senders: any[]) {
     const table = command(['-n', namespace, 'exec', child.name, '-c', container.name, '--', 'cat', '/proc/net/tcp']);
     for (const line of table.trim().split('\n').slice(1)) {
       const fields = line.trim().split(/\s+/);
-      const [remoteAddress, remotePort] = fields[2].split(':');
+      const local = fields[1];
+      const remote = fields[2];
+      if (!local || !remote) throw Error('OWN_SOCKET_METADATA_MALFORMED');
+      const [remoteAddress, remotePort] = remote.split(':');
+      const localPort = local.split(':')[1];
+      if (!remoteAddress || !remotePort || !localPort) throw Error('OWN_SOCKET_METADATA_MALFORMED');
       if (fields[3] !== '01' || remotePort !== '1538' || !['19042A0A', 'CB432B0A'].includes(remoteAddress)) continue;
-      sockets.push({ port: parseInt(fields[1].split(':')[1], 16), podUID: child.uid, podIP: pod.status.podIP });
+      sockets.push({ port: parseInt(localPort, 16), podUID: child.uid, podIP: pod.status.podIP });
     }
   }
   for (const sender of senders.filter(sender => sender.application === application)) {
     const matches = sockets.filter(socket => socket.port === sender.port && [socket.podIP, '100.64.0.8'].includes(sender.client));
-    if (matches.length !== 1) throw Error('OWN_SOURCE_SOCKET_IDENTITY_UNPROVEN');
+    const match = matches[0];
+    if (matches.length !== 1 || !match) throw Error('OWN_SOURCE_SOCKET_IDENTITY_UNPROVEN');
     observedOwnPids.add(sender.pid);
-    record('OWN_SOURCE_SOCKET_BOUND', { sourcePid: sender.pid, client: sender.client, port: sender.port, podUID: matches[0].podUID });
+    record('OWN_SOURCE_SOCKET_BOUND', { sourcePid: sender.pid, client: sender.client, port: sender.port, podUID: match.podUID });
   }
 }
 function deleteUID(kind: string, name: string, uid: string) {
@@ -243,6 +249,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     record: (path, value) => appendFileSync(path, JSON.stringify(value) + '\n', { mode: 0o600 }),
     emit: message => console.log(message), interrupted: () => interrupted,
   };
-  try { process.exitCode = await runWatcher(JSON.parse(readFileSync(process.argv[2], 'utf8')), runtime); }
+  try {
+    const configPath = process.argv[2];
+    if (!configPath) throw Error('CONFIG_PATH_REQUIRED');
+    process.exitCode = await runWatcher(JSON.parse(readFileSync(configPath, 'utf8')), runtime);
+  }
   catch { console.error('INVALID_CONFIG_OR_UNCONFIRMED_STOP'); process.exitCode = 2; }
 }

@@ -44,6 +44,7 @@ function fixture(options: { watch?: boolean; preflightFailure?: boolean; firstSo
       const getIndex = args.indexOf('get');
       if (getIndex >= 0) {
         const kind = args[getIndex + 1];
+        if (!kind) assert.fail('MOCK_GET_KIND_MISSING');
         const resource = args[getIndex + 2];
         if (kind === 'cluster' && resource === name) {
           if (!created) return '';
