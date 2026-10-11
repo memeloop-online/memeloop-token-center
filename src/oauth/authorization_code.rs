@@ -1972,7 +1972,7 @@ mod tests {
         .unwrap();
         db.migrate().await.unwrap();
         let key = b"json PKCE fixture encryption key";
-        let mut input = input(format!("{}/token", server.uri()));
+        let mut input = input("https://provider.example/token".into());
         input.client.redirect_uri = "https://provider.example/callback".into();
         input.adapter.response_mode = Some(OAuthResponseMode::FragmentManual);
         input.adapter.authorization_code = Some(AuthorizationCodeContribution {
@@ -1980,8 +1980,39 @@ mod tests {
             include_state: true,
             client_default: None,
         });
-        let adapter = input.adapter.clone();
         let started = start(&db, input, key, 1000).await.unwrap();
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id,
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        login.input.adapter.poll_url = format!("{}/token", server.uri());
+        login.input.adapter.refresh_url = login.input.adapter.poll_url.clone();
+        let adapter = login.input.adapter.clone();
+        db.replace_oauth_login_poll_state(
+            session.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.release_oauth_login_poll(session.session_id, lease_owner, 1001)
+            .await
+            .unwrap();
         let login_url = Url::parse(&started.login_url).unwrap();
         let state = login_url
             .query_pairs()
@@ -2007,7 +2038,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            1001,
+            2002,
             true,
         )
         .await;
@@ -2021,7 +2052,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            3000,
+            4003,
             true,
         )
         .await
@@ -2045,7 +2076,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            4000,
+            5004,
             true,
         )
         .await
