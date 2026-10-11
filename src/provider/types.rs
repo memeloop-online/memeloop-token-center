@@ -159,7 +159,6 @@ impl UpstreamAccountView {
             .is_some_and(|state| state.get("authorization_code").is_some())
         {
             self.can_reauthorize = self.can_refresh
-                && self.driver == crate::provider::antigravity::DRIVER
                 && crate::oauth::authorization_code::supports_reauthorization(credential);
         }
         Ok(())

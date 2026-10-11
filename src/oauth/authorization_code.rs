@@ -15,13 +15,88 @@ use crate::{
     network::{self, OutboundScope},
     provider::{
         OAuthAdapterContribution, OAuthFlowKind, OAuthIdentityContribution, OAuthResponseMode,
-        UpstreamCredential, open_private_json, seal_private_json,
+        OAuthTokenEncoding, UpstreamCredential, open_private_json, seal_private_json,
     },
 };
 
 pub const FLOW: &str = "generic_authorization_code";
 pub const CLIENT_DEFAULTS_ENV: &str = "MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON";
 const READY_RECOVERY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+pub(crate) fn validate_contribution(adapter: &OAuthAdapterContribution) -> Result<(), AppError> {
+    if (adapter.authorization_code.is_some()
+        || adapter.identity.is_some()
+        || adapter.response_mode.is_some())
+        && adapter.flow_kind != OAuthFlowKind::AuthorizationCodePkce
+    {
+        return Err(AppError::BadRequest(
+            "authorization-code settings require PKCE".into(),
+        ));
+    }
+    if let Some(identity) = &adapter.identity {
+        validate_identity_contribution(identity)?;
+    }
+    if let Some(client) = adapter
+        .authorization_code
+        .as_ref()
+        .and_then(|settings| settings.client_default.as_ref())
+    {
+        validate_client(&ClientConfig {
+            client_id: client.client_id.clone(),
+            redirect_uri: client.redirect_uri.clone(),
+            scopes: client.scopes.clone(),
+            client_secret: None,
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn default_client(
+    provider: &str,
+    adapter: &OAuthAdapterContribution,
+) -> Result<ClientConfig, AppError> {
+    validate_contribution(adapter)?;
+    if let Some(client) = adapter
+        .authorization_code
+        .as_ref()
+        .and_then(|settings| settings.client_default.as_ref())
+    {
+        return Ok(ClientConfig {
+            client_id: client.client_id.clone(),
+            redirect_uri: client.redirect_uri.clone(),
+            scopes: client.scopes.clone(),
+            client_secret: None,
+        });
+    }
+    deployment_client_default(provider)
+}
+
+pub(crate) fn validate_installed_contribution(
+    credential: &UpstreamCredential,
+    adapter: &OAuthAdapterContribution,
+) -> Result<(), AppError> {
+    validate_contribution(adapter)?;
+    let installed = installed_state(credential)?;
+    if installed
+        .adapter
+        .as_ref()
+        .is_some_and(|original| original != adapter)
+        || (installed.adapter.is_none()
+            && (adapter.authorization_code.is_some()
+                || adapter.identity.as_ref().is_some_and(|identity| {
+                    !identity.headers.is_empty()
+                        || installed
+                            .provider_identity
+                            .as_ref()
+                            .is_none_or(|original| original.url != identity.url)
+                })))
+    {
+        return Err(AppError::Conflict(
+            "OAuth contribution changed; reconnect this account".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Deployment-owned Secret injection. Values never appear in config debug or
 /// public catalog JSON; the chosen client is snapshotted into the AEAD session.
@@ -62,6 +137,8 @@ pub struct ClientConfig {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RefreshState {
+    #[serde(default)]
+    adapter: Option<OAuthAdapterContribution>,
     client_id: String,
     client_secret: Option<String>,
     refresh_url: String,
@@ -140,6 +217,7 @@ fn valid_provider_identity_id(id: &str) -> bool {
 /// payloads. Validation here is defense in depth: HTTPS only, no embedded
 /// credentials, no fragment, bounded length, and a bounded RFC 6901 pointer.
 fn validate_identity_contribution(identity: &OAuthIdentityContribution) -> Result<(), AppError> {
+    identity.headers.validate()?;
     if identity.url.len() > 2048 {
         return Err(AppError::BadRequest(
             "OAuth identity URL is too long".into(),
@@ -262,18 +340,32 @@ pub(crate) async fn bind_declared_identity(
     provider_config: &Value,
 ) -> Result<(), AppError> {
     validate_identity_contribution(contribution)?;
+    bind_declared_identity_with_transport(http, credential, contribution, provider_config, false)
+        .await
+}
+
+async fn bind_declared_identity_with_transport(
+    http: &reqwest::Client,
+    credential: &mut UpstreamCredential,
+    contribution: &OAuthIdentityContribution,
+    provider_config: &Value,
+    allow_test_loopback: bool,
+) -> Result<(), AppError> {
+    contribution.headers.validate()?;
     let http = network::client_for_config_url_no_retry(
         http,
         &contribution.url,
         provider_config,
         credential.proxy(),
-        false,
+        allow_test_loopback,
     )
     .await?;
     let response = credential
         .apply(
-            http.get(&contribution.url)
-                .timeout(std::time::Duration::from_secs(20)),
+            contribution.headers.apply(
+                http.get(&contribution.url)
+                    .timeout(std::time::Duration::from_secs(20)),
+            )?,
             crate::db::unix_millis(),
         )?
         .send()
@@ -336,6 +428,7 @@ pub(crate) fn same_reauthorization_identity(
 
 fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
     let state = json!({"authorization_code": RefreshState {
+        adapter: Some(input.adapter.clone()),
         client_id: input.client.client_id.clone(),
         client_secret: input.client.client_secret.clone(),
         refresh_url: input.adapter.refresh_url.clone(),
@@ -556,6 +649,7 @@ pub async fn start(
             "provider does not declare standard authorization-code OAuth".into(),
         ));
     }
+    validate_contribution(&input.adapter)?;
     if let Some(identity) = &input.adapter.identity {
         validate_identity_contribution(identity)?;
     }
@@ -730,6 +824,15 @@ pub async fn complete(
         ("code_verifier", login.verifier.clone()),
     ];
     add_client(&mut form, &login.input.client);
+    if login
+        .input
+        .adapter
+        .authorization_code
+        .as_ref()
+        .is_some_and(|settings| settings.include_state)
+    {
+        form.push(("state", login.state.clone()));
+    }
     let prepared = match prepare_token_request(
         http,
         &login.input.adapter.poll_url,
@@ -740,6 +843,7 @@ pub async fn complete(
             .as_deref()
             .zip(login.input.proxy_network_scope),
         &form,
+        token_encoding(&login.input.adapter),
         allow_test_loopback,
     )
     .await
@@ -825,6 +929,7 @@ pub async fn refresh(
     allow_test_loopback: bool,
     guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<UpstreamCredential, AppError> {
+    validate_installed_contribution(current, active_adapter)?;
     let UpstreamCredential::OAuth {
         refresh_token: Some(refresh),
         adapter_state: Some(state),
@@ -863,6 +968,7 @@ pub async fn refresh(
         &json!({"network_scope": input.network_scope}),
         current.proxy(),
         &form,
+        token_encoding(active_adapter),
         allow_test_loopback,
         Some(guard),
     )
@@ -935,23 +1041,34 @@ async fn token_request(
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
     form: &[(&str, String)],
+    encoding: OAuthTokenEncoding,
     allow_test_loopback: bool,
     guard: Option<&dyn OAuthRefreshRequestGuard>,
 ) -> Result<TokenResponse, AppError> {
-    let prepared =
-        prepare_token_request(http, endpoint, config, proxy, form, allow_test_loopback).await?;
+    let prepared = prepare_token_request(
+        http,
+        endpoint,
+        config,
+        proxy,
+        form,
+        encoding,
+        allow_test_loopback,
+    )
+    .await?;
     if let Some(guard) = guard {
         guard.mark_request_started().await?;
     }
     dispatch_token_request(prepared).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_token_request(
     http: &reqwest::Client,
     endpoint: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
     form: &[(&str, String)],
+    encoding: OAuthTokenEncoding,
     allow_test_loopback: bool,
 ) -> Result<(reqwest::Client, reqwest::Request), AppError> {
     let http =
@@ -960,12 +1077,22 @@ async fn prepare_token_request(
     let request = http
         .post(endpoint)
         .timeout(std::time::Duration::from_secs(20))
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .header(reqwest::header::ACCEPT, "application/json")
-        .body(encode_token_form(form))
+        .header(reqwest::header::ACCEPT, "application/json");
+    let request = match encoding {
+        OAuthTokenEncoding::Form => request
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(encode_token_form(form)),
+        OAuthTokenEncoding::Json => request.json(
+            &form
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ),
+    };
+    let request = request
         .build()
         .map_err(|_| AppError::BadRequest("OAuth token request is invalid".into()))?;
     Ok((http, request))
@@ -994,6 +1121,14 @@ fn encode_token_form(form: &[(&str, String)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form.iter().map(|(name, value)| (*name, value.as_str())))
         .finish()
+}
+
+fn token_encoding(adapter: &OAuthAdapterContribution) -> OAuthTokenEncoding {
+    adapter
+        .authorization_code
+        .as_ref()
+        .map(|settings| settings.token_encoding)
+        .unwrap_or_default()
 }
 
 fn add_client(form: &mut Vec<(&'static str, String)>, client: &ClientConfig) {
@@ -1095,6 +1230,7 @@ mod tests {
     #[test]
     fn identity_contribution_requires_credential_free_https_and_bounded_pointer() {
         let valid = OAuthIdentityContribution {
+            headers: Default::default(),
             url: "https://api.example.com/v1/profile".into(),
             id_pointer: "/account/uuid".into(),
         };
@@ -1108,6 +1244,7 @@ mod tests {
             ("https://api.example.com/profile", "/account//uuid"),
         ] {
             let contribution = OAuthIdentityContribution {
+                headers: Default::default(),
                 url: url.into(),
                 id_pointer: pointer.into(),
             };
@@ -1117,6 +1254,7 @@ mod tests {
             );
         }
         let long_url = OAuthIdentityContribution {
+            headers: Default::default(),
             url: format!("https://api.example.com/{}", "a".repeat(2048)),
             id_pointer: "/id".into(),
         };
@@ -1657,6 +1795,7 @@ mod tests {
                 refresh_url: token_endpoint,
                 response_mode: None,
                 identity: None,
+                authorization_code: None,
             },
             proxy_url: None,
             proxy_network_scope: None,
@@ -1817,6 +1956,252 @@ mod tests {
             matches!(reclaimed, Err(AppError::Conflict(_))),
             "a dispatched code exchange must not be retried after lease takeover"
         );
+    }
+
+    #[tokio::test]
+    async fn json_exchange_binds_state_and_refresh_preserves_contract() {
+        use crate::provider::AuthorizationCodeContribution;
+        use wiremock::matchers::{body_json_partial, header};
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("json-oauth.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"json PKCE fixture encryption key";
+        let mut input = input(format!("{}/token", server.uri()));
+        input.client.redirect_uri = "https://provider.example/callback".into();
+        input.adapter.response_mode = Some(OAuthResponseMode::FragmentManual);
+        input.adapter.authorization_code = Some(AuthorizationCodeContribution {
+            token_encoding: OAuthTokenEncoding::Json,
+            include_state: true,
+            client_default: None,
+        });
+        let adapter = input.adapter.clone();
+        let started = start(&db, input, key, 1000).await.unwrap();
+        let login_url = Url::parse(&started.login_url).unwrap();
+        let state = login_url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        Mock::given(method("POST")).and(path("/token"))
+            .and(header("content-type", "application/json"))
+            .and(body_json_partial(json!({"grant_type":"authorization_code", "code":"fixture+code", "state":state, "client_id":"fixture-client", "redirect_uri":"https://provider.example/callback"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"fixture-access", "refresh_token":"fixture-refresh", "expires_in":3600})))
+            .expect(1).mount(&server).await;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let wrong = complete(
+            &db,
+            &http,
+            &started.session_token,
+            "fixture+code#wrong",
+            Some("fixture-tenant"),
+            None,
+            key,
+            1001,
+            true,
+        )
+        .await;
+        assert!(matches!(wrong, Err(AppError::BadRequest(_))));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let complete_result = complete(
+            &db,
+            &http,
+            &started.session_token,
+            &format!("fixture+code#{state}"),
+            Some("fixture-tenant"),
+            None,
+            key,
+            3000,
+            true,
+        )
+        .await
+        .unwrap();
+        let CompleteResult::Ready { login, .. } = complete_result else {
+            panic!("expected ready")
+        };
+        let exchanged = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&exchanged[0].body).unwrap();
+        assert!(
+            body["code_verifier"]
+                .as_str()
+                .is_some_and(|value| value.len() >= 43)
+        );
+        assert_ne!(body["code_verifier"], body["state"]);
+        let _ = complete(
+            &db,
+            &http,
+            &started.session_token,
+            &format!("fixture+code#{state}"),
+            Some("fixture-tenant"),
+            None,
+            key,
+            4000,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        Mock::given(method("POST")).and(path("/token"))
+            .and(header("content-type", "application/json"))
+            .and(body_json_partial(json!({"grant_type":"refresh_token", "refresh_token":"fixture-refresh", "client_id":"fixture-client"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"refreshed-fixture", "expires_in":3600})))
+            .expect(1).mount(&server).await;
+        let mut changed = adapter.clone();
+        changed.authorization_code.as_mut().unwrap().token_encoding = OAuthTokenEncoding::Form;
+        assert!(
+            refresh(
+                &http,
+                &login.credential,
+                &changed,
+                5000,
+                true,
+                &super::super::TEST_OAUTH_REFRESH_REQUEST_GUARD
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let refreshed = refresh(
+            &http,
+            &login.credential,
+            &adapter,
+            5000,
+            true,
+            &super::super::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.adapter_state(), login.credential.adapter_state());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let refresh_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(refresh_body.get("state").is_none());
+    }
+
+    #[tokio::test]
+    async fn declared_identity_headers_bind_the_account_and_reauthorization_contract() {
+        use crate::provider::FixedProtocolHeaders;
+        use wiremock::matchers::header;
+        let server = MockServer::start().await;
+        let identity = OAuthIdentityContribution {
+            url: "https://provider.example/profile".into(),
+            id_pointer: "/account/id".into(),
+            headers: FixedProtocolHeaders {
+                anthropic_version: None,
+                anthropic_beta: vec!["subscription-v1".into()],
+            },
+        };
+        let mut input = input("https://provider.example/token".into());
+        input.adapter.identity = Some(identity.clone());
+        let now = crate::db::unix_millis();
+        let mut issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &input,
+            now,
+            None,
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/profile"))
+            .and(header("authorization", "Bearer fixture-access"))
+            .and(header("anthropic-beta", "subscription-v1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"account":{"id":"fixture-account"},"organization":{"id":"wrong-account"}}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut transport_identity = identity.clone();
+        transport_identity.url = format!("{}/profile", server.uri());
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        bind_declared_identity_with_transport(
+            &http,
+            &mut issued,
+            &transport_identity,
+            &input.provider_config,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(supports_reauthorization(&issued));
+        validate_installed_contribution(&issued, &input.adapter).unwrap();
+        let client = reauthorization_client(
+            &issued,
+            None,
+            "fixture-provider",
+            &input.adapter.refresh_url,
+        )
+        .unwrap();
+        assert_eq!(client.scopes, input.client.scopes);
+        let mut changed = input.adapter.clone();
+        changed
+            .identity
+            .as_mut()
+            .unwrap()
+            .headers
+            .anthropic_beta
+            .push("changed-v2".into());
+        assert!(validate_installed_contribution(&issued, &changed).is_err());
+        let mut other = issued.clone();
+        if let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = &mut other
+        {
+            state["authorization_code"]["provider_identity"]["id"] = json!("other-account");
+        }
+        assert!(!same_reauthorization_identity(&issued, &other));
+        assert!(same_reauthorization_identity(&issued, &issued));
+    }
+
+    #[test]
+    fn signed_public_client_defaults_reject_secrets_and_invalid_callbacks() {
+        use crate::provider::{AuthorizationCodeContribution, OAuthPublicClient};
+        let mut adapter = input("https://provider.example/token".into()).adapter;
+        adapter.authorization_code = Some(AuthorizationCodeContribution {
+            client_default: Some(OAuthPublicClient {
+                client_id: "public-client".into(),
+                redirect_uri: "https://provider.example/callback".into(),
+                scopes: vec!["inference".into()],
+            }),
+            ..Default::default()
+        });
+        let client = default_client("fixture-provider", &adapter).unwrap();
+        assert_eq!(client.client_id, "public-client");
+        assert!(client.client_secret.is_none());
+        let mut json = serde_json::to_value(&adapter).unwrap();
+        json["authorization_code"]["client_default"]["client_secret"] = json!("forbidden");
+        assert!(serde_json::from_value::<OAuthAdapterContribution>(json).is_err());
+        adapter
+            .authorization_code
+            .as_mut()
+            .unwrap()
+            .client_default
+            .as_mut()
+            .unwrap()
+            .redirect_uri = "https://user:secret@provider.example/callback".into();
+        assert!(default_client("fixture-provider", &adapter).is_err());
+        adapter.flow_kind = OAuthFlowKind::CursorPkce;
+        assert!(validate_contribution(&adapter).is_err());
     }
 
     #[tokio::test]

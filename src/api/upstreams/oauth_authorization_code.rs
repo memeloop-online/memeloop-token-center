@@ -58,7 +58,6 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         if account.driver != body.provider_driver
             || account.name != body.account_name.trim()
             || flow.as_deref() != Some(authorization_code::FLOW)
-            || account.driver != crate::provider::antigravity::DRIVER
             || !authorization_code::supports_reauthorization(&credential)
             || (!body.provider_config.is_null() && account.config != body.provider_config)
         {
@@ -124,15 +123,25 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         super::config_secrets::split_for_storage(&provider.config_schema, &body.provider_config)?;
     crate::provider::validate_provider_adapter_secret_patch(&secret_patch)?;
     let client = match current_credential.as_ref() {
-        Some(credential) => authorization_code::reauthorization_client(
-            credential,
-            body.client,
-            &body.provider_driver,
-            &adapter.refresh_url,
-        )?,
+        Some(credential) => {
+            if body.provider_driver != crate::provider::antigravity::DRIVER
+                && adapter.identity.is_none()
+            {
+                return Err(AppError::Conflict(
+                    "reauthorization requires a declared account identity".into(),
+                ));
+            }
+            authorization_code::validate_installed_contribution(credential, &adapter)?;
+            authorization_code::reauthorization_client(
+                credential,
+                body.client,
+                &body.provider_driver,
+                &adapter.refresh_url,
+            )?
+        }
         None => match body.client {
             Some(client) => client,
-            None => authorization_code::deployment_client_default(&body.provider_driver)?,
+            None => authorization_code::default_client(&body.provider_driver, &adapter)?,
         },
     };
     Ok(Json(

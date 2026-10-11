@@ -32,6 +32,126 @@ fn json_post(path: &str) -> Request<Body> {
         .unwrap()
 }
 
+#[tokio::test]
+async fn generic_declared_identity_reauthorization_start_preserves_client_and_account() {
+    use crate::provider::{
+        AuthorizationCodeContribution, OAuthAdapterContribution, OAuthFlowKind,
+        OAuthIdentityContribution, OAuthPublicClient,
+    };
+    let (mut state, _directory) = test_state().await;
+    let upstream = MockServer::start().await;
+    let public_client = OAuthPublicClient {
+        client_id: "fixture-public-client".into(),
+        redirect_uri: "https://provider.example/callback".into(),
+        scopes: vec!["profile".into()],
+    };
+    let adapter = OAuthAdapterContribution {
+        api_version: "oauth-adapter-v1".into(),
+        flow_kind: OAuthFlowKind::AuthorizationCodePkce,
+        login_url: "https://provider.example/authorize".into(),
+        poll_url: "https://provider.example/token".into(),
+        refresh_url: "https://provider.example/token".into(),
+        response_mode: None,
+        identity: Some(OAuthIdentityContribution {
+            url: "https://provider.example/profile".into(),
+            id_pointer: "/account/id".into(),
+            headers: Default::default(),
+        }),
+        authorization_code: Some(AuthorizationCodeContribution {
+            client_default: Some(public_client),
+            ..Default::default()
+        }),
+    };
+    let client =
+        crate::oauth::authorization_code::default_client("fixture-generic", &adapter).unwrap();
+    let credential = crate::provider::UpstreamCredential::OAuth {
+        access_token: "fixture-access".into(),
+        refresh_token: Some("fixture-refresh".into()),
+        expires_at: Some(crate::db::unix_millis() + 3_600_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        proxy_url: None,
+        proxy_network_scope: None,
+        adapter_state: Some(json!({"authorization_code":{
+            "adapter":adapter,"client_id":client.client_id,"client_secret":null,"refresh_url":adapter.refresh_url,
+            "network_scope":"public","login_client":client,"provider_identity":{"url":"https://provider.example/profile","id":"fixture-account"}
+        }})),
+    };
+    let mut provider = state.providers.get("http-json").unwrap().clone();
+    provider.id = "fixture-generic".into();
+    provider.oauth_adapter = Some(adapter);
+    state.providers.extend([provider]).unwrap();
+    let config = json!({"base_url":upstream.uri(),"network_scope":"public"});
+    let mut account = state
+        .db
+        .create_upstream_account(
+            crate::db::CreateUpstreamAccountInput {
+                tenant_external_id: "default".into(),
+                name: "fixture-account".into(),
+                driver: "fixture-generic".into(),
+                config: config.clone(),
+                credential: credential.clone(),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some(crate::oauth::authorization_code::FLOW.into()),
+                oauth_refresh_url: Some("https://provider.example/token".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    account
+        .attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())
+        .unwrap();
+    assert!(account.can_reauthorize);
+    let application = router_for_role(state.clone(), RuntimeRole::Control);
+    let body = json!({"account_name":account.name,"upstream_account_id":account.id,"provider_driver":"fixture-generic","provider_config":config});
+    let response = application
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/oauth/authorization-code/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let started: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        started["login_url"]
+            .as_str()
+            .unwrap()
+            .contains("client_id=fixture-public-client")
+    );
+    let mut invalid = body;
+    invalid["client"] = json!({"client_id":"different-client","redirect_uri":"https://provider.example/callback","scopes":["profile"]});
+    let response = application
+        .oneshot(
+            Request::post("/internal/v1/oauth/authorization-code/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let (preserved, _, _, _) = state
+        .db
+        .upstream_account_with_current_credential(account.id, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        preserved.credential_generation,
+        account.credential_generation
+    );
+}
+
 fn file_count(root: &std::path::Path) -> usize {
     std::fs::read_dir(root)
         .map(|entries| {
@@ -2169,6 +2289,7 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                 refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
                 response_mode: None,
                 identity: None,
+                authorization_code: None,
             }),
             component_adapter: None,
             generation_adapter: None,
