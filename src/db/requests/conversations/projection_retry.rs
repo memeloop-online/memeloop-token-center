@@ -43,6 +43,23 @@ impl From<ConversationContentError> for AppError {
 }
 
 impl Database {
+    pub(super) async fn try_schedule_rolled_back_conversation_retry(
+        &self,
+        request_id: Uuid,
+        lease_owner: Uuid,
+    ) {
+        if let Err(error) = self
+            .schedule_rolled_back_conversation_retry(request_id, lease_owner)
+            .await
+        {
+            tracing::warn!(
+                %request_id,
+                error_category = error.diagnostic_category(),
+                "conversation rollback retry scheduling failed"
+            );
+        }
+    }
+
     pub(crate) async fn schedule_rolled_back_conversation_retry(
         &self,
         request_id: Uuid,

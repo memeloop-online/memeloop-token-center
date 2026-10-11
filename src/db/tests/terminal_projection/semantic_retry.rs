@@ -178,6 +178,48 @@ async fn retry_contract(database_url: &str) {
     retained(&database, request_id, new_expiry).await;
     complete(&database, request_id, &reservation, next_owner).await;
 
+    let (_key, reservation, request_id, owner) = pending(&database).await;
+    let original_expiry = expiry(&database, request_id).await;
+    let terminal_projected_at: i64 = sqlx::query_scalar(
+        "SELECT projected_at FROM terminal_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = NULL WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION reject_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'injected scheduling failure'; END $$; CREATE TRIGGER reject_retry BEFORE UPDATE OF terminal_lease_expires_at ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_retry();")
+        .execute(&blockers).await.unwrap();
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    retained(&database, request_id, original_expiry).await;
+    sqlx::raw_sql("DROP TRIGGER reject_retry ON conversation_projection_outbox; DROP FUNCTION reject_retry();")
+        .execute(&blockers).await.unwrap();
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    let retry_expiry = expiry(&database, request_id).await;
+    assert!(retry_expiry < original_expiry);
+    retained(&database, request_id, retry_expiry).await;
+    sqlx::query("UPDATE terminal_projection_outbox SET projected_at = $1 WHERE request_id = $2")
+        .bind(terminal_projected_at)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    complete(&database, request_id, &reservation, owner).await;
+
     for (name, trigger) in [
         (
             "permanent",

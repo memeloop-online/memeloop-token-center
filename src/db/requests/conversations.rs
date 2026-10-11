@@ -225,8 +225,8 @@ impl Database {
                 "conversation content transaction failed"
             );
             if rollback_confirmed && retryable_sqlstate.is_some() {
-                self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                    .await?;
+                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await;
             }
             return Err(error.into());
         }
@@ -575,8 +575,8 @@ impl Database {
             }
             Ok(false) => {
                 transaction.rollback().await?;
-                self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                    .await?;
+                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await;
                 Ok(false)
             }
             Err(error) => {
@@ -589,8 +589,8 @@ impl Database {
                     "conversation projection transaction failed"
                 );
                 if rollback_confirmed && retryable_sqlstate.is_some() {
-                    self.schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                        .await?;
+                    self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                        .await;
                 }
                 Err(error.into())
             }
