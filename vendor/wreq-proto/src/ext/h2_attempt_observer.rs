@@ -64,6 +64,9 @@ fn millis(duration: std::time::Duration) -> u64 {
 #[cfg(feature = "h2-attempt-observer")]
 pub(crate) struct H2Connection(Arc<ConnectionState>, bool);
 
+#[cfg(not(feature = "h2-attempt-observer"))]
+pub(crate) type H2Connection = ();
+
 #[cfg(feature = "h2-attempt-observer")]
 impl H2Connection {
     pub(crate) fn new() -> Self {

@@ -12,5 +12,4 @@ pub use self::{
     preserve_header::{on_preserve_header, OnPreserveHeaderCallback},
 };
 pub(crate) use self::{informational::OnInformational, preserve_header::OnPreserveHeader};
-#[cfg(feature = "h2-attempt-observer")]
 pub(crate) use h2_attempt_observer::H2Connection;

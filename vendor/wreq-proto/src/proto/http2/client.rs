@@ -42,7 +42,8 @@ use crate::{
 };
 
 #[cfg(feature = "h2-attempt-observer")]
-use crate::ext::{H2AttemptObserver, H2Connection};
+use crate::ext::H2AttemptObserver;
+use crate::ext::H2Connection;
 
 /// Receiver for HTTP/2 client requests
 type ClientRx<B> = dispatch::Receiver<Request<B>, Response<Incoming>>;
@@ -99,7 +100,9 @@ where
         conn,
         is_terminated: false,
         #[cfg(feature = "h2-attempt-observer")]
-        lifecycle,
+        _lifecycle: lifecycle,
+        #[cfg(not(feature = "h2-attempt-observer"))]
+        _lifecycle: (),
     };
 
     exec.execute_h2_future(H2ClientFuture::Task {
@@ -171,8 +174,7 @@ pin_project! {
         conn: Either<Conn<T, B>, Connection<T, SendBuf<<B as Body>::Data>>>,
         #[pin]
         is_terminated: bool,
-        #[cfg(feature = "h2-attempt-observer")]
-        lifecycle: H2Connection,
+        _lifecycle: H2Connection,
     }
 }
 
@@ -193,7 +195,7 @@ where
         if polled.is_ready() {
             *this.is_terminated = true;
             #[cfg(feature = "h2-attempt-observer")]
-            this.lifecycle
+            this._lifecycle
                 .finish(if matches!(&polled, Poll::Ready(Ok(()))) {
                     1
                 } else {

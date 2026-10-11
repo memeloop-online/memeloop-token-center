@@ -45,7 +45,7 @@ test('wreq-proto source is authenticated upstream plus only reviewed binding pat
       rmSync(resolve(patched, extra));
     }
     const patch = readFileSync(resolve(vendor, 'MEMELOOP-SOURCE.patch'), 'utf8');
-    assert.equal(digest(patch), '01315c5df6143c60f957b6218032c9255941ee719f18226f4db95df4941da419');
+    assert.equal(digest(patch), '841a7ea7c4d7e8282f89ee15e4fa1d2cd4cd665c1f1b3018f086c09e1aebed42');
     const changed = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map((match) => match[1]);
     assert.deepEqual(changed.sort(), ['Cargo.toml', 'src/ext.rs', 'src/ext/h2_attempt_observer.rs', 'src/proto/http2/client.rs']);
     const reversed = spawnSync('patch', ['-p1', '--reverse', '--batch', '--fuzz=0'], {
@@ -56,9 +56,13 @@ test('wreq-proto source is authenticated upstream plus only reviewed binding pat
     const cargo = readFileSync(resolve(repository, 'Cargo.toml'), 'utf8');
     assert(cargo.includes('wreq-proto = { path = "vendor/wreq-proto" }'));
     const production = cargo.split('[dev-dependencies]')[0];
+    assert(production !== undefined);
     assert(!production.includes('features = ["h2-attempt-observer"]'));
     const lock = readFileSync(resolve(repository, 'Cargo.lock'), 'utf8');
-    const entry = lock.split('name = "wreq-proto"')[1].split('[[package]]')[0];
+    const remainder = lock.split('name = "wreq-proto"')[1];
+    assert(remainder !== undefined);
+    const entry = remainder.split('[[package]]')[0];
+    assert(entry !== undefined);
     assert(entry.includes('version = "0.2.6"'));
     assert(!entry.includes('source =') && !entry.includes('checksum ='));
   } finally {

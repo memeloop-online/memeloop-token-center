@@ -10,7 +10,7 @@
  tracing = [
 --- a/src/ext.rs
 +++ b/src/ext.rs
-@@ -1,12 +1,16 @@
+@@ -1,12 +1,15 @@
  //! Extensions for HTTP messages in wreq_proto.
  
  mod h1_reason_phrase;
@@ -25,11 +25,10 @@
      preserve_header::{on_preserve_header, OnPreserveHeaderCallback},
  };
  pub(crate) use self::{informational::OnInformational, preserve_header::OnPreserveHeader};
-+#[cfg(feature = "h2-attempt-observer")]
 +pub(crate) use h2_attempt_observer::H2Connection;
 --- /dev/null
 +++ b/src/ext/h2_attempt_observer.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,113 @@
 +#[cfg(feature = "h2-attempt-observer")]
 +use std::sync::atomic::{AtomicU64, Ordering};
 +use std::sync::{Arc, Mutex};
@@ -96,6 +95,9 @@
 +#[cfg(feature = "h2-attempt-observer")]
 +pub(crate) struct H2Connection(Arc<ConnectionState>, bool);
 +
++#[cfg(not(feature = "h2-attempt-observer"))]
++pub(crate) type H2Connection = ();
++
 +#[cfg(feature = "h2-attempt-observer")]
 +impl H2Connection {
 +    pub(crate) fn new() -> Self {
@@ -142,17 +144,18 @@
 +}
 --- a/src/proto/http2/client.rs
 +++ b/src/proto/http2/client.rs
-@@ -41,6 +41,9 @@
+@@ -41,6 +41,10 @@
      Error, Result,
  };
  
 +#[cfg(feature = "h2-attempt-observer")]
-+use crate::ext::{H2AttemptObserver, H2Connection};
++use crate::ext::H2AttemptObserver;
++use crate::ext::H2Connection;
 +
  /// Receiver for HTTP/2 client requests
  type ClientRx<B> = dispatch::Receiver<Request<B>, Response<Incoming>>;
  
-@@ -88,9 +91,15 @@
+@@ -88,9 +92,17 @@
      } else {
          (Either::Right(conn), ping::Recorder::disabled())
      };
@@ -164,11 +167,13 @@
          conn,
          is_terminated: false,
 +        #[cfg(feature = "h2-attempt-observer")]
-+        lifecycle,
++        _lifecycle: lifecycle,
++        #[cfg(not(feature = "h2-attempt-observer"))]
++        _lifecycle: (),
      };
  
      exec.execute_h2_future(H2ClientFuture::Task {
-@@ -98,6 +107,10 @@
+@@ -98,6 +110,10 @@
      });
  
      Ok(ClientTask {
@@ -179,21 +184,20 @@
          ping,
          conn_drop_ref,
          conn_eof,
-@@ -158,6 +171,8 @@
+@@ -158,6 +174,7 @@
          conn: Either<Conn<T, B>, Connection<T, SendBuf<<B as Body>::Data>>>,
          #[pin]
          is_terminated: bool,
-+        #[cfg(feature = "h2-attempt-observer")]
-+        lifecycle: H2Connection,
++        _lifecycle: H2Connection,
      }
  }
  
-@@ -177,6 +192,13 @@
+@@ -177,6 +194,13 @@
          let polled = this.conn.poll(cx);
          if polled.is_ready() {
              *this.is_terminated = true;
 +            #[cfg(feature = "h2-attempt-observer")]
-+            this.lifecycle
++            this._lifecycle
 +                .finish(if matches!(&polled, Poll::Ready(Ok(()))) {
 +                    1
 +                } else {
@@ -202,7 +206,7 @@
          }
          polled.map_err(|_e| {
              debug!(error = %_e, "connection error");
-@@ -324,6 +346,10 @@
+@@ -324,6 +348,10 @@
      E: Unpin,
  {
      ping: ping::Recorder,
@@ -213,7 +217,7 @@
      conn_drop_ref: ConnDropRef,
      conn_eof: ConnEof,
      executor: E,
-@@ -630,6 +656,8 @@
+@@ -630,6 +658,8 @@
                          continue;
                      }
  
@@ -222,7 +226,7 @@
                      let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                          Ok(ok) => ok,
                          Err(err) => {
-@@ -642,6 +670,17 @@
+@@ -642,6 +672,17 @@
                          }
                      };
  
