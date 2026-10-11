@@ -459,11 +459,24 @@ async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_
         .append_pair("options", &format!("-csearch_path={schema}"));
     let database = Database::connect(isolated_url.as_str()).await.unwrap();
     database.migrate().await.unwrap();
-    let account_id = account(&database).await;
-    let (account, source) = database
-        .upstream_account_with_credential(account_id, KEY)
+    let source = credential();
+    let account = database
+        .create_upstream_account(
+            crate::db::CreateUpstreamAccountInput {
+                tenant_external_id: format!("bootstrap-{}", Uuid::now_v7()),
+                name: "bootstrap-proxy-test".into(),
+                driver: "openai-codex".into(),
+                config: serde_json::json!({"base_url":"https://chatgpt.com/backend-api/codex"}),
+                credential: source.clone(),
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            KEY,
+        )
         .await
         .unwrap();
+    let account_id = account.id;
     let tenant = account.tenant_external_id.clone().unwrap();
     let group = database
         .create_transport_group(
