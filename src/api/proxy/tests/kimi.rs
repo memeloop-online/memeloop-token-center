@@ -1050,6 +1050,7 @@ async fn mock_declared_kimi_dialect_stream_checkpoint_roundtrips_as_untrusted_hi
     provider.component_adapter = None;
     provider.generation_adapter = None;
     provider.request_compatibility = crate::provider::RequestCompatibility {
+        anthropic_messages_headers: Default::default(),
         third_party: true,
         responses_via_chat_v1: true,
         responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::KimiV1),
