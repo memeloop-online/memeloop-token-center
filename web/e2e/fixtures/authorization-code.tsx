@@ -9,10 +9,11 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
+const fragmentMode = new URLSearchParams(location.search).has('fragment');
 const provider: ProviderType = {
   id: 'fixture-plugin', display_name: 'Fixture OAuth', source: 'plugin', protocols: ['openai'], modalities: ['text'],
   config_schema: { type: 'object', properties: { base_url: { type: 'string', default: 'https://api.example.invalid' } } }, credential_schema: {},
-  oauth_adapter: { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: 'https://login.example.invalid', poll_url: '', refresh_url: 'https://token.example.invalid' },
+  oauth_adapter: { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: 'https://login.example.invalid', poll_url: '', refresh_url: 'https://token.example.invalid', ...(fragmentMode ? { response_mode: 'fragment_manual' as const } : {}) },
 };
 function Fixture() {
   const mode = new URLSearchParams(location.search).get('reauthorize');
