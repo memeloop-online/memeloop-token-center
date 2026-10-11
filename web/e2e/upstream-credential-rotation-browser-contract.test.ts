@@ -6,6 +6,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { isUpstreamModelCatalog } from '../src/operator/managedModelSync.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 const labels = {
   'zh-CN': { details: '管理账号', manage: '账号设置与授权操作', rotate: '更换凭据', title: '更换 rotation@example.org 的凭据', back: '取消', close: '关闭', key: '新 API 密钥', submit: '保存', invalid: '请填写所有必填项，并检查标记出的字段。', failed: '未能确认替换结果。请检查网络和账号状态后再重试。', saved: '新凭据已保存。系统后续将使用新凭据连接此账号。', settings: '编辑 rotation@example.org', permission: '没有替换此账号凭据的权限。请联系管理员确认租户范围和提供商管理权限。', old: '这里不会在提供商处撤销旧密钥或令牌', oauth: 'OAuth 授权令牌', token: '访问令牌', expiry: '到期时间' },
@@ -31,6 +32,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
         assert.equal(url.origin, origin, 'the fixture must never contact a real provider');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
         if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } });
+        if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
         if (request.method() !== 'GET') {
           writes.push({ path: url.pathname, method: request.method(), body: request.postDataJSON(), idempotency: request.headers()['idempotency-key'] });
           assert.equal(url.pathname, '/internal/v1/upstreams/rotation-fixture/credential');

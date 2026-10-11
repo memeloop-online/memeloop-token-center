@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { editProviderAccount } from './support/provider-account-navigation.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -33,6 +34,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
         if (url.pathname === '/internal/v1/upstreams') { accountReads++; return route.fulfill({ json: [account] }); }
         return route.fulfill({ json: [] });
       }
+      if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
       assert.equal(url.pathname, '/internal/v1/oauth/claude/start');
       assert.equal(request.method(), 'POST');
       assert.equal(request.postDataJSON().upstream_account_id, account.id);
@@ -173,6 +175,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
           if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy } });
           return route.fulfill({ json: [] });
         }
+        if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
         const body = request.postDataJSON(); writes.push({ path: url.pathname, body });
         if (url.pathname.endsWith('/transport-proxy')) {
           assert.equal(request.method(), 'PUT');
@@ -265,17 +268,17 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       for (const width of [390, 1440]) {
         await page.setViewportSize({ width, height: 1000 });
         if (width === 390) {
-          const titleLayout = await page.locator('.provider-detail-heading h3').evaluate(heading => {
+          const titleLayout = await page.locator('.provider-detail-navigation h2').evaluate(heading => {
             const parent = heading.parentElement!;
             const title = heading.getBoundingClientRect();
             const container = parent.getBoundingClientRect();
-            const metadata = parent.querySelector('span')!.getBoundingClientRect();
+            const action = parent.querySelector('button')!.getBoundingClientRect();
             const text = document.createRange();
             text.selectNodeContents(heading);
-            return { titleWidth: title.width, containerWidth: container.width, titleBottom: title.bottom, metadataTop: metadata.top, lines: text.getClientRects().length };
+            return { titleWidth: title.width, containerWidth: container.width, titleRight: title.right, titleBottom: title.bottom, actionLeft: action.left, actionTop: action.top, lines: text.getClientRects().length };
           });
-          assert.ok(Math.abs(titleLayout.titleWidth - titleLayout.containerWidth) <= 1, 'the account name owns the full narrow-screen heading row');
-          assert.ok(titleLayout.metadataTop >= titleLayout.titleBottom, 'account metadata wraps after the account name');
+          assert.ok(titleLayout.titleWidth <= titleLayout.containerWidth, 'the account name stays inside the narrow-screen workspace navigation');
+          assert.ok(titleLayout.titleRight <= titleLayout.actionLeft + 1 || titleLayout.actionTop >= titleLayout.titleBottom - 1, 'the return action never overlaps the account name');
           assert.equal(titleLayout.lines, 1, 'the real reauthorization account name is not squeezed onto an orphan final-character line');
         }
         await page.screenshot({ path: `${screenshotRoot}/codex-reauthorization-saved-${locale}-${width}.png`, fullPage: true });

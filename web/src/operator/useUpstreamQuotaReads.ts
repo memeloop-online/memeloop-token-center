@@ -72,7 +72,16 @@ export function useUpstreamQuotaReads(token: string, tenant: string, accounts: Q
         const error = reason instanceof ApiError && [401, 403].includes(reason.status) ? 'quota.errorPermission' : 'quota.readFailed';
         const diagnostic = diagnosticForApiFailure(reason);
         setEntries(previous => ownsIdentity() && isEligible() ? { ...previous, [account.id]: { generation, snapshot: previous[account.id]?.generation === generation ? previous[account.id].snapshot : undefined, diagnostic, busy: false, refreshFailed: true, error } } : previous);
-      } finally { if (requests.current.get(key)?.controller === controller) requests.current.delete(key); }
+      } finally {
+        if (requests.current.get(key)?.controller === controller) requests.current.delete(key);
+        // A fenced or superseded read still releases its own pending entry so a
+        // later auto-read is not blocked forever; newer generations keep their
+        // own state and late results never publish.
+        setEntries(previous => {
+          const entry = previous[account.id];
+          return entry?.generation === generation && entry.busy ? { ...previous, [account.id]: { ...entry, busy: false, queued: false } } : previous;
+        });
+      }
     })();
     requests.current.set(key, { controller, promise });
     return promise;
