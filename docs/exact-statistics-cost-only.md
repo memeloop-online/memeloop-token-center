@@ -35,3 +35,13 @@ replay, rejected evidence, transaction rollback, all-column financial and
 non-cost statistics snapshots, shared writer coexistence, and actual append
 writer interleaving. PostgreSQL runs use the existing CI database service and
 `MTC_TEST_POSTGRES_URL`; no local test run or new test framework is required.
+
+The dedicated PostgreSQL concurrent-contribution contract runs both writer-first
+and correction-first orders for a real request terminal writer and a real
+generation terminal worker. Database blockers prove overlap on the same physical
+aggregate row. For requests, all seven aggregate dimensions are identical and
+retain both request counts; generation shares the session total and retains its
+cost, count and units. Each order checks every financial column and every
+non-cost statistics column across the correction commit, plus zero-change replay.
+Aggregate failures identify only the fixed stage and table category, never
+request IDs, model names, tenant IDs, dimension values or payloads.

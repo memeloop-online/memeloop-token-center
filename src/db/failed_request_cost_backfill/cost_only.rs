@@ -54,10 +54,19 @@ pub(super) async fn subtract_costs(
                 query.bind(value)
             };
         }
-        if query.execute(&mut **transaction).await?.rows_affected() != 1 {
-            return Err(AppError::Conflict(
-                "cost-only projection requires an existing aggregate with sufficient cost".into(),
-            ));
+        let updated = query.execute(&mut **transaction).await.map_err(|error| {
+            tracing::error!(
+                stage = "aggregate_cost_delta",
+                dimension_category = TABLES[table_index],
+                "cost-only projection aggregate update failed"
+            );
+            AppError::from(error)
+        })?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict(format!(
+                "cost-only projection stage=aggregate_cost_delta dimension={}: missing aggregate or insufficient cost",
+                TABLES[table_index]
+            )));
         }
     }
     Ok(())

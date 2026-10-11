@@ -958,6 +958,8 @@ async fn rebuild_analysis(
 
 #[cfg(test)]
 mod tests {
+    mod cost_only_concurrency;
+
     use rust_decimal::Decimal;
     use url::Url;
 
@@ -1621,6 +1623,7 @@ mod tests {
                 fixture.key.key_id.to_string(),
             ),
             ("credit_accounts", "id", fixture.account_id.to_string()),
+            ("generation_jobs", "key_id", fixture.key.key_id.to_string()),
             ("key_budget_state", "key_id", fixture.key.key_id.to_string()),
             (
                 "key_budget_daily_rollups",
@@ -2027,12 +2030,23 @@ mod tests {
             .await
             .unwrap();
         let insufficient_costs = aggregate_costs(fixture).await;
+        let error = fixture
+            .database
+            .backfill_failed_request_costs_exact_cost_only(manifest.clone(), true)
+            .await
+            .unwrap_err();
+        let AppError::Conflict(message) = error else {
+            panic!("expected bounded aggregate conflict")
+        };
+        assert!(message.contains("stage=aggregate_cost_delta"));
+        assert!(message.contains("dimension=usage_analysis_daily"));
+        assert!(!message.contains(&fixture.model));
+        assert!(!message.contains(&manifest.tenant_id));
         assert!(
-            fixture
-                .database
-                .backfill_failed_request_costs_exact_cost_only(manifest.clone(), true)
-                .await
-                .is_err()
+            manifest
+                .requests
+                .iter()
+                .all(|request| !message.contains(&request.request_id))
         );
         assert_eq!(aggregate_costs(fixture).await, insufficient_costs);
         assert_eq!(statistics_non_cost_rows(fixture).await, non_cost_before);
