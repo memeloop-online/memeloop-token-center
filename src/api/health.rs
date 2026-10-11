@@ -3,6 +3,30 @@ use super::*;
 // The database timeout is independent of configurable archive deadlines.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 
+async fn check_database_readiness(
+    database: &crate::db::Database,
+    progress: &crate::db::DatabaseReadinessProgress,
+) -> (
+    Result<Result<(), crate::db::DatabaseReadinessError>, tokio::time::error::Elapsed>,
+    crate::db::DatabaseReadinessSnapshot,
+) {
+    let result =
+        tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check_observed(progress)).await;
+    (result, progress.snapshot(database))
+}
+
+fn warn_database_readiness(timed_out: bool, snapshot: crate::db::DatabaseReadinessSnapshot) {
+    tracing::warn!(
+        timed_out,
+        stage = snapshot.stage,
+        phase = snapshot.phase,
+        elapsed_ms = snapshot.elapsed_ms,
+        pool_size = snapshot.pool_size,
+        pool_idle = snapshot.pool_idle,
+        "readiness database check failed"
+    );
+}
+
 pub(super) async fn liveness() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
@@ -72,8 +96,9 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
     let (database_ready, archive_ready) = state
         .metrics
         .readiness(move || async move {
-            let (database, archive) = tokio::join!(
-                tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check_detailed()),
+            let progress = crate::db::DatabaseReadinessProgress::new();
+            let ((database, snapshot), archive) = tokio::join!(
+                check_database_readiness(&database, &progress),
                 tokio::time::timeout(
                     archive.readiness_deadline() + Duration::from_secs(1),
                     archive.readiness_check()
@@ -106,10 +131,7 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
             };
             let archive_ready = matches!(archive, Ok(Ok(())));
             if !database_readiness.is_ready() {
-                tracing::warn!(
-                    timed_out = database_timed_out,
-                    "readiness database check failed"
-                );
+                warn_database_readiness(database_timed_out, snapshot);
             }
             if !archive_ready {
                 tracing::warn!(
@@ -389,5 +411,162 @@ mod tests {
             body["checks"]["database_schema"]["missing_migration_count"],
             6
         );
+    }
+
+    #[tokio::test]
+    async fn database_timeout_preserves_every_pending_stage_and_phase() {
+        use crate::db::{
+            Database, DatabaseReadinessPhase, DatabaseReadinessProgress, DatabaseReadinessStage,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("readiness-stages.db").display()
+        );
+        let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+        database.migrate().await.unwrap();
+        for (stage, expected_stage) in [
+            (DatabaseReadinessStage::Ping, "ping"),
+            (DatabaseReadinessStage::Schema, "schema"),
+            (DatabaseReadinessStage::ArchiveMarker, "archive_marker"),
+            (DatabaseReadinessStage::ArchiveShape, "archive_shape"),
+        ] {
+            for (phase, expected_phase) in [
+                (DatabaseReadinessPhase::Acquire, "acquire"),
+                (DatabaseReadinessPhase::Query, "query"),
+            ] {
+                let mut progress = DatabaseReadinessProgress::new();
+                progress.stalled_at = Some((stage, phase));
+                let progress = std::sync::Arc::new(progress);
+                let check_database = database.clone();
+                let check_progress = progress.clone();
+                let check = tokio::spawn(async move {
+                    check_database_readiness(&check_database, &check_progress).await
+                });
+                tokio::time::timeout(Duration::from_secs(5), progress.stalled.notified())
+                    .await
+                    .expect("check reaches the exact pending stage before the outer deadline");
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(5)).await;
+                assert!(!check.is_finished(), "the six-second deadline is unchanged");
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let (result, snapshot) = check.await.unwrap();
+                tokio::time::resume();
+                assert!(
+                    result.is_err(),
+                    "outer timeout must cancel the pending check"
+                );
+                assert_eq!(snapshot.stage, expected_stage);
+                assert_eq!(snapshot.phase, expected_phase);
+                assert!((6000..7000).contains(&snapshot.elapsed_ms));
+                assert!(snapshot.pool_idle <= snapshot.pool_size as usize);
+                let retained = progress.snapshot(&database);
+                assert_eq!(retained.stage, expected_stage);
+                assert_eq!(retained.phase, expected_phase);
+                let (status, body) =
+                    readiness_contract(crate::metrics::DatabaseReadiness::Unavailable, true);
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(body["checks"]["database"], "failed");
+            }
+        }
+        let progress = DatabaseReadinessProgress::new();
+        let (result, snapshot) = check_database_readiness(&database, &progress).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "cancelled checks release their connections"
+        );
+        assert_eq!(snapshot.stage, "archive_shape");
+        assert_eq!(snapshot.phase, "query");
+    }
+
+    #[derive(Clone, Default)]
+    struct ReadinessLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct ReadinessLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ReadinessLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for ReadinessLogCapture {
+        type Writer = ReadinessLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            ReadinessLogWriter(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn database_timeout_warning_contains_only_fixed_safe_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let canary = "private-sql-parameter-token-canary";
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join(format!("{canary}.db")).display()
+        );
+        let database = crate::db::Database::connect_with_max(&database_url, 1)
+            .await
+            .unwrap();
+        let mut progress = crate::db::DatabaseReadinessProgress::new();
+        progress.stalled_at = Some((
+            crate::db::DatabaseReadinessStage::Ping,
+            crate::db::DatabaseReadinessPhase::Query,
+        ));
+        let progress = std::sync::Arc::new(progress);
+        let check_database = database.clone();
+        let check_progress = progress.clone();
+        let check = tokio::spawn(async move {
+            check_database_readiness(&check_database, &check_progress).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), progress.stalled.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(CHECK_TIMEOUT).await;
+        let (result, snapshot) = check.await.unwrap();
+        tokio::time::resume();
+        assert!(result.is_err());
+        let capture = ReadinessLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || warn_database_readiness(true, snapshot));
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains(canary));
+        assert!(!output.contains(&database_url));
+        assert!(!output.contains("SELECT"));
+        let event: Value = serde_json::from_str(output.trim()).unwrap();
+        let fields = event["fields"].as_object().unwrap();
+        let mut names: Vec<_> = fields.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "elapsed_ms",
+                "message",
+                "phase",
+                "pool_idle",
+                "pool_size",
+                "stage",
+                "timed_out"
+            ]
+        );
+        assert_eq!(fields["stage"], "ping");
+        assert_eq!(fields["phase"], "query");
+        assert_eq!(fields["timed_out"], true);
+        assert_eq!(fields["message"], "readiness database check failed");
+        assert!(fields["elapsed_ms"].as_u64().unwrap() >= 6000);
+        assert!(fields["pool_size"].is_u64());
+        assert!(fields["pool_idle"].is_u64());
     }
 }

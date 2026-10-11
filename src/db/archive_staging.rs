@@ -18,7 +18,9 @@ use crate::archive_staging::{
 };
 use crate::model::GenerationStagedAssets;
 
-use super::{AppError, Database, DatabaseBackend};
+use super::{
+    AppError, Database, DatabaseBackend, DatabaseReadinessProgress, DatabaseReadinessStage,
+};
 
 impl Database {
     /// Creates a writing attempt or returns the exact idempotent replay.
@@ -497,20 +499,30 @@ impl Database {
         row.map(|row| archive_attempt_from_row(&row)).transpose()
     }
 
-    pub(crate) async fn archive_staging_readiness_check(&self) -> Result<(), sqlx::Error> {
-        let migration: Option<i64> =
-            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = 35")
-                .fetch_optional(&self.pool)
+    pub(crate) async fn archive_staging_readiness_check(
+        &self,
+        progress: &DatabaseReadinessProgress,
+    ) -> Result<(), sqlx::Error> {
+        let migration: Option<i64> = {
+            let mut connection = self
+                .acquire_readiness_connection(progress, DatabaseReadinessStage::ArchiveMarker)
                 .await?;
+            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = 35")
+                .fetch_optional(&mut *connection)
+                .await?
+        };
         if migration != Some(35) {
             return Err(sqlx::Error::Protocol(
                 "archive staging schema migration v35 is not applied".into(),
             ));
         }
+        let mut connection = self
+            .acquire_readiness_connection(progress, DatabaseReadinessStage::ArchiveShape)
+            .await?;
         sqlx::query(
             "SELECT attempt_id, owner_kind, purpose, state, lease_token, next_cleanup_at FROM archive_staging_attempts LIMIT 0",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await?;
         Ok(())
     }

@@ -1281,7 +1281,10 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
 ];
 
 impl Database {
-    pub(super) async fn schema_status(&self) -> Result<DatabaseSchemaStatus, sqlx::Error> {
+    pub(super) async fn schema_status(
+        &self,
+        progress: &DatabaseReadinessProgress,
+    ) -> Result<DatabaseSchemaStatus, sqlx::Error> {
         let migrations = match self.backend {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
@@ -1290,10 +1293,14 @@ impl Database {
             .last()
             .map(|migration| migration.version)
             .unwrap_or_default();
+        let mut connection = self
+            .acquire_readiness_connection(progress, DatabaseReadinessStage::Schema)
+            .await?;
         let applied_versions =
             sqlx::query_scalar::<_, i64>("SELECT version FROM schema_migrations ORDER BY version")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await?;
+        drop(connection);
         let missing_migration_count = migrations
             .iter()
             .filter(|migration| applied_versions.binary_search(&migration.version).is_err())

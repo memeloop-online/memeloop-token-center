@@ -1,6 +1,38 @@
 use super::super::*;
 
 #[tokio::test]
+async fn readiness_outer_timeout_preserves_a_real_pool_acquire_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("readiness-acquire.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    database.migrate().await.unwrap();
+    let held = database.pool.acquire().await.unwrap();
+    tokio::time::pause();
+    let progress = DatabaseReadinessProgress::new();
+    let mut check = Box::pin(tokio::time::timeout(
+        Duration::from_secs(6),
+        database.readiness_check_observed(&progress),
+    ));
+    assert!(futures_util::poll!(&mut check).is_pending());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(futures_util::poll!(&mut check).is_pending());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(check.await.is_err());
+    let snapshot = progress.snapshot(&database);
+    assert_eq!(snapshot.stage, "ping");
+    assert_eq!(snapshot.phase, "acquire");
+    assert_eq!(snapshot.elapsed_ms, 6000);
+    assert_eq!(snapshot.pool_size, 1);
+    assert_eq!(snapshot.pool_idle, 0);
+    tokio::time::resume();
+    drop(held);
+    database.readiness_check_detailed().await.unwrap();
+}
+
+#[tokio::test]
 async fn readiness_rejects_schema_gaps_and_an_outdated_migration_frontier() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -17,7 +49,14 @@ async fn readiness_rejects_schema_gaps_and_an_outdated_migration_frontier() {
         .await
         .unwrap();
 
-    let error = database.readiness_check_detailed().await.unwrap_err();
+    let progress = DatabaseReadinessProgress::new();
+    let error = database
+        .readiness_check_observed(&progress)
+        .await
+        .unwrap_err();
+    let snapshot = progress.snapshot(&database);
+    assert_eq!(snapshot.stage, "schema");
+    assert_eq!(snapshot.phase, "query");
     let DatabaseReadinessError::SchemaOutdated(status) = error else {
         panic!("schema gap must be reported separately from dependency failure");
     };
