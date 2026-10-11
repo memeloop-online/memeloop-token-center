@@ -759,7 +759,7 @@ pub(in crate::api) fn convert_with_dialect(
     let mut reasoning = String::new();
     let preserve_reasoning = dialect == ResponsesViaChatDialect::KimiV1;
     let mut compaction_trigger = false;
-    for item in &input {
+    for (input_index, item) in input.iter().enumerate() {
         let normalized;
         let item = if item["type"] == "agent_message" {
             normalized = agent_message(item)?;
@@ -898,6 +898,16 @@ pub(in crate::api) fn convert_with_dialect(
                 }
             }
             _ => {
+                let metadata =
+                    rejected_input_metadata(input_index, item, dialect, translate_compaction);
+                tracing::warn!(
+                    phase = "responses_chat_input_rejected",
+                    input_index = metadata.input_index,
+                    input_kind = metadata.input_kind,
+                    dialect = metadata.dialect,
+                    compaction_translation_enabled = metadata.compaction_translation_enabled,
+                    "Unsupported Responses input item rejected"
+                );
                 return Err(AppError::BadRequest(
                     "unsupported Responses input item for Responses-via-Chat".into(),
                 ));
@@ -961,6 +971,48 @@ pub(in crate::api) fn convert_with_dialect(
     }
     Ok(output)
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct RejectedInputMetadata {
+    input_index: usize,
+    input_kind: &'static str,
+    dialect: &'static str,
+    compaction_translation_enabled: bool,
+}
+
+fn rejected_input_metadata(
+    input_index: usize,
+    item: &Value,
+    dialect: ResponsesViaChatDialect,
+    compaction_translation_enabled: bool,
+) -> RejectedInputMetadata {
+    let input_kind = match item.get("type").and_then(Value::as_str) {
+        Some("compaction_trigger") => "compaction_trigger",
+        Some("compaction") => "compaction",
+        Some("local_shell_call") => "local_shell_call",
+        Some("web_search_call") => "web_search_call",
+        Some("file_search_call") => "file_search_call",
+        Some("computer_call") => "computer_call",
+        Some("computer_call_output") => "computer_call_output",
+        Some("image_generation_call") => "image_generation_call",
+        Some("item_reference") => "item_reference",
+        Some(_) => "unknown_type",
+        None => "missing_or_invalid_type",
+    };
+    RejectedInputMetadata {
+        input_index,
+        input_kind,
+        dialect: match dialect {
+            ResponsesViaChatDialect::KimiV1 => "kimi_v1",
+            ResponsesViaChatDialect::OpenAiChatV1 => "openai_chat_v1",
+        },
+        compaction_translation_enabled,
+    }
+}
+
+#[cfg(test)]
+#[path = "responses_input_metadata_tests.rs"]
+mod responses_input_metadata_tests;
 
 #[cfg(test)]
 mod tests {
