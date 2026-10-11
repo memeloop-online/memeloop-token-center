@@ -51,12 +51,13 @@ export function quotaBatchFixtureSnapshot(account: QuotaBatchFixtureAccount): Up
  */
 export function quotaBatchFixtureResponse(body: unknown, accounts: QuotaBatchFixtureAccount[]): UpstreamQuotaBatchResponse {
   const request = body as { account_ids?: unknown; fresh?: unknown; trigger?: unknown } | null;
-  if (!request || !Array.isArray(request.account_ids) || request.fresh !== true || request.trigger !== 'bulk') {
+  const ids = request?.account_ids;
+  if (!request || !Array.isArray(ids) || !ids.length || request.fresh !== true || request.trigger !== 'bulk') {
     throw new Error('Quota batch fixture expects a fresh bulk read');
   }
-  const eligible = accounts.filter(account => request.account_ids!.includes(account.id));
-  if (eligible.length !== request.account_ids.length || new Set(request.account_ids).size !== request.account_ids.length) {
-    throw new Error(`Quota batch fixture received unknown account ids: ${JSON.stringify(request.account_ids)}`);
+  const eligible = accounts.filter(account => ids.includes(account.id));
+  if (eligible.length !== ids.length || new Set(ids).size !== ids.length) {
+    throw new Error(`Quota batch fixture received unknown account ids: ${JSON.stringify(ids)}`);
   }
   return {
     contract_version: 'upstream_quota_batch_v1',

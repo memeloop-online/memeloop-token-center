@@ -29,7 +29,6 @@
 .provider-detail-navigation { flex-wrap: wrap; margin-bottom: 16px; }
 .provider-detail-navigation h2 { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
 .provider-detail-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
-.provider-detail-heading h3 { margin: 0; font-size: 18px; min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
 .provider-detail-heading > span, .connection-help { color: var(--picker-muted); font-size: 12px; text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
 .connection-help { display: inline-block; margin: 0 16px 12px 0; }
 .provider-detail-workspace > .account-main { display: flex; flex-direction: column; gap: 20px; }
@@ -68,5 +67,4 @@
   .provider-directory-actions { grid-column: 1 / -1; }
   .provider-layout > .provider-detail-workspace { padding: 20px 0; }
   .provider-detail-heading { align-items: flex-start; }
-  .provider-detail-heading h3 { flex: 1 0 100%; }
 }

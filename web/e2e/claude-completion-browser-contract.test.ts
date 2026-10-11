@@ -6,6 +6,7 @@ import { chromium } from 'playwright';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { claudeCompletionLimits } from '../src/operator/authorizationCode.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 declare global {
   interface Window {
@@ -70,6 +71,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
       if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: listedAccounts }); }
       return route.fulfill({ json: [] });
     }
+    if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
     assert.equal(request.method(), 'POST');
     assert.equal(url.pathname, '/internal/v1/oauth/claude/start');
     assert.equal(request.postDataJSON().upstream_account_id, reauthorize ? account.id : undefined);

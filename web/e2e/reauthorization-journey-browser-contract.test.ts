@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { editProviderAccount } from './support/provider-account-navigation.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -33,6 +34,7 @@ for (const locale of ['zh-CN', 'en'] as const) test(`Claude reauthorization safe
         if (url.pathname === '/internal/v1/upstreams') { accountReads++; return route.fulfill({ json: [account] }); }
         return route.fulfill({ json: [] });
       }
+      if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
       assert.equal(url.pathname, '/internal/v1/oauth/claude/start');
       assert.equal(request.method(), 'POST');
       assert.equal(request.postDataJSON().upstream_account_id, account.id);

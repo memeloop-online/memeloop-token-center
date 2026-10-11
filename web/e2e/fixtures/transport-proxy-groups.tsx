@@ -6,6 +6,7 @@ import { isOperatorRouteKey } from '../../src/operator/scope/operatorRoutes';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { Operator } from '../../src/operator/Operator';
+import { quotaBatchFixtureResponse } from '../support/quota-batch';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/app-shell.css';
@@ -21,8 +22,11 @@ const account = {
 };
 const slowAccess = new URL(location.href).searchParams.get('access') === 'slow';
 
-globalThis.fetch = async input => {
+globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
+  if (url.pathname === '/internal/v1/upstreams/quota/batch') {
+    return new Response(JSON.stringify(quotaBatchFixtureResponse(JSON.parse(String(init?.body ?? '{}')), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }])), { headers: { 'Content-Type': 'application/json' } });
+  }
   let value: unknown = [];
   if (url.pathname === '/internal/v1/tenants') value = [{ external_id: 'fixture' }];
   if (url.pathname === '/internal/v1/tenant-management') value = [{ external_id: 'fixture', status: 'active' }];
