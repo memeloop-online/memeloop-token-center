@@ -25,6 +25,60 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for MetadataLogCaptur
 }
 
 #[test]
+fn warn_only_preparation_keeps_typed_ids_and_safe_rejection_metadata() {
+    let capture = MetadataLogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_current_span(true)
+        .with_span_list(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let request_id = uuid::Uuid::from_u128(1);
+    let account_id = uuid::Uuid::from_u128(2);
+    tracing::subscriber::with_default(subscriber, || {
+        for kind in ["compaction_trigger", "private-type-canary"] {
+            let mut request = json!({"model":"kimi-k3","input":[
+                {"role":"user","content":"private-history-canary"},
+                {"type":kind,"encrypted_content":"private-ciphertext-canary",
+                    "arguments":"private-arguments-canary","output":"private-output-canary",
+                    "private-key-canary":"private-value-canary"}
+            ]});
+            let original = request.clone();
+            let result = with_input_rejection_diagnostics(request_id, account_id, 7, || {
+                crate::api::responses_via_chat::prepare_with_dialect(
+                    "kimi-k3",
+                    &mut request,
+                    ResponsesViaChatDialect::KimiV1,
+                    false,
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(request, original);
+        }
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("private-"));
+    let events: Vec<Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    for (event, expected_kind) in events.iter().zip(["compaction_trigger", "unknown_type"]) {
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["span"]["request_id"], request_id.to_string());
+        assert_eq!(event["span"]["upstream_account_id"], account_id.to_string());
+        assert_eq!(event["span"]["credential_generation"], 7);
+        assert_eq!(event["fields"]["phase"], "responses_chat_input_rejected");
+        assert_eq!(event["fields"]["input_index"], 1);
+        assert_eq!(event["fields"]["input_kind"], expected_kind);
+        assert_eq!(event["fields"]["dialect"], "kimi_v1");
+        assert_eq!(event["fields"]["compaction_translation_enabled"], false);
+    }
+}
+
+#[test]
 fn actual_conversion_rejection_logs_kind_index_and_flag_without_payload() {
     let capture = MetadataLogCapture::default();
     let subscriber = tracing_subscriber::fmt()

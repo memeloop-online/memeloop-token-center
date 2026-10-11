@@ -980,6 +980,21 @@ struct RejectedInputMetadata {
     compaction_translation_enabled: bool,
 }
 
+pub(in crate::api) fn with_input_rejection_diagnostics<Output>(
+    request_id: uuid::Uuid,
+    upstream_account_id: uuid::Uuid,
+    credential_generation: i64,
+    prepare: impl FnOnce() -> Output,
+) -> Output {
+    tracing::warn_span!(
+        "proxy_route_preparation",
+        request_id = %request_id,
+        upstream_account_id = %upstream_account_id,
+        credential_generation,
+    )
+    .in_scope(prepare)
+}
+
 fn rejected_input_metadata(
     input_index: usize,
     item: &Value,
