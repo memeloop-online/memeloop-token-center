@@ -215,16 +215,25 @@ impl Database {
             input.batch_size.saturating_add(1),
         )
         .await?;
-        apply_candidates(transaction, candidates, input.batch_size, false, false).await
+        apply_candidates(
+            transaction,
+            candidates,
+            input.batch_size,
+            false,
+            false,
+            std::future::ready(()),
+        )
+        .await
     }
 }
 
-async fn apply_candidates(
+async fn apply_candidates<BeforeCommit: std::future::Future<Output = ()>>(
     mut transaction: Transaction<'_, Any>,
     candidates: Vec<Candidate>,
     batch_size: i64,
     exact: bool,
     cost_only: bool,
+    before_commit: BeforeCommit,
 ) -> Result<FailedRequestCostBackfillReport, AppError> {
     let (candidates, mut report) = prepare_batch(candidates, batch_size, true);
     if candidates.is_empty() {
@@ -301,6 +310,7 @@ async fn apply_candidates(
 
     if cost_only {
         cost_only::subtract_costs(&mut transaction, &changed).await?;
+        before_commit.await;
         transaction.commit().await?;
         return Ok(report);
     }

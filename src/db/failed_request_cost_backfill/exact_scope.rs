@@ -122,8 +122,13 @@ impl Database {
         manifest: FailedRequestCostBackfillExactManifest,
         apply: bool,
     ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
-        self.backfill_failed_request_costs_exact_with_mode(manifest, apply, false)
-            .await
+        self.backfill_failed_request_costs_exact_with_mode(
+            manifest,
+            apply,
+            false,
+            std::future::ready(()),
+        )
+        .await
     }
 
     pub async fn backfill_failed_request_costs_exact_cost_only(
@@ -131,15 +136,35 @@ impl Database {
         manifest: FailedRequestCostBackfillExactManifest,
         apply: bool,
     ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
-        self.backfill_failed_request_costs_exact_with_mode(manifest, apply, true)
+        self.backfill_failed_request_costs_exact_with_mode(
+            manifest,
+            apply,
+            true,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cost_only_before_commit_for_test<
+        BeforeCommit: std::future::Future<Output = ()>,
+    >(
+        &self,
+        manifest: FailedRequestCostBackfillExactManifest,
+        before_commit: BeforeCommit,
+    ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
+        self.backfill_failed_request_costs_exact_with_mode(manifest, true, true, before_commit)
             .await
     }
 
-    async fn backfill_failed_request_costs_exact_with_mode(
+    async fn backfill_failed_request_costs_exact_with_mode<
+        BeforeCommit: std::future::Future<Output = ()>,
+    >(
         &self,
         mut manifest: FailedRequestCostBackfillExactManifest,
         apply: bool,
         cost_only: bool,
+        before_commit: BeforeCommit,
     ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
         manifest.validate()?;
         manifest.requests.sort_by(|left, right| {
@@ -242,6 +267,7 @@ impl Database {
                 manifest.requests.len() as i64,
                 true,
                 cost_only,
+                before_commit,
             )
             .await?
         } else {

@@ -1,5 +1,48 @@
 use super::*;
 
+fn unexpected_completion<Output>(
+    outcome: Result<Result<Output, AppError>, tokio::task::JoinError>,
+    case: &str,
+    stage: &str,
+) -> ! {
+    let category = match outcome {
+        Ok(Ok(_)) => "completed_before_expected_checkpoint",
+        Ok(Err(error)) => error.diagnostic_category(),
+        Err(_) => "task_join_failure",
+    };
+    panic!("cost-only PG case={case} stage={stage} outcome={category}");
+}
+
+async fn observe_blocker<Output>(
+    observer: &AnyPool,
+    waiter_pid: i32,
+    blocker_pid: i32,
+    task: &mut tokio::task::JoinHandle<Result<Output, AppError>>,
+    case: &str,
+    stage: &str,
+) {
+    eprintln!("cost-only PG case={case} stage={stage} waiting");
+    tokio::select! {
+        _ = wait_for_postgres_blocker(observer, waiter_pid, blocker_pid) => {
+            eprintln!("cost-only PG case={case} stage={stage} reached");
+        },
+        outcome = task => unexpected_completion(outcome, case, stage),
+    }
+}
+
+async fn observe_precommit(
+    reached: &mut tokio::sync::oneshot::Receiver<()>,
+    task: &mut tokio::task::JoinHandle<Result<FailedRequestCostBackfillExactReport, AppError>>,
+    case: &str,
+) {
+    tokio::select! {
+        biased;
+        outcome = task => unexpected_completion(outcome, case, "correction_precommit"),
+        outcome = reached => outcome.expect("precommit notification must be acknowledged"),
+    }
+    eprintln!("cost-only PG case={case} stage=correction_precommit reached");
+}
+
 async fn exercise_concurrent_contribution(
     fixture: &Fixture,
     database_url: &str,
@@ -7,6 +50,13 @@ async fn exercise_concurrent_contribution(
     generation: bool,
     writer_first: bool,
 ) {
+    let case = match (generation, writer_first) {
+        (false, true) => "request_writer_first",
+        (false, false) => "request_correction_first",
+        (true, true) => "generation_writer_first",
+        (true, false) => "generation_correction_first",
+    };
+    eprintln!("cost-only PG case={case} stage=fixture begin");
     let (historical_id, historical_cost) = seed_historical_case(
         fixture,
         499,
@@ -83,6 +133,18 @@ async fn exercise_concurrent_contribution(
                 .job_id,
             writer_id
         );
+        let owned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM generation_jobs job JOIN usage_reservations reservation ON reservation.id = job.reservation_id AND reservation.key_id = job.key_id JOIN credit_accounts account ON account.id = reservation.account_id WHERE job.id = $1 AND job.tenant_id = $2 AND job.key_id = $3 AND account.id = $4 AND account.currency = 'USD' AND reservation.status = 'reserved' AND job.status = 'queued' AND job.lease_owner = 'cost-only-contribution-worker' AND job.estimated_units = 2 AND job.micros_per_unit_snapshot > 0",
+        )
+        .bind(writer_id.to_string())
+        .bind(fixture.key.tenant_id.to_string())
+        .bind(fixture.key.key_id.to_string())
+        .bind(fixture.account_id.to_string())
+        .fetch_one(&writer.pool).await.unwrap();
+        assert_eq!(
+            owned, 1,
+            "generation fixture must match real worker ownership"
+        );
         None
     } else {
         Some(
@@ -118,10 +180,13 @@ async fn exercise_concurrent_contribution(
         }
         transaction.commit().await.unwrap();
         let matching_locator: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_records request JOIN request_record_locators locator ON locator.id = request.id AND locator.created_at = request.created_at AND locator.tenant_id = request.tenant_id AND locator.key_id = request.key_id WHERE request.id = $1 AND request.created_at = $2",
+            "SELECT COUNT(*) FROM request_records request JOIN request_record_locators locator ON locator.id = request.id AND locator.created_at = request.created_at AND locator.tenant_id = request.tenant_id AND locator.key_id = request.key_id JOIN usage_reservations reservation ON reservation.id = request.reservation_id AND reservation.key_id = request.key_id WHERE request.id = $1 AND request.created_at = $2 AND request.tenant_id = $3 AND request.key_id = $4 AND reservation.account_id = $5 AND reservation.status = 'reserved' AND reservation.reserved_tokens = 20 AND request.completed_at IS NULL",
         )
         .bind(writer_id.to_string())
         .bind(created_at)
+        .bind(fixture.key.tenant_id.to_string())
+        .bind(fixture.key.key_id.to_string())
+        .bind(fixture.account_id.to_string())
         .fetch_one(&writer.pool)
         .await
         .unwrap();
@@ -130,6 +195,7 @@ async fn exercise_concurrent_contribution(
             "writer fixture must retain its locator"
         );
     }
+    eprintln!("cost-only PG case={case} stage=production_lookup matched");
     let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&writer.pool)
         .await
@@ -140,29 +206,17 @@ async fn exercise_concurrent_contribution(
         .await
         .unwrap();
     let writer_gate = Database::connect_with_max(database_url, 1).await.unwrap();
-    let correction_gate = Database::connect_with_max(database_url, 1).await.unwrap();
     let mut writer_gate_transaction = writer_gate.begin_write_transaction().await.unwrap();
-    let mut correction_gate_transaction = correction_gate.begin_write_transaction().await.unwrap();
     let writer_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *writer_gate_transaction)
-        .await
-        .unwrap();
-    let correction_gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *correction_gate_transaction)
         .await
         .unwrap();
     let mut lock_bytes = [0_u8; 8];
     lock_bytes.copy_from_slice(&writer_id.as_bytes()[8..]);
     let writer_lock = (i64::from_be_bytes(lock_bytes) & i64::MAX) >> 1;
-    let correction_lock = writer_lock + 1;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(writer_lock)
         .execute(&mut *writer_gate_transaction)
-        .await
-        .unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(correction_lock)
-        .execute(&mut *correction_gate_transaction)
         .await
         .unwrap();
     let table = if generation {
@@ -171,13 +225,15 @@ async fn exercise_concurrent_contribution(
         "usage_daily_aggregates"
     };
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE FUNCTION mtc_cost_only_contribution_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.requests > OLD.requests THEN PERFORM pg_advisory_xact_lock({writer_lock}); ELSE PERFORM pg_advisory_xact_lock({correction_lock}); END IF; RETURN NEW; END $$"
+        "CREATE FUNCTION mtc_cost_only_contribution_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.requests > OLD.requests THEN PERFORM pg_advisory_xact_lock({writer_lock}); END IF; RETURN NEW; END $$"
     ))).execute(&fixture.database.pool).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER mtc_cost_only_contribution_gate AFTER UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION mtc_cost_only_contribution_gate()"
     ))).execute(&fixture.database.pool).await.unwrap();
     let tenant_id = fixture.key.tenant_id;
+    let writer_database = writer.clone();
     let writer_operation = async move {
+        let writer = writer_database;
         let cost = if generation {
             writer
                 .finish_generation_job(FinishGenerationJobInput {
@@ -223,28 +279,51 @@ async fn exercise_concurrent_contribution(
                 | FinishProxyRequestResult::AlreadyFinished { cost_micros, .. } => cost_micros,
             }
         };
-        writer.close().await;
         Ok::<i64, AppError>(cost)
     };
     let correction_manifest = manifest.clone();
+    let correction_database = correction.clone();
+    let (precommit_sender, mut precommit_reached) = tokio::sync::oneshot::channel();
+    let (commit_release, commit_receiver) = tokio::sync::oneshot::channel();
     let correction_operation = async move {
-        let report = correction
-            .backfill_failed_request_costs_exact_cost_only(correction_manifest, true)
-            .await;
-        correction.close().await;
-        report
+        correction_database
+            .cost_only_before_commit_for_test(correction_manifest, async move {
+                precommit_sender
+                    .send(())
+                    .expect("precommit observer must exist");
+                commit_receiver
+                    .await
+                    .expect("commit must be explicitly released");
+            })
+            .await
     };
     let (report, writer_cost) = if writer_first {
-        let writer_task = tokio::spawn(writer_operation);
-        wait_for_postgres_blocker(observer, writer_pid, writer_gate_pid).await;
-        let correction_task = tokio::spawn(correction_operation);
-        wait_for_postgres_blocker(observer, correction_pid, writer_pid).await;
+        let mut writer_task = tokio::spawn(writer_operation);
+        observe_blocker(
+            observer,
+            writer_pid,
+            writer_gate_pid,
+            &mut writer_task,
+            case,
+            "writer_aggregate_gate",
+        )
+        .await;
+        let mut correction_task = tokio::spawn(correction_operation);
+        observe_blocker(
+            observer,
+            correction_pid,
+            writer_pid,
+            &mut correction_task,
+            case,
+            "correction_waits_writer_row",
+        )
+        .await;
         writer_gate_transaction.commit().await.unwrap();
         let writer_cost = writer_task.await.unwrap().unwrap();
-        wait_for_postgres_blocker(observer, correction_pid, correction_gate_pid).await;
+        observe_precommit(&mut precommit_reached, &mut correction_task, case).await;
         let financial_before = financial_rows(fixture).await;
         let non_cost_before = statistics_non_cost_rows(fixture).await;
-        correction_gate_transaction.commit().await.unwrap();
+        commit_release.send(()).unwrap();
         let report = correction_task.await.unwrap().unwrap();
         assert_eq!(financial_rows(fixture).await, financial_before);
         assert_eq!(statistics_non_cost_rows(fixture).await, non_cost_before);
@@ -252,13 +331,29 @@ async fn exercise_concurrent_contribution(
     } else {
         let financial_before = financial_rows(fixture).await;
         let non_cost_before = statistics_non_cost_rows(fixture).await;
-        let correction_task = tokio::spawn(correction_operation);
-        wait_for_postgres_blocker(observer, correction_pid, correction_gate_pid).await;
-        let writer_task = tokio::spawn(writer_operation);
-        wait_for_postgres_blocker(observer, writer_pid, correction_pid).await;
-        correction_gate_transaction.commit().await.unwrap();
+        let mut correction_task = tokio::spawn(correction_operation);
+        observe_precommit(&mut precommit_reached, &mut correction_task, case).await;
+        let mut writer_task = tokio::spawn(writer_operation);
+        observe_blocker(
+            observer,
+            writer_pid,
+            correction_pid,
+            &mut writer_task,
+            case,
+            "writer_waits_correction_row",
+        )
+        .await;
+        commit_release.send(()).unwrap();
         let report = correction_task.await.unwrap().unwrap();
-        wait_for_postgres_blocker(observer, writer_pid, writer_gate_pid).await;
+        observe_blocker(
+            observer,
+            writer_pid,
+            writer_gate_pid,
+            &mut writer_task,
+            case,
+            "writer_aggregate_gate_after_correction",
+        )
+        .await;
         assert_eq!(financial_rows(fixture).await, financial_before);
         assert_eq!(statistics_non_cost_rows(fixture).await, non_cost_before);
         writer_gate_transaction.commit().await.unwrap();
@@ -352,8 +447,10 @@ async fn exercise_concurrent_contribution(
         non_cost_before_replay
     );
     assert_eq!(aggregate_costs(fixture).await, costs_before_replay);
+    eprintln!("cost-only PG case={case} stage=cost_count_finance_and_replay PASS");
+    writer.close().await;
+    correction.close().await;
     writer_gate.close().await;
-    correction_gate.close().await;
 }
 
 #[tokio::test]
