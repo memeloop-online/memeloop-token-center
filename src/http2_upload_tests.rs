@@ -38,6 +38,9 @@ pub(crate) mod native_encoded;
 #[path = "http2_upload_tests/native_reused_window.rs"]
 mod native_reused_window;
 
+#[path = "http2_upload_tests/sibling_client_cancel_window.rs"]
+mod sibling_client_cancel_window;
+
 struct Frame {
     from_client: bool,
     kind: u8,
