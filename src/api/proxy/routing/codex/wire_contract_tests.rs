@@ -96,7 +96,7 @@ async fn local_candidate_failures_log_only_fixed_reasons_and_preserve_dispositio
             assert!(matches!(error, ProxySendError::CandidateUnavailable));
             assert_eq!(
                 super::super::failover_disposition(None, Some(&error)),
-                super::super::FailoverDisposition::CandidateNotDispatched
+                super::super::outcome::FailoverDisposition::CandidateNotDispatched
             );
             assert!(super::super::classify_attempt_failure(&Err(error), None).is_none());
         }
