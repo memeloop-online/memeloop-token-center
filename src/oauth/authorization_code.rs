@@ -1967,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn json_exchange_binds_state_and_refresh_preserves_contract() {
         use crate::provider::AuthorizationCodeContribution;
-        use wiremock::matchers::{body_json_partial, header};
+        use wiremock::matchers::{body_partial_json, header};
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
         let db = Database::connect(&format!(
@@ -2028,7 +2028,7 @@ mod tests {
             .into_owned();
         Mock::given(method("POST")).and(path("/token"))
             .and(header("content-type", "application/json"))
-            .and(body_json_partial(json!({"grant_type":"authorization_code", "code":"fixture+code", "state":state, "client_id":"fixture-client", "redirect_uri":"https://provider.example/callback"})))
+            .and(body_partial_json(json!({"grant_type":"authorization_code", "code":"fixture+code", "state":state, "client_id":"fixture-client", "redirect_uri":"https://provider.example/callback"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"fixture-access", "refresh_token":"fixture-refresh", "expires_in":3600})))
             .expect(1).mount(&server).await;
         let http = reqwest::Client::builder()
@@ -2090,7 +2090,7 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         Mock::given(method("POST")).and(path("/token"))
             .and(header("content-type", "application/json"))
-            .and(body_json_partial(json!({"grant_type":"refresh_token", "refresh_token":"fixture-refresh", "client_id":"fixture-client"})))
+            .and(body_partial_json(json!({"grant_type":"refresh_token", "refresh_token":"fixture-refresh", "client_id":"fixture-client"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"refreshed-fixture", "expires_in":3600})))
             .expect(1).mount(&server).await;
         let mut changed = adapter.clone();
