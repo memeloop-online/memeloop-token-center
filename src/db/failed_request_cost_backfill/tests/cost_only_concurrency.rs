@@ -104,12 +104,31 @@ async fn exercise_concurrent_contribution(
         )
     };
     if !generation {
-        sqlx::query("UPDATE request_records SET created_at = $1 WHERE id = $2")
+        let mut transaction = writer.begin_write_transaction().await.unwrap();
+        for table in ["request_records", "request_record_locators"] {
+            let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET created_at = $1 WHERE id = $2"
+            )))
             .bind(created_at)
             .bind(writer_id.to_string())
-            .execute(&writer.pool)
+            .execute(&mut *transaction)
             .await
             .unwrap();
+            assert_eq!(updated.rows_affected(), 1, "{table} fixture identity");
+        }
+        transaction.commit().await.unwrap();
+        let matching_locator: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_records request JOIN request_record_locators locator ON locator.id = request.id AND locator.created_at = request.created_at AND locator.tenant_id = request.tenant_id AND locator.key_id = request.key_id WHERE request.id = $1 AND request.created_at = $2",
+        )
+        .bind(writer_id.to_string())
+        .bind(created_at)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            matching_locator, 1,
+            "writer fixture must retain its locator"
+        );
     }
     let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&writer.pool)
