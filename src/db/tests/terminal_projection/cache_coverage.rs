@@ -511,7 +511,7 @@ async fn postgres_cache_coverage_terminal_replay_filters_and_daily_edges() {
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
-    let database = Database::connect_with_max(isolated.as_str(), 8)
+    let database = Database::connect_for_migration(isolated.as_str(), 8)
         .await
         .unwrap();
     legacy_coverage_contract(&database).await;
