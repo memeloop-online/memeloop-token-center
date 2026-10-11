@@ -178,6 +178,20 @@
                   "required": ["api_version", "flow_kind", "login_url", "poll_url", "refresh_url"],
                   "properties": {
                     "api_version": { "const": "oauth-adapter-v1" },
+                    "response_mode": {
+                      "enum": ["fragment_manual"],
+                      "description": "Absent means the standard query-parameter callback. fragment_manual declares that the provider page displays code#state for manual paste."
+                    },
+                    "identity": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["url", "id_pointer"],
+                      "properties": {
+                        "url": { "type": "string", "format": "uri" },
+                        "id_pointer": { "type": "string", "minLength": 2, "maxLength": 256 }
+                      },
+                      "description": "Declared account-identity read used for same-account reauthorization. The URL is reviewed at plugin install time and never accepted from runtime payloads."
+                    },
                     "flow_kind": { "enum": ["cursor_pkce", "authorization_code_pkce"] },
                     "login_url": { "type": "string", "format": "uri" },
                   "poll_url": { "type": "string", "format": "uri" },

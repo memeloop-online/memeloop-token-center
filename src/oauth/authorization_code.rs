@@ -14,8 +14,8 @@ use crate::{
     error::AppError,
     network::{self, OutboundScope},
     provider::{
-        OAuthAdapterContribution, OAuthFlowKind, UpstreamCredential, open_private_json,
-        seal_private_json,
+        OAuthAdapterContribution, OAuthFlowKind, OAuthIdentityContribution, OAuthResponseMode,
+        UpstreamCredential, open_private_json, seal_private_json,
     },
 };
 
@@ -70,6 +70,17 @@ struct RefreshState {
     login_client: Option<ClientConfig>,
     #[serde(default)]
     identity: Option<GoogleIdentity>,
+    #[serde(default)]
+    provider_identity: Option<ProviderIdentity>,
+}
+
+/// Account id bound through the signed provider contribution's declared
+/// identity read. The URL is persisted so reauthorization compares the exact
+/// declared source, not just the id value.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProviderIdentity {
+    url: String,
+    id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,9 +115,12 @@ pub(crate) fn supports_reauthorization(credential: &UpstreamCredential) -> bool 
             validate_client(client).is_ok()
                 && client.client_id == state.client_id
                 && client.client_secret == state.client_secret
-        }) && state.identity.as_ref().is_some_and(|identity| {
+        }) && (state.identity.as_ref().is_some_and(|identity| {
             identity.issuer == GOOGLE_ISSUER && valid_google_subject(&identity.subject)
-        })
+        }) || state
+            .provider_identity
+            .as_ref()
+            .is_some_and(|identity| valid_provider_identity_id(&identity.id)))
     })
 }
 
@@ -114,6 +128,61 @@ fn valid_google_subject(subject: &str) -> bool {
     !subject.is_empty()
         && subject.len() <= 512
         && subject.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+fn valid_provider_identity_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 512 && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+/// The identity endpoint ships inside the signed provider contribution and is
+/// reviewed at install time, the same trust class as the token/refresh URLs
+/// that also receive credentials. It is never accepted from runtime request
+/// payloads. Validation here is defense in depth: HTTPS only, no embedded
+/// credentials, no fragment, bounded length, and a bounded RFC 6901 pointer.
+fn validate_identity_contribution(identity: &OAuthIdentityContribution) -> Result<(), AppError> {
+    if identity.url.len() > 2048 {
+        return Err(AppError::BadRequest("OAuth identity URL is too long".into()));
+    }
+    let url = Url::parse(&identity.url)
+        .map_err(|_| AppError::BadRequest("invalid OAuth identity URL".into()))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(AppError::BadRequest(
+            "OAuth identity URL must be a credential-free HTTPS URL".into(),
+        ));
+    }
+    let pointer = &identity.id_pointer;
+    if pointer.len() > 256
+        || !pointer.starts_with('/')
+        || pointer.split('/').skip(1).any(|segment| segment.is_empty())
+        || pointer.bytes().any(|byte| byte < 0x20)
+    {
+        return Err(AppError::BadRequest(
+            "OAuth identity id pointer must be a non-empty-segment JSON pointer".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fragment-manual completion: the provider page displays `code#state` and the
+/// operator pastes it verbatim. There is no reachable redirect to match.
+fn fragment_manual_code(pasted: &str, state: &str) -> Result<String, AppError> {
+    let invalid = || AppError::BadRequest("OAuth completion must be code#state".into());
+    let (code, pasted_state) = pasted.split_once('#').ok_or_else(invalid)?;
+    if code.is_empty()
+        || code.len() > 8192
+        || pasted_state.is_empty()
+        || pasted_state.len() > 8192
+        || pasted_state.contains('#')
+        || pasted_state.as_bytes().ct_eq(state.as_bytes()).unwrap_u8() != 1
+    {
+        return Err(invalid());
+    }
+    Ok(code.to_owned())
 }
 
 /// Google owns both this fixed HTTPS endpoint and the returned account id.
@@ -179,6 +248,64 @@ async fn read_google_identity(
     })
 }
 
+/// Read the declared identity endpoint with the fresh token and persist the
+/// account id. Mirrors the Google path: bounded body, provider network scope,
+/// and only the declared pointer is read.
+pub(crate) async fn bind_declared_identity(
+    http: &reqwest::Client,
+    credential: &mut UpstreamCredential,
+    contribution: &OAuthIdentityContribution,
+    provider_config: &Value,
+) -> Result<(), AppError> {
+    validate_identity_contribution(contribution)?;
+    let http = network::client_for_config_url_no_retry(
+        http,
+        &contribution.url,
+        provider_config,
+        credential.proxy(),
+        false,
+    )
+    .await?;
+    let response = credential
+        .apply(
+            http.get(&contribution.url)
+                .timeout(std::time::Duration::from_secs(20)),
+            crate::db::unix_millis(),
+        )?
+        .send()
+        .await
+        .map_err(|_| AppError::Upstream("account identity request failed".into()))?;
+    let status = response.status();
+    let bytes = super::bounded_body(response).await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "account identity returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Upstream("account identity response is invalid".into()))?;
+    let id = value
+        .pointer(&contribution.id_pointer)
+        .and_then(Value::as_str)
+        .filter(|id| valid_provider_identity_id(id))
+        .ok_or_else(|| AppError::Upstream("account identity is missing".into()))?;
+    let identity = ProviderIdentity {
+        url: contribution.url.clone(),
+        id: id.to_owned(),
+    };
+    let UpstreamCredential::OAuth {
+        adapter_state: Some(state),
+        ..
+    } = credential
+    else {
+        return Err(AppError::Internal);
+    };
+    state["authorization_code"]["provider_identity"] =
+        serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+    Ok(())
+}
+
 pub(crate) fn same_reauthorization_identity(
     current: &UpstreamCredential,
     next: &UpstreamCredential,
@@ -195,6 +322,12 @@ pub(crate) fn same_reauthorization_identity(
             .ok()
             .and_then(|state| state.identity)
             == installed_state(next).ok().and_then(|state| state.identity)
+        && installed_state(current)
+            .ok()
+            .and_then(|state| state.provider_identity)
+            == installed_state(next)
+                .ok()
+                .and_then(|state| state.provider_identity)
 }
 
 fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
@@ -205,6 +338,7 @@ fn refresh_state(input: &StartInput) -> Result<Value, AppError> {
         network_scope: network::scope_from_config(&input.provider_config),
         login_client: Some(input.client.clone()),
         identity: None,
+        provider_identity: None,
     }});
     crate::provider::validate_adapter_state(&state)?;
     Ok(state)
@@ -418,6 +552,16 @@ pub async fn start(
             "provider does not declare standard authorization-code OAuth".into(),
         ));
     }
+    if let Some(identity) = &input.adapter.identity {
+        validate_identity_contribution(identity)?;
+    }
+    if input.adapter.response_mode == Some(OAuthResponseMode::FragmentManual)
+        && !input.client.redirect_uri.starts_with("https://")
+    {
+        return Err(AppError::BadRequest(
+            "fragment-manual OAuth requires an HTTPS redirect URI".into(),
+        ));
+    }
     for endpoint in [
         &input.adapter.login_url,
         &input.adapter.poll_url,
@@ -561,7 +705,13 @@ pub async fn complete(
             "OAuth code exchange outcome is unknown; start a new login".into(),
         ));
     }
-    let code = match callback_code(callback_url, &login.input.client.redirect_uri, &login.state) {
+    let parsed_code = if login.input.adapter.response_mode == Some(OAuthResponseMode::FragmentManual)
+    {
+        fragment_manual_code(callback_url, &login.state)
+    } else {
+        callback_code(callback_url, &login.input.client.redirect_uri, &login.state)
+    };
+    let code = match parsed_code {
         Ok(code) => code,
         Err(error) => {
             db.release_oauth_login_poll(session.session_id, lease_owner, now)
@@ -916,6 +1066,115 @@ fn callback_code(callback: &str, redirect: &str, state: &str) -> Result<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_manual_code_requires_exact_code_hash_state() {
+        let code = fragment_manual_code("the-code#the-state", "the-state").unwrap();
+        assert_eq!(code, "the-code");
+        for invalid in [
+            "the-code#wrong-state",
+            "the-code",
+            "#the-state",
+            "the-code#",
+            "the-code#the-state#extra",
+            "the-code#the-state\n",
+        ] {
+            assert!(fragment_manual_code(invalid, "the-state").is_err(), "{invalid}");
+        }
+        let long = format!("{}#the-state", "a".repeat(8193));
+        assert!(fragment_manual_code(&long, "the-state").is_err());
+    }
+
+    #[test]
+    fn identity_contribution_requires_credential_free_https_and_bounded_pointer() {
+        let valid = OAuthIdentityContribution {
+            url: "https://api.example.com/v1/profile".into(),
+            id_pointer: "/account/uuid".into(),
+        };
+        validate_identity_contribution(&valid).unwrap();
+        for (url, pointer) in [
+            ("http://api.example.com/profile", "/account/uuid"),
+            ("https://user:pass@api.example.com/profile", "/account/uuid"),
+            ("https://api.example.com/profile#frag", "/account/uuid"),
+            ("https://api.example.com/profile", ""),
+            ("https://api.example.com/profile", "account/uuid"),
+            ("https://api.example.com/profile", "/account//uuid"),
+        ] {
+            let contribution = OAuthIdentityContribution {
+                url: url.into(),
+                id_pointer: pointer.into(),
+            };
+            assert!(
+                validate_identity_contribution(&contribution).is_err(),
+                "{url} {pointer}"
+            );
+        }
+        let long_url = OAuthIdentityContribution {
+            url: format!("https://api.example.com/{}", "a".repeat(2048)),
+            id_pointer: "/id".into(),
+        };
+        assert!(validate_identity_contribution(&long_url).is_err());
+    }
+
+    #[test]
+    fn provider_identity_drives_same_account_reauthorization() {
+        let credential = |url: &str, id: &str| {
+            let state = json!({"authorization_code": {
+                "client_id": "client",
+                "client_secret": null,
+                "refresh_url": "https://tokens.example.com/token",
+                "network_scope": "public",
+                "login_client": {
+                    "client_id": "client",
+                    "client_secret": null,
+                    "redirect_uri": "https://provider.example.com/callback",
+                    "scopes": ["profile"]
+                },
+                "identity": null,
+                "provider_identity": {"url": url, "id": id}
+            }});
+            serde_json::from_value::<UpstreamCredential>(json!({
+                "type": "oauth",
+                "access_token": "token",
+                "expires_at": 4102444800000i64,
+                "adapter_state": state
+            }))
+            .unwrap()
+        };
+        let original = credential("https://api.example.com/profile", "account-1");
+        assert!(supports_reauthorization(&original));
+        assert!(same_reauthorization_identity(
+            &original,
+            &credential("https://api.example.com/profile", "account-1")
+        ));
+        assert!(!same_reauthorization_identity(
+            &original,
+            &credential("https://api.example.com/profile", "account-2")
+        ));
+        assert!(!same_reauthorization_identity(
+            &original,
+            &credential("https://other.example.com/profile", "account-1")
+        ));
+        let without_identity = serde_json::from_value::<UpstreamCredential>(json!({
+            "type": "oauth",
+            "access_token": "token",
+            "expires_at": 4102444800000i64,
+            "adapter_state": {"authorization_code": {
+                "client_id": "client",
+                "client_secret": null,
+                "refresh_url": "https://tokens.example.com/token",
+                "network_scope": "public",
+                "login_client": {
+                    "client_id": "client",
+                    "client_secret": null,
+                    "redirect_uri": "https://provider.example.com/callback",
+                    "scopes": ["profile"]
+                }
+            }}
+        }))
+        .unwrap();
+        assert!(!supports_reauthorization(&without_identity));
+    }
 
     #[tokio::test]
     async fn google_userinfo_uses_authenticated_id_not_email_or_project() {
@@ -1389,6 +1648,8 @@ mod tests {
                 login_url: "https://accounts.example.com/authorize".into(),
                 poll_url: token_endpoint.clone(),
                 refresh_url: token_endpoint,
+                response_mode: None,
+                identity: None,
             },
             proxy_url: None,
             proxy_network_scope: None,

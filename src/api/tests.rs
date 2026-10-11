@@ -2167,6 +2167,8 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                 login_url: "http://oauth-adapter.default.svc/login".to_owned(),
                 poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
                 refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
+                response_mode: None,
+                identity: None,
             }),
             component_adapter: None,
             generation_adapter: None,

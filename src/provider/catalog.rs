@@ -15,6 +15,34 @@ pub struct OAuthAdapterContribution {
     pub login_url: String,
     pub poll_url: String,
     pub refresh_url: String,
+    /// How the authorization code returns. Absent means the standard
+    /// query-parameter callback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_mode: Option<OAuthResponseMode>,
+    /// Optional account-identity binding used for same-account reauthorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<OAuthIdentityContribution>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthResponseMode {
+    /// The provider page displays `code#state` for the operator to paste
+    /// manually; no reachable redirect is involved.
+    FragmentManual,
+}
+
+/// Declared account-identity read. The URL ships inside the signed provider
+/// contribution and is reviewed at install time, the same trust class as the
+/// token/refresh URLs that also receive credentials; it is never accepted
+/// from runtime request payloads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthIdentityContribution {
+    /// HTTPS endpoint read with the fresh access token to bind the account id.
+    pub url: String,
+    /// RFC 6901 JSON pointer to the stable account id string.
+    pub id_pointer: String,
 }
 
 #[derive(Clone, Debug)]
@@ -704,6 +732,8 @@ impl ProviderCatalog {
             login_url: "https://auth.openai.com/codex/device".to_owned(),
             poll_url: "https://auth.openai.com/api/accounts/deviceauth/token".to_owned(),
             refresh_url: crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned(),
+            response_mode: None,
+            identity: None,
         });
         let mut claude = builtin_interactive_oauth_provider(
             "anthropic-claude",
@@ -788,6 +818,8 @@ impl ProviderCatalog {
             login_url: crate::oauth::kimi_device::DEVICE_ENDPOINT.to_owned(),
             poll_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
             refresh_url: crate::oauth::managed::kimi::TOKEN_ENDPOINT.to_owned(),
+            response_mode: None,
+            identity: None,
         });
         kimi.request_compatibility = RequestCompatibility {
             third_party: true,
@@ -1184,6 +1216,8 @@ fn builtin_interactive_oauth_provider(
             login_url: oauth.login_url.to_owned(),
             poll_url: oauth.poll_url.to_owned(),
             refresh_url: oauth.refresh_url.to_owned(),
+            response_mode: None,
+            identity: None,
         }),
         component_adapter: None,
         generation_adapter: None,

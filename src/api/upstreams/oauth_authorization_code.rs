@@ -225,11 +225,29 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
         CompleteResult::Ready { lease_owner, login } => {
             let mut ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            let declared_identity = state
+                .providers
+                .get(&ready.provider_driver)
+                .and_then(|provider| provider.oauth_adapter.as_ref())
+                .and_then(|adapter| adapter.identity.clone());
+            let identity_supported = ready.provider_driver
+                == crate::provider::antigravity::DRIVER
+                || declared_identity.is_some();
             if ready.provider_driver == crate::provider::antigravity::DRIVER {
                 // The token is durably staged already. A transient identity read
                 // can be retried without exchanging the authorization code again.
                 authorization_code::bind_google_identity(&state.http, &mut ready.credential)
                     .await?;
+            } else if let Some(identity) = declared_identity.clone() {
+                // Same durability contract: the token is staged; a transient
+                // identity read failure is retryable without re-exchange.
+                authorization_code::bind_declared_identity(
+                    &state.http,
+                    &mut ready.credential,
+                    &identity,
+                    &ready.provider_config,
+                )
+                .await?;
             }
             if let Some(target) = &ready.reauthorize {
                 let (account, current, _, _) = state
@@ -240,7 +258,7 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                     )
                     .await?;
                 if account.tenant_external_id.as_deref() != Some(ready.tenant_external_id.as_str())
-                    || ready.provider_driver != crate::provider::antigravity::DRIVER
+                    || !identity_supported
                     || !authorization_code::same_reauthorization_identity(
                         &current,
                         &ready.credential,
