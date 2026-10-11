@@ -17,6 +17,7 @@ test('canonical supplier messages expose complete bounded provider details witho
   const request: RequestView = { request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 402, duration_ms: 1, input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402' };
   for (const [code, base, providerCode, message] of [
     ['no_active_plan', '当前账号没有可用套餐', '402', '当前账号没有可用套餐'],
+    ['insufficient_quota', 'The upstream account has insufficient quota', 'insufficient_user_quota', '用户额度不足'],
     ['model_unavailable', 'The requested upstream model is unavailable', '400', 'Model not found'],
     ['model_unavailable', 'The requested upstream model is unavailable', 'model_not_found', 'Model not found'],
     ['model_unavailable', 'The requested upstream model is unavailable', 'unsupported_model', 'Unsupported model'],
@@ -36,6 +37,12 @@ test('canonical supplier messages expose complete bounded provider details witho
       }
       assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code: 'unknown', message: canonical } }, locale), null);
     }
+  }
+  const quotaOnlyCode = { ...request, supplier_error: { code: 'insufficient_quota', message: 'The upstream account has insufficient quota; provider code: insufficient_user_quota' } };
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const detail = requestSupplierDetail(quotaOnlyCode, locale);
+    assert.ok(detail?.includes('insufficient_user_quota'), 'a safe provider code survives without any provider message');
+    assert.doesNotMatch(detail ?? '', /剩余额度|request id/);
   }
   assert.match(components, /request-supplier-detail/);
   assert.match(components, /<span>\{supplierDetail\}<\/span>/);

@@ -35,7 +35,7 @@ const supplierFailureCopy: Record<string, [string, string]> = {
 
 const supplierVocabulary: Record<string, { base: string; codes: string[]; messages: string[] }> = {
   no_active_plan: { base: '当前账号没有可用套餐', codes: ['no_active_plan', 'NoAvailablePlan', 'NoActivePlan', 'NoPlan', '402'], messages: ['当前账号没有可用套餐', 'No active plan', 'No available plan'] },
-  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota'] },
+  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota', 'insufficient_user_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota', '用户额度不足'] },
   authentication_invalid: { base: 'The upstream authentication credentials are invalid', codes: ['authentication_invalid', 'invalid_api_key'], messages: ['Invalid API key', 'Invalid authentication credentials'] },
   authentication_expired: { base: 'The upstream authentication credentials have expired', codes: ['authentication_expired', 'api_key_expired', 'token_expired'], messages: ['API key expired', 'Authentication token expired'] },
   rate_limited: { base: 'The upstream request rate limit was exceeded', codes: ['rate_limited', 'rate_limit_exceeded'], messages: ['Rate limit exceeded', 'Too many requests'] },
