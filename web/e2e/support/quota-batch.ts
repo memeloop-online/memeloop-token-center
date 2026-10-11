@@ -46,8 +46,9 @@ export function quotaBatchFixtureSnapshot(account: QuotaBatchFixtureAccount): Up
 
 /**
  * Strict batch contract for the automatic list quota read: only a fresh bulk
- * read over exactly the fixture's eligible accounts is answered. Unknown
- * accounts or unexpected payloads throw instead of masking the request.
+ * read over exactly the fixture's complete eligible set is answered, matching
+ * bulk semantics. Unknown, missing or subset identities throw instead of
+ * masking the request.
  */
 export function quotaBatchFixtureResponse(body: unknown, accounts: QuotaBatchFixtureAccount[]): UpstreamQuotaBatchResponse {
   const request = body as { account_ids?: unknown; fresh?: unknown; trigger?: unknown } | null;
@@ -55,12 +56,12 @@ export function quotaBatchFixtureResponse(body: unknown, accounts: QuotaBatchFix
   if (!request || !Array.isArray(ids) || !ids.length || request.fresh !== true || request.trigger !== 'bulk') {
     throw new Error('Quota batch fixture expects a fresh bulk read');
   }
-  const eligible = accounts.filter(account => ids.includes(account.id));
-  if (eligible.length !== ids.length || new Set(ids).size !== ids.length) {
-    throw new Error(`Quota batch fixture received unknown account ids: ${JSON.stringify(ids)}`);
+  const expected = accounts.map(account => account.id);
+  if (ids.length !== expected.length || new Set(ids).size !== ids.length || expected.some(id => !ids.includes(id))) {
+    throw new Error(`Quota batch fixture expects exactly the eligible accounts: ${JSON.stringify(expected)}`);
   }
   return {
     contract_version: 'upstream_quota_batch_v1',
-    results: eligible.map(account => ({ status: 'success', upstream_account_id: account.id, snapshot: quotaBatchFixtureSnapshot(account) })),
+    results: accounts.map(account => ({ status: 'success', upstream_account_id: account.id, snapshot: quotaBatchFixtureSnapshot(account) })),
   };
 }

@@ -16,7 +16,7 @@ import { builtinApiKeyCredential } from './builtin-api-key-credential';
 import { providerEditShape } from './provider-edit-shapes';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
 window.formJourneyQuotaBatchBodies = [];
-window.deferNextFormQuotaBatch = false;
+window.deferNextFormQuotaBatch = new URLSearchParams(location.search).has('hold-quota-batch');
 window.failNextFormWrite = false;
 window.failNextFormNotesWrite = false;
 window.conflictNextFormNotesWrite = false;
@@ -65,8 +65,9 @@ window.fetch = async (input, init) => {
       if (!Array.isArray(quotaBatch.account_ids) || quotaBatch.fresh !== true || quotaBatch.trigger !== 'bulk') throw new Error('Form fixture quota batch must be a fresh bulk read');
       window.formJourneyQuotaBatchBodies.push(quotaBatch.account_ids);
       const knownAccounts = [account, ...(createdProvider ? [createdProvider] : [])];
-      const eligibleAccounts = knownAccounts.filter(value => value.status === 'active' && (quotaBatch.account_ids as string[]).includes(value.id));
-      if (eligibleAccounts.length !== quotaBatch.account_ids.length || new Set(quotaBatch.account_ids).size !== quotaBatch.account_ids.length) throw new Error(`Form fixture quota batch received unknown accounts: ${JSON.stringify(quotaBatch.account_ids)}`);
+      const eligibleAccounts = knownAccounts.filter(value => value.status === 'active');
+      const expectedIds = eligibleAccounts.map(value => value.id);
+      if (expectedIds.length !== quotaBatch.account_ids.length || new Set(quotaBatch.account_ids).size !== quotaBatch.account_ids.length || expectedIds.some(id => !(quotaBatch.account_ids as string[]).includes(id))) throw new Error(`Form fixture quota batch expects exactly the eligible accounts: ${JSON.stringify(expectedIds)}`);
       if (window.deferNextFormQuotaBatch) {
         window.deferNextFormQuotaBatch = false;
         // Hold the response so tests can change the account generation while

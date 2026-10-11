@@ -34,8 +34,8 @@ test('independent proxy save updates concurrency metadata without dropping the p
     assert.doesNotMatch(await row.innerText(), /account-native|openai-codex|credential_generation/);
     await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
     assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBatchBodies), [['account-native']], 'the list auto-read covers exactly the authorized active accounts once');
+    await row.getByText('已用 75%', { exact: false }).waitFor();
     assert.doesNotMatch(await row.innerText(), /尚未读取/, 'the list no longer waits for manual quota reads');
-    assert.match(await row.innerText(), /75/, 'the auto-read publishes the shared quota summary in the row');
     assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
     assert.equal(await page.locator('.provider-directory details').count(), 0);
     const artifacts = `${root}/e2e-artifacts/ui-system/account-workspace`;
@@ -130,9 +130,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
     await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
     // The fixture exposes one available reset credit with a known expiry.
+    await row.getByText('重置于', { exact: false }).waitFor();
     await row.getByRole('button', { name: '刷新额度', exact: true }).click();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 1);
-    assert.match(await row.innerText(), /重置于/);
+    await row.getByText('重置于', { exact: false }).waitFor();
     assert.doesNotMatch(await row.innerText(), /重置机会最近到期/);
     const quotaSummary = row.locator('.quota-summary');
     await quotaSummary.focus();
@@ -170,10 +171,15 @@ test('independent proxy save updates concurrency metadata without dropping the p
       false,
       'unknown capability must not allow reset preparation after a credential-generation change',
     );
-    await quotaDetails.getByRole('button', { name: '查看额度', exact: true }).click();
-    await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
+    // The superseded single read settles without publishing, and the list then
+    // auto-recovers the new generation with exactly one compensating batch read.
+    await page.evaluate(() => { window.deferNextFormQuotaBatch = true; });
     await page.evaluate(() => window.releaseFormQuotaRead());
-    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 2);
+    await row.getByText('等待刷新', { exact: true }).waitFor();
+    assert.doesNotMatch(await row.innerText(), /75|代次 1 额度/, 'the fenced old-generation response never publishes');
+    await page.evaluate(() => window.releaseFormQuotaBatch());
+    await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.match(await row.innerText(), /25/);
     assert.doesNotMatch(await row.innerText(), /75/);
     assert.equal(await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).count(), 0);
@@ -201,8 +207,8 @@ test('list quota auto-read stays single in flight and compensates a generation c
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
     });
-    await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'zh-CN'); window.deferNextFormQuotaBatch = true; });
-    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow`);
+    await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'zh-CN'); });
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&hold-quota-batch`);
     const row = page.locator('.provider-directory-row');
     await row.waitFor();
     await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
@@ -296,6 +302,7 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
       let deleted = false;
+      let listedTenant = 'fixture-a';
       let deletionMode: 'failed' | 'ready' | 'late' = 'failed';
       let releaseDelete: (() => void) | undefined;
       let deleteStarted: (() => void) | undefined;
@@ -304,7 +311,7 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'deletion contracts only use the isolated fixture');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
-        if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [firstId, secondId].flatMap(id => ['fixture-a', 'fixture-b'].map(tenant => ({ id, tenant, driver: 'http-json' })))) });
+        if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [...(!deleted && listedTenant === 'fixture-a' ? [firstId] : []), secondId].map(id => ({ id, tenant: listedTenant, driver: 'http-json' }))) });
         if (request.method() !== 'GET') {
           assert.equal(request.method(), 'DELETE');
           assert.equal(url.pathname, `/internal/v1/upstreams/${firstId}`);
@@ -316,7 +323,7 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
           return route.fulfill({ json: {} });
         }
         if (url.pathname === '/internal/v1/upstreams') {
-          const tenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
+          const tenant = listedTenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
           return route.fulfill({ json: [...(!deleted && tenant === 'fixture-a' ? [account(firstId, tenant)] : []), account(secondId, tenant)] });
         }
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: {} }, credential_schema: { type: 'object', properties: {} } }] });
@@ -411,12 +418,14 @@ test('account workspace returns without retained details, shares list tracks and
       let writes = 0;
       let deferSave = false;
       let failNextListRead = false;
+      let listedTenant = 'fixture-a';
       let savedAccount: ReturnType<typeof accounts>[number] | undefined;
       await page.route('**/*', async route => {
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'account contracts never contact a live provider');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
         if (request.method() !== 'GET') {
+          if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), accounts(listedTenant).map(account => ({ id: account.id, tenant: account.tenant_external_id, driver: account.driver }))) });
           assert.equal(request.method(), 'PUT');
           assert.equal(url.pathname, '/internal/v1/upstreams/account-fixture-a');
           writes += 1;
@@ -426,7 +435,7 @@ test('account workspace returns without retained details, shares list tracks and
           return route.fulfill({ json: updated });
         }
         if (url.pathname === '/internal/v1/upstreams') {
-          const tenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
+          const tenant = listedTenant = url.searchParams.get('tenant_external_id') ?? 'fixture-a';
           if (failNextListRead) { failNextListRead = false; return route.fulfill({ status: 503, json: { error: { message: 'Fixture list refresh unavailable' } } }); }
           if (state === 'slow') await new Promise<void>(resolve => { releaseRead = resolve; readStarted?.(); readStarted = undefined; });
           if (state === 'denied') return route.fulfill({ status: 403, json: { error: { message: 'Fixture account read denied' } } });

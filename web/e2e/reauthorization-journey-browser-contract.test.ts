@@ -175,6 +175,7 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
           if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy } });
           return route.fulfill({ json: [] });
         }
+        if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
         const body = request.postDataJSON(); writes.push({ path: url.pathname, body });
         if (url.pathname.endsWith('/transport-proxy')) {
           assert.equal(request.method(), 'PUT');
