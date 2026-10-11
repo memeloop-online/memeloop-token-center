@@ -270,6 +270,19 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
                 "upstream_failed_response"
             })
         );
+        let events = fixture
+            .state
+            .db
+            .all_request_events_after(0, None, 500)
+            .await
+            .unwrap();
+        let finished = events
+            .iter()
+            .find(|event| event.request_id == row.request_id && event.event_kind == "finished")
+            .unwrap();
+        assert_eq!(finished.status_code, row.status_code);
+        assert_eq!(finished.lifecycle_state, row.lifecycle_state);
+        assert_eq!(finished.error_code, row.error_code);
         assert_exactly_once_side_effects(&fixture, row.request_id, None).await;
         drain_completed_response_archive(&fixture).await;
         let refs = fixture
@@ -278,6 +291,8 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .request_archive_refs(fixture.key_id, row.request_id)
             .await
             .unwrap();
+        assert_eq!(refs.view.status_code, row.status_code);
+        assert_eq!(refs.view.lifecycle_state, row.lifecycle_state);
         let locator = refs.response_object.unwrap();
         if valid {
             assert!(!locator.starts_with("gap://"));

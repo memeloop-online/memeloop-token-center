@@ -1852,7 +1852,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                         Some(499) => crate::model::RequestLifecycleState::Cancelled,
                         Some(code)
                             if (200..400).contains(&code)
-                                && row.try_get::<Option<String>, _>("error_code")?.as_deref()
+                                && error_code.as_deref()
                                     == Some("upstream_incomplete_response") =>
                         {
                             crate::model::RequestLifecycleState::Failed
