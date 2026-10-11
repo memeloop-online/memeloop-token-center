@@ -7773,6 +7773,18 @@ components:
         login_url: { type: string, format: uri }
         poll_url: { type: string, format: uri }
         refresh_url: { type: string, format: uri }
+        response_mode:
+          type: string
+          enum: [fragment_manual]
+          description: Absent means the standard query-parameter callback. fragment_manual declares that the provider page displays code#state for manual paste.
+        identity:
+          type: object
+          additionalProperties: false
+          required: [url, id_pointer]
+          properties:
+            url: { type: string, format: uri }
+            id_pointer: { type: string, minLength: 2, maxLength: 256 }
+          description: Declared account-identity read used for same-account reauthorization. The URL is reviewed at plugin install time and never accepted from runtime payloads.
     ComponentAdapterContribution:
       type: object
       additionalProperties: false

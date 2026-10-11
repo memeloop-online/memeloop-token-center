@@ -167,6 +167,8 @@ async fn provider_adapter_secret_cycles_are_rejected_before_oauth_start_or_reaut
         login_url: "https://provider.example/login".into(),
         poll_url: "https://provider.example/poll".into(),
         refresh_url: "https://provider.example/refresh".into(),
+        response_mode: None,
+        identity: None,
     };
     let config = json!({"base_url":mock.uri(),"tree":{"next":{}}});
     for secret in [false, true] {
@@ -259,6 +261,8 @@ async fn provider_adapter_reauthorization_restores_only_the_current_secret_confi
         login_url: "https://provider.example/login".into(),
         poll_url: "https://provider.example/poll".into(),
         refresh_url: "https://provider.example/refresh".into(),
+        response_mode: None,
+        identity: None,
     };
     let mut provider = state.providers.get("http-json").unwrap().clone();
     provider.id = "oauth-static-secret".into();
