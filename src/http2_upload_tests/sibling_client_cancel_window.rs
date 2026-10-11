@@ -188,15 +188,24 @@ fn verify_wire(wire: &Wire, cancel: bool) -> serde_json::Value {
         "big_end_streams": uploads[&3].end_streams, "client_cancel_frames": resets })
 }
 
-async fn send(client: wreq::Client, proxy: wreq::Proxy, payload: Bytes) -> wreq::Response {
-    let response = client
+async fn send(
+    client: wreq::Client,
+    proxy: wreq::Proxy,
+    payload: Bytes,
+    observer: Option<wreq_proto::ext::H2AttemptObserver>,
+) -> wreq::Response {
+    let mut request = client
         .post(format!("https://{HOST}/v1/responses"))
         .proxy(proxy)
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(payload)
-        .send()
-        .await
+        .header(http::header::AUTHORIZATION, "Bearer AUTHORIZATION_CANARY")
+        .build()
         .unwrap();
+    if let Some(observer) = observer {
+        request.extensions_mut().insert(observer);
+    }
+    let response = client.execute(request).await.unwrap();
     assert_eq!(response.version(), http::Version::HTTP_2);
     assert_eq!(response.status(), http::StatusCode::OK);
     response
@@ -250,16 +259,26 @@ async fn scenario(cancel: bool) {
             }
         });
         let _server_guard = AbortTask(server.abort_handle());
-        let prime = send(client.clone(), proxy.clone(), Bytes::from_static(PRIME)).await;
+        let prime = send(client.clone(), proxy.clone(), Bytes::from_static(PRIME), None).await;
         assert!(prime.bytes().await.unwrap().is_empty());
         let payload = Bytes::from(vec![b'x'; PAYLOAD_BYTES]);
         let expected_digest = format!("{:x}", Sha256::digest(&payload));
-        let big = tokio::spawn(send(client.clone(), proxy.clone(), payload.clone()));
+        let big_binding = wreq_proto::ext::H2AttemptObserver::default();
+        let sibling_binding = wreq_proto::ext::H2AttemptObserver::default();
+        assert!(big_binding.snapshot().is_none());
+        let big = tokio::spawn(send(client.clone(), proxy.clone(), payload.clone(), Some(big_binding.clone())));
         let _big_guard = AbortTask(big.abort_handle());
         big_started.notified().await;
-        let sibling = tokio::spawn(send(client.clone(), proxy.clone(), payload));
+        let sibling = tokio::spawn(send(client.clone(), proxy.clone(), payload, Some(sibling_binding.clone())));
         let _sibling_guard = AbortTask(sibling.abort_handle());
         sibling_started.notified().await;
+        let big_bound = big_binding.snapshot().unwrap();
+        let sibling_bound = sibling_binding.snapshot().unwrap();
+        assert_ne!(big_bound.connection_id, 0);
+        assert_eq!(big_bound.connection_id, sibling_bound.connection_id);
+        assert_eq!((big_bound.stream_id, sibling_bound.stream_id), (3, 5));
+        assert_eq!((big_bound.stream_ordinal, sibling_bound.stream_ordinal), (2, 3));
+        assert_eq!((big_bound.lifecycle, sibling_bound.lifecycle), (0, 0));
         if cancel {
             sibling.abort();
             assert!(sibling.await.unwrap_err().is_cancelled());
@@ -269,6 +288,24 @@ async fn scenario(cancel: bool) {
         assert!(big.await.unwrap().bytes().await.unwrap().is_empty());
         shutdown.send(()).unwrap();
         let receipts = server.await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while big_binding.snapshot().unwrap().lifecycle == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("connection task terminal receipt");
+        let terminal = big_binding.snapshot().unwrap();
+        let sibling_terminal = sibling_binding.snapshot().unwrap();
+        assert!((1..=3).contains(&terminal.lifecycle));
+        assert_eq!(terminal.connection_id, big_bound.connection_id);
+        assert_eq!(sibling_terminal.stream_id, 5);
+        assert_eq!(terminal.lifecycle, sibling_terminal.lifecycle);
+        assert!(terminal.terminal_age_ms.is_some());
+        let binding_json = serde_json::json!({"connection_id": terminal.connection_id,
+            "stream_ids": [terminal.stream_id, sibling_terminal.stream_id],
+            "stream_ordinals": [terminal.stream_ordinal, sibling_terminal.stream_ordinal],
+            "lifecycle": terminal.lifecycle, "terminal_age_ms": terminal.terminal_age_ms,
+            "peer_delivery_state": "unknown"});
+        assert!(!binding_json.to_string().contains("CANARY"));
         let big_receipt = receipts.iter().find(|receipt| receipt.stream_id == 3).unwrap();
         assert_eq!(big_receipt.bytes, PAYLOAD_BYTES);
         assert!(big_receipt.end_stream && !big_receipt.cancelled);
@@ -280,6 +317,7 @@ async fn scenario(cancel: bool) {
             "boundary": "synthetic-socks-tls-h2-client-cancel-not-production-root-proof",
             "cancel_arm": cancel, "posts": receipts.len(), "socks_connections": 1,
             "sibling_peer_bytes": sibling_receipt.bytes, "wire": evidence,
+            "binding": binding_json,
             "production_root_proven": false,
         }));
     }).await.expect("bounded client-cancel window experiment");

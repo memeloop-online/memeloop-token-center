@@ -129,7 +129,7 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
         let subscriber = tracing_subscriber::fmt()
             .json()
             .without_time()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(tracing::Level::INFO)
             .with_writer(move || sink.clone())
             .finish();
         let client = crate::build_codex_http_client().unwrap();
@@ -142,7 +142,14 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
                 .build()
                 .unwrap();
             evidence.body_consumption.attach(&mut request);
+            assert!(evidence.binding.snapshot().is_none());
+            evidence.attach_binding(&mut request);
             let result = client.execute(request).await;
+            let binding = evidence.binding.snapshot().unwrap();
+            assert_ne!(binding.connection_id, 0);
+            assert_eq!(binding.stream_id, 1);
+            assert_eq!(binding.stream_ordinal, 1);
+            assert!(!format!("{binding:?}").contains("CANARY"));
             if before_headers {
                 let error = result.expect_err("peer reset must precede headers");
                 evidence.observe_error(&error, true);
@@ -201,6 +208,16 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let bindings: Vec<_> = events
+            .iter()
+            .map(|event| &event["fields"])
+            .filter(|fields| fields["message"] == "TEST-only H2 attempt binding")
+            .collect();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0]["request_id"], expected_request.to_string());
+        assert_eq!(bindings[0]["h2_stream_id"], 1);
+        assert_eq!(bindings[0]["h2_stream_ordinal"], 1);
+        assert_eq!(bindings[0]["peer_delivery_state"], "unknown");
         let fields: Vec<_> = events
             .iter()
             .map(|event| &event["fields"])

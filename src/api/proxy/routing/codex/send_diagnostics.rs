@@ -84,6 +84,8 @@ pub(super) struct TransportIdentity {
 }
 
 pub(super) struct Http2AttemptEvidence {
+    #[cfg(test)]
+    binding: wreq_proto::ext::H2AttemptObserver,
     request_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
@@ -105,6 +107,8 @@ impl Http2AttemptEvidence {
         body_consumption: BodyConsumption,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            binding: wreq_proto::ext::H2AttemptObserver::default(),
             request_id: context.request_id,
             upstream_account_id: route.account_id,
             credential_generation: route.credential_generation,
@@ -123,12 +127,32 @@ impl Http2AttemptEvidence {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn attach_binding(&self, request: &mut wreq::Request) {
+        request.extensions_mut().insert(self.binding.clone());
+    }
+
     pub(super) fn observe_error(
         &self,
         error: &(dyn std::error::Error + 'static),
         before_response_headers: bool,
     ) {
         if let Some(http2) = upstream_response::codex_http2_error(error) {
+            #[cfg(test)]
+            if let Some(binding) = self.binding.snapshot() {
+                tracing::info!(
+                    request_id = %self.request_id,
+                    outbound_attempt = self.outbound_attempt,
+                    h2_connection_id = binding.connection_id,
+                    h2_stream_id = binding.stream_id,
+                    h2_stream_ordinal = binding.stream_ordinal,
+                    h2_connection_age_ms = binding.connection_age_ms,
+                    h2_lifecycle = binding.lifecycle,
+                    h2_terminal_age_ms = binding.terminal_age_ms,
+                    peer_delivery_state = "unknown",
+                    "TEST-only H2 attempt binding"
+                );
+            }
             tracing::warn!(
                 request_id = %self.request_id,
                 upstream_account_id = %self.upstream_account_id,
