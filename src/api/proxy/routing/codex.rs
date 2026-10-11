@@ -588,6 +588,13 @@ async fn send_codex_attempt_once(
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let body_consumption = send_diagnostics::BodyConsumption::default();
+    let http2_evidence = send_diagnostics::Http2AttemptEvidence::capture(
+        &route.route,
+        transport_identity,
+        context,
+        matches!(egress_path, CodexEgressPath::AccountProxy),
+        body_consumption.clone(),
+    );
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
@@ -596,21 +603,7 @@ async fn send_codex_attempt_once(
         }
         .await
         .map_err(|error| {
-            if let Some(http2) = upstream_response::codex_http2_error(&error) {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %route.route.account_id,
-                    transport_revision = route.route.transport_revision,
-                    account_proxy = route.route.credential.proxy().is_some(),
-                    stage = "codex_http2_before_response_headers",
-                    http2_reset = http2.is_reset(),
-                    http2_goaway = http2.is_go_away(),
-                    http2_remote = http2.is_remote(),
-                    http2_library = http2.is_library(),
-                    http2_reason = ?http2.reason().map(u32::from),
-                    "Codex HTTP/2 failure origin evidence"
-                );
-            }
+            http2_evidence.observe_error(&error, true);
             tracing::warn!(
                 %request_id,
                 upstream_account_id = %route.route.account_id,
@@ -649,7 +642,8 @@ async fn send_codex_attempt_once(
     );
     match upstream_result {
         Ok(response) => Ok((
-            UpstreamResponse::Codex(response)
+            http2_evidence
+                .observe_response(response)
                 .with_body_timeouts(deadline.request, deadline.read_inactivity),
             upstream_activity,
         )),

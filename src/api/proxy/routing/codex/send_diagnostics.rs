@@ -70,6 +70,7 @@ impl Body for ObservedRequestBody {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct TransportIdentity {
     pub(super) client_instance_id: Uuid,
     pub(super) cache_hit: bool,
@@ -80,6 +81,106 @@ pub(super) struct TransportIdentity {
     pub(super) selection_epoch: i64,
     pub(super) group_selection_version: Option<i64>,
     pub(super) request_local_selection: bool,
+}
+
+pub(super) struct Http2AttemptEvidence {
+    request_id: Uuid,
+    upstream_account_id: Uuid,
+    credential_generation: i64,
+    transport_revision: i64,
+    candidate_rank: usize,
+    outbound_attempt: usize,
+    binding_group_id: Option<Uuid>,
+    account_proxy: bool,
+    identity: TransportIdentity,
+    body_consumption: BodyConsumption,
+}
+
+impl Http2AttemptEvidence {
+    pub(super) fn capture(
+        route: &ResolvedUpstream,
+        identity: TransportIdentity,
+        context: CodexAttemptContext,
+        account_proxy: bool,
+        body_consumption: BodyConsumption,
+    ) -> Self {
+        Self {
+            request_id: context.request_id,
+            upstream_account_id: route.account_id,
+            credential_generation: route.credential_generation,
+            transport_revision: route.transport_revision,
+            candidate_rank: context.candidate_rank,
+            outbound_attempt: context.outbound_attempt,
+            binding_group_id: route
+                .config
+                .get(crate::db::transport_proxy_management::CONFIG_KEY)
+                .and_then(|value| value.get("group_id"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            account_proxy,
+            identity,
+            body_consumption,
+        }
+    }
+
+    pub(super) fn observe_error(
+        &self,
+        error: &(dyn std::error::Error + 'static),
+        before_response_headers: bool,
+    ) {
+        if let Some(http2) = upstream_response::codex_http2_error(error) {
+            tracing::warn!(
+                request_id = %self.request_id,
+                upstream_account_id = %self.upstream_account_id,
+                credential_generation = self.credential_generation,
+                transport_revision = self.transport_revision,
+                candidate_rank = self.candidate_rank,
+                outbound_attempt = self.outbound_attempt,
+                connect_attempt = self.identity.connect_attempt,
+                client_instance_id = %self.identity.client_instance_id,
+                client_cache_hit = self.identity.cache_hit,
+                selected_proxy_matches_client_key = self.identity.selected_proxy_matches_client_key,
+                proxy_member_index = ?self.identity.proxy_member_index,
+                proxy_member_count = self.identity.proxy_member_count,
+                selection_epoch = self.identity.selection_epoch,
+                group_selection_version = ?self.identity.group_selection_version,
+                request_local_selection = self.identity.request_local_selection,
+                binding_group_id = ?self.binding_group_id,
+                account_proxy = self.account_proxy,
+                stage = if before_response_headers { "codex_http2_before_response_headers" } else { "codex_http2_response_body" },
+                http2_reset = http2.is_reset(),
+                http2_goaway = http2.is_go_away(),
+                http2_remote = http2.is_remote(),
+                http2_library = http2.is_library(),
+                http2_reason = ?http2.reason().map(u32::from),
+                request_body_polls = self.body_consumption.polls(),
+                request_body_consumed_bytes = self.body_consumption.bytes(),
+                body_consumption_scope = "transport_body_poll_not_wire_commit",
+                client_identity_scope = "cached_client_not_connection_or_stream",
+                wire_delivery_state = "unknown",
+                "Codex HTTP/2 failure origin evidence"
+            );
+        }
+    }
+
+    pub(super) fn observe_response(self, response: wreq::Response) -> UpstreamResponse {
+        use futures_util::StreamExt;
+        UpstreamResponse::Prefetched {
+            status: response.status(),
+            headers: response.headers().clone(),
+            version: response.version(),
+            content_length: response.content_length(),
+            stream: Box::pin(response.bytes_stream().map(move |chunk| {
+                chunk.map_err(|error| {
+                    self.observe_error(&error, false);
+                    upstream_response::codex_http2_failure(&error).map_or(
+                        upstream_response::UPSTREAM_STREAM_ERROR,
+                        upstream_response::CodexHttp2Failure::error_code,
+                    )
+                })
+            })),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
