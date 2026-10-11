@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
-import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, parseClaudeCompletion, validAuthorizationCallback, validFragmentManualCode } from '../src/operator/authorizationCode.js';
+import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, isFragmentManualCodeRejection, parseClaudeCompletion, validAuthorizationCallback, validFragmentManualCode } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { providerAccountStatus } from '../src/operator/providerAccountState.js';
@@ -79,6 +79,16 @@ test('missing deployment client and authority errors get actionable safe copy', 
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 409, 'oauth_identity_mismatch')), true);
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('no issued result yet', 409)), false);
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 502, 'oauth_identity_mismatch')), false);
+  assert.equal(isFragmentManualCodeRejection(new ApiError('invalid request: OAuth completion must be code#state', 400, 'invalid_request')), true);
+  for (const reason of [
+    new ApiError('invalid request: OAuth completion must be code#state: secret-code-state', 400, 'invalid_request'),
+    new ApiError('invalid request: OAuth completion must be code#state', 409, 'invalid_request'),
+    new ApiError('invalid request: OAuth completion must be code#state', 400, 'conflict'),
+    new ApiError('sensitive-code-state', 400, 'invalid_request'),
+    new Error('invalid request: OAuth completion must be code#state'),
+  ]) {
+    assert.equal(isFragmentManualCodeRejection(reason), false);
+  }
 });
 
 test('Claude completion classifies only known backend error shapes into safe bilingual recovery copy', () => {

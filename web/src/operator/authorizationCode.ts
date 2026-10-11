@@ -10,6 +10,12 @@ export function isAuthorizationIdentityMismatch(reason: unknown): boolean {
   return reason instanceof ApiError && reason.status === 409 && reason.code === 'oauth_identity_mismatch';
 }
 
+/** The one documented fragment-manual rejection; any other server text stays on the safe uncertain path. */
+export function isFragmentManualCodeRejection(reason: unknown): boolean {
+  return reason instanceof ApiError && reason.status === 400 && reason.code === 'invalid_request'
+    && reason.message === 'invalid request: OAuth completion must be code#state';
+}
+
 export function authorizationCompleteError(reason: unknown) {
   if (!(reason instanceof ApiError)) return 'completeUncertain';
   if (reason.status === 400 && reason.code === 'invalid_request') {

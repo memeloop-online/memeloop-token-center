@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { ApiError, api } from '../api';
+import { api } from '../api';
 import { Button, Checkbox, FormSection, Input } from '../design-system';
 import { localizeSchema, useI18n } from '../i18n';
 import { tenantDisplayName } from '../tenantDisplayName';
@@ -14,7 +14,7 @@ import { ProxyInput } from './UpstreamConnection';
 import { connectionSchema, isGenericProxyUrlInput } from './upstreamConnectionPolicy';
 import { authorizationCodeCopy } from './authorizationCodeCopy';
 import { OAuthLoginLinkActions } from './OAuthLoginLinkActions';
-import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, validAuthorizationCallback, validFragmentManualCode, type AuthorizationCodeSession } from './authorizationCode';
+import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, isFragmentManualCodeRejection, validAuthorizationCallback, validFragmentManualCode, type AuthorizationCodeSession } from './authorizationCode';
 import { fluentFormWidgets } from './FluentFormWidgets';
 import { providerConnectionCopy } from './providerConnectionCopy';
 
@@ -89,7 +89,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
       if (live.current) {
         if (existing && isAuthorizationIdentityMismatch(reason)) {
           setSession(undefined); setRecoveryDeadline(undefined); setError(copy.identityMismatch);
-        } else if (fragmentManual && !continueIssued && reason instanceof ApiError && reason.status === 400 && reason.code === 'invalid_request' && reason.message === 'invalid request: OAuth completion must be code#state') {
+        } else if (fragmentManual && !continueIssued && isFragmentManualCodeRejection(reason)) {
           setError(copy.codeRejected);
         } else setError(continueIssued ? copy.continueFailed : copy.uncertain);
       }
