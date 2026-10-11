@@ -63,6 +63,8 @@ enum Command {
         manifest: std::path::PathBuf,
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        cost_only: bool,
     },
     /// Audit or correct one bounded batch of historical failed-request cost projections.
     /// Without --apply this is a read-only dry run; resume from the returned JSON cursor.
@@ -194,7 +196,11 @@ async fn run() -> Result<(), &'static str> {
                 .map_err(|_| "database_migration_failed")?;
             info!("database schema is current");
         }
-        Command::BackfillExactFailedRequestCosts { manifest, apply } => {
+        Command::BackfillExactFailedRequestCosts {
+            manifest,
+            apply,
+            cost_only,
+        } => {
             use tokio::io::AsyncReadExt;
 
             let file = tokio::fs::File::open(manifest)
@@ -213,10 +219,16 @@ async fn run() -> Result<(), &'static str> {
             let database = Database::connect_with_max(&config.database_url, 1)
                 .await
                 .map_err(|_| "database_connect_failed")?;
-            let report = database
-                .backfill_failed_request_costs_exact(manifest, apply)
-                .await
-                .map_err(|_| "exact_projection_backfill_failed")?;
+            let operation = if cost_only {
+                database
+                    .backfill_failed_request_costs_exact_cost_only(manifest, apply)
+                    .await
+            } else {
+                database
+                    .backfill_failed_request_costs_exact(manifest, apply)
+                    .await
+            };
+            let report = operation.map_err(|_| "exact_projection_backfill_failed")?;
             println!(
                 "{}",
                 serde_json::to_string(&report).map_err(|_| "exact_projection_report_failed")?
@@ -348,7 +360,27 @@ mod lifecycle_tests {
         .unwrap();
         assert!(matches!(
             parsed.command,
-            Command::BackfillExactFailedRequestCosts { apply: false, .. }
+            Command::BackfillExactFailedRequestCosts {
+                apply: false,
+                cost_only: false,
+                ..
+            }
+        ));
+        let cost_only = Cli::try_parse_from([
+            "memeloop-token-center",
+            "backfill-exact-failed-request-costs",
+            "--manifest",
+            "reviewed.json",
+            "--cost-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cost_only.command,
+            Command::BackfillExactFailedRequestCosts {
+                apply: false,
+                cost_only: true,
+                ..
+            }
         ));
         for disallowed in ["--batch-size", "--from-created-at", "--after-created-at"] {
             assert!(
