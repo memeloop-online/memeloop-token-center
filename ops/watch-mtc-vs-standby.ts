@@ -160,8 +160,13 @@ async function stopOwn() {
       const sourceConnectionsGone = remaining.senders.every((sender: any) => baselineSenders.has(senderKey(sender)) && sender.application !== application && !observedOwnPids.has(sender.pid));
       const tempSlotsGone = remaining.slots.every((slot: any) => baselineSlots.has(slot.name) && !observedOwnSlots.has(slot.name));
       const ownChildrenGone = JSON.parse(command(['-n', namespace, 'get', 'pods,jobs', '-l', `cnpg.io/cluster=${ownName}`, '-o', 'json'])).items.length === 0;
+      let knownUIDsGone = true;
+      for (const child of children.values()) {
+        const raw = command(['-n', namespace, 'get', child.kind, child.name, '--ignore-not-found', '-o', 'json']).trim();
+        if (raw && JSON.parse(raw).metadata.uid === child.uid) knownUIDsGone = false;
+      }
       const app = JSON.parse(command(['-n', 'argocd', 'get', 'application', ownName, '-o', 'json']));
-      if (!own && ownChildrenGone && sourceConnectionsGone && tempSlotsGone && !app.operation && !app.spec.syncPolicy?.automated && !receiptFailed) { confirmed = true; break; }
+      if (!own && ownChildrenGone && knownUIDsGone && sourceConnectionsGone && tempSlotsGone && !app.operation && !app.spec.syncPolicy?.automated && !receiptFailed) { confirmed = true; break; }
     } catch { record('STOP_VERIFICATION_READ_FAILED'); break; }
     if (runtime.now() + 1000 >= readDeadline) break;
     await runtime.pause(1000);

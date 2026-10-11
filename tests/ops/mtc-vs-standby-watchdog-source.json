@@ -1,7 +1,7 @@
 {
   "repository": "https://git.k3s.onetwo.website/llm/k3s-gitops",
-  "commit": "81fbc4551f77fad0928302807c1777bc38b7bbb8",
+  "commit": "6aa65466c298ca9b22168f95ba60aec7efcc2990",
   "path": "scripts/watch-mtc-vs-standby.ts",
-  "sha256": "2510f6bf10cb06109e3f69d50579fc1aa93265a949000f4977d696398ff9195e",
+  "sha256": "9ecaf212ff3934d99df773160174479d835daf496819afec120b90d2b2048ba8",
   "execution": "GitHub Actions command mocks only; no cluster credentials or operational execution"
 }
