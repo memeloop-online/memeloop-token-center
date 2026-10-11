@@ -1297,8 +1297,12 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     let audio_transcription = protocol == "audio-transcription";
     let generation_status: Option<String> = row.try_get("generation_status")?;
     let persisted_status_code: Option<i64> = row.try_get("status_code")?;
-    let (lifecycle_state, status_code) =
-        request_lifecycle_projection(generation_status.as_deref(), persisted_status_code)?;
+    let error_code: Option<String> = row.try_get("error_code")?;
+    let (lifecycle_state, status_code) = request_lifecycle_projection(
+        generation_status.as_deref(),
+        persisted_status_code,
+        error_code.as_deref(),
+    )?;
     let input_tokens: Option<i64> = row.try_get("input_tokens")?;
     let cached_input_tokens: Option<i64> = row.try_get("cached_input_tokens")?;
     let cache_write_tokens: Option<i64> = row.try_get("cache_write_tokens")?;
@@ -1306,7 +1310,6 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     let billed_units: Option<i64> = row.try_get("billed_units")?;
     let billing_unit: Option<String> = row.try_get("billing_unit")?;
     let cost_micros: Option<i64> = row.try_get("cost_micros")?;
-    let error_code: Option<String> = row.try_get("error_code")?;
     let terminal_cause_code: Option<String> = row.try_get("terminal_cause_code")?;
     let usage_basis: Option<String> = row.try_get("usage_basis")?;
     let cost = cost_micros
@@ -1440,6 +1443,7 @@ pub(crate) fn request_usage_basis_from_row(
 fn request_lifecycle_projection(
     generation_status: Option<&str>,
     status_code: Option<i64>,
+    error_code: Option<&str>,
 ) -> Result<(RequestLifecycleState, Option<i64>), AppError> {
     if let Some(status) = generation_status {
         return Ok(match status {
@@ -1457,6 +1461,11 @@ fn request_lifecycle_projection(
     Ok(match status_code {
         None => (RequestLifecycleState::Pending, None),
         Some(499) => (RequestLifecycleState::Cancelled, Some(499)),
+        Some(code)
+            if (200..400).contains(&code) && error_code == Some("upstream_incomplete_response") =>
+        {
+            (RequestLifecycleState::Failed, Some(code))
+        }
         Some(code) if (200..400).contains(&code) => (RequestLifecycleState::Succeeded, Some(code)),
         Some(code) => (RequestLifecycleState::Failed, Some(code)),
     })
@@ -1573,8 +1582,12 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
             let audio_transcription = protocol == "audio-transcription";
             let generation_status: Option<String> = row.try_get("generation_status")?;
             let persisted_status_code: Option<i64> = row.try_get("current_status_code")?;
-            let (lifecycle_state, status_code) =
-                request_lifecycle_projection(generation_status.as_deref(), persisted_status_code)?;
+            let error_code: Option<String> = row.try_get("current_error_code")?;
+            let (lifecycle_state, status_code) = request_lifecycle_projection(
+                generation_status.as_deref(),
+                persisted_status_code,
+                error_code.as_deref(),
+            )?;
             let input_tokens: Option<i64> = row.try_get("current_input_tokens")?;
             let cached_input_tokens: Option<i64> = row.try_get("cached_input_tokens")?;
             let cache_write_tokens: Option<i64> = row.try_get("cache_write_tokens")?;
@@ -1582,7 +1595,6 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
             let billed_units: Option<i64> = row.try_get("billed_units")?;
             let billing_unit: Option<String> = row.try_get("billing_unit")?;
             let cost_micros: Option<i64> = row.try_get("current_cost_micros")?;
-            let error_code: Option<String> = row.try_get("current_error_code")?;
             let terminal_cause_code: Option<String> = row.try_get("current_terminal_cause_code")?;
             let usage_basis = request_usage_basis_from_row(&row)?;
             let cost = cost_micros
@@ -1732,7 +1744,11 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
     let cache_write_tokens: Option<i64> = row.try_get("cache_write_tokens")?;
     let output_tokens: Option<i64> = row.try_get("output_tokens")?;
     let status_code: Option<i64> = row.try_get("status_code")?;
-    let (lifecycle_state, status_code) = request_lifecycle_projection(None, status_code)?;
+    let (lifecycle_state, status_code) = request_lifecycle_projection(
+        None,
+        status_code,
+        row.try_get::<Option<String>, _>("error_code")?.as_deref(),
+    )?;
     let (request_archive_state, request_archive_reason) =
         locator_archive_projection(request_object.as_deref());
     let (response_archive_state, response_archive_reason) =
@@ -1855,7 +1871,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
         .map_or((None, false), |(value, metadata_only)| {
             (Some(value), metadata_only)
         });
-    let (lifecycle_state, status_code) = request_lifecycle_projection(Some(&status), None)?;
+    let (lifecycle_state, status_code) = request_lifecycle_projection(Some(&status), None, None)?;
     let billed_units: Option<i64> = row.try_get("facts_billed_units")?;
     let billing_unit: Option<String> = row.try_get("facts_billing_unit")?;
     let cost_micros: Option<i64> = row.try_get("facts_cost_micros")?;
