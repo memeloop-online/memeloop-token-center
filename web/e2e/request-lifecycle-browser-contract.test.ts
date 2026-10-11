@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -236,6 +236,25 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await row.locator('[data-outcome="failed"]').waitFor();
       assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
+      await page.evaluate(`(() => {
+        const started = performance.now();
+        const events = [];
+        const record = (event) => {
+          if (events.length >= 80) return;
+          const target = event.target;
+          events.push({
+            elapsed: Math.round(performance.now() - started),
+            type: event.type,
+            key: event instanceof KeyboardEvent ? event.key : undefined,
+            target: target instanceof HTMLElement ? target.className : String(target),
+            active: document.activeElement instanceof HTMLElement ? document.activeElement.className : null,
+          });
+        };
+        for (const type of ['focusin', 'focusout', 'keydown', 'keyup', 'pointerenter', 'pointerleave']) {
+          document.addEventListener(type, record, true);
+        }
+        window.supplierTooltipEvents = events;
+      })()`);
       await row.locator('.request-outcome').press('Shift+Tab');
       await page.keyboard.press('Tab');
       assert.equal(await row.locator('.request-outcome').evaluate(element => element === document.activeElement), true, 'keyboard navigation focuses the list status');
@@ -263,15 +282,20 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
           const active = document.activeElement;
           return {
             focus: active instanceof HTMLElement ? active.className : String(active),
+            focusRect: active instanceof HTMLElement ? active.getBoundingClientRect().toJSON() : null,
+            viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
+            events: window.supplierTooltipEvents,
             tooltips: Array.from(document.querySelectorAll('[role="tooltip"]')).map((node) => {
               const style = getComputedStyle(node);
               const rect = node.getBoundingClientRect();
               return {
+                id: node.id,
                 display: style.display,
                 visibility: style.visibility,
                 width: Math.round(rect.width),
                 height: Math.round(rect.height),
                 exactText: node.textContent === expected,
+                exactInnerText: node.innerText === expected,
                 described: active instanceof HTMLElement && (active.getAttribute('aria-describedby') || '').split(/\\s+/).indexOf(node.id) !== -1,
               };
             }),
@@ -279,9 +303,9 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
         })()`);
         const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
         await mkdir(artifactRoot, { recursive: true });
+        await writeFile(`${artifactRoot}/supplier-error-${locale}-tooltip-failure.json`, JSON.stringify(diagnostics, null, 2));
         await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-tooltip-failure.png`, fullPage: true });
-        if (error instanceof Error) error.message += ` keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`;
-        throw error;
+        throw new Error(`keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
       }
       assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
       assert.equal(observed, hint);
