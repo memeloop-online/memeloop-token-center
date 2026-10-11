@@ -220,7 +220,7 @@ async fn scenario(cancel: bool) {
             let sibling_started = sibling_started.clone();
             async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                accept_socks(&mut socket).await;
+                accept_socks_at_port(&mut socket, 443).await;
                 let encrypted = fixture.acceptor.accept(socket).await.unwrap();
                 assert_eq!(encrypted.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
                 let mut connection = http2::server::Builder::new()
