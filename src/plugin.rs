@@ -3187,6 +3187,55 @@ mod tests {
     }
 
     #[test]
+    fn subscription_release_messages_declaration_matches_closed_manifest_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json")).unwrap();
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude-wire-subscription-1.1.0.json"
+        ))
+        .unwrap();
+        crate::schema::validate_instance(&schema, &manifest).unwrap();
+        for invalid in [
+            Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!({}),
+        ] {
+            let mut changed = manifest.clone();
+            changed["contributions"]["providers"][0]["request_compatibility"]["responses_via_anthropic_messages_v1"] =
+                invalid;
+            assert!(crate::schema::validate_instance(&schema, &changed).is_err());
+        }
+        let mut unknown = manifest.clone();
+        unknown["contributions"]["providers"][0]["request_compatibility"]["unreviewed_transport"] =
+            serde_json::json!(true);
+        assert!(crate::schema::validate_instance(&schema, &unknown).is_err());
+        for pointer in [
+            "/contributions/providers/0/request_compatibility/third_party",
+            "/contributions/providers/0/protocols",
+        ] {
+            let mut changed = manifest.clone();
+            *changed
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing reviewed field {pointer}")) =
+                if pointer.ends_with("protocols") {
+                    serde_json::json!(["openai"])
+                } else {
+                    serde_json::json!(false)
+                };
+            let parsed: PluginManifest = serde_json::from_value(changed).unwrap();
+            assert!(super::validate_manifest(&parsed).is_err());
+        }
+        let mut mixed = manifest;
+        mixed["contributions"]["providers"][0]["request_compatibility"]["responses_via_chat_v1"] =
+            serde_json::json!(true);
+        mixed["contributions"]["providers"][0]["request_compatibility"]["responses_via_chat_dialect"] =
+            serde_json::json!("openai_chat_v1");
+        let parsed: PluginManifest = serde_json::from_value(mixed).unwrap();
+        assert!(super::validate_manifest(&parsed).is_err());
+    }
+
+    #[test]
     #[ignore = "GHA supplies the signed public WASM with the exact 1.1.0 release hash"]
     fn privacy_wire_shim_release_component_subscription_package_validation() {
         use sha2::{Digest, Sha256};
