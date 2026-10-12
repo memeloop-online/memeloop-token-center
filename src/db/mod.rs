@@ -431,21 +431,22 @@ impl Database {
         &self,
         progress: &DatabaseReadinessProgress,
     ) -> Result<(), DatabaseReadinessError> {
-        {
-            let mut connection = self
-                .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
-                .await
-                .map_err(AppError::from)?;
-            sqlx::query("SELECT 1")
-                .execute(&mut *connection)
-                .await
-                .map_err(AppError::from)?;
-        }
-        let schema = self.schema_status(progress).await.map_err(AppError::from)?;
+        let mut connection = self
+            .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
+            .await
+            .map_err(AppError::from)?;
+        sqlx::query("SELECT 1")
+            .execute(&mut *connection)
+            .await
+            .map_err(AppError::from)?;
+        let schema = self
+            .schema_status(&mut connection, progress)
+            .await
+            .map_err(AppError::from)?;
         if !schema.is_ready() {
             return Err(DatabaseReadinessError::SchemaOutdated(schema));
         }
-        self.archive_staging_readiness_check(progress)
+        self.archive_staging_readiness_check(&mut connection, progress)
             .await
             .map_err(AppError::from)?;
         Ok(())

@@ -1,6 +1,121 @@
 use super::super::*;
 
 #[tokio::test]
+async fn readiness_reuses_one_checkout_while_pool_return_is_delayed() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("readiness-one-checkout.db").display()
+    );
+    let mut database = Database::connect_with_max(&database_url, 2).await.unwrap();
+    database.migrate().await.unwrap();
+    let checkouts = Arc::new(AtomicUsize::new(0));
+    let delayed_return = Arc::new(AtomicBool::new(false));
+    let returning = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let checkout_count = checkouts.clone();
+    let return_enabled = delayed_return.clone();
+    let return_entered = returning.clone();
+    let return_release = release.clone();
+    let pool = database
+        .pool
+        .options()
+        .clone()
+        .before_acquire(move |_connection, _metadata| {
+            let checkouts = checkout_count.clone();
+            Box::pin(async move {
+                checkouts.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        })
+        .after_release(move |_connection, _metadata| {
+            let enabled = return_enabled.clone();
+            let entered = return_entered.clone();
+            let release = return_release.clone();
+            Box::pin(async move {
+                if enabled.load(Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.acquire().await.unwrap().forget();
+                }
+                Ok(true)
+            })
+        })
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+    let previous_pool = std::mem::replace(&mut database.pool, pool);
+    previous_pool.close().await;
+    let held = database.pool.acquire().await.unwrap();
+    let mut warmed = database.pool.acquire().await.unwrap();
+    warmed.return_to_pool().await;
+    checkouts.store(0, Ordering::SeqCst);
+    delayed_return.store(true, Ordering::SeqCst);
+
+    let progress = DatabaseReadinessProgress::new();
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        database.readiness_check_observed(&progress),
+    )
+    .await
+    .expect("readiness must not wait for an intermediate connection return")
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), returning.notified())
+        .await
+        .expect("the final connection return is independently stalled");
+    assert_eq!(checkouts.load(Ordering::SeqCst), 1);
+    let snapshot = progress.snapshot(&database);
+    assert_eq!(snapshot.stage, "archive_shape");
+    assert_eq!(snapshot.phase, "query");
+    assert_eq!(snapshot.pool_size, 2);
+    assert_eq!(snapshot.pool_idle, 0);
+
+    delayed_return.store(false, Ordering::SeqCst);
+    release.add_permits(1);
+    let mut reused = tokio::time::timeout(Duration::from_secs(5), database.pool.acquire())
+        .await
+        .expect("the final return releases its pool slot")
+        .unwrap();
+    sqlx::query("SELECT 1").execute(&mut *reused).await.unwrap();
+    reused.return_to_pool().await;
+    drop(held);
+    database.pool.close().await;
+}
+
+#[tokio::test]
+async fn readiness_reused_connection_still_checks_archive_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("readiness-archive-shape.db")
+            .display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    database.migrate().await.unwrap();
+    sqlx::query("ALTER TABLE archive_staging_attempts RENAME TO unavailable_archive_staging")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let progress = DatabaseReadinessProgress::new();
+    assert!(matches!(
+        database.readiness_check_observed(&progress).await,
+        Err(DatabaseReadinessError::Dependency(_))
+    ));
+    let snapshot = progress.snapshot(&database);
+    assert_eq!(snapshot.stage, "archive_shape");
+    assert_eq!(snapshot.phase, "query");
+    sqlx::query("ALTER TABLE unavailable_archive_staging RENAME TO archive_staging_attempts")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.readiness_check_detailed().await.unwrap();
+}
+
+#[tokio::test]
 async fn readiness_outer_timeout_preserves_a_real_pool_acquire_wait() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
