@@ -321,6 +321,189 @@ async fn postgres_boundary_queries_use_bounded_fact_index_ranges() {
     database.pool.close().await;
 }
 
+#[test]
+fn output_rate_retained_lookups_keep_scope_time_and_provenance() {
+    for backend in [DatabaseBackend::PostgreSql, DatabaseBackend::Sqlite] {
+        for tenant_scoped in [false, true] {
+            let sql = super::output_rate::output_rate_sql(
+                backend,
+                UsageAnalysisGranularity::Hour,
+                tenant_scoped,
+            );
+            assert!(sql.contains("f.created_at >= $2 AND f.created_at <= $3"));
+            assert!(sql.contains("r.usage_basis = 'provider_reported'"));
+            assert!(sql.contains("o.key_id = r.key_id"));
+            assert!(sql.contains("o.cluster_id = r.conversation_cluster_id"));
+            assert!(sql.contains("o.compaction = 1"));
+            assert!(!sql.contains("request_object"));
+            assert!(!sql.contains("response_object"));
+            match backend {
+                DatabaseBackend::PostgreSql => {
+                    assert!(sql.contains("JOIN LATERAL"));
+                    assert!(sql.contains("record.id = f.request_id"));
+                    assert!(sql.contains("record.created_at = f.created_at"));
+                    assert!(sql.contains("record.created_at >= $2 AND record.created_at <= $3"));
+                    assert!(sql.contains("OFFSET 0"));
+                }
+                DatabaseBackend::Sqlite => {
+                    assert!(!sql.contains("LATERAL"));
+                    assert!(sql.contains("r.created_at >= $2 AND r.created_at <= $3"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_output_rate_30d_uses_partition_pruned_parameterized_primary_keys() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let mut connection = <sqlx::PgConnection as sqlx::Connection>::connect(&database_url)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "SET statement_timeout = '30s';
+         CREATE TEMP TABLE request_stats_facts (
+             request_id TEXT PRIMARY KEY, tenant_id TEXT, key_id TEXT, created_at BIGINT,
+             model TEXT, protocol TEXT, error_code TEXT, upstream_account_id TEXT,
+             model_route_id TEXT);
+         CREATE INDEX ON request_stats_facts (tenant_id, created_at);
+         CREATE TEMP TABLE request_records (
+             id TEXT, created_at BIGINT, key_id TEXT, conversation_cluster_id TEXT,
+             completed_at BIGINT, status_code BIGINT, error_code TEXT, usage_basis TEXT,
+             duration_ms BIGINT, output_tokens BIGINT, PRIMARY KEY (id, created_at))
+             PARTITION BY RANGE (created_at);
+         CREATE TEMP TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT,
+             principal_id TEXT, alias TEXT);
+         CREATE TEMP TABLE principals (id TEXT PRIMARY KEY, tenant_id TEXT, external_id TEXT);
+         CREATE TEMP TABLE conversation_observations (request_id TEXT, key_id TEXT,
+             cluster_id TEXT, compaction BIGINT);",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    const MONTH: i64 = 30 * 86_400_000;
+    for partition in 0..64 {
+        let sql = format!(
+            "CREATE TEMP TABLE request_records_rate_{partition} PARTITION OF request_records
+             FOR VALUES FROM ({}) TO ({})",
+            partition * MONTH,
+            (partition + 1) * MONTH,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO request_records
+         SELECT 'history-' || sequence, (sequence / 1000) * $1 + (sequence % 1000) * 60000,
+                'other-key', '', 1, 200, '', 'provider_reported', 1000, 20
+           FROM generate_series(0, 63999) sequence",
+    )
+    .bind(MONTH)
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let from = 30 * MONTH + 12 * 86_400_000 + 12 * 3_600_000;
+    let to = from + MONTH;
+    for (request_id, created_at) in [
+        ("first", from),
+        ("middle", from + 3_600_000),
+        ("last", to),
+        ("before", from - 1),
+        ("after", to + 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO request_stats_facts VALUES ($1, 'rate-tenant', 'rate-key', $2,
+                 'rate-model', 'openai', '', '', '')",
+        )
+        .bind(request_id)
+        .bind(created_at)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    }
+    sqlx::raw_sql(
+        "INSERT INTO request_records SELECT request_id, created_at, key_id, '',
+             created_at + 1000, 200, '', 'provider_reported', 1000, 20
+           FROM request_stats_facts;
+         ANALYZE request_stats_facts;
+         ANALYZE request_records;",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let sql = super::output_rate::output_rate_sql(
+        DatabaseBackend::PostgreSql,
+        UsageAnalysisGranularity::Hour,
+        true,
+    );
+    let bind = |sql| {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind("rate-tenant")
+            .bind(from)
+            .bind(to)
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+    };
+    let rows = bind(sql.clone()).fetch_all(&mut connection).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<i64, _>("requests"))
+            .sum::<i64>(),
+        3
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<i64, _>("output_tokens"))
+            .sum::<i64>(),
+        60
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<i64, _>("duration_ms"))
+            .sum::<i64>(),
+        3000
+    );
+    let plan_rows = bind(format!("EXPLAIN (ANALYZE, COSTS OFF) {sql}"))
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+    let plan = plan_rows
+        .iter()
+        .map(|row| row.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("Nested Loop"), "{plan}");
+    assert!(
+        plan.contains("Index Scan using request_records_rate_"),
+        "{plan}"
+    );
+    assert!(plan.contains("id = f.request_id"), "{plan}");
+    assert!(plan.contains("created_at = f.created_at"), "{plan}");
+    assert!(
+        !plan.contains("Seq Scan on request_records_rate_"),
+        "{plan}"
+    );
+    for partition in 0..64 {
+        if ![30, 31].contains(&partition) {
+            assert!(
+                !plan.contains(&format!("on request_records_rate_{partition} ")),
+                "{plan}"
+            );
+        }
+    }
+}
+
 async fn explain_usage_query(
     pool: &sqlx::AnyPool,
     sql: &str,
