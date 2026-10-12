@@ -219,6 +219,7 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
+        fixture.state.routing_persistence.drain_for_test().await;
         loop {
             let rows = fixture
                 .state
@@ -253,7 +254,7 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
     else {
         panic!("preferred account must be healthy before local failure evidence");
     };
-    fixture
+    let failure = fixture
         .state
         .db
         .record_admitted_connection_failure_by_domain(
@@ -272,6 +273,14 @@ async fn same_session_skips_only_the_current_failure_domain_without_replaying() 
         )
         .await
         .unwrap();
+    assert_eq!(
+        failure.distinct_failure_domains, 1,
+        "local failure injection must pass its admitted epoch/revision CAS"
+    );
+    assert!(
+        !failure.global_breaker_opened,
+        "one local failure domain must not open the global breaker"
+    );
 
     let second = send_resilient_chat(&fixture, Some(session_id), false).await;
     assert_eq!(second.status(), StatusCode::OK);

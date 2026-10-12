@@ -594,12 +594,13 @@ async fn send_codex_attempt_once(
         context,
         matches!(egress_path, CodexEgressPath::AccountProxy),
         body_consumption.clone(),
+        state.config.h2_attempt_binding_enabled,
     );
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
-            #[cfg(test)]
+            #[cfg(feature = "h2-attempt-binding")]
             http2_evidence.attach_binding(&mut request);
             client.execute(request).await
         }
