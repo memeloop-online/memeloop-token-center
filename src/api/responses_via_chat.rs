@@ -22,12 +22,15 @@ pub(in crate::api) fn prepare_with_dialect(
     translate_compaction: bool,
 ) -> Result<Context, AppError> {
     let context = Context::with_dialect(request, dialect);
-    *request = super::kimi_transport::responses_request::convert_with_dialect(
+    let producer_unavailable = context.is_compaction()
+        && dialect == ResponsesViaChatDialect::KimiV1
+        && !translate_compaction;
+    let mut converted = super::kimi_transport::responses_request::convert_with_dialect(
         request,
         dialect,
-        translate_compaction,
+        translate_compaction || producer_unavailable,
     )?;
-    let object = request
+    let object = converted
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;
     let model = match dialect {
@@ -42,6 +45,23 @@ pub(in crate::api) fn prepare_with_dialect(
             .ok_or_else(|| AppError::BadRequest("stream_options must be an object".into()))?;
         options.insert("include_usage".into(), Value::Bool(true));
     }
+    if producer_unavailable {
+        if let Some((input_index, item)) = request["input"].as_array().and_then(|items| {
+            items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item["type"] == "compaction_trigger")
+        }) {
+            super::kimi_transport::responses_request::report_input_rejection(
+                input_index,
+                item,
+                dialect,
+                false,
+            );
+        }
+        return Err(AppError::CompactionProducerUnavailable);
+    }
+    *request = converted;
     Ok(context)
 }
 

@@ -1139,6 +1139,382 @@ fn native_kimi_billing_does_not_depend_on_client_usage_opt_in() {
     ));
 }
 
+async fn compaction_candidate_fixture(
+    label: &str,
+    preferred: &MockServer,
+    standby: &MockServer,
+    preferred_producer: bool,
+    standby_producer: bool,
+) -> CodexRouteFixture {
+    let driver = "test-kimi-compaction-candidates";
+    let mut fixture = response_usage_fixture_with_uri_contract_driver_model_config_and_credential(
+        label,
+        preferred.uri(),
+        0,
+        Some("openai-chat-usage-only"),
+        driver,
+        "test-compaction-candidates",
+        ResponseUsageFixtureOptions {
+            extra_upstream_config: json!({"responses_via_chat_compaction":preferred_producer}),
+            credential: UpstreamCredential::None,
+        },
+    )
+    .await;
+    let mut provider = fixture.state.providers.get("http-json").unwrap().clone();
+    provider.id = driver.to_owned();
+    provider.oauth_adapter = None;
+    provider.component_adapter = None;
+    provider.generation_adapter = None;
+    provider.request_compatibility = crate::provider::RequestCompatibility {
+        anthropic_messages_headers: Default::default(),
+        third_party: true,
+        responses_via_chat_v1: true,
+        responses_via_chat_dialect: Some(crate::provider::ResponsesViaChatDialect::KimiV1),
+        responses_transport_configurable: false,
+        responses_via_anthropic_messages_v1: false,
+        codex_multi_agent_v2: true,
+    };
+    provider.config_schema["properties"]["responses_via_chat_compaction"] =
+        json!({"type":"boolean","default":false});
+    fixture.state.providers.extend([provider]).unwrap();
+    let tenant = format!("compatibility-route-{label}");
+    let account = fixture
+        .state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.clone(),
+                name: format!("compaction-standby-{label}"),
+                driver: driver.to_owned(),
+                config: json!({"base_url":standby.uri(),"network_scope":"public",
+                    "input_token_overhead_ceiling":0,
+                    "stream_usage_contract":"openai-chat-usage-only",
+                    "responses_via_chat_compaction":standby_producer}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant,
+            public_model: fixture.model.clone(),
+            upstream_account_id: account.id,
+            upstream_model: fixture.model.clone(),
+            protocol: "openai".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO routing_grants (tenant_id,key_id,model_route_id,route_group_id,created_at) VALUES ($1,$2,$3,NULL,$4)")
+        .bind(tenant_id)
+        .bind(fixture.key_id.to_string())
+        .bind(route.id.to_string())
+        .bind(crate::db::unix_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    fixture
+}
+
+fn compaction_candidate_response(text: &str) -> Value {
+    json!({"id":"chatcmpl-compaction-candidate","created":1,
+        "choices":[{"index":0,"finish_reason":"stop",
+            "message":{"role":"assistant","content":text}}],
+        "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
+}
+
+async fn assert_no_compaction_candidate_health_failure(fixture: &CodexRouteFixture) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE consecutive_failures > 0 OR cooldown_until > 0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(failures, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn compaction_candidates_skip_disabled_producer_before_single_dispatch() {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&preferred)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(compaction_candidate_response(
+                "Retained harmless reference: candidate-checkpoint.",
+            )),
+        )
+        .expect(1)
+        .mount(&standby)
+        .await;
+    let fixture = compaction_candidate_fixture(
+        "compaction-disabled-enabled",
+        &preferred,
+        &standby,
+        false,
+        true,
+    )
+    .await;
+    let response = send_official_codex_responses_request(
+        &fixture,
+        &json!({"model":fixture.model,"stream":false,"input":[
+            {"role":"user","content":"Retain candidate-checkpoint in the summary."},
+            {"type":"compaction_trigger"}
+        ]}),
+        "application/json",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "compaction");
+    assert!(
+        body["output"][0]["encrypted_content"]
+            .as_str()
+            .unwrap()
+            .starts_with("mtc-compact-v1.")
+    );
+    assert!(preferred.received_requests().await.unwrap().is_empty());
+    assert_eq!(standby.received_requests().await.unwrap().len(), 1);
+    assert_no_compaction_candidate_health_failure(&fixture).await;
+    preferred.verify().await;
+    standby.verify().await;
+}
+
+#[tokio::test]
+async fn compaction_candidates_all_disabled_return_precise_400_without_dispatch() {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    let fixture = compaction_candidate_fixture(
+        "compaction-all-disabled",
+        &preferred,
+        &standby,
+        false,
+        false,
+    )
+    .await;
+    let response = send_official_codex_responses_request(
+        &fixture,
+        &json!({"model":fixture.model,"stream":false,"input":[
+            {"role":"user","content":"Retain the history."},
+            {"type":"compaction_trigger"}
+        ]}),
+        "application/json",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(
+        body["error"]["message"],
+        "invalid request: no available authorized upstream supports Responses compaction production"
+    );
+    assert!(preferred.received_requests().await.unwrap().is_empty());
+    assert!(standby.received_requests().await.unwrap().is_empty());
+    assert_no_compaction_candidate_health_failure(&fixture).await;
+}
+
+#[tokio::test]
+async fn compaction_consumer_messages_and_tools_do_not_require_producer_opt_in() {
+    let producer_context = crate::api::responses_via_chat::Context::with_dialect(
+        &json!({"model":"test-compaction-candidates","input":[{"type":"compaction_trigger"}]}),
+        crate::provider::ResponsesViaChatDialect::KimiV1,
+    );
+    let produced = crate::api::responses_via_chat::buffered(
+        &producer_context,
+        &compaction_candidate_response("Earlier nonprivileged checkpoint history."),
+    )
+    .unwrap();
+    for (label, input, tools) in [
+        (
+            "consumer-only",
+            json!([produced["output"][0].clone(), {"role":"user","content":"Continue."}]),
+            Value::Null,
+        ),
+        (
+            "ordinary-message",
+            json!([{"role":"user","content":"Ordinary request."}]),
+            Value::Null,
+        ),
+        (
+            "ordinary-tools",
+            json!([
+                {"type":"function_call","name":"lookup","call_id":"call-1","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-1","output":"Earlier lookup result."},
+                {"role":"user","content":"Continue."}
+            ]),
+            json!([{"type":"function","name":"lookup","parameters":{"type":"object"}}]),
+        ),
+    ] {
+        let preferred = MockServer::start().await;
+        let standby = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(compaction_candidate_response("Ordinary completed reply.")),
+            )
+            .expect(1)
+            .mount(&preferred)
+            .await;
+        let fixture = compaction_candidate_fixture(label, &preferred, &standby, false, true).await;
+        let mut request = json!({"model":fixture.model,"stream":false,"input":input});
+        if !tools.is_null() {
+            request["tools"] = tools;
+        }
+        let response =
+            send_official_codex_responses_request(&fixture, &request, "application/json").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        let requests = preferred.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(standby.received_requests().await.unwrap().is_empty());
+        let forwarded: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        if label == "consumer-only" {
+            assert_eq!(forwarded["messages"][0]["role"], "user");
+            assert!(
+                forwarded["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Earlier nonprivileged checkpoint history.")
+            );
+        }
+        if label == "ordinary-tools" {
+            assert_eq!(forwarded["tools"][0]["function"]["name"], "lookup");
+            assert_eq!(forwarded["messages"][1]["role"], "tool");
+        }
+        assert_no_compaction_candidate_health_failure(&fixture).await;
+        preferred.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_compaction_requests_are_not_swallowed_by_candidate_skipping() {
+    for standby_producer in [false, true] {
+        for (label, extra, input, expected) in [
+            (
+                "bad-text-after-trigger",
+                json!({}),
+                json!([{"type":"compaction_trigger"},
+                    {"role":"user","content":[{"type":"input_text","text":null}]}]),
+                "invalid request: Responses-via-Chat text content must contain text",
+            ),
+            (
+                "incomplete-native-continuation",
+                json!({"previous_response_id":"native-response-without-history"}),
+                json!([{"role":"user","content":"Earlier history."},{"type":"compaction_trigger"}]),
+                "invalid request: Responses-via-Chat continuation requires the complete input history",
+            ),
+            (
+                "bad-checkpoint-after-trigger",
+                json!({}),
+                json!([{"type":"compaction_trigger"},
+                    {"type":"compaction","encrypted_content":"mtc-compact-v1.!"}]),
+                "invalid request: invalid gateway compaction checkpoint",
+            ),
+        ] {
+            let preferred = MockServer::start().await;
+            let standby = MockServer::start().await;
+            let fixture =
+                compaction_candidate_fixture(label, &preferred, &standby, false, standby_producer)
+                    .await;
+            let mut request = json!({"model":fixture.model,"stream":false,"input":input});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response =
+                send_official_codex_responses_request(&fixture, &request, "application/json").await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["code"], "invalid_request");
+            assert_eq!(body["error"]["message"], expected);
+            assert!(preferred.received_requests().await.unwrap().is_empty());
+            assert!(standby.received_requests().await.unwrap().is_empty());
+            assert_no_compaction_candidate_health_failure(&fixture).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatched_compaction_400_is_not_replayed_to_a_standby() {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":{
+            "code":"invalid_request_error","message":"provider-rejection-canary"}})))
+        .expect(1)
+        .mount(&preferred)
+        .await;
+    let fixture = compaction_candidate_fixture(
+        "compaction-dispatched-400",
+        &preferred,
+        &standby,
+        true,
+        true,
+    )
+    .await;
+    let response = send_official_codex_responses_request(
+        &fixture,
+        &json!({"model":fixture.model,"stream":false,"input":[
+            {"role":"user","content":"Summarize earlier history."},
+            {"type":"compaction_trigger"}
+        ]}),
+        "application/json",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
+    assert_eq!(preferred.received_requests().await.unwrap().len(), 1);
+    assert!(standby.received_requests().await.unwrap().is_empty());
+    preferred.verify().await;
+}
+
 #[test]
 fn native_kimi_headers_keep_one_bearer_and_preserve_sealed_device_identity() {
     let credential = UpstreamCredential::OAuth {
