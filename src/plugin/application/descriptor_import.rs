@@ -725,6 +725,7 @@ mod tests {
             previous_bundle_dir: None,
             previous_inventory_file: None,
             installation: InstallPluginOptions {
+                egress_proxy: None,
                 reference: String::new(),
                 plugin_root: directory.into(),
                 allowed_sources: Default::default(),

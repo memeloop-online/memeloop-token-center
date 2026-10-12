@@ -22,6 +22,8 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallPolicy {
+    #[serde(default)]
+    egress_proxy: Option<String>,
     plugin_root: PathBuf,
     allowed_sources: BTreeSet<String>,
     #[serde(default)]
@@ -132,6 +134,10 @@ impl ApplicationPlugins {
         }
         let policy: InstallPolicy =
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
+        if let Some(proxy) = &policy.egress_proxy {
+            crate::plugin_distribution::validate_install_egress_proxy(proxy)
+                .map_err(|_| AppError::Forbidden)?;
+        }
         if !policy.plugin_root.is_absolute()
             || policy.allowed_sources.is_empty()
             || !policy.signer_policy_valid()
@@ -374,6 +380,7 @@ impl ApplicationPlugins {
                     command.arg("--allowed-source").arg(source);
                 }
                 policy.apply_signer(reference, &mut command)?;
+                policy.apply_egress(&mut command)?;
                 if let Some(credentials) = policy.credentials_for(reference) {
                     credentials.apply(&mut command);
                 }
@@ -731,6 +738,14 @@ impl CredentialFiles {
 }
 
 impl InstallPolicy {
+    fn apply_egress(&self, command: &mut tokio::process::Command) -> Result<(), AppError> {
+        if let Some(proxy) = &self.egress_proxy {
+            crate::plugin_distribution::validate_install_egress_proxy(proxy)
+                .map_err(|_| AppError::Forbidden)?;
+            command.arg("--egress-proxy").arg(proxy);
+        }
+        Ok(())
+    }
     fn signer_policy_valid(&self) -> bool {
         if self.source_keyless.is_empty() {
             return self.cosign_public_keys.is_empty() != self.cosign_keyless.is_none()
@@ -830,6 +845,67 @@ fn log_installer_diagnostics(bytes: &[u8]) {
     for (stage, category, errno) in installer_diagnostics(bytes) {
         tracing::warn!(stage, category, errno, "plugin installer diagnostic");
     }
+    for (operation, stderr_class, exit_code) in cosign_diagnostics(bytes) {
+        tracing::warn!(
+            operation,
+            stderr_class,
+            exit_code,
+            "plugin cosign diagnostic"
+        );
+    }
+}
+
+fn cosign_diagnostics(bytes: &[u8]) -> Vec<(&'static str, &'static str, Option<i64>)> {
+    let mut diagnostics = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("mtc_plugin_install")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || value.get("stage").and_then(serde_json::Value::as_str) != Some("install")
+            || value.get("category").and_then(serde_json::Value::as_str) != Some("signature")
+        {
+            continue;
+        }
+        let operation = match value
+            .get("cosign_operation")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("version") => "version",
+            Some("verify") => "verify",
+            Some("other") => "other",
+            Some("workspace") => "workspace",
+            _ => continue,
+        };
+        let stderr_class = match value
+            .get("stderr_class")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("storage_full") => "storage_full",
+            Some("permission_denied") => "permission_denied",
+            Some("tls_authority") => "tls_authority",
+            Some("dns") => "dns",
+            Some("deadline") => "deadline",
+            Some("connection_refused") => "connection_refused",
+            Some("network_unreachable") => "network_unreachable",
+            Some("no_matching_signatures") => "no_matching_signatures",
+            Some("unclassified") => "unclassified",
+            Some("timeout") => "timeout",
+            Some("process_io") => "process_io",
+            Some("version_rejected") => "version_rejected",
+            Some("workspace_io") => "workspace_io",
+            _ => continue,
+        };
+        let exit_code = value
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|code| (0..=255).contains(code));
+        diagnostics.push((operation, stderr_class, exit_code));
+    }
+    diagnostics
 }
 
 fn installer_diagnostics(bytes: &[u8]) -> Vec<(&'static str, &'static str, Option<i64>)> {
@@ -1156,6 +1232,9 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
         keys.push(bytes);
     }
     let mut trust = json!({"sources":policy.allowed_sources,"keys":keys});
+    if let Some(proxy) = &policy.egress_proxy {
+        trust["egress_proxy"] = json!(proxy);
+    }
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.
     if let Some(identity) = &policy.cosign_keyless {
@@ -1242,6 +1321,51 @@ pub(super) async fn append_inventory_file(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn installation_proxy_is_explicit_and_review_bound() {
+        let mut value = source_signer_policy();
+        let legacy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        let original = trust_digest(&legacy).await.unwrap();
+        let mut command = tokio::process::Command::new("install-plugin-oci");
+        legacy.apply_egress(&mut command).unwrap();
+        assert_eq!(command.as_std().get_args().count(), 0);
+        value["egress_proxy"] = json!("socks5h://100.64.0.2:1080");
+        let policy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        policy.apply_egress(&mut command).unwrap();
+        assert_eq!(
+            command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["--egress-proxy", "socks5h://100.64.0.2:1080"]
+        );
+        assert_ne!(original, trust_digest(&policy).await.unwrap());
+        value["egress_proxy"] = json!("socks5h://secret:token@100.64.0.2:1080");
+        let rejected: InstallPolicy = serde_json::from_value(value).unwrap();
+        let mut command = tokio::process::Command::new("install-plugin-oci");
+        assert!(rejected.apply_egress(&mut command).is_err());
+        assert_eq!(command.as_std().get_args().count(), 0);
+        assert!(serde_json::from_value::<InstallPluginRequest>(json!({"inventory_id":"candidate","packages":[],"egress_proxy":"socks5h://100.64.0.2:1080"})).is_err());
+    }
+
+    #[test]
+    fn cosign_diagnostic_projection_rejects_untrusted_fields() {
+        let bytes = br#"secret raw stderr
+{"mtc_plugin_install":1,"stage":"install","category":"signature","cosign_operation":"verify","stderr_class":"tls_authority","exit_code":1,"message":"secret/path"}
+{"mtc_plugin_install":1,"stage":"install","category":"signature","cosign_operation":"secret","stderr_class":"tls_authority"}
+{"mtc_plugin_install":1,"stage":"install","category":"signature","cosign_operation":"verify","stderr_class":"secret/path"}
+{"mtc_plugin_install":1,"stage":"install","category":"signature","cosign_operation":"version","stderr_class":"process_io","exit_code":999999}
+"#;
+        assert_eq!(
+            super::cosign_diagnostics(bytes),
+            vec![
+                ("verify", "tls_authority", Some(1)),
+                ("version", "process_io", None)
+            ]
+        );
+    }
+
     #[test]
     fn installer_diagnostic_projection_never_forwards_untrusted_text() {
         let bytes = br#"raw secret/path/provider body
