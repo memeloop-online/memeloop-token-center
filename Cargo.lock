@@ -2579,6 +2579,7 @@ dependencies = [
  "wit-component 0.252.0",
  "wit-parser 0.252.0",
  "wreq",
+ "wreq-proto",
  "wreq-util",
  "zstd",
 ]
@@ -5676,8 +5677,6 @@ dependencies = [
 [[package]]
 name = "wreq-proto"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4d829f0427a5064829976fe790641ca21abb1d83d844812baf022dc0bdf2db"
 dependencies = [
  "bytes",
  "futures-channel",
