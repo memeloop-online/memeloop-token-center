@@ -1857,7 +1857,7 @@ mod tests {
         .unwrap();
         db.migrate().await.unwrap();
         let key = b"generic missing-group encryption fixture";
-        let mut initial = input(server.uri());
+        let mut initial = input("https://tokens.example.com/token".into());
         initial.transport_group = Some(crate::db::transport_proxy_management::OAuthGroupSnapshot {
             reference: crate::db::transport_proxy_management::OAuthGroupReference {
                 group_id: Uuid::now_v7(),
@@ -1873,6 +1873,36 @@ mod tests {
         initial.proxy_url = Some("socks5h://10.20.30.40:1080".into());
         initial.proxy_network_scope = Some(OutboundScope::Private);
         let started = start(&db, initial, key, 1000).await.unwrap();
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id,
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        login.input.adapter.poll_url = server.uri();
+        db.replace_oauth_login_poll_state(
+            reference.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.release_oauth_login_poll(reference.session_id, lease_owner, 1001)
+            .await
+            .unwrap();
         let state = Url::parse(&started.login_url)
             .unwrap()
             .query_pairs()
@@ -1889,7 +1919,7 @@ mod tests {
             Some("fixture-tenant"),
             None,
             key,
-            1001,
+            2002,
             true,
         )
         .await;
