@@ -599,7 +599,7 @@ async fn send_codex_attempt_once(
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
-            #[cfg(test)]
+            #[cfg(feature = "h2-attempt-binding")]
             http2_evidence.attach_binding(&mut request);
             client.execute(request).await
         }

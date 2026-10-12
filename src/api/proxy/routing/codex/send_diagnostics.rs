@@ -84,7 +84,7 @@ pub(super) struct TransportIdentity {
 }
 
 pub(super) struct Http2AttemptEvidence {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "h2-attempt-binding"))]
     binding: wreq_proto::ext::H2AttemptObserver,
     request_id: Uuid,
     upstream_account_id: Uuid,
@@ -107,7 +107,7 @@ impl Http2AttemptEvidence {
         body_consumption: BodyConsumption,
     ) -> Self {
         Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "h2-attempt-binding"))]
             binding: wreq_proto::ext::H2AttemptObserver::default(),
             request_id: context.request_id,
             upstream_account_id: route.account_id,
@@ -127,9 +127,34 @@ impl Http2AttemptEvidence {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "h2-attempt-binding"))]
     pub(super) fn attach_binding(&self, request: &mut wreq::Request) {
         request.extensions_mut().insert(self.binding.clone());
+    }
+
+    #[cfg(feature = "h2-attempt-binding")]
+    fn observe_binding(&self, stage: &'static str, status: Option<u16>) {
+        if let Some(binding) = self.binding.snapshot() {
+            tracing::info!(
+                request_id = %self.request_id,
+                upstream_account_id = %self.upstream_account_id,
+                credential_generation = self.credential_generation,
+                transport_revision = self.transport_revision,
+                candidate_rank = self.candidate_rank,
+                outbound_attempt = self.outbound_attempt,
+                connect_attempt = self.identity.connect_attempt,
+                stage, status,
+                h2_connection_id = binding.connection_id,
+                h2_stream_id = binding.stream_id,
+                h2_stream_ordinal = binding.stream_ordinal,
+                h2_connection_age_ms = binding.connection_age_ms,
+                h2_lifecycle = binding.lifecycle,
+                h2_terminal_age_ms = binding.terminal_age_ms,
+                lifecycle_scope = "local_connection_task_not_peer_close",
+                peer_delivery_state = "unknown",
+                "Optional H2 attempt binding"
+            );
+        }
     }
 
     pub(super) fn observe_error(
@@ -138,21 +163,15 @@ impl Http2AttemptEvidence {
         before_response_headers: bool,
     ) {
         if let Some(http2) = upstream_response::codex_http2_error(error) {
-            #[cfg(test)]
-            if let Some(binding) = self.binding.snapshot() {
-                tracing::info!(
-                    request_id = %self.request_id,
-                    outbound_attempt = self.outbound_attempt,
-                    h2_connection_id = binding.connection_id,
-                    h2_stream_id = binding.stream_id,
-                    h2_stream_ordinal = binding.stream_ordinal,
-                    h2_connection_age_ms = binding.connection_age_ms,
-                    h2_lifecycle = binding.lifecycle,
-                    h2_terminal_age_ms = binding.terminal_age_ms,
-                    peer_delivery_state = "unknown",
-                    "TEST-only H2 attempt binding"
-                );
-            }
+            #[cfg(feature = "h2-attempt-binding")]
+            self.observe_binding(
+                if before_response_headers {
+                    "codex_h2_binding_before_response_headers"
+                } else {
+                    "codex_h2_binding_response_body"
+                },
+                None,
+            );
             tracing::warn!(
                 request_id = %self.request_id,
                 upstream_account_id = %self.upstream_account_id,
@@ -189,6 +208,11 @@ impl Http2AttemptEvidence {
 
     pub(super) fn observe_response(self, response: wreq::Response) -> UpstreamResponse {
         use futures_util::StreamExt;
+        #[cfg(feature = "h2-attempt-binding")]
+        self.observe_binding(
+            "codex_h2_binding_response_admitted_not_full_success",
+            Some(response.status().as_u16()),
+        );
         UpstreamResponse::Prefetched {
             status: response.status(),
             headers: response.headers().clone(),

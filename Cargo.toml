@@ -29,6 +29,7 @@ harness = false
 [features]
 experimental-plugin-revisions = []
 default = []
+h2-attempt-binding = ["wreq-proto/h2-attempt-observer"]
 plugin-distribution = ["dep:oci-client"]
 
 [dependencies]

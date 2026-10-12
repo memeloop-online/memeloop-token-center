@@ -143,13 +143,19 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
                 .unwrap();
             evidence.body_consumption.attach(&mut request);
             assert!(evidence.binding.snapshot().is_none());
-            evidence.attach_binding(&mut request);
+            if cfg!(feature = "h2-attempt-binding") {
+                evidence.attach_binding(&mut request);
+            }
             let result = client.execute(request).await;
-            let binding = evidence.binding.snapshot().unwrap();
-            assert_ne!(binding.connection_id, 0);
-            assert_eq!(binding.stream_id, 1);
-            assert_eq!(binding.stream_ordinal, 1);
-            assert!(!format!("{binding:?}").contains("CANARY"));
+            if cfg!(feature = "h2-attempt-binding") {
+                let binding = evidence.binding.snapshot().unwrap();
+                assert_ne!(binding.connection_id, 0);
+                assert_eq!(binding.stream_id, 1);
+                assert_eq!(binding.stream_ordinal, 1);
+                assert!(!format!("{binding:?}").contains("CANARY"));
+            } else {
+                assert!(evidence.binding.snapshot().is_none());
+            }
             if before_headers {
                 let error = result.expect_err("peer reset must precede headers");
                 evidence.observe_error(&error, true);
@@ -211,13 +217,50 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
         let bindings: Vec<_> = events
             .iter()
             .map(|event| &event["fields"])
-            .filter(|fields| fields["message"] == "TEST-only H2 attempt binding")
+            .filter(|fields| fields["message"] == "Optional H2 attempt binding")
             .collect();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0]["request_id"], expected_request.to_string());
-        assert_eq!(bindings[0]["h2_stream_id"], 1);
-        assert_eq!(bindings[0]["h2_stream_ordinal"], 1);
-        assert_eq!(bindings[0]["peer_delivery_state"], "unknown");
+        assert_eq!(
+            bindings.len(),
+            if cfg!(feature = "h2-attempt-binding") {
+                if before_headers { 1 } else { 2 }
+            } else {
+                0
+            }
+        );
+        for binding in &bindings {
+            assert_eq!(binding["request_id"], expected_request.to_string());
+            assert_eq!(binding["upstream_account_id"], expected_account.to_string());
+            assert_eq!(binding["credential_generation"], 13);
+            assert_eq!(binding["transport_revision"], 42);
+            assert_eq!(binding["candidate_rank"], 2);
+            assert_eq!(binding["outbound_attempt"], 1);
+            assert_eq!(binding["connect_attempt"], 2);
+            assert!(binding["h2_connection_id"].as_u64().unwrap() > 0);
+            assert_eq!(binding["h2_connection_id"], bindings[0]["h2_connection_id"]);
+            assert_eq!(binding["h2_stream_id"], 1);
+            assert_eq!(binding["h2_stream_ordinal"], 1);
+            assert_eq!(binding["peer_delivery_state"], "unknown");
+            assert!(binding["h2_lifecycle"].as_u64().unwrap() <= 3);
+            assert!(binding["h2_connection_age_ms"].as_u64().is_some());
+            assert_eq!(
+                binding["lifecycle_scope"],
+                "local_connection_task_not_peer_close"
+            );
+        }
+        if cfg!(feature = "h2-attempt-binding") {
+            assert_eq!(
+                bindings[0]["stage"],
+                if before_headers {
+                    "codex_h2_binding_before_response_headers"
+                } else {
+                    "codex_h2_binding_response_admitted_not_full_success"
+                }
+            );
+            if !before_headers {
+                assert_eq!(bindings[0]["status"], 200);
+                assert_eq!(bindings[1]["stage"], "codex_h2_binding_response_body");
+            }
+        }
         let fields: Vec<_> = events
             .iter()
             .map(|event| &event["fields"])

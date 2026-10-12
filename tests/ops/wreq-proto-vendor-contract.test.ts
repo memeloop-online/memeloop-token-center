@@ -69,6 +69,12 @@ test('wreq-proto source is authenticated upstream plus only reviewed binding pat
     const production = cargo.split('[dev-dependencies]')[0];
     assert(production !== undefined);
     assert(!production.includes('features = ["h2-attempt-observer"]'));
+    assert(production.includes('default = []'));
+    assert(production.includes('h2-attempt-binding = ["wreq-proto/h2-attempt-observer"]'));
+    const diagnostics = readFileSync(resolve(repository, 'src/api/proxy/routing/codex/send_diagnostics.rs'), 'utf8');
+    assert(diagnostics.includes('#[cfg(feature = "h2-attempt-binding")]\n    fn observe_binding'));
+    const sender = readFileSync(resolve(repository, 'src/api/proxy/routing/codex.rs'), 'utf8');
+    assert(sender.includes('#[cfg(feature = "h2-attempt-binding")]\n            http2_evidence.attach_binding'));
     const lock = readFileSync(resolve(repository, 'Cargo.lock'), 'utf8');
     const remainder = lock.split('name = "wreq-proto"')[1];
     assert(remainder !== undefined);
