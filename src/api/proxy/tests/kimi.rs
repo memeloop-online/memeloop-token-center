@@ -1436,10 +1436,10 @@ async fn malformed_compaction_requests_are_not_swallowed_by_candidate_skipping()
                 "invalid request: Responses-via-Chat text content must contain text",
             ),
             (
-                "bad-stream-options",
-                json!({"stream":true,"stream_options":7}),
+                "incomplete-native-continuation",
+                json!({"previous_response_id":"native-response-without-history"}),
                 json!([{"role":"user","content":"Earlier history."},{"type":"compaction_trigger"}]),
-                "invalid request: stream_options must be an object",
+                "invalid request: Responses-via-Chat continuation requires the complete input history",
             ),
             (
                 "bad-checkpoint-after-trigger",
