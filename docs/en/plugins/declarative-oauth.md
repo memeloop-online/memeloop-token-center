@@ -57,6 +57,21 @@ Public defaults have no `client_secret` field. A confidential client's secret
 continues to belong only in the existing encrypted operator/session path.
 The global-operator requirement on the generic start API is unchanged.
 
+An operator with `providers:write` may pass `transport_proxy_group` to the start
+API for a new account: `{ "group_id": "<existing tenant group UUID>",
+"expected_group_version": 1, "initial_member_id": "<existing member UUID>" }`.
+This host-owned reference cannot be combined with an individual proxy or declared
+by a plugin. Token exchange and identity reads use that member. The encrypted
+session freezes tenant, group version and member; completion installs the binding
+inside the account transaction, rejecting changed groups without creating an
+unbound account. Reauthorization inherits the account's group and snapshots its
+binding and account revisions. Refresh, Messages and health/catalog requests use
+the existing managed selection. Messages uses the existing sticky selection and
+only advances on a connection failure before delivery, within one absolute
+deadline; accepted or ambiguous POSTs are never replayed. Token exchange and
+refresh retain their durable send fences and do not retry dispatched grants.
+No existing account or route is automatically replaced or rebound.
+
 Identity and Messages headers use a closed, typed protocol contract: only
 `anthropic_version` and a bounded array of `anthropic_beta` feature tokens are
 accepted. Tokens are 1–128 ASCII letters/digits/dot/underscore/hyphen; at most 16

@@ -189,7 +189,10 @@ impl Database {
             .fetch_optional(&mut **tx)
             .await?
             .ok_or(AppError::NotFound)?;
-        if row.try_get::<String, _>("driver")? != crate::oauth::codex_device::PROVIDER_DRIVER
+        let current_credential =
+            open_credential(&row.try_get::<String, _>("credential_ciphertext")?, key)?;
+        if (row.try_get::<String, _>("driver")? != crate::oauth::codex_device::PROVIDER_DRIVER
+            && !crate::oauth::authorization_code::supports_managed_transport(&current_credential))
             || row.try_get::<String, _>("auth_kind")? != "oauth"
         {
             return Err(invalid());
@@ -233,8 +236,7 @@ impl Database {
                     .bind(next_generation).bind(format!("transport-proxy-fence-{}", Uuid::now_v7())).bind(id.to_string()).bind(generation).execute(&mut **tx).await?;
             }
         }
-        let credential = open_credential(&row.try_get::<String, _>("credential_ciphertext")?, key)?
-            .with_transport_proxy(proxy.to_owned())?;
+        let credential = current_credential.with_transport_proxy(proxy.to_owned())?;
         let ciphertext = seal_credential(&credential, key)?;
         let mut config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
             .map_err(|_| AppError::Internal)?;

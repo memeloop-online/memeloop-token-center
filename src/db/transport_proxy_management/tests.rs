@@ -415,6 +415,7 @@ async fn sqlite_management_transaction_and_tombstone_contract() {
     .unwrap();
     database.migrate().await.unwrap();
     contract(&database).await;
+    generic_oauth_group_contract(&database).await;
     database.migrate().await.unwrap();
 }
 
@@ -426,4 +427,241 @@ async fn postgres_management_transaction_and_tombstone_contract() {
     let database = Database::connect(&url).await.unwrap();
     database.migrate().await.unwrap();
     contract(&database).await;
+    generic_oauth_group_contract(&database).await;
+}
+
+async fn generic_oauth_group_contract(database: &Database) {
+    let external = format!("generic-proxy-{}", Uuid::now_v7());
+    let account_input = |name: &str| CreateUpstreamAccountInput {
+        tenant_external_id: external.clone(),
+        name: name.into(),
+        driver: "fixture-generic-oauth".into(),
+        config: serde_json::json!({"base_url":"https://api.example.com"}),
+        credential: UpstreamCredential::OAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: Some("fixture-refresh".into()),
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(serde_json::json!({"authorization_code": {
+                "client_id":"fixture-client", "client_secret":null,
+                "refresh_url":"https://api.example.com/token", "network_scope":"public"
+            }})),
+            proxy_url: Some(PRIMARY.into()),
+            proxy_network_scope: Some(crate::network::OutboundScope::Private),
+        },
+        oauth_session_id: None,
+        oauth_driver: Some(crate::oauth::authorization_code::FLOW.into()),
+        oauth_refresh_url: Some("https://api.example.com/token".into()),
+    };
+    let source = database
+        .create_upstream_account(account_input("source"), KEY)
+        .await
+        .unwrap();
+    let group = database
+        .create_transport_group(
+            CreateGroup {
+                tenant_external_id: external.clone(),
+                name: "generic-egress".into(),
+                members: vec![input("primary", PRIMARY), input("backup", BACKUP)],
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    let group_id: Uuid = serde_json::from_value(group["id"].clone()).unwrap();
+    let primary: Uuid = serde_json::from_value(group["members"][0]["id"].clone()).unwrap();
+    let backup: Uuid = serde_json::from_value(group["members"][1]["id"].clone()).unwrap();
+    let reference = OAuthGroupReference {
+        group_id,
+        expected_group_version: 1,
+        initial_member_id: primary,
+    };
+    assert!(
+        database
+            .snapshot_oauth_transport_group(reference.clone(), "other-tenant", None, KEY)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .snapshot_oauth_transport_group(
+                OAuthGroupReference {
+                    expected_group_version: 2,
+                    ..reference.clone()
+                },
+                &external,
+                None,
+                KEY
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .snapshot_oauth_transport_group(
+                OAuthGroupReference {
+                    initial_member_id: Uuid::now_v7(),
+                    ..reference.clone()
+                },
+                &external,
+                None,
+                KEY
+            )
+            .await
+            .is_err()
+    );
+    let snapshot = database
+        .snapshot_oauth_transport_group(reference.clone(), &external, None, KEY)
+        .await
+        .unwrap();
+    let mut wrong_proxy = account_input("wrong-proxy");
+    wrong_proxy.credential = wrong_proxy
+        .credential
+        .with_transport_proxy(BACKUP.into())
+        .unwrap();
+    assert!(
+        database
+            .create_upstream_account_with_transport(wrong_proxy, Some(&snapshot), KEY)
+            .await
+            .is_err()
+    );
+    let created = database
+        .create_upstream_account_with_transport(account_input("login"), Some(&snapshot), KEY)
+        .await
+        .unwrap();
+    let binding = database
+        .get_transport_binding(created.id, &external)
+        .await
+        .unwrap();
+    assert_eq!(binding["group_id"], group["id"]);
+    assert_eq!(binding["binding_version"], 1);
+    assert_eq!(created.credential_generation, 1);
+    let groups = TransportProxyGroups::parse("[]", KEY).unwrap();
+    groups
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let (account, credential) = database
+        .upstream_account_with_credential(created.id, KEY)
+        .await
+        .unwrap();
+    let selected = groups
+        .select_config(
+            account.id,
+            account.credential_generation,
+            &credential,
+            &account.config,
+        )
+        .unwrap();
+    selected.advance_after_connect_failure(&[0]).unwrap();
+    let selected = groups
+        .select_config(
+            account.id,
+            account.credential_generation,
+            &credential,
+            &account.config,
+        )
+        .unwrap();
+    assert_eq!(selected.credential.proxy().unwrap().0, BACKUP);
+    assert_eq!(credential.proxy().unwrap().0, PRIMARY);
+    let stamp: BindingStamp = serde_json::from_value(account.config[CONFIG_KEY].clone()).unwrap();
+    let reauth = database
+        .snapshot_oauth_transport_group(
+            reference.clone(),
+            &external,
+            Some((created.id, stamp)),
+            KEY,
+        )
+        .await
+        .unwrap();
+    database
+        .bind_transport_group(
+            source.id,
+            BindGroup {
+                tenant_external_id: external.clone(),
+                group_id,
+                expected_group_version: 1,
+                initial_member_id: primary,
+                expected_binding_version: 0,
+                expected_credential_generation: source.credential_generation,
+                expected_updated_at: source.updated_at,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    database
+        .validate_oauth_transport_group(&reauth, KEY)
+        .await
+        .unwrap();
+    database
+        .unbind_transport_group(
+            account.id,
+            UnbindGroup {
+                tenant_external_id: external.clone(),
+                expected_group_version: 1,
+                expected_binding_version: 1,
+                expected_credential_generation: account.credential_generation,
+                expected_updated_at: account.updated_at,
+                single_proxy_member_id: backup,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(
+        database
+            .validate_oauth_transport_group(&reauth, KEY)
+            .await
+            .is_err()
+    );
+    database
+        .update_transport_group(
+            group_id,
+            UpdateGroup {
+                tenant_external_id: external.clone(),
+                expected_version: 1,
+                name: "generic-egress".into(),
+                members: vec![
+                    MemberInput {
+                        id: Some(primary),
+                        label: "primary".into(),
+                        proxy_url: None,
+                    },
+                    MemberInput {
+                        id: Some(backup),
+                        label: "backup".into(),
+                        proxy_url: None,
+                    },
+                ],
+                replacement_member_id: None,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(
+        database
+            .validate_oauth_transport_group(&snapshot, KEY)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .create_upstream_account_with_transport(
+                account_input("stale-login"),
+                Some(&snapshot),
+                KEY
+            )
+            .await
+            .is_err()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = $1 AND a.name IN ('wrong-proxy', 'stale-login')")
+        .bind(external).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(count, 0);
 }

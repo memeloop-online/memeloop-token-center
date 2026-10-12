@@ -83,7 +83,7 @@ mod session_projection;
 mod tenants;
 mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
-pub(crate) use transport_proxy_groups::TransportProxyGroups;
+pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 mod upstream_quota_reset;
