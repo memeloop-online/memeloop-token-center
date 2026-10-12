@@ -75,6 +75,15 @@ test('wreq-proto source is authenticated upstream plus only reviewed binding pat
     assert(diagnostics.includes('#[cfg(feature = "h2-attempt-binding")]\n    fn observe_binding'));
     const sender = readFileSync(resolve(repository, 'src/api/proxy/routing/codex.rs'), 'utf8');
     assert(sender.includes('#[cfg(feature = "h2-attempt-binding")]\n            http2_evidence.attach_binding'));
+    assert(sender.includes('state.config.h2_attempt_binding_enabled'));
+    assert(diagnostics.includes('binding: Option<wreq_proto::ext::H2AttemptObserver>'));
+    assert(diagnostics.includes('cfg!(feature = "h2-attempt-binding") && binding_enabled'));
+    const config = readFileSync(resolve(repository, 'src/config.rs'), 'utf8');
+    assert(config.includes('#[serde(default)]\n    pub h2_attempt_binding_enabled: bool'));
+    assert(config.includes('env_bool("MTC_H2_ATTEMPT_BINDING_ENABLED", false)'));
+    assert(config.includes('h2_attempt_binding_enabled: false'));
+    const docker = readFileSync(resolve(repository, 'Dockerfile'), 'utf8');
+    assert.equal((docker.match(/--features experimental-plugin-revisions,plugin-distribution,h2-attempt-binding/g) ?? []).length, 2);
     const lock = readFileSync(resolve(repository, 'Cargo.lock'), 'utf8');
     const remainder = lock.split('name = "wreq-proto"')[1];
     assert(remainder !== undefined);

@@ -594,6 +594,7 @@ async fn send_codex_attempt_once(
         context,
         matches!(egress_path, CodexEgressPath::AccountProxy),
         body_consumption.clone(),
+        state.config.h2_attempt_binding_enabled,
     );
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {

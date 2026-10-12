@@ -85,7 +85,7 @@ pub(super) struct TransportIdentity {
 
 pub(super) struct Http2AttemptEvidence {
     #[cfg(any(test, feature = "h2-attempt-binding"))]
-    binding: wreq_proto::ext::H2AttemptObserver,
+    binding: Option<wreq_proto::ext::H2AttemptObserver>,
     request_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
@@ -105,10 +105,14 @@ impl Http2AttemptEvidence {
         context: CodexAttemptContext,
         account_proxy: bool,
         body_consumption: BodyConsumption,
+        binding_enabled: bool,
     ) -> Self {
+        #[cfg(not(any(test, feature = "h2-attempt-binding")))]
+        let _ = binding_enabled;
         Self {
             #[cfg(any(test, feature = "h2-attempt-binding"))]
-            binding: wreq_proto::ext::H2AttemptObserver::default(),
+            binding: (cfg!(feature = "h2-attempt-binding") && binding_enabled)
+                .then(wreq_proto::ext::H2AttemptObserver::default),
             request_id: context.request_id,
             upstream_account_id: route.account_id,
             credential_generation: route.credential_generation,
@@ -129,12 +133,18 @@ impl Http2AttemptEvidence {
 
     #[cfg(any(test, feature = "h2-attempt-binding"))]
     pub(super) fn attach_binding(&self, request: &mut wreq::Request) {
-        request.extensions_mut().insert(self.binding.clone());
+        if let Some(binding) = &self.binding {
+            request.extensions_mut().insert(binding.clone());
+        }
     }
 
     #[cfg(feature = "h2-attempt-binding")]
     fn observe_binding(&self, stage: &'static str, status: Option<u16>) {
-        if let Some(binding) = self.binding.snapshot() {
+        if let Some(binding) = self
+            .binding
+            .as_ref()
+            .and_then(|observer| observer.snapshot())
+        {
             tracing::info!(
                 request_id = %self.request_id,
                 upstream_account_id = %self.upstream_account_id,
