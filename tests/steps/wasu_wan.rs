@@ -1,5 +1,58 @@
 use super::*;
 
+#[then("the Wasu Wan missing usage fails once without charging or probing assets")]
+async fn wan_missing_usage_fails_once(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.unwrap();
+    for _ in 0..80 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if value["status"] == "failed" {
+            assert_eq!(value["error_code"], "wasu_wan_invalid_usage");
+            assert_eq!(value["cost"], "0");
+            assert!(value["assets"].as_array().unwrap().is_empty());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let requests = world
+                .mock
+                .as_ref()
+                .unwrap()
+                .received_requests()
+                .await
+                .unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.url.path() == "/api/v1/tasks/wan-task-1")
+                    .count(),
+                1
+            );
+            assert!(
+                world
+                    .asset_mock
+                    .as_ref()
+                    .unwrap()
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("Wan missing usage did not terminal-fail");
+}
+
 fn wan_input() -> Value {
     json!({
         "input": {"prompt": "a cat running on grass", "media": [
@@ -14,6 +67,15 @@ fn wan_input() -> Value {
 
 #[given("the mock Wasu Wan upstream completes a reference image video")]
 async fn mock_wan(world: &mut TokenCenterWorld) {
+    mock_wan_result(world, true).await;
+}
+
+#[given("the mock Wasu Wan upstream succeeds without usage")]
+async fn mock_wan_missing_usage(world: &mut TokenCenterWorld) {
+    mock_wan_result(world, false).await;
+}
+
+async fn mock_wan_result(world: &mut TokenCenterWorld, usage_present: bool) {
     let assets = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/wan.mp4"))
@@ -25,7 +87,7 @@ async fn mock_wan(world: &mut TokenCenterWorld) {
                 .set_body_bytes(b"w"),
         )
         .with_priority(1)
-        .expect(1)
+        .expect(if usage_present { 1 } else { 0 })
         .mount(&assets)
         .await;
     Mock::given(method("GET"))
@@ -36,7 +98,7 @@ async fn mock_wan(world: &mut TokenCenterWorld) {
                 .set_body_bytes(b"wan-video"),
         )
         .with_priority(10)
-        .expect(1)
+        .expect(if usage_present { 1 } else { 0 })
         .mount(&assets)
         .await;
     let server = world.mock.as_ref().unwrap();
@@ -55,14 +117,17 @@ async fn mock_wan(world: &mut TokenCenterWorld) {
         .expect(1)
         .mount(server)
         .await;
+    let mut result = json!({
+        "output": {"task_id": "wan-task-1", "task_status": "SUCCEEDED",
+            "video_url": format!("{}/wan.mp4?signature=private-wan-signature", assets.uri())}
+    });
+    if usage_present {
+        result["usage"] = json!({"video_count": 1, "duration": 5, "output_video_duration": 5});
+    }
     Mock::given(method("GET"))
         .and(path("/api/v1/tasks/wan-task-1"))
         .and(header("authorization", "Bearer wasu-wan-secret"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "output": {"task_id": "wan-task-1", "task_status": "SUCCEEDED",
-                "video_url": format!("{}/wan.mp4?signature=private-wan-signature", assets.uri())},
-            "usage": {"video_count": 1, "duration": 5, "output_video_duration": 5}
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(result))
         .mount(server)
         .await;
     world.asset_mock = Some(assets);

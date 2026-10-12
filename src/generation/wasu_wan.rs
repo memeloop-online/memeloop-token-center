@@ -201,13 +201,17 @@ pub(super) async fn poll(
             terminal_failure(state, worker_id, job, "wasu_wan_generation_failed").await
         }
         Some("SUCCEEDED") => {
-            let billed_units = billed_seconds(&body, job.estimated_units)?;
-            let video_url = output
-                .get("video_url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    AppError::Upstream("Wasu Wan succeeded response has no video asset".into())
-                })?;
+            let billed_units = match billed_seconds(&body, job.estimated_units) {
+                Ok(units) => units,
+                Err(_) => {
+                    attempt.invalid_response();
+                    return terminal_failure(state, worker_id, job, "wasu_wan_invalid_usage").await;
+                }
+            };
+            let Some(video_url) = output.get("video_url").and_then(Value::as_str) else {
+                attempt.invalid_response();
+                return terminal_failure(state, worker_id, job, "wasu_wan_missing_asset").await;
+            };
             attempt.envelope_valid();
             if ensure_asset_origin(route, video_url).is_err() {
                 attempt.invalid_response();
