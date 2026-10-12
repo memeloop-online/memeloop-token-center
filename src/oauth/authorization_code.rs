@@ -813,12 +813,12 @@ pub async fn complete(
             "OAuth transport group binding changed".into(),
         ));
     }
-    if let Some(snapshot) = &login.input.transport_group {
-        if let Err(error) = db.validate_oauth_transport_group(snapshot, key).await {
-            db.release_oauth_login_poll(session.session_id, lease_owner, now)
-                .await?;
-            return Err(error);
-        }
+    if let Some(snapshot) = &login.input.transport_group
+        && let Err(error) = db.validate_oauth_transport_group(snapshot, key).await
+    {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(error);
     }
     // Empty callbacks are explicit status/finalization checks from the UI.
     // They may claim a Ready result, but may never arm, exchange or fail a code.
