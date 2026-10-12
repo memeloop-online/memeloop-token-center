@@ -228,7 +228,7 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   await journey.code.waitFor({ state: 'detached' });
   const savedAccount = journey.page.locator(`[data-upstream-id="${journey.account.id}"]`);
   const accountWorkspace = journey.page.locator(`[id="provider-details-${journey.account.id}"]`);
-  await journey.page.locator('.create-journey').waitFor({ state: 'detached' });
+  await journey.page.locator('.create-journey[data-open="false"]').waitFor({ state: 'attached' });
   await journey.workspace.getByRole('region', { includeHidden: true }).waitFor({ state: 'hidden' });
   await accountWorkspace.getByRole('heading', { name: journey.account.name, exact: true }).waitFor();
   assert.equal(await accountWorkspace.getAttribute('aria-label'), `${journey.account.name} · Manage account`);
@@ -238,7 +238,8 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   const success = journey.page.getByText(`Saved upstream connection ${journey.account.name}.`, { exact: true });
   await success.waitFor();
   assert.equal(await success.count(), 1);
-  assert.equal(await journey.page.locator('.create-journey').count(), 0, 'the list-level add entry is not rendered while the created account workspace is shown');
+  assert.equal(await journey.page.locator('.create-journey').getAttribute('data-open'), 'false');
+  assert.equal(await journey.page.locator('.create-journey [data-workspace-toggle]').isHidden(), true, 'the list-level add entry is not rendered while the created account workspace is shown');
   assert.equal(journey.reads(), reads + 1);
   await journey.page.clock.runFor(60_000);
   assert.equal((await journey.calls()).length, 2);

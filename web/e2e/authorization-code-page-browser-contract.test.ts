@@ -68,7 +68,8 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     await page.getByRole('button', { name: '检查账号列表', exact: true }).click();
     await readFailure.waitFor({ state: 'detached' });
     await page.getByText('已保存上游连接 Fixture OAuth。', { exact: true }).waitFor();
-    assert.equal(await page.locator('.create-journey').count(), 0, 'the list-level add entry is not rendered while the saved account workspace is shown');
+    assert.equal(await page.locator('.create-journey').getAttribute('data-open'), 'false');
+    assert.equal(await page.locator('.create-journey [data-workspace-toggle]').isHidden(), true, 'the list-level add entry is not rendered while the saved account workspace is shown');
     await page.locator('#provider-details-saved-fixture-account').waitFor();
     await catalogRead;
     await page.locator('#provider-details-saved-fixture-account .provider-model-catalog[aria-busy="false"]').waitFor();

@@ -652,12 +652,12 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
       })}</div>
     </article>
     {detailAccount && renderAccountDetails(detailAccount)}
-    {!detailAccount && (rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
+    {rotating && rotateProvider ? <UpstreamCredentialRotation key={`${token}\0${tenant}\0${writeTenant}\0${rotating.id}`} account={rotating} provider={rotateProvider} token={token} allowed={canManage(rotating)} onBack={() => returnFromRotation()} onSaved={updated => {
       if (!ownsWorkspace()) return;
       returnFromRotation(updated); setProviderEditDraft(undefined); setMessage(upstreamRotationCopy(locale).saved);
       const returnedGeneration = workspaceGeneration.current;
       void onChanged(true).catch(reason => { if (!(reason instanceof AccountListRefreshError) && providerMounted.current && providerScope.current === renderScope && workspaceGeneration.current === returnedGeneration) setMessage(upstreamRotationCopy(locale).reloadFailed); });
-    }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale, reauthorizing.driver).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } if (!open && editing) { void leaveProviderSettings(() => { returnToAccount(editing, 'inline-edit'); }); return; } if (open) { returnFocus.current = undefined; navigateWorkspace({ kind: 'create' }); } else returnToAccountList(); }}>
+    }} /> : <CreateJourney className={editing ? 'provider-edit-workspace' : reauthorizing ? 'provider-reauthorization-workspace' : ''} title={editing ? t('providers.editFor', { name: editing.name }) : reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')} description={reauthorizing ? authorizationJourneyCopy(locale, reauthorizing.driver).purpose : t('providers.description')} open={providerWorkspaceActive} busy={Boolean(busy) || proxyEditorOpen} showTrigger={!detailAccount} onOpenChange={(open) => { if (proxyEditorOpen) return; if (!open && reauthorizing) { returnFromReauthorization(); return; } if (!open && editing) { void leaveProviderSettings(() => { returnToAccount(editing, 'inline-edit'); }); return; } if (open) { returnFocus.current = undefined; navigateWorkspace({ kind: 'create' }); } else returnToAccountList(); }}>
       {editing && message && <div className="notice success" role="status">{message}</div>}
       {error && providerWorkspaceActive && <div className="notice error" role="alert">{error}</div>}
       {editing && <ProviderModelCatalog key={`catalog-edit-${editing.id}-${editing.credential_generation}`} accountId={editing.id} tenant={editing.tenant_external_id ?? writeTenant} token={token} disabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(editing, action)} routeActionDisabled={!editProvider || editing.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[editing.id] ?? 0} />}
@@ -678,7 +678,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         openAccount(account);
         setMessage(t('providers.created', { name: account.name }));
       }} />}</>}
-    </CreateJourney>)}
+    </CreateJourney>}
   </section></TransportProxyGroups>;
 }
 
