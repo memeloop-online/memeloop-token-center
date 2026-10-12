@@ -435,7 +435,11 @@ mod tests {
             for (phase, expected_phase) in [
                 (DatabaseReadinessPhase::Acquire, "acquire"),
                 (DatabaseReadinessPhase::Query, "query"),
-            ] {
+            ]
+            .into_iter()
+            .filter(|(phase, _)| {
+                stage == DatabaseReadinessStage::Ping || *phase == DatabaseReadinessPhase::Query
+            }) {
                 let mut progress = DatabaseReadinessProgress::new();
                 progress.stalled_at = Some((stage, phase));
                 let progress = std::sync::Arc::new(progress);
@@ -468,6 +472,10 @@ mod tests {
                     readiness_contract(crate::metrics::DatabaseReadiness::Unavailable, true);
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(body["checks"]["database"], "failed");
+                tokio::time::timeout(Duration::from_secs(5), database.readiness_check_detailed())
+                    .await
+                    .expect("each cancelled check releases its connection")
+                    .unwrap();
             }
         }
         let progress = DatabaseReadinessProgress::new();

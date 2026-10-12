@@ -3,7 +3,7 @@
 //! PostgreSQL workers claim rows with `FOR UPDATE SKIP LOCKED`. SQLite uses WAL
 //! plus `BEGIN IMMEDIATE` and remains a lightweight test/development backend.
 
-use sqlx::{Any, Row, Transaction, any::AnyRow};
+use sqlx::{Any, AnyConnection, Row, Transaction, any::AnyRow};
 use uuid::Uuid;
 
 use crate::archive_staging::{
@@ -19,7 +19,8 @@ use crate::archive_staging::{
 use crate::model::GenerationStagedAssets;
 
 use super::{
-    AppError, Database, DatabaseBackend, DatabaseReadinessProgress, DatabaseReadinessStage,
+    AppError, Database, DatabaseBackend, DatabaseReadinessPhase, DatabaseReadinessProgress,
+    DatabaseReadinessStage,
 };
 
 impl Database {
@@ -501,12 +502,16 @@ impl Database {
 
     pub(crate) async fn archive_staging_readiness_check(
         &self,
+        connection: &mut AnyConnection,
         progress: &DatabaseReadinessProgress,
     ) -> Result<(), sqlx::Error> {
         let migration: Option<i64> = {
-            let mut connection = self
-                .acquire_readiness_connection(progress, DatabaseReadinessStage::ArchiveMarker)
-                .await?;
+            progress
+                .enter(
+                    DatabaseReadinessStage::ArchiveMarker,
+                    DatabaseReadinessPhase::Query,
+                )
+                .await;
             sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = 35")
                 .fetch_optional(&mut *connection)
                 .await?
@@ -516,9 +521,12 @@ impl Database {
                 "archive staging schema migration v35 is not applied".into(),
             ));
         }
-        let mut connection = self
-            .acquire_readiness_connection(progress, DatabaseReadinessStage::ArchiveShape)
-            .await?;
+        progress
+            .enter(
+                DatabaseReadinessStage::ArchiveShape,
+                DatabaseReadinessPhase::Query,
+            )
+            .await;
         sqlx::query(
             "SELECT attempt_id, owner_kind, purpose, state, lease_token, next_cleanup_at FROM archive_staging_attempts LIMIT 0",
         )
