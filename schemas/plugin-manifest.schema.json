@@ -260,6 +260,11 @@
                     "default": false,
                     "description": "Explicitly identifies a provider adapter that translates OpenAI Responses through Chat Completions."
                   },
+                  "responses_via_anthropic_messages_v1": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Explicitly selects the host's versioned Responses-via-Anthropic Messages transport. Runtime still requires third_party and openai/anthropic protocols and rejects simultaneous Chat translation."
+                  },
                   "responses_via_chat_dialect": {
                     "type": "string",
                     "enum": ["openai_chat_v1", "kimi_v1"],

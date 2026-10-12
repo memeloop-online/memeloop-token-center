@@ -1,0 +1,115 @@
+{
+  "id": "claude-code-wire",
+  "version": "1.1.0",
+  "wit_version": "0.3.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [],
+  "contributions": {
+    "providers": [
+      {
+        "id": "claude-code-subscription",
+        "display_name": "Claude Code subscription (community)",
+        "protocols": ["anthropic", "openai"],
+        "modalities": ["text", "image"],
+        "config_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["base_url", "network_scope"],
+          "properties": {
+            "base_url": {"const": "https://api.anthropic.com", "default": "https://api.anthropic.com", "readOnly": true},
+            "network_scope": {"const": "public", "default": "public", "readOnly": true}
+          }
+        },
+        "credential_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "access_token", "expires_at"],
+          "properties": {
+            "type": {"const": "oauth"},
+            "access_token": {"type": "string", "minLength": 1, "writeOnly": true},
+            "refresh_token": {"type": ["string", "null"], "writeOnly": true},
+            "expires_at": {"type": "integer", "description": "Unix milliseconds"},
+            "header": {"const": "authorization"},
+            "prefix": {"const": "Bearer "},
+            "proxy_url": {"type": "string", "pattern": "^socks5h://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
+            "proxy_network_scope": {"const": "private"},
+            "adapter_state": {"type": "object", "writeOnly": true}
+          }
+        },
+        "oauth_adapter": {
+          "api_version": "oauth-adapter-v1",
+          "flow_kind": "authorization_code_pkce",
+          "login_url": "https://claude.com/cai/oauth/authorize?code=true",
+          "poll_url": "https://platform.claude.com/v1/oauth/token",
+          "refresh_url": "https://platform.claude.com/v1/oauth/token",
+          "response_mode": "fragment_manual",
+          "authorization_code": {
+            "token_encoding": "json",
+            "include_state": true,
+            "client_default": {
+              "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+              "redirect_uri": "https://platform.claude.com/oauth/code/callback",
+              "scopes": ["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload"]
+            }
+          },
+          "identity": {
+            "url": "https://api.anthropic.com/api/oauth/profile",
+            "id_pointer": "/account/uuid",
+            "headers": {"anthropic_beta": ["oauth-2025-04-20"]}
+          }
+        },
+        "request_compatibility": {
+          "third_party": true,
+          "responses_via_anthropic_messages_v1": true,
+          "codex_multi_agent_v2": true,
+          "anthropic_messages_headers": {
+            "anthropic_version": "2023-06-01",
+            "anthropic_beta": ["oauth-2025-04-20"]
+          }
+        },
+        "codex_model_capabilities": {
+          "version": "codex-model-capabilities-v1",
+          "agent_instructions_template": "codex-generic-agent-v1",
+          "shell_type": "unified_exec",
+          "apply_patch_tool_type": "freeform",
+          "fallback_context_window": 200000,
+          "input_modalities": ["text", "image"],
+          "supports_image_detail_original": false,
+          "include_skills_usage_instructions": false,
+          "include_plugin_usage_instructions": false,
+          "include_apps_usage_instructions": false,
+          "supported_reasoning_levels": [],
+          "default_reasoning_level": null
+        }
+      }
+    ],
+    "wire_shim": {
+      "drivers": ["anthropic-claude", "claude-code-subscription"],
+      "protocols": ["anthropic"]
+    },
+    "configuration": {
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "启用请求隐私处理",
+            "description": "仅移除所选追踪字段；保留模型、提示词、工具及其他请求内容。",
+            "default": true
+          },
+          "remove_user_id": {
+            "type": "boolean",
+            "title": "不发送用户追踪标识",
+            "description": "移除 metadata.user_id。客户端明确依赖此字段时可关闭。",
+            "default": true
+          }
+        }
+      },
+      "default": {"enabled": true, "remove_user_id": true}
+    }
+  }
+}
