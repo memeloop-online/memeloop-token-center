@@ -135,7 +135,7 @@ impl ApplicationPlugins {
         let policy: InstallPolicy =
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if let Some(proxy) = &policy.egress_proxy {
-            crate::plugin_distribution::validate_install_egress_proxy(proxy)
+            crate::network::validate_install_egress_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
         }
         if !policy.plugin_root.is_absolute()
@@ -740,7 +740,7 @@ impl CredentialFiles {
 impl InstallPolicy {
     fn apply_egress(&self, command: &mut tokio::process::Command) -> Result<(), AppError> {
         if let Some(proxy) = &self.egress_proxy {
-            crate::plugin_distribution::validate_install_egress_proxy(proxy)
+            crate::network::validate_install_egress_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
             command.arg("--egress-proxy").arg(proxy);
         }

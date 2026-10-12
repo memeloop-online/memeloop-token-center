@@ -88,30 +88,6 @@ pub struct InstallPluginOptions {
 
 pub use crate::plugin::CosignKeylessIdentity;
 
-pub fn validate_install_egress_proxy(value: &str) -> Result<(), PluginDistributionError> {
-    let invalid = || PluginDistributionError::InvalidEgressProxy;
-    if value.len() > 2048
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
-    {
-        return Err(invalid());
-    }
-    let url = url::Url::parse(value).map_err(|_| invalid())?;
-    if url.scheme() != "socks5h"
-        || !crate::network::has_safe_private_ip_literal_host(&url)
-        || !matches!(url.port(), Some(1..=65535))
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || !matches!(url.path(), "" | "/")
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
 struct CosignKeylessSignatureVerifier<'a> {
     identity: &'a CosignKeylessIdentity,
     runner: &'a dyn CosignRunner,
@@ -665,7 +641,8 @@ pub async fn install_plugin_oci(
     options: &InstallPluginOptions,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
     if let Some(proxy) = &options.egress_proxy {
-        validate_install_egress_proxy(proxy)?;
+        crate::network::validate_install_egress_proxy(proxy)
+            .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
     }
     let runner = SystemCosignRunner {
         egress_proxy: options.egress_proxy.clone(),
@@ -714,7 +691,8 @@ async fn install_plugin_oci_with_verifier(
     allow_plain_http: bool,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
     if let Some(proxy) = &options.egress_proxy {
-        validate_install_egress_proxy(proxy)?;
+        crate::network::validate_install_egress_proxy(proxy)
+            .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
     }
     let supplied_reference: Reference = options
         .reference

@@ -10,31 +10,6 @@ use wiremock::{
 use super::*;
 
 #[test]
-fn installation_proxy_rejects_untrusted_urls() {
-    for accepted in ["socks5h://100.64.0.2:1080", "socks5h://10.1.2.3:1080"] {
-        validate_install_egress_proxy(accepted).unwrap();
-    }
-    for rejected in [
-        "http://100.64.0.2:1080",
-        "socks5://100.64.0.2:1080",
-        "socks5h://127.0.0.1:1080",
-        "socks5h://169.254.169.254:1080",
-        "socks5h://8.8.8.8:1080",
-        "socks5h://proxy.example:1080",
-        "socks5h://secret:token@100.64.0.2:1080",
-        "socks5h://100.64.0.2",
-        "socks5h://100.64.0.2:0",
-        "socks5h://100.64.0.2:1080/path",
-        "socks5h://100.64.0.2:1080?token=secret",
-        "socks5h://100.64.0.2:1080#secret",
-    ] {
-        let error = validate_install_egress_proxy(rejected).unwrap_err();
-        assert_eq!(error.to_string(), "installation egress proxy is invalid");
-        assert_eq!(error.diagnostic_category(), "source_policy");
-    }
-}
-
-#[test]
 fn cosign_proxy_environment_is_explicit_and_has_no_bypass() {
     let command = CosignCommandSpec {
         arguments: vec!["verify".into()],
