@@ -3,7 +3,7 @@
 //! PostgreSQL workers claim rows with `FOR UPDATE SKIP LOCKED`. SQLite uses WAL
 //! plus `BEGIN IMMEDIATE` and remains a lightweight test/development backend.
 
-use sqlx::{Any, Row, Transaction, any::AnyRow};
+use sqlx::{Any, AnyConnection, Row, Transaction, any::AnyRow};
 use uuid::Uuid;
 
 use crate::archive_staging::{
@@ -19,7 +19,8 @@ use crate::archive_staging::{
 use crate::model::GenerationStagedAssets;
 
 use super::{
-    AppError, Database, DatabaseBackend, DatabaseReadinessProgress, DatabaseReadinessStage,
+    AppError, Database, DatabaseBackend, DatabaseReadinessPhase, DatabaseReadinessProgress,
+    DatabaseReadinessStage,
 };
 
 impl Database {
