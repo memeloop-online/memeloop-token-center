@@ -101,6 +101,7 @@ pub(in crate::api::proxy) struct CandidatePreparationSummary {
     reservation_metadata_unavailable: usize,
     codex_chat_incompatible: usize,
     multi_agent_incompatible: usize,
+    compaction_producer_incompatible: usize,
     codex_chat_rejection: Option<String>,
     skipped_incompatible_strict_route: bool,
     skipped_local_protocol_mismatch: bool,
@@ -222,6 +223,17 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         });
         match planned {
             Ok(planned) => return Ok(Some(planned)),
+            Err(AppError::CompactionProducerUnavailable) => {
+                summary.compaction_producer_incompatible += 1;
+                tracing::info!(
+                    %request.request_id,
+                    %route_id,
+                    upstream_account_id = %account_id,
+                    stage = "candidate_compaction_producer_incompatible",
+                    "proxy skipped a candidate without Responses compaction production"
+                );
+                continue;
+            }
             Err(AppError::BadRequest(message))
                 if codex_transport::is_driver(&candidate.driver)
                     && matches!(request.protocol, Protocol::OpenAiChat)
@@ -262,6 +274,7 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
         reservation_metadata_unavailable = summary.reservation_metadata_unavailable,
         codex_chat_incompatible = summary.codex_chat_incompatible,
         multi_agent_incompatible = summary.multi_agent_incompatible,
+        compaction_producer_incompatible = summary.compaction_producer_incompatible,
         "authorized candidate preparation exhausted without dispatch"
     );
     Ok(None)
@@ -285,6 +298,9 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
     }
     if let Some(message) = summary.codex_chat_rejection.as_ref() {
         return Ok(AppError::BadRequest(message.clone()));
+    }
+    if summary.compaction_producer_incompatible > 0 {
+        return Ok(AppError::CompactionProducerUnavailable);
     }
     if summary.reservation_metadata_unavailable > 0 {
         return Ok(AppError::Upstream(

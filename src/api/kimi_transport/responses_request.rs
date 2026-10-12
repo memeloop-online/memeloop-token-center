@@ -898,16 +898,7 @@ pub(in crate::api) fn convert_with_dialect(
                 }
             }
             _ => {
-                let metadata =
-                    rejected_input_metadata(input_index, item, dialect, translate_compaction);
-                tracing::warn!(
-                    phase = "responses_chat_input_rejected",
-                    input_index = metadata.input_index,
-                    input_kind = metadata.input_kind,
-                    dialect = metadata.dialect,
-                    compaction_translation_enabled = metadata.compaction_translation_enabled,
-                    "Unsupported Responses input item rejected"
-                );
+                report_input_rejection(input_index, item, dialect, translate_compaction);
                 return Err(AppError::BadRequest(
                     "unsupported Responses input item for Responses-via-Chat".into(),
                 ));
@@ -978,6 +969,23 @@ struct RejectedInputMetadata {
     input_kind: &'static str,
     dialect: &'static str,
     compaction_translation_enabled: bool,
+}
+
+pub(in crate::api) fn report_input_rejection(
+    input_index: usize,
+    item: &Value,
+    dialect: ResponsesViaChatDialect,
+    translate_compaction: bool,
+) {
+    let metadata = rejected_input_metadata(input_index, item, dialect, translate_compaction);
+    tracing::warn!(
+        phase = "responses_chat_input_rejected",
+        input_index = metadata.input_index,
+        input_kind = metadata.input_kind,
+        dialect = metadata.dialect,
+        compaction_translation_enabled = metadata.compaction_translation_enabled,
+        "Unsupported Responses input item rejected"
+    );
 }
 
 pub(in crate::api) fn with_input_rejection_diagnostics<Output>(
