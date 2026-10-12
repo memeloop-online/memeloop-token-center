@@ -3186,6 +3186,37 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "GHA supplies the signed public WASM with the exact 1.1.0 release hash"]
+    fn privacy_wire_shim_release_component_subscription_package_validation() {
+        use sha2::{Digest, Sha256};
+
+        let manifest_bytes =
+            include_bytes!("../tests/fixtures/claude-wire-subscription-1.1.0.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(manifest_bytes)),
+            "118cff3218b1d4512477d6fdef17001841a18c3393a81b586801cf39f5d21031"
+        );
+        let fixture = std::path::PathBuf::from(
+            std::env::var("MTC_CLAUDE_WIRE_FIXTURE").expect("GHA public signed fixture"),
+        );
+        let wasm_bytes = std::fs::read(fixture.join("plugin.wasm")).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&wasm_bytes)),
+            "51043af426632581a218c227a0f90b2de2253d27b5438519098c44d965c01f3c"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("plugin.json"), manifest_bytes).unwrap();
+        std::fs::write(directory.path().join("plugin.wasm"), wasm_bytes).unwrap();
+        let manifest = super::validate_plugin_package(directory.path())
+            .expect("immutable public 1.1.0 release must pass authoritative package validation");
+        assert_eq!(manifest.version, "1.1.0");
+        assert_eq!(
+            manifest.contributions.providers[0].id,
+            "claude-code-subscription"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "CI builds the pinned claude-code-wire v1.0.1 component"]
     async fn privacy_wire_shim_release_component() {
