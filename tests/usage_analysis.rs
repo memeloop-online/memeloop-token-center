@@ -304,13 +304,18 @@ async fn assert_output_rate_provenance(database_url: String) {
             reported = Some(id);
         }
     }
-    let filter = memeloop_token_center::db::UsageAnalysisFilter::default();
+    let to_created_at = memeloop_token_center::db::unix_millis();
+    let filter = memeloop_token_center::db::UsageAnalysisFilter {
+        from_created_at: Some(to_created_at - 30 * 86_400_000),
+        to_created_at: Some(to_created_at),
+        ..Default::default()
+    };
     let initial = state
         .db
         .operator_usage_analysis_trends(&tenant, filter.clone())
         .await
         .unwrap();
-    let rate = initial.summary.output_rate.unwrap();
+    let rate = initial.summary.output_rate.as_ref().unwrap();
     assert_eq!(
         (rate.requests, rate.output_tokens, rate.duration_ms),
         (1, 20, 1000)
@@ -318,6 +323,20 @@ async fn assert_output_rate_provenance(database_url: String) {
     assert_eq!(
         initial.summary.requests, 7,
         "provenance filtering must not erase usage/accounting activity"
+    );
+    let full = state
+        .db
+        .operator_usage_analysis(&tenant, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(full.summary.requests, initial.summary.requests);
+    assert_eq!(
+        serde_json::to_value(&full.summary.costs).unwrap(),
+        serde_json::to_value(&initial.summary.costs).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&full.summary.output_rate).unwrap(),
+        serde_json::to_value(&initial.summary.output_rate).unwrap()
     );
     let failed = state
         .db
