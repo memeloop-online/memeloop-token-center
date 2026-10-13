@@ -157,6 +157,7 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
     candidate_rank: usize,
     outbound_attempt: usize,
+    h2_recovery_available: &mut bool,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
     network::validate_codex_transport(
@@ -177,7 +178,6 @@ pub(super) async fn send_proxy_route(
     // bounded, domain-level classification identifies known transient
     // semantics.
     let mut retry = CodexRetryState::new(route.codex_store_disabled);
-    let mut h2_recovery_available = true;
     let transport_policy = runtime_transport_policy(
         &route.route.config,
         state.config.upstream_health.shared_probe_attempts,
@@ -216,7 +216,7 @@ pub(super) async fn send_proxy_route(
                 transport_policy,
                 deadline,
             },
-            &mut h2_recovery_available,
+            h2_recovery_available,
         )
         .await
         {

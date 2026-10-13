@@ -10,6 +10,7 @@ enum Failure {
     PreHeaderRefusedReset,
     ResetThenSuccess,
     ResetThenTransientThenReset,
+    ResetThenRateLimitThenReset,
     PreHeaderSilence,
     PostHeaderSilence,
     RejectedReset,
@@ -52,6 +53,12 @@ async fn http2_failure_upstream(
                             assert_eq!(request.method(), http::Method::POST);
                             assert_eq!(request.uri().path(), codex_transport::RESPONSES_PATH);
                             let attempt = count.fetch_add(1, Ordering::SeqCst);
+                            if matches!(failure, Failure::ResetThenRateLimitThenReset) {
+                                assert_eq!(
+                                    request.headers().get("chatgpt-account-id").unwrap(),
+                                    if attempt < 2 { "account-123" } else { "account-456" }
+                                );
+                            }
                             match failure {
                                 Failure::PreHeaderReset => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PreHeaderRefusedReset => response.send_reset(http2::Reason::REFUSED_STREAM),
@@ -75,6 +82,16 @@ async fn http2_failure_upstream(
                                     body.send_data(Bytes::from_static(br#"{"error":{"type":"request_error","message":"The service is under high demand."}}"#), true).unwrap();
                                 }
                                 Failure::ResetThenTransientThenReset => response.send_reset(http2::Reason::CANCEL),
+                                Failure::ResetThenRateLimitThenReset if attempt == 1 => {
+                                    let headers = http::Response::builder()
+                                        .status(429)
+                                        .header(http::header::CONTENT_TYPE, "application/json")
+                                        .body(())
+                                        .unwrap();
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    body.send_data(Bytes::from_static(br#"{"error":{"type":"rate_limit_error","message":"Rate limit reached"}}"#), true).unwrap();
+                                }
+                                Failure::ResetThenRateLimitThenReset => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PreHeaderSilence => held_headers.push(response),
                                 Failure::PostHeaderSilence => {
                                     let headers = http::Response::builder()
@@ -181,7 +198,10 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert!(!body.contains("upstream_http2_reset"));
     wait_for_request_settlement(&fixture, 1).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let expected_attempts = if matches!(failure, Failure::ResetThenTransientThenReset) {
+    let expected_attempts = if matches!(
+        failure,
+        Failure::ResetThenTransientThenReset | Failure::ResetThenRateLimitThenReset
+    ) {
         3
     } else if matches!(
         failure,
@@ -197,7 +217,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(
         received.load(Ordering::SeqCst),
         expected_attempts,
-        "H2 recovery has one shared replay allowance even across the permitted 400 retry"
+        "H2 recovery has one logical-request allowance across 400 retry and candidate failover"
     );
     release.send(()).unwrap();
     server.await.unwrap();
@@ -214,7 +234,8 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     let expected_error = match failure {
         Failure::PreHeaderReset
         | Failure::PreHeaderRefusedReset
-        | Failure::ResetThenTransientThenReset => "upstream_transport_http2_reset",
+        | Failure::ResetThenTransientThenReset
+        | Failure::ResetThenRateLimitThenReset => "upstream_transport_http2_reset",
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
         Failure::RejectedReset
@@ -250,7 +271,9 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
     let (expected_account, expected_route) = if matches!(
         failure,
-        Failure::RejectedPriorReset | Failure::RejectedFinalReset
+        Failure::RejectedPriorReset
+            | Failure::RejectedFinalReset
+            | Failure::ResetThenRateLimitThenReset
     ) {
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let route_id: String = sqlx::query_scalar(
@@ -291,6 +314,15 @@ async fn pre_header_reset_recovery_allowance_is_not_refreshed_by_transient_400()
     assert_terminal_failure(
         Failure::ResetThenTransientThenReset,
         "h2-recovery-shared-400",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pre_header_reset_recovery_allowance_is_not_refreshed_by_candidate_failover() {
+    assert_terminal_failure(
+        Failure::ResetThenRateLimitThenReset,
+        "h2-recovery-shared-candidate",
     )
     .await;
 }
