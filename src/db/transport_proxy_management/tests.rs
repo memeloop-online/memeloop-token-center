@@ -568,14 +568,54 @@ async fn generic_oauth_group_contract(database: &Database) {
     assert_eq!(credential.proxy().unwrap().0, PRIMARY);
     let stamp: BindingStamp = serde_json::from_value(account.config[CONFIG_KEY].clone()).unwrap();
     let reauth = database
-        .snapshot_oauth_transport_group(
+        .snapshot_oauth_transport_group_selected(
             reference.clone(),
             &external,
             Some((created.id, stamp)),
+            selected.credential.proxy().map(|(proxy, _)| proxy),
             KEY,
         )
         .await
         .unwrap();
+    assert_eq!(reauth.reference.initial_member_id, primary);
+    assert_eq!(reauth.proxy_url, PRIMARY);
+    assert_eq!(reauth.selected_member_id, backup);
+    assert_eq!(reauth.selected_proxy_url, BACKUP);
+    reauth.validate_proxy(selected.credential.proxy()).unwrap();
+    assert!(reauth.validate_proxy(credential.proxy()).is_err());
+    let mut mismatched_member = reauth.clone();
+    mismatched_member.selected_member_id = primary;
+    assert!(
+        database
+            .validate_oauth_transport_group(&mismatched_member, KEY)
+            .await
+            .is_err()
+    );
+    assert_oauth_snapshot_cannot_arm(database, &mismatched_member).await;
+    let mut removed_member = reauth.clone();
+    removed_member.selected_member_id = Uuid::now_v7();
+    assert!(
+        database
+            .validate_oauth_transport_group(&removed_member, KEY)
+            .await
+            .is_err()
+    );
+    assert_oauth_snapshot_cannot_arm(database, &removed_member).await;
+    assert_eq!(
+        groups
+            .select_config(
+                account.id,
+                account.credential_generation,
+                &credential,
+                &account.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
     database
         .bind_transport_group(
             source.id,
@@ -651,6 +691,7 @@ async fn generic_oauth_group_contract(database: &Database) {
             .await
             .is_err()
     );
+    assert_oauth_snapshot_cannot_arm(database, &snapshot).await;
     assert!(
         database
             .create_upstream_account_with_transport(
@@ -664,4 +705,55 @@ async fn generic_oauth_group_contract(database: &Database) {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = $1 AND a.name IN ('wrong-proxy', 'stale-login')")
         .bind(external).fetch_one(&database.pool).await.unwrap();
     assert_eq!(count, 0);
+}
+
+async fn assert_oauth_snapshot_cannot_arm(database: &Database, snapshot: &OAuthGroupSnapshot) {
+    let reference = OAuthLoginSessionReference {
+        session_id: Uuid::now_v7(),
+        flow_kind: crate::oauth::authorization_code::FLOW.into(),
+        tenant_external_id: snapshot.tenant_external_id.clone(),
+        operator_service_id: None,
+        expires_at: unix_millis() + 60_000,
+    };
+    let now = unix_millis();
+    database
+        .begin_oauth_login_session(BeginOAuthLoginSession {
+            session_id: reference.session_id,
+            flow_kind: reference.flow_kind.clone(),
+            tenant_external_id: reference.tenant_external_id.clone(),
+            operator_service_id: None,
+            state_ciphertext: "fixture-unarmed".into(),
+            next_poll_at: now,
+            expires_at: reference.expires_at,
+        })
+        .await
+        .unwrap();
+    let OAuthLoginClaim::Claimed { lease_owner, .. } = database
+        .claim_oauth_login_poll(&reference, now, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("initial lease")
+    };
+    for _ in 0..2 {
+        assert!(
+            database
+                .replace_oauth_login_poll_state_with_transport(
+                    reference.session_id,
+                    lease_owner,
+                    "fixture-armed".into(),
+                    Some(snapshot),
+                    KEY
+                )
+                .await
+                .is_err()
+        );
+    }
+    let ciphertext: String =
+        sqlx::query_scalar("SELECT state_ciphertext FROM oauth_login_sessions WHERE id = $1")
+            .bind(reference.session_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(ciphertext, "fixture-unarmed");
 }

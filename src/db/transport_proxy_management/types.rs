@@ -62,8 +62,27 @@ pub(crate) struct OAuthGroupSnapshot {
     pub tenant_external_id: String,
     pub proxy_url: String,
     pub account_binding: Option<(Uuid, BindingStamp)>,
+    pub selected_member_id: Uuid,
+    pub selected_proxy_url: String,
     pub account_revision: Option<(i64, i64)>,
     pub session_id: Option<Uuid>,
+}
+
+impl OAuthGroupSnapshot {
+    pub(crate) fn validate_proxy(
+        &self,
+        proxy: Option<(&str, crate::network::OutboundScope)>,
+    ) -> Result<(), AppError> {
+        if proxy
+            != Some((
+                self.selected_proxy_url.as_str(),
+                crate::network::OutboundScope::Private,
+            ))
+        {
+            return Err(conflict("proxy_group_binding_conflict"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]

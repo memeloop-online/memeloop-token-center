@@ -71,6 +71,12 @@ pub(in crate::api) async fn start_authorization_code_oauth(
                 "reauthorization must use the existing provider, name and configuration".into(),
             ));
         }
+        let selected = state.transport_proxy_groups.select_config(
+            account_id,
+            account.credential_generation,
+            &credential,
+            &account.config,
+        )?;
         if let Some(encoded) = account
             .config
             .get(crate::db::transport_proxy_management::CONFIG_KEY)
@@ -91,7 +97,7 @@ pub(in crate::api) async fn start_authorization_code_oauth(
                 transport_group = Some(
                     state
                         .db
-                        .snapshot_oauth_transport_group(
+                        .snapshot_oauth_transport_group_selected(
                             crate::db::transport_proxy_management::OAuthGroupReference {
                                 group_id,
                                 expected_group_version: group_version,
@@ -99,18 +105,13 @@ pub(in crate::api) async fn start_authorization_code_oauth(
                             },
                             &body.tenant_external_id,
                             Some((account_id, stamp)),
+                            selected.credential.proxy().map(|(proxy, _)| proxy),
                             state.config.key_pepper.as_bytes(),
                         )
                         .await?,
                 );
             }
         }
-        let selected = state.transport_proxy_groups.select_config(
-            account_id,
-            account.credential_generation,
-            &credential,
-            &account.config,
-        )?;
         body.account_name = account.name;
         body.provider_config = account.config;
         if let Some((proxy, scope)) = selected.credential.proxy() {

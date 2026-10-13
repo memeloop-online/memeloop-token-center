@@ -65,7 +65,11 @@ by a plugin. Token exchange and identity reads use that member. The encrypted
 session freezes tenant, group version and member; completion installs the binding
 inside the account transaction, rejecting changed groups without creating an
 unbound account. Reauthorization inherits the account's group and snapshots its
-binding and account revisions. Refresh, Messages and health/catalog requests use
+binding and account revisions. Token exchange and identity reads use the actual
+sticky member frozen in the reauthorization session; the persistent base binding
+remains separate. A proxy mismatch
+in the login input or staged credential is rejected before dispatch or identity use.
+Refresh, Messages and health/catalog requests use
 the existing managed selection. Messages uses the existing sticky selection and
 only advances on a connection failure before delivery, within one absolute
 deadline; accepted or ambiguous POSTs are never replayed. Token exchange and

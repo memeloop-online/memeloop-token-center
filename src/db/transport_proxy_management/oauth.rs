@@ -8,6 +8,24 @@ impl Database {
         account_binding: Option<(Uuid, BindingStamp)>,
         key: &[u8],
     ) -> Result<OAuthGroupSnapshot, AppError> {
+        self.snapshot_oauth_transport_group_selected(
+            reference,
+            external,
+            account_binding,
+            None,
+            key,
+        )
+        .await
+    }
+
+    pub(crate) async fn snapshot_oauth_transport_group_selected(
+        &self,
+        reference: OAuthGroupReference,
+        external: &str,
+        account_binding: Option<(Uuid, BindingStamp)>,
+        selected_proxy: Option<&str>,
+        key: &[u8],
+    ) -> Result<OAuthGroupSnapshot, AppError> {
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, external).await?;
@@ -26,6 +44,13 @@ impl Database {
             .iter()
             .find(|member| member.id == reference.initial_member_id)
             .ok_or_else(invalid)?;
+        let selected = match selected_proxy {
+            Some(proxy) => members
+                .iter()
+                .find(|member| member.proxy_url == proxy)
+                .ok_or_else(invalid)?,
+            None => member,
+        };
         let account_revision = if let Some((account_id, _)) = &account_binding {
             let row = sqlx::query("SELECT a.credential_generation, a.updated_at FROM upstream_accounts a WHERE a.id = $1 AND a.tenant_id = $2")
                 .bind(account_id.to_string()).bind(tenant(&mut tx, external).await?)
@@ -41,6 +66,8 @@ impl Database {
             reference,
             tenant_external_id: external.into(),
             proxy_url: member.proxy_url.clone(),
+            selected_member_id: selected.id,
+            selected_proxy_url: selected.proxy_url.clone(),
             account_binding,
             account_revision,
             session_id: None,
@@ -82,6 +109,12 @@ impl Database {
             return Err(conflict("proxy_group_version_conflict"));
         }
         let members = open_members(&row, key)?;
+        if !members.iter().any(|member| {
+            member.id == snapshot.selected_member_id
+                && member.proxy_url == snapshot.selected_proxy_url
+        }) {
+            return Err(conflict("proxy_group_binding_conflict"));
+        }
         if !members.iter().any(|member| {
             member.id == snapshot.reference.initial_member_id
                 && member.proxy_url == snapshot.proxy_url
