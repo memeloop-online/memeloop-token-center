@@ -868,6 +868,42 @@ async fn unauthorized_traffic_hint_cannot_expand_the_granted_candidate_set() {
 }
 
 #[tokio::test]
+async fn disabled_granted_routes_are_unavailable_not_forbidden() {
+    let preferred = MockServer::start().await;
+    let standby = MockServer::start().await;
+    for upstream in [&preferred, &standby] {
+        Mock::given(method("POST"))
+            .respond_with(successful_hint_response("unexpected"))
+            .expect(0)
+            .mount(upstream)
+            .await;
+    }
+    let fixture =
+        hint_routing_fixture("disabled-routes", preferred.uri(), standby.uri(), false).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE model_routes SET enabled = 0 WHERE public_model = $1")
+        .bind(&fixture.model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = call_hint_routing_fixture(&fixture).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Removing the grant still revokes access: disabling a route must not
+    // dispatch it, nor should separating readiness authorize another key.
+    sqlx::query("DELETE FROM routing_grants WHERE key_id = $1")
+        .bind(fixture.issued.key_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = call_hint_routing_fixture(&fixture).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    pool.close().await;
+    preferred.verify().await;
+    standby.verify().await;
+}
+
+#[tokio::test]
 async fn all_authorized_candidates_in_cooldown_return_unavailable_without_upstream_calls() {
     let preferred = MockServer::start().await;
     let standby = MockServer::start().await;
