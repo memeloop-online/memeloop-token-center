@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef } from 'react';
-import { api } from '../../api';
+import { ApiError, api } from '../../api';
 import {
   clearRememberedCredential,
   readRememberedCredential,
@@ -10,6 +10,7 @@ import {
 } from '../../credentialStorage';
 import { useI18n } from '../../i18n';
 import type { TenantView } from '../../types';
+import { isOrdinaryClientCredential } from '../clientCredentialGuidance';
 import { messageOf } from '../scope/operatorShared';
 
 type ScopeStatus =
@@ -103,11 +104,11 @@ export function useOperatorScope() {
     } catch (reason) {
       if (request !== sequence.current) return;
       if (!preserve) clearRememberedCredential('operator');
-      dispatch({
-        type: 'authentication-failed',
-        message: messageOf(reason, t('common.connectionFailed')),
-        preserve,
-      });
+      const message =
+        reason instanceof ApiError && reason.status === 401 && isOrdinaryClientCredential(candidate)
+          ? t('operator.clientKeyRejected')
+          : messageOf(reason, t('common.connectionFailed'));
+      dispatch({ type: 'authentication-failed', message, preserve });
     }
   }
 
