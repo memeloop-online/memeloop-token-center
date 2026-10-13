@@ -239,7 +239,12 @@ pub(super) fn plan_proxy_route(
             config_json: "{}".to_owned(),
         },
     );
+    let wait_for_compaction = is_codex
+        && (matches!(protocol, Protocol::OpenAiResponsesCompact)
+            || (matches!(protocol, Protocol::OpenAiResponses)
+                && crate::api::new_api_transport::has_compaction_trigger(request_json)));
     Ok(PlannedProxyRoute {
+        wait_for_compaction,
         route,
         forwarded_json,
         output_token_ceiling,
@@ -411,6 +416,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body = outcome.request_json.into_bytes();
     }
     Ok(PreparedProxyRoute {
+        wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
         upstream_stream: planned.upstream_stream,

@@ -37,7 +37,7 @@ struct CodexAttemptContext {
 
 #[derive(Clone, Copy)]
 struct CodexRequestDeadline {
-    request: tokio::time::Instant,
+    request: Option<tokio::time::Instant>,
     read_inactivity: std::time::Duration,
 }
 
@@ -193,11 +193,12 @@ pub(super) async fn send_proxy_route(
         stage = "sse_framing_policy_snapshot",
         "upstream SSE framing policy frozen"
     );
-    // One logical Codex send may include the sole, explicitly permitted 400
-    // replay. Keep one deadline across both sends so replay cannot refresh an
-    // operator-configured total request budget.
+    // Native compaction may compute silently for an arbitrary duration. Its
+    // lifetime follows upstream completion or downstream cancellation. Other
+    // requests retain one configured deadline across any permitted replay.
     let deadline = CodexRequestDeadline {
-        request: tokio::time::Instant::now() + transport_policy.request_timeout,
+        request: (!route.wait_for_compaction)
+            .then(|| tokio::time::Instant::now() + transport_policy.request_timeout),
         read_inactivity: transport_policy.read_timeout,
     };
     loop {
@@ -482,11 +483,13 @@ async fn send_codex_attempt(
                 // cannot fit in the remaining absolute request budget. Every
                 // attempt so admitted can still prove non-delivery before the
                 // request-level ambiguity boundary.
-                if !connect_retry_fits_before_request_deadline(
-                    deadline.request,
-                    transport_policy.connect_retry_delay,
-                    transport_policy.connect_timeout,
-                ) {
+                if deadline.request.is_some_and(|request_deadline| {
+                    !connect_retry_fits_before_request_deadline(
+                        request_deadline,
+                        transport_policy.connect_retry_delay,
+                        transport_policy.connect_timeout,
+                    )
+                }) {
                     return Err(ProxySendError::RetryableConnection(failure_stage));
                 }
                 tokio::time::sleep(transport_policy.connect_retry_delay).await;
@@ -644,12 +647,16 @@ async fn send_codex_attempt_once(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok((
-            http2_evidence
-                .observe_response(response)
-                .with_body_timeouts(deadline.request, deadline.read_inactivity),
-            upstream_activity,
-        )),
+        Ok(response) => {
+            let response = http2_evidence.observe_response(response);
+            let response = match deadline.request {
+                Some(request_deadline) => {
+                    response.with_body_timeouts(request_deadline, deadline.read_inactivity)
+                }
+                None => response,
+            };
+            Ok((response, upstream_activity))
+        }
         Err(error) => Err(error),
     }
 }
@@ -811,12 +818,15 @@ fn record_codex_send_attempt_failure<T>(
 }
 
 async fn send_until_request_deadline<T, F>(
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
     send: F,
 ) -> Result<T, ProxySendError>
 where
     F: std::future::Future<Output = Result<T, ProxySendError>>,
 {
+    let Some(deadline) = deadline.into() else {
+        return send.await;
+    };
     tokio::pin!(send);
     tokio::select! {
         // This budget is absolute. A result that becomes observable only at
