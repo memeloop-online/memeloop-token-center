@@ -46,15 +46,12 @@ async fn wan_submit_refused_stream_disables_the_library_replay_that_default_clie
             connections.abort_all();
             while connections.join_next().await.is_some() {}
         });
-        let shared = crate::build_http_client().unwrap();
-        let config = json!({"network_scope": "private"});
         let client = if no_retry {
-            submit_http(&shared, &endpoint, &config, None, true)
-                .await
-                .unwrap()
+            crate::build_no_retry_http2_test_client()
         } else {
-            crate::network::client_for_config_url(&shared, &endpoint, &config, None, true)
-                .await
+            crate::base_http_client_builder()
+                .http2_prior_knowledge()
+                .build()
                 .unwrap()
         };
         let result = tokio::time::timeout(
