@@ -116,7 +116,7 @@ async fn egress_sink_failure_and_saturation_do_not_change_successful_forwarding(
         let mut releases = Vec::new();
         if saturation {
             for _ in 0..4 {
-                let (release, wait) = tokio::sync::oneshot::channel();
+                let (release, wait) = tokio::sync::oneshot::channel::<()>();
                 releases.push(release);
                 assert!(fixture.state.routing_persistence.submit(1, async move {
                     let _ = wait.await;
