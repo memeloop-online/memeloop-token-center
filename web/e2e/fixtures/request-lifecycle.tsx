@@ -16,7 +16,15 @@ const base: RequestDetail = { request_id: 'request-a', created_at: 1000, complet
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
   ? { ...base, status_code: 402, completed_at: 3000, duration_ms: 2000, error_code: 'http_402',
     supplier_error: { code: 'no_active_plan', message: '当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐' } } : undefined;
-let first = supplierFailure ?? base;
+const diagnosticParam = new URLSearchParams(location.search).get('failure-diagnostic');
+const diagnosticFailure = diagnosticParam === 'downstream'
+  ? { ...base, status_code: 499, completed_at: 3000, duration_ms: 2000, error_code: 'http_499',
+    failure_diagnostic: { stage: 'response_delivery', source: 'downstream_connection', reason: 'client_disconnected' } }
+  : diagnosticParam === 'supplier'
+  ? { ...base, status_code: 499, completed_at: 3000, duration_ms: 2000, error_code: 'http_499',
+    failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } }
+  : undefined;
+let first = supplierFailure ?? diagnosticFailure ?? base;
 const second = { ...base, compaction: null, request_id: 'request-b', model: 'model-b', status_code: 200, completed_at: 3000, duration_ms: 2000 };
 let hold = false;
 let release: (() => void) | undefined;
