@@ -3,6 +3,25 @@ use serde_json::{Value, json};
 
 use super::*;
 
+#[cfg(test)]
+mod retry_tests;
+
+pub(super) use crate::network::client_for_config_url_no_retry as submit_http;
+
+pub(super) fn is_mp4_response(headers: &reqwest::header::HeaderMap) -> bool {
+    let mut values = headers.get_all(reqwest::header::CONTENT_TYPE).iter();
+    let valid = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("video/mp4"))
+        });
+    valid && values.next().is_none()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
@@ -236,6 +255,28 @@ pub(super) async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mp4_response_requires_an_unambiguous_provider_content_type() {
+        use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+        assert!(!is_mp4_response(&HeaderMap::new()));
+        for (mime, expected) in [
+            ("video/mp4", true),
+            ("VIDEO/MP4; codecs=avc1", true),
+            ("image/png", false),
+            ("application/xml", false),
+            ("text/html", false),
+            ("application/octet-stream", false),
+            ("audio/mp4", false),
+            ("video/mp4, text/html", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+            assert_eq!(is_mp4_response(&headers), expected);
+            headers.append(CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            assert!(!is_mp4_response(&headers));
+        }
+    }
 
     fn verified_input() -> Value {
         json!({

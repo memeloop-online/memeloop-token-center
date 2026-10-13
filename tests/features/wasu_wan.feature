@@ -1,5 +1,21 @@
 Feature: Wasu Wan native video execution through MTC
 
+  Scenario Outline: Non-MP4 or absent asset MIME cannot be billed as a video
+    Given a token center backed by SQLite and memory object storage
+    And the mock Wasu Wan asset has MIME "<mime>"
+    When the service creates a second-priced Wasu Wan video route and key
+    And the client creates and replays a Wasu Wan reference image generation
+    Then the response status is 202
+    And the Wasu Wan invalid MIME fails uncharged after one bounded probe
+
+    Examples:
+      | mime                     |
+      | missing                  |
+      | image/png                |
+      | application/xml          |
+      | text/html                |
+      | application/octet-stream |
+
   Scenario: A succeeded task with missing usage fails once without fabricated billing
     Given a token center backed by SQLite and memory object storage
     And the mock Wasu Wan upstream succeeds without usage

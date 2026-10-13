@@ -683,7 +683,18 @@ async fn submit_attempt(
     } else {
         format!("{}{}", route.base_url, path)
     };
-    let outbound_http = route_http(state, route, &submit_url).await?;
+    let outbound_http = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+        wasu_wan::submit_http(
+            &state.http,
+            &submit_url,
+            &route.config,
+            route.credential.proxy(),
+            state.config.allow_oauth_loopback,
+        )
+        .await?
+    } else {
+        route_http(state, route, &submit_url).await?
+    };
     let mut request = outbound_http
         .post(submit_url)
         .header("idempotency-key", job.job_id.to_string())
@@ -1296,6 +1307,12 @@ pub(crate) async fn provider_asset_is_obtainable(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_satisfied_content_range);
+    if GenerationProtocolAdapter::detect(&route.driver, &route.config, &route.upstream_model)
+        == Some(GenerationProtocolAdapter::WasuWanV1)
+        && !wasu_wan::is_mp4_response(response.headers())
+    {
+        return Ok(false);
+    }
     if !content_range.is_some_and(|range| range.start == 0 && range.end == 0 && range.total > 0)
         || response.content_length() != Some(1)
     {

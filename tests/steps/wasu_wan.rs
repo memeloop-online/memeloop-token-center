@@ -1,5 +1,55 @@
 use super::*;
 
+#[then("the Wasu Wan invalid MIME fails uncharged after one bounded probe")]
+async fn wan_invalid_mime(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.unwrap();
+    for _ in 0..80 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if value["status"] == "failed" {
+            assert_eq!(value["error_code"], "generation_asset_unavailable");
+            assert_eq!(value["cost"], "0");
+            assert_eq!(value["billed_units"], 0);
+            assert!(value["assets"].as_array().unwrap().is_empty());
+            let assets = world
+                .asset_mock
+                .as_ref()
+                .unwrap()
+                .received_requests()
+                .await
+                .unwrap();
+            assert_eq!(assets.len(), 1);
+            assert_eq!(assets[0].headers.get("range").unwrap(), "bytes=0-0");
+            assert!(assets[0].headers.get("authorization").is_none());
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            assert_eq!(key["available_balance"], "10");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("Wan invalid MIME did not terminal-fail");
+}
+
 #[then("the Wasu Wan missing usage fails once without charging or probing assets")]
 async fn wan_missing_usage_fails_once(world: &mut TokenCenterWorld) {
     let job_id = world.generation_job_id.unwrap();
@@ -67,25 +117,31 @@ fn wan_input() -> Value {
 
 #[given("the mock Wasu Wan upstream completes a reference image video")]
 async fn mock_wan(world: &mut TokenCenterWorld) {
-    mock_wan_result(world, true).await;
+    mock_wan_result(world, true, Some("video/mp4")).await;
 }
 
 #[given("the mock Wasu Wan upstream succeeds without usage")]
 async fn mock_wan_missing_usage(world: &mut TokenCenterWorld) {
-    mock_wan_result(world, false).await;
+    mock_wan_result(world, false, Some("video/mp4")).await;
 }
 
-async fn mock_wan_result(world: &mut TokenCenterWorld, usage_present: bool) {
+#[given(expr = "the mock Wasu Wan asset has MIME {string}")]
+async fn mock_wan_asset_mime(world: &mut TokenCenterWorld, mime: String) {
+    mock_wan_result(world, true, (mime != "missing").then_some(mime.as_str())).await;
+}
+
+async fn mock_wan_result(world: &mut TokenCenterWorld, usage_present: bool, mime: Option<&str>) {
     let assets = MockServer::start().await;
+    let mut probe = ResponseTemplate::new(206)
+        .insert_header("content-range", "bytes 0-0/9")
+        .set_body_bytes(b"w");
+    if let Some(mime) = mime {
+        probe = probe.insert_header("content-type", mime);
+    }
     Mock::given(method("GET"))
         .and(path("/wan.mp4"))
         .and(header("range", "bytes=0-0"))
-        .respond_with(
-            ResponseTemplate::new(206)
-                .insert_header("content-type", "video/mp4")
-                .insert_header("content-range", "bytes 0-0/9")
-                .set_body_bytes(b"w"),
-        )
+        .respond_with(probe)
         .with_priority(1)
         .expect(if usage_present { 1 } else { 0 })
         .mount(&assets)
@@ -98,7 +154,11 @@ async fn mock_wan_result(world: &mut TokenCenterWorld, usage_present: bool) {
                 .set_body_bytes(b"wan-video"),
         )
         .with_priority(10)
-        .expect(if usage_present { 1 } else { 0 })
+        .expect(if usage_present && mime == Some("video/mp4") {
+            1
+        } else {
+            0
+        })
         .mount(&assets)
         .await;
     let server = world.mock.as_ref().unwrap();

@@ -10,4 +10,6 @@ Only `second` prices are accepted. Five seconds are reserved; successful provide
 
 Existing network restrictions, stable-key asset ownership, encrypted provider references and cross-origin credential isolation apply. Repeatable asset GET access requires the existing explicit `provider_asset_reads_repeatable` declaration; absent that guarantee the worker fails uncharged. Unknown ACKs retain the existing delivery quarantine/reservation and never cause a new submit, even if a provider contribution advertises generic idempotency. No supplier cancellation contract is assumed. H3 and other suppliers are outside this profile.
 
+Wan submission uses the existing no-retry HTTP client, including its URL, DNS pinning and proxy boundary. Its single bounded asset-validation GET additionally requires one unambiguous `Content-Type: video/mp4` response header before success or settlement; missing, conflicting and non-MP4 MIME declarations fail uncharged. This verifies the provider response MIME, not a complete media decode or playback.
+
 Wire evidence: October 12 platform sample and the existing single successful supplier task. GHA fixtures use synthetic mock credentials/assets; no live requests or production credentials are involved.
