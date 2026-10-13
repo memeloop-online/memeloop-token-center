@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{StatusCode, header};
+use http::{HeaderMap, StatusCode, header};
 use serde_json::{Value, json};
 
 use super::upstream_response::UpstreamResponse;
@@ -14,6 +14,34 @@ const MAX_ERROR_WAIT: Duration = Duration::from_millis(100);
 pub(super) struct Rejection {
     pub(super) body: Bytes,
     pub(super) terminal_cause: Option<RequestTerminalCause>,
+}
+
+pub(super) fn rejection_content_class(headers: &HeaderMap) -> &'static str {
+    let mut content_types = headers.get_all(header::CONTENT_TYPE).iter();
+    let first = content_types.next();
+    if content_types.next().is_some() {
+        return "ambiguous";
+    }
+    let Some(first) = first else {
+        return "missing";
+    };
+    let Some(value) = first
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+    else {
+        return "other";
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value == "application/json"
+        || (value.starts_with("application/") && value.ends_with("+json"))
+    {
+        "json"
+    } else if value == "text/html" {
+        "html"
+    } else {
+        "other"
+    }
 }
 
 pub(super) fn fallback_body() -> Bytes {
@@ -82,17 +110,7 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
                 .or(Some(RequestTerminalCause::UpstreamHttpStatus)),
         };
     }
-    let mut content_types = response.headers().get_all(header::CONTENT_TYPE).iter();
-    let json_content = content_types
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            value == "application/json"
-                || (value.starts_with("application/") && value.ends_with("+json"))
-        })
-        && content_types.next().is_none();
+    let json_content = rejection_content_class(response.headers()) == "json";
     let identity_encoding = response
         .headers()
         .get_all(header::CONTENT_ENCODING)
@@ -146,6 +164,26 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[test]
+    fn rejection_header_classes_are_fixed_and_share_the_reader_eligibility_rule() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(rejection_content_class(&headers), "missing");
+        for (value, expected) in [
+            ("application/json; charset=utf-8", "json"),
+            ("application/problem+json", "json"),
+            ("text/html", "html"),
+            ("private-header-canary", "other"),
+        ] {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(value));
+            assert_eq!(rejection_content_class(&headers), expected);
+        }
+        headers.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(rejection_content_class(&headers), "ambiguous");
+    }
 
     fn response(
         status: StatusCode,

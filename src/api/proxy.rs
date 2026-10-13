@@ -1735,6 +1735,22 @@ async fn proxy_with_cancellation_guard(
             == Some(true);
     let responses_anthropic_route = active_route.is_responses_via_anthropic();
     let status = upstream.status();
+    if status == StatusCode::FORBIDDEN {
+        let headers = upstream.headers();
+        tracing::warn!(
+            stage = "upstream_response_headers",
+            source = "upstream_http_response",
+            %request_id,
+            status = status.as_u16(),
+            content_class = upstream_error::rejection_content_class(headers),
+            content_type_count = headers.get_all(header::CONTENT_TYPE).iter().count(),
+            content_encoding_present = headers.contains_key(header::CONTENT_ENCODING),
+            www_authenticate_present = headers.contains_key(header::WWW_AUTHENTICATE),
+            server_present = headers.contains_key(header::SERVER),
+            cf_ray_present = headers.contains_key("cf-ray"),
+            "Upstream rejection header structure"
+        );
+    }
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
