@@ -68,15 +68,21 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
             "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}),
     );
     tokio::pin!(send);
-    let post = tokio::select! {
-        post = peer.post() => post,
-        _ = &mut send => panic!("must reach peer before response"),
+    let (post, early_response) = tokio::select! {
+        post = peer.post() => (post, None),
+        response = &mut send => {
+            assert_eq!(response.status(), StatusCode::OK);
+            (peer.post().await, Some(response))
+        },
     };
     assert_eq!(post.body["model"], fixture.upstream_model);
     assert_eq!(post.body["tools"][0]["name"], "lookup");
     emit(&post, CREATED).await;
     emit(&post, TOOL).await;
-    let response = send.await;
+    let response = match early_response {
+        Some(response) => response,
+        None => send.await,
+    };
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
     let mut rendered = String::new();
