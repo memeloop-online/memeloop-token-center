@@ -62,7 +62,7 @@ fn http2_attempt_evidence(binding_enabled: bool) -> Http2AttemptEvidence {
             outbound_attempt: 1,
             transport_policy: runtime_transport_policy(&Value::Null, 1).unwrap(),
             deadline: CodexRequestDeadline {
-                request: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                request: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
                 read_inactivity: std::time::Duration::from_secs(5),
             },
         },
