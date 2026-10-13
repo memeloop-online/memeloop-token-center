@@ -246,7 +246,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     };
     let expected_cause = match failure {
         Failure::RejectedReset | Failure::RejectedFinalReset => Some("upstream_http2_reset"),
-        Failure::RejectedPlain | Failure::RejectedPriorReset => None,
+        Failure::RejectedPlain | Failure::RejectedPriorReset => Some("upstream_http_status"),
         _ => Some(expected_error),
     };
     assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));

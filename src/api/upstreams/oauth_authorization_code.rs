@@ -21,6 +21,8 @@ pub(in crate::api) struct StartRequest {
     proxy_url: Option<String>,
     #[serde(default)]
     proxy_network_scope: Option<crate::network::OutboundScope>,
+    #[serde(default)]
+    transport_proxy_group: Option<crate::db::transport_proxy_management::OAuthGroupReference>,
 }
 
 pub(in crate::api) async fn start_authorization_code_oauth(
@@ -39,8 +41,12 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         return Err(AppError::Forbidden);
     }
     let mut current_credential = None;
+    let mut transport_group = None;
     let reauthorize = if let Some(account_id) = body.upstream_account_id {
-        if body.proxy_url.is_some() || body.proxy_network_scope.is_some() {
+        if body.proxy_url.is_some()
+            || body.proxy_network_scope.is_some()
+            || body.transport_proxy_group.is_some()
+        {
             return Err(AppError::BadRequest(
                 "reauthorization cannot change the transport proxy".into(),
             ));
@@ -65,9 +71,50 @@ pub(in crate::api) async fn start_authorization_code_oauth(
                 "reauthorization must use the existing provider, name and configuration".into(),
             ));
         }
+        let selected = state.transport_proxy_groups.select_config(
+            account_id,
+            account.credential_generation,
+            &credential,
+            &account.config,
+        )?;
+        if let Some(encoded) = account
+            .config
+            .get(crate::db::transport_proxy_management::CONFIG_KEY)
+        {
+            let stamp: crate::db::transport_proxy_management::BindingStamp =
+                serde_json::from_value(encoded.clone()).map_err(|_| {
+                    AppError::Conflict("OAuth transport group is unavailable".into())
+                })?;
+            if let (Some(group_id), Some(group_version)) = (stamp.group_id, stamp.group_version) {
+                let binding = state
+                    .db
+                    .get_transport_binding(account_id, &body.tenant_external_id)
+                    .await?;
+                let initial_member_id =
+                    serde_json::from_value(binding["initial_member_id"].clone()).map_err(|_| {
+                        AppError::Conflict("OAuth transport group is unavailable".into())
+                    })?;
+                transport_group = Some(
+                    state
+                        .db
+                        .snapshot_oauth_transport_group_selected(
+                            crate::db::transport_proxy_management::OAuthGroupReference {
+                                group_id,
+                                expected_group_version: group_version,
+                                initial_member_id,
+                            },
+                            &body.tenant_external_id,
+                            Some((account_id, stamp)),
+                            selected.credential.proxy().map(|(proxy, _)| proxy),
+                            state.config.key_pepper.as_bytes(),
+                        )
+                        .await?,
+                );
+            }
+        }
         body.account_name = account.name;
         body.provider_config = account.config;
-        if let Some((proxy, scope)) = credential.proxy() {
+        if let Some((proxy, scope)) = selected.credential.proxy() {
             body.proxy_url = Some(proxy.to_owned());
             body.proxy_network_scope = Some(scope);
         }
@@ -80,6 +127,28 @@ pub(in crate::api) async fn start_authorization_code_oauth(
     } else {
         None
     };
+    if let Some(reference) = body.transport_proxy_group {
+        if !service.allows("providers:write") {
+            return Err(AppError::Forbidden);
+        }
+        if body.proxy_url.is_some() || body.proxy_network_scope.is_some() {
+            return Err(AppError::BadRequest(
+                "transport group cannot be combined with an individual proxy".into(),
+            ));
+        }
+        let snapshot = state
+            .db
+            .snapshot_oauth_transport_group(
+                reference,
+                &body.tenant_external_id,
+                None,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?;
+        body.proxy_url = Some(snapshot.proxy_url.clone());
+        body.proxy_network_scope = Some(crate::network::OutboundScope::Private);
+        transport_group = Some(snapshot);
+    }
     if body.proxy_url.is_some() != body.proxy_network_scope.is_some()
         || body
             .proxy_network_scope
@@ -148,6 +217,7 @@ pub(in crate::api) async fn start_authorization_code_oauth(
         authorization_code::start(
             &state.db,
             StartInput {
+                transport_group,
                 reauthorize,
                 application_plugin_revision: state.application_plugin_revision(),
                 tenant_external_id: body.tenant_external_id,
@@ -234,6 +304,12 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
         CompleteResult::Ready { lease_owner, login } => {
             let mut ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            if let Some(snapshot) = &ready.transport_group {
+                state
+                    .db
+                    .validate_oauth_transport_group(snapshot, state.config.key_pepper.as_bytes())
+                    .await?;
+            }
             let declared_identity = state
                 .providers
                 .get(&ready.provider_driver)
@@ -321,10 +397,15 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                 .with_provider_adapter_secret_patch(&secret_patch)?;
             ready.provider_config = public_config;
             let reauthorizing = ready.reauthorize.is_some();
+            if reauthorizing && let Some(snapshot) = &ready.transport_group {
+                ready.credential = ready
+                    .credential
+                    .with_transport_proxy(snapshot.proxy_url.clone())?;
+            }
             let mut account = if let Some(target) = ready.reauthorize {
                 state
                     .db
-                    .reauthorize_upstream_account(
+                    .reauthorize_upstream_account_with_transport(
                         target.account_id,
                         crate::db::ReauthorizeUpstreamAccountInput {
                             tenant_external_id: ready.tenant_external_id,
@@ -337,13 +418,14 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                             provider_config: Some(ready.provider_config),
                             credential: ready.credential,
                         },
+                        ready.transport_group.as_ref(),
                         state.config.key_pepper.as_bytes(),
                     )
                     .await?
             } else {
                 state
                     .db
-                    .create_upstream_account(
+                    .create_upstream_account_with_transport(
                         CreateUpstreamAccountInput {
                             tenant_external_id: ready.tenant_external_id,
                             name: ready.account_name,
@@ -354,6 +436,7 @@ pub(in crate::api) async fn complete_authorization_code_oauth(
                             oauth_driver: Some(authorization_code::FLOW.into()),
                             oauth_refresh_url: Some(ready.refresh_url),
                         },
+                        ready.transport_group.as_ref(),
                         state.config.key_pepper.as_bytes(),
                     )
                     .await?

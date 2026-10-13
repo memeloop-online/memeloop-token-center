@@ -20,6 +20,9 @@ use crate::{
 };
 
 pub const FLOW: &str = "generic_authorization_code";
+pub(crate) fn supports_managed_transport(credential: &UpstreamCredential) -> bool {
+    credential.auth_kind() == "oauth" && installed_state(credential).is_ok()
+}
 pub const CLIENT_DEFAULTS_ENV: &str = "MTC_PROVIDER_OAUTH_CLIENT_DEFAULTS_JSON";
 const READY_RECOVERY_MILLIS: i64 = 24 * 60 * 60 * 1000;
 
@@ -514,6 +517,8 @@ fn validate_start_proxy(input: &StartInput) -> Result<(), AppError> {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StartInput {
     #[serde(default)]
+    pub(crate) transport_group: Option<crate::db::transport_proxy_management::OAuthGroupSnapshot>,
+    #[serde(default)]
     pub reauthorize: Option<super::OAuthReauthorizationTarget>,
     #[serde(default)]
     pub application_plugin_revision: Option<i64>,
@@ -540,6 +545,8 @@ pub struct LoginStart {
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
     #[serde(default)]
+    transport_group: Option<crate::db::transport_proxy_management::OAuthGroupSnapshot>,
+    #[serde(default)]
     application_plugin_revision: Option<i64>,
     session_id: Uuid,
     tenant_external_id: String,
@@ -558,6 +565,8 @@ struct LoginState {
 
 #[derive(Serialize, Deserialize)]
 pub struct ReadyLogin {
+    #[serde(default)]
+    pub(crate) transport_group: Option<crate::db::transport_proxy_management::OAuthGroupSnapshot>,
     #[serde(default)]
     pub reauthorize: Option<super::OAuthReauthorizationTarget>,
     #[serde(default)]
@@ -613,12 +622,16 @@ fn open_ready(
 ) -> Result<Box<ReadyLogin>, AppError> {
     let ready: ReadyLogin = open_private_json(ciphertext, key, READY_AAD)?;
     if ready.application_plugin_revision != session.application_plugin_revision
+        || ready.transport_group != session.transport_group
         || ready.session_id != session.session_id
         || ready.tenant_external_id != session.tenant_external_id
     {
         return Err(AppError::Conflict(
             "OAuth ready session binding changed".into(),
         ));
+    }
+    if let Some(snapshot) = &ready.transport_group {
+        snapshot.validate_proxy(ready.credential.proxy())?;
     }
     Ok(Box::new(ready))
 }
@@ -644,6 +657,9 @@ pub async fn start(
         .map_err(|_| AppError::BadRequest("invalid OAuth redirect URI".into()))?
         .to_string();
     validate_start_proxy(&input)?;
+    if let Some(snapshot) = &input.transport_group {
+        snapshot.validate_proxy(input.proxy_url.as_deref().zip(input.proxy_network_scope))?;
+    }
     let _ = refresh_state(&input)?;
     if input.provider_driver == crate::provider::antigravity::DRIVER {
         let _ = crate::provider::antigravity::Config::from_account(&input.provider_config)?;
@@ -693,9 +709,14 @@ pub async fn start(
         )
         .append_pair("code_challenge_method", "S256")
         .append_pair("access_type", "offline");
+    let session_id = Uuid::now_v7();
+    if let Some(snapshot) = &mut input.transport_group {
+        snapshot.session_id = Some(session_id);
+    }
     let session = Session {
+        transport_group: input.transport_group.clone(),
         application_plugin_revision: input.application_plugin_revision,
-        session_id: Uuid::now_v7(),
+        session_id,
         tenant_external_id: input.tenant_external_id.clone(),
         operator_service_id: input.operator_service_id,
         expires_at: now.saturating_add(600_000),
@@ -793,6 +814,31 @@ pub async fn complete(
             "OAuth application revision binding changed".into(),
         ));
     }
+    if login.input.transport_group != session.transport_group {
+        return Err(AppError::Conflict(
+            "OAuth transport group binding changed".into(),
+        ));
+    }
+    if let Some(snapshot) = &login.input.transport_group
+        && let Err(error) = snapshot.validate_proxy(
+            login
+                .input
+                .proxy_url
+                .as_deref()
+                .zip(login.input.proxy_network_scope),
+        )
+    {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(error);
+    }
+    if let Some(snapshot) = &login.input.transport_group
+        && let Err(error) = db.validate_oauth_transport_group(snapshot, key).await
+    {
+        db.release_oauth_login_poll(session.session_id, lease_owner, now)
+            .await?;
+        return Err(error);
+    }
     // Empty callbacks are explicit status/finalization checks from the UI.
     // They may claim a Ready result, but may never arm, exchange or fail a code.
     if callback_url.is_empty() {
@@ -871,10 +917,12 @@ pub async fn complete(
     // This one-way marker is encrypted with the existing session state and
     // becomes durable before any token request can be dispatched.
     login.exchange_started = true;
-    db.replace_oauth_login_poll_state(
+    db.replace_oauth_login_poll_state_with_transport(
         session.session_id,
         lease_owner,
         super::seal_oauth_login_state(&login, key, STATE_AAD)?,
+        login.input.transport_group.as_ref(),
+        key,
     )
     .await?;
     let tokens = dispatch_token_request(prepared)
@@ -889,6 +937,7 @@ pub async fn complete(
         }
     };
     let ready = ReadyLogin {
+        transport_group: login.input.transport_group,
         reauthorize: login.input.reauthorize,
         application_plugin_revision: session.application_plugin_revision,
         session_id: session.session_id,
@@ -1524,6 +1573,7 @@ mod tests {
         )
         .unwrap();
         let ready = ReadyLogin {
+            transport_group: None,
             reauthorize: None,
             application_plugin_revision: session.application_plugin_revision,
             session_id: session.session_id,
@@ -1780,6 +1830,7 @@ mod tests {
 
     fn input(token_endpoint: String) -> StartInput {
         StartInput {
+            transport_group: None,
             reauthorize: None,
             application_plugin_revision: Some(7),
             tenant_external_id: "fixture-tenant".into(),
@@ -1805,6 +1856,258 @@ mod tests {
             },
             proxy_url: None,
             proxy_network_scope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_group_snapshot_never_dispatches_a_token_exchange() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("missing-group.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"generic missing-group encryption fixture";
+        let mut initial = input("https://tokens.example.com/token".into());
+        initial.transport_group = Some(crate::db::transport_proxy_management::OAuthGroupSnapshot {
+            reference: crate::db::transport_proxy_management::OAuthGroupReference {
+                group_id: Uuid::now_v7(),
+                expected_group_version: 1,
+                initial_member_id: Uuid::now_v7(),
+            },
+            tenant_external_id: initial.tenant_external_id.clone(),
+            proxy_url: "socks5h://10.20.30.40:1080".into(),
+            account_binding: None,
+            selected_member_id: Uuid::now_v7(),
+            selected_proxy_url: "socks5h://10.20.30.40:1080".into(),
+            account_revision: None,
+            session_id: None,
+        });
+        initial.proxy_url = Some("socks5h://10.20.30.40:1080".into());
+        initial.proxy_network_scope = Some(OutboundScope::Private);
+        let started = start(&db, initial, key, 1000).await.unwrap();
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id,
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        login.input.adapter.poll_url = server.uri();
+        db.replace_oauth_login_poll_state(
+            reference.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.release_oauth_login_poll(reference.session_id, lease_owner, 1001)
+            .await
+            .unwrap();
+        let state = Url::parse(&started.login_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let callback = format!("http://127.0.0.1:51121/oauth-callback?code=fixture&state={state}");
+        let result = complete(
+            &db,
+            &reqwest::Client::new(),
+            &started.session_token,
+            &callback,
+            Some("fixture-tenant"),
+            None,
+            key,
+            2002,
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::NotFound)));
+        assert!(!started.session_token.contains("socks5h"));
+    }
+
+    #[tokio::test]
+    async fn reauthorization_freezes_selected_proxy_for_token_and_identity_without_rebasing() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("selected-reauth.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = b"selected-member-reauthorization-fixture";
+        let primary = "socks5h://10.20.30.40:1080";
+        let backup = "socks5h://10.20.30.41:1080";
+        let account_id = Uuid::now_v7();
+        let group_id = Uuid::now_v7();
+        let selected_member_id = Uuid::now_v7();
+        let mut initial = input("https://tokens.example.com/token".into());
+        initial.reauthorize = Some(super::super::OAuthReauthorizationTarget {
+            account_id,
+            expected_updated_at: 100,
+            expected_credential_generation: 2,
+        });
+        initial.proxy_url = Some(backup.into());
+        initial.proxy_network_scope = Some(OutboundScope::Private);
+        initial.transport_group = Some(crate::db::transport_proxy_management::OAuthGroupSnapshot {
+            reference: crate::db::transport_proxy_management::OAuthGroupReference {
+                group_id,
+                expected_group_version: 1,
+                initial_member_id: Uuid::now_v7(),
+            },
+            tenant_external_id: initial.tenant_external_id.clone(),
+            proxy_url: primary.into(),
+            selected_member_id,
+            selected_proxy_url: backup.into(),
+            account_binding: Some((
+                account_id,
+                crate::db::transport_proxy_management::BindingStamp {
+                    selection_version: 1,
+                    binding_version: 1,
+                    group_id: Some(group_id),
+                    group_version: Some(1),
+                },
+            )),
+            account_revision: Some((2, 100)),
+            session_id: None,
+        });
+        let started = start(&db, initial, key, 1000).await.unwrap();
+        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let reference = OAuthLoginSessionReference {
+            session_id: session.session_id,
+            flow_kind: FLOW.into(),
+            tenant_external_id: session.tenant_external_id.clone(),
+            operator_service_id: None,
+            expires_at: session.expires_at,
+        };
+        let OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } = db
+            .claim_oauth_login_poll(&reference, 1001, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("initial lease")
+        };
+        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        assert!(login.input.transport_group == session.transport_group);
+        let snapshot = login.input.transport_group.as_ref().unwrap();
+        assert_eq!(snapshot.selected_member_id, selected_member_id);
+        assert_eq!(snapshot.proxy_url, primary);
+        snapshot
+            .validate_proxy(
+                login
+                    .input
+                    .proxy_url
+                    .as_deref()
+                    .zip(login.input.proxy_network_scope),
+            )
+            .unwrap();
+        let issued = credential(
+            TokenResponse {
+                access_token: "fixture-access".into(),
+                refresh_token: Some("fixture-refresh".into()),
+                expires_in: 3600,
+                token_type: None,
+            },
+            &login.input,
+            1001,
+            None,
+        )
+        .unwrap();
+        let mut ready = ReadyLogin {
+            transport_group: session.transport_group.clone(),
+            reauthorize: login.input.reauthorize.clone(),
+            application_plugin_revision: session.application_plugin_revision,
+            session_id: session.session_id,
+            tenant_external_id: session.tenant_external_id.clone(),
+            account_name: login.input.account_name.clone(),
+            provider_driver: login.input.provider_driver.clone(),
+            provider_config: login.input.provider_config.clone(),
+            refresh_url: login.input.adapter.refresh_url.clone(),
+            credential: issued,
+        };
+        let identity_input = open_ready(
+            &seal_private_json(&ready, key, READY_AAD).unwrap(),
+            key,
+            &session,
+        )
+        .unwrap();
+        assert_eq!(
+            identity_input.credential.proxy(),
+            Some((backup, OutboundScope::Private))
+        );
+        ready.credential = ready
+            .credential
+            .with_transport_proxy(primary.into())
+            .unwrap();
+        assert!(
+            open_ready(
+                &seal_private_json(&ready, key, READY_AAD).unwrap(),
+                key,
+                &session
+            )
+            .is_err()
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        login.input.adapter.poll_url = server.uri();
+        login.input.proxy_url = Some(primary.into());
+        db.replace_oauth_login_poll_state(
+            session.session_id,
+            lease_owner,
+            seal_private_json(&login, key, STATE_AAD).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.release_oauth_login_poll(session.session_id, lease_owner, 1001)
+            .await
+            .unwrap();
+        for now in [2002, 3003] {
+            let result = complete(
+                &db,
+                &reqwest::Client::new(),
+                &started.session_token,
+                "http://127.0.0.1:51121/oauth-callback?code=fixture&state=unused",
+                Some("fixture-tenant"),
+                None,
+                key,
+                now,
+                true,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(AppError::ProxyGroupConflict("proxy_group_binding_conflict"))
+            ));
         }
     }
 
@@ -1873,6 +2176,7 @@ mod tests {
         );
         let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
         let ready = ReadyLogin {
+            transport_group: None,
             reauthorize: None,
             application_plugin_revision: Some(8),
             session_id: session.session_id,

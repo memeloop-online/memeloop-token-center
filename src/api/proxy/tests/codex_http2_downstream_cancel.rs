@@ -319,6 +319,14 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         "client_cancelled"
     };
     assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
+    assert_eq!(
+        rows[0].terminal_cause_code.as_deref(),
+        if pre_header {
+            None
+        } else {
+            Some("client_disconnected")
+        }
+    );
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     assert_eq!(rows[0].cost, "0");
     assert_eq!(
