@@ -218,6 +218,8 @@ pub(super) async fn bind_transport_group(
     response(
         async {
             let actor = authority(&headers, &state, &body.tenant_external_id).await?;
+            let state = state.pin_application_plugins().await?;
+            validate_binding_provider(&state, id).await?;
             let body = state
                 .db
                 .bind_transport_group(id, body, actor, state.config.key_pepper.as_bytes())
@@ -237,6 +239,8 @@ pub(super) async fn unbind_transport_group(
     response(
         async {
             let actor = authority(&headers, &state, &body.tenant_external_id).await?;
+            let state = state.pin_application_plugins().await?;
+            validate_binding_provider(&state, id).await?;
             let body = state
                 .db
                 .unbind_transport_group(id, body, actor, state.config.key_pepper.as_bytes())
@@ -245,4 +249,25 @@ pub(super) async fn unbind_transport_group(
         }
         .await,
     )
+}
+
+async fn validate_binding_provider(state: &AppState, account_id: Uuid) -> Result<(), AppError> {
+    let (account, credential, _, flow) = state
+        .db
+        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if account.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+        return Ok(());
+    }
+    if flow.as_deref() != Some(crate::oauth::authorization_code::FLOW) {
+        return Err(AppError::BadRequest(
+            "provider does not support managed OAuth transport".into(),
+        ));
+    }
+    let adapter = state
+        .providers
+        .get(&account.driver)
+        .and_then(|provider| provider.oauth_adapter.as_ref())
+        .ok_or_else(|| AppError::Conflict("OAuth provider contribution is unavailable".into()))?;
+    crate::oauth::authorization_code::validate_installed_contribution(&credential, adapter)
 }

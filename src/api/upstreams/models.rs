@@ -756,6 +756,24 @@ async fn discover_models(
     blocking: Option<&crate::worker::BlockingTasks>,
     require_complete: bool,
 ) -> Result<(&'static str, Vec<DiscoveredUpstreamModel>), &'static str> {
+    let selected_credential =
+        if crate::oauth::authorization_code::supports_managed_transport(credential) {
+            Some(
+                state
+                    .transport_proxy_groups
+                    .select_config(
+                        account.id,
+                        account.credential_generation,
+                        credential,
+                        &account.config,
+                    )
+                    .map_err(|_| "transport_selection_unavailable")?
+                    .credential,
+            )
+        } else {
+            None
+        };
+    let credential = selected_credential.as_ref().unwrap_or(credential);
     // Native Cursor credentials never enter a compatibility/plugin catalog.
     if account.driver == crate::cursor_native::DRIVER {
         let body = crate::cursor_native::unary(

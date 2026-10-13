@@ -2,10 +2,12 @@ use super::*;
 
 mod bindings;
 mod groups;
+mod oauth;
 mod selection;
 #[cfg(test)]
 mod tests;
 mod types;
+pub(crate) use oauth::lock_oauth_transport_group;
 pub(crate) use types::*;
 
 pub(crate) const CONFIG_KEY: &str = "__mtc_transport_proxy_binding";
