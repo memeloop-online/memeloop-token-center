@@ -99,6 +99,11 @@ pub(super) struct Http2AttemptEvidence {
 }
 
 impl Http2AttemptEvidence {
+    #[cfg(feature = "h2-attempt-binding")]
+    pub(super) fn binding_observer(&self) -> Option<wreq_proto::ext::H2AttemptObserver> {
+        self.binding.clone()
+    }
+
     pub(super) fn capture(
         route: &ResolvedUpstream,
         identity: TransportIdentity,

@@ -17,6 +17,7 @@
   混合公网 DNS 结果；不探测 SOCKS/TLS 健康，也不推断某出口持续健康或死亡。
   地址最长 2048 字节，包含认证信息时同样按秘密处理。
 - 代理 URL 只写不回显；更新现有成员时省略 `proxy_url` 表示保留原值。
+  授权管理员可读取独立的 `scheme`、`host`、`port`；用户名、密码及 URL 其他部分不回显。
   成员 ID 稳定且由服务端生成，客户端不能用数组下标充当成员身份。
 - 未知请求字段拒绝。版本由服务端生成，客户端以 expected 字段做 CAS。
 - 配置以数据库为权威来源，URL 使用现有凭据加密机制落盘。
@@ -67,6 +68,8 @@ Group 响应示例；`bound_account_count` 是配置绑定数，不是活跃连�
       "id": "019c0000-0000-7000-8000-000000000002",
       "label": "出口 A",
       "scheme": "socks5h",
+      "host": "10.20.30.40",
+      "port": 1080,
       "remote_dns": true,
       "has_auth": false
     },
@@ -74,6 +77,8 @@ Group 响应示例；`bound_account_count` 是配置绑定数，不是活跃连�
       "id": "019c0000-0000-7000-8000-000000000003",
       "label": "出口 B",
       "scheme": "socks5h",
+      "host": "10.20.30.41",
+      "port": 1080,
       "remote_dns": true,
       "has_auth": false
     }

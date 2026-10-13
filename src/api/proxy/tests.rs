@@ -39,6 +39,7 @@ mod codex_proxy_groups;
 mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
+mod egress;
 mod filter_assistant;
 mod gateway_persistence;
 mod group_routing;

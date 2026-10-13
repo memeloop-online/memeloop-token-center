@@ -60,14 +60,34 @@ impl Persistence {
         bytes: usize,
         operation: impl std::future::Future<Output = Result<(), AppError>> + Send + 'static,
     ) -> bool {
+        self.submit_with_headroom(bytes, 0, operation)
+    }
+
+    pub(crate) fn submit_observation(
+        self: &Arc<Self>,
+        bytes: usize,
+        operation: impl std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    ) -> bool {
+        self.submit_with_headroom(bytes, 1, operation)
+    }
+
+    fn submit_with_headroom(
+        self: &Arc<Self>,
+        bytes: usize,
+        headroom: u32,
+        operation: impl std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    ) -> bool {
         let permits = u32::try_from(bytes)
             .ok()
             .filter(|bytes| *bytes as usize <= BYTES)
             .and_then(|bytes| {
-                Some((
-                    self.jobs.clone().try_acquire_owned().ok()?,
-                    self.bytes.clone().try_acquire_many_owned(bytes).ok()?,
-                ))
+                let mut jobs = self
+                    .jobs
+                    .clone()
+                    .try_acquire_many_owned(1 + headroom)
+                    .ok()?;
+                let job = jobs.split(1)?;
+                Some((job, self.bytes.clone().try_acquire_many_owned(bytes).ok()?))
             });
         let Some(permits) = permits else {
             self.rejected.fetch_add(1, Ordering::Relaxed);
@@ -157,6 +177,34 @@ pub(super) fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observations_leave_existing_health_work_a_job_without_waiting() {
+        let persistence = Arc::new(Persistence::default());
+        let mut releases = Vec::new();
+        for _ in 0..JOBS - 1 {
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            releases.push(release);
+            assert!(persistence.submit_observation(1024, async move {
+                let _ = wait.await;
+                Ok(())
+            }));
+        }
+        assert!(!persistence.submit_observation(1024, async {
+            panic!("observation must not consume health headroom")
+        }));
+        assert_eq!(persistence.jobs.available_permits(), 1);
+        let (published, health) = tokio::sync::oneshot::channel();
+        assert!(persistence.submit(4096, async move {
+            published.send(()).unwrap();
+            Ok(())
+        }));
+        health.await.unwrap();
+        drop(releases);
+        persistence.drain_for_test().await;
+        assert_eq!(persistence.jobs.available_permits(), JOBS);
+        assert_eq!(persistence.bytes.available_permits(), BYTES);
+    }
 
     #[tokio::test]
     async fn deferred_persistence_has_no_waiting_jobs_when_saturated() {

@@ -1,6 +1,8 @@
 use super::*;
 use crate::metrics::{CodexBadRequestRetry, CodexEgressFailureStage, CodexEgressPath};
 
+#[path = "codex/egress.rs"]
+pub(in crate::api::proxy) mod egress;
 pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
@@ -203,7 +205,7 @@ pub(super) async fn send_proxy_route(
         read_inactivity: transport_policy.read_timeout,
     };
     loop {
-        let (response, upstream_activity) = match send_codex_attempt(
+        let (response, upstream_activity, egress_selection) = match send_codex_attempt(
             state,
             headers,
             &target_url,
@@ -251,6 +253,7 @@ pub(super) async fn send_proxy_route(
         }
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
+                egress_selection,
                 response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::new(state.metrics.clone(), retry.outcome()),
@@ -267,6 +270,7 @@ pub(super) async fn send_proxy_route(
         {
             Ok(response) => {
                 return Ok(ProxyRouteResponse {
+                    egress_selection,
                     response,
                     upstream_activity,
                     codex_retry: CodexRetryTerminalGuard::new(
@@ -320,7 +324,14 @@ async fn send_codex_attempt(
     session_id: &str,
     context: CodexAttemptContext,
     h2_recovery_available: &mut bool,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         candidate_rank,
@@ -422,6 +433,7 @@ async fn send_codex_attempt(
                 &client_snapshot.client,
                 &selection.credential,
                 transport_identity,
+                selection.egress_snapshot(),
             ),
             context,
             h2_recovery_available,
@@ -436,7 +448,7 @@ async fn send_codex_attempt(
             result
                 .as_ref()
                 .ok()
-                .map(|(response, _)| response.status().as_u16()),
+                .map(|(response, ..)| response.status().as_u16()),
             None,
         );
         if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
@@ -542,10 +554,18 @@ async fn send_codex_attempt_once(
         &wreq::Client,
         &UpstreamCredential,
         send_diagnostics::TransportIdentity,
+        Option<crate::db::egress::SelectedEgress>,
     ),
     context: CodexAttemptContext,
     h2_recovery_available: &mut bool,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         deadline,
@@ -571,7 +591,7 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
-    let (client, credential, transport_identity) = transport;
+    let (client, credential, transport_identity, selected_egress) = transport;
     loop {
         let mut request = client.post(target_url).body(route.forwarded_body.clone());
         let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
@@ -606,6 +626,7 @@ async fn send_codex_attempt_once(
             body_consumption.clone(),
             state.config.h2_attempt_binding_enabled,
         );
+        let mut egress = None;
         let mut remote_reset = false;
         let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
@@ -613,6 +634,15 @@ async fn send_codex_attempt_once(
             body_consumption.attach(&mut request);
             #[cfg(feature = "h2-attempt-binding")]
             http2_evidence.attach_binding(&mut request);
+            egress = egress::AttemptRecorder::begin(
+                state,
+                &route.route,
+                selected_egress.clone(),
+                transport_identity,
+                context,
+                body_consumption.clone(),
+                &http2_evidence,
+            );
             client.execute(request).await
         }
         .await
@@ -659,13 +689,14 @@ async fn send_codex_attempt_once(
         match upstream_result {
             Ok(response) => {
                 let response = http2_evidence.observe_response(response);
+                let (response, egress_selection) = egress::observe_response(response, egress);
                 let response = match deadline.request {
                     Some(request_deadline) => {
                         response.with_body_timeouts(request_deadline, deadline.read_inactivity)
                     }
                     None => response,
                 };
-                return Ok((response, upstream_activity));
+                return Ok((response, upstream_activity, egress_selection));
             }
             Err(_) if remote_reset && *h2_recovery_available => {
                 *h2_recovery_available = false;
@@ -685,6 +716,7 @@ async fn send_codex_attempt_once(
                     stage = "codex_h2_server_recovery",
                     "recovering a remote HTTP/2 reset before response headers"
                 );
+                drop(egress);
                 drop(upstream_activity);
                 tokio::task::yield_now().await;
             }

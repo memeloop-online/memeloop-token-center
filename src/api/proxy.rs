@@ -1638,6 +1638,9 @@ async fn proxy_with_cancellation_guard(
         }
         match result {
             Ok(result) => {
+                if let Some(selection) = &result.egress_selection {
+                    selection.select();
+                }
                 break (
                     active_route,
                     result.response,

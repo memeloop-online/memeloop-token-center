@@ -640,7 +640,14 @@ pub(super) async fn internal_request_detail(
         .db
         .request_upstream_transport_diagnostics(request_id)
         .await?;
-    request_detail_response_with_transport_diagnostics(&state, refs, diagnostics).await
+    let egress_attempts = state.db.request_egress_attempts(request_id).await?;
+    request_detail_response_with_transport_diagnostics(
+        &state,
+        refs,
+        diagnostics,
+        Some(egress_attempts),
+    )
+    .await
 }
 
 pub(super) async fn internal_request_archive_content(
@@ -819,6 +826,42 @@ pub(super) async fn internal_stats(
         None => state.db.global_operator_stats_filtered(filter).await?,
     };
     Ok(Json(stats))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct EgressSummaryQuery {
+    start: i64,
+    end: i64,
+    tenant_external_id: Option<String>,
+}
+
+pub(super) async fn internal_egress_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EgressSummaryQuery>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let groups = state
+        .db
+        .request_egress_summary_for_tenant(query.start, query.end, tenant.as_deref())
+        .await?;
+    let mut response = Json(json!({
+        "start": query.start,
+        "end": query.end,
+        "coverage": "recorded_codex_attempts_only",
+        "measurement_basis": "application_payload_estimate",
+        "wire_bytes": null,
+        "supplier_billed_bytes": null,
+        "groups": groups,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Default, Deserialize)]
