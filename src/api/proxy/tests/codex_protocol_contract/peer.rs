@@ -1,10 +1,12 @@
 use super::*;
-use crate::http2_upload_tests::{HOST, accept_socks_at_port, tls_fixture::TlsFixture};
+use crate::http2_upload_tests::{accept_socks_for_host, tls_fixture::TlsFixture};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+const HOST: &str = "localhost";
 
 struct OutputStream {
     receiver: ReceiverStream<Result<bytes::Bytes, Infallible>>,
@@ -52,7 +54,7 @@ impl Peer {
         version: http::Version,
         policy: crate::provider::CodexTransportPolicy,
     ) -> Self {
-        let fixture = TlsFixture::new().await;
+        let fixture = TlsFixture::for_host(HOST).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy =
             wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
@@ -81,7 +83,7 @@ impl Peer {
                         let accepted_sender = accepted_sender.clone();
                         let cancel_sender = cancel_sender.clone();
                         connections.spawn(async move {
-                            accept_socks_at_port(&mut socket, 443).await;
+                            accept_socks_for_host(&mut socket, 443, HOST).await;
                             let encrypted = acceptor.accept(socket).await.unwrap();
                             let expected_alpn: &[u8] = if version == http::Version::HTTP_2 { b"h2" } else { b"http/1.1" };
                             assert_eq!(encrypted.get_ref().1.alpn_protocol(), Some(expected_alpn));

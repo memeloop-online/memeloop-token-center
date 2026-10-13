@@ -32,6 +32,10 @@ async fn openssl(directory: &Path, arguments: &[&str]) {
 
 impl TlsFixture {
     pub(crate) async fn new() -> Self {
+        Self::for_host(HOST).await
+    }
+
+    pub(crate) async fn for_host(host: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         openssl(
             directory.path(),
@@ -76,7 +80,7 @@ impl TlsFixture {
         )
         .await;
         tokio::fs::write(directory.path().join("server.ext"), format!(
-            "subjectAltName=DNS:{HOST}\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+            "subjectAltName=DNS:{host}\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
         )).await.unwrap();
         openssl(
             directory.path(),

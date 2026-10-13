@@ -171,6 +171,10 @@ async fn accept_socks(socket: &mut TcpStream) {
 }
 
 pub(crate) async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
+    accept_socks_for_host(socket, port, HOST).await;
+}
+
+pub(crate) async fn accept_socks_for_host(socket: &mut TcpStream, port: u16, host: &str) {
     let mut greeting = [0; 2];
     socket.read_exact(&mut greeting).await.unwrap();
     assert_eq!(greeting[0], 5);
@@ -184,7 +188,7 @@ pub(crate) async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
     let length = socket.read_u8().await.unwrap();
     let mut destination = vec![0; usize::from(length)];
     socket.read_exact(&mut destination).await.unwrap();
-    assert_eq!(destination, HOST.as_bytes());
+    assert_eq!(destination, host.as_bytes());
     assert_eq!(socket.read_u16().await.unwrap(), port);
     socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1]).await.unwrap();
     socket.write_all(&port.to_be_bytes()).await.unwrap();
