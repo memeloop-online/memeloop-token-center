@@ -1,7 +1,7 @@
 use std::{
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -22,14 +22,24 @@ struct Observation {
     response_body_complete: AtomicBool,
     completed: AtomicBool,
     final_response: AtomicBool,
+    pending: Mutex<Pending>,
     #[cfg(feature = "h2-attempt-binding")]
     binding: Option<wreq_proto::ext::H2AttemptObserver>,
 }
 
+#[derive(Default)]
+struct Pending {
+    latest: Option<RequestEgressAttempt>,
+    running: bool,
+}
+
 impl Observation {
-    fn submit(&self) {
+    fn snapshot(&self) -> RequestEgressAttempt {
         let mut attempt = self.attempt.clone();
-        attempt.request_payload_bytes = i64::try_from(self.request_body.bytes()).ok();
+        attempt.request_payload_bytes = (self.completed.load(Ordering::Relaxed)
+            || self.request_body.polls() > 0)
+            .then(|| i64::try_from(self.request_body.bytes()).ok())
+            .flatten();
         attempt.response_payload_bytes = self
             .response_started
             .load(Ordering::Relaxed)
@@ -53,10 +63,42 @@ impl Observation {
                     })
                 });
         }
-        let database = self.database.clone();
-        self.queue.submit(16 * 1024, async move {
-            database.record_request_egress_attempt(&attempt).await
-        });
+        attempt
+    }
+
+    fn submit(self: &Arc<Self>) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.latest = Some(self.snapshot());
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        let observation = self.clone();
+        if !self.queue.submit_observation(64 * 1024, async move {
+            loop {
+                let attempt = {
+                    let mut pending = observation.pending.lock().unwrap();
+                    match pending.latest.take() {
+                        Some(attempt) => attempt,
+                        None => {
+                            pending.running = false;
+                            return Ok(());
+                        }
+                    }
+                };
+                if observation
+                    .database
+                    .record_request_egress_attempt(&attempt)
+                    .await
+                    .is_err()
+                {
+                    observation.queue.record_failure_gap();
+                }
+            }
+        }) {
+            pending.running = false;
+            pending.latest = None;
+        }
     }
 }
 
@@ -110,8 +152,7 @@ impl AttemptRecorder {
             response_body_complete: false,
             measurement_basis: "application_payload_estimate",
         };
-        crate::db::egress::enqueue_request_egress_attempt(state, attempt.clone());
-        Some(Self(Arc::new(Observation {
+        let recorder = Self(Arc::new(Observation {
             database: state.routing_persistence_db.clone(),
             queue: state.routing_persistence.clone(),
             attempt,
@@ -121,9 +162,12 @@ impl AttemptRecorder {
             response_body_complete: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             final_response: AtomicBool::new(false),
+            pending: Mutex::new(Pending::default()),
             #[cfg(feature = "h2-attempt-binding")]
             binding: http2_evidence.binding_observer(),
-        })))
+        }));
+        recorder.0.submit();
+        Some(recorder)
     }
 
     fn finish(&self) {
@@ -203,3 +247,7 @@ impl Stream for ObservedResponse {
         result
     }
 }
+
+#[cfg(test)]
+#[path = "egress_tests.rs"]
+mod tests;

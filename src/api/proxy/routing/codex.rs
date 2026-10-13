@@ -619,21 +619,22 @@ async fn send_codex_attempt_once(
         body_consumption.clone(),
         state.config.h2_attempt_binding_enabled,
     );
-    let egress = egress::AttemptRecorder::begin(
-        state,
-        &route.route,
-        selected_egress.clone(),
-        transport_identity,
-        context,
-        body_consumption.clone(),
-        &http2_evidence,
-    );
+    let mut egress = None;
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
             #[cfg(feature = "h2-attempt-binding")]
             http2_evidence.attach_binding(&mut request);
+            egress = egress::AttemptRecorder::begin(
+                state,
+                &route.route,
+                selected_egress.clone(),
+                transport_identity,
+                context,
+                body_consumption.clone(),
+                &http2_evidence,
+            );
             client.execute(request).await
         }
         .await

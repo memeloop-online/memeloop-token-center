@@ -84,16 +84,6 @@ pub struct RequestEgressSummary {
     pub supplier_billed_bytes: Option<i64>,
 }
 
-pub fn enqueue_request_egress_attempt(
-    state: &crate::AppState,
-    attempt: RequestEgressAttempt,
-) -> bool {
-    let database = state.routing_persistence_db.clone();
-    state.routing_persistence.submit(16 * 1024, async move {
-        database.record_request_egress_attempt(&attempt).await
-    })
-}
-
 impl Database {
     pub async fn record_request_egress_attempt(
         &self,

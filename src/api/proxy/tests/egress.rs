@@ -50,9 +50,14 @@ async fn egress_records_every_real_send_and_counts_retry_payload_without_double_
     assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
     assert_eq!(attempts[0].connect_attempt, attempts[1].connect_attempt);
     assert!(
+        attempts.iter().all(|attempt| attempt.completed),
+        "{attempts:?}"
+    );
+    assert!(
         attempts
             .iter()
-            .all(|attempt| attempt.completed && attempt.selected.kind == "direct")
+            .all(|attempt| attempt.selected.kind == "direct"),
+        "{attempts:?}"
     );
     assert_eq!(
         attempts
