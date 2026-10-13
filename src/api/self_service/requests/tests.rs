@@ -127,7 +127,7 @@ async fn request_detail_keeps_specific_safe_supplier_reason_separate_from_http_o
     refs.view.status_code = Some(404);
     refs.view.error_code = Some("http_404".to_owned());
     refs.view.terminal_cause_code = Some("upstream_http_status".to_owned());
-    refs.response_object = Some("inline-json:{\"error\":{\"code\":\"model_unavailable\",\"message\":\"The requested upstream model is unavailable\",\"mtc_safe_reason\":\"model_unavailable\"}}".to_owned());
+    refs.response_object = Some("inline-json:{\"error\":{\"type\":\"upstream_error\",\"code\":\"model_unavailable\",\"message\":\"The requested upstream model is unavailable\",\"mtc_safe_reason\":\"model_unavailable\"}}".to_owned());
     refs.view.supplier_error =
         crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
     let response = request_detail_response(&state, refs).await.unwrap();
