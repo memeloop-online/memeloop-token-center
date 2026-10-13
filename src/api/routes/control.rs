@@ -197,6 +197,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/requests", get(internal_requests))
         .route(
+            "/internal/v1/requests/egress-summary",
+            get(internal_egress_summary),
+        )
+        .route(
             "/internal/v1/requests/{request_id}",
             get(internal_request_detail),
         )

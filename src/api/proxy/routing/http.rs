@@ -178,6 +178,7 @@ pub(super) async fn send_reqwest_proxy_route(
                 UpstreamResponse::Reqwest(response)
             };
             Ok(ProxyRouteResponse {
+                egress_selection: None,
                 // Keep one absolute deadline from before DNS through first
                 // byte and every subsequent streaming read. The inactivity
                 // window uses the same configured scalar and resets only on

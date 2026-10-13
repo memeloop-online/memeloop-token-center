@@ -1,5 +1,6 @@
 mod associations;
 mod create_idempotency;
+pub mod egress;
 mod equivalence;
 mod grant_revisions;
 mod grants;

@@ -1009,6 +1009,8 @@ pub struct RequestDetail {
     pub provenance: Option<RequestProvenanceView>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub transport_diagnostics: Vec<RequestTransportDiagnosticView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_attempts: Option<Vec<crate::db::egress::RequestEgressAttempt>>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

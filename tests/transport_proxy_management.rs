@@ -200,7 +200,10 @@ async fn operator_api_enforces_authority_cas_redaction_and_explicit_unbind() {
     let (status, group) = request(&state, "POST", collection, &operator.token, input).await;
     assert_eq!(status, StatusCode::CREATED, "{group}");
     assert_eq!(group["members"][0]["has_auth"], true);
-    for secret in ["fixture-user", "fixture-password", "10.20.30.40"] {
+    assert_eq!(group["members"][0]["scheme"], "socks5h");
+    assert_eq!(group["members"][0]["host"], "10.20.30.40");
+    assert_eq!(group["members"][0]["port"], 1080);
+    for secret in ["fixture-user", "fixture-password"] {
         assert!(!group.to_string().contains(secret));
     }
     let path = format!("{collection}/{}", group["id"].as_str().unwrap());

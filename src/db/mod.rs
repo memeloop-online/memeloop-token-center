@@ -77,6 +77,7 @@ mod providers;
 mod requests;
 mod rotation;
 mod routing;
+pub use routing::egress;
 mod rows;
 mod session_analytics;
 mod session_projection;

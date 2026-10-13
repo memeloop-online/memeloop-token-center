@@ -1,6 +1,8 @@
 use super::*;
 use crate::metrics::{CodexBadRequestRetry, CodexEgressFailureStage, CodexEgressPath};
 
+#[path = "codex/egress.rs"]
+pub(in crate::api::proxy) mod egress;
 pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
@@ -202,7 +204,7 @@ pub(super) async fn send_proxy_route(
         read_inactivity: transport_policy.read_timeout,
     };
     loop {
-        let (response, upstream_activity) = match send_codex_attempt(
+        let (response, upstream_activity, egress_selection) = match send_codex_attempt(
             state,
             headers,
             &target_url,
@@ -250,6 +252,7 @@ pub(super) async fn send_proxy_route(
         }
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
+                egress_selection,
                 response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::new(state.metrics.clone(), retry.outcome()),
@@ -266,6 +269,7 @@ pub(super) async fn send_proxy_route(
         {
             Ok(response) => {
                 return Ok(ProxyRouteResponse {
+                    egress_selection,
                     response,
                     upstream_activity,
                     codex_retry: CodexRetryTerminalGuard::new(
@@ -317,7 +321,14 @@ async fn send_codex_attempt(
     route: &PreparedProxyRoute,
     session_id: &str,
     context: CodexAttemptContext,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         candidate_rank,
@@ -419,6 +430,7 @@ async fn send_codex_attempt(
                 &client_snapshot.client,
                 &selection.credential,
                 transport_identity,
+                selection.egress_snapshot(),
             ),
             context,
         )
@@ -432,7 +444,7 @@ async fn send_codex_attempt(
             result
                 .as_ref()
                 .ok()
-                .map(|(response, _)| response.status().as_u16()),
+                .map(|(response, ..)| response.status().as_u16()),
             None,
         );
         if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
@@ -537,9 +549,17 @@ async fn send_codex_attempt_once(
         &wreq::Client,
         &UpstreamCredential,
         send_diagnostics::TransportIdentity,
+        Option<crate::db::egress::SelectedEgress>,
     ),
     context: CodexAttemptContext,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         deadline,
@@ -565,7 +585,7 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
-    let (client, credential, transport_identity) = transport;
+    let (client, credential, transport_identity, selected_egress) = transport;
     let mut request = client.post(target_url).body(route.forwarded_body.clone());
     let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
         let proxy =
@@ -598,6 +618,15 @@ async fn send_codex_attempt_once(
         matches!(egress_path, CodexEgressPath::AccountProxy),
         body_consumption.clone(),
         state.config.h2_attempt_binding_enabled,
+    );
+    let egress = egress::AttemptRecorder::begin(
+        state,
+        &route.route,
+        selected_egress.clone(),
+        transport_identity,
+        context,
+        body_consumption.clone(),
+        &http2_evidence,
     );
     let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
@@ -649,13 +678,14 @@ async fn send_codex_attempt_once(
     match upstream_result {
         Ok(response) => {
             let response = http2_evidence.observe_response(response);
+            let (response, egress_selection) = egress::observe_response(response, egress);
             let response = match deadline.request {
                 Some(request_deadline) => {
                     response.with_body_timeouts(request_deadline, deadline.read_inactivity)
                 }
                 None => response,
             };
-            Ok((response, upstream_activity))
+            Ok((response, upstream_activity, egress_selection))
         }
         Err(error) => Err(error),
     }

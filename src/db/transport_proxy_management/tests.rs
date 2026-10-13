@@ -84,7 +84,9 @@ async fn contract(database: &Database) {
         )
         .await
         .unwrap();
-    assert!(!group.to_string().contains("10.20.30"));
+    assert_eq!(group["members"][0]["host"], "10.20.30.40");
+    assert_eq!(group["members"][0]["port"], 1080);
+    assert!(group["members"][0].get("proxy_url").is_none());
     let unrelated = database
         .create_transport_group(
             CreateGroup {
@@ -165,6 +167,13 @@ async fn contract(database: &Database) {
         )
         .unwrap();
     assert_eq!(first.credential.proxy().unwrap().0, PRIMARY);
+    let first_egress = first.egress_snapshot().unwrap();
+    assert_eq!(first_egress.group_name.as_deref(), Some("egress"));
+    assert_eq!(first_egress.member_name.as_deref(), Some("first"));
+    assert_eq!(
+        serde_json::to_value(&first_egress).unwrap()["host"],
+        "10.20.30.40"
+    );
     assert!(first.advance_after_connect_failure(&[0]).unwrap());
     runtime
         .synchronize_managed_for_test(&database.pool)
@@ -198,6 +207,19 @@ async fn contract(database: &Database) {
     .await
     .unwrap();
     assert_eq!(fingerprint, refreshed_fingerprint);
+    assert_eq!(first.egress_snapshot().unwrap(), first_egress);
+    let later = runtime
+        .select_config(
+            account.id,
+            refreshed_account.credential_generation,
+            &bound_credential,
+            &bound_account.config,
+        )
+        .unwrap();
+    assert_eq!(
+        later.egress_snapshot().unwrap().member_name.as_deref(),
+        Some("second")
+    );
     assert_eq!(
         refreshed_account.config[CONFIG_KEY],
         bound_account.config[CONFIG_KEY]

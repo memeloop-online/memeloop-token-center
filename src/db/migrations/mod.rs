@@ -647,6 +647,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "operator upstream account notes",
         sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
     },
+    Migration {
+        version: 124,
+        name: "request selected egress attempt payload estimates",
+        sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1277,6 +1282,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 123,
         name: "operator upstream account notes",
         sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
+    },
+    Migration {
+        version: 124,
+        name: "request selected egress attempt payload estimates",
+        sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
     },
 ];
 

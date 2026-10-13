@@ -83,6 +83,7 @@ pub(crate) struct ProxySelection {
     pub(crate) generation: i64,
     ticket: Option<(Arc<Entry>, u64)>,
     member_override: Option<usize>,
+    egress_members: Vec<egress::SelectedEgress>,
 }
 
 fn unavailable() -> AppError {
@@ -208,6 +209,7 @@ impl TransportProxyGroups {
                 generation: 0,
                 ticket: None,
                 member_override: None,
+                egress_members: Vec::new(),
             });
         };
         let generation = u32::try_from(credential_generation).map_err(|_| unavailable())?;
@@ -267,11 +269,30 @@ impl TransportProxyGroups {
             generation: snapshot.epoch as i64,
             ticket: Some((entry.clone(), state)),
             member_override: None,
+            egress_members: managed
+                .get(&account_id)
+                .map(managed::ManagedEntry::egress_members)
+                .unwrap_or_default(),
         })
     }
 }
 
 impl ProxySelection {
+    pub(crate) fn egress_snapshot(&self) -> Option<egress::SelectedEgress> {
+        if let Some(selected) = self
+            .member_index()
+            .and_then(|index| self.egress_members.get(index))
+        {
+            return Some(selected.clone());
+        }
+        let mut selected =
+            egress::SelectedEgress::capture(self.credential.proxy().map(|value| value.0)).ok()?;
+        if self.credential.proxy().is_none() {
+            selected.kind = "direct".into();
+        }
+        Some(selected)
+    }
+
     pub(crate) fn member_index(&self) -> Option<usize> {
         self.ticket.as_ref().map(|(_, state)| {
             self.member_override

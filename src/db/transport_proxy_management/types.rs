@@ -114,7 +114,7 @@ pub(super) fn members(
 pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result<Value, AppError> {
     let members = open_members(row, key)?.into_iter().map(|member| {
         let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::Internal)?;
-        Ok(serde_json::json!({"id":member.id,"label":member.label,"scheme":"socks5h","remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
+        Ok(serde_json::json!({"id":member.id,"label":member.label,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
     }).collect::<Result<Vec<_>, AppError>>()?;
     Ok(serde_json::json!({
         "id":row.try_get::<String,_>("id")?, "tenant_external_id":tenant_external_id,
