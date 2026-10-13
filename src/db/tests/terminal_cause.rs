@@ -51,6 +51,16 @@ async fn assert_terminal_cause_contract(database_url: &str) {
     use crate::model::RequestTerminalCause;
     for (error_code, terminal_cause, expected) in [
         (
+            Some("http_404"),
+            Some(RequestTerminalCause::UpstreamHttpStatus),
+            Some("upstream_http_status"),
+        ),
+        (
+            Some("client_cancelled"),
+            Some(RequestTerminalCause::ClientDisconnected),
+            Some("client_disconnected"),
+        ),
+        (
             Some("http_502"),
             Some(RequestTerminalCause::Http2Reset),
             Some("upstream_http2_reset"),
@@ -142,7 +152,10 @@ async fn assert_terminal_cause_contract(database_url: &str) {
             .unwrap();
         assert_eq!(detail.view.terminal_cause_code.as_deref(), expected);
         assert_eq!(detail.view.error_code.as_deref(), error_code);
+        let expected_diagnostic =
+            serde_json::to_value(crate::model::failure_diagnostic(expected)).unwrap();
         let serialized = serde_json::to_value(&detail.view).unwrap();
+        assert_eq!(serialized["failure_diagnostic"], expected_diagnostic);
         assert_eq!(
             serialized["terminal_cause_code"],
             serde_json::json!(expected)
@@ -164,6 +177,7 @@ async fn assert_terminal_cause_contract(database_url: &str) {
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].terminal_cause_code.as_deref(), expected);
         let serialized = serde_json::to_value(finished[0]).unwrap();
+        assert_eq!(serialized["failure_diagnostic"], expected_diagnostic);
         assert_eq!(
             serialized["terminal_cause_code"],
             serde_json::json!(expected)

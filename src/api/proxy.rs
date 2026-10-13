@@ -1735,6 +1735,22 @@ async fn proxy_with_cancellation_guard(
             == Some(true);
     let responses_anthropic_route = active_route.is_responses_via_anthropic();
     let status = upstream.status();
+    if status == StatusCode::FORBIDDEN {
+        let headers = upstream.headers();
+        tracing::warn!(
+            stage = "upstream_response_headers",
+            source = "upstream_http_response",
+            %request_id,
+            status = status.as_u16(),
+            content_class = upstream_error::rejection_content_class(headers),
+            content_type_count = headers.get_all(header::CONTENT_TYPE).iter().count(),
+            content_encoding_present = headers.contains_key(header::CONTENT_ENCODING),
+            www_authenticate_present = headers.contains_key(header::WWW_AUTHENTICATE),
+            server_present = headers.contains_key(header::SERVER),
+            cf_ray_present = headers.contains_key("cf-ray"),
+            "Upstream rejection header structure"
+        );
+    }
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
@@ -1829,10 +1845,12 @@ async fn proxy_with_cancellation_guard(
         } else {
             let upstream = upstream.ok_or(AppError::Internal)?;
             let terminal_cause = if status == StatusCode::BAD_GATEWAY {
-                upstream_response::rejected_response_terminal_cause(upstream).await
+                upstream_response::rejected_response_terminal_cause(upstream)
+                    .await
+                    .or(Some(crate::model::RequestTerminalCause::UpstreamHttpStatus))
             } else {
                 drop(upstream);
-                None
+                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
             };
             (upstream_error::fallback_body(), terminal_cause)
         };
@@ -2552,7 +2570,7 @@ async fn execute_component_provider(
         } else {
             drop(upstream);
         }
-        return finish_buffered_request(
+        return finish_buffered_request_with_upstream_attribution_and_response_object(
             &request,
             upstream_status,
             Bytes::from_static(
@@ -2564,6 +2582,11 @@ async fn execute_component_provider(
                 crate::model::RequestUsageBasis::NotObserved,
             ),
             Some(format!("http_{}", upstream_status.as_u16())),
+            BufferedFinishPolicy {
+                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                response_storage: BufferedResponseStorage::DurableArchive,
+                terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
+            },
         )
         .await;
     }
@@ -2944,7 +2967,7 @@ async fn finish_unarchived_proxy_response(
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
             response_storage: BufferedResponseStorage::Omit,
-            terminal_cause: None,
+            terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
         },
     )
     .await

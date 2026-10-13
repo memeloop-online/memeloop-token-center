@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{StatusCode, header};
+use http::{HeaderMap, StatusCode, header};
 use serde_json::{Value, json};
 
 use super::upstream_response::UpstreamResponse;
@@ -14,6 +14,34 @@ const MAX_ERROR_WAIT: Duration = Duration::from_millis(100);
 pub(super) struct Rejection {
     pub(super) body: Bytes,
     pub(super) terminal_cause: Option<RequestTerminalCause>,
+}
+
+pub(super) fn rejection_content_class(headers: &HeaderMap) -> &'static str {
+    let mut content_types = headers.get_all(header::CONTENT_TYPE).iter();
+    let first = content_types.next();
+    if content_types.next().is_some() {
+        return "ambiguous";
+    }
+    let Some(first) = first else {
+        return "missing";
+    };
+    let Some(value) = first
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+    else {
+        return "other";
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value == "application/json"
+        || (value.starts_with("application/") && value.ends_with("+json"))
+    {
+        "json"
+    } else if value == "text/html" {
+        "html"
+    } else {
+        "other"
+    }
 }
 
 pub(super) fn fallback_body() -> Bytes {
@@ -78,20 +106,11 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
         return Rejection {
             body: fallback_body(),
             terminal_cause: super::upstream_response::rejected_response_terminal_cause(response)
-                .await,
+                .await
+                .or(Some(RequestTerminalCause::UpstreamHttpStatus)),
         };
     }
-    let mut content_types = response.headers().get_all(header::CONTENT_TYPE).iter();
-    let json_content = content_types
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            value == "application/json"
-                || (value.starts_with("application/") && value.ends_with("+json"))
-        })
-        && content_types.next().is_none();
+    let json_content = rejection_content_class(response.headers()) == "json";
     let identity_encoding = response
         .headers()
         .get_all(header::CONTENT_ENCODING)
@@ -107,7 +126,8 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
         drop(response);
         return Rejection {
             body: fallback_body(),
-            terminal_cause: None,
+            terminal_cause: (!status.is_success())
+                .then_some(RequestTerminalCause::UpstreamHttpStatus),
         };
     }
     let mut stream = response.bytes_stream();
@@ -118,18 +138,24 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
                 Some(Ok(chunk)) if chunk.len() <= MAX_ERROR_BYTES.saturating_sub(body.len()) => {
                     body.extend_from_slice(&chunk);
                 }
-                Some(Ok(_)) | Some(Err(_)) => return fallback_body(),
-                None => return safe_error_body(&body),
+                Some(Ok(_)) => return (fallback_body(), None),
+                Some(Err(error)) => {
+                    return (
+                        fallback_body(),
+                        super::upstream_response::terminal_cause_from_stream_error(error),
+                    );
+                }
+                None => return (safe_error_body(&body), None),
             }
         }
-        fallback_body()
+        (fallback_body(), None)
     };
-    let body = tokio::time::timeout(MAX_ERROR_WAIT, read)
+    let (body, terminal_cause) = tokio::time::timeout(MAX_ERROR_WAIT, read)
         .await
-        .unwrap_or_else(|_| fallback_body());
+        .unwrap_or_else(|_| (fallback_body(), None));
     Rejection {
         body,
-        terminal_cause: None,
+        terminal_cause: terminal_cause.or(Some(RequestTerminalCause::UpstreamHttpStatus)),
     }
 }
 
@@ -138,6 +164,26 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[test]
+    fn rejection_header_classes_are_fixed_and_share_the_reader_eligibility_rule() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(rejection_content_class(&headers), "missing");
+        for (value, expected) in [
+            ("application/json; charset=utf-8", "json"),
+            ("application/problem+json", "json"),
+            ("text/html", "html"),
+            ("private-header-canary", "other"),
+        ] {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(value));
+            assert_eq!(rejection_content_class(&headers), expected);
+        }
+        headers.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(rejection_content_class(&headers), "ambiguous");
+    }
 
     fn response(
         status: StatusCode,
@@ -335,7 +381,10 @@ mod tests {
             ))
             .await;
             assert_eq!(tokio::time::Instant::now(), started);
-            assert_eq!(result.terminal_cause, None);
+            assert_eq!(
+                result.terminal_cause,
+                Some(RequestTerminalCause::UpstreamHttpStatus)
+            );
             if code == "insufficient_user_quota" {
                 let value: Value = serde_json::from_slice(&result.body).unwrap();
                 assert_eq!(value["error"]["code"], "insufficient_quota");
@@ -358,6 +407,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn rejection_status_is_evidence_without_guessing_its_specific_cause() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::from_u16(499).unwrap()] {
+            let result = read_rejection(response(
+                status,
+                "application/json",
+                None,
+                Box::pin(stream::iter([Ok(Bytes::from_static(
+                    b"{\"error\":\"Bearer private-canary\"}",
+                ))])),
+            ))
+            .await;
+            assert_eq!(result.body, fallback_body());
+            assert_eq!(
+                result.terminal_cause,
+                Some(RequestTerminalCause::UpstreamHttpStatus)
+            );
+        }
+        let result = read_rejection(response(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            None,
+            Box::pin(stream::iter([Err(
+                super::super::upstream_response::UPSTREAM_HTTP2_RESET,
+            )])),
+        ))
+        .await;
+        assert_eq!(result.body, fallback_body());
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::Http2Reset)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn non_json_empty_oversized_and_success_never_poll_the_body() {
         for (status, content_type, length) in [
             (StatusCode::PAYMENT_REQUIRED, "text/html", None),
@@ -375,6 +458,10 @@ mod tests {
             let result =
                 read_rejection(response(status, content_type, length, Box::pin(body))).await;
             assert_eq!(result.body, fallback_body());
+            assert_eq!(
+                result.terminal_cause,
+                (!status.is_success()).then_some(RequestTerminalCause::UpstreamHttpStatus)
+            );
             assert_eq!(tokio::time::Instant::now(), started);
         }
         for (name, value) in [
@@ -407,7 +494,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now() - started, MAX_ERROR_WAIT);
     }
 
@@ -466,7 +556,10 @@ mod tests {
         .with_body_timeouts(started + Duration::from_millis(20), Duration::from_secs(5));
         let result = read_rejection(timed).await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::RequestTimeout)
+        );
         assert_eq!(
             tokio::time::Instant::now() - started,
             Duration::from_millis(20)
@@ -520,7 +613,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now(), started);
         let result = read_rejection(response(
             StatusCode::BAD_GATEWAY,
@@ -530,7 +626,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now() - started, MAX_ERROR_WAIT);
         let capped = stream::iter([
             Ok(Bytes::from(vec![b'x'; 64 * 1024])),
@@ -544,7 +643,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         let started = tokio::time::Instant::now();
         let timed = response(
             StatusCode::BAD_GATEWAY,
