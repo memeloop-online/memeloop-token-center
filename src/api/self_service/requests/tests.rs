@@ -85,6 +85,64 @@ async fn request_detail_response_has_exact_content_length_and_bounded_json_body(
 }
 
 #[tokio::test]
+async fn request_detail_projects_safe_failure_evidence_without_inventing_legacy_causes() {
+    let (state, _directory) = test_state().await;
+    for (cause, expected) in [
+        (None, Value::Null),
+        (
+            Some("upstream_http2_reset"),
+            json!({
+                "stage": "upstream_response_body", "source": "upstream_stream", "reason": "upstream_http2_reset"
+            }),
+        ),
+        (
+            Some("upstream_http_status"),
+            json!({
+                "stage": "upstream_response_headers", "source": "upstream_http_response", "reason": "upstream_http_status"
+            }),
+        ),
+        (
+            Some("client_disconnected"),
+            json!({
+                "stage": "response_delivery", "source": "downstream_connection", "reason": "client_disconnected"
+            }),
+        ),
+    ] {
+        let mut refs = request_detail_refs(Uuid::now_v7());
+        refs.view.error_code = Some("http_404".to_owned());
+        refs.view.terminal_cause_code = cause.map(str::to_owned);
+        let response = request_detail_response(&state, refs).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+            .await
+            .unwrap();
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["failure_diagnostic"], expected);
+    }
+}
+
+#[tokio::test]
+async fn request_detail_keeps_specific_safe_supplier_reason_separate_from_http_observation() {
+    let (state, _directory) = test_state().await;
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.view.status_code = Some(404);
+    refs.view.error_code = Some("http_404".to_owned());
+    refs.view.terminal_cause_code = Some("upstream_http_status".to_owned());
+    refs.response_object = Some("inline-json:{\"error\":{\"code\":\"model_unavailable\",\"message\":\"The requested upstream model is unavailable\",\"mtc_safe_reason\":\"model_unavailable\"}}".to_owned());
+    refs.view.supplier_error =
+        crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["supplier_error"]["code"], "model_unavailable");
+    assert_eq!(
+        detail["failure_diagnostic"]["reason"],
+        "upstream_http_status"
+    );
+}
+
+#[tokio::test]
 async fn request_detail_failure_keeps_durable_archive_state_separate() {
     let (state, _directory) = test_state().await;
     let mut refs = request_detail_refs(Uuid::now_v7());

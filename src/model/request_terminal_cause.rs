@@ -1,5 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestTerminalCause {
+    UpstreamHttpStatus,
+    ClientDisconnected,
     TransportTimeout,
     TransportOuterDeadline,
     TransportConnectionReset,
@@ -19,6 +21,8 @@ pub enum RequestTerminalCause {
 impl RequestTerminalCause {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::UpstreamHttpStatus => "upstream_http_status",
+            Self::ClientDisconnected => "client_disconnected",
             Self::TransportTimeout => "upstream_transport_timeout",
             Self::TransportOuterDeadline => "upstream_transport_outer_deadline",
             Self::TransportConnectionReset => "upstream_transport_connection_reset",
@@ -33,6 +37,93 @@ impl RequestTerminalCause {
             Self::ReadTimeout => "upstream_read_timeout",
             Self::RequestTimeout => "upstream_request_timeout",
             Self::StreamReadError => "upstream_stream_read_error",
+        }
+    }
+}
+
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+pub struct RequestFailureDiagnostic {
+    pub stage: &'static str,
+    pub source: &'static str,
+    pub reason: &'static str,
+}
+
+pub fn failure_diagnostic(code: Option<&str>) -> Option<RequestFailureDiagnostic> {
+    use RequestTerminalCause::*;
+    let cause = [
+        UpstreamHttpStatus,
+        ClientDisconnected,
+        TransportTimeout,
+        TransportOuterDeadline,
+        TransportConnectionReset,
+        TransportHttp2Reset,
+        TransportHttp2GoAway,
+        TransportBody,
+        TransportDecode,
+        TransportRequest,
+        TransportOther,
+        Http2Reset,
+        Http2GoAway,
+        ReadTimeout,
+        RequestTimeout,
+        StreamReadError,
+    ]
+    .into_iter()
+    .find(|cause| Some(cause.as_str()) == code)?;
+    let (stage, source) = match cause {
+        UpstreamHttpStatus => ("upstream_response_headers", "upstream_http_response"),
+        ClientDisconnected => ("response_delivery", "downstream_connection"),
+        Http2Reset | Http2GoAway | ReadTimeout | RequestTimeout | StreamReadError => {
+            ("upstream_response_body", "upstream_stream")
+        }
+        _ => ("upstream_transport", "upstream_transport"),
+    };
+    Some(RequestFailureDiagnostic {
+        stage,
+        source,
+        reason: cause.as_str(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_require_persisted_allowlisted_evidence() {
+        for code in [
+            None,
+            Some("http_404"),
+            Some("http_499"),
+            Some("Bearer private-canary"),
+        ] {
+            assert_eq!(failure_diagnostic(code), None);
+        }
+        for (cause, stage, source) in [
+            (
+                RequestTerminalCause::UpstreamHttpStatus,
+                "upstream_response_headers",
+                "upstream_http_response",
+            ),
+            (
+                RequestTerminalCause::ClientDisconnected,
+                "response_delivery",
+                "downstream_connection",
+            ),
+            (
+                RequestTerminalCause::Http2Reset,
+                "upstream_response_body",
+                "upstream_stream",
+            ),
+        ] {
+            assert_eq!(
+                failure_diagnostic(Some(cause.as_str())),
+                Some(RequestFailureDiagnostic {
+                    stage,
+                    source,
+                    reason: cause.as_str(),
+                })
+            );
         }
     }
 }

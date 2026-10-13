@@ -78,7 +78,8 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
         return Rejection {
             body: fallback_body(),
             terminal_cause: super::upstream_response::rejected_response_terminal_cause(response)
-                .await,
+                .await
+                .or(Some(RequestTerminalCause::UpstreamHttpStatus)),
         };
     }
     let mut content_types = response.headers().get_all(header::CONTENT_TYPE).iter();
@@ -107,7 +108,8 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
         drop(response);
         return Rejection {
             body: fallback_body(),
-            terminal_cause: None,
+            terminal_cause: (!status.is_success())
+                .then_some(RequestTerminalCause::UpstreamHttpStatus),
         };
     }
     let mut stream = response.bytes_stream();
@@ -118,18 +120,24 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
                 Some(Ok(chunk)) if chunk.len() <= MAX_ERROR_BYTES.saturating_sub(body.len()) => {
                     body.extend_from_slice(&chunk);
                 }
-                Some(Ok(_)) | Some(Err(_)) => return fallback_body(),
-                None => return safe_error_body(&body),
+                Some(Ok(_)) => return (fallback_body(), None),
+                Some(Err(error)) => {
+                    return (
+                        fallback_body(),
+                        super::upstream_response::terminal_cause_from_stream_error(error),
+                    );
+                }
+                None => return (safe_error_body(&body), None),
             }
         }
-        fallback_body()
+        (fallback_body(), None)
     };
-    let body = tokio::time::timeout(MAX_ERROR_WAIT, read)
+    let (body, terminal_cause) = tokio::time::timeout(MAX_ERROR_WAIT, read)
         .await
-        .unwrap_or_else(|_| fallback_body());
+        .unwrap_or_else(|_| (fallback_body(), None));
     Rejection {
         body,
-        terminal_cause: None,
+        terminal_cause: terminal_cause.or(Some(RequestTerminalCause::UpstreamHttpStatus)),
     }
 }
 
@@ -335,7 +343,10 @@ mod tests {
             ))
             .await;
             assert_eq!(tokio::time::Instant::now(), started);
-            assert_eq!(result.terminal_cause, None);
+            assert_eq!(
+                result.terminal_cause,
+                Some(RequestTerminalCause::UpstreamHttpStatus)
+            );
             if code == "insufficient_user_quota" {
                 let value: Value = serde_json::from_slice(&result.body).unwrap();
                 assert_eq!(value["error"]["code"], "insufficient_quota");
@@ -358,6 +369,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn rejection_status_is_evidence_without_guessing_its_specific_cause() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::from_u16(499).unwrap()] {
+            let result = read_rejection(response(
+                status,
+                "application/json",
+                None,
+                Box::pin(stream::iter([Ok(Bytes::from_static(
+                    b"{\"error\":\"Bearer private-canary\"}",
+                ))])),
+            ))
+            .await;
+            assert_eq!(result.body, fallback_body());
+            assert_eq!(
+                result.terminal_cause,
+                Some(RequestTerminalCause::UpstreamHttpStatus)
+            );
+        }
+        let result = read_rejection(response(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            None,
+            Box::pin(stream::iter([Err(
+                super::super::upstream_response::UPSTREAM_HTTP2_RESET,
+            )])),
+        ))
+        .await;
+        assert_eq!(result.body, fallback_body());
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::Http2Reset)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn non_json_empty_oversized_and_success_never_poll_the_body() {
         for (status, content_type, length) in [
             (StatusCode::PAYMENT_REQUIRED, "text/html", None),
@@ -375,6 +420,10 @@ mod tests {
             let result =
                 read_rejection(response(status, content_type, length, Box::pin(body))).await;
             assert_eq!(result.body, fallback_body());
+            assert_eq!(
+                result.terminal_cause,
+                (!status.is_success()).then_some(RequestTerminalCause::UpstreamHttpStatus)
+            );
             assert_eq!(tokio::time::Instant::now(), started);
         }
         for (name, value) in [
@@ -407,7 +456,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now() - started, MAX_ERROR_WAIT);
     }
 
@@ -466,7 +518,10 @@ mod tests {
         .with_body_timeouts(started + Duration::from_millis(20), Duration::from_secs(5));
         let result = read_rejection(timed).await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::RequestTimeout)
+        );
         assert_eq!(
             tokio::time::Instant::now() - started,
             Duration::from_millis(20)
@@ -520,7 +575,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now(), started);
         let result = read_rejection(response(
             StatusCode::BAD_GATEWAY,
@@ -530,7 +588,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         assert_eq!(tokio::time::Instant::now() - started, MAX_ERROR_WAIT);
         let capped = stream::iter([
             Ok(Bytes::from(vec![b'x'; 64 * 1024])),
@@ -544,7 +605,10 @@ mod tests {
         ))
         .await;
         assert_eq!(result.body, fallback_body());
-        assert_eq!(result.terminal_cause, None);
+        assert_eq!(
+            result.terminal_cause,
+            Some(RequestTerminalCause::UpstreamHttpStatus)
+        );
         let started = tokio::time::Instant::now();
         let timed = response(
             StatusCode::BAD_GATEWAY,

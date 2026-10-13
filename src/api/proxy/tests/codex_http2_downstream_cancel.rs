@@ -272,6 +272,10 @@ async fn assert_network_cancellation(reset_stream: bool) {
     assert_eq!(rows[0].request_id, request_id);
     assert_eq!(rows[0].status_code, Some(499));
     assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(
+        rows[0].terminal_cause_code.as_deref(),
+        Some("client_disconnected")
+    );
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     assert_eq!(rows[0].cost, "0");
     assert_eq!(
