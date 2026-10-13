@@ -371,9 +371,21 @@ fn build_codex_http2_test_client(
     policy: provider::CodexTransportPolicy,
     keep_alive_interval: Duration,
 ) -> Result<wreq::Client, wreq::Error> {
-    codex_http_client_builder(policy, keep_alive_interval)
-        .http2_only()
-        .build()
+    codex_http_protocol_test_builder(policy, keep_alive_interval, http::Version::HTTP_2).build()
+}
+
+#[cfg(test)]
+fn codex_http_protocol_test_builder(
+    policy: provider::CodexTransportPolicy,
+    keep_alive_interval: Duration,
+    version: http::Version,
+) -> wreq::ClientBuilder {
+    let builder = codex_http_client_builder(policy, keep_alive_interval);
+    match version {
+        http::Version::HTTP_11 => builder.http1_only(),
+        http::Version::HTTP_2 => builder.http2_only(),
+        _ => panic!("unsupported synthetic protocol arm"),
+    }
 }
 
 fn codex_http_client_builder(

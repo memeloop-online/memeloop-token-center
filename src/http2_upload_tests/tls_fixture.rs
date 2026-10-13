@@ -7,9 +7,9 @@ pub(super) trait FixtureStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<Socket: AsyncRead + AsyncWrite + Unpin + Send> FixtureStream for Socket {}
 
-pub(super) struct TlsFixture {
-    pub(super) acceptor: TlsAcceptor,
-    pub(super) roots: CertStore,
+pub(crate) struct TlsFixture {
+    pub(crate) acceptor: TlsAcceptor,
+    pub(crate) roots: CertStore,
 }
 
 async fn openssl(directory: &Path, arguments: &[&str]) {
@@ -31,7 +31,7 @@ async fn openssl(directory: &Path, arguments: &[&str]) {
 }
 
 impl TlsFixture {
-    pub(super) async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         openssl(
             directory.path(),

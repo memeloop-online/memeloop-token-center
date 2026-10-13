@@ -24,13 +24,13 @@ const HEADERS_DELAY: Duration = Duration::from_secs(42);
 const REUSE_IDLE: Duration = Duration::from_secs(25);
 const WINDOW: i64 = 65_535;
 const PRIME: &[u8] = b"prime";
-const HOST: &str = "upload.example.test";
+pub(crate) const HOST: &str = "upload.example.test";
 
 #[path = "http2_upload_tests/multiplex.rs"]
 mod multiplex;
 
 #[path = "http2_upload_tests/tls_fixture.rs"]
-mod tls_fixture;
+pub(crate) mod tls_fixture;
 
 #[path = "http2_upload_tests/native_encoded.rs"]
 pub(crate) mod native_encoded;
@@ -170,7 +170,7 @@ async fn accept_socks(socket: &mut TcpStream) {
     accept_socks_at_port(socket, 80).await;
 }
 
-async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
+pub(crate) async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
     let mut greeting = [0; 2];
     socket.read_exact(&mut greeting).await.unwrap();
     assert_eq!(greeting[0], 5);
