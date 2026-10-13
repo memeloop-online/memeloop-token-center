@@ -8,6 +8,8 @@ use std::sync::{
 enum Failure {
     PreHeaderReset,
     PreHeaderRefusedReset,
+    ResetThenSuccess,
+    ResetThenTransientThenReset,
     PreHeaderSilence,
     PostHeaderSilence,
     RejectedReset,
@@ -53,6 +55,26 @@ async fn http2_failure_upstream(
                             match failure {
                                 Failure::PreHeaderReset => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PreHeaderRefusedReset => response.send_reset(http2::Reason::REFUSED_STREAM),
+                                Failure::ResetThenSuccess if attempt == 0 => response.send_reset(http2::Reason::CANCEL),
+                                Failure::ResetThenSuccess => {
+                                    let headers = http::Response::builder()
+                                        .status(200)
+                                        .header(http::header::CONTENT_TYPE, "text/event-stream")
+                                        .body(())
+                                        .unwrap();
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    body.send_data(Bytes::from(completed_codex_sse("recovered")), true).unwrap();
+                                }
+                                Failure::ResetThenTransientThenReset if attempt == 1 => {
+                                    let headers = http::Response::builder()
+                                        .status(400)
+                                        .header(http::header::CONTENT_TYPE, "application/json")
+                                        .body(())
+                                        .unwrap();
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    body.send_data(Bytes::from_static(br#"{"error":{"type":"request_error","message":"The service is under high demand."}}"#), true).unwrap();
+                                }
+                                Failure::ResetThenTransientThenReset => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PreHeaderSilence => held_headers.push(response),
                                 Failure::PostHeaderSilence => {
                                     let headers = http::Response::builder()
@@ -159,9 +181,14 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert!(!body.contains("upstream_http2_reset"));
     wait_for_request_settlement(&fixture, 1).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let expected_attempts = if matches!(
+    let expected_attempts = if matches!(failure, Failure::ResetThenTransientThenReset) {
+        3
+    } else if matches!(
         failure,
-        Failure::RejectedPriorReset | Failure::RejectedFinalReset
+        Failure::RejectedPriorReset
+            | Failure::RejectedFinalReset
+            | Failure::PreHeaderReset
+            | Failure::PreHeaderRefusedReset
     ) {
         2
     } else {
@@ -170,7 +197,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(
         received.load(Ordering::SeqCst),
         expected_attempts,
-        "only the initial 429 permits candidate failover; 502 and transport failures forbid replay"
+        "H2 recovery has one shared replay allowance even across the permitted 400 retry"
     );
     release.send(()).unwrap();
     server.await.unwrap();
@@ -185,15 +212,16 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(rows[0].cost, "0");
     let expected_error = match failure {
-        Failure::PreHeaderReset | Failure::PreHeaderRefusedReset => {
-            "upstream_transport_http2_reset"
-        }
+        Failure::PreHeaderReset
+        | Failure::PreHeaderRefusedReset
+        | Failure::ResetThenTransientThenReset => "upstream_transport_http2_reset",
         Failure::PreHeaderSilence => "upstream_request_timeout",
         Failure::PostHeaderSilence => "upstream_read_timeout",
         Failure::RejectedReset
         | Failure::RejectedPlain
         | Failure::RejectedPriorReset
         | Failure::RejectedFinalReset => "http_502",
+        Failure::ResetThenSuccess => unreachable!(),
     };
     let expected_cause = match failure {
         Failure::RejectedReset | Failure::RejectedFinalReset => Some("upstream_http2_reset"),
@@ -220,7 +248,10 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
         .unwrap();
     assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
-    let (expected_account, expected_route) = if expected_attempts == 2 {
+    let (expected_account, expected_route) = if matches!(
+        failure,
+        Failure::RejectedPriorReset | Failure::RejectedFinalReset
+    ) {
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let route_id: String = sqlx::query_scalar(
             "SELECT id FROM model_routes WHERE upstream_account_id = $1 AND public_model = $2",
@@ -246,13 +277,77 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
 }
 
 #[tokio::test]
-async fn pre_header_rst_stream_does_not_replay_or_double_settle() {
+async fn pre_header_rst_stream_recovers_once_without_double_settlement() {
     assert_terminal_failure(Failure::PreHeaderReset, "h2-pre-header-rst").await;
 }
 
 #[tokio::test]
-async fn pre_header_refused_stream_does_not_replay_or_double_settle() {
+async fn pre_header_refused_stream_recovers_once_without_double_settlement() {
     assert_terminal_failure(Failure::PreHeaderRefusedReset, "h2-pre-header-refused").await;
+}
+
+#[tokio::test]
+async fn pre_header_reset_recovery_allowance_is_not_refreshed_by_transient_400() {
+    assert_terminal_failure(
+        Failure::ResetThenTransientThenReset,
+        "h2-recovery-shared-400",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pre_header_reset_then_success_settles_one_logical_request() {
+    for stream in [false, true] {
+        let fixture = codex_route_fixture(if stream {
+            "h2-recover-stream"
+        } else {
+            "h2-recover-buffered"
+        })
+        .await;
+        set_short_http2_deadline(&fixture).await;
+        fixture.state.codex_clients.install_test_client(
+            wreq::Client::builder()
+                .http2_only()
+                .retry(wreq::retry::Policy::never())
+                .no_proxy()
+                .build()
+                .unwrap(),
+        );
+        let (endpoint, received, release, server) =
+            http2_failure_upstream(Failure::ResetThenSuccess).await;
+        let response = send_codex_route_to_endpoint(
+            &fixture,
+            endpoint,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "recover", "stream": stream}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("recovered"));
+        wait_for_request_settlement(&fixture, 1).await;
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status_code, Some(200));
+        assert_exactly_once_side_effects_for(
+            &fixture,
+            rows[0].request_id,
+            Some("resp-codex"),
+            fixture.upstream_account_id,
+            fixture.route_id,
+        )
+        .await;
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]

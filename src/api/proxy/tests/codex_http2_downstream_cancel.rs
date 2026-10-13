@@ -6,6 +6,8 @@ use std::sync::{
 
 const PREFIX: &[u8] = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-h2-cancelled\"}}\n\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc-cancel\",\"call_id\":\"call-cancel\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc-cancel\",\"delta\":\"{}\"}\n\n",
     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered before cancellation\"}\n\n"
 )
 .as_bytes();
@@ -25,7 +27,7 @@ impl Drop for StalledHttp2 {
 }
 
 impl StalledHttp2 {
-    async fn start() -> Self {
+    async fn start(pre_header: bool, recover_first: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let posts = Arc::new(AtomicUsize::new(0));
@@ -58,7 +60,21 @@ impl StalledHttp2 {
                                         assert_eq!(request.version(), http::Version::HTTP_2);
                                         assert_eq!(request.method(), http::Method::POST);
                                         assert_eq!(request.uri().path(), codex_transport::RESPONSES_PATH);
-                                        count.fetch_add(1, Ordering::SeqCst);
+                                        let attempt = count.fetch_add(1, Ordering::SeqCst);
+                                        if recover_first && attempt == 0 {
+                                            response.send_reset(http2::Reason::CANCEL);
+                                            held_requests.push(request);
+                                            continue;
+                                        }
+                                        if pre_header {
+                                            let reset_sender = reset_sender.clone();
+                                            monitors.spawn(async move {
+                                                let reason = std::future::poll_fn(|context| response.poll_reset(context)).await.unwrap();
+                                                reset_sender.send(reason).unwrap();
+                                            });
+                                            held_requests.push(request);
+                                            continue;
+                                        }
                                         let headers = http::Response::builder()
                                             .status(200)
                                             .header(http::header::CONTENT_TYPE, "text/event-stream")
@@ -99,11 +115,11 @@ impl StalledHttp2 {
         }
     }
 
-    async fn finish(&mut self) {
+    async fn finish(&mut self, expected_posts: usize) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             self.posts.load(Ordering::SeqCst),
-            1,
+            expected_posts,
             "cancelled POST must not replay"
         );
         assert!(
@@ -146,11 +162,15 @@ async fn single_dispatch_route(fixture: &CodexRouteFixture) -> ResolvedUpstream 
     }
 }
 
-async fn assert_network_cancellation(reset_stream: bool) {
-    let label = if reset_stream {
-        "h2-downstream-rst"
-    } else {
-        "h2-downstream-tcp-close"
+async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recover_first: bool) {
+    let expected_posts = if recover_first { 2 } else { 1 };
+    let label = match (reset_stream, pre_header, recover_first) {
+        (true, _, true) => "h2-downstream-recovery-rst",
+        (false, _, true) => "h2-downstream-recovery-tcp-close",
+        (true, false, false) => "h2-downstream-rst",
+        (false, false, false) => "h2-downstream-tcp-close",
+        (true, true, false) => "h2-downstream-pre-header-rst",
+        (false, true, false) => "h2-downstream-pre-header-tcp-close",
     };
     let mut fixture = codex_route_fixture(label).await;
     fixture.state.proxy_lifecycle_permits = Arc::new(tokio::sync::Semaphore::new(1));
@@ -162,7 +182,7 @@ async fn assert_network_cancellation(reset_stream: bool) {
         )
         .unwrap(),
     );
-    let mut upstream = StalledHttp2::start().await;
+    let mut upstream = StalledHttp2::start(pre_header, recover_first).await;
     let endpoint = upstream.endpoint.clone();
     let app = router_for_role(fixture.state.clone(), RuntimeRole::Gateway).layer(
         axum::middleware::from_fn(
@@ -200,28 +220,47 @@ async fn assert_network_cancellation(reset_stream: bool) {
             true,
         )
         .unwrap();
-    let response = response.await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.version(), http::Version::HTTP_2);
-    let request_id = response.headers()[REQUEST_ID_HEADER]
-        .to_str()
-        .unwrap()
-        .parse::<Uuid>()
-        .unwrap();
-    let mut body = response.into_body();
-    let mut rendered = String::new();
-    while !rendered.contains("delivered before cancellation") {
-        let frame = body
-            .data()
-            .await
-            .expect("output before cancellation")
-            .unwrap();
-        body.flow_control().release_capacity(frame.len()).unwrap();
-        rendered.push_str(std::str::from_utf8(&frame).unwrap());
+    let mut body = None;
+    let mut request_id = None;
+    if pre_header {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while upstream.posts.load(Ordering::SeqCst) < expected_posts {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upstream request must arrive before cancellation");
+    } else {
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        request_id = Some(
+            response.headers()[REQUEST_ID_HEADER]
+                .to_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        );
+        let mut response_body = response.into_body();
+        let mut rendered = String::new();
+        while !rendered.contains("delivered before cancellation") {
+            let frame = response_body
+                .data()
+                .await
+                .expect("output before cancellation")
+                .unwrap();
+            response_body
+                .flow_control()
+                .release_capacity(frame.len())
+                .unwrap();
+            rendered.push_str(std::str::from_utf8(&frame).unwrap());
+        }
+        assert!(rendered.contains("response.created"));
+        assert!(rendered.contains("call-cancel"));
+        assert!(!rendered.contains("response.completed"));
+        assert!(!rendered.contains("[DONE]"));
+        body = Some(response_body);
     }
-    assert!(rendered.contains("response.created"));
-    assert!(!rendered.contains("response.completed"));
-    assert!(!rendered.contains("[DONE]"));
     assert!(fixture.state.proxy_lifecycle_permits.try_acquire().is_err());
     assert!(matches!(
         fixture
@@ -261,7 +300,7 @@ async fn assert_network_cancellation(reset_stream: bool) {
         .await
         .expect("dispatch permit must be returned without upstream EOF");
     wait_for_request_settlement(&fixture, 1).await;
-    upstream.finish().await;
+    upstream.finish(expected_posts).await;
     let rows = fixture
         .state
         .db
@@ -269,7 +308,10 @@ async fn assert_network_cancellation(reset_stream: bool) {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].request_id, request_id);
+    let settled_request_id = rows[0].request_id;
+    if let Some(request_id) = request_id {
+        assert_eq!(settled_request_id, request_id);
+    }
     assert_eq!(rows[0].status_code, Some(499));
     assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
@@ -278,7 +320,7 @@ async fn assert_network_cancellation(reset_stream: bool) {
         rows[0].usage_basis,
         Some(crate::model::RequestUsageBasis::NotObserved)
     );
-    assert_exactly_once_side_effects(&fixture, request_id, None).await;
+    assert_exactly_once_side_effects(&fixture, settled_request_id, None).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0",
@@ -305,7 +347,7 @@ async fn assert_network_cancellation(reset_stream: bool) {
         format!(
             "MTC_CONTROLLED_HTTP2_CANCEL {}\n",
             json!({
-                "case": label, "posts": 1, "upstream_reset": "CANCEL", "settlements": 1,
+                "case": label, "pre_header": pre_header, "posts": expected_posts, "upstream_reset": "CANCEL", "settlements": 1,
                 "status": 499, "error_code": "client_cancelled", "lifecycle_permit_released": true,
                 "dispatch_permit_released": true, "upstream_failures": 0
             })
@@ -317,10 +359,17 @@ async fn assert_network_cancellation(reset_stream: bool) {
 
 #[tokio::test]
 async fn real_http2_downstream_reset_and_tcp_close_cancel_once_and_release_permits() {
-    for reset_stream in [true, false] {
+    for (reset_stream, pre_header, recover_first) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, false),
+        (true, true, true),
+        (false, true, true),
+    ] {
         tokio::time::timeout(
             Duration::from_secs(15),
-            assert_network_cancellation(reset_stream),
+            assert_network_cancellation(reset_stream, pre_header, recover_first),
         )
         .await
         .expect("real HTTP/2 cancellation must not wait for a provider timeout");
