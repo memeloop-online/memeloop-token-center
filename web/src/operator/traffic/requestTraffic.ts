@@ -272,6 +272,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   };
   const supplierError = event.supplier_error ?? previous?.supplier_error;
   if (supplierError !== undefined || event.supplier_error === null) request.supplier_error = supplierError ?? null;
+  const failureDiagnostic = event.failure_diagnostic ?? previous?.failure_diagnostic;
+  if (failureDiagnostic !== undefined || event.failure_diagnostic === null) request.failure_diagnostic = failureDiagnostic ?? null;
   const credentialIdentity = event.credential_identity ?? previous?.credential_identity;
   const firstOutput = event.first_output_ms ?? previous?.first_output_ms;
   const generationDuration = event.generation_duration_ms ?? previous?.generation_duration_ms;

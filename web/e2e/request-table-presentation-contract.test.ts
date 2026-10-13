@@ -21,7 +21,7 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(known.hint, known.cause);
   assert.equal(requestErrorCopy(reset.error_code, 'en'), requestFailureCause(reset, 'en'));
   const generic = requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502' }, 'en');
-  assert.equal(generic.cause, 'Recorded cause: Unknown (no specific cause recorded)');
+  assert.equal(generic.cause, 'Recorded cause: No specific cause was captured at the time');
   assert.equal(generic.hint, generic.cause);
   assert.equal(requestFailureCause({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en'), null);
   assert.doesNotMatch(requestStatusCopy({ ...request, status_code: 502, error_code: 'Bearer secret-token' }, 'en').hint, /secret-token/);
@@ -37,13 +37,13 @@ test('502 tooltip and detail share recorded cause, and missing evidence stays ex
   assert.equal(requestStatusCopy({ ...http2, error_code: 'upstream_http2_reset' }, 'zh-CN').hint, '已记录原因: 上游 HTTP/2 流被重置');
   assert.equal(requestStatusCopy({ ...request, status_code: 200, error_code: 'upstream_stream' }, 'en').hint, 'Recorded cause: The upstream response stream was interrupted');
   assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_http2_reset' }, 'en').hint, 'Recorded cause: The upstream HTTP/2 stream was reset');
-  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: Unknown (no specific cause recorded)');
+  assert.equal(requestStatusCopy({ ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token' }, 'en').hint, 'Recorded cause: No specific cause was captured at the time');
 });
 
 test('hostile or unrecorded terminal cause codes never reach operators and never mask a known recorded cause', () => {
   const hostile = { ...request, status_code: 502, error_code: 'http_502', terminal_cause_code: 'Bearer secret-token\r\nSet-Cookie: session=attacker' };
   const hostileCopy = requestStatusCopy(hostile, 'en');
-  assert.equal(hostileCopy.hint, 'Recorded cause: Unknown (no specific cause recorded)');
+  assert.equal(hostileCopy.hint, 'Recorded cause: No specific cause was captured at the time');
   assert.equal(hostileCopy.cause, hostileCopy.hint);
   assert.doesNotMatch(hostileCopy.hint, /secret-token|Set-Cookie|attacker/);
   assert.equal(requestFailureCause(hostile, 'zh-CN'), null);
