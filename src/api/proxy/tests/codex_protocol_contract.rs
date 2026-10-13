@@ -31,7 +31,7 @@ async fn complete(post: Post) {
     drop(post);
 }
 
-async fn settled(fixture: &CodexRouteFixture, status: u16) {
+async fn settled(fixture: &CodexRouteFixture, status: i64) {
     wait_for_request_settlement(fixture, 1).await;
     let rows = fixture
         .state
@@ -52,8 +52,9 @@ async fn settled(fixture: &CodexRouteFixture, status: u16) {
         .await;
 }
 
-async fn streaming(version: http::Version, cancel: bool) {
-    let fixture = codex_route_fixture("protocol-stream").await;
+async fn streaming(version: http::Version, cancel: bool, silence: bool) {
+    let mut fixture = codex_route_fixture("protocol-stream").await;
+    fixture.state.proxy_lifecycle_permits = Arc::new(tokio::sync::Semaphore::new(1));
     let mut peer = Peer::start(version, crate::provider::CodexTransportPolicy::default()).await;
     fixture
         .state
@@ -89,6 +90,45 @@ async fn streaming(version: http::Version, cancel: bool) {
     }
     assert!(rendered.contains("call-contract"));
     assert!(!rendered.contains("response.completed"));
+    assert!(fixture.state.proxy_lifecycle_permits.try_acquire().is_err());
+    if silence {
+        let started = std::time::Instant::now();
+        let until = tokio::time::sleep(Duration::from_secs(310));
+        tokio::pin!(until);
+        let mut progress_count = rendered.matches("event: response.in_progress").count();
+        let initial_progress = progress_count;
+        let mut last_progress = std::time::Instant::now();
+        loop {
+            let next_progress = async {
+                loop {
+                    let chunk = body
+                        .next()
+                        .await
+                        .expect("stream must remain open during silence")
+                        .unwrap();
+                    rendered.push_str(std::str::from_utf8(&chunk).unwrap());
+                    let count = rendered.matches("event: response.in_progress").count();
+                    if count > progress_count {
+                        return count;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = &mut until => break,
+                count = tokio::time::timeout(Duration::from_secs(25), next_progress) => {
+                    progress_count = count.expect("continuous progress during real upstream silence");
+                    assert!(last_progress.elapsed() <= Duration::from_secs(25));
+                    last_progress = std::time::Instant::now();
+                    let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status_code, None, "must not settle during silence");
+                }
+            }
+        }
+        assert!(started.elapsed() >= Duration::from_secs(310));
+        assert!(last_progress.elapsed() <= Duration::from_secs(25));
+        assert!(progress_count - initial_progress >= 18);
+    }
     if cancel {
         drop(body);
         tokio::time::timeout(Duration::from_secs(3), peer.cancelled.recv())
@@ -111,6 +151,13 @@ async fn streaming(version: http::Version, cancel: bool) {
         1,
         "tool output must never replay"
     );
+    let _permit = tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.state.proxy_lifecycle_permits.acquire(),
+    )
+    .await
+    .expect("lifecycle permit must be released")
+    .unwrap();
 }
 
 async fn compact(version: http::Version) {
@@ -176,11 +223,65 @@ async fn compact(version: http::Version) {
 async fn native_tls_socks_h1_h2_stream_tool_cancel_and_compact_contract() {
     for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
         tokio::time::timeout(Duration::from_secs(60), async {
-            streaming(version, false).await;
-            streaming(version, true).await;
+            streaming(version, false, false).await;
+            streaming(version, true, false).await;
             compact(version).await;
         })
         .await
         .expect("bounded native protocol contract");
+    }
+}
+
+#[tokio::test]
+async fn native_tls_socks_h1_h2_310_seconds_silence_keeps_progress_and_settles_once() {
+    let arm = |version| async move {
+        tokio::time::timeout(Duration::from_secs(360), streaming(version, false, true))
+            .await
+            .expect("real silence contract must finish within 360 seconds");
+    };
+    tokio::join!(arm(http::Version::HTTP_11), arm(http::Version::HTTP_2));
+}
+
+#[tokio::test]
+async fn native_builder_tls_socks_negotiates_real_response_version() {
+    for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut peer =
+                Peer::start(version, crate::provider::CodexTransportPolicy::default()).await;
+            let request = peer
+                .client
+                .post(format!(
+                    "{}{}",
+                    peer.endpoint(),
+                    codex_transport::RESPONSES_PATH
+                ))
+                .header(header::AUTHORIZATION, "Bearer upstream-access-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{\"input\":\"capability\"}")
+                .build()
+                .unwrap();
+            let send = peer.client.execute(request);
+            tokio::pin!(send);
+            let post = tokio::select! {
+                post = peer.post() => post,
+                _ = &mut send => panic!("peer must observe native request"),
+            };
+            assert_eq!(post.body["input"], "capability");
+            emit(&post, CREATED).await;
+            complete(post).await;
+            let response = send.await.unwrap();
+            assert_eq!(response.version(), version);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("response.completed")
+            );
+            assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+        })
+        .await
+        .expect("bounded real response version contract");
     }
 }
