@@ -16,7 +16,6 @@ use futures_util::StreamExt;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
-pub(crate) const GATEWAY_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
 pub(crate) const GATEWAY_BODY_ROUTE_CLASS_COUNT: usize = 4;
@@ -135,7 +134,6 @@ pub(crate) enum GatewayBodyAdmissionError {
 #[cfg(test)]
 pub(crate) async fn admit_gateway_request_body(
     request: Request,
-    deadline: Duration,
     permits: Arc<tokio::sync::Semaphore>,
     responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
@@ -146,7 +144,6 @@ pub(crate) async fn admit_gateway_request_body(
     );
     admit_gateway_request_body_with_memory(
         request,
-        deadline,
         permits,
         responses_permits,
         responses_maximum,
@@ -162,7 +159,6 @@ pub(crate) async fn admit_gateway_request_body(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_gateway_request_body_with_memory(
     request: Request,
-    deadline: Duration,
     permits: Arc<tokio::sync::Semaphore>,
     responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
@@ -191,7 +187,7 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
         .map(memory::ProxyMemoryBudget::reservation);
     admit_request_body_for_route(
         request,
-        deadline,
+        None,
         maximum,
         route_class,
         reservation,
@@ -221,7 +217,7 @@ pub(crate) async fn admit_request_body(
 ) -> Result<Request, GatewayBodyAdmissionError> {
     admit_request_body_for_route(
         request,
-        deadline,
+        Some(deadline),
         maximum,
         GatewayBodyRouteClass::Other,
         None,
@@ -230,9 +226,24 @@ pub(crate) async fn admit_request_body(
     .await
 }
 
+// Inference uploads can contain an entire conversation. Wait for completion or
+// cancellation regardless of elapsed time; only explicit control/webhook readers
+// impose a deadline. Dropping this future still drops all body/spool guards.
+async fn read_with_deadline<F: std::future::Future>(
+    deadline: Option<Duration>,
+    read: F,
+) -> Result<F::Output, GatewayBodyAdmissionError> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout(deadline, read)
+            .await
+            .map_err(|_| GatewayBodyAdmissionError::Timeout),
+        None => Ok(read.await),
+    }
+}
+
 async fn admit_request_body_for_route(
     request: Request,
-    deadline: Duration,
+    deadline: Option<Duration>,
     maximum: usize,
     route_class: GatewayBodyRouteClass,
     reservation: Option<Arc<memory::ProxyMemoryReservation>>,
@@ -269,14 +280,13 @@ async fn admit_request_body_for_route(
             .min(maximum);
         let declared_content_length_usize =
             declared_content_length.and_then(|length| usize::try_from(length).ok());
-        let spool = tokio::time::timeout(
+        let spool = read_with_deadline(
             deadline,
             request_spool
                 .ok_or(GatewayBodyAdmissionError::RequestSpoolUnavailable)?
                 .capture(body, read_maximum, declared_content_length_usize),
         )
-        .await
-        .map_err(|_| GatewayBodyAdmissionError::Timeout)?
+        .await?
         .map_err(|error| match error {
             request_spool::RequestSpoolCaptureError::CapacityExhausted => {
                 GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
@@ -333,9 +343,7 @@ async fn admit_request_body_for_route(
             }
             Ok(retained.freeze())
         };
-        let bytes = tokio::time::timeout(deadline, read)
-            .await
-            .map_err(|_| GatewayBodyAdmissionError::Timeout)??;
+        let bytes = read_with_deadline(deadline, read).await??;
         reservation.release(
             maximum.saturating_sub(bytes.len()),
             memory::REQUEST_MEMORY_WEIGHT,
@@ -343,9 +351,8 @@ async fn admit_request_body_for_route(
         parts.extensions.insert(reservation);
         return Ok(Request::from_parts(parts, Body::from(bytes)));
     }
-    let bytes = tokio::time::timeout(deadline, to_bytes(body, maximum))
-        .await
-        .map_err(|_| GatewayBodyAdmissionError::Timeout)?
+    let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
+        .await?
         .map_err(|_| {
             rejected_body(
                 route_class,
@@ -396,7 +403,7 @@ fn rejected_body(
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, sync::Arc, time::Instant};
+    use std::{convert::Infallible, sync::Arc};
 
     use axum::http::Request;
     use bytes::Bytes;
@@ -427,7 +434,6 @@ mod tests {
             .unwrap();
         let result = admit_gateway_request_body_with_memory(
             request,
-            Duration::from_secs(1),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
@@ -459,7 +465,6 @@ mod tests {
             .unwrap();
         let result = admit_gateway_request_body_with_memory(
             request,
-            Duration::from_secs(1),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
@@ -489,7 +494,6 @@ mod tests {
             .unwrap();
         let admitted = admit_gateway_request_body_with_memory(
             request,
-            Duration::from_secs(1),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
@@ -527,7 +531,6 @@ mod tests {
             .unwrap();
         let winner = admit_gateway_request_body_with_memory(
             winner,
-            Duration::from_secs(1),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
@@ -551,7 +554,6 @@ mod tests {
         assert!(matches!(
             admit_gateway_request_body_with_memory(
                 loser,
-                Duration::from_secs(1),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 16 * 1024 * 1024,
@@ -572,7 +574,6 @@ mod tests {
             .unwrap();
         let recovered = admit_gateway_request_body_with_memory(
             recovered,
-            Duration::from_secs(1),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             16 * 1024 * 1024,
@@ -587,28 +588,36 @@ mod tests {
         assert_eq!(spool.snapshot().used_bytes, 0);
     }
 
-    #[tokio::test]
-    async fn absolute_deadline_rejects_a_drip_body() {
-        let drip = stream::unfold(0_u64, |index| async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            Some((Ok::<_, Infallible>(Bytes::from_static(b"x")), index + 1))
-        });
-        let request = Request::post("/v1/chat/completions")
-            .body(Body::from_stream(drip))
-            .expect("drip request");
-        let started = Instant::now();
-        assert!(matches!(
-            admit_gateway_request_body(
+    #[tokio::test(start_paused = true)]
+    async fn gateway_uploads_wait_beyond_the_former_deadline() {
+        for path in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+        ] {
+            let body = stream::once(async {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok::<_, Infallible>(Bytes::from_static(b"{}"))
+            });
+            let request = Request::post(path).body(Body::from_stream(body)).unwrap();
+            let admitted = admit_gateway_request_body(
                 request,
-                Duration::from_millis(35),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 16 * 1024 * 1024,
             )
-            .await,
-            Err(GatewayBodyAdmissionError::Timeout)
-        ));
-        assert!(started.elapsed() < Duration::from_millis(200));
+            .await
+            .unwrap();
+            if path.starts_with("/v1/responses") {
+                let captured = admitted
+                    .extensions()
+                    .get::<Arc<request_spool::RequestSpool>>()
+                    .unwrap();
+                assert_eq!(captured.len(), 2);
+            } else {
+                assert_eq!(to_bytes(admitted.into_body(), 1024).await.unwrap(), "{}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -626,7 +635,6 @@ mod tests {
             assert!(
                 admit_gateway_request_body(
                     exact,
-                    Duration::from_secs(2),
                     Arc::new(tokio::sync::Semaphore::new(1)),
                     Arc::new(tokio::sync::Semaphore::new(1)),
                     responses_maximum,
@@ -642,7 +650,6 @@ mod tests {
                 matches!(
                     admit_gateway_request_body(
                         over,
-                        Duration::from_secs(2),
                         Arc::new(tokio::sync::Semaphore::new(1)),
                         Arc::new(tokio::sync::Semaphore::new(1)),
                         responses_maximum,
@@ -665,7 +672,6 @@ mod tests {
         assert!(matches!(
             admit_gateway_request_body(
                 request,
-                Duration::from_secs(1),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 maximum,
@@ -704,7 +710,6 @@ mod tests {
         let memory_budget = memory::ProxyMemoryBudget::new(512 * 1024 * 1024);
         let admitted = admit_gateway_request_body_with_memory(
             request,
-            Duration::from_secs(30),
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(tokio::sync::Semaphore::new(1)),
             MAXIMUM,
@@ -727,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn responses_spool_timeout_releases_file_bytes_and_read_permits() {
+    async fn responses_spool_cancellation_releases_file_bytes_and_read_permits() {
         let directory = tempfile::tempdir().unwrap();
         let spool = request_spool::RequestSpoolAdmission::new(
             directory.path().to_owned(),
@@ -747,7 +752,6 @@ mod tests {
         let capture = tokio::spawn(async move {
             admit_gateway_request_body_with_memory(
                 request,
-                Duration::from_secs(60),
                 active_body_permits,
                 active_responses_permits,
                 32 * 1024 * 1024,
@@ -767,10 +771,13 @@ mod tests {
         assert_eq!(responses_permits.available_permits(), 0);
         assert_eq!(spool.snapshot().active_files, 1);
         tokio::time::advance(Duration::from_secs(61)).await;
-        assert!(matches!(
-            capture.await.unwrap(),
-            Err(GatewayBodyAdmissionError::Timeout)
-        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !capture.is_finished(),
+            "elapsed upload time must not cancel a request"
+        );
+        capture.abort();
+        assert!(capture.await.unwrap_err().is_cancelled());
         assert_eq!(body_permits.available_permits(), 1);
         assert_eq!(responses_permits.available_permits(), 1);
         assert_eq!(spool.snapshot().used_bytes, 0);
@@ -823,7 +830,6 @@ mod tests {
         let read = tokio::spawn(async move {
             admit_gateway_request_body(
                 request,
-                Duration::from_secs(1),
                 active_permits,
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 16 * 1024 * 1024,
@@ -839,7 +845,6 @@ mod tests {
         assert!(matches!(
             admit_gateway_request_body(
                 rejected,
-                Duration::from_secs(1),
                 permits.clone(),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 16 * 1024 * 1024,
@@ -860,7 +865,6 @@ mod tests {
         assert!(matches!(
             admit_gateway_request_body(
                 failed,
-                Duration::from_secs(1),
                 permits.clone(),
                 Arc::new(tokio::sync::Semaphore::new(1)),
                 16 * 1024 * 1024,
@@ -890,7 +894,6 @@ mod tests {
         assert!(matches!(
             admit_gateway_request_body(
                 rejected,
-                Duration::from_secs(1),
                 standard.clone(),
                 responses.clone(),
                 16 * 1024 * 1024,
@@ -907,7 +910,6 @@ mod tests {
         assert!(
             admit_gateway_request_body(
                 ordinary,
-                Duration::from_secs(1),
                 standard.clone(),
                 responses.clone(),
                 16 * 1024 * 1024,

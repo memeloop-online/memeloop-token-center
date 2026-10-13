@@ -184,7 +184,6 @@ pub(super) async fn authenticate_gateway_before_body(
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         request = match crate::gateway_body::admit_gateway_request_body_with_memory(
             request,
-            crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
             state.gateway_body_read_permits.clone(),
             state.responses_body_read_permits.clone(),
             state.config.responses_body_max_bytes as usize,
