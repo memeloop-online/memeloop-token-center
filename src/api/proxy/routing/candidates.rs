@@ -387,6 +387,7 @@ mod tests {
             )),
             responses_chat: None,
             upstream_path: "/v1/responses",
+            wait_for_compaction: false,
             compact_v2_bridge: false,
             wrap_compact_as_sse: false,
             responses_anthropic: None,

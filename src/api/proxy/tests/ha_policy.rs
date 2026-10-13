@@ -209,3 +209,49 @@ async fn codex_dispatched_503_never_replays_despite_an_available_budget_and_stan
         .unwrap();
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn native_compaction_waits_past_failover_and_transport_deadlines() {
+    let fixture = codex_route_fixture("compact-no-deadline").await;
+    set_policy(
+        &fixture,
+        json!({
+            "failover_deadline_millis": 1000,
+            "connect_timeout_millis": 1000,
+            "read_timeout_millis": 1000,
+            "request_timeout_millis": 2000
+        }),
+    )
+    .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(3))
+                .set_body_raw(completed_codex_sse("compact finished"), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": [
+            {"role": "user", "content": "summarize this conversation"},
+            {"type": "compaction_trigger"}
+        ], "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("compact finished")
+    );
+    upstream.verify().await;
+}

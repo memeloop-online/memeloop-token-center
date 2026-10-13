@@ -1507,15 +1507,18 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.credential_generation),
         );
         let (result, rate_limit) = match attempt_budget
-            .send(send_proxy_route(
-                &state,
-                &headers,
-                protocol,
-                request_id,
-                &active_route,
-                selected_candidate_rank,
-                outbound_attempt,
-            ))
+            .send(
+                send_proxy_route(
+                    &state,
+                    &headers,
+                    protocol,
+                    request_id,
+                    &active_route,
+                    selected_candidate_rank,
+                    outbound_attempt,
+                ),
+                active_route.wait_for_compaction,
+            )
             .await
         {
             Ok(mut result)
