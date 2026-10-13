@@ -8,6 +8,7 @@ mod comfyui_schema;
 pub(crate) mod group_routing;
 mod protocol;
 mod siliconflow_video_schema;
+mod wasu_wan;
 pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
     validate_config as validate_comfyui_config, validate_parameters as validate_comfyui_parameters,
@@ -489,7 +490,7 @@ async fn cancel_upstream_generation(
                 )
             }
         }
-        GenerationProtocolAdapter::SiliconFlowVideoV1 => {
+        GenerationProtocolAdapter::SiliconFlowVideoV1 | GenerationProtocolAdapter::WasuWanV1 => {
             return Err(AppError::Upstream("unsupported generation driver".into()));
         }
     };
@@ -593,6 +594,13 @@ async fn submit_attempt(
             .await?;
         nonce
     };
+    if job.status == "submitting"
+        && GenerationProtocolAdapter::for_route(route)? == GenerationProtocolAdapter::WasuWanV1
+    {
+        return Err(AppError::Upstream(
+            "Wasu Wan submission outcome requires reconciliation".into(),
+        ));
+    }
     let archived = state
         .archive
         .get_bounded(&job.request_object, MAX_CONTROL_BODY)
@@ -606,6 +614,17 @@ async fn submit_attempt(
         .ok_or_else(|| AppError::Storage("generation input archive is invalid".into()))?;
     let adapter = GenerationProtocolAdapter::for_route(route)?;
     let (path, id_field) = match adapter {
+        GenerationProtocolAdapter::WasuWanV1 => {
+            wasu_wan::validate_input(&Value::Object(input.clone()))?;
+            input.insert(
+                "model".to_owned(),
+                Value::String(job.upstream_model.clone()),
+            );
+            (
+                "/api/v1/services/aigc/video-generation/video-synthesis".to_owned(),
+                "task_id",
+            )
+        }
         GenerationProtocolAdapter::SeedanceV3 => {
             input.insert(
                 "model".to_owned(),
@@ -659,11 +678,30 @@ async fn submit_attempt(
             ("/video/submit".to_owned(), "requestId")
         }
     };
-    let outbound_http = route_http(state, route, &route.base_url).await?;
-    let request = outbound_http
-        .post(format!("{}{}", route.base_url, path))
+    let submit_url = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+        wasu_wan::url(&route.base_url, &path)?
+    } else {
+        format!("{}{}", route.base_url, path)
+    };
+    let outbound_http = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+        wasu_wan::submit_http(
+            &state.http,
+            &submit_url,
+            &route.config,
+            route.credential.proxy(),
+            state.config.allow_oauth_loopback,
+        )
+        .await?
+    } else {
+        route_http(state, route, &submit_url).await?
+    };
+    let mut request = outbound_http
+        .post(submit_url)
         .header("idempotency-key", job.job_id.to_string())
         .json(&input);
+    if adapter == GenerationProtocolAdapter::WasuWanV1 {
+        request = request.header("X-DashScope-Async", "enable");
+    }
     let request = route.credential.apply(request, unix_millis())?;
     // Commit before send, including before its first poll, for both supervised
     // and single-attempt workers. Only a durable provider ACK or an explicit
@@ -703,7 +741,12 @@ async fn submit_attempt(
         )));
     }
     let body = body?;
-    let upstream_job_id = body
+    let envelope = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+        wasu_wan::ack_output(&body)?
+    } else {
+        &body
+    };
+    let upstream_job_id = envelope
         .get(id_field)
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Upstream("generation submit response has no job id".into()))?;
@@ -788,6 +831,9 @@ async fn poll(
 ) -> Result<(), AppError> {
     let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
     let result = match GenerationProtocolAdapter::for_route(route)? {
+        GenerationProtocolAdapter::WasuWanV1 => {
+            wasu_wan::poll(state, worker_id, job, route, upstream_job_id, &mut attempt).await
+        }
         GenerationProtocolAdapter::SeedanceV3 => {
             poll_seedance(state, worker_id, job, route, upstream_job_id, &mut attempt).await
         }
@@ -1261,6 +1307,12 @@ pub(crate) async fn provider_asset_is_obtainable(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_satisfied_content_range);
+    if GenerationProtocolAdapter::detect(&route.driver, &route.config, &route.upstream_model)
+        == Some(GenerationProtocolAdapter::WasuWanV1)
+        && !wasu_wan::is_mp4_response(response.headers())
+    {
+        return Ok(false);
+    }
     if !content_range.is_some_and(|range| range.start == 0 && range.end == 0 && range.total > 0)
         || response.content_length() != Some(1)
     {

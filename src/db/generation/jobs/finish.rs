@@ -428,6 +428,10 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
             | "siliconflow_video_missing_asset"
             | "siliconflow_video_asset_limit_exceeded"
             | "siliconflow_video_invalid_asset"
+            | "wasu_wan_generation_failed"
+            | "wasu_wan_invalid_usage"
+            | "wasu_wan_missing_asset"
+            | "wasu_wan_invalid_asset"
             | "cancelled_by_user"
     )
 }

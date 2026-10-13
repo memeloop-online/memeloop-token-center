@@ -43,6 +43,8 @@ mod cloud_entitlements;
 mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
+#[path = "steps/wasu_wan.rs"]
+mod wasu_wan;
 
 #[derive(World)]
 struct TokenCenterWorld {
