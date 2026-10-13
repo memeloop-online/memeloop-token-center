@@ -44,6 +44,16 @@ impl Database {
         input: CreateUpstreamAccountInput,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
+        self.create_upstream_account_with_transport(input, None, key_material)
+            .await
+    }
+
+    pub(crate) async fn create_upstream_account_with_transport(
+        &self,
+        mut input: CreateUpstreamAccountInput,
+        transport_group: Option<&crate::db::transport_proxy_management::OAuthGroupSnapshot>,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
         if input
             .config
@@ -68,7 +78,8 @@ impl Database {
         let now = unix_millis();
         let account_id = Uuid::now_v7();
         let tenant_candidate = Uuid::now_v7();
-        let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
+        let mut config_json =
+            serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
         let auth_kind = input.credential.auth_kind();
         let credential_expires_at = input.credential.expires_at();
@@ -79,6 +90,24 @@ impl Database {
             input.oauth_driver.as_deref(),
         );
         let mut tx = self.begin_write_transaction().await?;
+        if let Some(snapshot) = transport_group {
+            if snapshot.tenant_external_id != input.tenant_external_id
+                || input.oauth_driver.as_deref() != Some(crate::oauth::authorization_code::FLOW)
+                || !crate::oauth::authorization_code::supports_managed_transport(&input.credential)
+                || input.credential.proxy()
+                    != Some((
+                        snapshot.proxy_url.as_str(),
+                        crate::network::OutboundScope::Private,
+                    ))
+            {
+                return Err(AppError::BadRequest(
+                    "invalid OAuth transport group binding".into(),
+                ));
+            }
+            crate::db::transport_proxy_management::lock_oauth_transport_group(&mut tx).await?;
+            self.validate_oauth_transport_group_tx(&mut tx, snapshot, key_material)
+                .await?;
+        }
 
         sqlx::query(
             "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
@@ -150,6 +179,25 @@ impl Database {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        if let Some(snapshot) = transport_group {
+            let stamp = self
+                .install_oauth_transport_group_tx(&mut tx, account_id, snapshot, key_material)
+                .await?;
+            input
+                .config
+                .as_object_mut()
+                .ok_or(AppError::Internal)?
+                .insert(
+                    crate::db::transport_proxy_management::CONFIG_KEY.into(),
+                    serde_json::to_value(stamp).map_err(|_| AppError::Internal)?,
+                );
+            config_json = input.config.to_string();
+            sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+                .bind(config_json)
+                .bind(account_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         let mut view = UpstreamAccountView {

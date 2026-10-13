@@ -102,7 +102,10 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
             let rejection = rejection.expect("native Kimi non-success uses the safe reader");
             let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
             assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
-            assert_eq!(rejection.terminal_cause, None);
+            assert_eq!(
+                rejection.terminal_cause,
+                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
+            );
             if let Some(reason) = expected_reason {
                 assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
                 assert_eq!(

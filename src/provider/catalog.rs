@@ -458,8 +458,8 @@ impl ProviderCatalog {
                 "video_api": {
                     "title": "Video generation API",
                     "type": "string",
-                    "enum": ["siliconflow-v1"],
-                    "description": "Enable SiliconFlow's fixed /v1/video/submit and /v1/video/status asynchronous video contract."
+                    "enum": ["siliconflow-v1", "wasu-wan-v1"],
+                    "description": "Explicit asynchronous video contract: SiliconFlow submit/status or Wasu Wan video-synthesis/tasks. Wasu Wan supports only the verified wan3.0-video reference-image profile."
                 },
                 "video_models": {
                     "title": "Video generation models",

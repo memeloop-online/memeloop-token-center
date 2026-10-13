@@ -21,6 +21,7 @@ pub(crate) enum GenerationProtocolAdapter {
     SeedanceV3,
     ComfyUi,
     SiliconFlowVideoV1,
+    WasuWanV1,
 }
 
 impl GenerationProtocolAdapter {
@@ -37,6 +38,20 @@ impl GenerationProtocolAdapter {
         match driver {
             "volcengine-seedance" => Some(Self::SeedanceV3),
             "comfyui" => Some(Self::ComfyUi),
+            "http-json"
+                if config.get("video_api").and_then(Value::as_str) == Some("wasu-wan-v1")
+                    && upstream_model == "wan3.0-video"
+                    && config
+                        .get("video_models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|model| model.as_str() == Some(upstream_model))
+                        }) =>
+            {
+                Some(Self::WasuWanV1)
+            }
             "http-json" if is_siliconflow_video_profile(config, upstream_model) => {
                 Some(Self::SiliconFlowVideoV1)
             }
@@ -46,7 +61,9 @@ impl GenerationProtocolAdapter {
 
     pub(crate) fn supports_modality(self, modality: &str) -> bool {
         match self {
-            Self::SeedanceV3 | Self::SiliconFlowVideoV1 => matches!(modality, "video"),
+            Self::SeedanceV3 | Self::SiliconFlowVideoV1 | Self::WasuWanV1 => {
+                matches!(modality, "video")
+            }
             Self::ComfyUi => matches!(modality, "image" | "video"),
         }
     }
@@ -57,6 +74,7 @@ impl GenerationProtocolAdapter {
     pub(crate) const fn catalog_modalities(self) -> &'static [&'static str] {
         match self {
             Self::SeedanceV3 => &["video"],
+            Self::WasuWanV1 => &["video"],
             Self::ComfyUi => &["image", "video"],
             Self::SiliconFlowVideoV1 => &["image", "video"],
         }
@@ -64,6 +82,7 @@ impl GenerationProtocolAdapter {
 
     pub(crate) fn normalize_input(self, input: &mut Value) -> Result<(), AppError> {
         match self {
+            Self::WasuWanV1 => super::wasu_wan::validate_input(input),
             Self::SeedanceV3 => {
                 normalize_seedance_duration(input)?;
                 Ok(())
@@ -84,6 +103,13 @@ impl GenerationProtocolAdapter {
         input: &Value,
     ) -> Result<i64, AppError> {
         match (self, billing_unit) {
+            (Self::WasuWanV1, "second") => {
+                super::wasu_wan::validate_input(input)?;
+                Ok(5)
+            }
+            (Self::WasuWanV1, _) => Err(AppError::BadRequest(
+                "Wasu Wan generation price must use second billing".into(),
+            )),
             (Self::SeedanceV3, "second") => {
                 let units = input
                     .get("duration")
@@ -110,6 +136,7 @@ impl GenerationProtocolAdapter {
 
     pub(crate) fn parameter_schema(self, config: &Value) -> Option<Value> {
         match self {
+            Self::WasuWanV1 => Some(super::wasu_wan::input_schema()),
             Self::ComfyUi => super::comfyui_parameter_schema(config).ok(),
             Self::SiliconFlowVideoV1 => Some(super::siliconflow_video_parameter_schema()),
             Self::SeedanceV3 => None,

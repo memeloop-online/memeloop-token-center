@@ -48,6 +48,43 @@ pub(crate) struct BindingStamp {
     pub group_version: Option<i64>,
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OAuthGroupReference {
+    pub group_id: Uuid,
+    pub expected_group_version: i64,
+    pub initial_member_id: Uuid,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct OAuthGroupSnapshot {
+    pub reference: OAuthGroupReference,
+    pub tenant_external_id: String,
+    pub proxy_url: String,
+    pub account_binding: Option<(Uuid, BindingStamp)>,
+    pub selected_member_id: Uuid,
+    pub selected_proxy_url: String,
+    pub account_revision: Option<(i64, i64)>,
+    pub session_id: Option<Uuid>,
+}
+
+impl OAuthGroupSnapshot {
+    pub(crate) fn validate_proxy(
+        &self,
+        proxy: Option<(&str, crate::network::OutboundScope)>,
+    ) -> Result<(), AppError> {
+        if proxy
+            != Some((
+                self.selected_proxy_url.as_str(),
+                crate::network::OutboundScope::Private,
+            ))
+        {
+            return Err(conflict("proxy_group_binding_conflict"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BindGroup {

@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 mod request_terminal_cause;
 pub use request_terminal_cause::RequestTerminalCause;
+pub(crate) use request_terminal_cause::failure_diagnostic;
 
 pub const MONEY_SCALE: i64 = 1_000_000;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
@@ -678,7 +679,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 30)?;
+        let mut state = serializer.serialize_struct("RequestView", 31)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
@@ -714,6 +715,10 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field(
+            "failure_diagnostic",
+            &failure_diagnostic(self.terminal_cause_code.as_deref()),
+        )?;
         state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
@@ -927,7 +932,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 34)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 35)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -968,6 +973,10 @@ impl Serialize for RequestEventView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field(
+            "failure_diagnostic",
+            &failure_diagnostic(self.terminal_cause_code.as_deref()),
+        )?;
         state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;

@@ -506,6 +506,17 @@ impl Database {
         input: ReauthorizeUpstreamAccountInput,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
+        self.reauthorize_upstream_account_with_transport(account_id, input, None, key_material)
+            .await
+    }
+
+    pub(crate) async fn reauthorize_upstream_account_with_transport(
+        &self,
+        account_id: Uuid,
+        input: ReauthorizeUpstreamAccountInput,
+        transport_group: Option<&crate::db::transport_proxy_management::OAuthGroupSnapshot>,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
         if input.credential.auth_kind() != "oauth" {
             return Err(AppError::BadRequest(
                 "interactive authorization must produce an OAuth credential".into(),
@@ -544,6 +555,16 @@ impl Database {
             .transpose()?;
         let now = unix_millis();
         let mut tx = self.begin_write_transaction().await?;
+        if let Some(snapshot) = transport_group {
+            if snapshot.tenant_external_id != input.tenant_external_id
+                || snapshot.account_binding.as_ref().map(|(id, _)| *id) != Some(account_id)
+            {
+                return Err(AppError::Forbidden);
+            }
+            crate::db::transport_proxy_management::lock_oauth_transport_group(&mut tx).await?;
+            self.validate_oauth_transport_group_tx(&mut tx, snapshot, key_material)
+                .await?;
+        }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"

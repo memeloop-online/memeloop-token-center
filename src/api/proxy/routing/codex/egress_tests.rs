@@ -127,6 +127,7 @@ impl Fixture {
         ),
         ProxySendError,
     > {
+        let mut h2_recovery_available = true;
         send_codex_attempt_once(
             &self.state,
             &HeaderMap::new(),
@@ -140,6 +141,7 @@ impl Fixture {
                 Some(self.selected.clone()),
             ),
             context,
+            &mut h2_recovery_available,
         )
         .await
     }

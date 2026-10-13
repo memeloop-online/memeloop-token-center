@@ -40,6 +40,100 @@ pub(super) async fn send_reqwest_proxy_route(
     request_id: Uuid,
     route: &PreparedProxyRoute,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    let deadline = tokio::time::Instant::now() + configured_timeout(&route.route.config);
+    let managed =
+        crate::oauth::authorization_code::supports_managed_transport(&route.route.credential);
+    if !managed
+        && route
+            .route
+            .config
+            .get(crate::db::transport_proxy_management::CONFIG_KEY)
+            .is_none()
+    {
+        return send_reqwest_proxy_route_once(
+            state,
+            headers,
+            protocol,
+            request_id,
+            route,
+            &route.route.credential,
+            deadline,
+        )
+        .await;
+    }
+    let adapter = state
+        .providers
+        .get(&route.route.driver)
+        .and_then(|provider| provider.oauth_adapter.as_ref())
+        .ok_or(ProxySendError::CandidateUnavailable)?;
+    crate::oauth::authorization_code::validate_installed_contribution(
+        &route.route.credential,
+        adapter,
+    )
+    .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let mut attempted = Vec::with_capacity(4);
+    loop {
+        let mut selection = state
+            .transport_proxy_groups
+            .select_config(
+                route.route.account_id,
+                route.route.credential_generation,
+                &route.route.credential,
+                &route.route.config,
+            )
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        if !selection
+            .select_unattempted(&attempted)
+            .map_err(|_| ProxySendError::CandidateUnavailable)?
+        {
+            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
+        }
+        if let Some(member) = selection.member() {
+            attempted.push(member);
+        }
+        let result = send_reqwest_proxy_route_once(
+            state,
+            headers,
+            protocol,
+            request_id,
+            route,
+            &selection.credential,
+            deadline,
+        )
+        .await;
+        if advance_after_preconnect_failure(&selection, &attempted, &result)? {
+            continue;
+        }
+        return result;
+    }
+}
+
+fn advance_after_preconnect_failure(
+    selection: &crate::db::ProxySelection,
+    attempted: &[usize],
+    result: &Result<ProxyRouteResponse, ProxySendError>,
+) -> Result<bool, ProxySendError> {
+    if matches!(result, Err(ProxySendError::RetryableConnection(_)))
+        && attempted.len() < selection.member_count()
+    {
+        selection
+            .advance_after_connect_failure(attempted)
+            .map_err(|_| ProxySendError::CandidateUnavailable)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_reqwest_proxy_route_once(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: Protocol,
+    request_id: Uuid,
+    route: &PreparedProxyRoute,
+    transport_credential: &UpstreamCredential,
+    request_deadline: tokio::time::Instant,
+) -> Result<ProxyRouteResponse, ProxySendError> {
     // Start the route timeout before endpoint validation/DNS. The deadline is
     // local to this attempt; the caller's frozen outer attempt budget remains
     // authoritative when it selects a standby candidate.
@@ -56,7 +150,6 @@ pub(super) async fn send_reqwest_proxy_route(
         stage = "sse_framing_policy_snapshot",
         "upstream SSE framing policy frozen"
     );
-    let request_deadline = tokio::time::Instant::now() + timeout;
     let outbound_base_url = route.route.base_url.clone();
     let outbound_http = match tokio::time::timeout_at(
         request_deadline,
@@ -64,7 +157,7 @@ pub(super) async fn send_reqwest_proxy_route(
             &state.http,
             &outbound_base_url,
             &route.route.config,
-            route.route.credential.proxy(),
+            transport_credential.proxy(),
             state.config.allow_oauth_loopback,
         ),
     )
@@ -308,6 +401,57 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn generic_group_advances_only_before_delivery_and_never_revisits_members() {
+        let account_id = Uuid::now_v7();
+        let groups = crate::db::TransportProxyGroups::parse(
+            &json!([{
+                "account_id":account_id, "version":1,
+                "proxies":["socks5h://10.20.30.40:1080", "socks5h://10.20.30.41:1080"]
+            }])
+            .to_string(),
+            b"generic-http-fixture-key",
+        )
+        .unwrap();
+        let credential: UpstreamCredential = serde_json::from_value(json!({
+            "type":"oauth", "access_token":"fixture", "proxy_url":"socks5h://10.20.30.40:1080", "proxy_network_scope":"private"
+        })).unwrap();
+        let selected = groups.select(account_id, 1, &credential).unwrap();
+        for error in [
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout),
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Body),
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Request),
+            ProxySendError::AmbiguousResponse("upstream_invalid_response"),
+            ProxySendError::CandidateUnavailable,
+            ProxySendError::Credential,
+        ] {
+            assert!(!advance_after_preconnect_failure(&selected, &[0], &Err(error)).unwrap());
+            assert_eq!(
+                groups.select(account_id, 1, &credential).unwrap().member(),
+                Some(0)
+            );
+        }
+        assert!(
+            advance_after_preconnect_failure(
+                &selected,
+                &[0],
+                &Err(ProxySendError::RetryableConnection("connect"))
+            )
+            .unwrap()
+        );
+        let mut backup = groups.select(account_id, 1, &credential).unwrap();
+        assert_eq!(backup.member(), Some(1));
+        assert!(
+            !advance_after_preconnect_failure(
+                &backup,
+                &[0, 1],
+                &Err(ProxySendError::RetryableConnection("connect"))
+            )
+            .unwrap()
+        );
+        assert!(!backup.select_unattempted(&[0, 1]).unwrap());
+    }
 
     fn compact_response(status: StatusCode, body: &'static str) -> reqwest::Response {
         http::Response::builder()

@@ -8308,6 +8308,15 @@ components:
         provider_config: { type: object }
         proxy_url: { type: string, writeOnly: true }
         proxy_network_scope: { type: string, enum: [private] }
+        transport_proxy_group:
+          type: object
+          additionalProperties: false
+          description: Global operators with providers:write may select an existing tenant group for a new login. Cannot be combined with proxy_url/proxy_network_scope or supplied during reauthorization. The encrypted session freezes the group version and member; completion atomically installs the account binding. Reauthorization inherits the existing group and rejects stale group/binding/account revisions.
+          required: [group_id, expected_group_version, initial_member_id]
+          properties:
+            group_id: { type: string, format: uuid }
+            expected_group_version: { type: integer, minimum: 1 }
+            initial_member_id: { type: string, format: uuid }
         client:
           type: object
           additionalProperties: false
