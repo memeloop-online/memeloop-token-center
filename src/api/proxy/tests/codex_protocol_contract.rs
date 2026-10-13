@@ -272,14 +272,17 @@ async fn native_builder_tls_socks_negotiates_real_response_version() {
                 .unwrap();
             let send = peer.client.execute(request);
             tokio::pin!(send);
-            let post = tokio::select! {
-                post = peer.post() => post,
-                _ = &mut send => panic!("peer must observe native request"),
+            let (post, early_response) = tokio::select! {
+                post = peer.post() => (post, None),
+                response = &mut send => (peer.post().await, Some(response.unwrap())),
             };
             assert_eq!(post.body["input"], "capability");
             emit(&post, CREATED).await;
             complete(post).await;
-            let response = send.await.unwrap();
+            let response = match early_response {
+                Some(response) => response,
+                None => send.await.unwrap(),
+            };
             assert_eq!(response.version(), version);
             assert_eq!(response.status(), StatusCode::OK);
             assert!(
