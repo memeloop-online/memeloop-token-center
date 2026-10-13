@@ -1396,6 +1396,7 @@ async fn proxy_with_cancellation_guard(
         model_route_id.ok_or(AppError::Internal)?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut h2_recovery_available = true;
     let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
     let mut deferred_shared_probes = std::collections::VecDeque::new();
@@ -1516,6 +1517,7 @@ async fn proxy_with_cancellation_guard(
                     &active_route,
                     selected_candidate_rank,
                     outbound_attempt,
+                    &mut h2_recovery_available,
                 ),
                 active_route.wait_for_compaction,
             )
