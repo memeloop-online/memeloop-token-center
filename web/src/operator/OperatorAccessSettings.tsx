@@ -34,7 +34,7 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
     </form>
     <p className="muted">
       {t('operator.clientCredentialPortalHint')}{' '}
-      <a href={clientCredentialPortalUrl} target="_blank" rel="noopener noreferrer">{t('operator.openPortal')}</a>
+      <a href={clientCredentialPortalUrl(window.location.origin)} target="_blank" rel="noopener noreferrer">{t('operator.openPortal')}</a>
     </p>
   </article>;
 }

@@ -45,13 +45,17 @@ test('a failed credential is never stored and never shown as signed in', () => {
 });
 
 test('portal guidance is a bare link that never carries the credential', () => {
-  assert.equal(clientCredentialPortalUrl, 'https://token.k3s.onetwo.website/portal');
-  assert.doesNotMatch(clientCredentialPortalUrl, /[?#]/);
-  assert.match(access, /<a href=\{clientCredentialPortalUrl\} target="_blank" rel="noopener noreferrer">/);
+  const portal = clientCredentialPortalUrl('https://token-operator.example.test');
+  assert.equal(portal, 'https://token.example.test/portal');
+  assert.equal(clientCredentialPortalUrl('https://mtc.example.test'), 'https://mtc.example.test/portal');
+  assert.equal(clientCredentialPortalUrl('http://localhost:8080'), 'http://localhost:8080/portal');
+  assert.equal(clientCredentialPortalUrl('https://token-operator.example.test/operator?view=requests#fragment'), portal);
+  assert.doesNotMatch(portal, /[?#]/);
+  assert.match(access, /<a href=\{clientCredentialPortalUrl\(window\.location\.origin\)\} target="_blank" rel="noopener noreferrer">/);
   assert.match(access, /t\('operator\.openPortal'\)/);
   assert.match(access, /t\('operator\.clientCredentialPortalHint'\)/);
   assert.doesNotMatch(access, /clientCredentialPortalUrl\s*\+|\$\{[^}]*credential/i);
-  assert.doesNotMatch(access, /URLSearchParams|location\.|history\./);
+  assert.doesNotMatch(access, /URLSearchParams|location\.(?:href|search|hash)|history\./);
 });
 
 test('rejection and portal-guidance copy exists in both locales', () => {
