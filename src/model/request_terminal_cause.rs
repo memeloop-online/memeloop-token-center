@@ -43,7 +43,7 @@ impl RequestTerminalCause {
 
 #[derive(serde::Serialize, Debug, PartialEq, Eq)]
 pub struct RequestFailureDiagnostic {
-    pub stage: &'static str,
+    pub stage: Option<&'static str>,
     pub source: &'static str,
     pub reason: &'static str,
 }
@@ -71,12 +71,9 @@ pub fn failure_diagnostic(code: Option<&str>) -> Option<RequestFailureDiagnostic
     .into_iter()
     .find(|cause| Some(cause.as_str()) == code)?;
     let (stage, source) = match cause {
-        UpstreamHttpStatus => ("upstream_response_headers", "upstream_http_response"),
-        ClientDisconnected => ("response_delivery", "downstream_connection"),
-        Http2Reset | Http2GoAway | ReadTimeout | RequestTimeout | StreamReadError => {
-            ("upstream_response_body", "upstream_stream")
-        }
-        _ => ("upstream_transport", "upstream_transport"),
+        UpstreamHttpStatus => (Some("upstream_response_headers"), "upstream_http_response"),
+        ClientDisconnected => (Some("response_delivery"), "downstream_connection"),
+        _ => (None, "upstream"),
     };
     Some(RequestFailureDiagnostic {
         stage,
@@ -102,19 +99,15 @@ mod tests {
         for (cause, stage, source) in [
             (
                 RequestTerminalCause::UpstreamHttpStatus,
-                "upstream_response_headers",
+                Some("upstream_response_headers"),
                 "upstream_http_response",
             ),
             (
                 RequestTerminalCause::ClientDisconnected,
-                "response_delivery",
+                Some("response_delivery"),
                 "downstream_connection",
             ),
-            (
-                RequestTerminalCause::Http2Reset,
-                "upstream_response_body",
-                "upstream_stream",
-            ),
+            (RequestTerminalCause::Http2Reset, None, "upstream"),
         ] {
             assert_eq!(
                 failure_diagnostic(Some(cause.as_str())),
@@ -124,6 +117,27 @@ mod tests {
                     reason: cause.as_str(),
                 })
             );
+        }
+    }
+
+    #[test]
+    fn a_persisted_transport_reason_does_not_establish_its_observation_phase() {
+        for cause in [
+            RequestTerminalCause::Http2Reset,
+            RequestTerminalCause::TransportHttp2Reset,
+            RequestTerminalCause::Http2GoAway,
+            RequestTerminalCause::StreamReadError,
+            RequestTerminalCause::ReadTimeout,
+            RequestTerminalCause::RequestTimeout,
+            RequestTerminalCause::TransportDecode,
+            RequestTerminalCause::TransportBody,
+        ] {
+            let diagnostic = failure_diagnostic(Some(cause.as_str())).unwrap();
+            assert_eq!(diagnostic.stage, None);
+            assert_eq!(diagnostic.source, "upstream");
+            assert_eq!(diagnostic.reason, cause.as_str());
+            let serialized = serde_json::to_value(diagnostic).unwrap();
+            assert!(serialized["stage"].is_null());
         }
     }
 }

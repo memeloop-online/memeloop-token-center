@@ -92,7 +92,7 @@ async fn request_detail_projects_safe_failure_evidence_without_inventing_legacy_
         (
             Some("upstream_http2_reset"),
             json!({
-                "stage": "upstream_response_body", "source": "upstream_stream", "reason": "upstream_http2_reset"
+                "stage": null, "source": "upstream", "reason": "upstream_http2_reset"
             }),
         ),
         (
