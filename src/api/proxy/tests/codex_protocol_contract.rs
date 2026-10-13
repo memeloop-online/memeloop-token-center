@@ -48,8 +48,12 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
         assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
         assert_eq!(rows[0].cost, "0");
     }
-    assert_exactly_once_side_effects(fixture, rows[0].request_id, Some("resp-usage-contract"))
-        .await;
+    assert_exactly_once_side_effects(
+        fixture,
+        rows[0].request_id,
+        (status == 200).then_some("resp-usage-contract"),
+    )
+    .await;
 }
 
 async fn streaming(version: http::Version, cancel: bool, silence: bool) {
