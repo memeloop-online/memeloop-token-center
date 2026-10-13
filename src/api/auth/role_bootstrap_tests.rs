@@ -280,3 +280,107 @@ fn chart_disabled_tokens_are_the_reserved_non_authenticating_values() {
         assert!(template.contains(&format!("value: \"{disabled}\"")));
     }
 }
+
+#[tokio::test]
+async fn client_keys_cannot_authenticate_operator_data() {
+    let (state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "operator-boundary-client".to_owned(),
+                principal_external_id: "operator-boundary-client".to_owned(),
+                alias: "operator-boundary-client".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let application = router_for_role(state, RuntimeRole::All);
+    let response = application
+        .clone()
+        .oneshot(authenticated_get("/self/v1/key", &issued.key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for path in [
+        "/internal/v1/tenants",
+        "/internal/v1/requests",
+        "/internal/v1/stats",
+        "/internal/v1/keys",
+    ] {
+        let response = application
+            .clone()
+            .oneshot(authenticated_get(path, &issued.key))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let response = application
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn operator_service_credentials_keep_scope_and_tenant_boundaries() {
+    let (state, _directory) = test_state().await;
+    state
+        .db
+        .create_tenant("operator-boundary-tenant", None)
+        .await
+        .unwrap();
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "operator-boundary-reader".to_owned(),
+                scopes: vec!["requests:read".to_owned()],
+                tenant_external_id: Some("operator-boundary-tenant".to_owned()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let application = router_for_role(state, RuntimeRole::Control);
+    for path in [
+        "/internal/v1/tenants",
+        "/internal/v1/requests?tenant_external_id=operator-boundary-tenant",
+    ] {
+        let response = application
+            .clone()
+            .oneshot(authenticated_get(path, &issued.token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    for path in [
+        "/internal/v1/requests?tenant_external_id=another-tenant",
+        "/internal/v1/keys",
+    ] {
+        let response = application
+            .clone()
+            .oneshot(authenticated_get(path, &issued.token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn operator_bootstrap_is_not_rejected_by_client_credential_shape() {
+    let (mut state, _directory) = test_state().await;
+    let token = "mtc_0123456789abcdef0123456789abcdef_synthetic-bootstrap-material-at-least-32";
+    Arc::make_mut(&mut state.config).service_token = token.to_owned();
+    let response = router_for_role(state, RuntimeRole::Control)
+        .oneshot(authenticated_get("/internal/v1/tenants", token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
