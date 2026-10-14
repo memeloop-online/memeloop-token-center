@@ -83,6 +83,8 @@ pub enum AppError {
     OAuthRefresh(crate::oauth::OAuthRefreshFailure),
     #[error("service is temporarily overloaded")]
     Overloaded,
+    #[error("no authorized upstream candidate is currently available")]
+    NoAuthorizedUpstreamCandidate,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("internal error")]
@@ -113,6 +115,7 @@ impl AppError {
             Self::Upstream(_) => "upstream",
             Self::OAuthRefresh(_) => "oauth_refresh",
             Self::Overloaded => "overloaded",
+            Self::NoAuthorizedUpstreamCandidate => "no_authorized_upstream_candidate",
             Self::Storage(_) => "storage",
             Self::Internal => "internal",
         }
@@ -175,6 +178,11 @@ impl IntoResponse for AppError {
                 "service_overloaded",
                 self.to_string(),
             ),
+            Self::NoAuthorizedUpstreamCandidate => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_authorized_upstream_candidate",
+                self.to_string(),
+            ),
             Self::Storage(_) | Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -206,7 +214,11 @@ impl IntoResponse for AppError {
         {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
-        if matches!(&self, Self::Overloaded) {
+        response.extensions_mut().insert(PublicErrorCode(code));
+        if matches!(
+            &self,
+            Self::Overloaded | Self::NoAuthorizedUpstreamCandidate
+        ) {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -214,6 +226,9 @@ impl IntoResponse for AppError {
         response
     }
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct PublicErrorCode(pub(crate) &'static str);
 
 impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {

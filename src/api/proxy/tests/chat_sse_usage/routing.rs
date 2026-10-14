@@ -65,15 +65,7 @@ async fn non_opt_in_chat_n_output_reservation_overflow_is_rejected_before_admiss
     request["n"] = json!(MAX_REPORTED_TOKENS);
     let response = send_chat_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     upstream.verify().await;
 }
 
@@ -230,14 +222,6 @@ async fn chat_n_greater_than_one_is_rejected_before_upstream_or_reservation() {
     request["n"] = json!(2);
     let response = send_chat_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     upstream.verify().await;
 }

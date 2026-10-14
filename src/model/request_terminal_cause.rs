@@ -1,5 +1,6 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestTerminalCause {
+    GatewayPreAdmission,
     UpstreamHttpStatus,
     ClientDisconnected,
     TransportTimeout,
@@ -21,6 +22,7 @@ pub enum RequestTerminalCause {
 impl RequestTerminalCause {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::GatewayPreAdmission => "gateway_pre_admission",
             Self::UpstreamHttpStatus => "upstream_http_status",
             Self::ClientDisconnected => "client_disconnected",
             Self::TransportTimeout => "upstream_transport_timeout",
@@ -51,6 +53,7 @@ pub struct RequestFailureDiagnostic {
 pub fn failure_diagnostic(code: Option<&str>) -> Option<RequestFailureDiagnostic> {
     use RequestTerminalCause::*;
     let cause = [
+        GatewayPreAdmission,
         UpstreamHttpStatus,
         ClientDisconnected,
         TransportTimeout,
@@ -71,6 +74,7 @@ pub fn failure_diagnostic(code: Option<&str>) -> Option<RequestFailureDiagnostic
     .into_iter()
     .find(|cause| Some(cause.as_str()) == code)?;
     let (stage, source) = match cause {
+        GatewayPreAdmission => (Some("pre_admission"), "gateway"),
         UpstreamHttpStatus => (Some("upstream_response_headers"), "upstream_http_response"),
         ClientDisconnected => (Some("response_delivery"), "downstream_connection"),
         _ => (None, "upstream"),

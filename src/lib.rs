@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod crypto;
 mod cursor_native;
 pub mod db;
+mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
@@ -95,6 +96,7 @@ pub struct AppState {
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
+    pub(crate) early_requests: Arc<early_request::Journal>,
     /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
@@ -161,6 +163,16 @@ impl AppState {
             .map_err(|_| InitializationError::Archive)?;
         let persistence_db = db.independent_persistence_pool();
         let routing_persistence_db = db.independent_persistence_pool();
+        let early_requests = early_request::Journal::new(
+            std::path::Path::new(&config.responses_request_spool_path)
+                .join("early-terminals")
+                .join(
+                    blake3::hash(config.database_url.as_bytes())
+                        .to_hex()
+                        .as_str(),
+                ),
+            db.independent_persistence_pool(),
+        );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins
@@ -238,6 +250,7 @@ impl AppState {
                 responses_body_read_concurrency,
             )),
             responses_request_spool,
+            early_requests,
             // Cloned request/router states share the same bounded synchronous
             // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.

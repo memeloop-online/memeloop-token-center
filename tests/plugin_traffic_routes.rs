@@ -979,23 +979,67 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
         .authenticate_key(&issued.key, state.config.key_pepper.as_bytes())
         .await
         .unwrap();
+    let summary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let summary = state
+                .db
+                .stats_filtered(
+                    key.key_id,
+                    StatsFilter {
+                        from_created_at: Some(unix_millis().saturating_sub(60_000)),
+                        to_created_at: Some(unix_millis().saturating_add(1)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .summary;
+            if summary.total_requests == 1 {
+                break summary;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authenticated text rejection projects one failure");
+    assert_eq!(summary.total_requests, 1);
+    assert_eq!(summary.successful_requests, 0);
+    assert_eq!(summary.failed_requests, 1);
+    assert_eq!(summary.input_tokens, 0);
+    assert_eq!(summary.output_tokens, 0);
     assert_eq!(
-        state
-            .db
-            .stats_filtered(
-                key.key_id,
-                StatsFilter {
-                    from_created_at: Some(unix_millis().saturating_sub(60_000)),
-                    to_created_at: Some(unix_millis().saturating_add(1)),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .summary
-            .total_requests,
-        0
+        Decimal::from_str_exact(summary.total_cost.as_deref().unwrap()).unwrap(),
+        Decimal::ZERO
     );
+    let records = state.db.list_requests(key.key_id, 10).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status_code, Some(403));
+    assert_eq!(
+        records[0].terminal_cause_code.as_deref(),
+        Some("gateway_pre_admission")
+    );
+    assert!(!records[0].billing.billable);
+    assert!(records[0].upstream_account_id.is_none());
+    assert!(records[0].route_id.is_none());
+    let pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
+            .bind(key.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reservations, 0);
+    let charges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ledger_entries WHERE account_id = $1 AND kind = 'usage'",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(charges, 0);
+    pool.close().await;
 }
 
 #[tokio::test]

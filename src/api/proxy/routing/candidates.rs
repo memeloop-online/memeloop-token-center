@@ -285,6 +285,9 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
     request_json: &Value,
     summary: &CandidatePreparationSummary,
 ) -> Result<AppError, AppError> {
+    if summary.examined == 0 {
+        return Ok(AppError::NoAuthorizedUpstreamCandidate);
+    }
     if summary.skipped_local_protocol_mismatch {
         codex_transport::validate_protocol(protocol)?;
     }
