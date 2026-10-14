@@ -54,7 +54,7 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await page.evaluate(() => window.egressFixture.release?.());
       assert.equal(await summary.locator('[data-egress-summary]').count(), 0);
       assert.ok(await page.evaluate(() => window.egressFixture.reads.every(query => new URLSearchParams(query).has('tenant_external_id'))));
-      await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?egress=1`);
+      await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?egress=1&quiet-background-help`);
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
@@ -65,9 +65,32 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       assert.match(await drawer.innerText(), /HTTP\/2/);
       assert.match(await drawer.innerText(), /Research account/);
       assert.doesNotMatch(await drawer.innerText(), /credential-canary|attempt-a|attempt-b/);
-      await drawer.getByRole('region', { name: copy.attemptsTitle, exact: true }).scrollIntoViewIfNeeded();
+      await drawer.locator('.close').focus();
       await page.mouse.move(0, 0);
-      await page.screenshot({ path: `${artifactRoot}/egress-attempts-${locale}-390.png`, fullPage: true });
+      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+      await drawer.getByRole('region', { name: copy.attemptsTitle, exact: true }).evaluate(element => element.scrollIntoView({ block: 'start' }));
+      await page.screenshot({ path: `${artifactRoot}/egress-attempts-${locale}-390.png`, fullPage: false });
+      const finalAttempt = drawer.locator('[data-egress-attempt="attempt-b"]');
+      await finalAttempt.scrollIntoViewIfNeeded();
+      assert.equal(await finalAttempt.evaluate(element => {
+        const bounds = element.getBoundingClientRect();
+        const drawerBounds = element.closest('[role="dialog"]')!.getBoundingClientRect();
+        return bounds.top >= Math.max(0, drawerBounds.top) && bounds.bottom <= Math.min(innerHeight, drawerBounds.bottom);
+      }), true, 'the final-attempt screenshot includes its heading, directional bytes, completion and disclosure');
+      await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-${locale}-390.png`, fullPage: false });
+      await finalAttempt.getByRole('button', { name: copy.technical, exact: true }).click();
+      await finalAttempt.getByText('attempt-b', { exact: true }).waitFor();
+      const identifiers = finalAttempt.locator('.egress-facts').last();
+      await identifiers.scrollIntoViewIfNeeded();
+      await page.mouse.move(0, 0);
+      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+      assert.equal(await identifiers.evaluate(element => {
+        const bounds = element.getBoundingClientRect();
+        const drawerBounds = element.closest('[role="dialog"]')!.getBoundingClientRect();
+        return bounds.top >= Math.max(0, drawerBounds.top) && bounds.bottom <= Math.min(innerHeight, drawerBounds.bottom)
+          && element.scrollWidth <= element.clientWidth;
+      }), true, 'all expanded troubleshooting identifiers are visible without horizontal clipping');
+      await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-identifiers-${locale}-390.png`, fullPage: false });
       assert.deepEqual(errors, []);
       await page.close();
     }
