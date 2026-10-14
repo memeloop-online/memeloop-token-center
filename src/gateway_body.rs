@@ -785,15 +785,18 @@ mod tests {
         );
         let body_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let responses_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started, started_wait) = tokio::sync::oneshot::channel();
         let request = Request::post("/v1/responses")
-            .body(Body::from_stream(stream::pending::<
-                Result<Bytes, Infallible>,
-            >()))
+            .body(Body::from_stream(stream::once(async move {
+                let _ = started.send(());
+                std::future::pending::<Result<Bytes, Infallible>>().await
+            })))
             .unwrap();
         let active_body_permits = body_permits.clone();
         let active_responses_permits = responses_permits.clone();
         let active_spool = spool.clone();
-        let memory_budget = memory::ProxyMemoryBudget::new(512 * 1024 * 1024);
+        let memory_budget = Arc::new(memory::ProxyMemoryBudget::new(512 * 1024 * 1024));
+        let active_memory_budget = memory_budget.clone();
         let capture = tokio::spawn(async move {
             admit_gateway_request_body_with_memory(
                 request,
@@ -801,18 +804,14 @@ mod tests {
                 active_responses_permits,
                 32 * 1024 * 1024,
                 crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-                Some(&memory_budget),
+                Some(&active_memory_budget),
                 &active_spool,
             )
             .await
         });
-        for _ in 0..100 {
-            if spool.snapshot().active_files == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(body_permits.available_permits(), 0);
+        started_wait.await.unwrap();
+        assert!(memory_budget.snapshot().0 > 0);
+        assert_eq!(body_permits.available_permits(), 1);
         assert_eq!(responses_permits.available_permits(), 1);
         assert_eq!(spool.snapshot().active_files, 1);
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -823,6 +822,7 @@ mod tests {
         );
         capture.abort();
         assert!(capture.await.unwrap_err().is_cancelled());
+        assert_eq!(memory_budget.snapshot().0, 0);
         assert_eq!(body_permits.available_permits(), 1);
         assert_eq!(responses_permits.available_permits(), 1);
         assert_eq!(spool.snapshot().used_bytes, 0);
