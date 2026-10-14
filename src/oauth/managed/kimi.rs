@@ -300,6 +300,7 @@ async fn refresh_with_client(
         .build()
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     request_guard.mark_request_started().await?;
+    let mut response_status = None;
     let operation = async {
         let response = client.execute(request).await.map_err(|error| {
             refresh_failure(
@@ -312,6 +313,7 @@ async fn refresh_with_client(
             )
         })?;
         let status = response.status().as_u16();
+        response_status = Some(status);
         let bytes = super::super::bounded_body(response)
             .await
             .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)))?;
@@ -322,7 +324,7 @@ async fn refresh_with_client(
     };
     let bytes = tokio::time::timeout(TIMEOUT, operation)
         .await
-        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Timeout, None))??;
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Timeout, response_status))??;
     let response: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
@@ -603,6 +605,75 @@ mod tests {
             1,
             "an accepted refresh-token POST has an unknown outcome and must not be replayed"
         );
+    }
+
+    async fn assert_stalled_refresh_preserves_observed_status(status: Option<u16>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            tokio::pin!(shutdown_rx);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut connection, _) = accepted.unwrap();
+                        let request = http1_request::read_bounded_http1_request(&mut connection)
+                            .await
+                            .unwrap();
+                        assert_eq!(request.method, "POST");
+                        assert_eq!(request.path, "/token");
+                        assert_eq!(request.body, format!(
+                            "client_id={CLIENT_ID}&grant_type=refresh_token&refresh_token=fixture-refresh"
+                        ).into_bytes());
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        if let Some(status) = status {
+                            connection.write_all(format!(
+                                "HTTP/1.1 {status} OK\r\nContent-Length: 128\r\n\r\n{{"
+                            ).as_bytes()).await.unwrap();
+                        }
+                        connections.push(connection);
+                    }
+                }
+            }
+        });
+        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let error = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &credential("fixture-device"),
+            true,
+            &format!("http://{address}/token"),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        let AppError::OAuthRefresh(failure) = error else {
+            panic!("expected a classified refresh failure");
+        };
+        assert_eq!(failure.http_status, status);
+        assert!(matches!(
+            failure.kind,
+            OAuthRefreshFailureKind::Timeout | OAuthRefreshFailureKind::ResponseBody
+        ));
+        assert!(!failure.requires_reauthorization());
+        assert!(guard.0.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_before_headers_does_not_invent_a_status_or_replay() {
+        assert_stalled_refresh_preserves_observed_status(None).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_after_headers_preserves_status_without_replay() {
+        assert_stalled_refresh_preserves_observed_status(Some(200)).await;
     }
 
     #[tokio::test]

@@ -203,6 +203,7 @@ mod tests {
         assert_eq!(value["refresh_state"], "outcome_unknown");
         assert_eq!(value["access_state"], "expired");
         assert_eq!(value["reauthorization_required"], false);
+        assert_eq!(value["automatic_refresh_paused"], true);
         let persisted: Option<String> = sqlx::query_scalar("SELECT oauth_refresh_diagnostic_json FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1")
             .bind(account.id.to_string()).fetch_one(&database.pool).await.unwrap();
         assert!(persisted.is_none());

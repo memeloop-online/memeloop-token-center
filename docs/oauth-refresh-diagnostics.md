@@ -20,6 +20,12 @@ The projection provides:
 - `reauthorization_required`, true only when a new refresh attempt has an
   explicit supported rejection such as `invalid_grant`. Access expiry,
   generic HTTP 401/403, and historical unknown attempts do not establish this.
+- `automatic_refresh_paused`, true when the current generation has a started
+  attempt with no saved result and its refresh state is `outcome_unknown` or
+  `reauthorization_required`. This is an observation of the existing replay
+  protection, not a new scheduling gate or proof of invalid authorization.
+  Active attempts, saved results awaiting local completion, and access expiry
+  alone do not set it. Clients predating this field can ignore it.
 
 Administrative `status`, `can_refresh` and `can_reauthorize` keep their existing
 meanings. Diagnostics do not affect routing, model visibility, availability
@@ -56,3 +62,25 @@ The stored diagnostic is a per-generation latest failure snapshot, not an
 immutable history of every attempt. Kimi errors are typed without logging
 provider response content; unsupported provider error formats remain unknown.
 This change does not recover or reauthorize existing production accounts.
+
+## Kimi timeout and recovery boundary
+
+Kimi refresh has an unchanged ten-second request and operation budget. The
+durable `request_started_at` marker is written before executing the request:
+it is a replay-safety boundary, not proof that the provider received a POST.
+A timeout can occur while connecting, awaiting headers, or reading the body.
+New body-deadline diagnostics preserve an already observed HTTP status; a
+missing status does not establish a particular network failure phase for
+historical attempts. A status without a complete response does not establish
+that a replacement credential was received or that refresh succeeded.
+
+The worker checks expiring credentials every minute, five minutes ahead of
+expiry. It excludes a generation with a started request and no saved result,
+even after lease expiry. Only undispatched expired leases can be reclaimed;
+saved encrypted results can be finalized locally without another remote POST.
+Without provider-confirmed idempotency or token-reuse semantics, do not replay
+an unknown refresh, clear its lease, or infer `invalid_grant` from access expiry.
+An operator alert should say that automatic refresh is paused because its
+result is unconfirmed, not that the user failed to sign in. Do not automatically
+initiate authorization. A later user-supplied authorization supersedes the old
+generation; its healthy state is not evidence that the timeout cause was fixed.
