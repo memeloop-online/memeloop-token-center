@@ -373,6 +373,10 @@ mod tests {
             ([false, false, true, false, false], "tls"),
             ([false, false, false, true, false], "connect"),
             ([false, false, false, false, true], "timeout"),
+            ([false, false, false, true, true], "connect"),
+            ([true, false, false, true, true], "proxy_connect"),
+            ([false, true, false, true, true], "dns"),
+            ([false, false, true, true, true], "tls"),
             ([false; 5], "transport"),
             ([true; 5], "proxy_connect"),
         ] {

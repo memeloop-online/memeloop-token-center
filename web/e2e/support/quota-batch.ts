@@ -6,6 +6,14 @@ export interface QuotaBatchFixtureAccount {
   driver?: string;
 }
 
+export function quotaReadFixtureResponse(url: URL, accounts: QuotaBatchFixtureAccount[]): UpstreamQuotaSnapshot {
+  const match = /^\/internal\/v1\/upstreams\/([^/]+)\/quota$/.exec(url.pathname);
+  if (!match || url.searchParams.get('fresh') !== 'true' || !['bulk', 'manual'].includes(url.searchParams.get('trigger') ?? '')) throw new Error('Quota read fixture expects a fresh account read');
+  const account = accounts.find(account => account.id === decodeURIComponent(match[1]) && account.tenant === url.searchParams.get('tenant_external_id'));
+  if (!account) throw new Error('Quota read fixture expects an eligible account and tenant');
+  return quotaBatchFixtureSnapshot(account);
+}
+
 export function quotaBatchFixtureSnapshot(account: QuotaBatchFixtureAccount): UpstreamQuotaSnapshot {
   const now = Date.now();
   return {

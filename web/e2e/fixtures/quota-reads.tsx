@@ -52,7 +52,7 @@ function Fixture() {
     {accounts.map(account => {
       const entry = quota.entries[account.id]?.generation === generation ? quota.entries[account.id] : undefined;
       const summary = quotaSummaryPresentation(entry?.snapshot, Date.now(), entry?.refreshFailed);
-      return <section key={account.id} data-account={account.id}><h2>{account.id}</h2><span data-summary>{t(entry?.busy ? 'quota.refreshing' : entry?.queued ? 'quota.queued' : summary.key, { percent: '—' })}</span>{entry?.snapshot && <QuotaResetCreditExpiry snapshot={entry.snapshot} />}<button onClick={() => void quota.read(account)} disabled={Boolean(entry?.busy || quota.progress?.busy)}>{t('quota.refreshAccount')}</button><UpstreamQuota accountId={account.id} credentialGeneration={generation} tenant={tenant} token="fixture-only" readState={entry} onRefresh={() => void quota.read(account)} refreshDisabled={quota.progress?.busy} /></section>;
+      return <section key={account.id} data-account={account.id}><h2>{account.id}</h2><span data-summary>{t(entry?.busy ? 'quota.refreshing' : entry?.queued ? 'quota.queued' : summary.key, { percent: '—' })}</span>{entry?.snapshot && <QuotaResetCreditExpiry snapshot={entry.snapshot} />}<button onClick={() => void quota.read(account)} disabled={Boolean(entry?.busy)}>{t('quota.refreshAccount')}</button><UpstreamQuota accountId={account.id} credentialGeneration={generation} tenant={tenant} token="fixture-only" readState={entry} onRefresh={() => void quota.read(account)} refreshDisabled={entry?.busy} /></section>;
     })}</main>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
