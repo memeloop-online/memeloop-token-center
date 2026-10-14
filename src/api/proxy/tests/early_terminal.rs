@@ -1,5 +1,7 @@
 use super::*;
 
+mod journal_isolation;
+
 async fn reject_without_candidates(fixture: &CodexRouteFixture) -> Response {
     router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(

@@ -15,12 +15,15 @@ use crate::db::{Database, EarlyRequestTerminal};
 const MAX_RECORD_BYTES: u64 = 4096;
 const MAX_PENDING_RECORDS: usize = 16_384;
 const REPLAY_BATCH: usize = 64;
+const MAX_PENDING_WRITES: usize = 64;
+const WRITE_DEADLINE: Duration = Duration::from_millis(250);
 
 pub(crate) struct Journal {
     directory: PathBuf,
     wake: Arc<Notify>,
-    writes: tokio::sync::Mutex<()>,
-    written: AtomicU64,
+    writes: Arc<tokio::sync::Mutex<()>>,
+    pending_writes: Arc<tokio::sync::Semaphore>,
+    written: Arc<AtomicU64>,
     replayed: AtomicU64,
     failed: AtomicU64,
 }
@@ -30,8 +33,9 @@ impl Journal {
         let journal = Arc::new(Self {
             directory,
             wake: Arc::new(Notify::new()),
-            writes: tokio::sync::Mutex::new(()),
-            written: AtomicU64::new(0),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
+            pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
+            written: Arc::new(AtomicU64::new(0)),
             replayed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         });
@@ -51,19 +55,50 @@ impl Journal {
     }
 
     pub(crate) async fn append(&self, record: EarlyRequestTerminal) -> bool {
-        let _writer = self.writes.lock().await;
-        let directory = self.directory.clone();
         let request_id = record.request_id;
-        let result = tokio::task::spawn_blocking(move || write_record(&directory, &record)).await;
-        if matches!(result, Ok(Ok(()))) {
-            self.written.fetch_add(1, Ordering::Relaxed);
-            self.wake.notify_one();
-            true
-        } else {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(%request_id, reason = "journal_unavailable", "early request terminal recording failed");
-            false
+        let Ok(pending) = self.pending_writes.clone().try_acquire_owned() else {
+            return self.unavailable(request_id, "journal_queue_full");
+        };
+        let directory = self.directory.clone();
+        let writes = self.writes.clone();
+        let written = self.written.clone();
+        let wake = self.wake.clone();
+        let result = tokio::time::timeout(WRITE_DEADLINE, async move {
+            let writer = writes.lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _writer = writer;
+                let _pending = pending;
+                let result = write_record(&directory, &record);
+                if result.is_ok() {
+                    written.fetch_add(1, Ordering::Relaxed);
+                    wake.notify_one();
+                }
+                result
+            })
+            .await
+        })
+        .await;
+        match result {
+            Ok(Ok(Ok(()))) => true,
+            Err(_) => self.unavailable(request_id, "journal_write_timeout"),
+            _ => self.unavailable(request_id, "journal_unavailable"),
         }
+    }
+
+    fn unavailable(&self, request_id: uuid::Uuid, reason: &'static str) -> bool {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(%request_id, reason, "early request terminal recording failed");
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_writer_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.writes.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_writes_for_test(&self) -> usize {
+        MAX_PENDING_WRITES - self.pending_writes.available_permits()
     }
 
     async fn replay(&self, database: &Database) {
@@ -196,4 +231,51 @@ fn write_record(directory: &Path, record: &EarlyRequestTerminal) -> std::io::Res
     }
     std::fs::File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_journal_queue_fails_without_spawning_or_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("queue.db").display()
+        ))
+        .await
+        .unwrap();
+        let path = directory.path().join("journal");
+        let journal = Journal::new(path.clone(), database.clone());
+        let held = journal
+            .pending_writes
+            .clone()
+            .acquire_many_owned(MAX_PENDING_WRITES as u32)
+            .await
+            .unwrap();
+        let now = crate::db::unix_millis();
+        assert!(
+            !journal
+                .append(EarlyRequestTerminal {
+                    request_id: uuid::Uuid::now_v7(),
+                    tenant_id: uuid::Uuid::nil(),
+                    key_id: uuid::Uuid::nil(),
+                    created_at: now,
+                    completed_at: now,
+                    duration_ms: 0,
+                    protocol: "openai".into(),
+                    model: "synthetic".into(),
+                    status_code: 503,
+                    error_code: "no_authorized_upstream_candidate".into(),
+                })
+                .await
+        );
+        assert_eq!(journal.written.load(Ordering::Relaxed), 0);
+        assert_eq!(journal.failed.load(Ordering::Relaxed), 1);
+        assert!(!path.exists());
+        drop(held);
+        assert_eq!(journal.pending_writes_for_test(), 0);
+        database.close().await;
+    }
 }

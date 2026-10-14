@@ -20,6 +20,18 @@ Before returning an early error, the gateway atomically journals only the
 bounded terminal metadata under
 `responses_request_spool_path/early-terminals/<database fingerprint>`.
 Successful/admitted forwarding does not write or wait for this journal.
+Rejected pre-admission requests release their ingress-memory owner before
+journal admission; their error response bodies do not retain that owner.
+The journal admits at most 64 concurrent metadata writes/waiters and bounds
+queue plus filesystem acknowledgment waiting to 250 ms. Saturation or expiry
+returns the original error with `x-mtc-request-recording: unavailable`, never
+a false durability acknowledgment. This bound is not a forwarding/key limit.
+A filesystem write already running retains its serial writer guard and queue
+permit even if its caller times out or disconnects, so stalled fsync cannot
+spawn an unbounded set of replacement blocking writes. Such a write may finish
+and replay later; `unavailable` means unconfirmed at response time, not proof
+that no record will ever appear. Cancellation before acquiring the writer
+drops the pending metadata and queue permit.
 A separate database pool replays files into the request list, failure
 statistics and a single finished event in one transaction. A request locator
 claim is the idempotency fence: duplicate replay or an admission whose commit

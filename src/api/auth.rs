@@ -244,6 +244,10 @@ async fn admit_authenticated_gateway_body(
         });
     }
     let response = next.run(request).await;
+    if super::early_request::is_pre_admission_failure(response.status()) {
+        drop(memory);
+        return Ok(response);
+    }
     let response = match (audio_request, memory) {
         (true, _) => response,
         (false, Some(permit)) => hold_response_body_permit(response, permit),

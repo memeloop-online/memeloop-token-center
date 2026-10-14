@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 
-use axum::{http::HeaderValue, response::Response};
+use axum::{
+    http::{HeaderValue, StatusCode},
+    response::Response,
+};
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 
@@ -39,6 +42,13 @@ pub(super) fn mark_admitted() {
     let _ = METADATA.try_with(|current| current.borrow_mut().admitted = true);
 }
 
+pub(super) fn is_pre_admission_failure(status: StatusCode) -> bool {
+    (status.is_client_error() || status.is_server_error())
+        && METADATA
+            .try_with(|metadata| !metadata.borrow().admitted)
+            .unwrap_or(false)
+}
+
 pub(super) async fn observe(
     state: &AppState,
     key: &AuthenticatedKey,
@@ -51,9 +61,7 @@ pub(super) async fn observe(
     METADATA
         .scope(RefCell::new(Metadata::default()), async {
             let mut response = operation.await;
-            if (response.status().is_client_error() || response.status().is_server_error())
-                && !METADATA.with(|metadata| metadata.borrow().admitted)
-            {
+            if is_pre_admission_failure(response.status()) {
                 let error_code = response
                     .extensions()
                     .get::<PublicErrorCode>()
