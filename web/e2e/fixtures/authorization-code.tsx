@@ -2,12 +2,14 @@ import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
+import { AppShell } from '../../src/app/AppShell';
 import { AuthorizationCodeConnection } from '../../src/operator/AuthorizationCodeConnection';
 import { ProvidersPage } from '../../src/operator/pages/ManagementPages';
 import type { ProviderType, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
+import '../../src/app-shell.css';
 
 const fragmentMode = new URLSearchParams(location.search).has('fragment');
 const provider: ProviderType = {
@@ -38,7 +40,8 @@ function ScopedProvidersFixture() {
   const [tenant, setTenant] = useState('fixture-a');
   const [token, setToken] = useState('fixture-token');
   const [writeTenant, setWriteTenant] = useState<string>();
-  return <><button onClick={() => setTenant(current => current === 'fixture-a' ? 'fixture-b' : 'fixture-a')}>Switch tenant</button><button onClick={() => setToken('next-fixture-token')}>Switch credential</button><button onClick={() => setWriteTenant(current => current ? undefined : 'fixture-b')}>Switch write tenant</button><ProvidersPage token={token} tenant={tenant} writeTenant={writeTenant} /></>;
+  const content = <><button onClick={() => setTenant(current => current === 'fixture-a' ? 'fixture-b' : 'fixture-a')}>Switch tenant</button><button onClick={() => setToken('next-fixture-token')}>Switch credential</button><button onClick={() => setWriteTenant(current => current ? undefined : 'fixture-b')}>Switch write tenant</button><ProvidersPage token={token} tenant={tenant} writeTenant={writeTenant} /></>;
+  return new URLSearchParams(location.search).has('app-shell') ? <AppShell surface="operator" route="providers" onNavigate={() => {}}>{content}</AppShell> : content;
 }
 const params = new URLSearchParams(location.search);
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{params.has('scope-controls') ? <ScopedProvidersFixture /> : params.has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);

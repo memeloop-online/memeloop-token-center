@@ -3,8 +3,8 @@
 ## Baseline and deployment boundary
 
 - Implementation baseline: `b02f8f2ef288cd83c4276b00a90c8204894449b7` (GitHub master API checked 2026-10-14 UTC).
-- The parent reports deployed control `9ca3dbf` and gateway `921…`. These are not evidence that master is deployed. GitHub's commit API cannot resolve `9ca3dbf` (422); an immutable control image-to-source receipt is still needed for an exact deployed-source diff. No production read, deployment, credential change or OAuth action is part of this PR.
-- Baseline already includes PR540 (`9df02cb0`): validated metadata-only rename receipts, name validation, and returning the confirmed account to the detail workspace. Do not reimplement that fix or infer a new rename backend defect from the old deployed heading.
+- `9ca3dbf` was a descriptive shorthand, not a Git ref. The 2026-10-14 01:35 UTC control readback records image index `sha256:9ca66b6838bc59e7db088c2c0dfe4453bb8610443085e64e68485b582b7ca2a2`. Fresh registry reads, each checked against its raw SHA-256, resolve this to amd64 manifest `sha256:db33821bc0cece80051d42e82afeebc993ab9133869e8249c516969ac70447a5`, config `sha256:1262bde8a3097c9d98eba7b175ecacac517349e0c62168bdaf2352d5a4399520`, and OCI revision `3dbf18898357cd00ab33e8a79523d85dd6a08367`. A fresh read-only cluster query was refused; current production state is not inferred from master. No deployment, credential change or OAuth action is part of this PR.
+- Both that image revision and baseline already include PR540 (`9df02cb0`): validated metadata-only rename receipts, name validation, and returning the confirmed account to the detail workspace. The editor composition, rename helper, identity, notes and layout CSS have no diff between those revisions. The reported production rename symptom is not explained by an undeployed PR540 fix; its root cause remains unproven. Do not reimplement that fix.
 - PR603 remains frozen at `23ceef4b9e81074143113c22ab870e229a8aa67a`; none of its egress UI changes are included here. OAuth work in PR605/606 is separate.
 
 ## Actual composition and minimal change
@@ -19,7 +19,7 @@ No changes to OAuth, credentials, account scope/generation fences, proxy saving,
 
 ## GHA-only executable screenshot contract
 
-Extend the existing `web/e2e/kimi-device-browser-contract.test.ts`; do not run tests, build or install locally. Its actual full-page `authorization-code.html?full-page&scope-controls` fixture renders the application shell and production provider page, with synthetic accounts and network interception. Unexpected non-rename writes fail the test; quota reads are synthetic too.
+Extend the existing `web/e2e/kimi-device-browser-contract.test.ts`; do not run tests, build or install locally. The `authorization-code.html?full-page&scope-controls&app-shell` fixture renders the existing AppShell and production provider page, with synthetic accounts and network interception. Unexpected non-rename writes fail the test; quota reads are synthetic too. The initial head's fixture rendered the complete provider component but omitted AppShell; those images were actually inspected and are not accepted as full application-shell evidence. The explicit shell option closes that acceptance gap without changing production code.
 
 Artifacts use the existing CI upload path `web/e2e-artifacts/ui-system/account-workspace/`:
 
@@ -36,4 +36,4 @@ Existing GHA contracts remain required: `form-mobile-navigation-browser-contract
 
 ## Independent review and reporting
 
-Report exact PR head and actual GHA run separately. A source PR or a screenshot filename is not evidence of green CI or visual acceptance. After GHA produces artifacts, inspect the complete screenshots, including the bottom notes/actions, at mobile and desktop widths. Hand off to the independent Kimi reviewer for layout, button hierarchy, copy and rename-context review; do not count author's CI reruns as reviews. At most a necessary second review round. No screenshot was visually inspected when this contract was authored.
+Report exact PR head and actual GHA run separately. A source PR or a screenshot filename is not evidence of green CI or visual acceptance. After GHA produces artifacts, inspect the complete screenshots, including the bottom notes/actions, at mobile and desktop widths. Hand off to the independent Kimi reviewer for layout, button hierarchy, copy and rename-context review; do not count author's CI reruns as reviews. At most a necessary second review round. Kimi service 503 failures have produced no independent R1 and are not passes. The separate 0142 generation/automatic-refresh investigation belongs to Kepler, with UI state-selection findings handed off separately; quota-hook work belongs to its separate owner and is not part of PR607.

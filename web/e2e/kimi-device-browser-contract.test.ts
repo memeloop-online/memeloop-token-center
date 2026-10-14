@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { editProviderAccount } from './support/provider-account-navigation.js';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
@@ -88,7 +88,8 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
         if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, proxy_url: 'socks5h://10.0.0.15:1080', supported: true, updated_at: account.updated_at, credential_generation: account.credential_generation } });
         return route.fulfill({ json: [] });
       });
-      await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page&scope-controls`);
+      await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page&scope-controls&app-shell`);
+      await page.locator('.app-context-bar').waitFor();
       await page.locator(`[data-upstream-id="${account.id}"]`).getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
       const reauthorization = page.locator('.provider-reauthorization-workspace');
       await reauthorization.getByText('My Kimi', { exact: true }).waitFor();
@@ -119,6 +120,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       const discard = page.getByRole('dialog');
       await discard.waitFor();
       await discard.getByRole('button', { name: chinese ? '取消' : 'Cancel', exact: true }).click();
+      await discard.waitFor({ state: 'detached' });
       assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'dirty confirmation retains the name draft');
       assert.deepEqual(await editor.locator('.rjsf fieldset.mtc-form-section > legend').allTextContents(),
         [text.identity, text.network, text.authentication, text.routing], 'the complete editor starts with account and connection, not the model catalog');
@@ -132,6 +134,8 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       for (const width of [320, 390, 1440]) for (const theme of ['light', 'dark']) {
         await page.setViewportSize({ width, height: 1000 });
         await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+        await page.waitForFunction(() => matchMedia('(min-width: 901px)').matches || document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
+        assert.equal(await editor.getByRole('button', { name: text.signInAgain, exact: true }).isEnabled(), true);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         assert.equal(await editor.locator('button:visible').evaluateAll(buttons => buttons.every(button => {
           const bounds = button.getBoundingClientRect();
@@ -139,6 +143,11 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
         })), true, 'all full-page buttons have usable targets and remain inside the viewport');
         const screenshots = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
         await mkdir(screenshots, { recursive: true });
+        const actions = await editor.locator('button:visible').evaluateAll(buttons => buttons.map(button => ({
+          label: button.textContent, disabled: (button as HTMLButtonElement).disabled,
+          color: getComputedStyle(button).color, background: getComputedStyle(button).backgroundColor,
+        })));
+        await writeFile(`${screenshots}/kimi-rename-${locale}-${width}-${theme}.json`, JSON.stringify(actions, null, 2));
         await page.screenshot({ path: `${screenshots}/kimi-rename-${locale}-${width}-${theme}.png`, fullPage: true });
       }
       const rejectedSave = page.waitForResponse(response => response.request().method() === 'PUT' && response.status() === 409);
