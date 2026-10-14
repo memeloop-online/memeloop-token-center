@@ -34,7 +34,7 @@ test('quota rows start together, settle independently and retain failed observat
     await page.getByText('1/5', { exact: true }).waitFor();
     await page.locator('[data-account="account-3"] [data-reset-credit-expiry="known"]').first().waitFor();
     assert.match(await page.locator('[data-account="account-0"] [data-summary]').innerText(), /Refreshing/);
-    await page.locator('[data-account="account-3"]').getByRole('button', { name: 'Refresh quota', exact: true }).click();
+    await page.locator('[data-account="account-3"] > button').click();
     await page.waitForFunction(() => window.quotaReadCalls.length === 6);
     await page.evaluate(() => window.releaseQuota(5, 504));
     await page.locator('[data-account="account-3"] [data-quota-error-code="quota_timeout"]').waitFor();

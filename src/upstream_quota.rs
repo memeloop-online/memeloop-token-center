@@ -156,13 +156,12 @@ fn codex_quota_transport_policy(
     let value = config.get("transport_policy");
     let mut policy = crate::provider::CodexTransportPolicy::parse(value)?;
     let total_millis = budget.total.as_millis() as u64;
-    policy.connect_timeout_millis = if value
-        .is_some_and(|policy| policy.get("connect_timeout_millis").is_some())
-    {
-        policy.connect_timeout_millis.min(total_millis)
-    } else {
-        total_millis
-    };
+    policy.connect_timeout_millis =
+        if value.is_some_and(|policy| policy.get("connect_timeout_millis").is_some()) {
+            policy.connect_timeout_millis.min(total_millis)
+        } else {
+            total_millis
+        };
     Ok(policy)
 }
 
@@ -840,20 +839,19 @@ async fn read_codex(
     })?;
     let budget = codex_quota_budget(&account.config)?;
     let policy = codex_quota_transport_policy(&account.config, budget)?;
-    let http = crate::build_codex_http_client_with_policy(policy)
-        .map_err(|_| {
-            tracing::warn!(
-                operation = "quota_supplier_read",
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                endpoint_kind = "quota_client",
-                trigger = trigger.as_str(),
-                phase = "client",
-                error_kind = "transport_client_unavailable",
-                "quota supplier client setup failed"
-            );
-            "quota_transport_failed"
-        })?;
+    let http = crate::build_codex_http_client_with_policy(policy).map_err(|_| {
+        tracing::warn!(
+            operation = "quota_supplier_read",
+            upstream_account_id = %account.id,
+            credential_generation = account.credential_generation,
+            endpoint_kind = "quota_client",
+            trigger = trigger.as_str(),
+            phase = "client",
+            error_kind = "transport_client_unavailable",
+            "quota supplier client setup failed"
+        );
+        "quota_transport_failed"
+    })?;
     let (credential_header, credential_value) = credential
         .request_header(observation_started_at)
         .map_err(|_| "credential_invalid")?
