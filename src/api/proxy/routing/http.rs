@@ -825,9 +825,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(health_stage, "dns");
-        assert!(state.routing_persistence.render_routing().contains(
-            "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"
-        ));
+        assert!(
+            state.routing_persistence.render_routing().contains(
+                "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"
+            )
+        );
         pool.close().await;
     }
 
