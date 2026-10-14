@@ -287,14 +287,51 @@ fn kimi_oauth_schema_accepts_the_request_timeout_used_by_existing_accounts() {
     let provider = catalog.get("kimi-oauth").unwrap();
     let mut config = crate::oauth::managed::kimi::native_import_config();
     crate::schema::validate_instance(&provider.config_schema, &config).unwrap();
-    for timeout in [1, 120, 600] {
-        config["timeout_seconds"] = json!(timeout);
+    for timeout in [
+        json!(1),
+        json!(120),
+        json!(600),
+        json!(601),
+        json!(900),
+        json!(900.0),
+        json!(1261),
+    ] {
+        config["timeout_seconds"] = timeout.clone();
         crate::schema::validate_instance(&provider.config_schema, &config).unwrap();
         assert_eq!(config["timeout_seconds"], timeout);
     }
-    for invalid in [json!(0), json!(601), json!("600")] {
+    for invalid in [json!(0), json!(-1), json!(1.5), json!(null), json!("600")] {
         config["timeout_seconds"] = invalid;
         assert!(crate::schema::validate_instance(&provider.config_schema, &config).is_err());
+    }
+}
+
+#[test]
+fn compatible_http_schemas_preserve_explicit_timeout_without_a_local_upper_cap() {
+    let catalog = ProviderCatalog::builtins();
+    for driver in [HTTP_JSON_PROVIDER_DRIVER, NEW_API_PROVIDER_DRIVER] {
+        let provider = catalog.get(driver).unwrap();
+        let mut config = json!({"base_url":"https://example.com"});
+        assert_eq!(
+            provider.config_schema["properties"]["timeout_seconds"]["default"],
+            120
+        );
+        for timeout in [
+            json!(1),
+            json!(120),
+            json!(600),
+            json!(601),
+            json!(900),
+            json!(900.0),
+            json!(1261),
+        ] {
+            config["timeout_seconds"] = timeout;
+            crate::schema::validate_instance(&provider.config_schema, &config).unwrap();
+        }
+        for invalid in [json!(0), json!(-1), json!(1.5), json!(null), json!("900")] {
+            config["timeout_seconds"] = invalid;
+            assert!(crate::schema::validate_instance(&provider.config_schema, &config).is_err());
+        }
     }
 }
 
