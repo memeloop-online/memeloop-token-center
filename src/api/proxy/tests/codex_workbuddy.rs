@@ -481,16 +481,12 @@ async fn assert_failed_chat_stream(body: Body) {
 }
 
 async fn assert_chat_failure_account_health(fixture: &CodexRouteFixture, invalid_response: bool) {
-    let _completed_lifecycles = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(3),
-        fixture
-            .state
-            .proxy_lifecycle_permits
-            .acquire_many(fixture.state.config.proxy_lifecycle_concurrency),
+        fixture.state.proxy_lifecycles.wait_for_idle(),
     )
     .await
-    .expect("request lifecycle must finish before inspecting account health")
-    .unwrap();
+    .expect("request lifecycle must finish before inspecting account health");
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     if invalid_response {

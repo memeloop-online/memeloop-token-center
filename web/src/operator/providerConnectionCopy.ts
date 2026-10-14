@@ -2,6 +2,7 @@ export function providerConnectionCopy(locale: string) {
   return locale.startsWith('zh') ? {
     identity: '账号', network: '网络与连接', authentication: '认证', routing: '路由设置',
     displayName: '备注名称',
+    editHint: '修改账号名称与连接设置后保存。网络代理和备注分别保存；重新登录不会修改账号名称。',
     editDisplayName: '修改名称',
     signInAgain: '重新登录',
     authorizationExpires: '授权有效期',
@@ -17,6 +18,7 @@ export function providerConnectionCopy(locale: string) {
   } : {
     identity: 'Account', network: 'Network and connection', authentication: 'Authentication', routing: 'Routing settings',
     displayName: 'Display name',
+    editHint: 'Save after changing the account name or connection settings. Network proxy and notes are saved separately. Signing in again does not rename the account.',
     editDisplayName: 'Rename',
     signInAgain: 'Sign in again',
     authorizationExpires: 'Authorization expires',

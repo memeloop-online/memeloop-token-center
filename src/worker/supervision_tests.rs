@@ -7,6 +7,229 @@ use super::*;
 
 struct OnDrop(Arc<AtomicUsize>);
 
+#[tokio::test(start_paused = true)]
+async fn early_oauth_stop_drains_current_exchange_without_stopping_http_cleanup_roles() {
+    let (stop, shutdown) = watch::channel(false);
+    let (early_stop, early_shutdown) = watch::channel(false);
+    let (role_stop, mut role_shutdown) = watch::channel(false);
+    let (oauth_stop, oauth_shutdown) = watch::channel(false);
+    let mut observed_oauth_stop = oauth_shutdown.clone();
+    let saved = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let joined = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(joined.clone());
+    let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let mut refresh_roles = JoinSet::new();
+    refresh_roles.spawn({
+        let saved = saved.clone();
+        let entered = entered.clone();
+        async move {
+            let _guard = guard;
+            run_periodic(Duration::from_secs(60), oauth_shutdown, || async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                started.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                saved.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+            "oauth_refresh"
+        }
+    });
+    let mut roles = JoinSet::new();
+    let mut ordinary_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        wait_for_shutdown(&mut ordinary_shutdown).await;
+        "http_cleanup"
+    });
+    let supervisor = tokio::spawn(supervise_roles_with_early_oauth_shutdown(
+        roles,
+        OAuthRefreshRoles {
+            roles: refresh_roles,
+            stop: oauth_stop,
+            shutdown: early_shutdown,
+            grace: OAUTH_REFRESH_SHUTDOWN_GRACE,
+        },
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        BlockingTasks::new(),
+    ));
+    observed.recv().await.unwrap();
+    early_stop.send(true).unwrap();
+    wait_for_shutdown(&mut observed_oauth_stop).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(saved.load(Ordering::SeqCst), 1);
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    assert_eq!(joined.load(Ordering::SeqCst), 1);
+    assert!(!*role_shutdown.borrow());
+    assert!(!supervisor.is_finished());
+    tokio::time::advance(Duration::from_secs(1139)).await;
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    stop.send(true).unwrap();
+    wait_for_shutdown(&mut role_shutdown).await;
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn early_oauth_deadline_is_not_restarted_after_http_finishes() {
+    let (stop, shutdown) = watch::channel(false);
+    let (early_stop, early_shutdown) = watch::channel(false);
+    let (role_stop, mut role_shutdown) = watch::channel(false);
+    let (oauth_stop, mut oauth_shutdown) = watch::channel(false);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(dropped.clone());
+    let mut refresh_roles = JoinSet::new();
+    refresh_roles.spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+        "oauth_refresh"
+    });
+    let mut roles = JoinSet::new();
+    let mut ordinary_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        wait_for_shutdown(&mut ordinary_shutdown).await;
+        "http_cleanup"
+    });
+    let supervisor = tokio::spawn(supervise_roles_with_early_oauth_shutdown(
+        roles,
+        OAuthRefreshRoles {
+            roles: refresh_roles,
+            stop: oauth_stop,
+            shutdown: early_shutdown,
+            grace: OAUTH_REFRESH_SHUTDOWN_GRACE,
+        },
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        BlockingTasks::new(),
+    ));
+    early_stop.send(true).unwrap();
+    wait_for_shutdown(&mut oauth_shutdown).await;
+    let started = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(170)).await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    stop.send(true).unwrap();
+    wait_for_shutdown(&mut role_shutdown).await;
+    supervisor.await.unwrap();
+    assert_eq!(started.elapsed(), OAUTH_REFRESH_SHUTDOWN_GRACE);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn oauth_refresh_drain_preserves_current_exchange_beyond_ordinary_grace() {
+    let (stop, shutdown) = watch::channel(false);
+    let (role_stop, role_shutdown) = watch::channel(false);
+    let ordinary_dropped = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(ordinary_dropped.clone());
+    let mut roles = JoinSet::new();
+    roles.spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+        "ordinary"
+    });
+    let entered = Arc::new(AtomicUsize::new(0));
+    let saved = Arc::new(AtomicUsize::new(0));
+    let observed_saved = saved.clone();
+    let observed_entered = entered.clone();
+    let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let refresh_shutdown = role_shutdown.clone();
+    let mut refresh_roles = JoinSet::new();
+    refresh_roles.spawn(async move {
+        run_periodic(Duration::from_secs(60), refresh_shutdown, || async {
+            entered.fetch_add(1, Ordering::SeqCst);
+            started.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            saved.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        "oauth_refresh"
+    });
+    let supervisor = tokio::spawn(supervise_roles_with_oauth_refresh(
+        roles,
+        refresh_roles,
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        OAUTH_REFRESH_SHUTDOWN_GRACE,
+        BlockingTasks::new(),
+    ));
+    observed.recv().await.unwrap();
+    stop.send(true).unwrap();
+    let mut stopping = role_shutdown.clone();
+    wait_for_shutdown(&mut stopping).await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(ordinary_dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(observed_saved.load(Ordering::SeqCst), 0);
+    assert!(!supervisor.is_finished());
+    tokio::time::advance(Duration::from_secs(100)).await;
+    supervisor.await.unwrap();
+    assert_eq!(observed_saved.load(Ordering::SeqCst), 1);
+    assert_eq!(observed_entered.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn oauth_refresh_drain_remains_bounded_and_joins_the_cancelled_operation() {
+    let (stop, shutdown) = watch::channel(false);
+    let (role_stop, mut role_shutdown) = watch::channel(false);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(dropped.clone());
+    let (started, observed) = tokio::sync::oneshot::channel();
+    let mut refresh_roles = JoinSet::new();
+    refresh_roles.spawn(async move {
+        let _guard = guard;
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+        "oauth_refresh"
+    });
+    let supervisor = tokio::spawn(supervise_roles_with_oauth_refresh(
+        JoinSet::new(),
+        refresh_roles,
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        OAUTH_REFRESH_SHUTDOWN_GRACE,
+        BlockingTasks::new(),
+    ));
+    observed.await.unwrap();
+    stop.send(true).unwrap();
+    wait_for_shutdown(&mut role_shutdown).await;
+    let before = tokio::time::Instant::now();
+    supervisor.await.unwrap();
+    assert_eq!(before.elapsed(), OAUTH_REFRESH_SHUTDOWN_GRACE);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unexpected_oauth_refresh_exit_stops_and_joins_ordinary_roles() {
+    let (_stop, shutdown) = watch::channel(false);
+    let (role_stop, mut role_shutdown) = watch::channel(false);
+    let mut refresh_roles = JoinSet::new();
+    refresh_roles.spawn(async { "oauth_refresh" });
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let guard = OnDrop(dropped.clone());
+    let mut roles = JoinSet::new();
+    roles.spawn(async move {
+        let _guard = guard;
+        wait_for_shutdown(&mut role_shutdown).await;
+        "ordinary"
+    });
+    let error = tokio::spawn(supervise_roles_with_oauth_refresh(
+        roles,
+        refresh_roles,
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        OAUTH_REFRESH_SHUTDOWN_GRACE,
+        BlockingTasks::new(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.is_panic());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn deadline_joins_started_blocking_calls_after_cancelling_their_async_role() {
     let (stop, shutdown) = watch::channel(false);

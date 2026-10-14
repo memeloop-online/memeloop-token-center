@@ -981,8 +981,12 @@ async fn refresh_managed_upstream_oauth_impl(
         driver,
         refresh_url,
     } = claim;
-    let request_guard =
-        crate::oauth::DurableOAuthRefreshRequestGuard::new(&state.db, account_id, idempotency_key);
+    let request_guard = crate::oauth::DurableOAuthRefreshRequestGuard::new(
+        &state.db,
+        account_id,
+        idempotency_key,
+        credential_generation,
+    );
     let refreshed: Result<UpstreamCredential, AppError> = async {
         let (account, credential) = state
             .db
@@ -1153,18 +1157,37 @@ async fn refresh_managed_upstream_oauth_impl(
     // A successful authorization-server refresh may have invalidated the old
     // refresh token. Finalize retries therefore stay local; on exhaustion the
     // encrypted pending result and lease remain for exact same-key recovery.
-    let finalized = state
-        .db
-        .finish_upstream_oauth_refresh(
-            account_id,
-            refreshed,
-            idempotency_key,
-            state.config.key_pepper.as_bytes(),
-        )
-        .await;
+    let finalized = if driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        state
+            .db
+            .finish_kimi_oauth_refresh(
+                account_id,
+                refreshed,
+                idempotency_key,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+    } else {
+        state
+            .db
+            .finish_upstream_oauth_refresh(
+                account_id,
+                refreshed,
+                idempotency_key,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+    };
     let account = match finalized {
         Ok(account) => account,
         Err(error) => {
+            tracing::error!(
+                %account_id,
+                credential_generation,
+                error_kind = error.diagnostic_category(),
+                stage = "oauth_refresh_local_persistence",
+                "received authorization refresh result could not be finalized; do not repeat the remote refresh"
+            );
             record_refresh_failure_best_effort(
                 state,
                 account_id,

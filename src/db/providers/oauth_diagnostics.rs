@@ -203,6 +203,7 @@ mod tests {
         assert_eq!(value["refresh_state"], "outcome_unknown");
         assert_eq!(value["access_state"], "expired");
         assert_eq!(value["reauthorization_required"], false);
+        assert_eq!(value["automatic_refresh_paused"], true);
         let persisted: Option<String> = sqlx::query_scalar("SELECT oauth_refresh_diagnostic_json FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1")
             .bind(account.id.to_string()).fetch_one(&database.pool).await.unwrap();
         assert!(persisted.is_none());
@@ -222,6 +223,152 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn proven_unsent_connector_failure_can_reenter_worker_without_rotating() {
+        let (database, _directory, account) = setup().await;
+        let created = claim(&database, &account, "connect-failed").await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, "connect-failed")
+            .await
+            .unwrap();
+        database
+            .mark_upstream_oauth_refresh_request_not_sent(account.id, "connect-failed", 1)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .record_upstream_oauth_refresh_failure(
+                    account.id,
+                    1,
+                    created,
+                    "connect-failed",
+                    OAuthRefreshFailure::new(OAuthRefreshFailureKind::Network, None),
+                )
+                .await
+                .unwrap()
+        );
+        database
+            .abort_upstream_oauth_refresh(account.id, "connect-failed")
+            .await
+            .unwrap();
+        let statuses = database
+            .upstream_oauth_refresh_statuses(std::slice::from_ref(&account))
+            .await
+            .unwrap();
+        let status = serde_json::to_value(&statuses[&account.id]).unwrap();
+        assert_eq!(status["refresh_state"], "failed");
+        assert_eq!(status["automatic_refresh_paused"], false);
+        assert_eq!(status["credential_generation"], 1);
+        assert_eq!(
+            database
+                .list_managed_oauth_refresh_candidates(unix_millis(), 20)
+                .await
+                .unwrap(),
+            vec![(account.id, 1)],
+        );
+        claim(&database, &account, "connect-recovery").await;
+    }
+
+    #[tokio::test]
+    async fn unsent_release_cannot_clear_saved_results_or_a_superseding_claim() {
+        let (database, _directory, account) = setup().await;
+        claim(&database, &account, "original-connect").await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, "original-connect")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = 'synthetic-pending' WHERE account_id = $1")
+            .bind(account.id.to_string()).execute(&database.pool).await.unwrap();
+        assert!(
+            database
+                .mark_upstream_oauth_refresh_request_not_sent(account.id, "original-connect", 1)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = NULL, credential_generation = 2, idempotency_key = 'new-generation' WHERE account_id = $1")
+            .bind(account.id.to_string()).execute(&database.pool).await.unwrap();
+        sqlx::query("UPDATE upstream_accounts SET credential_generation = 2 WHERE id = $1")
+            .bind(account.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .mark_upstream_oauth_refresh_request_not_sent(account.id, "original-connect", 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .mark_upstream_oauth_refresh_request_not_sent(account.id, "new-generation", 1)
+                .await
+                .is_err()
+        );
+        let started: Option<i64> = sqlx::query_scalar("SELECT request_started_at FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = 2 AND idempotency_key = 'new-generation'")
+            .bind(account.id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert!(started.is_some());
+    }
+
+    #[tokio::test]
+    async fn kimi_received_result_survives_a_temporary_local_stage_failure() {
+        let (database, directory, account) = setup().await;
+        claim(&database, &account, "kimi-stage-recovery").await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, "kimi-stage-recovery")
+            .await
+            .unwrap();
+        let writer = Database::connect_with_max(
+            &format!(
+                "sqlite://{}",
+                directory.path().join("diagnostics.db").display()
+            ),
+            1,
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        let blocked = database.begin_write_transaction().await.unwrap();
+        let account_id = account.id;
+        let finish = tokio::spawn(async move {
+            writer
+                .finish_kimi_oauth_refresh(
+                    account_id,
+                    credential(unix_millis() + 900_000),
+                    "kimi-stage-recovery",
+                    PEPPER,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!finish.is_finished());
+        blocked.rollback().await.unwrap();
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.credential_generation, 2);
+        let replay = database
+            .claim_upstream_oauth_refresh(account.id, "kimi-stage-recovery", PEPPER)
+            .await
+            .unwrap();
+        let ClaimUpstreamOAuthRefreshResult::Replay(replay) = replay else {
+            panic!("a received result must recover locally, not dispatch again");
+        };
+        assert_eq!(replay.credential_generation, 2);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

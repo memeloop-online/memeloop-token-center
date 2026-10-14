@@ -47,6 +47,7 @@ mod gateway_persistence;
 mod group_routing;
 mod ha_policy;
 mod kimi;
+mod lifecycle_activity;
 mod memory_admission;
 mod memory_metrics;
 mod passthrough_reservation;
@@ -2676,51 +2677,20 @@ async fn successful_stream_is_never_replayed_after_downstream_delivery_can_start
     standby.verify().await;
 }
 
-#[tokio::test]
-async fn exhausted_proxy_lifecycle_capacity_reports_overload_before_side_effects() {
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&upstream)
-        .await;
-    let mut fixture = response_usage_fixture("lifecycle-budget", &upstream, 0).await;
-    fixture.state.proxy_lifecycle_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let held = fixture
-        .state
-        .proxy_lifecycle_permits
-        .clone()
-        .acquire_owned()
-        .await
-        .unwrap();
-
-    let response = send_response_usage_request(
-        &fixture,
-        &json!({"model": fixture.model.clone(), "input": "probe", "stream": true}),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-    assert_only_early_request_failures(&fixture).await;
-    drop(held);
-}
-
 #[tokio::test(start_paused = true)]
-async fn absolute_proxy_deadline_releases_the_lifecycle_permit() {
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let permit = permits.clone().acquire_owned().await.unwrap();
+async fn absolute_proxy_deadline_releases_lifecycle_activity() {
+    let counter = std::sync::Arc::new(crate::proxy_lifecycle::ProxyLifecycleCounter::default());
+    let activity = counter.start();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let task = tokio::spawn(async move {
-        let _permit = permit;
+        let _activity = activity;
         let _ = run_bounded_proxy_lifecycle(deadline, std::future::pending::<()>()).await;
     });
     tokio::task::yield_now().await;
-    assert!(permits.clone().try_acquire_owned().is_err());
-
+    assert_eq!(counter.active(), 1);
     tokio::time::advance(Duration::from_secs(1)).await;
     task.await.unwrap();
-    assert!(permits.try_acquire_owned().is_ok());
+    assert_eq!(counter.active(), 0);
 }
 
 fn archive_file_count(root: &std::path::Path) -> usize {

@@ -1023,11 +1023,7 @@ async fn proxy_with_cancellation_guard(
         proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
-    let proxy_lifecycle_permit = state
-        .proxy_lifecycle_permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::Overloaded)?;
+    let proxy_lifecycle_permit = state.proxy_lifecycles.start();
     if !memory.try_reserve_json(&body) {
         state
             .metrics
