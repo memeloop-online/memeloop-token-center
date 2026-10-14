@@ -33,7 +33,7 @@ pub(super) async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         .db
         .create_service_token(
             crate::db::CreateServiceTokenInput {
-                name: "policy-manager".into(),
+                name: format!("policy-manager-{}", Uuid::now_v7()),
                 scopes: vec!["providers:read".into(), "providers:write".into()],
                 tenant_external_id: Some(tenant.clone()),
             },
