@@ -100,7 +100,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
           id: 'raw-group-id', tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
           bound_account_count: old?.bound_account_count ?? 0,
           members: body.members.map((member: { id?: string; label: string }, index: number) => ({
-            id: member.id ?? `raw-member-id-${index}`, label: member.label, scheme: 'socks5h', remote_dns: true, has_auth: true,
+            id: member.id ?? `raw-member-id-${index}`, label: member.label, scheme: 'socks5h', host: '10.20.30.40', port: 1080, remote_dns: true, has_auth: true,
           })),
         };
         state.groups = [group];
@@ -228,7 +228,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
         await captureNavigationIdentity(page, 'proxy-groups', 'empty', locale);
         await page.evaluate(() => { window.proxyGroupFixture.groups = [{
           id: 'raw-group-id', tenant_external_id: 'fixture', name: 'Research exits', version: 1, bound_account_count: 0,
-          members: [{ id: 'raw-member-id-0', label: 'Primary exit', scheme: 'socks5h', remote_dns: true, has_auth: true }],
+          members: [{ id: 'raw-member-id-0', label: 'Primary exit', scheme: 'socks5h', host: '10.20.30.40', port: 1080, remote_dns: true, has_auth: true }],
         }]; });
         await page.getByRole('button', { name: copy.refresh, exact: true }).click();
         await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).waitFor();

@@ -28,6 +28,10 @@ globalThis.fetch = async (input, init) => {
     return new Response(JSON.stringify(quotaBatchFixtureResponse(JSON.parse(String(init?.body ?? '{}')), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }])), { headers: { 'Content-Type': 'application/json' } });
   }
   let value: unknown = [];
+  if (url.pathname === '/internal/v1/requests/egress-summary') value = {
+    start: Number(url.searchParams.get('start')), end: Number(url.searchParams.get('end')),
+    coverage: 'recorded_codex_attempts_only', measurement_basis: 'application_payload_estimate', wire_bytes: null, supplier_billed_bytes: null, groups: [],
+  };
   if (url.pathname === '/internal/v1/tenants') value = [{ external_id: 'fixture' }];
   if (url.pathname === '/internal/v1/tenant-management') value = [{ external_id: 'fixture', status: 'active' }];
   if (url.pathname === '/internal/v1/transport-proxy-groups/access') {

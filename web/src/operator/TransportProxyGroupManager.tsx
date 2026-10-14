@@ -7,6 +7,8 @@ import { useConfirmDialog } from '../useConfirmDialog';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { transportProxyError, transportProxyFailureKind, transportProxyGroupsPath, transportProxyRequest, type TransportProxyBinding, type TransportProxyGroup } from './transportProxyGroups';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy';
+import { egressAddress } from './requestEgress';
+import './requestEgress.css';
 
 interface Props {
   token: string;
@@ -281,6 +283,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
         {ready && groups.length === 0 && <p>{copy.empty}</p>}
         {groups.map(group => <div className="button-row" key={group.id}>
           <span>{copy.groupSummary(group.name, group.members.length, group.bound_account_count)}</span>
+          <ul className="proxy-group-addresses">{group.members.map(member => <li key={member.id}>{member.label} · {egressAddress(member, locale)}</li>)}</ul>
           <Button type="button" disabled={editing !== undefined} onClick={() => editGroup(group)}>{copy.edit(group.name)}</Button>
           <Button type="button" disabled={editing !== undefined || group.bound_account_count > 0} onClick={async () => {
             if (!await confirm(copy.confirmDelete(group.name))) return;

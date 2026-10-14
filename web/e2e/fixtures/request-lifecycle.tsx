@@ -5,6 +5,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { RequestsPage } from '../../src/operator/pages/RequestsPage';
 import type { RequestDetail, RequestEvent, TypedFilterAst } from '../../src/types';
+import { egressAttempts } from '../support/request-egress-fixtures';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
@@ -25,6 +26,10 @@ const diagnosticFailure = diagnosticParam === 'downstream'
     failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } }
   : undefined;
 let first = supplierFailure ?? diagnosticFailure ?? base;
+if (new URLSearchParams(location.search).has('egress')) first = {
+  ...base, status_code: 502, completed_at: 3000, duration_ms: 2000, error_code: 'upstream_http2_reset',
+  egress_attempts: egressAttempts,
+};
 const second = { ...base, compaction: null, request_id: 'request-b', model: 'model-b', status_code: 200, completed_at: 3000, duration_ms: 2000 };
 let hold = false;
 let release: (() => void) | undefined;

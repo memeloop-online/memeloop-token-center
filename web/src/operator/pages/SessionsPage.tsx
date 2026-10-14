@@ -4,6 +4,7 @@ import { DrawerFrame, RequestDiagnostics } from '../../components.js';
 import { Button, Disclosure, LoadingState, PageLoadingRegion } from '../../design-system/index.js';
 import { useI18n } from '../../i18n.js';
 import type { RequestDetail, RequestView } from '../../types.js';
+import { RequestEgressDetails } from '../RequestEgressDetails';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
 import { messageOf, queryForTenant } from '../scope/operatorShared.js';
 import {
@@ -96,6 +97,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
       </>}
       {scopedSelection.detail && <>
           <RequestDiagnostics request={scopedSelection.detail} />
+          <RequestEgressDetails attempts={scopedSelection.detail.egress_attempts} />
           <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
             <span><b>{t('self.archive')}</b>{scopedSelection.detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
             {scopedSelection.detail.provenance && <span><b>{t('request.provenance')}</b>{scopedSelection.detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {scopedSelection.detail.provenance.source}</span>}

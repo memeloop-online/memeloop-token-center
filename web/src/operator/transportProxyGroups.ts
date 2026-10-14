@@ -5,6 +5,8 @@ export interface TransportProxyMember {
   id: string;
   label: string;
   scheme: string;
+  host: string;
+  port: number;
   remote_dns: boolean;
   has_auth: boolean;
 }
