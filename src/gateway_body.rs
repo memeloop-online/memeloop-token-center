@@ -881,9 +881,9 @@ mod tests {
         let admitted = Request::post("/v1/responses")
             .body(Body::from_stream(stream::poll_fn(move |_| {
                 let previous = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::task::Poll::Ready((previous == 0).then_some(Ok::<_, Infallible>(
-                    Bytes::from_static(b"x"),
-                )))
+                std::task::Poll::Ready(
+                    (previous == 0).then_some(Ok::<_, Infallible>(Bytes::from_static(b"x"))),
+                )
             })))
             .expect("responses request");
         assert!(
