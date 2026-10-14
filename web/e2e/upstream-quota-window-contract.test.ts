@@ -168,5 +168,7 @@ test('quota refresh diagnostics stay separate from the effective observation and
   for (const unsafeCode of ['proxy.internal:1080', 'socks5h', 'proxy_password']) {
     assert.equal(quotaRefreshDiagnostic({ ...failed, error_code: unsafeCode }).error_code, null, `unknown top-level code ${unsafeCode} is discarded`);
   }
-  assert.equal(quotaEffectiveSnapshot(observed, failed), observed, 'the failed read keeps the last effective observation');
+  const retained = quotaEffectiveSnapshot(observed, failed);
+  assert.deepEqual(retained, { ...observed, stale: true, freshness: 'stale' }, 'the failed read keeps the last effective observation and marks it historical');
+  assert.equal(quotaObservationState(retained), 'historical');
 });
