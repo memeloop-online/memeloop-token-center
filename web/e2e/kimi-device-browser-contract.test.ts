@@ -29,7 +29,7 @@ const copy = {
   },
 } as const;
 
-test('Kimi display-name editing saves metadata alone and keeps unknown identity and connection state clear', { timeout: 90_000 }, async () => {
+test('Kimi display-name editing saves metadata alone and keeps unknown identity and connection state clear', { timeout: 180_000 }, async () => {
   const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen(); const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
@@ -49,6 +49,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
         },
       }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'kimi_device' } };
       const writes: Record<string, unknown>[] = [];
+      const staleAccount = { ...account };
       const errors: string[] = [];
       page.on('pageerror', error => errors.push(error.message));
       let failNextSave = true;
@@ -76,7 +77,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
           return route.fulfill({ json: { id: updated.id, name: updated.name, updated_at: updated.updated_at, tenant_id: updated.tenant_id, tenant_external_id: updated.tenant_external_id } });
         }
         if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [provider] });
-        if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: url.searchParams.get('tenant_external_id') === 'fixture-b' ? [] : [account] });
+        if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: url.searchParams.get('tenant_external_id') === 'fixture-b' ? [] : [writes.length >= 2 ? staleAccount : account] });
         if (url.pathname.endsWith('/models')) {
           assert.equal(url.pathname, `/internal/v1/upstreams/${account.id}/models`);
           assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id);
@@ -96,6 +97,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       assert.equal(await page.getByRole('dialog').count(), 0, 'opening settings before login does not discard an authorization session');
       assert.equal(writes.length, 0, 'reauthorization-to-settings navigation starts no OAuth request');
       const editor = page.locator('.provider-edit-workspace');
+      await editor.getByText(text.editHint, { exact: true }).waitFor();
       await editor.getByText(text.providerIdentity, { exact: true }).waitFor();
       await editor.getByText(text.kimiIdentityUnavailable, { exact: true }).waitFor();
       const name = editor.getByLabel(text.displayName, { exact: false });
@@ -118,20 +120,38 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       await discard.waitFor();
       await discard.getByRole('button', { name: chinese ? '取消' : 'Cancel', exact: true }).click();
       assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'dirty confirmation retains the name draft');
-      for (const width of [390, 1440]) {
+      assert.deepEqual(await editor.locator('.rjsf fieldset.mtc-form-section > legend').allTextContents(),
+        [text.identity, text.network, text.authentication, text.routing], 'the complete editor starts with account and connection, not the model catalog');
+      assert.equal(await editor.evaluate(element => {
+        const form = element.querySelector('.rjsf')!;
+        const catalog = element.querySelector('.provider-model-catalog')!;
+        const notes = element.querySelector('.upstream-notes-editor')!;
+        return Boolean(form.compareDocumentPosition(catalog) & Node.DOCUMENT_POSITION_FOLLOWING)
+          && Boolean(catalog.compareDocumentPosition(notes) & Node.DOCUMENT_POSITION_FOLLOWING);
+      }), true, 'models and separately saved notes follow the account form in reading and keyboard order');
+      for (const width of [320, 390, 1440]) for (const theme of ['light', 'dark']) {
         await page.setViewportSize({ width, height: 1000 });
+        await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        assert.equal(await editor.locator('button:visible').evaluateAll(buttons => buttons.every(button => {
+          const bounds = button.getBoundingClientRect();
+          return bounds.width > 0 && bounds.height >= 40 && bounds.left >= 0 && bounds.right <= innerWidth;
+        })), true, 'all full-page buttons have usable targets and remain inside the viewport');
         const screenshots = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
         await mkdir(screenshots, { recursive: true });
-        await page.screenshot({ path: `${screenshots}/kimi-rename-${locale}-${width}.png`, fullPage: true });
+        await page.screenshot({ path: `${screenshots}/kimi-rename-${locale}-${width}-${theme}.png`, fullPage: true });
       }
       const rejectedSave = page.waitForResponse(response => response.request().method() === 'PUT' && response.status() === 409);
       await save.click(); await rejectedSave;
       await editor.getByText('Synthetic revision conflict', { exact: true }).waitFor();
       assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'a failed save retains the draft');
+      const screenshots = fileURLToPath(new URL('../e2e-artifacts/ui-system/account-workspace', import.meta.url));
+      await page.screenshot({ path: `${screenshots}/kimi-save-conflict-${locale}.png`, fullPage: true });
       await save.click();
       const details = page.locator('.provider-detail-workspace');
       await details.getByRole('heading', { name: 'Kimi OAuth 0142', exact: true }).waitFor();
+      assert.equal(await details.getByRole('heading', { name: 'My Kimi', exact: true }).count(), 0, 'a stale list refresh cannot replace the confirmed rename heading');
+      await page.screenshot({ path: `${screenshots}/kimi-saved-heading-${locale}.png`, fullPage: true });
       assert.deepEqual(writes, [
         { name: 'Kimi OAuth 0142', tenant_external_id: 'fixture-a', expected_updated_at: 4 },
         { name: 'Kimi OAuth 0142', tenant_external_id: 'fixture-a', expected_updated_at: 4 },
@@ -146,6 +166,9 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       await details.getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
       await reauthorization.getByText('Kimi OAuth 0142', { exact: true }).waitFor();
       await reauthorization.getByRole('button', { name: text.editDisplayName, exact: true }).click();
+      await editor.getByRole('heading', { name: new RegExp('Kimi OAuth 0142') }).waitFor();
+      assert.equal(await name.inputValue(), 'Kimi OAuth 0142', 'reauthorization and settings reuse the confirmed account name');
+      await page.screenshot({ path: `${screenshots}/kimi-reopened-heading-${locale}.png`, fullPage: true });
       await name.fill('Late old-scope name');
       holdNextSave = true;
       const started = page.waitForRequest(request => request.method() === 'PUT');
