@@ -63,6 +63,7 @@ pub async fn run(state: AppState) {
 }
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const OAUTH_REFRESH_SHUTDOWN_GRACE: Duration = Duration::from_secs(180);
 
 /// Blocking component calls cannot be cancelled once started. Keep ownership
 /// separate from their async callers so deadline cancellation never detaches
@@ -134,6 +135,7 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
     }
     let (role_stop, role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
+    let mut oauth_refresh_roles = JoinSet::new();
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
     let service_data_blocking = blocking_tasks.clone();
@@ -166,11 +168,16 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
         ($name:literal, $period:expr, $operation:expr) => {{
             let state = state.clone();
             let shutdown = role_shutdown.clone();
-            roles.spawn(async move {
+            let task = async move {
                 let operation = $operation;
                 run_periodic($period, shutdown.clone(), || operation(&state, &shutdown)).await;
                 $name
-            });
+            };
+            if $name == "oauth_refresh" {
+                oauth_refresh_roles.spawn(task);
+            } else {
+                roles.spawn(task);
+            }
         }};
     }
     periodic!(
@@ -399,7 +406,16 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
             refresh_plugin_service_data(state, shutdown, &service_data_blocking).await;
         }
     );
-    supervise_roles(roles, role_stop, shutdown, SHUTDOWN_GRACE, blocking_tasks).await;
+    supervise_roles_with_oauth_refresh(
+        roles,
+        oauth_refresh_roles,
+        role_stop,
+        shutdown,
+        SHUTDOWN_GRACE,
+        OAUTH_REFRESH_SHUTDOWN_GRACE,
+        blocking_tasks,
+    )
+    .await;
 }
 
 async fn refresh_plugin_service_data(
@@ -587,18 +603,44 @@ pub(crate) async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+#[cfg(test)]
 async fn supervise_roles(
+    roles: JoinSet<&'static str>,
+    role_stop: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+    grace: Duration,
+    blocking_tasks: BlockingTasks,
+) {
+    supervise_roles_with_oauth_refresh(
+        roles,
+        JoinSet::new(),
+        role_stop,
+        shutdown,
+        grace,
+        grace,
+        blocking_tasks,
+    )
+    .await;
+}
+
+async fn supervise_roles_with_oauth_refresh(
     mut roles: JoinSet<&'static str>,
+    mut oauth_refresh_roles: JoinSet<&'static str>,
     role_stop: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
     grace: Duration,
+    oauth_grace: Duration,
     blocking_tasks: BlockingTasks,
 ) {
     let mut failed = tokio::select! {
         biased;
         _ = wait_for_shutdown(&mut shutdown) => false,
-        result = roles.join_next() => {
+        result = roles.join_next(), if !roles.is_empty() => {
             tracing::error!(?result, "worker role exited unexpectedly; stopping worker roles");
+            true
+        }
+        result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => {
+            tracing::error!(?result, "OAuth refresh role exited unexpectedly; stopping worker roles");
             true
         }
     };
@@ -606,30 +648,41 @@ async fn supervise_roles(
     // retain their independent plugin execution deadline and remain joinable.
     let mut blocking = blocking_tasks.close();
     let _ = role_stop.send(true);
-    // One shared deadline, not one grace period per role. JoinSet aborts on
-    // supervisor cancellation too, so no detached provider/lease loops survive.
     let deadline = tokio::time::sleep(grace);
-    tokio::pin!(deadline);
-    loop {
+    let oauth_deadline = tokio::time::sleep(oauth_grace);
+    tokio::pin!(deadline, oauth_deadline);
+    let mut ordinary_aborted = false;
+    let mut oauth_aborted = false;
+    while !roles.is_empty() || !oauth_refresh_roles.is_empty() {
         tokio::select! {
             biased;
-            _ = &mut deadline => {
+            _ = &mut deadline, if !ordinary_aborted && !roles.is_empty() => {
                 tracing::warn!("worker shutdown deadline reached; aborting remaining roles");
                 roles.abort_all();
-                while let Some(result) = roles.join_next().await {
-                    if let Err(error) = result {
-                        failed |= error.is_panic();
-                    }
-                }
-                break;
+                ordinary_aborted = true;
             }
-            result = roles.join_next() => match result {
-                None => break,
+            _ = &mut oauth_deadline, if !oauth_aborted && !oauth_refresh_roles.is_empty() => {
+                tracing::error!(stage = "oauth_refresh_shutdown", "OAuth refresh drain deadline reached; an unpersisted result may be unknown");
+                oauth_refresh_roles.abort_all();
+                oauth_aborted = true;
+            }
+            result = roles.join_next(), if !roles.is_empty() => match result {
                 Some(Err(error)) => {
-                    tracing::error!(%error, "worker role failed during shutdown");
-                    failed = true;
+                    if !ordinary_aborted || error.is_panic() {
+                        tracing::error!(%error, "worker role failed during shutdown");
+                        failed = true;
+                    }
                 },
-                Some(Ok(_)) => {},
+                _ => {},
+            },
+            result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => match result {
+                Some(Err(error)) => {
+                    if !oauth_aborted || error.is_panic() {
+                        tracing::error!(%error, "OAuth refresh role failed during shutdown");
+                        failed = true;
+                    }
+                },
+                _ => {},
             },
         }
     }

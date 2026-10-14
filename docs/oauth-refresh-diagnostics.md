@@ -124,7 +124,11 @@ results remain durable and use the existing local replay path. Historical
 unknown POSTs stay blocked; no production lease or credential is rewritten by
 deployment of this change.
 
-The existing worker supervisor still has a 30-second shutdown grace. A forced
-shutdown during a longer in-flight exchange can therefore leave an unknown
-result. This patch does not change pod termination settings or claim to solve
-that separate drain-lifetime boundary; rollout must account for it.
+On worker shutdown, ordinary roles retain their 30-second shared grace. The
+single OAuth-refresh role stops scheduling new work and retains up to180seconds
+to finish the current exchange and local persistence. Both task sets remain
+owned and joined; the OAuth lane is forcibly cancelled with a safe error event
+only at its own bounded deadline. Existing chart pod termination grace1320seconds
+already accommodates this; no pod setting changes are required. A process kill
+or deployment overriding the pod grace below this drain budget can still lose
+an unstaged result.
