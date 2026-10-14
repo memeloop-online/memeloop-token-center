@@ -437,7 +437,7 @@ async fn optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity() {
                 }
                 tokio::task::yield_now().await;
             }
-            let lifecycle_capacity = fixture.state.proxy_lifecycle_permits.available_permits();
+            let lifecycle_capacity = fixture.state.proxy_lifecycles.active();
             let upstream = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_raw(
@@ -464,9 +464,7 @@ async fn optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity() {
                     .unwrap();
                 assert!(String::from_utf8_lossy(&body).contains("optional SQL cannot hold output"));
                 wait_for_request_settlement(&fixture, 1).await;
-                while fixture.state.proxy_lifecycle_permits.available_permits()
-                    != lifecycle_capacity
-                {
+                while fixture.state.proxy_lifecycles.active() != lifecycle_capacity {
                     tokio::task::yield_now().await;
                 }
             })

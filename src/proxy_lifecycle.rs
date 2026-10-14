@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -13,6 +17,41 @@ use crate::{
     error::AppError,
     model::UsageReservation,
 };
+
+#[derive(Default)]
+pub(crate) struct ProxyLifecycleCounter {
+    active: AtomicUsize,
+}
+
+impl ProxyLifecycleCounter {
+    pub(crate) fn start(self: &Arc<Self>) -> ProxyLifecycleActivity {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ProxyLifecycleActivity {
+            counter: self.clone(),
+        }
+    }
+
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_idle(&self) {
+        while self.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+pub(crate) struct ProxyLifecycleActivity {
+    counter: Arc<ProxyLifecycleCounter>,
+}
+
+impl Drop for ProxyLifecycleActivity {
+    fn drop(&mut self) {
+        self.counter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub(crate) const MAX_PROXY_STREAM_LIFETIME: Duration = Duration::from_secs(20 * 60);
 pub(crate) const MAX_PROXY_FINALIZATION_LIFETIME: Duration = Duration::from_secs(30);
