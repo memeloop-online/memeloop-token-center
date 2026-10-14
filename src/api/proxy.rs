@@ -42,6 +42,7 @@ mod routing;
 pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
+mod transport_protocol;
 mod upstream_error;
 mod upstream_response;
 
@@ -1533,6 +1534,18 @@ async fn proxy_with_cancellation_guard(
             }
             result => (result, None),
         };
+        if active_route.is_codex()
+            && let Ok(response) = &result
+        {
+            transport_protocol::record_response(
+                request_id,
+                &active_route.route,
+                selected_candidate_rank,
+                outbound_attempt,
+                response.response.version(),
+                response.response.status(),
+            );
+        }
         attempt.finish(
             if result.is_ok() {
                 "completed"

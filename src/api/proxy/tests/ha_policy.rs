@@ -26,14 +26,14 @@ async fn policy_api(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
+pub(super) async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
     let tenant = fixture.model.replacen("codex-public-", "codex-route-", 1);
     let service = fixture
         .state
         .db
         .create_service_token(
             crate::db::CreateServiceTokenInput {
-                name: "policy-manager".into(),
+                name: format!("policy-manager-{}", Uuid::now_v7()),
                 scopes: vec!["providers:read".into(), "providers:write".into()],
                 tenant_external_id: Some(tenant.clone()),
             },
@@ -79,6 +79,10 @@ async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
     );
     for invalid in [
         json!({"version": 2}),
+        json!({"http_protocol": "http2_only"}),
+        json!({"http_protocol": "automatic_fallback"}),
+        json!({"http_protocol": null}),
+        json!({"http_protocol": true}),
         json!({"candidate_attempts": 9}),
         json!({"failover_deadline_millis": 999}),
         json!({"retry_503": true}),

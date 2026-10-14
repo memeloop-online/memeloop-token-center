@@ -412,7 +412,7 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
-    wreq::Client::builder()
+    let builder = wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
@@ -423,7 +423,11 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options)
+        .http2_options(http2_options);
+    match policy.http_protocol {
+        provider::CodexHttpProtocol::ProviderDefault => builder,
+        provider::CodexHttpProtocol::Http1Only => builder.http1_only(),
+    }
 }
 
 fn codex_http2_options(

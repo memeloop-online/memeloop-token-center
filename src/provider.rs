@@ -29,7 +29,8 @@ pub(crate) use credential::{
     validate_proxy_url,
 };
 pub(crate) use transport_policy::{
-    CodexChatControlPolicy, CodexResponsesOutputLimitPolicy, CodexTransportPolicy, SseFramingLimits,
+    CodexChatControlPolicy, CodexHttpProtocol, CodexResponsesOutputLimitPolicy,
+    CodexTransportPolicy, SseFramingLimits,
 };
 pub use types::{
     AuthorizedUpstreamCandidate, ModelRouteView, ResolvedUpstream, UpstreamAccountNotes,
