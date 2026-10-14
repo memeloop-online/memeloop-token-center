@@ -1203,6 +1203,13 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             reason,
             failure_stage,
         } => {
+            let preparation_timeout =
+                kind == UpstreamFailureKind::Connection && failure_stage == "preparation_timeout";
+            let diagnostic_kind = if preparation_timeout {
+                "preparation"
+            } else {
+                kind.as_str()
+            };
             let diagnostic_db = state.routing_persistence_db.clone();
             let diagnostic_identity = gateway_identity.clone();
             let diagnostic = async move {
@@ -1213,7 +1220,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                         upstream_account_id,
                         credential_generation,
                         transport_revision,
-                        failure_kind: kind.as_str(),
+                        failure_kind: diagnostic_kind,
                         failure_stage,
                         gateway_pod: &diagnostic_identity.pod,
                         gateway_node: diagnostic_identity.node.as_deref(),
@@ -1231,6 +1238,11 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 state.routing_persistence.record_failure_gap();
                 tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transport_diagnostic_persist", "failed to persist upstream transport diagnostic");
             }
+            let failure_stage = if preparation_timeout {
+                "dns"
+            } else {
+                failure_stage
+            };
             // A shared recovery request never owns the heartbeat lease. Its
             // connection/stream failure must not cancel the primary probe or
             // overwrite a concurrent success. A complete 429 is different:

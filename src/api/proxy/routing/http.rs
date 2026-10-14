@@ -65,6 +65,34 @@ pub(super) async fn send_reqwest_proxy_route(
     request_id: Uuid,
     route: &PreparedProxyRoute,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    send_reqwest_proxy_route_with_preparation(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        network::client_for_config_url_no_retry(
+            &state.http,
+            &route.route.base_url,
+            &route.route.config,
+            route.route.credential.proxy(),
+            state.config.allow_oauth_loopback,
+        ),
+    )
+    .await
+}
+
+async fn send_reqwest_proxy_route_with_preparation<F>(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: Protocol,
+    request_id: Uuid,
+    route: &PreparedProxyRoute,
+    preparation: F,
+) -> Result<ProxyRouteResponse, ProxySendError>
+where
+    F: std::future::Future<Output = Result<reqwest::Client, AppError>>,
+{
     // Start the route timeout before endpoint validation/DNS. The deadline is
     // local to this attempt; the caller's frozen outer attempt budget remains
     // authoritative when it selects a standby candidate.
@@ -83,24 +111,13 @@ pub(super) async fn send_reqwest_proxy_route(
     );
     let request_deadline = tokio::time::Instant::now() + timeout;
     let outbound_base_url = route.route.base_url.clone();
-    let outbound_http = match tokio::time::timeout_at(
-        request_deadline,
-        network::client_for_config_url_no_retry(
-            &state.http,
-            &outbound_base_url,
-            &route.route.config,
-            route.route.credential.proxy(),
-            state.config.allow_oauth_loopback,
-        ),
-    )
-    .await
-    {
+    let outbound_http = match tokio::time::timeout_at(request_deadline, preparation).await {
         Ok(Ok(client)) => client,
         // Endpoint validation and DNS happen before the POST leaves this
         // process, so a route-budget expiry here is safe to fail over.
         Err(_) => {
-            record_preparation_failure(state, request_id, &route.route, None);
-            return Err(ProxySendError::RetryableConnection("dns"));
+            let failure_stage = log_preparation_failure(request_id, route.route.account_id, None);
+            return Err(ProxySendError::RetryableConnection(failure_stage));
         }
         Ok(Err(error)) => {
             record_preparation_failure(state, request_id, &route.route, Some(&error));
@@ -518,5 +535,148 @@ mod tests {
                 TransportFailureKind::Timeout
             ))
         ));
+    }
+
+    async fn assert_preparation_timeout_has_one_terminal_writer(drain_before_terminal: bool) {
+        let (state, _directory) = crate::api::tests::test_state().await;
+        let request_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let route = PreparedProxyRoute {
+            route: ResolvedUpstream {
+                route_id: Uuid::now_v7(),
+                account_id,
+                transport_revision: 42,
+                credential_generation: 7,
+                driver: "http-json".into(),
+                base_url: "https://preparation.invalid".into(),
+                config: json!({"timeout_seconds": 1}),
+                upstream_model: "preparation-test".into(),
+                credential: UpstreamCredential::None,
+            },
+            forwarded_body: Bytes::from_static(b"{}"),
+            upstream_stream: false,
+            codex_downstream_stream: false,
+            codex_store_disabled: false,
+            codex_session_id: None,
+            component_request: None,
+            responses_chat: None,
+            upstream_path: "/v1/chat/completions",
+            compact_v2_bridge: false,
+            wrap_compact_as_sse: false,
+            responses_anthropic: None,
+        };
+        let pool = sqlx::AnyPool::connect(&state.config.database_url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO upstream_accounts (
+                 id, tenant_id, name, driver, auth_kind, config_json, status,
+                 credential_generation, created_at, updated_at
+             ) VALUES ($1, $2, 'preparation-test', 'http-json', 'none', '{}', 'active', 7, 0, 42)",
+        )
+        .bind(account_id.to_string())
+        .bind(Uuid::now_v7().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let admission = state
+            .db
+            .claim_upstream_account_attempt_at_revision_with_health_config(
+                account_id,
+                7,
+                42,
+                state.config.upstream_health,
+                Some(current_gateway_failure_domain()),
+            )
+            .await
+            .unwrap();
+        assert!(admission.is_healthy());
+        let mut guard = UpstreamAttemptGuard::new(
+            &state,
+            request_id,
+            route.route.route_id,
+            account_id,
+            7,
+            42,
+            admission,
+            None,
+        );
+        let result = send_reqwest_proxy_route_with_preparation(
+            &state,
+            &HeaderMap::new(),
+            Protocol::OpenAiChat,
+            request_id,
+            &route,
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProxySendError::RetryableConnection("preparation_timeout"))
+        ));
+        assert_eq!(
+            failover_disposition(None, result.as_ref().err()),
+            super::super::outcome::FailoverDisposition::ConnectionNotDelivered
+        );
+        if drain_before_terminal {
+            state.routing_persistence.drain_for_test().await;
+            assert!(
+                state
+                    .db
+                    .request_upstream_transport_diagnostics(request_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let (kind, reason) = classify_attempt_failure(&result, None).unwrap();
+        assert_eq!(kind, UpstreamFailureKind::Connection);
+        assert!(matches!(
+            reason,
+            crate::metrics::UpstreamHealthReason::Connection
+        ));
+        guard
+            .complete(UpstreamAttemptTerminal::Failed {
+                kind,
+                reason,
+                failure_stage: attempt_failure_stage(&result),
+            })
+            .await;
+        state.routing_persistence.drain_for_test().await;
+        let diagnostics = state
+            .db
+            .request_upstream_transport_diagnostics(request_id)
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.route_id, route.route.route_id);
+        assert_eq!(diagnostic.upstream_account_id, account_id);
+        assert_eq!(diagnostic.credential_generation, 7);
+        assert_eq!(diagnostic.transport_revision, 42);
+        assert_eq!(diagnostic.failure_kind, "preparation");
+        assert_eq!(diagnostic.failure_stage, "preparation_timeout");
+        let health_stage: String = sqlx::query_scalar(
+            "SELECT failure_stage FROM upstream_connection_failure_domains WHERE last_request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(health_stage, "dns");
+        assert!(state.routing_persistence.render_routing().contains(
+            "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"
+        ));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_immediate_terminal_preserves_diagnostic() {
+        assert_preparation_timeout_has_one_terminal_writer(false).await;
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_delayed_terminal_has_no_preparation_writer() {
+        assert_preparation_timeout_has_one_terminal_writer(true).await;
     }
 }
