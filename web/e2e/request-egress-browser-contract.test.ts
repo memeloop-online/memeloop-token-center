@@ -86,7 +86,7 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await finalAttempt.getByRole('button', { name: copy.technical, exact: true }).click();
       await finalAttempt.getByText('attempt-b', { exact: true }).waitFor();
       const identifiers = finalAttempt.locator('.egress-facts').last();
-      await identifiers.evaluate(element => element.scrollIntoView({ block: 'end' }));
+      await identifiers.evaluate(element => element.scrollIntoView({ block: 'center' }));
       await page.mouse.move(0, 0);
       await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
       await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-identifiers-${locale}-390.png`, fullPage: false });
