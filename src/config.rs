@@ -11,13 +11,13 @@ pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
 pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
-pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
+pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 64 * 1024 * 1024;
 pub const MAX_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
 pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
-pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
+pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = MAX_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
@@ -178,7 +178,7 @@ pub struct Config {
     /// independent from Responses so audio uploads cannot widen text ingress.
     #[serde(default = "default_audio_body_max_bytes")]
     pub audio_body_max_bytes: u32,
-    /// Maximum concurrent `/v1/responses` body reads per gateway process.
+    /// Legacy compatibility setting; Responses body reads use gateway_body_read_concurrency.
     pub responses_body_read_concurrency: u32,
     /// Shared per-upstream-account circuit-breaker and half-open probe timings.
     pub upstream_health: UpstreamHealthConfig,
@@ -994,6 +994,8 @@ mod tests {
 
     #[test]
     fn responses_body_configuration_keeps_large_reads_bounded() {
+        assert_eq!(DEFAULT_RESPONSES_BODY_READ_CONCURRENCY, 1_024);
+        assert_eq!(responses_body_read_concurrency(1_024), 1_024);
         assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(
             responses_body_max_bytes(MIN_RESPONSES_BODY_MAX_BYTES - 1),
