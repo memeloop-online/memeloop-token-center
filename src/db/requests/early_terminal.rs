@@ -158,7 +158,7 @@ mod tests {
                 1,
             ),
             (
-                "SELECT SUM(requests) FROM request_daily_aggregates WHERE key_id = $1",
+                "SELECT CAST(SUM(requests) AS BIGINT) FROM request_daily_aggregates WHERE key_id = $1",
                 1,
             ),
             (

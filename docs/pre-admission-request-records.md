@@ -54,8 +54,10 @@ The copied snapshot retains the exact model set, bounds and original fetch
 timestamp. It is marked stale and due for the existing asynchronous catalog
 sync; it is not presented as fresh discovery. The old sync lease is invalidated
 so an old-generation result cannot overwrite the refreshed generation. A real
-replacement, including an empty catalog, remains authoritative and removed
-models are not resurrected on the next refresh. Refresh sync failure preserves
+replacement remains authoritative and removed models are not resurrected on
+the next refresh. Kimi permits an empty catalog; Codex retains its existing
+nonempty trusted-model guard, so its withdrawal case retains another known
+model without restoring the withdrawn route. Refresh sync failure preserves
 the existing stale-evidence semantics, rather than creating a generation gap.
 
 SQLite and PostgreSQL CI cases recreate the old generation-only empty-eligible

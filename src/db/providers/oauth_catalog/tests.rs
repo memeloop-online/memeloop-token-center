@@ -217,10 +217,29 @@ async fn verify_interleaving(url: &str) {
                 .is_none()
         );
 
-        publish(&database, account.id, &tenant, 2, &[]).await;
+        let withdrawn_catalog = if driver == "openai-codex" {
+            vec![DiscoveredUpstreamModel {
+                model_id: "other-known-model".into(),
+                ..models[0].clone()
+            }]
+        } else {
+            Vec::new()
+        };
+        publish(&database, account.id, &tenant, 2, &withdrawn_catalog).await;
         assert_eq!(eligible(&database, account.id).await, 0);
         refresh(&database, account.id, credential(driver, "identity-one")).await;
         assert_eq!(eligible(&database, account.id).await, 0);
+        let inherited = database
+            .upstream_model_catalog(account.id, &tenant, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(inherited.models.len(), withdrawn_catalog.len());
+        assert!(
+            inherited
+                .models
+                .iter()
+                .all(|model| model.id != "known-model")
+        );
         publish(&database, account.id, &tenant, 3, &models).await;
         refresh(&database, account.id, credential(driver, "identity-two")).await;
         assert_eq!(eligible(&database, account.id).await, 0);
