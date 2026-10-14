@@ -6,22 +6,31 @@ const MAX_TIMEOUT_SECONDS: u64 = 600;
 const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 fn log_preparation_failure(
-    state: &AppState,
     request_id: Uuid,
-    route: &ResolvedUpstream,
+    account_id: Uuid,
     error: Option<&AppError>,
-) {
+) -> &'static str {
     let failure_category = error
         .map(network::preparation_failure_category)
         .unwrap_or("preparation_timeout");
     tracing::warn!(
         %request_id,
-        upstream_account_id = %route.account_id,
+        upstream_account_id = %account_id,
         stage = "http_json_preparation",
         failure_category,
         dispatched = false,
         "upstream preparation failed"
     );
+    failure_category
+}
+
+fn record_preparation_failure(
+    state: &AppState,
+    request_id: Uuid,
+    route: &ResolvedUpstream,
+    error: Option<&AppError>,
+) {
+    let failure_category = log_preparation_failure(request_id, route.account_id, error);
     super::probe::record_preparation_failure(
         state,
         super::probe::PreparationFailure {
@@ -90,11 +99,11 @@ pub(super) async fn send_reqwest_proxy_route(
         // Endpoint validation and DNS happen before the POST leaves this
         // process, so a route-budget expiry here is safe to fail over.
         Err(_) => {
-            log_preparation_failure(state, request_id, &route.route, None);
+            record_preparation_failure(state, request_id, &route.route, None);
             return Err(ProxySendError::RetryableConnection("dns"));
         }
         Ok(Err(error)) => {
-            log_preparation_failure(state, request_id, &route.route, Some(&error));
+            record_preparation_failure(state, request_id, &route.route, Some(&error));
             return Err(ProxySendError::CandidateUnavailable);
         }
     };

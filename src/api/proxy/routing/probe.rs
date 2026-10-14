@@ -196,19 +196,21 @@ mod preparation_diagnostic_tests {
         let pool = sqlx::AnyPool::connect(&state.config.database_url)
             .await
             .unwrap();
-        for table in [
-            "upstream_account_health",
-            "upstream_connection_failure_domains",
-        ] {
-            let count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(*) FROM {table} WHERE upstream_account_id = $1"
-            ))
-            .bind(account_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(count, 0);
-        }
+        let health_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let domain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_connection_failure_domains WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((health_count, domain_count), (0, 0));
         pool.close().await;
     }
 }
