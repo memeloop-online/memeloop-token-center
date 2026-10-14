@@ -65,7 +65,8 @@ This change does not recover or reauthorize existing production accounts.
 
 ## Kimi timeout and recovery boundary
 
-Kimi refresh has an unchanged ten-second request and operation budget. The
+Kimi refresh has a 120-second request and operation budget, replacing the
+previous ten-second cutoff. The
 durable `request_started_at` marker is written before executing the request:
 it is a replay-safety boundary, not proof that the provider received a POST.
 A timeout can occur while connecting, awaiting headers, or reading the body.
@@ -84,3 +85,46 @@ An operator alert should say that automatic refresh is paused because its
 result is unconfirmed, not that the user failed to sign in. Do not automatically
 initiate authorization. A later user-supplied authorization supersedes the old
 generation; its healthy state is not evidence that the timeout cause was fixed.
+
+## Kimi prevention and bounded recovery
+
+The official Kimi CLI at revision
+[`9ab1286b`](https://github.com/MoonshotAI/kimi-cli/blob/9ab1286b8fe4e6bcd116949a27ce5e0ac3389c82/src/kimi_cli/utils/aiohttp.py)
+uses a 120-second total budget, 60-second socket-read budget and 15-second
+connection budget. MTC adopts the total budget for refresh only; its existing
+five-second connector limit and shared TLS/proxy validation remain unchanged.
+This avoids discarding a valid exchange solely because headers or the complete
+body take longer than ten seconds. The byte bound still applies.
+
+The [official refresh implementation](https://github.com/MoonshotAI/kimi-cli/blob/9ab1286b8fe4e6bcd116949a27ce5e0ac3389c82/src/kimi_cli/auth/oauth.py)
+retries transient errors, coordinates local processes with a file lock, reloads
+persisted tokens and atomically replaces the credential file on success. This
+is client behavior, not a server guarantee of refresh-token reuse or remote
+idempotency. MTC does not copy the ambiguous POST retry behavior.
+
+Only a connector-classified failure from the fresh no-retry Kimi HTTP client
+can undo its own dispatch marker. The transition locks the account and matches
+the claimed credential generation and idempotency key; a pending result or
+superseding credential prevents release. Normal cleanup then makes that
+unconsumed credential eligible for the next worker pass. Failure to persist
+this transition leaves the marker in place. An ordinary total timeout, a
+received HTTP rejection or a disconnect after POST does not release it.
+
+A complete Kimi result is sealed once and retained for up to seven local
+staging/finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff.
+Only storage/internal failures are retried. Every attempt reuses the same
+ciphertext and existing generation/claim fences, and never calls the provider.
+Other providers keep their original three-attempt behavior. An exhausted local
+failure emits a secret-free error with account ID, generation, stage and error
+category so it can be alerted separately from remote rejection.
+
+These are bounded protections, not a guarantee against losing an unstaged
+response during a process crash or a prolonged database outage. Already staged
+results remain durable and use the existing local replay path. Historical
+unknown POSTs stay blocked; no production lease or credential is rewritten by
+deployment of this change.
+
+The existing worker supervisor still has a 30-second shutdown grace. A forced
+shutdown during a longer in-flight exchange can therefore leave an unknown
+result. This patch does not change pod termination settings or claim to solve
+that separate drain-lifetime boundary; rollout must account for it.
