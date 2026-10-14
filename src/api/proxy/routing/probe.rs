@@ -189,7 +189,10 @@ mod preparation_diagnostic_tests {
         assert_eq!(diagnostic.transport_revision, 42);
         assert_eq!(diagnostic.failure_kind, "preparation");
         assert_eq!(diagnostic.failure_stage, "dns_timeout");
-        assert_eq!(diagnostic.gateway_pod, gateway_failure_domain_identity().pod);
+        assert_eq!(
+            diagnostic.gateway_pod,
+            gateway_failure_domain_identity().pod
+        );
         let pool = sqlx::AnyPool::connect(&state.config.database_url)
             .await
             .unwrap();
