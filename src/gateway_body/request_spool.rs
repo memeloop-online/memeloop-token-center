@@ -102,6 +102,9 @@ impl RequestSpoolAdmission {
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
+            if chunk.len() > maximum.saturating_sub(capture.length) {
+                return Err(RequestSpoolCaptureError::TooLarge);
+            }
             let frame_memory = memory
                 .map(|memory| {
                     memory
