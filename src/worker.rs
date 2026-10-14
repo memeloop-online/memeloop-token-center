@@ -666,23 +666,21 @@ async fn supervise_roles_with_oauth_refresh(
                 oauth_refresh_roles.abort_all();
                 oauth_aborted = true;
             }
-            result = roles.join_next(), if !roles.is_empty() => match result {
-                Some(Err(error)) => {
-                    if !ordinary_aborted || error.is_panic() {
-                        tracing::error!(%error, "worker role failed during shutdown");
-                        failed = true;
-                    }
-                },
-                _ => {},
+            result = roles.join_next(), if !roles.is_empty() => {
+                if let Some(Err(error)) = result
+                    && (!ordinary_aborted || error.is_panic())
+                {
+                    tracing::error!(%error, "worker role failed during shutdown");
+                    failed = true;
+                }
             },
-            result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => match result {
-                Some(Err(error)) => {
-                    if !oauth_aborted || error.is_panic() {
-                        tracing::error!(%error, "OAuth refresh role failed during shutdown");
-                        failed = true;
-                    }
-                },
-                _ => {},
+            result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => {
+                if let Some(Err(error)) = result
+                    && (!oauth_aborted || error.is_panic())
+                {
+                    tracing::error!(%error, "OAuth refresh role failed during shutdown");
+                    failed = true;
+                }
             },
         }
     }
