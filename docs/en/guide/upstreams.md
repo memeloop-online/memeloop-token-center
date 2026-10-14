@@ -24,6 +24,14 @@ Providers expose different data ranges. Clients should use request results and t
 
 ## Generation settings for Codex accounts
 
+### Upstream HTTP protocol
+
+The account field `transport_policy.http_protocol` accepts `provider_default` (the default, including when omitted) or `http1_only`. `provider_default` preserves existing native TLS protocol negotiation. `http1_only` forces HTTP/1.1 for new account clients, using the same TLS profile and configured proxy, without automatic protocol fallback. Model and quota reads sharing the account client are affected too.
+
+Use the existing upstream account update API, preserving the remaining configuration and supplying its current `expected_updated_at`. Add `"http_protocol": "http1_only"` inside the existing `transport_policy` object for the single account under test. A stale revision is rejected. Restore `provider_default` or remove this field to roll back: new requests use a new cached client, while in-flight requests keep their captured client. Other accounts retain their settings. Existing cancellation, compaction waiting, retry budgets and settlement rules still apply.
+
+The safe `codex_upstream_http_protocol` log records the configured mode and the actual returned response's `negotiated_http_version`, request/account/route identifiers and status. Its scope is a returned candidate response's headers; it does not prove stream completion or enumerate internal retries. No response means there is no negotiated-response log. Synthetic contracts do not establish a live provider's HTTP/1.1 support or a lower failure rate; verify using the same account, model, fixed proxy member and node before considering a deployment change.
+
 ### Request concurrency
 
 Codex accounts have no additional dispatch concurrency limit by default. When `transport_policy.dispatch_max_in_flight` is omitted or `0`, the dispatch queue is inactive. Client credential permissions, budgets, explicitly configured concurrency policies, and gateway memory protection still apply. Set a positive value only when you want to limit simultaneous requests for an account and proxy endpoint. Streaming requests occupy a slot until they finish; a full queue or queue timeout can return 503.

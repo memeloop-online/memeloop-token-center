@@ -722,6 +722,13 @@ impl ProviderCatalog {
                     "enum": [1],
                     "default": 1
                 },
+                "http_protocol": {
+                    "type": "string",
+                    "enum": ["provider_default", "http1_only"],
+                    "default": "provider_default",
+                    "title": "Upstream HTTP protocol",
+                    "description": "Provider default preserves native TLS protocol negotiation. HTTP/1.1 only is an explicit account override for controlled compatibility checks; it does not enable automatic fallback. Changes affect new account clients, including model and quota reads; existing requests retain their client."
+                },
                 "connect_timeout_millis": {
                     "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000,
                     "description": "Pre-delivery connection deadline; must be lower than the total request timeout."

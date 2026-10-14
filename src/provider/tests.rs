@@ -628,6 +628,18 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
     assert_eq!(
         codex
             .config_schema
+            .pointer("/properties/transport_policy/properties/http_protocol/enum"),
+        Some(&json!(["provider_default", "http1_only"]))
+    );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/http_protocol/default"),
+        Some(&json!("provider_default"))
+    );
+    assert_eq!(
+        codex
+            .config_schema
             .pointer("/properties/reservation_token_bounds/additionalProperties/minimum"),
         Some(&json!(1))
     );
