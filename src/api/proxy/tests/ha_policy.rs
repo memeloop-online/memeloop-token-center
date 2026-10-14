@@ -261,8 +261,9 @@ async fn native_compaction_waits_past_failover_and_transport_deadlines() {
 }
 
 #[tokio::test]
-async fn ordinary_codex_headers_after_310_seconds_settle_once_without_standby_replay() {
+async fn ordinary_codex_headers_outlive_selection_and_settle_once_without_standby_replay() {
     let fixture = codex_route_fixture("ordinary-selection-deadline").await;
+    set_policy(&fixture, json!({"failover_deadline_millis": 1000})).await;
     add_codex_standby_route(
         &fixture,
         "codex-route-ordinary-selection-deadline",
@@ -275,7 +276,7 @@ async fn ordinary_codex_headers_after_310_seconds_settle_once_without_standby_re
         .and(header_matcher("chatgpt-account-id", "account-123"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_delay(Duration::from_secs(310))
+                .set_delay(Duration::from_secs(2))
                 .set_body_raw(
                     completed_codex_sse("ordinary completed"),
                     "text/event-stream",
