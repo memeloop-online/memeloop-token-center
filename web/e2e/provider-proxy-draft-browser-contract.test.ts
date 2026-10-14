@@ -75,7 +75,7 @@ test('production quota row and detail refresh remain independent while another a
     const detailRead = nextRead();
     await detailRefresh.click(); await detailRead;
     assert.equal(await detailRefresh.isDisabled(), true);
-    assert.equal(await fastRefresh.isDisabled(), true, 'the hidden row shares the detail in-flight owner');
+    assert.equal(await fastRow.locator('.provider-directory-actions button').first().isDisabled(), true, 'the hidden row shares the detail in-flight owner');
     release('account-fast');
     await page.waitForFunction(() => document.querySelector('#provider-details-account-fast .upstream-quota-heading button')?.matches(':enabled'));
     await detail.getByRole('button', { name: 'Back to account list', exact: true }).click();
