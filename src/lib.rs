@@ -93,6 +93,7 @@ pub struct AppState {
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) gateway_body_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
     /// Shared bounded lifecycle admission for synchronous media requests.
@@ -234,6 +235,7 @@ impl AppState {
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
             )),
+            gateway_body_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             responses_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 responses_body_read_concurrency,
             )),
