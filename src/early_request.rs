@@ -38,10 +38,7 @@ impl Journal {
         let owner = Arc::downgrade(&journal);
         let wake = journal.wake.clone();
         tokio::spawn(async move {
-            loop {
-                let Some(journal) = owner.upgrade() else {
-                    break;
-                };
+            while let Some(journal) = owner.upgrade() {
                 journal.replay(&database).await;
                 drop(journal);
                 tokio::select! {
