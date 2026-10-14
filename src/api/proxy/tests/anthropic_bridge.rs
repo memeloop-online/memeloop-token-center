@@ -23,6 +23,79 @@ async fn fixture(label: &str, upstream: &MockServer) -> CodexRouteFixture {
 }
 
 #[tokio::test]
+async fn contributed_provider_responses_use_declared_messages_headers() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header_matcher("anthropic-version", "2023-06-01"))
+        .and(header_matcher("anthropic-beta", "subscription-v1"))
+        .and(header_matcher(
+            "authorization",
+            "Bearer fixture-oauth-token",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"msg_fixture","type":"message","role":"assistant","model":"fixture-upstream",
+            "content":[{"type":"text","text":"fixture response"}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":4,"output_tokens":2}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let driver = "fixture-messages-subscription";
+    let mut fixture = response_usage_fixture_with_uri_contract_driver_model_and_credential(
+        "declared-messages-headers",
+        upstream.uri(),
+        0,
+        None,
+        driver,
+        "fixture-messages-model",
+        UpstreamCredential::OAuth {
+            access_token: "fixture-oauth-token".into(),
+            refresh_token: None,
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        },
+    )
+    .await;
+    let mut provider = fixture
+        .state
+        .providers
+        .get(crate::oauth::claude::PROVIDER_DRIVER)
+        .unwrap()
+        .clone();
+    provider.id = driver.into();
+    provider.oauth_adapter = None;
+    provider.request_compatibility.anthropic_messages_headers =
+        crate::provider::FixedProtocolHeaders {
+            anthropic_version: Some("2023-06-01".into()),
+            anthropic_beta: vec!["subscription-v1".into()],
+        };
+    fixture.state.providers.extend([provider]).unwrap();
+    let response = send_response_usage_request(
+        &fixture,
+        &json!({
+            "model":fixture.model,"input":"fixture prompt","stream":false,"max_output_tokens":64
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers.get_all("anthropic-beta").iter().count(),
+        1
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], fixture.upstream_model);
+    assert!(body["messages"].is_array());
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn responses_route_dispatches_anthropic_messages_and_restores_buffered_contract() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

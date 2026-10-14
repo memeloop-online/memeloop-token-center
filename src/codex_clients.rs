@@ -15,6 +15,7 @@ struct ClientKey {
     selection_generation: i64,
     proxy_fingerprint: [u8; 32],
     timeouts: [u64; 3],
+    http_protocol: crate::provider::CodexHttpProtocol,
 }
 
 impl ClientKey {
@@ -38,6 +39,7 @@ impl ClientKey {
             revision,
             selection_generation: 0,
             proxy_fingerprint: proxy_fingerprint(credential),
+            http_protocol: policy.http_protocol,
             timeouts: [
                 policy.connect_timeout_millis,
                 policy.read_timeout_millis,
@@ -486,6 +488,11 @@ mod tests {
             "directory and generation share the same account client key"
         );
         assert!(first == ClientKey::new(&route, policy));
+        let changed_protocol = CodexTransportPolicy {
+            http_protocol: crate::provider::CodexHttpProtocol::Http1Only,
+            ..policy
+        };
+        assert!(first != ClientKey::new(&route, changed_protocol));
         route.transport_revision += 1;
         assert!(first != ClientKey::new(&route, policy));
         route.transport_revision -= 1;
@@ -502,5 +509,44 @@ mod tests {
             proxy_network_scope: crate::network::OutboundScope::Private,
         };
         assert!(first != ClientKey::new(&route, policy));
+    }
+
+    #[test]
+    fn protocol_change_and_rollback_replace_only_the_account_client() {
+        let clients = CodexClients::default();
+        let policy = CodexTransportPolicy::default();
+        let account = uuid::Uuid::now_v7();
+        let unrelated = uuid::Uuid::now_v7();
+        let key = |account_id, policy| {
+            ClientKey::for_account(account_id, 7, &UpstreamCredential::None, policy)
+        };
+        let initial = clients
+            .client_snapshot(key(account, policy), policy)
+            .unwrap();
+        let other = clients
+            .client_snapshot(key(unrelated, policy), policy)
+            .unwrap();
+        let h1 = CodexTransportPolicy {
+            http_protocol: crate::provider::CodexHttpProtocol::Http1Only,
+            ..policy
+        };
+        let changed = clients.client_snapshot(key(account, h1), h1).unwrap();
+        assert!(!changed.cache_hit);
+        assert_ne!(initial.instance_id, changed.instance_id);
+        let reused = clients.client_snapshot(key(account, h1), h1).unwrap();
+        assert!(reused.cache_hit);
+        assert_eq!(changed.instance_id, reused.instance_id);
+        let rollback = clients
+            .client_snapshot(key(account, policy), policy)
+            .unwrap();
+        assert!(!rollback.cache_hit);
+        assert_ne!(rollback.instance_id, changed.instance_id);
+        assert_ne!(rollback.instance_id, initial.instance_id);
+        let still_other = clients
+            .client_snapshot(key(unrelated, policy), policy)
+            .unwrap();
+        assert!(still_other.cache_hit);
+        assert_eq!(other.instance_id, still_other.instance_id);
+        assert_eq!(clients.clients.lock().unwrap().len(), 2);
     }
 }

@@ -4860,6 +4860,40 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/requests/egress-summary:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorEgressSummary
+      summary: Estimate observed application payload across all recorded Codex send attempts
+      description: |
+        Includes recorded retries and partial attempts; coverage is not guaranteed.
+        Groups by actual immutable selected egress, including historical names/version.
+        Null byte totals mean unrecorded, not zero. Wire and supplier billing are unknown.
+        Tenant-scoped service credentials cannot query another tenant or global traffic.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: start
+          in: query
+          required: true
+          description: Inclusive attempt-start timestamp in Unix milliseconds.
+          schema: { type: integer, format: int64 }
+        - name: end
+          in: query
+          required: true
+          description: Exclusive attempt-start timestamp in Unix milliseconds, greater than start.
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Recorded-attempt payload estimates; Cache-Control private, no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestEgressSummaryResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/requests/{request_id}:
     get:
       tags: [Operator traffic]
@@ -7082,7 +7116,7 @@ components:
     TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}
     CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
     DeleteTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}
-    TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
+    TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","host","port","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
     TransportProxyGroupBinding: {"type":"object","required":["account_id","tenant_external_id","binding_version","group_id","group_version","initial_member_id","credential_generation","updated_at","runtime"],"properties":{"account_id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"binding_version":{"type":"integer"},"group_id":{"type":["string","null"],"format":"uuid"},"group_version":{"type":["integer","null"]},"initial_member_id":{"type":["string","null"],"format":"uuid"},"credential_generation":{"type":"integer"},"updated_at":{"type":"integer"},"runtime":{"type":"object","required":["scope","configuration_state","applied_binding_version","applied_group_version","selected_member_id","observed_at"],"properties":{"scope":{"const":"this_process"},"configuration_state":{"enum":["unbound","pending","applied","unavailable"]},"applied_binding_version":{"type":["integer","null"]},"applied_group_version":{"type":["integer","null"]},"selected_member_id":{"type":["string","null"],"format":"uuid"},"observed_at":{"type":"integer"}}}}}
     UpdateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}},"expected_version":{"type":"integer","minimum":1},"replacement_member_id":{"type":"string","format":"uuid","description":"Required when removing/replacing an existing member of a bound group. Used only when a selected member no longer exists unchanged. Must identify a retained member in the submitted list."}}}
     BindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","group_id","initial_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"group_id":{"type":"string","format":"uuid"},"initial_member_id":{"type":"string","format":"uuid"}}}
@@ -7773,6 +7807,18 @@ components:
         login_url: { type: string, format: uri }
         poll_url: { type: string, format: uri }
         refresh_url: { type: string, format: uri }
+        response_mode:
+          type: string
+          enum: [fragment_manual]
+          description: Absent means the standard query-parameter callback. fragment_manual declares that the provider page displays code#state for manual paste.
+        identity:
+          type: object
+          additionalProperties: false
+          required: [url, id_pointer]
+          properties:
+            url: { type: string, format: uri }
+            id_pointer: { type: string, minLength: 2, maxLength: 256 }
+          description: Declared account-identity read used for same-account reauthorization. The URL is reviewed at plugin install time and never accepted from runtime payloads.
     ComponentAdapterContribution:
       type: object
       additionalProperties: false
@@ -8262,6 +8308,15 @@ components:
         provider_config: { type: object }
         proxy_url: { type: string, writeOnly: true }
         proxy_network_scope: { type: string, enum: [private] }
+        transport_proxy_group:
+          type: object
+          additionalProperties: false
+          description: Global operators with providers:write may select an existing tenant group for a new login. Cannot be combined with proxy_url/proxy_network_scope or supplied during reauthorization. The encrypted session freezes the group version and member; completion atomically installs the account binding. Reauthorization inherits the existing group and rejects stale group/binding/account revisions.
+          required: [group_id, expected_group_version, initial_member_id]
+          properties:
+            group_id: { type: string, format: uuid }
+            expected_group_version: { type: integer, minimum: 1 }
+            initial_member_id: { type: string, format: uuid }
         client:
           type: object
           additionalProperties: false
@@ -10129,10 +10184,75 @@ components:
             response_body: true
             archive_complete: { type: boolean }
             archive: { $ref: '#/components/schemas/RequestArchiveCompleteness' }
+            egress_attempts:
+              type: array
+              description: Operator-only actual selected send attempts. Empty means not recorded. Self-service omits this field.
+              items: { $ref: '#/components/schemas/RequestEgressAttempt' }
             provenance:
               oneOf:
                 - $ref: '#/components/schemas/RequestProvenance'
                 - type: 'null'
+    SelectedRequestEgress:
+      type: object
+      required: [kind, group_id, group_version, group_name, member_id, member_name, scheme, host, port]
+      properties:
+        kind: { type: string, enum: [proxy, direct, unknown] }
+        group_id: { type: [string, 'null'], format: uuid }
+        group_version: { type: [integer, 'null'] }
+        group_name: { type: [string, 'null'] }
+        member_id: { type: [string, 'null'], format: uuid }
+        member_name: { type: [string, 'null'] }
+        scheme: { type: [string, 'null'] }
+        host: { type: [string, 'null'], description: 'Visible to authorized operators; URL authentication is excluded.' }
+        port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
+    RequestEgressAttempt:
+      type: object
+      required: [request_id, attempt_id, outbound_attempt, connect_attempt, route_id, upstream_account_id, credential_generation, transport_revision, observed_at, selected, transport, connection_binding, request_payload_bytes, response_payload_bytes, completed, final_response, response_body_complete, measurement_basis]
+      properties:
+        request_id: { type: string, format: uuid }
+        attempt_id: { type: string, format: uuid, description: 'Unique per real send, including replay with identical routing counters.' }
+        outbound_attempt: { type: integer, minimum: 1 }
+        connect_attempt: { type: integer, minimum: 1 }
+        route_id: { type: string, format: uuid }
+        upstream_account_id: { type: string, format: uuid }
+        credential_generation: { type: integer }
+        transport_revision: { type: integer }
+        observed_at: { type: integer, format: int64 }
+        selected: { $ref: '#/components/schemas/SelectedRequestEgress' }
+        transport: { type: object, description: 'Immutable cached-client and selected-member diagnostics, not a wire delivery claim.' }
+        connection_binding: { type: [object, 'null'], description: 'Optional existing observer connection/stream IDs; process-local.' }
+        request_payload_bytes: { type: [integer, 'null'], minimum: 0 }
+        response_payload_bytes: { type: [integer, 'null'], minimum: 0 }
+        completed: { type: boolean, description: 'Attempt terminated, including failure or cancellation.' }
+        final_response: { type: boolean, description: 'Selected after candidate failover; does not imply delivery or success.' }
+        response_body_complete: { type: boolean, description: 'Observed response-stream EOF; false on early drop.' }
+        measurement_basis: { const: application_payload_estimate }
+    RequestEgressSummary:
+      type: object
+      required: [selected, recorded_attempts, completed_attempts, final_response_attempts, request_known_attempts, response_known_attempts, request_payload_bytes, response_payload_bytes, measurement_basis, wire_bytes, supplier_billed_bytes]
+      properties:
+        selected: { $ref: '#/components/schemas/SelectedRequestEgress' }
+        recorded_attempts: { type: integer, minimum: 0 }
+        completed_attempts: { type: integer, minimum: 0 }
+        final_response_attempts: { type: integer, minimum: 0 }
+        request_known_attempts: { type: integer, minimum: 0 }
+        response_known_attempts: { type: integer, minimum: 0 }
+        request_payload_bytes: { type: [integer, 'null'], minimum: 0 }
+        response_payload_bytes: { type: [integer, 'null'], minimum: 0 }
+        measurement_basis: { const: application_payload_estimate }
+        wire_bytes: { type: 'null' }
+        supplier_billed_bytes: { type: 'null' }
+    RequestEgressSummaryResponse:
+      type: object
+      required: [start, end, coverage, measurement_basis, wire_bytes, supplier_billed_bytes, groups]
+      properties:
+        start: { type: integer, format: int64 }
+        end: { type: integer, format: int64 }
+        coverage: { const: recorded_codex_attempts_only }
+        measurement_basis: { const: application_payload_estimate }
+        wire_bytes: { type: 'null' }
+        supplier_billed_bytes: { type: 'null' }
+        groups: { type: array, items: { $ref: '#/components/schemas/RequestEgressSummary' } }
     RequestArchiveSide:
       type: object
       additionalProperties: false

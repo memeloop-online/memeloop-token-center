@@ -99,6 +99,9 @@ The Worker owns scheduling, lease fencing, timeout, persisted backoff and last-g
 
 ## Minimal manifest
 
+For host-owned PKCE, fixed public client defaults, token encoding and constrained
+identity/Messages protocol headers, see [Declarative authorization-code transport](declarative-oauth.md).
+
 ```json
 {
   "id": "example-policy",

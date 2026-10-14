@@ -136,7 +136,7 @@ fn delivery_error_class(error: &AppError) -> &'static str {
         AppError::Storage(_) => "storage",
         AppError::Conflict(_) | AppError::ProxyGroupConflict(_) => "state_conflict",
         AppError::NotFound => "owner_missing",
-        AppError::BadRequest(_) => "invalid_state",
+        AppError::BadRequest(_) | AppError::CompactionProducerUnavailable => "invalid_state",
         AppError::Overloaded => "overloaded",
         AppError::Unauthorized | AppError::Forbidden => "authorization",
         AppError::UnpricedModel

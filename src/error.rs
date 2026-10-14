@@ -69,6 +69,10 @@ pub enum AppError {
     ProxyGroupConflict(&'static str),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error(
+        "invalid request: no available authorized upstream supports Responses compaction production"
+    )]
+    CompactionProducerUnavailable,
     #[error("secret schema analysis exceeds the supported complexity limit")]
     SchemaSecretAnalysisTooComplex,
     #[error("configured upstream is unavailable: {0}")]
@@ -104,6 +108,7 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::ProxyGroupConflict(code) => code,
             Self::BadRequest(_) => "invalid_request",
+            Self::CompactionProducerUnavailable => "compaction_producer_unavailable",
             Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
             Self::Upstream(_) => "upstream",
             Self::OAuthRefresh(_) => "oauth_refresh",
@@ -147,6 +152,9 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
             Self::ProxyGroupConflict(code) => (StatusCode::CONFLICT, *code, self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
+            Self::CompactionProducerUnavailable => {
+                (StatusCode::BAD_REQUEST, "invalid_request", self.to_string())
+            }
             Self::SchemaSecretAnalysisTooComplex => (
                 StatusCode::BAD_REQUEST,
                 "schema_secret_analysis_too_complex",
@@ -300,6 +308,10 @@ mod tests {
         for (error, expected) in [
             (AppError::Conflict(CANARY.to_owned()), "conflict"),
             (AppError::BadRequest(CANARY.to_owned()), "invalid_request"),
+            (
+                AppError::CompactionProducerUnavailable,
+                "compaction_producer_unavailable",
+            ),
             (
                 AppError::SchemaSecretAnalysisTooComplex,
                 "schema_secret_analysis_too_complex",

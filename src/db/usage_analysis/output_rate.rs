@@ -4,15 +4,12 @@ use crate::model::UsageOutputRate;
 /// Retained terminal records are the authority for provenance. Evaluate current
 /// compaction observations on every read so late conversation projection cannot
 /// permanently contaminate a throughput rollup. No accounting rows are changed.
-pub(super) async fn attach_output_rates(
-    snapshot: &mut UsageAnalysisSnapshot,
-    projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
-    tenant_id: &str,
+pub(super) fn output_rate_sql(
+    backend: DatabaseBackend,
+    granularity: UsageAnalysisGranularity,
     tenant_scoped: bool,
-    filter: &UsageAnalysisFilter,
-    range: ValidatedUsageAnalysisRange,
-) -> Result<(), AppError> {
-    let bucket_ms = match range.granularity {
+) -> String {
+    let bucket_ms = match granularity {
         UsageAnalysisGranularity::Hour => 3_600_000,
         UsageAnalysisGranularity::Day => 86_400_000,
     };
@@ -21,17 +18,31 @@ pub(super) async fn attach_output_rates(
     } else {
         "CAST($1 AS TEXT) = ''"
     };
-    // Both range and scope constrain the indexed compact fact relation before
-    // primary-key terminal-record lookups. Archived-away records are excluded,
-    // never silently promoted from historical unproven token counters.
-    let sql = format!(
+    let retained_join = match backend {
+        DatabaseBackend::PostgreSql => {
+            r#"JOIN LATERAL (
+                SELECT record.id, record.created_at, record.key_id,
+                       record.conversation_cluster_id, record.completed_at,
+                       record.status_code, record.error_code, record.usage_basis,
+                       record.duration_ms, record.output_tokens
+                  FROM request_records record
+                 WHERE record.id = f.request_id AND record.created_at = f.created_at
+                   AND record.created_at >= $2 AND record.created_at <= $3
+                 OFFSET 0
+            ) r ON TRUE"#
+        }
+        DatabaseBackend::Sqlite => {
+            "JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at AND r.created_at >= $2 AND r.created_at <= $3"
+        }
+    };
+    format!(
         r#"
         SELECT (f.created_at / {bucket_ms}) * {bucket_ms} AS bucket_start,
                CAST(COUNT(*) AS BIGINT) AS requests,
                CAST(SUM(r.output_tokens) AS BIGINT) AS output_tokens,
                CAST(SUM(r.duration_ms) AS BIGINT) AS duration_ms
           FROM request_stats_facts f
-          JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at
+          {retained_join}
           LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
           LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = f.tenant_id
          WHERE {tenant} AND f.created_at >= $2 AND f.created_at <= $3
@@ -60,7 +71,23 @@ pub(super) async fn attach_output_rates(
            )
          GROUP BY (f.created_at / {bucket_ms}) * {bucket_ms}
     "#
-    );
+    )
+}
+
+pub(super) async fn attach_output_rates(
+    snapshot: &mut UsageAnalysisSnapshot,
+    projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
+    tenant_id: &str,
+    tenant_scoped: bool,
+    filter: &UsageAnalysisFilter,
+    range: ValidatedUsageAnalysisRange,
+) -> Result<(), AppError> {
+    let backend = if snapshot.transaction.as_mut().backend_name() == "PostgreSQL" {
+        DatabaseBackend::PostgreSql
+    } else {
+        DatabaseBackend::Sqlite
+    };
+    let sql = output_rate_sql(backend, range.granularity, tenant_scoped);
     let rows = snapshot
         .fetch_all(
             "output_rate",

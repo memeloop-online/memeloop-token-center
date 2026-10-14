@@ -44,12 +44,14 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
       return route.fulfill({ status: 200, json: { id: 'original-account', name: 'Original account', credential_generation: 5 } });
     });
     const path = `${origin}/e2e/fixtures/authorization-code.html`;
-    for (const mode of ['legacy', 'other']) {
-      await page.goto(`${path}?reauthorize=${mode}`);
-      await page.getByRole('status').filter({ hasText: '保持账号连接唯一' }).waitFor();
-      assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).count(), 0);
-    }
-    assert.equal(starts, 0);
+    await page.goto(`${path}?reauthorize=legacy`);
+    await page.getByRole('status').filter({ hasText: '保持账号连接唯一' }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '开始登录', exact: true }).count(), 0);
+    await page.goto(`${path}?reauthorize=other`);
+    await page.getByRole('button', { name: '开始登录', exact: true }).waitFor();
+    assert.doesNotMatch(await page.locator('body').innerText(), /Google|保持账号连接唯一/);
+    assert.match(await page.locator('body').innerText(), /原来的身份登录/);
+    assert.equal(starts, 0, 'inspecting eligibility never starts a session');
     await page.goto(`${path}?reauthorize=eligible`);
     assert.equal(await page.getByLabel('上游名称', { exact: true }).count(), 0);
     await page.getByText('Original account', { exact: true }).waitFor();
@@ -75,6 +77,55 @@ test('Antigravity reauthorization preserves the account and consumes identity-mi
     await page.getByRole('status').filter({ hasText: '原账号已重新授权' }).waitFor();
     assert.equal(starts, 2); assert.equal(completes, 3); assert.equal(reads, 1);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('fragment-manual reauthorization restores the paste after an exact pre-exchange rejection and preserves the original account', { timeout: 60_000 }, async () => {
+  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen(); const address = server.httpServer!.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 1000 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    let starts = 0; let completes = 0; let reads = 0;
+    const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/*', async route => {
+      const url = new URL(route.request().url());
+      if (url.origin !== origin) return route.abort();
+      if (!url.pathname.startsWith('/internal/')) return route.continue();
+      if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: [] }); }
+      const body = route.request().postDataJSON();
+      if (url.pathname.endsWith('/authorization-code/start')) {
+        starts++;
+        assert.deepEqual(body, { tenant_external_id: 'fixture-a', account_name: 'Original account', provider_driver: 'fixture-plugin', upstream_account_id: 'original-account' });
+        return route.fulfill({ json: { driver: 'fixture-plugin', login_url: 'https://login.example.invalid/authorize', session_token: 'fixture-session', expires_at: Date.now() + 600_000, recovery_expires_at: Date.now() + 86_400_000 } });
+      }
+      assert.equal(url.pathname, '/internal/v1/oauth/authorization-code/complete'); completes++;
+      assert.equal(body.session_token, 'fixture-session');
+      if (body.callback_url === 'stale-code#stale-state') {
+        return route.fulfill({ status: 400, json: { error: { code: 'invalid_request', message: 'invalid request: OAuth completion must be code#state' } } });
+      }
+      assert.equal(body.callback_url, 'fixture-code#fixture-state');
+      return route.fulfill({ status: 200, json: { id: 'original-account', name: 'Original account', credential_generation: 5 } });
+    });
+    await page.goto(`${origin}/e2e/fixtures/authorization-code.html?reauthorize=other&fragment=1`);
+    const start = page.getByRole('button', { name: '开始登录', exact: true });
+    await start.waitFor();
+    assert.doesNotMatch(await page.locator('body').innerText(), /Google/);
+    await start.click();
+    const paste = page.getByLabel('提供商页面显示的授权码', { exact: true });
+    await paste.fill('stale-code#stale-state');
+    await page.getByRole('button', { name: '完成授权', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: '与本次登录会话不匹配' }).waitFor();
+    await paste.waitFor();
+    assert.equal(await paste.inputValue(), '');
+    await paste.fill('fixture-code#fixture-state');
+    await page.getByRole('button', { name: '完成授权', exact: true }).click();
+    await page.getByRole('status').filter({ hasText: '原账号已重新授权' }).waitFor();
+    assert.equal(starts, 1); assert.equal(completes, 2); assert.equal(reads, 1);
+    assert.doesNotMatch(await page.locator('body').innerText(), /stale-code|fixture-code|fixture-session/);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
 });

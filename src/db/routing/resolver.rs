@@ -447,7 +447,7 @@ impl Database {
             .collect()
     }
 
-    /// Checks only normalized route authorization. Runtime account and
+    /// Checks only normalized route authorization. Route enablement, runtime account and
     /// credential readiness belongs to candidate resolution so an authorized
     /// key receives a typed availability failure instead of a misleading 403.
     pub async fn credential_has_authorized_route(
@@ -460,7 +460,7 @@ impl Database {
         let found = sqlx::query(
             "SELECT r.id
              FROM model_routes r
-             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND r.archived_at IS NULL
+             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.archived_at IS NULL
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (

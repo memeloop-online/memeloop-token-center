@@ -5,16 +5,18 @@ mod credential;
 mod transport_policy;
 mod types;
 
+pub use catalog::{
+    AuthorizationCodeContribution, CodexModelCapabilities, CodexReasoningLevel,
+    ComponentAdapterContribution, FixedProtocolHeaders, GenerationAdapterContribution,
+    HTTP_JSON_PROVIDER_DRIVER, NEW_API_PROVIDER_DRIVER, OAuthAdapterContribution, OAuthFlowKind,
+    OAuthIdentityContribution, OAuthPublicClient, OAuthResponseMode, OAuthTokenEncoding,
+    ONE_API_PROVIDER_ALIAS, ProviderCatalog, ProviderType, RESPONSES_VIA_CHAT_COMPACTION_CONFIG,
+    RequestCompatibility, ResponsesViaChatDialect, canonicalize_provider_driver, is_new_api_driver,
+    is_openai_compatible_http_driver,
+};
 pub(crate) use catalog::{
     CODEX_AGENT_INSTRUCTIONS_TEMPLATE_V1, CODEX_MODEL_CAPABILITIES_VERSION,
     is_bundled_codex_model_slug,
-};
-pub use catalog::{
-    CodexModelCapabilities, CodexReasoningLevel, ComponentAdapterContribution,
-    GenerationAdapterContribution, HTTP_JSON_PROVIDER_DRIVER, NEW_API_PROVIDER_DRIVER,
-    OAuthAdapterContribution, OAuthFlowKind, ONE_API_PROVIDER_ALIAS, ProviderCatalog, ProviderType,
-    RESPONSES_VIA_CHAT_COMPACTION_CONFIG, RequestCompatibility, ResponsesViaChatDialect,
-    canonicalize_provider_driver, is_new_api_driver, is_openai_compatible_http_driver,
 };
 pub(crate) use catalog::{ManagedOAuthAdapterBackend, ResolvedManagedOAuthAdapter};
 pub(crate) use codex_agent_profile::CODEX_GENERIC_AGENT_INSTRUCTIONS_V1;
@@ -27,7 +29,8 @@ pub(crate) use credential::{
     validate_proxy_url,
 };
 pub(crate) use transport_policy::{
-    CodexChatControlPolicy, CodexResponsesOutputLimitPolicy, CodexTransportPolicy, SseFramingLimits,
+    CodexChatControlPolicy, CodexHttpProtocol, CodexResponsesOutputLimitPolicy,
+    CodexTransportPolicy, SseFramingLimits,
 };
 pub use types::{
     AuthorizedUpstreamCandidate, ModelRouteView, ResolvedUpstream, UpstreamAccountNotes,

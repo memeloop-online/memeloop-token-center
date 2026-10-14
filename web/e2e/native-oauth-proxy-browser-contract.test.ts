@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 test('native OAuth creates with the chosen proxy, preserves direct choice, and reauthorizes with stored transport', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -31,6 +32,7 @@ test('native OAuth creates with the chosen proxy, preserves direct choice, and r
     await page.route('**/internal/v1/**', async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
       if (path.endsWith('/poll')) return route.fulfill({ status: 202, json: { status: 'pending', retry_after_seconds: 60 } });
+      if (request.method() === 'POST' && path === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
       if (request.method() !== 'GET') {
         assert.equal(request.method(), 'POST'); assert.equal(path, `/internal/v1/oauth/${profile.endpoint}/start`);
         posts.push({ path, body: request.postDataJSON() });

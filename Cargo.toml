@@ -29,6 +29,7 @@ harness = false
 [features]
 experimental-plugin-revisions = []
 default = []
+h2-attempt-binding = ["wreq-proto/h2-attempt-observer"]
 plugin-distribution = ["dep:oci-client"]
 
 [dependencies]
@@ -78,6 +79,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 wasmtime = { version = "48.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wreq = { version = "=6.0.0-rc.31", default-features = false, features = ["prefix-symbols", "socks", "stream", "tokio-rt", "webpki-roots"] }
 wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
+wreq-proto = { version = "=0.2.6", default-features = false }
 zstd = "0.13.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -88,6 +90,7 @@ tikv-jemallocator = { version = "0.7.0", features = ["profiling", "stats"] }
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 
 [dev-dependencies]
+wreq-proto = { version = "=0.2.6", default-features = false, features = ["h2-attempt-observer"] }
 cucumber = { version = "0.23.0", features = ["macros"] }
 percent-encoding = "2"
 tempfile = "3"
@@ -112,3 +115,4 @@ strip = "debuginfo"
 # feature can reach it. This source-identical, manifest-only fork removes that
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
+wreq-proto = { path = "vendor/wreq-proto" }

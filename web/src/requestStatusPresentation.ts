@@ -35,7 +35,7 @@ const supplierFailureCopy: Record<string, [string, string]> = {
 
 const supplierVocabulary: Record<string, { base: string; codes: string[]; messages: string[] }> = {
   no_active_plan: { base: '当前账号没有可用套餐', codes: ['no_active_plan', 'NoAvailablePlan', 'NoActivePlan', 'NoPlan', '402'], messages: ['当前账号没有可用套餐', 'No active plan', 'No available plan'] },
-  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota'] },
+  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota', 'insufficient_user_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota', '用户额度不足'] },
   authentication_invalid: { base: 'The upstream authentication credentials are invalid', codes: ['authentication_invalid', 'invalid_api_key'], messages: ['Invalid API key', 'Invalid authentication credentials'] },
   authentication_expired: { base: 'The upstream authentication credentials have expired', codes: ['authentication_expired', 'api_key_expired', 'token_expired'], messages: ['API key expired', 'Authentication token expired'] },
   rate_limited: { base: 'The upstream request rate limit was exceeded', codes: ['rate_limited', 'rate_limit_exceeded'], messages: ['Rate limit exceeded', 'Too many requests'] },
@@ -59,6 +59,25 @@ function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null
   return cause ? cause[locale === 'zh-CN' ? 0 : 1] : null;
 }
 
+// Localized explanations keyed by the server's typed stage/source/reason triple.
+// Unknown typed evidence renders nothing; a null stage never adds a phase claim.
+function diagnosticCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+  const diagnostic = request.failure_diagnostic;
+  if (!diagnostic) return null;
+  const zh = locale === 'zh-CN';
+  if (diagnostic.source === 'downstream_connection' && diagnostic.reason === 'client_disconnected') {
+    return zh ? '客户端在响应交付完成前断开了连接' : 'The client disconnected before response delivery completed';
+  }
+  if (diagnostic.source === 'upstream_http_response' && diagnostic.reason === 'upstream_http_status') {
+    if (diagnostic.stage === 'upstream_response_headers') {
+      return zh ? '上游服务在响应开始时返回了错误状态' : 'The upstream service returned an error status at the start of its response';
+    }
+    return zh ? '上游服务返回了错误状态' : 'The upstream service returned an error status';
+  }
+  if (diagnostic.source === 'upstream') return recordedCause(diagnostic.reason, locale);
+  return null;
+}
+
 export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
   const terminal = request.terminal_cause_code ? recordedCause(request.terminal_cause_code, locale) : null;
   const transport = terminal ?? (request.error_code ? recordedCause(request.error_code, locale) : null);
@@ -66,7 +85,8 @@ export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'
   if (!['failed', 'interrupted'].includes(requestOutcome(request))) return null;
   const supplier = request.supplier_error?.code;
   const copy = supplier && Object.hasOwn(supplierFailureCopy, supplier) ? supplierFailureCopy[supplier] : null;
-  return copy ? copy[locale === 'zh-CN' ? 0 : 1] : null;
+  if (copy) return copy[locale === 'zh-CN' ? 0 : 1];
+  return diagnosticCause(request, locale);
 }
 
 export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
@@ -112,7 +132,7 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
   const code = request.status_code === null ? '' : `${locale === 'zh-CN' ? '记录状态码' : 'Recorded status'}: ${request.status_code}`;
   const cause = ['failed', 'interrupted'].includes(outcome) ? requestFailureCause(request, locale) : null;
   const failureDetail = ['failed', 'interrupted'].includes(outcome)
-    ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? (locale === 'zh-CN' ? '未知（未记录具体原因）' : 'Unknown (no specific cause recorded)')}` : '';
+    ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? (locale === 'zh-CN' ? '当时未采集具体原因' : 'No specific cause was captured at the time')}` : '';
   return { outcome, label, tone: outcome === 'completed' ? 'ok' : ['cancelled', 'interrupted', 'failed'].includes(outcome) ? 'bad' : outcome === 'unknown' ? 'unknown' : 'pending',
     cause: failureDetail,
     supplierDetail: requestSupplierDetail(request, locale),

@@ -1,6 +1,7 @@
 import { CopyButton } from '../CopyButton.js';
 import { useI18n } from '../i18n';
 import { SecretInput } from '../SecretInput';
+import { clientCredentialPortalUrl } from './clientCredentialGuidance';
 import './pages/systemSettings.css';
 
 export interface OperatorAccessSettingsProps {
@@ -31,5 +32,9 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
       <div><label htmlFor="operator-access-credential">{t('settings.accessCredential')}</label><SecretInput id="operator-access-credential" name="credential" label={t('settings.accessCredential')} autoComplete="off" value={credentialInput} onChange={(event) => onCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} /></div>
       <div className="button-row"><button type="submit" disabled={!credentialInput.trim()}>{credential ? t('settings.replaceCredential') : t('common.connect')}</button>{credentialInput.trim() && <CopyButton value={credentialInput} label={t('common.copySecret')} />}{credential && <><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary" onClick={onClear}>{t('common.clearCredential')}</button></>}</div>
     </form>
+    <p className="muted">
+      {t('operator.clientCredentialPortalHint')}{' '}
+      <a href={clientCredentialPortalUrl(window.location.origin)} target="_blank" rel="noopener noreferrer">{t('operator.openPortal')}</a>
+    </p>
   </article>;
 }

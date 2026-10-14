@@ -10,6 +10,7 @@ pub(in crate::api::proxy) struct PreparedProxyRoute {
     pub(in crate::api::proxy) component_request: Option<(PreparedProviderRequest, RequestContext)>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
     pub(super) upstream_path: &'static str,
+    pub(in crate::api::proxy) wait_for_compaction: bool,
     pub(super) compact_v2_bridge: bool,
     pub(super) wrap_compact_as_sse: bool,
     pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
@@ -26,6 +27,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(super) component_context: Option<RequestContext>,
     pub(super) responses_chat: Option<crate::api::responses_via_chat::Context>,
     pub(super) upstream_path: &'static str,
+    pub(in crate::api::proxy) wait_for_compaction: bool,
     pub(super) compact_v2_bridge: bool,
     pub(super) wrap_compact_as_sse: bool,
     pub(super) responses_anthropic: Option<crate::api::responses_via_anthropic::Context>,
@@ -164,6 +166,7 @@ pub(in crate::api::proxy) enum ProxySendError {
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
+    pub(in crate::api::proxy) egress_selection: Option<super::codex::egress::FinalSelection>,
     pub(in crate::api::proxy) response: UpstreamResponse,
     pub(in crate::api::proxy) upstream_activity: crate::metrics::ActivityGuard,
     pub(in crate::api::proxy) codex_retry: CodexRetryTerminalGuard,

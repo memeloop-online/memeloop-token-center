@@ -647,6 +647,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "operator upstream account notes",
         sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
     },
+    Migration {
+        version: 124,
+        name: "request selected egress attempt payload estimates",
+        sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1278,10 +1283,19 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "operator upstream account notes",
         sql: include_str!("../../../migrations/common/0123_upstream_account_notes.sql"),
     },
+    Migration {
+        version: 124,
+        name: "request selected egress attempt payload estimates",
+        sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
+    },
 ];
 
 impl Database {
-    pub(super) async fn schema_status(&self) -> Result<DatabaseSchemaStatus, sqlx::Error> {
+    pub(super) async fn schema_status(
+        &self,
+        connection: &mut AnyConnection,
+        progress: &DatabaseReadinessProgress,
+    ) -> Result<DatabaseSchemaStatus, sqlx::Error> {
         let migrations = match self.backend {
             DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
@@ -1290,9 +1304,15 @@ impl Database {
             .last()
             .map(|migration| migration.version)
             .unwrap_or_default();
+        progress
+            .enter(
+                DatabaseReadinessStage::Schema,
+                DatabaseReadinessPhase::Query,
+            )
+            .await;
         let applied_versions =
             sqlx::query_scalar::<_, i64>("SELECT version FROM schema_migrations ORDER BY version")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await?;
         let missing_migration_count = migrations
             .iter()

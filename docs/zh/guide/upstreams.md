@@ -24,6 +24,14 @@
 
 ## Codex 账号的生成参数
 
+### 上游 HTTP 协议
+
+账号配置 `transport_policy.http_protocol` 接受 `provider_default`（默认，省略时相同）或 `http1_only`。`provider_default` 保持 native 客户端现有的 TLS 协议协商；`http1_only` 让该账号新建的客户端使用 HTTP/1.1，复用相同 TLS 配置与已配置代理，不启用自动协议回退。共用账号客户端的模型目录、额度读取也会受到影响。
+
+通过已有上游账号更新 API 修改，保留其余配置并传入当前 `expected_updated_at`。仅在待测试账号原有 `transport_policy` 对象中增加 `"http_protocol": "http1_only"`；过期版本会被拒绝。回滚时恢复 `provider_default` 或删除此字段，新请求使用新的缓存客户端，进行中的请求继续持有原客户端，其他账号保留原设置。取消、compact 等待、重试额度和结算规则继续适用。
+
+安全日志 `codex_upstream_http_protocol` 记录配置模式、实际返回响应的 `negotiated_http_version`、请求/账号/路由标识及状态码。其范围是候选返回的响应头，不证明流已完成，也不枚举 sender 内部重试；没有响应就没有该协商结果日志。Synthetic 合同通过不代表真实供应商支持 HTTP/1.1 或失败率更低，考虑部署变更前需固定同账号、模型、代理成员和节点验证。
+
 ### 请求并发
 
 默认不会为 Codex 账号额外设置派发并发上限。`transport_policy.dispatch_max_in_flight` 未填写或设为 `0` 时，派发队列不生效；客户端凭据的权限、额度和已设置的并发策略仍然有效，网关内存保护也不会关闭。只有需要主动限制某个账号出口的同时请求数时，才填写正数。流式请求在结束前占用一个名额；队列满或等待超时可能返回 503。

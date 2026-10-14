@@ -112,14 +112,22 @@ pub(super) fn plan_proxy_route(
             anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
         (forwarded, None, Some(context))
     } else {
-        let (forwarded, context) = kimi::prepare_forwarded_request(
-            &route,
-            protocol,
-            request_json,
-            bridge_multi_agent && responses_via_chat_dialect.is_some(),
-            bridge_multi_agent && responses_via_chat_dialect.is_some(),
-            responses_via_chat_dialect,
-        )?;
+        let (forwarded, context) =
+            crate::api::kimi_transport::responses_request::with_input_rejection_diagnostics(
+                request_id,
+                route.account_id,
+                route.credential_generation,
+                || {
+                    kimi::prepare_forwarded_request(
+                        &route,
+                        protocol,
+                        request_json,
+                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                        bridge_multi_agent && responses_via_chat_dialect.is_some(),
+                        responses_via_chat_dialect,
+                    )
+                },
+            )?;
         (forwarded, context, None)
     };
     let (compact_v2_bridge, wrap_compact_as_sse) = prepare_compact_bridge(
@@ -231,7 +239,12 @@ pub(super) fn plan_proxy_route(
             config_json: "{}".to_owned(),
         },
     );
+    let wait_for_compaction = is_codex
+        && (matches!(protocol, Protocol::OpenAiResponsesCompact)
+            || (matches!(protocol, Protocol::OpenAiResponses)
+                && crate::api::new_api_transport::has_compaction_trigger(request_json)));
     Ok(PlannedProxyRoute {
+        wait_for_compaction,
         route,
         forwarded_json,
         output_token_ceiling,
@@ -403,6 +416,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body = outcome.request_json.into_bytes();
     }
     Ok(PreparedProxyRoute {
+        wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),
         upstream_stream: planned.upstream_stream,
@@ -418,6 +432,7 @@ pub(super) async fn materialize_proxy_route(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
@@ -426,6 +441,7 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
     candidate_rank: usize,
     outbound_attempt: usize,
+    h2_recovery_available: &mut bool,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     // Catalog/quota support does not implement Cursor's AgentService Run
     // conversation protocol. Never send its OAuth token and an OpenAI payload
@@ -442,6 +458,7 @@ pub(super) async fn send_proxy_route(
             route,
             candidate_rank,
             outbound_attempt,
+            h2_recovery_available,
         )
         .await;
     }

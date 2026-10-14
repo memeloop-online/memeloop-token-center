@@ -4,6 +4,7 @@ import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import type { ManagedModelSyncResponse } from '../src/types.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 declare global {
   interface Window { managedHandoffPayloads: Array<Record<string, unknown>>; managedHandoffRouteReads: string[] }
@@ -529,6 +530,7 @@ async function stubProvidersPage(page: Page, options: { denySync?: boolean; deny
       if (options.denySync && posts.length > 1) return route.fulfill({ status: 403, json: { error: { message: 'write denied' } } });
       return route.fulfill({ json: syncResponse({ models: 68 }) });
     }
+    if (request.method() === 'POST' && path === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: 'managed-account', tenant: 'fixture-b', driver: 'http-json' }]) });
     if (request.method() !== 'GET') {
       unexpectedWrites.push(path);
       return route.fulfill({ status: 403, json: { error: { message: 'write denied' } } });

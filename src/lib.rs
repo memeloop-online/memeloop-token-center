@@ -371,9 +371,21 @@ fn build_codex_http2_test_client(
     policy: provider::CodexTransportPolicy,
     keep_alive_interval: Duration,
 ) -> Result<wreq::Client, wreq::Error> {
-    codex_http_client_builder(policy, keep_alive_interval)
-        .http2_only()
-        .build()
+    codex_http_protocol_test_builder(policy, keep_alive_interval, http::Version::HTTP_2).build()
+}
+
+#[cfg(test)]
+fn codex_http_protocol_test_builder(
+    policy: provider::CodexTransportPolicy,
+    keep_alive_interval: Duration,
+    version: http::Version,
+) -> wreq::ClientBuilder {
+    let builder = codex_http_client_builder(policy, keep_alive_interval);
+    match version {
+        http::Version::HTTP_11 => builder.http1_only(),
+        http::Version::HTTP_2 => builder.http2_only(),
+        _ => panic!("unsupported synthetic protocol arm"),
+    }
 }
 
 fn codex_http_client_builder(
@@ -400,7 +412,7 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
-    wreq::Client::builder()
+    let builder = wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
@@ -411,7 +423,11 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options)
+        .http2_options(http2_options);
+    match policy.http_protocol {
+        provider::CodexHttpProtocol::ProviderDefault => builder,
+        provider::CodexHttpProtocol::Http1Only => builder.http1_only(),
+    }
 }
 
 fn codex_http2_options(
@@ -458,6 +474,13 @@ pub(crate) fn build_no_retry_http_client(
     proxy_url: Option<&str>,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],
 ) -> Result<reqwest::Client, reqwest::Error> {
+    no_retry_http_client_builder(proxy_url, pinned_hosts)?.build()
+}
+
+fn no_retry_http_client_builder(
+    proxy_url: Option<&str>,
+    pinned_hosts: &[(&str, &[std::net::SocketAddr])],
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     let mut builder = base_http_client_builder()
         .retry(reqwest::retry::never())
         .redirect(reqwest::redirect::Policy::none())
@@ -468,7 +491,16 @@ pub(crate) fn build_no_retry_http_client(
     for (hostname, addresses) in pinned_hosts {
         builder = builder.resolve_to_addrs(hostname, addresses);
     }
-    builder.build()
+    Ok(builder)
+}
+
+#[cfg(test)]
+pub(crate) fn build_no_retry_http2_test_client() -> reqwest::Client {
+    no_retry_http_client_builder(None, &[])
+        .unwrap()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
 }
 
 pub(crate) fn build_explicit_proxy_http_client(

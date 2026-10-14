@@ -14,6 +14,8 @@ const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
     about = "Verify and atomically install a digest-pinned Token Center OCI plugin"
 )]
 struct Arguments {
+    #[arg(long)]
+    egress_proxy: Option<String>,
     /// OCI reference. Tags are rejected; @sha256:<digest> is mandatory.
     #[cfg_attr(
         feature = "experimental-plugin-revisions",
@@ -149,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|path| read_bounded_file(path, "Cosign public key"))
         .collect::<Result<Vec<_>, _>>()?;
     let installation = InstallPluginOptions {
+        egress_proxy: arguments.egress_proxy,
         reference: arguments.reference.unwrap_or_default(),
         plugin_root: plugin_root.clone(),
         allowed_sources: arguments

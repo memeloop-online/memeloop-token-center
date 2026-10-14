@@ -74,6 +74,7 @@ impl RegistryCredentials {
 
 #[derive(Clone)]
 pub struct InstallPluginOptions {
+    pub egress_proxy: Option<String>,
     pub reference: String,
     pub plugin_root: PathBuf,
     pub allowed_sources: BTreeSet<String>,
@@ -110,13 +111,19 @@ impl SignatureVerifier for CosignKeylessSignatureVerifier<'_> {
             return Err(PluginDistributionError::SignatureVerification);
         }
         let workspace = CosignWorkspace::new(image.registry(), credentials, &[])
-            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+            .map_err(cosign_workspace_failure)?;
         let version = self
             .runner
             .run(&cosign_version_command(&workspace))
             .await
             .map_err(|_| PluginDistributionError::SignatureVerification)?;
         if !version.success || !cosign_version_matches(&version.stdout) {
+            emit_cosign_diagnostic(
+                &cosign_version_command(&workspace),
+                "version_rejected",
+                None,
+                None,
+            );
             return Err(PluginDistributionError::SignatureVerification);
         }
         let mut command = cosign_base_command(&workspace);
@@ -163,6 +170,8 @@ pub enum PluginDistributionError {
     DigestPinRequired,
     #[error("plugin source is not allowed by policy")]
     SourceDenied,
+    #[error("installation egress proxy is invalid")]
+    InvalidEgressProxy,
     #[error("plugin signature verification failed")]
     SignatureVerification,
     #[error("OCI registry operation failed")]
@@ -182,7 +191,7 @@ impl PluginDistributionError {
     pub fn diagnostic_category(&self) -> &'static str {
         match self {
             Self::DigestPinRequired => "digest_pin",
-            Self::SourceDenied => "source_policy",
+            Self::SourceDenied | Self::InvalidEgressProxy => "source_policy",
             Self::SignatureVerification => "signature",
             Self::Registry => "registry",
             Self::InvalidArtifact(_) => "artifact",
@@ -235,7 +244,7 @@ impl SignatureVerifier for CosignPublicKeySignatureVerifier<'_> {
         let source = format!("{}/{}", image.registry(), image.repository());
         let verified_reference = format!("{source}@{expected_digest}");
         let workspace = CosignWorkspace::new(image.registry(), credentials, self.keys)
-            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+            .map_err(cosign_workspace_failure)?;
 
         let version = self
             .runner
@@ -243,6 +252,12 @@ impl SignatureVerifier for CosignPublicKeySignatureVerifier<'_> {
             .await
             .map_err(|_| PluginDistributionError::SignatureVerification)?;
         if !version.success || !cosign_version_matches(&version.stdout) {
+            emit_cosign_diagnostic(
+                &cosign_version_command(&workspace),
+                "version_rejected",
+                None,
+                None,
+            );
             return Err(PluginDistributionError::SignatureVerification);
         }
         for key_path in &workspace.key_paths {
@@ -267,6 +282,18 @@ struct CosignWorkspace {
     directory: TempDir,
     docker_config: PathBuf,
     key_paths: Vec<PathBuf>,
+}
+
+fn cosign_workspace_failure(error: io::Error) -> PluginDistributionError {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "mtc_plugin_install": 1, "stage": "install", "category": "signature",
+            "cosign_operation": "workspace", "stderr_class": "workspace_io",
+            "errno": error.raw_os_error(),
+        })
+    );
+    PluginDistributionError::SignatureVerification
 }
 
 impl CosignWorkspace {
@@ -386,7 +413,25 @@ trait CosignRunner: Send + Sync {
     async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput>;
 }
 
-struct SystemCosignRunner;
+#[derive(Default)]
+struct SystemCosignRunner {
+    egress_proxy: Option<String>,
+}
+
+fn cosign_proxy_command(command: &CosignCommandSpec, proxy: Option<&str>) -> CosignCommandSpec {
+    let mut environment = command.environment.clone();
+    if let Some(proxy) = proxy {
+        for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            environment.push((name.into(), proxy.into()));
+        }
+        environment.push(("NO_PROXY".into(), "".into()));
+    }
+    CosignCommandSpec {
+        arguments: command.arguments.clone(),
+        environment,
+        current_directory: command.current_directory.clone(),
+    }
+}
 
 /// Prove that this service executable can launch its co-located installer and
 /// that the installer can launch and validate its co-located Cosign verifier.
@@ -400,7 +445,7 @@ impl CosignRunner for SystemCosignRunner {
     async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput> {
         run_cosign_process(
             &crate::plugin_runtime_companions::cosign_verifier_path()?,
-            command,
+            &cosign_proxy_command(command, self.egress_proxy.as_deref()),
             COSIGN_TIMEOUT,
         )
         .await
@@ -417,7 +462,7 @@ pub async fn verify_cosign_runtime() -> Result<(), PluginDistributionError> {
         &[],
     )
     .map_err(|_| PluginDistributionError::SignatureVerification)?;
-    let runner = SystemCosignRunner;
+    let runner = SystemCosignRunner::default();
     let version = runner
         .run(&cosign_version_command(&workspace))
         .await
@@ -439,6 +484,73 @@ pub async fn verify_cosign_runtime() -> Result<(), PluginDistributionError> {
 }
 
 async fn run_cosign_process(
+    program: &Path,
+    command: &CosignCommandSpec,
+    timeout: Duration,
+) -> io::Result<CosignProcessOutput> {
+    let result = run_cosign_process_inner(program, command, timeout).await;
+    if let Err(error) = &result {
+        let reason = if error.kind() == io::ErrorKind::TimedOut {
+            "timeout"
+        } else {
+            "process_io"
+        };
+        emit_cosign_diagnostic(command, reason, None, error.raw_os_error());
+    }
+    result
+}
+
+fn cosign_stderr_class(bytes: &[u8]) -> &'static str {
+    for (pattern, reason) in [
+        ("no space left on device", "storage_full"),
+        ("permission denied", "permission_denied"),
+        (
+            "x509: certificate signed by unknown authority",
+            "tls_authority",
+        ),
+        ("no such host", "dns"),
+        ("context deadline exceeded", "deadline"),
+        ("i/o timeout", "deadline"),
+        ("connection refused", "connection_refused"),
+        ("network is unreachable", "network_unreachable"),
+        ("no matching signatures", "no_matching_signatures"),
+    ] {
+        if bytes
+            .windows(pattern.len())
+            .any(|window| window == pattern.as_bytes())
+        {
+            return reason;
+        }
+    }
+    "unclassified"
+}
+
+fn emit_cosign_diagnostic(
+    command: &CosignCommandSpec,
+    reason: &'static str,
+    exit_code: Option<i32>,
+    errno: Option<i32>,
+) {
+    let operation = match command.arguments.first().and_then(|value| value.to_str()) {
+        Some("version") => "version",
+        Some("verify") => "verify",
+        _ => "other",
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "mtc_plugin_install": 1,
+            "stage": "install",
+            "category": "signature",
+            "cosign_operation": operation,
+            "stderr_class": reason,
+            "exit_code": exit_code,
+            "errno": errno,
+        })
+    );
+}
+
+async fn run_cosign_process_inner(
     program: &Path,
     command: &CosignCommandSpec,
     timeout: Duration,
@@ -480,11 +592,12 @@ async fn run_cosign_process(
     let stdout = stdout_task
         .await
         .map_err(|_| io::Error::other("cosign stdout task failed"))??;
-    // Drain and bound stderr, but never return it to callers or logs: registry
-    // implementations have historically echoed credential-bearing errors.
-    stderr_task
+    let stderr = stderr_task
         .await
         .map_err(|_| io::Error::other("cosign stderr task failed"))??;
+    if !status.success() {
+        emit_cosign_diagnostic(command, cosign_stderr_class(&stderr), status.code(), None);
+    }
     Ok(CosignProcessOutput {
         success: status.success(),
         stdout,
@@ -527,7 +640,13 @@ struct InstallReceipt<'a> {
 pub async fn install_plugin_oci(
     options: &InstallPluginOptions,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
-    let runner = SystemCosignRunner;
+    if let Some(proxy) = &options.egress_proxy {
+        crate::network::validate_install_egress_proxy(proxy)
+            .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
+    }
+    let runner = SystemCosignRunner {
+        egress_proxy: options.egress_proxy.clone(),
+    };
     if let Some(identity) = &options.cosign_keyless {
         if !options.cosign_public_keys.is_empty() {
             return Err(PluginDistributionError::SignatureVerification);
@@ -549,11 +668,32 @@ pub async fn install_plugin_oci(
     install_plugin_oci_with_verifier(options, &verifier, false).await
 }
 
+fn registry_client_config(options: &InstallPluginOptions, allow_plain_http: bool) -> ClientConfig {
+    ClientConfig {
+        protocol: if allow_plain_http {
+            ClientProtocol::Http
+        } else {
+            ClientProtocol::Https
+        },
+        max_concurrent_download: 1,
+        read_timeout: Some(Duration::from_secs(60)),
+        connect_timeout: Some(Duration::from_secs(10)),
+        https_proxy: options.egress_proxy.clone(),
+        http_proxy: options.egress_proxy.clone(),
+        no_proxy: options.egress_proxy.as_ref().map(|_| String::new()),
+        ..Default::default()
+    }
+}
+
 async fn install_plugin_oci_with_verifier(
     options: &InstallPluginOptions,
     verifier: &dyn SignatureVerifier,
     allow_plain_http: bool,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
+    if let Some(proxy) = &options.egress_proxy {
+        crate::network::validate_install_egress_proxy(proxy)
+            .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
+    }
     let supplied_reference: Reference = options
         .reference
         .parse()
@@ -582,17 +722,8 @@ async fn install_plugin_oci_with_verifier(
         .verify(&verified_reference, expected_digest, &options.credentials)
         .await?;
 
-    let client = Client::new(ClientConfig {
-        protocol: if allow_plain_http {
-            ClientProtocol::Http
-        } else {
-            ClientProtocol::Https
-        },
-        max_concurrent_download: 1,
-        read_timeout: Some(Duration::from_secs(60)),
-        connect_timeout: Some(Duration::from_secs(10)),
-        ..Default::default()
-    });
+    let client = Client::try_from(registry_client_config(options, allow_plain_http))
+        .map_err(|_| PluginDistributionError::Registry)?;
     let auth = options.credentials.oci_auth();
     let (manifest, resolved_digest) = tokio::time::timeout(
         OCI_OPERATION_TIMEOUT,

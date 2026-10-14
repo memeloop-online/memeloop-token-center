@@ -4,6 +4,13 @@ export interface SupplierError {
   message: string;
 }
 
+/** Typed server-recorded failure evidence; a null stage means the observation phase was not recorded. */
+export interface RequestFailureDiagnostic {
+  stage?: string | null;
+  source: string;
+  reason: string;
+}
+
 export interface RequestView {
   /** Recorded token provenance; null/absence is historical unknown, not provider actual. */
   usage_basis?: 'provider_reported' | 'provider_estimated' | 'contract_ceiling' | 'not_observed' | null;
@@ -34,6 +41,7 @@ export interface RequestView {
   credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
@@ -154,6 +162,7 @@ export interface RequestEvent {
   cost: string;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   archive_state: RequestArchiveState;
   credential_identity?: RequestCredentialIdentity | null;
@@ -803,6 +812,8 @@ export interface ProviderType {
     login_url: string;
     poll_url: string;
     refresh_url: string;
+    /** Absent means the standard query-parameter callback; fragment_manual declares the provider page displays code#state for manual paste. */
+    response_mode?: 'fragment_manual';
   };
   component_adapter?: {
     api_version: 'buffered-v1';

@@ -77,13 +77,14 @@ mod providers;
 mod requests;
 mod rotation;
 mod routing;
+pub use routing::egress;
 mod rows;
 mod session_analytics;
 mod session_projection;
 mod tenants;
 mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
-pub(crate) use transport_proxy_groups::TransportProxyGroups;
+pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 mod upstream_quota_reset;
@@ -260,6 +261,103 @@ impl From<AppError> for DatabaseReadinessError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseReadinessStage {
+    Ping,
+    Schema,
+    ArchiveMarker,
+    ArchiveShape,
+}
+
+impl DatabaseReadinessStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Schema => "schema",
+            Self::ArchiveMarker => "archive_marker",
+            Self::ArchiveShape => "archive_shape",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseReadinessPhase {
+    Acquire,
+    Query,
+}
+
+impl DatabaseReadinessPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Acquire => "acquire",
+            Self::Query => "query",
+        }
+    }
+}
+
+pub(crate) struct DatabaseReadinessProgress {
+    position: std::sync::Mutex<(DatabaseReadinessStage, DatabaseReadinessPhase)>,
+    started_at: tokio::time::Instant,
+    #[cfg(test)]
+    pub(crate) stalled_at: Option<(DatabaseReadinessStage, DatabaseReadinessPhase)>,
+    #[cfg(test)]
+    pub(crate) stalled: tokio::sync::Notify,
+}
+
+pub(crate) struct DatabaseReadinessSnapshot {
+    pub(crate) stage: &'static str,
+    pub(crate) phase: &'static str,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) pool_size: u32,
+    pub(crate) pool_idle: usize,
+}
+
+impl DatabaseReadinessProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            position: std::sync::Mutex::new((
+                DatabaseReadinessStage::Ping,
+                DatabaseReadinessPhase::Acquire,
+            )),
+            started_at: tokio::time::Instant::now(),
+            #[cfg(test)]
+            stalled_at: None,
+            #[cfg(test)]
+            stalled: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn enter(&self, stage: DatabaseReadinessStage, phase: DatabaseReadinessPhase) {
+        *self
+            .position
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = (stage, phase);
+        #[cfg(test)]
+        if self.stalled_at == Some((stage, phase)) {
+            self.stalled.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    pub(crate) fn snapshot(&self, database: &Database) -> DatabaseReadinessSnapshot {
+        let (stage, phase) = *self
+            .position
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        DatabaseReadinessSnapshot {
+            stage: stage.label(),
+            phase: phase.label(),
+            elapsed_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            pool_size: database.pool.size(),
+            pool_idle: database.pool.num_idle(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OAuthRefreshWritePhase {
     Disconnect,
     Claim,
@@ -315,15 +413,41 @@ impl Database {
     }
 
     pub(crate) async fn readiness_check_detailed(&self) -> Result<(), DatabaseReadinessError> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
+        self.readiness_check_observed(&DatabaseReadinessProgress::new())
+            .await
+    }
+
+    pub(crate) async fn acquire_readiness_connection(
+        &self,
+        progress: &DatabaseReadinessProgress,
+        stage: DatabaseReadinessStage,
+    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+        progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
+        let connection = self.pool.acquire().await?;
+        progress.enter(stage, DatabaseReadinessPhase::Query).await;
+        Ok(connection)
+    }
+
+    pub(crate) async fn readiness_check_observed(
+        &self,
+        progress: &DatabaseReadinessProgress,
+    ) -> Result<(), DatabaseReadinessError> {
+        let mut connection = self
+            .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
             .await
             .map_err(AppError::from)?;
-        let schema = self.schema_status().await.map_err(AppError::from)?;
+        sqlx::query("SELECT 1")
+            .execute(&mut *connection)
+            .await
+            .map_err(AppError::from)?;
+        let schema = self
+            .schema_status(&mut connection, progress)
+            .await
+            .map_err(AppError::from)?;
         if !schema.is_ready() {
             return Err(DatabaseReadinessError::SchemaOutdated(schema));
         }
-        self.archive_staging_readiness_check()
+        self.archive_staging_readiness_check(&mut connection, progress)
             .await
             .map_err(AppError::from)?;
         Ok(())

@@ -42,6 +42,7 @@ mod routing;
 pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
+mod transport_protocol;
 mod upstream_error;
 mod upstream_response;
 
@@ -638,26 +639,37 @@ async fn finish_non_sse_proxy_response(
         _ => Ok(()),
     };
     if let Err(error_code) = validation {
-        if matches!(protocol, Protocol::OpenAiResponses)
+        if status == StatusCode::OK
+            && matches!(protocol, Protocol::OpenAiResponses)
             && let Some(usage) = trusted_buffered_responses_incomplete_usage(&response_body)
         {
-            // A provider-declared terminal is not a successful completion, but
-            // its complete counters must not be discarded as unobserved usage.
-            // This is the same atomic buffered settlement used for success;
-            // neither the response status nor retry eligibility is promoted.
+            let valid_output = buffered_responses_incomplete_output_is_valid(&response_body);
+            let (response_status, response_body, terminal_error) = if valid_output {
+                (status, response_body, "upstream_incomplete_response")
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
+                    ),
+                    "upstream_invalid_response",
+                )
+            };
             let result = finish_buffered_request(
                 buffered_request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
-                ),
+                response_status,
+                response_body,
                 "application/json",
                 (usage, crate::model::RequestUsageBasis::ProviderReported),
-                Some("upstream_incomplete_response".to_owned()),
+                Some(terminal_error.to_owned()),
             )
             .await;
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .complete(if valid_output {
+                    UpstreamAttemptTerminal::Inconclusive
+                } else {
+                    UpstreamAttemptTerminal::invalid_response()
+                })
                 .await;
             return result;
         }
@@ -1385,6 +1397,7 @@ async fn proxy_with_cancellation_guard(
         model_route_id.ok_or(AppError::Internal)?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut h2_recovery_available = true;
     let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
     let mut deferred_shared_probes = std::collections::VecDeque::new();
@@ -1496,15 +1509,19 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.credential_generation),
         );
         let (result, rate_limit) = match attempt_budget
-            .send(send_proxy_route(
-                &state,
-                &headers,
-                protocol,
-                request_id,
-                &active_route,
-                selected_candidate_rank,
-                outbound_attempt,
-            ))
+            .send(
+                send_proxy_route(
+                    &state,
+                    &headers,
+                    protocol,
+                    request_id,
+                    &active_route,
+                    selected_candidate_rank,
+                    outbound_attempt,
+                    &mut h2_recovery_available,
+                ),
+                active_route.wait_for_compaction,
+            )
             .await
         {
             Ok(mut result)
@@ -1517,6 +1534,18 @@ async fn proxy_with_cancellation_guard(
             }
             result => (result, None),
         };
+        if active_route.is_codex()
+            && let Ok(response) = &result
+        {
+            transport_protocol::record_response(
+                request_id,
+                &active_route.route,
+                selected_candidate_rank,
+                outbound_attempt,
+                response.response.version(),
+                response.response.status(),
+            );
+        }
         attempt.finish(
             if result.is_ok() {
                 "completed"
@@ -1622,6 +1651,9 @@ async fn proxy_with_cancellation_guard(
         }
         match result {
             Ok(result) => {
+                if let Some(selection) = &result.egress_selection {
+                    selection.select();
+                }
                 break (
                     active_route,
                     result.response,
@@ -1721,6 +1753,22 @@ async fn proxy_with_cancellation_guard(
             == Some(true);
     let responses_anthropic_route = active_route.is_responses_via_anthropic();
     let status = upstream.status();
+    if status == StatusCode::FORBIDDEN {
+        let headers = upstream.headers();
+        tracing::warn!(
+            stage = "upstream_response_headers",
+            source = "upstream_http_response",
+            %request_id,
+            status = status.as_u16(),
+            content_class = upstream_error::rejection_content_class(headers),
+            content_type_count = headers.get_all(header::CONTENT_TYPE).iter().count(),
+            content_encoding_present = headers.contains_key(header::CONTENT_ENCODING),
+            www_authenticate_present = headers.contains_key(header::WWW_AUTHENTICATE),
+            server_present = headers.contains_key(header::SERVER),
+            cf_ray_present = headers.contains_key("cf-ray"),
+            "Upstream rejection header structure"
+        );
+    }
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
@@ -1815,10 +1863,12 @@ async fn proxy_with_cancellation_guard(
         } else {
             let upstream = upstream.ok_or(AppError::Internal)?;
             let terminal_cause = if status == StatusCode::BAD_GATEWAY {
-                upstream_response::rejected_response_terminal_cause(upstream).await
+                upstream_response::rejected_response_terminal_cause(upstream)
+                    .await
+                    .or(Some(crate::model::RequestTerminalCause::UpstreamHttpStatus))
             } else {
                 drop(upstream);
-                None
+                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
             };
             (upstream_error::fallback_body(), terminal_cause)
         };
@@ -1922,27 +1972,49 @@ async fn proxy_with_cancellation_guard(
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
-            buffer_phase.finish(
-                "upstream_incomplete_response",
-                Some(200),
-                Some(buffered.body.len()),
-            );
+            let buffered_body_length = buffered.body.len();
+            let valid_output = buffered_responses_incomplete_output_is_valid(&buffered.body);
+            let terminal_error = if valid_output {
+                "upstream_incomplete_response"
+            } else {
+                "upstream_invalid_response"
+            };
+            let (response_status, response_body) = if status == StatusCode::OK && valid_output {
+                (StatusCode::OK, buffered.body)
+            } else if !valid_output {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
+                    ),
+                )
+            };
+            buffer_phase.finish(terminal_error, Some(200), Some(buffered_body_length));
             let result = finish_buffered_request(
                 &buffered_request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"upstream response was incomplete\",\"type\":\"upstream_error\"}}",
-                ),
+                response_status,
+                response_body,
                 "application/json",
                 (
                     buffered.usage,
                     crate::model::RequestUsageBasis::ProviderReported,
                 ),
-                Some("upstream_incomplete_response".to_owned()),
+                Some(terminal_error.to_owned()),
             )
             .await;
             upstream_attempt
-                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .complete(if valid_output {
+                    UpstreamAttemptTerminal::Inconclusive
+                } else {
+                    UpstreamAttemptTerminal::invalid_response()
+                })
                 .await;
             codex_retry.complete(CodexRetryTerminal::Failed);
             return result;
@@ -2124,6 +2196,73 @@ fn trusted_buffered_responses_incomplete_usage(body: &[u8]) -> Option<TokenUsage
     // Reuse the typed terminal accounting contract from streaming incomplete
     // and Codex buffered Responses, not the permissive generic JSON extractor.
     codex_transport::canonical_responses_usage(&value).ok()
+}
+
+fn buffered_responses_incomplete_output_is_valid(body: &[u8]) -> bool {
+    let Ok(value) = crate::api::sse::parse_unique_json(body) else {
+        return false;
+    };
+    let Some(output) = value.get("output").and_then(Value::as_array) else {
+        return false;
+    };
+    output.iter().all(|item| {
+        let Some(kind) = item.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        match kind {
+            "message" => {
+                item.get("role").and_then(Value::as_str) == Some("assistant")
+                    && item
+                        .get("content")
+                        .is_some_and(buffered_responses_content_is_valid)
+                    && item.get("status").is_none_or(|status| {
+                        matches!(
+                            status.as_str(),
+                            Some("in_progress" | "completed" | "incomplete")
+                        )
+                    })
+            }
+            "reasoning" => {
+                item.get("summary")
+                    .is_none_or(buffered_responses_content_is_valid)
+                    && item
+                        .get("content")
+                        .is_none_or(buffered_responses_content_is_valid)
+                    && item
+                        .get("encrypted_content")
+                        .is_none_or(|content| content.is_null() || content.is_string())
+            }
+            "function_call" => ["call_id", "name", "arguments"]
+                .iter()
+                .all(|field| item.get(*field).is_some_and(Value::is_string)),
+            "custom_tool_call" => ["call_id", "name", "input"]
+                .iter()
+                .all(|field| item.get(*field).is_some_and(Value::is_string)),
+            _ => !kind.is_empty(),
+        }
+    })
+}
+
+fn buffered_responses_content_is_valid(content: &Value) -> bool {
+    content.as_array().is_some_and(|parts| {
+        parts.iter().all(|part| {
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            match kind {
+                "output_text" | "summary_text" | "reasoning_text" => {
+                    part.get("text").is_some_and(Value::is_string)
+                        && part.get("annotations").is_none_or(|annotations| {
+                            annotations
+                                .as_array()
+                                .is_some_and(|items| items.iter().all(Value::is_object))
+                        })
+                }
+                "refusal" => part.get("refusal").is_some_and(Value::is_string),
+                _ => !kind.is_empty(),
+            }
+        })
+    })
 }
 
 fn validate_buffered_chat_success(body: &[u8]) -> Result<(), &'static str> {
@@ -2449,7 +2588,7 @@ async fn execute_component_provider(
         } else {
             drop(upstream);
         }
-        return finish_buffered_request(
+        return finish_buffered_request_with_upstream_attribution_and_response_object(
             &request,
             upstream_status,
             Bytes::from_static(
@@ -2461,6 +2600,11 @@ async fn execute_component_provider(
                 crate::model::RequestUsageBasis::NotObserved,
             ),
             Some(format!("http_{}", upstream_status.as_u16())),
+            BufferedFinishPolicy {
+                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                response_storage: BufferedResponseStorage::DurableArchive,
+                terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
+            },
         )
         .await;
     }
@@ -2841,7 +2985,7 @@ async fn finish_unarchived_proxy_response(
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
             response_storage: BufferedResponseStorage::Omit,
-            terminal_cause: None,
+            terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
         },
     )
     .await

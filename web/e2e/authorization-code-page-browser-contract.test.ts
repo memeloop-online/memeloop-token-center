@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 test('real ProvidersPage propagates saved-account read failure without conflating statistics or replaying OAuth', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -18,6 +19,7 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     const mutations: string[] = [];
     await page.route('**/internal/v1/**', async route => {
       const path = new URL(route.request().url()).pathname;
+      if (route.request().method() === 'POST' && path === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(route.request().postDataJSON(), [{ id: savedAccount.id, tenant: savedAccount.tenant_external_id, driver: savedAccount.driver }]) });
       if (route.request().method() !== 'GET') mutations.push(path);
       if (path === '/internal/v1/provider-types') return route.fulfill({ json: [{
         id: 'fixture-plugin', display_name: 'Fixture OAuth', source: 'plugin', protocols: ['openai'], modalities: ['text'],
@@ -67,6 +69,7 @@ test('real ProvidersPage propagates saved-account read failure without conflatin
     await readFailure.waitFor({ state: 'detached' });
     await page.getByText('已保存上游连接 Fixture OAuth。', { exact: true }).waitFor();
     assert.equal(await page.locator('.create-journey').getAttribute('data-open'), 'false');
+    assert.equal(await page.locator('.create-journey [data-workspace-toggle]').isHidden(), true, 'the list-level add entry is not rendered while the saved account workspace is shown');
     await page.locator('#provider-details-saved-fixture-account').waitFor();
     await catalogRead;
     await page.locator('#provider-details-saved-fixture-account .provider-model-catalog[aria-busy="false"]').waitFor();

@@ -2837,6 +2837,26 @@ fn validate_provider_contribution(
         )));
     }
     crate::schema::validate_definition(&provider.config_schema)?;
+    provider
+        .request_compatibility
+        .anthropic_messages_headers
+        .validate()?;
+    if !provider
+        .request_compatibility
+        .anthropic_messages_headers
+        .is_empty()
+        && !provider
+            .protocols
+            .iter()
+            .any(|protocol| protocol == "anthropic")
+        && !provider
+            .request_compatibility
+            .responses_via_anthropic_messages_v1
+    {
+        return Err(AppError::BadRequest(
+            "Messages headers require a Messages transport".into(),
+        ));
+    }
     crate::schema::validate_definition(&provider.credential_schema)?;
     let supported_credentials = [
         serde_json::json!({"type": "none"}),
@@ -2857,6 +2877,7 @@ fn validate_provider_contribution(
         )));
     }
     if let Some(adapter) = &provider.oauth_adapter {
+        crate::oauth::authorization_code::validate_contribution(adapter)?;
         if adapter.api_version != "oauth-adapter-v1"
             || !matches!(
                 adapter.flow_kind,
@@ -3162,6 +3183,86 @@ mod tests {
                     &BTreeMap::new()
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn subscription_release_messages_declaration_matches_closed_manifest_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json")).unwrap();
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude-wire-subscription-1.1.0.json"
+        ))
+        .unwrap();
+        crate::schema::validate_instance(&schema, &manifest).unwrap();
+        for invalid in [
+            Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!({}),
+        ] {
+            let mut changed = manifest.clone();
+            changed["contributions"]["providers"][0]["request_compatibility"]["responses_via_anthropic_messages_v1"] =
+                invalid;
+            assert!(crate::schema::validate_instance(&schema, &changed).is_err());
+        }
+        let mut unknown = manifest.clone();
+        unknown["contributions"]["providers"][0]["request_compatibility"]["unreviewed_transport"] =
+            serde_json::json!(true);
+        assert!(crate::schema::validate_instance(&schema, &unknown).is_err());
+        for pointer in [
+            "/contributions/providers/0/request_compatibility/third_party",
+            "/contributions/providers/0/protocols",
+        ] {
+            let mut changed = manifest.clone();
+            *changed
+                .pointer_mut(pointer)
+                .unwrap_or_else(|| panic!("missing reviewed field {pointer}")) =
+                if pointer.ends_with("protocols") {
+                    serde_json::json!(["openai"])
+                } else {
+                    serde_json::json!(false)
+                };
+            let parsed: PluginManifest = serde_json::from_value(changed).unwrap();
+            assert!(super::validate_manifest(&parsed).is_err());
+        }
+        let mut mixed = manifest;
+        mixed["contributions"]["providers"][0]["request_compatibility"]["responses_via_chat_v1"] =
+            serde_json::json!(true);
+        mixed["contributions"]["providers"][0]["request_compatibility"]["responses_via_chat_dialect"] =
+            serde_json::json!("openai_chat_v1");
+        let parsed: PluginManifest = serde_json::from_value(mixed).unwrap();
+        assert!(super::validate_manifest(&parsed).is_err());
+    }
+
+    #[test]
+    #[ignore = "GHA supplies the signed public WASM with the exact 1.1.0 release hash"]
+    fn privacy_wire_shim_release_component_subscription_package_validation() {
+        use sha2::{Digest, Sha256};
+
+        let manifest_bytes =
+            include_bytes!("../tests/fixtures/claude-wire-subscription-1.1.0.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(manifest_bytes)),
+            "118cff3218b1d4512477d6fdef17001841a18c3393a81b586801cf39f5d21031"
+        );
+        let fixture = std::path::PathBuf::from(
+            std::env::var("MTC_CLAUDE_WIRE_FIXTURE").expect("GHA public signed fixture"),
+        );
+        let wasm_bytes = std::fs::read(fixture.join("plugin.wasm")).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&wasm_bytes)),
+            "51043af426632581a218c227a0f90b2de2253d27b5438519098c44d965c01f3c"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("plugin.json"), manifest_bytes).unwrap();
+        std::fs::write(directory.path().join("plugin.wasm"), wasm_bytes).unwrap();
+        let manifest = super::validate_plugin_package(directory.path())
+            .expect("immutable public 1.1.0 release must pass authoritative package validation");
+        assert_eq!(manifest.version, "1.1.0");
+        assert_eq!(
+            manifest.contributions.providers[0].id,
+            "claude-code-subscription"
         );
     }
 
@@ -3683,6 +3784,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("forbidden header"), "{error}");
+    }
+
+    #[test]
+    fn signed_oauth_extensions_reject_credentials_and_header_smuggling() {
+        let candidate = serde_json::json!({
+            "id":"fixture-oauth","version":"1.0.0","wit_version":"0.2.0","wasm":null,
+            "contributions":{"providers":[{
+                "id":"fixture-provider","display_name":"Fixture provider","protocols":["anthropic"],"modalities":["text"],
+                "config_schema":{"type":"object"},"credential_schema":{"type":"object"},
+                "oauth_adapter":{
+                    "api_version":"oauth-adapter-v1","flow_kind":"authorization_code_pkce",
+                    "login_url":"https://provider.example/authorize","poll_url":"https://provider.example/token","refresh_url":"https://provider.example/token",
+                    "authorization_code":{"token_encoding":"json","include_state":true,"client_default":{"client_id":"public-client","redirect_uri":"https://provider.example/callback","scopes":["profile"]}},
+                    "identity":{"url":"https://provider.example/profile","id_pointer":"/account/id","headers":{"anthropic_beta":["subscription-v1"]}}
+                },
+                "request_compatibility":{"anthropic_messages_headers":{"anthropic_version":"2023-06-01","anthropic_beta":["subscription-v1"]}}
+            }]}
+        });
+        let manifest: PluginManifest = serde_json::from_value(candidate.clone()).unwrap();
+        validate_manifest(&manifest).unwrap();
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json")).unwrap();
+        crate::schema::validate_instance(&schema, &candidate).unwrap();
+        for (pointer, value) in [
+            (
+                "/contributions/providers/0/oauth_adapter/authorization_code/client_default",
+                serde_json::json!({"client_id":"public-client","redirect_uri":"https://provider.example/callback","scopes":["profile"],"client_secret":"injected"}),
+            ),
+            (
+                "/contributions/providers/0/oauth_adapter/identity/headers",
+                serde_json::json!({"authorization":"Bearer injected"}),
+            ),
+            (
+                "/contributions/providers/0/request_compatibility/anthropic_messages_headers",
+                serde_json::json!({"cookie":"injected"}),
+            ),
+        ] {
+            let mut invalid = candidate.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(serde_json::from_value::<PluginManifest>(invalid.clone()).is_err());
+            assert!(crate::schema::validate_instance(&schema, &invalid).is_err());
+        }
+        let mut invalid = manifest.clone();
+        invalid.contributions.providers[0]
+            .oauth_adapter
+            .as_mut()
+            .unwrap()
+            .flow_kind = crate::provider::OAuthFlowKind::CursorPkce;
+        assert!(validate_manifest(&invalid).is_err());
+        let mut invalid = manifest.clone();
+        invalid.contributions.providers[0]
+            .request_compatibility
+            .anthropic_messages_headers
+            .anthropic_beta = vec!["feature\r\nAuthorization: injected".into()];
+        assert!(validate_manifest(&invalid).is_err());
+        let mut invalid = manifest;
+        invalid.contributions.providers[0].protocols = vec!["openai".into()];
+        assert!(validate_manifest(&invalid).is_err());
     }
 
     #[test]

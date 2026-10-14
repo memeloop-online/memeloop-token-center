@@ -9,6 +9,55 @@ use wiremock::{
 
 use super::*;
 
+#[test]
+fn cosign_proxy_environment_is_explicit_and_has_no_bypass() {
+    let command = CosignCommandSpec {
+        arguments: vec!["verify".into()],
+        environment: vec![],
+        current_directory: PathBuf::from("/tmp"),
+    };
+    let proxy = "socks5h://100.64.0.2:1080";
+    let proxied = cosign_proxy_command(&command, Some(proxy));
+    assert_eq!(
+        proxied.environment,
+        vec![
+            ("HTTP_PROXY".into(), proxy.into()),
+            ("HTTPS_PROXY".into(), proxy.into()),
+            ("NO_PROXY".into(), "".into())
+        ]
+    );
+    assert!(cosign_proxy_command(&command, None).environment.is_empty());
+    assert_eq!(proxied.arguments, command.arguments);
+}
+
+#[tokio::test]
+async fn invalid_installation_proxy_rejects_before_registry_or_storage() {
+    let (_server, _directory, mut artifact) = mock_artifact("plugin.json", &plugin_json()).await;
+    artifact.options.egress_proxy = Some("socks5h://secret:token@100.64.0.2:1080".into());
+    assert!(matches!(
+        install_plugin_oci_with_verifier(&artifact.options, &AcceptSignature, true).await,
+        Err(PluginDistributionError::InvalidEgressProxy)
+    ));
+    assert!(!artifact.options.plugin_root.exists());
+}
+
+#[test]
+fn cosign_stderr_projection_returns_only_fixed_classes() {
+    assert_eq!(
+        cosign_stderr_class(b"secret-token no space left on device /private/path"),
+        "storage_full"
+    );
+    assert_eq!(
+        cosign_stderr_class(b"x509: certificate signed by unknown authority: secret"),
+        "tls_authority"
+    );
+    assert_eq!(
+        cosign_stderr_class(b"registry credential secret/private/path"),
+        "unclassified"
+    );
+    assert_eq!(cosign_stderr_class(b""), "unclassified");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn unsupported_rename_publishes_verified_tree_without_replacement_and_resumes() {
@@ -270,6 +319,7 @@ async fn mock_artifact(title: &str, plugin_json: &[u8]) -> (MockServer, TempDir,
         temporary,
         MockArtifact {
             options: InstallPluginOptions {
+                egress_proxy: None,
                 reference,
                 plugin_root: plugin_root.clone(),
                 allowed_sources: BTreeSet::from([source]),
@@ -367,6 +417,65 @@ fn operator_ui_module_entry_must_be_a_signed_asset_layer() {
         )
         .is_ok()
     );
+}
+
+#[tokio::test]
+async fn registry_fetch_uses_explicit_socks_remote_dns() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (server, _directory, mut artifact) = mock_artifact("plugin.json", &plugin_json()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let target_address = *server.address();
+    let (observed, observation) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&0));
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut request = [0; 4];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, [5, 1, 0, 3]);
+        let length = socket.read_u8().await.unwrap();
+        let mut hostname = vec![0; length as usize];
+        socket.read_exact(&mut hostname).await.unwrap();
+        assert_eq!(socket.read_u16().await.unwrap(), target_address.port());
+        observed.send(hostname).unwrap();
+        let mut upstream = tokio::net::TcpStream::connect(target_address)
+            .await
+            .unwrap();
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+    });
+    artifact.options.egress_proxy = Some(format!("socks5h://{proxy_address}"));
+    let expected_digest = artifact.options.reference.rsplit_once('@').unwrap().1;
+    let reference: Reference = format!(
+        "registry.invalid:{}/test/plugin@{expected_digest}",
+        target_address.port()
+    )
+    .parse()
+    .unwrap();
+    let config = registry_client_config(&artifact.options, true);
+    assert_eq!(config.http_proxy, artifact.options.egress_proxy);
+    assert_eq!(config.https_proxy, artifact.options.egress_proxy);
+    assert_eq!(config.no_proxy.as_deref(), Some(""));
+    let client = Client::try_from(config).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pull_manifest(&reference, &RegistryAuth::Anonymous),
+    )
+    .await;
+    relay.abort();
+    let _ = relay.await;
+    let (_, resolved) = result.unwrap().unwrap();
+    assert_eq!(resolved, expected_digest);
+    assert_eq!(observation.await.unwrap(), b"registry.invalid");
 }
 
 #[tokio::test]
@@ -508,6 +617,7 @@ async fn wrong_key_and_tampered_payload_fail_before_registry_or_storage_access()
     let digest = format!("sha256:{}", "a".repeat(64));
     let reference = format!("127.0.0.1:1/test/plugin@{digest}");
     let options = InstallPluginOptions {
+        egress_proxy: None,
         reference: reference.clone(),
         plugin_root: temporary.path().join("plugins"),
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),
@@ -710,6 +820,7 @@ async fn signature_policy_rejects_before_registry_or_storage_access() {
     let temporary = TempDir::new().expect("temporary directory");
     let digest = format!("sha256:{}", "a".repeat(64));
     let options = InstallPluginOptions {
+        egress_proxy: None,
         reference: format!("127.0.0.1:1/test/plugin@{digest}"),
         plugin_root: temporary.path().join("plugins"),
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),

@@ -17,6 +17,7 @@ test('canonical supplier messages expose complete bounded provider details witho
   const request: RequestView = { request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 402, duration_ms: 1, input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402' };
   for (const [code, base, providerCode, message] of [
     ['no_active_plan', '当前账号没有可用套餐', '402', '当前账号没有可用套餐'],
+    ['insufficient_quota', 'The upstream account has insufficient quota', 'insufficient_user_quota', '用户额度不足'],
     ['model_unavailable', 'The requested upstream model is unavailable', '400', 'Model not found'],
     ['model_unavailable', 'The requested upstream model is unavailable', 'model_not_found', 'Model not found'],
     ['model_unavailable', 'The requested upstream model is unavailable', 'unsupported_model', 'Unsupported model'],
@@ -36,6 +37,12 @@ test('canonical supplier messages expose complete bounded provider details witho
       }
       assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code: 'unknown', message: canonical } }, locale), null);
     }
+  }
+  const quotaOnlyCode = { ...request, supplier_error: { code: 'insufficient_quota', message: 'The upstream account has insufficient quota; provider code: insufficient_user_quota' } };
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const detail = requestSupplierDetail(quotaOnlyCode, locale);
+    assert.ok(detail?.includes('insufficient_user_quota'), 'a safe provider code survives without any provider message');
+    assert.doesNotMatch(detail ?? '', /剩余额度|request id/);
   }
   assert.match(components, /request-supplier-detail/);
   assert.match(components, /<span>\{supplierDetail\}<\/span>/);
@@ -122,4 +129,54 @@ test('supplier reasons share localized tooltip/detail copy, preserve transport p
   assert.deepEqual(requestViewFromEvent({ ...partial, supplier_error: null }, safe)?.supplier_error, safe.supplier_error);
   assert.deepEqual(requestViewFromEvent({ ...event, event_kind: 'started', status_code: null }, safe)?.supplier_error, safe.supplier_error);
   assert.equal(requestViewFromEvent({ ...event, supplier_error: null })?.supplier_error, null);
+});
+
+test('typed failure diagnostics explain stage and source without guessing from the status number', () => {
+  const base: RequestView = { request_id: 'diagnostic-fixture', created_at: 1, completed_at: 2,
+    protocol: 'openai', model: 'fixture', status_code: 499, duration_ms: 1,
+    input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_499' };
+  const downstream = { ...base, failure_diagnostic: { stage: 'response_delivery', source: 'downstream_connection', reason: 'client_disconnected' } };
+  const supplierStatus = { ...base, failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } };
+  for (const [locale, prefix, downstreamCopy, supplierCopy] of [
+    ['zh-CN', '已记录原因', '客户端在响应交付完成前断开了连接', '上游服务在响应开始时返回了错误状态'],
+    ['en', 'Recorded cause', 'The client disconnected before response delivery completed', 'The upstream service returned an error status at the start of its response'],
+  ] as const) {
+    // The same recorded 499 carries opposite typed evidence; only the evidence speaks.
+    for (const [request, reason] of [[downstream, downstreamCopy], [supplierStatus, supplierCopy]] as const) {
+      assert.equal(requestFailureCause(request, locale), reason);
+      const copy = requestStatusCopy(request, locale);
+      assert.equal(copy.cause, `${prefix}: ${reason}`);
+      assert.equal(copy.hint, copy.cause);
+      assert.doesNotMatch(copy.hint, /499|http_499|client_disconnected|upstream_http_status|response_delivery|upstream_response_headers/);
+    }
+    // A supplier HTTP 499 never becomes a client disconnect, and the reverse, without typed evidence.
+    assert.equal(requestFailureCause(base, locale), null);
+    assert.equal(requestStatusCopy(base, locale).hint, `${prefix}: ${locale === 'zh-CN' ? '当时未采集具体原因' : 'No specific cause was captured at the time'}`);
+    // An unrecorded observation phase adds no phase claim.
+    const unknownPhase = { ...base, failure_diagnostic: { stage: null, source: 'upstream', reason: 'upstream_http2_reset' } };
+    const phaseCopy = requestStatusCopy(unknownPhase, locale);
+    assert.equal(requestFailureCause(unknownPhase, locale), locale === 'zh-CN' ? '上游 HTTP/2 流被重置' : 'The upstream HTTP/2 stream was reset');
+    assert.doesNotMatch(phaseCopy.hint, /响应头|请求体|交付|header|body|deliver/i);
+    // Unknown typed evidence never renders raw and keeps the honest fallback.
+    const hostile = { ...base, failure_diagnostic: { stage: null, source: 'Bearer private-canary', reason: 'private-canary' } };
+    assert.equal(requestFailureCause(hostile, locale), null);
+    assert.equal(requestStatusCopy(hostile, locale).hint, requestStatusCopy(base, locale).hint);
+    assert.doesNotMatch(requestStatusCopy(hostile, locale).hint, /private-canary|Bearer/);
+    // A safe supplier reason stays more specific than the generic HTTP observation.
+    const withSupplier = { ...supplierStatus, supplier_error: { code: 'model_unavailable', message: 'untrusted-message-canary' } };
+    assert.equal(requestFailureCause(withSupplier, locale), locale === 'zh-CN'
+      ? '上游账号无法使用所请求的模型，需检查模型权限或更换模型。'
+      : 'The requested model is unavailable to the upstream account. Check model access or use another model.');
+  }
+  // Transport terminal evidence keeps precedence over the diagnostic explanation.
+  assert.equal(requestFailureCause({ ...downstream, terminal_cause_code: 'upstream_read_timeout' }, 'zh-CN'), '读取上游响应超时');
+  // Diagnostics survive SSE reconciliation like the rest of the recorded evidence.
+  const event: RequestEvent = { ...downstream, event_id: 'finished', event_at: 2, event_kind: 'finished', key_id: 'key', archive_state: 'bound' };
+  const running: RequestView = { ...base, status_code: null, completed_at: null, error_code: null };
+  assert.deepEqual(requestViewFromEvent(event, running)?.failure_diagnostic, downstream.failure_diagnostic);
+  const partial = { ...event, event_id: 'archive', event_kind: 'archive_bound' } as RequestEvent;
+  delete partial.failure_diagnostic;
+  assert.deepEqual(requestViewFromEvent(partial, downstream)?.failure_diagnostic, downstream.failure_diagnostic);
+  assert.deepEqual(requestViewFromEvent({ ...partial, failure_diagnostic: null }, downstream)?.failure_diagnostic, downstream.failure_diagnostic);
+  assert.equal(requestViewFromEvent({ ...event, failure_diagnostic: null })?.failure_diagnostic, null);
 });

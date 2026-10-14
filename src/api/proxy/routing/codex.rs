@@ -1,6 +1,8 @@
 use super::*;
 use crate::metrics::{CodexBadRequestRetry, CodexEgressFailureStage, CodexEgressPath};
 
+#[path = "codex/egress.rs"]
+pub(in crate::api::proxy) mod egress;
 pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
@@ -37,7 +39,7 @@ struct CodexAttemptContext {
 
 #[derive(Clone, Copy)]
 struct CodexRequestDeadline {
-    request: tokio::time::Instant,
+    request: Option<tokio::time::Instant>,
     read_inactivity: std::time::Duration,
 }
 
@@ -157,6 +159,7 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
     candidate_rank: usize,
     outbound_attempt: usize,
+    h2_recovery_available: &mut bool,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
     network::validate_codex_transport(
@@ -175,7 +178,7 @@ pub(super) async fn send_proxy_route(
     // `prepare_request_with_id` has forced the exact outbound document to be
     // non-persistent. An HTTP 400 is still replayable only after a complete,
     // bounded, domain-level classification identifies known transient
-    // semantics; connection ambiguity never enters this state machine.
+    // semantics.
     let mut retry = CodexRetryState::new(route.codex_store_disabled);
     let transport_policy = runtime_transport_policy(
         &route.route.config,
@@ -193,15 +196,16 @@ pub(super) async fn send_proxy_route(
         stage = "sse_framing_policy_snapshot",
         "upstream SSE framing policy frozen"
     );
-    // One logical Codex send may include the sole, explicitly permitted 400
-    // replay. Keep one deadline across both sends so replay cannot refresh an
-    // operator-configured total request budget.
+    // Native compaction may compute silently for an arbitrary duration. Its
+    // lifetime follows upstream completion or downstream cancellation. Other
+    // requests retain one configured deadline across any permitted replay.
     let deadline = CodexRequestDeadline {
-        request: tokio::time::Instant::now() + transport_policy.request_timeout,
+        request: (!route.wait_for_compaction)
+            .then(|| tokio::time::Instant::now() + transport_policy.request_timeout),
         read_inactivity: transport_policy.read_timeout,
     };
     loop {
-        let (response, upstream_activity) = match send_codex_attempt(
+        let (response, upstream_activity, egress_selection) = match send_codex_attempt(
             state,
             headers,
             &target_url,
@@ -214,6 +218,7 @@ pub(super) async fn send_proxy_route(
                 transport_policy,
                 deadline,
             },
+            h2_recovery_available,
         )
         .await
         {
@@ -231,8 +236,7 @@ pub(super) async fn send_proxy_route(
             match retry.after_bad_request(disposition) {
                 AttemptControl::RetrySameAccount => {
                     // The immutable PreparedProxyRoute preserves the body,
-                    // identity, session, and `store: false` contract. This
-                    // is the sole same-account replay transition.
+                    // identity, session, and `store: false` contract.
                     state
                         .metrics
                         .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
@@ -249,6 +253,7 @@ pub(super) async fn send_proxy_route(
         }
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
+                egress_selection,
                 response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::new(state.metrics.clone(), retry.outcome()),
@@ -265,6 +270,7 @@ pub(super) async fn send_proxy_route(
         {
             Ok(response) => {
                 return Ok(ProxyRouteResponse {
+                    egress_selection,
                     response,
                     upstream_activity,
                     codex_retry: CodexRetryTerminalGuard::new(
@@ -309,6 +315,7 @@ pub(super) async fn send_proxy_route(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_codex_attempt(
     state: &AppState,
     headers: &HeaderMap,
@@ -316,7 +323,15 @@ async fn send_codex_attempt(
     route: &PreparedProxyRoute,
     session_id: &str,
     context: CodexAttemptContext,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+    h2_recovery_available: &mut bool,
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         candidate_rank,
@@ -418,8 +433,10 @@ async fn send_codex_attempt(
                 &client_snapshot.client,
                 &selection.credential,
                 transport_identity,
+                selection.egress_snapshot(),
             ),
             context,
+            h2_recovery_available,
         )
         .await;
         phase.finish(
@@ -431,7 +448,7 @@ async fn send_codex_attempt(
             result
                 .as_ref()
                 .ok()
-                .map(|(response, _)| response.status().as_u16()),
+                .map(|(response, ..)| response.status().as_u16()),
             None,
         );
         if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
@@ -482,11 +499,13 @@ async fn send_codex_attempt(
                 // cannot fit in the remaining absolute request budget. Every
                 // attempt so admitted can still prove non-delivery before the
                 // request-level ambiguity boundary.
-                if !connect_retry_fits_before_request_deadline(
-                    deadline.request,
-                    transport_policy.connect_retry_delay,
-                    transport_policy.connect_timeout,
-                ) {
+                if deadline.request.is_some_and(|request_deadline| {
+                    !connect_retry_fits_before_request_deadline(
+                        request_deadline,
+                        transport_policy.connect_retry_delay,
+                        transport_policy.connect_timeout,
+                    )
+                }) {
                     return Err(ProxySendError::RetryableConnection(failure_stage));
                 }
                 tokio::time::sleep(transport_policy.connect_retry_delay).await;
@@ -524,6 +543,7 @@ fn connect_retry_fits_before_request_deadline(
     tokio::time::Instant::now() + retry_delay + connect_timeout < request_deadline
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_codex_attempt_once(
     state: &AppState,
     headers: &HeaderMap,
@@ -534,9 +554,18 @@ async fn send_codex_attempt_once(
         &wreq::Client,
         &UpstreamCredential,
         send_diagnostics::TransportIdentity,
+        Option<crate::db::egress::SelectedEgress>,
     ),
     context: CodexAttemptContext,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+    h2_recovery_available: &mut bool,
+) -> Result<
+    (
+        UpstreamResponse,
+        crate::metrics::ActivityGuard,
+        Option<egress::FinalSelection>,
+    ),
+    ProxySendError,
+> {
     let CodexAttemptContext {
         request_id,
         deadline,
@@ -562,47 +591,64 @@ async fn send_codex_attempt_once(
     {
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
-    let (client, credential, transport_identity) = transport;
-    let mut request = client.post(target_url).body(route.forwarded_body.clone());
-    let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
-        let proxy =
-            wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
-        request = request.proxy(proxy);
-        CodexEgressPath::AccountProxy
-    } else {
-        CodexEgressPath::Direct
-    };
-    let credential_now = credential_application_now();
-    let request = codex_transport::apply_wreq_wire_headers(
-        request,
-        headers,
-        &route.route.credential,
-        session_id,
-        credential_now,
-    )
-    .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
-    let (client, request) = request.build_split();
-    if let Ok(request) = &request {
-        send_diagnostics::observe(request, route, credential, &transport_identity, context);
-    }
-    let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
-    let upstream_started = Instant::now();
-    let body_consumption = send_diagnostics::BodyConsumption::default();
-    let http2_evidence = send_diagnostics::Http2AttemptEvidence::capture(
-        &route.route,
-        transport_identity,
-        context,
-        matches!(egress_path, CodexEgressPath::AccountProxy),
-        body_consumption.clone(),
-    );
-    let upstream_result = send_until_request_deadline(deadline.request, async {
+    let (client, credential, transport_identity, selected_egress) = transport;
+    loop {
+        let mut request = client.post(target_url).body(route.forwarded_body.clone());
+        let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
+            let proxy =
+                wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
+            request = request.proxy(proxy);
+            CodexEgressPath::AccountProxy
+        } else {
+            CodexEgressPath::Direct
+        };
+        let credential_now = credential_application_now();
+        let request = codex_transport::apply_wreq_wire_headers(
+            request,
+            headers,
+            &route.route.credential,
+            session_id,
+            credential_now,
+        )
+        .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
+        let (client, request) = request.build_split();
+        if let Ok(request) = &request {
+            send_diagnostics::observe(request, route, credential, &transport_identity, context);
+        }
+        let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
+        let upstream_started = Instant::now();
+        let body_consumption = send_diagnostics::BodyConsumption::default();
+        let http2_evidence = send_diagnostics::Http2AttemptEvidence::capture(
+            &route.route,
+            transport_identity,
+            context,
+            matches!(egress_path, CodexEgressPath::AccountProxy),
+            body_consumption.clone(),
+            state.config.h2_attempt_binding_enabled,
+        );
+        let mut egress = None;
+        let mut remote_reset = false;
+        let upstream_result = send_until_request_deadline(deadline.request, async {
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
+            #[cfg(feature = "h2-attempt-binding")]
+            http2_evidence.attach_binding(&mut request);
+            egress = egress::AttemptRecorder::begin(
+                state,
+                &route.route,
+                selected_egress.clone(),
+                transport_identity,
+                context,
+                body_consumption.clone(),
+                &http2_evidence,
+            );
             client.execute(request).await
         }
         .await
         .map_err(|error| {
+            remote_reset = upstream_response::codex_http2_error(&error)
+                .is_some_and(|error| error.is_reset() && error.is_remote() && !error.is_library());
             http2_evidence.observe_error(&error, true);
             tracing::warn!(
                 %request_id,
@@ -633,21 +679,49 @@ async fn send_codex_attempt_once(
         })
     })
     .await;
-    record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
-    state.metrics.observe_upstream(
-        &route.route.driver,
-        "proxy",
-        upstream_result.as_ref().ok().map(wreq::Response::status),
-        upstream_started.elapsed(),
-    );
-    match upstream_result {
-        Ok(response) => Ok((
-            http2_evidence
-                .observe_response(response)
-                .with_body_timeouts(deadline.request, deadline.read_inactivity),
-            upstream_activity,
-        )),
-        Err(error) => Err(error),
+        record_codex_send_attempt_failure(&state.metrics, egress_path, &upstream_result);
+        state.metrics.observe_upstream(
+            &route.route.driver,
+            "proxy",
+            upstream_result.as_ref().ok().map(wreq::Response::status),
+            upstream_started.elapsed(),
+        );
+        match upstream_result {
+            Ok(response) => {
+                let response = http2_evidence.observe_response(response);
+                let (response, egress_selection) = egress::observe_response(response, egress);
+                let response = match deadline.request {
+                    Some(request_deadline) => {
+                        response.with_body_timeouts(request_deadline, deadline.read_inactivity)
+                    }
+                    None => response,
+                };
+                return Ok((response, upstream_activity, egress_selection));
+            }
+            Err(_) if remote_reset && *h2_recovery_available => {
+                *h2_recovery_available = false;
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %route.route.account_id,
+                    candidate_rank = context.candidate_rank,
+                    outbound_attempt = context.outbound_attempt,
+                    recovery_attempt = 1,
+                    recovery_attempt_limit = 1,
+                    recovery_phase = "before_response_headers",
+                    accounting_scope = "original_logical_request_reservation",
+                    recovery_policy_source = "codex_native_pre_header_remote_reset_v1",
+                    transport_policy_source = context.transport_policy.source,
+                    transport_policy_version = context.transport_policy.version,
+                    failure_code = "upstream_transport_http2_reset",
+                    stage = "codex_h2_server_recovery",
+                    "recovering a remote HTTP/2 reset before response headers"
+                );
+                drop(egress);
+                drop(upstream_activity);
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -808,12 +882,15 @@ fn record_codex_send_attempt_failure<T>(
 }
 
 async fn send_until_request_deadline<T, F>(
-    deadline: tokio::time::Instant,
+    deadline: impl Into<Option<tokio::time::Instant>>,
     send: F,
 ) -> Result<T, ProxySendError>
 where
     F: std::future::Future<Output = Result<T, ProxySendError>>,
 {
+    let Some(deadline) = deadline.into() else {
+        return send.await;
+    };
     tokio::pin!(send);
     tokio::select! {
         // This budget is absolute. A result that becomes observable only at

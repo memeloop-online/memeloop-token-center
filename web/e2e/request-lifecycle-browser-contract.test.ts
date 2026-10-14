@@ -51,7 +51,7 @@ test('request error details distinguish active delivery from recorded terminal f
         assert.doesNotMatch(text, /The request failed|delivery_started/);
         assert.equal(await drawer.getByText('Error', { exact: true }).count(), 0, 'a progress marker must not create an error detail row');
       } else {
-        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'Unknown (no specific cause recorded)';
+        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'No specific cause was captured at the time';
         assert.equal(text.split(cause).length - 1, 1);
         assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
         await drawer.locator('.request-outcome').focus();
@@ -351,6 +351,48 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await tooltip.waitFor();
       assert.equal(await tooltip.innerText(), hint);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2, 'status interaction adds no fetch beyond existing terminal refresh');
+      await drawer.getByRole('button', { name: close, exact: true }).click();
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('typed failure diagnostic replaces the repeated unknown cause in list and detail', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const [locale, param, reason, prefix, close, label] of [
+      ['zh-CN', 'downstream', '客户端在响应交付完成前断开了连接', '已记录原因', '关闭', '失败'],
+      ['zh-CN', 'supplier', '上游服务在响应开始时返回了错误状态', '已记录原因', '关闭', '失败'],
+      ['en', 'downstream', 'The client disconnected before response delivery completed', 'Recorded cause', 'Close', 'Failed'],
+      ['en', 'supplier', 'The upstream service returned an error status at the start of its response', 'Recorded cause', 'Close', 'Failed'],
+    ] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?failure-diagnostic=${param}`);
+      await page.setViewportSize({ width: 390, height: 844 });
+      const hint = `${prefix}: ${reason}`;
+      const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+      await row.locator('[data-outcome="failed"]').waitFor();
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
+      assert.doesNotMatch(await row.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      await row.locator('.table-action').click();
+      const drawer = page.getByRole('dialog', { name: 'model-a' });
+      const visibleCause = drawer.locator('.request-status-cause').and(drawer.getByText(hint, { exact: true }));
+      await visibleCause.waitFor();
+      assert.equal(await visibleCause.count(), 1, 'list and detail reuse the same typed explanation');
+      assert.doesNotMatch(await drawer.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
+      await mkdir(artifactRoot, { recursive: true });
+      await page.screenshot({ path: `${artifactRoot}/failure-diagnostic-${param}-${locale}-detail.png`, fullPage: true });
       await drawer.getByRole('button', { name: close, exact: true }).click();
       await page.close();
     }

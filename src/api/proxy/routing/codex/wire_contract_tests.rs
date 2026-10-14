@@ -68,7 +68,7 @@ async fn local_candidate_failures_log_only_fixed_reasons_and_preserve_dispositio
         outbound_attempt: 1,
         transport_policy: runtime_transport_policy(&Value::Null, 1).unwrap(),
         deadline: CodexRequestDeadline {
-            request: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            request: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
             read_inactivity: std::time::Duration::from_secs(1),
         },
     };

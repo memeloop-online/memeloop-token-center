@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { ApiError } from '../src/api.js';
-import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, parseClaudeCompletion, validAuthorizationCallback } from '../src/operator/authorizationCode.js';
+import { authorizationCompleteError, authorizationStartError, canReauthorizeAccount, claudeCompletionLimits, claudeCompletionRetryMillis, claudeCompletionStopReason, isAuthorizationIdentityMismatch, isFragmentManualCodeRejection, parseClaudeCompletion, validAuthorizationCallback, validFragmentManualCode } from '../src/operator/authorizationCode.js';
 import { authorizationCodeCopy } from '../src/operator/authorizationCodeCopy.js';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { providerAccountStatus } from '../src/operator/providerAccountState.js';
@@ -37,6 +37,12 @@ test('generic OAuth help does not assume Google and continuation uses user-facin
     assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin').help, /Google/);
     assert.match(authorizationCodeCopy(locale, 'google-antigravity').help, /Google/);
     assert.doesNotMatch(authorizationCodeCopy(locale).recoveryExpires, /已签发|恢复截止|Issued|recovery/);
+    assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin', true).reauthorizeHelp, /Google/);
+    assert.match(authorizationCodeCopy(locale, 'google-antigravity', true).reauthorizeHelp, /Google/);
+    assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin', true).identityMismatch, /Google/);
+    assert.match(authorizationCodeCopy(locale, 'google-antigravity', true).identityMismatch, /Google/);
+    assert.match(authorizationCodeCopy(locale, 'fixture-plugin').codePasteHelp, locale === 'en' ? /code#state/ : /授权码#状态/);
+    assert.doesNotMatch(authorizationCodeCopy(locale, 'fixture-plugin').codeRejected, /invalid_request|OAuth completion must be/);
   }
 });
 
@@ -47,12 +53,20 @@ test('complete callback requires an unambiguous full URL, not a code fragment', 
   }
 });
 
+test('fragment-manual paste requires exactly one non-empty bounded code#state pair', () => {
+  assert.equal(validFragmentManualCode('fixture-code#fixture-state'), true);
+  for (const value of ['', 'no-separator', '#state-only', 'code-only#', 'code#state#extra', `code#${'s'.repeat(8193)}`, `${'c'.repeat(8193)}#state`]) {
+    assert.equal(validFragmentManualCode(value), false);
+  }
+  assert.equal(validFragmentManualCode(`  code#state  `), true, 'surrounding paste whitespace is tolerated');
+});
+
 test('generic reauthorization needs both authoritative capability and the supported account provider', () => {
   const adapter = { api_version: 'oauth-adapter-v1', flow_kind: 'authorization_code_pkce', login_url: '', poll_url: '', refresh_url: '' } as const;
   const provider = { id: 'google-antigravity', oauth_adapter: adapter };
   assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: true }, provider), true);
   assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: false }, provider), false);
-  assert.equal(canReauthorizeAccount({ driver: 'other-plugin', can_reauthorize: true }, { ...provider, id: 'other-plugin' }), false);
+  assert.equal(canReauthorizeAccount({ driver: 'other-plugin', can_reauthorize: true }, { ...provider, id: 'other-plugin' }), true, 'the server gates generic PKCE reauthorization through can_reauthorize');
   assert.equal(canReauthorizeAccount({ driver: 'other-plugin', can_reauthorize: true }, provider), false);
   assert.equal(canReauthorizeAccount({ driver: provider.id, can_reauthorize: true }), false);
   assert.equal(canReauthorizeAccount({ driver: 'native', can_reauthorize: true }, { id: 'native', oauth_adapter: { ...adapter, flow_kind: 'openai_device' } }), true);
@@ -65,6 +79,16 @@ test('missing deployment client and authority errors get actionable safe copy', 
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 409, 'oauth_identity_mismatch')), true);
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('no issued result yet', 409)), false);
   assert.equal(isAuthorizationIdentityMismatch(new ApiError('safe', 502, 'oauth_identity_mismatch')), false);
+  assert.equal(isFragmentManualCodeRejection(new ApiError('invalid request: OAuth completion must be code#state', 400, 'invalid_request')), true);
+  for (const reason of [
+    new ApiError('invalid request: OAuth completion must be code#state: secret-code-state', 400, 'invalid_request'),
+    new ApiError('invalid request: OAuth completion must be code#state', 409, 'invalid_request'),
+    new ApiError('invalid request: OAuth completion must be code#state', 400, 'conflict'),
+    new ApiError('sensitive-code-state', 400, 'invalid_request'),
+    new Error('invalid request: OAuth completion must be code#state'),
+  ]) {
+    assert.equal(isFragmentManualCodeRejection(reason), false);
+  }
 });
 
 test('Claude completion classifies only known backend error shapes into safe bilingual recovery copy', () => {

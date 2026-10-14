@@ -628,6 +628,18 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
     assert_eq!(
         codex
             .config_schema
+            .pointer("/properties/transport_policy/properties/http_protocol/enum"),
+        Some(&json!(["provider_default", "http1_only"]))
+    );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/http_protocol/default"),
+        Some(&json!("provider_default"))
+    );
+    assert_eq!(
+        codex
+            .config_schema
             .pointer("/properties/reservation_token_bounds/additionalProperties/minimum"),
         Some(&json!(1))
     );
@@ -763,14 +775,14 @@ fn builtin_http_json_optionally_bounds_trusted_input_token_overhead() {
 }
 
 #[test]
-fn builtin_http_json_exposes_only_the_fixed_siliconflow_video_profile() {
+fn builtin_http_json_exposes_only_fixed_video_profiles() {
     let catalog = ProviderCatalog::builtins();
     let http_json = catalog.get("http-json").unwrap();
     let video_api = http_json
         .config_schema
         .pointer("/properties/video_api")
         .expect("video API profile schema");
-    assert_eq!(video_api["enum"], json!(["siliconflow-v1"]));
+    assert_eq!(video_api["enum"], json!(["siliconflow-v1", "wasu-wan-v1"]));
     assert_eq!(
         http_json.config_schema["properties"]["provider_asset_reads_repeatable"]["default"],
         false

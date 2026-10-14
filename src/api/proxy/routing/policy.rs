@@ -109,11 +109,15 @@ impl RequestAttemptBudget {
     pub(in crate::api::proxy) async fn send<F>(
         &self,
         send: F,
+        wait_for_compaction: bool,
     ) -> Result<ProxyRouteResponse, ProxySendError>
     where
         F: std::future::Future<Output = Result<ProxyRouteResponse, ProxySendError>>,
     {
-        match self.deadline {
+        // The failover window bounds candidate selection. A native compact
+        // already dispatched can compute silently for longer; wait for its
+        // response or client cancellation instead of aborting that work.
+        match self.deadline.filter(|_| !wait_for_compaction) {
             // Cancellation after dispatch is ambiguous. It never grants another send.
             Some(deadline) => tokio::time::timeout_at(deadline, send)
                 .await
@@ -285,7 +289,7 @@ mod tests {
             budget.terminal_reason(3),
             Some("upstream_attempts_exhausted")
         );
-        let result = budget.send(std::future::pending()).await;
+        let result = budget.send(std::future::pending(), false).await;
         assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
         assert_eq!(
             budget.terminal_reason(1),

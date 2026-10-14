@@ -140,7 +140,9 @@ pub(in crate::api) async fn probe_upstream_health(
             })));
         }
     }
-    let credential = if account.driver == "openai-codex" {
+    let credential = if account.driver == "openai-codex"
+        || crate::oauth::authorization_code::supports_managed_transport(&credential)
+    {
         state
             .transport_proxy_groups
             .select_config(

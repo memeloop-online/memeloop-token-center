@@ -107,7 +107,7 @@ jobs:
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
         run: |
-          node --test tests/ops/rust-decimal-vendor-contract.test.ts
+          node --test tests/ops/rust-decimal-vendor-contract.test.ts tests/ops/wreq-proto-vendor-contract.test.ts
           default_tree="$(cargo tree --locked --target all --prefix none)"
           all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
           for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
@@ -380,6 +380,10 @@ jobs:
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Verify H2 binding build and runtime gates without secrets or replay
+        run: |
+          cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
+          cargo test --locked --all-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
       - name: Optional routing SQL cannot delay forwarding or retain lifecycle capacity
         run: cargo test --locked --all-features --lib api::proxy::tests::routing_persistence
       - name: Buffered delivery must precede PostgreSQL semantic materialization

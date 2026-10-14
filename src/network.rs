@@ -641,6 +641,30 @@ async fn validated_endpoint(
     Ok((host_name, addresses, test_loopback))
 }
 
+pub(crate) fn validate_install_egress_proxy(value: &str) -> Result<(), AppError> {
+    let invalid = || AppError::BadRequest("installation egress proxy is invalid".into());
+    if value.len() > 2048
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if url.scheme() != "socks5h"
+        || !has_safe_private_ip_literal_host(&url)
+        || !matches!(url.port(), Some(1..=65535))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
@@ -845,6 +869,31 @@ fn embedded_ipv4(high: u16, low: u16) -> Ipv4Addr {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installation_proxy_rejects_untrusted_urls() {
+        for accepted in ["socks5h://100.64.0.2:1080", "socks5h://10.1.2.3:1080"] {
+            super::validate_install_egress_proxy(accepted).unwrap();
+        }
+        for rejected in [
+            "http://100.64.0.2:1080",
+            "socks5://100.64.0.2:1080",
+            "socks5h://127.0.0.1:1080",
+            "socks5h://169.254.169.254:1080",
+            "socks5h://8.8.8.8:1080",
+            "socks5h://proxy.example:1080",
+            "socks5h://secret:token@100.64.0.2:1080",
+            "socks5h://100.64.0.2",
+            "socks5h://100.64.0.2:0",
+            "socks5h://100.64.0.2:1080/path",
+            "socks5h://100.64.0.2:1080?token=secret",
+            "socks5h://100.64.0.2:1080#secret",
+        ] {
+            assert!(
+                matches!(super::validate_install_egress_proxy(rejected), Err(AppError::BadRequest(message)) if message == "installation egress proxy is invalid")
+            );
+        }
+    }
+
     use super::*;
     use std::sync::{
         Arc,

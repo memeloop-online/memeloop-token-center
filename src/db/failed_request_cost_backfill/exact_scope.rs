@@ -75,6 +75,7 @@ fn terminal_predicate(status_parameter: &str, error_parameter: &str) -> String {
 
 #[derive(Debug, Serialize)]
 pub struct FailedRequestCostBackfillExactReport {
+    pub projection_mode: &'static str,
     pub manifest_rows: usize,
     pub already_projected_rows: usize,
     pub backfill: FailedRequestCostBackfillReport,
@@ -121,7 +122,54 @@ impl Database {
         manifest: FailedRequestCostBackfillExactManifest,
         apply: bool,
     ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
+        self.backfill_failed_request_costs_exact_with_mode(
+            manifest,
+            apply,
+            false,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    pub async fn backfill_failed_request_costs_exact_cost_only(
+        &self,
+        manifest: FailedRequestCostBackfillExactManifest,
+        apply: bool,
+    ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
+        self.backfill_failed_request_costs_exact_with_mode(
+            manifest,
+            apply,
+            true,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cost_only_before_commit_for_test<
+        BeforeCommit: std::future::Future<Output = ()>,
+    >(
+        &self,
+        manifest: FailedRequestCostBackfillExactManifest,
+        before_commit: BeforeCommit,
+    ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
+        self.backfill_failed_request_costs_exact_with_mode(manifest, true, true, before_commit)
+            .await
+    }
+
+    async fn backfill_failed_request_costs_exact_with_mode<
+        BeforeCommit: std::future::Future<Output = ()>,
+    >(
+        &self,
+        mut manifest: FailedRequestCostBackfillExactManifest,
+        apply: bool,
+        cost_only: bool,
+        before_commit: BeforeCommit,
+    ) -> Result<FailedRequestCostBackfillExactReport, AppError> {
         manifest.validate()?;
+        manifest.requests.sort_by(|left, right| {
+            (left.created_at, &left.request_id).cmp(&(right.created_at, &right.request_id))
+        });
         let mut transaction = if apply {
             self.begin_write_transaction().await?
         } else {
@@ -143,7 +191,11 @@ impl Database {
                 .await?;
         }
         if apply {
-            lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+            if cost_only {
+                lock_request_stats_projection_writer_in_transaction(&mut transaction).await?;
+            } else {
+                lock_request_stats_projection_rebuild_in_transaction(&mut transaction).await?;
+            }
         }
         let lock = if apply && matches!(self.backend, DatabaseBackend::PostgreSql) {
             " FOR UPDATE OF f"
@@ -214,6 +266,8 @@ impl Database {
                 candidates,
                 manifest.requests.len() as i64,
                 true,
+                cost_only,
+                before_commit,
             )
             .await?
         } else {
@@ -221,6 +275,11 @@ impl Database {
             prepare_batch(candidates, manifest.requests.len() as i64, false).1
         };
         Ok(FailedRequestCostBackfillExactReport {
+            projection_mode: if cost_only {
+                "cost-only"
+            } else {
+                "full-rebuild"
+            },
             manifest_rows: manifest.requests.len(),
             already_projected_rows,
             backfill,

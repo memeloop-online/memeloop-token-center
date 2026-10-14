@@ -6,6 +6,7 @@ import { chromium } from 'playwright';
 import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCopy.js';
 import { claudeCompletionLimits } from '../src/operator/authorizationCode.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 declare global {
   interface Window {
@@ -70,6 +71,7 @@ async function fixture(context: TestContext, { locale = 'en', reauthorize = fals
       if (url.pathname === '/internal/v1/upstreams') { reads++; return route.fulfill({ json: listedAccounts }); }
       return route.fulfill({ json: [] });
     }
+    if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
     assert.equal(request.method(), 'POST');
     assert.equal(url.pathname, '/internal/v1/oauth/claude/start');
     assert.equal(request.postDataJSON().upstream_account_id, reauthorize ? account.id : undefined);
@@ -224,10 +226,10 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   assert.equal(journey.starts(), 1, 'reopening continues the original authorization');
   await journey.release(1, 200, journey.account);
   await journey.code.waitFor({ state: 'detached' });
-  await journey.page.locator('.create-journey[data-open="false"]').waitFor();
-  await journey.workspace.getByRole('region', { includeHidden: true }).waitFor({ state: 'hidden' });
   const savedAccount = journey.page.locator(`[data-upstream-id="${journey.account.id}"]`);
   const accountWorkspace = journey.page.locator(`[id="provider-details-${journey.account.id}"]`);
+  await journey.page.locator('.create-journey[data-open="false"]').waitFor({ state: 'attached' });
+  await journey.workspace.getByRole('region', { includeHidden: true }).waitFor({ state: 'hidden' });
   await accountWorkspace.getByRole('heading', { name: journey.account.name, exact: true }).waitFor();
   assert.equal(await accountWorkspace.getAttribute('aria-label'), `${journey.account.name} · Manage account`);
   assert.equal(await journey.page.locator('.provider-detail-workspace').count(), 1);
@@ -237,10 +239,13 @@ for (const reopenAfter of [4000, 12_000]) test(`closing a confirmed pending crea
   await success.waitFor();
   assert.equal(await success.count(), 1);
   assert.equal(await journey.page.locator('.create-journey').getAttribute('data-open'), 'false');
+  assert.equal(await journey.page.locator('.create-journey [data-workspace-toggle]').isHidden(), true, 'the list-level add entry is not rendered while the created account workspace is shown');
   assert.equal(journey.reads(), reads + 1);
   await journey.page.clock.runFor(60_000);
   assert.equal((await journey.calls()).length, 2);
   assert.equal(journey.starts(), 1);
+  await accountWorkspace.getByRole('button', { name: 'Back to account list', exact: true }).click();
+  await journey.add.waitFor();
   await journey.add.click();
   await journey.start.waitFor();
   assert.equal(await journey.code.count(), 0, 'successful completion cannot restore the authorization code on reopen');

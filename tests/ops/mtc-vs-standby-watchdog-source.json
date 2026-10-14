@@ -1,0 +1,8 @@
+{
+  "source": "existing GitOps PR192",
+  "commit": "e6118897654c1572985f88e6cc6010d18bb991a7",
+  "path": "scripts/watch-mtc-vs-standby.ts",
+  "sha256": "711b4203bd6eb49cf17a25e40978989027c20f831f319a7a5a91081ad51e0bff",
+  "execution": "GitHub Actions command mocks only; no cluster credentials or operational execution",
+  "provenance": "Byte-identical GitOpse6118897 source imported in the isolated author worktree; GitHub tests this frozen SHA, not live Forgejo connectivity"
+}

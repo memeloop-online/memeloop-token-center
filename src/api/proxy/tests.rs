@@ -35,10 +35,12 @@ mod codex_http2_downstream_cancel;
 mod codex_http2_failure_safety;
 mod codex_http2_long_silence;
 mod codex_output_limits;
+mod codex_protocol_contract;
 mod codex_proxy_groups;
 mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
+mod egress;
 mod filter_assistant;
 mod gateway_persistence;
 mod group_routing;
@@ -3964,7 +3966,13 @@ async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
         json!({"model": fixture.model, "input": "long response", "stream": false}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "incomplete");
+    assert_eq!(value["incomplete_details"]["reason"], "max_output_tokens");
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
@@ -3972,7 +3980,11 @@ async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(
+        rows[0].lifecycle_state,
+        crate::model::RequestLifecycleState::Failed
+    );
     assert_eq!(
         rows[0].error_code.as_deref(),
         Some("upstream_incomplete_response")
@@ -3983,6 +3995,74 @@ async fn codex_buffered_responses_keeps_valid_incomplete_as_non_success() {
     );
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_buffered_responses_rejects_malformed_incomplete_output_with_observed_usage() {
+    let fixture = codex_route_fixture("buffered-responses-malformed-incomplete").await;
+    let upstream = MockServer::start().await;
+    let content =
+        serde_json::to_string(&json!([{"type":"output_text","text":"Partial response"}])).unwrap();
+    let original = incomplete_codex_sse("Partial response", "max_output_tokens", false);
+    assert_eq!(original.matches(&content).count(), 2);
+    let malformed = original.replace(&content, "\"invalid\"");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(malformed.into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model":fixture.model,"input":"long response","stream":false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(serde_json::from_slice::<Value>(&delivered).unwrap()["error"].is_object());
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_response")
+    );
+    assert_eq!(
+        rows[0].usage_basis,
+        Some(crate::model::RequestUsageBasis::ProviderReported)
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert!(rows[0].cost.parse::<Decimal>().unwrap() > Decimal::ZERO);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    drain_completed_response_archive(&fixture).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap(),
+        delivered.as_ref()
+    );
     upstream.verify().await;
 }
 

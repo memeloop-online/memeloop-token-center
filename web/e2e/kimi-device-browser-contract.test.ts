@@ -8,6 +8,7 @@ import { authorizationJourneyCopy } from '../src/operator/authorizationJourneyCo
 import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { isUpstreamModelCatalog } from '../src/operator/managedModelSync.js';
+import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 
 const copy = {
   'zh-CN': {
@@ -57,6 +58,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
         const request = route.request(), url = new URL(request.url());
         assert.equal(url.origin, origin, 'all requests stay in the synthetic fixture');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
+        if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
         if (request.method() !== 'GET') {
           assert.equal(request.method(), 'PUT', 'renaming never starts OAuth or refreshes authorization');
           assert.equal(url.pathname, '/internal/v1/upstreams/synthetic-kimi-rename');
@@ -183,6 +185,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
     let releaseList: (() => void) | undefined;
     await page.route('**/internal/v1/**', async route => {
       const request = route.request(), path = new URL(request.url()).pathname;
+      if (request.method() === 'POST' && path === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
       if (request.method() !== 'GET') {
         assert.equal(request.method(), 'POST');
         assert.ok(['/internal/v1/oauth/kimi/start', '/internal/v1/oauth/kimi/poll'].includes(path), 'no approval, refresh, reset or other write is allowed');

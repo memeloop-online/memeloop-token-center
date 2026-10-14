@@ -329,6 +329,24 @@ async fn validate_secondary_outbound_urls(
 
 fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError> {
     if driver == "http-json"
+        && config.get("video_api").and_then(Value::as_str) == Some("wasu-wan-v1")
+    {
+        let base_url = validate_config(config)?;
+        let parsed = url::Url::parse(&base_url).map_err(|_| AppError::Internal)?;
+        if parsed.path() != "/v1"
+            || config.get("video_models") != Some(&json!(["wan3.0-video"]))
+            || config
+                .get("result_origins")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(AppError::BadRequest(
+                "Wasu Wan requires a /v1 base URL, only wan3.0-video, and exact result origins"
+                    .into(),
+            ));
+        }
+    }
+    if driver == "http-json"
         && config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
     {
         let base_url = validate_config(config)?;
@@ -680,6 +698,7 @@ pub(in crate::api) async fn update_upstream(
             actor_service_id = ?service.service_id,
             expected_revision = body.expected_updated_at, accepted_revision = account.updated_at,
             policy_version = policy.version, candidate_attempts = policy.candidate_attempts,
+            http_protocol = policy.http_protocol.as_str(),
             failover_deadline_millis = policy.failover_deadline_millis,
             connect_attempts = policy.connect_attempts,
             connect_retry_delay_millis = policy.connect_retry_delay_millis,

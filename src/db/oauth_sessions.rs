@@ -305,14 +305,39 @@ impl Database {
         lease_owner: Uuid,
         state_ciphertext: String,
     ) -> Result<(), AppError> {
+        self.replace_oauth_login_poll_state_with_transport(
+            session_id,
+            lease_owner,
+            state_ciphertext,
+            None,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn replace_oauth_login_poll_state_with_transport(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        state_ciphertext: String,
+        transport_group: Option<&crate::db::transport_proxy_management::OAuthGroupSnapshot>,
+        key: &[u8],
+    ) -> Result<(), AppError> {
         if state_ciphertext.is_empty() || state_ciphertext.len() > 256 * 1024 {
             return Err(AppError::BadRequest("OAuth state exceeds bounds".into()));
         }
+        let mut tx = self.begin_write_transaction().await?;
+        if let Some(snapshot) = transport_group {
+            crate::db::transport_proxy_management::lock_oauth_transport_group(&mut tx).await?;
+            self.validate_oauth_transport_group_tx(&mut tx, snapshot, key)
+                .await?;
+        }
         let changed = sqlx::query("UPDATE oauth_login_sessions SET state_ciphertext = $1 WHERE id = $2 AND status = 'polling' AND lease_owner = $3")
-            .bind(state_ciphertext).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&self.pool).await?;
+            .bind(state_ciphertext).bind(session_id.to_string()).bind(lease_owner.to_string()).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(AppError::Conflict("OAuth login poll lease changed".into()));
         }
+        tx.commit().await?;
         Ok(())
     }
 

@@ -24,19 +24,22 @@ const HEADERS_DELAY: Duration = Duration::from_secs(42);
 const REUSE_IDLE: Duration = Duration::from_secs(25);
 const WINDOW: i64 = 65_535;
 const PRIME: &[u8] = b"prime";
-const HOST: &str = "upload.example.test";
+pub(crate) const HOST: &str = "upload.example.test";
 
 #[path = "http2_upload_tests/multiplex.rs"]
 mod multiplex;
 
 #[path = "http2_upload_tests/tls_fixture.rs"]
-mod tls_fixture;
+pub(crate) mod tls_fixture;
 
 #[path = "http2_upload_tests/native_encoded.rs"]
 pub(crate) mod native_encoded;
 
 #[path = "http2_upload_tests/native_reused_window.rs"]
 mod native_reused_window;
+
+#[path = "http2_upload_tests/sibling_client_cancel_window.rs"]
+mod sibling_client_cancel_window;
 
 struct Frame {
     from_client: bool,
@@ -167,7 +170,11 @@ async fn accept_socks(socket: &mut TcpStream) {
     accept_socks_at_port(socket, 80).await;
 }
 
-async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
+pub(crate) async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
+    accept_socks_for_host(socket, port, HOST).await;
+}
+
+pub(crate) async fn accept_socks_for_host(socket: &mut TcpStream, port: u16, host: &str) {
     let mut greeting = [0; 2];
     socket.read_exact(&mut greeting).await.unwrap();
     assert_eq!(greeting[0], 5);
@@ -181,7 +188,7 @@ async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
     let length = socket.read_u8().await.unwrap();
     let mut destination = vec![0; usize::from(length)];
     socket.read_exact(&mut destination).await.unwrap();
-    assert_eq!(destination, HOST.as_bytes());
+    assert_eq!(destination, host.as_bytes());
     assert_eq!(socket.read_u16().await.unwrap(), port);
     socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1]).await.unwrap();
     socket.write_all(&port.to_be_bytes()).await.unwrap();
