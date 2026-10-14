@@ -39,10 +39,7 @@ async fn cancel_before_headers(stream: bool) {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, None);
     let request_id = rows[0].request_id;
-    assert_eq!(
-        fixture.state.proxy_lifecycles.active(),
-        available + 1
-    );
+    assert_eq!(fixture.state.proxy_lifecycles.active(), available + 1);
     drop(request);
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
