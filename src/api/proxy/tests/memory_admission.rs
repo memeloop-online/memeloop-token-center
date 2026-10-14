@@ -391,15 +391,7 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(rejected.headers().contains_key(header::RETRY_AFTER));
     assert!(upstream.received_requests().await.unwrap().is_empty());
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
 
     drop(rejected);
     drop(held);
@@ -421,7 +413,11 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[1].terminal_cause_code.as_deref(),
+        Some("gateway_pre_admission")
+    );
     let refs = fixture
         .state
         .db

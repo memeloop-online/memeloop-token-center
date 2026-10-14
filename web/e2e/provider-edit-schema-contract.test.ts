@@ -52,6 +52,7 @@ test('connection, localization and edit composition translate transport copy wit
     field.title = title;
   }
   const labels = {
+    http_protocol: '上游 HTTP 协议',
     version: '策略版本', connect_timeout_millis: '连接超时（毫秒）', read_timeout_millis: '读取无数据超时（毫秒）',
     request_timeout_millis: '请求总超时（毫秒）', memory_admission_wait_millis: '内存排队超时（毫秒）',
     dispatch_max_in_flight: '调度最大并发数', dispatch_max_queued: '调度队列容量', dispatch_queue_timeout_millis: '调度排队超时（毫秒）',
@@ -61,6 +62,7 @@ test('connection, localization and edit composition translate transport copy wit
     chat_controls: 'Chat 控制策略', responses_output_limits: 'Responses 输出限制',
   };
   const policyHelp: Record<string, string> = {
+    http_protocol: '默认策略（provider_default）保留现有 TLS 协议协商。仅 HTTP/1.1（http1_only）用于对指定账号验证兼容性，不启用自动协议回退。更改影响该账号新建的客户端，包括模型目录和额度读取；进行中的请求继续使用原客户端。',
     chat_controls: '默认策略（provider_default）会校验并移除不受支持的 Chat 采样和输出限制参数；上游使用自身默认值，不保证请求指定的采样设置或词元上限。显式选择严格策略（strict）时，仅接受中性的采样值，并拒绝输出限制提示。额度预留仍使用可信的模型上限。',
     responses_output_limits: '默认策略（provider_default）会校验并移除客户端的输出限制提示；上游使用自身默认值，不强制执行请求指定的词元上限。由于 Codex OAuth 无法保证该限制，显式选择严格策略（strict）时会拒绝任何输出限制提示。额度始终按可信的模型上限预留，并按观测到的实际用量结算。',
   };

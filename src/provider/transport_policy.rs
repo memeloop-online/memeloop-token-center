@@ -57,6 +57,7 @@ pub(crate) enum CodexResponsesOutputLimitPolicy {
 #[serde(default)]
 pub(crate) struct CodexTransportPolicy {
     pub version: u32,
+    pub http_protocol: CodexHttpProtocol,
     pub connect_attempts: usize,
     pub connect_retry_delay_millis: u64,
     pub shared_probe_attempts: Option<u32>,
@@ -82,6 +83,7 @@ impl Default for CodexTransportPolicy {
     fn default() -> Self {
         Self {
             version: 1,
+            http_protocol: CodexHttpProtocol::ProviderDefault,
             connect_attempts: 2,
             connect_retry_delay_millis: 150,
             shared_probe_attempts: None,
@@ -99,6 +101,23 @@ impl Default for CodexTransportPolicy {
             max_sse_terminal_hold_bytes: SseFramingLimits::DEFAULT_TERMINAL_HOLD_BYTES,
             chat_controls: CodexChatControlPolicy::ProviderDefault,
             responses_output_limits: CodexResponsesOutputLimitPolicy::ProviderDefault,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodexHttpProtocol {
+    #[default]
+    ProviderDefault,
+    Http1Only,
+}
+
+impl CodexHttpProtocol {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderDefault => "provider_default",
+            Self::Http1Only => "http1_only",
         }
     }
 }
@@ -155,6 +174,39 @@ impl CodexTransportPolicy {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_protocol_is_opt_in_and_does_not_gate_existing_fields() {
+        for config in [
+            None,
+            Some(json!({})),
+            Some(json!({"http_protocol":"provider_default"})),
+        ] {
+            let policy = CodexTransportPolicy::parse(config.as_ref()).unwrap();
+            assert_eq!(policy.http_protocol, CodexHttpProtocol::ProviderDefault);
+        }
+        let configured = CodexTransportPolicy::parse(Some(&json!({
+            "http_protocol":"http1_only", "dispatch_max_in_flight":0,
+            "existing_extension":"preserve_legacy_parse_behavior"
+        })))
+        .unwrap();
+        assert_eq!(configured.http_protocol, CodexHttpProtocol::Http1Only);
+        assert_eq!(configured.http_protocol.as_str(), "http1_only");
+        assert_eq!(configured.dispatch_max_in_flight, 0);
+        assert_eq!(
+            configured.request_timeout_millis,
+            CodexTransportPolicy::default().request_timeout_millis
+        );
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!(1),
+            json!("h2"),
+            json!("automatic_fallback"),
+        ] {
+            assert!(CodexTransportPolicy::parse(Some(&json!({"http_protocol":invalid}))).is_err());
+        }
+    }
 
     #[test]
     fn legacy_defaults_and_versioned_budgets_are_bounded() {

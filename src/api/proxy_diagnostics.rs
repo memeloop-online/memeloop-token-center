@@ -1,4 +1,4 @@
-//! Correlates pre-admission failures and response tails without database writes.
+//! Correlates gateway phases with their server-owned request identity.
 //! Never accept a client-provided correlation ID, path, body, or error text.
 use std::time::Instant;
 use uuid::Uuid;

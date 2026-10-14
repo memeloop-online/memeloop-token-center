@@ -485,16 +485,12 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
         Some("upstream_invalid_usage")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    let _completed_lifecycles = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(3),
-        fixture
-            .state
-            .proxy_lifecycle_permits
-            .acquire_many(fixture.state.config.proxy_lifecycle_concurrency),
+        fixture.state.proxy_lifecycles.wait_for_idle(),
     )
     .await
-    .expect("streaming lifecycle must finish before upstream health is inspected")
-    .unwrap();
+    .expect("streaming lifecycle must finish before upstream health is inspected");
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health = sqlx::query(

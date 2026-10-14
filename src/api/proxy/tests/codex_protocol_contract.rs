@@ -57,9 +57,13 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
 }
 
 async fn streaming(version: http::Version, cancel: bool, silence: bool) {
-    let mut fixture = codex_route_fixture("protocol-stream").await;
-    fixture.state.proxy_lifecycle_permits = Arc::new(tokio::sync::Semaphore::new(1));
-    let mut peer = Peer::start(version, crate::provider::CodexTransportPolicy::default()).await;
+    let fixture = codex_route_fixture("protocol-stream").await;
+    super::ha_policy::set_policy(
+        &fixture,
+        json!({"http_protocol": account_protocol(version)}),
+    )
+    .await;
+    let mut peer = Peer::for_account(&fixture, version).await;
     fixture
         .state
         .codex_clients
@@ -100,7 +104,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
     }
     assert!(rendered.contains("call-contract"));
     assert!(!rendered.contains("response.completed"));
-    assert!(fixture.state.proxy_lifecycle_permits.try_acquire().is_err());
+    assert_eq!(fixture.state.proxy_lifecycles.active(), 1);
     if silence {
         let started = std::time::Instant::now();
         let until = tokio::time::sleep(Duration::from_secs(310));
@@ -161,13 +165,12 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         1,
         "tool output must never replay"
     );
-    let _permit = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(3),
-        fixture.state.proxy_lifecycle_permits.acquire(),
+        fixture.state.proxy_lifecycles.wait_for_idle(),
     )
     .await
-    .expect("lifecycle permit must be released")
-    .unwrap();
+    .expect("lifecycle permit must be released");
 }
 
 async fn compact(version: http::Version) {
@@ -181,7 +184,7 @@ async fn compact(version: http::Version) {
             .unwrap(),
     )
     .unwrap();
-    config["transport_policy"] = json!({"failover_deadline_millis":1000,"connect_timeout_millis":1000,
+    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"failover_deadline_millis":1000,"connect_timeout_millis":1000,
         "read_timeout_millis":1000,"request_timeout_millis":2000});
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
@@ -190,14 +193,7 @@ async fn compact(version: http::Version) {
         .await
         .unwrap();
     pool.close().await;
-    let policy = crate::provider::CodexTransportPolicy {
-        failover_deadline_millis: 1000,
-        connect_timeout_millis: 1000,
-        read_timeout_millis: 1000,
-        request_timeout_millis: 2000,
-        ..Default::default()
-    };
-    let mut peer = Peer::start(version, policy).await;
+    let mut peer = Peer::for_account(&fixture, version).await;
     fixture
         .state
         .codex_clients
@@ -240,6 +236,73 @@ async fn native_tls_socks_h1_h2_stream_tool_cancel_and_compact_contract() {
         .await
         .expect("bounded native protocol contract");
     }
+}
+
+fn account_protocol(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_11 => "http1_only",
+        http::Version::HTTP_2 => "provider_default",
+        _ => panic!("unsupported account protocol arm"),
+    }
+}
+
+#[tokio::test]
+async fn account_protocol_api_roundtrip_and_rollback_change_real_tls_version() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let fixture = codex_route_fixture("account-protocol-rollback").await;
+        for (config, version) in [
+            (json!({}), http::Version::HTTP_2),
+            (
+                json!({"http_protocol":"http1_only"}),
+                http::Version::HTTP_11,
+            ),
+            (
+                json!({"http_protocol":"provider_default"}),
+                http::Version::HTTP_2,
+            ),
+            (json!({}), http::Version::HTTP_2),
+        ] {
+            super::ha_policy::set_policy(&fixture, config).await;
+            let mut peer = Peer::for_account(&fixture, version).await;
+            let request = peer
+                .client
+                .post(format!(
+                    "{}{}",
+                    peer.endpoint(),
+                    codex_transport::RESPONSES_PATH
+                ))
+                .header(header::AUTHORIZATION, "Bearer upstream-access-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{\"input\":\"account-protocol\"}")
+                .build()
+                .unwrap();
+            let send = peer.client.execute(request);
+            tokio::pin!(send);
+            let (post, early_response) = tokio::select! {
+                post = peer.post() => (post, None),
+                response = &mut send => (peer.post().await, Some(response.unwrap())),
+            };
+            assert_eq!(post.body["input"], "account-protocol");
+            emit(&post, CREATED).await;
+            complete(post).await;
+            let response = match early_response {
+                Some(response) => response,
+                None => send.await.unwrap(),
+            };
+            assert_eq!(response.version(), version);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("response.completed")
+            );
+            assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+        }
+    })
+    .await
+    .expect("bounded account protocol rollback contract");
 }
 
 #[tokio::test]

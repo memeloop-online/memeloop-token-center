@@ -1323,7 +1323,8 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
         })
         .map(micros_to_decimal_string);
     let currency: Option<String> = row.try_get("currency")?;
-    let billable = row.try_get::<i64, _>("billable")? != 0;
+    let billable = row.try_get::<i64, _>("billable")? != 0
+        && terminal_cause_code.as_deref() != Some("gateway_pre_admission");
     // This source marker is assigned by each SQL branch, never imported from
     // an external archive's error vocabulary or serialized into the API.
     let supplier_error = if row.try_get::<i64, _>("native_terminal")? == 1 {
@@ -1673,7 +1674,7 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 cost: cost.clone().unwrap_or_else(|| "0".to_owned()),
                 usage: RequestUsageView { tokens, generation },
                 billing: RequestBillingView {
-                    billable: true,
+                    billable: terminal_cause_code.as_deref() != Some("gateway_pre_admission"),
                     cost,
                     currency,
                 },

@@ -1050,6 +1050,51 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
+    pub(crate) async fn mark_upstream_oauth_refresh_request_not_sent(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+        expected_generation: i64,
+    ) -> Result<(), AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let mut tx = self
+            .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Abort)
+            .await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT credential_generation FROM upstream_accounts WHERE id = $1"
+            }
+        };
+        let generation: i64 = sqlx::query_scalar(select)
+            .bind(account_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if generation != expected_generation {
+            return Err(AppError::Conflict(
+                "OAuth refresh unsent claim was superseded by a new credential generation".into(),
+            ));
+        }
+        let changed = sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET request_started_at = NULL WHERE account_id = $1 AND idempotency_key = $2 AND credential_generation = $3 AND request_started_at IS NOT NULL AND pending_credential_ciphertext IS NULL",
+        )
+        .bind(account_id.to_string())
+        .bind(idempotency_key.trim())
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "OAuth refresh unsent claim is missing, superseded, or already has a result".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn finish_upstream_oauth_refresh(
         &self,
         account_id: Uuid,
@@ -1057,12 +1102,54 @@ impl Database {
         idempotency_key: &str,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
+        self.finish_upstream_oauth_refresh_with_retry_delays(
+            account_id,
+            credential,
+            idempotency_key,
+            key_material,
+            &[std::time::Duration::ZERO, std::time::Duration::ZERO],
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_kimi_oauth_refresh(
+        &self,
+        account_id: Uuid,
+        credential: UpstreamCredential,
+        idempotency_key: &str,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        self.finish_upstream_oauth_refresh_with_retry_delays(
+            account_id,
+            credential,
+            idempotency_key,
+            key_material,
+            &[
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(4),
+                std::time::Duration::from_secs(8),
+            ],
+        )
+        .await
+    }
+
+    async fn finish_upstream_oauth_refresh_with_retry_delays(
+        &self,
+        account_id: Uuid,
+        credential: UpstreamCredential,
+        idempotency_key: &str,
+        key_material: &[u8],
+        retry_delays: &[std::time::Duration],
+    ) -> Result<UpstreamAccountView, AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         // Seal once: bounded finalize retries reuse identical ciphertext and
         // never contact the authorization server again.
         let pending_ciphertext = seal_credential(&credential, key_material)?;
-        for attempt in 0..3 {
+        for attempt in 0..=retry_delays.len() {
             let result = self
                 .finish_upstream_oauth_refresh_attempt(
                     account_id,
@@ -1075,10 +1162,14 @@ impl Database {
             match result {
                 Ok(view) => return Ok(view),
                 Err(error)
-                    if attempt < 2
+                    if attempt < retry_delays.len()
                         && matches!(error, AppError::Internal | AppError::Storage(_)) =>
                 {
-                    tokio::task::yield_now().await;
+                    if retry_delays[attempt].is_zero() {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(retry_delays[attempt]).await;
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -1394,6 +1485,22 @@ impl Database {
         }
         let generation = current_generation + 1;
         let updated_at = now.max(row.try_get::<i64, _>("updated_at")?.saturating_add(1));
+        if resource_kind == UPSTREAM_OAUTH_REFRESH_RESOURCE
+            && expected_generation == Some(current_generation)
+            && prepared_ciphertext.is_some()
+            && row
+                .try_get::<Option<String>, _>("oauth_session_id")?
+                .is_some()
+        {
+            super::oauth_catalog::carry_forward_refresh_catalog(
+                tx,
+                account_id,
+                &row,
+                &credential,
+                key_material,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND revoked_at IS NULL",
         )

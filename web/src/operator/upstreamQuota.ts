@@ -258,7 +258,7 @@ export function quotaRefreshDiagnostic(snapshot?: Pick<UpstreamQuotaSnapshot, 'e
 
 /** A failed refresh never replaces the effective quota observation. */
 export function quotaEffectiveSnapshot(previous: UpstreamQuotaSnapshot | undefined, candidate: UpstreamQuotaSnapshot): UpstreamQuotaSnapshot {
-  if ((candidate.status === 'error' || candidate.error_code) && previous?.observed_at !== null && previous?.observed_at !== undefined) return previous;
+  if ((candidate.status === 'error' || candidate.error_code) && previous?.observed_at !== null && previous?.observed_at !== undefined) return { ...previous, stale: true, freshness: 'stale' };
   return candidate;
 }
 

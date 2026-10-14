@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod crypto;
 mod cursor_native;
 pub mod db;
+mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
@@ -93,12 +94,14 @@ pub struct AppState {
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) gateway_body_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
+    pub(crate) early_requests: Arc<early_request::Journal>,
     /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
-    pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) proxy_lifecycles: Arc<proxy_lifecycle::ProxyLifecycleCounter>,
     pub(crate) proxy_memory_budget: Arc<gateway_body::memory::ProxyMemoryBudget>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) upstream_quota: Arc<upstream_quota::QuotaCache>,
@@ -130,7 +133,6 @@ impl AppState {
         config
             .validate_proxy_memory_budget()
             .map_err(|_| InitializationError::ProxyMemoryBudget)?;
-        let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
         let proxy_memory_budget = Arc::new(gateway_body::memory::ProxyMemoryBudget::new(
             config.proxy_memory_budget_bytes,
         ));
@@ -162,6 +164,16 @@ impl AppState {
             .map_err(|_| InitializationError::Archive)?;
         let persistence_db = db.independent_persistence_pool();
         let routing_persistence_db = db.independent_persistence_pool();
+        let early_requests = early_request::Journal::new(
+            std::path::Path::new(&config.responses_request_spool_path)
+                .join("early-terminals")
+                .join(
+                    blake3::hash(config.database_url.as_bytes())
+                        .to_hex()
+                        .as_str(),
+                ),
+            db.independent_persistence_pool(),
+        );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
         plugins
@@ -235,18 +247,18 @@ impl AppState {
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
             )),
+            gateway_body_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             responses_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 responses_body_read_concurrency,
             )),
             responses_request_spool,
+            early_requests,
             // Cloned request/router states share the same bounded synchronous
             // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.
             image_response_permits: Arc::new(tokio::sync::Semaphore::new(2)),
             gateway_body_rejections: Arc::new(gateway_body::GatewayBodyRejectionMetrics::default()),
-            proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
-                proxy_lifecycle_concurrency,
-            )),
+            proxy_lifecycles: Arc::new(proxy_lifecycle::ProxyLifecycleCounter::default()),
             proxy_memory_budget,
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
@@ -412,7 +424,7 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
-    wreq::Client::builder()
+    let builder = wreq::Client::builder()
         .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
@@ -423,7 +435,11 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options)
+        .http2_options(http2_options);
+    match policy.http_protocol {
+        provider::CodexHttpProtocol::ProviderDefault => builder,
+        provider::CodexHttpProtocol::Http1Only => builder.http1_only(),
+    }
 }
 
 fn codex_http2_options(

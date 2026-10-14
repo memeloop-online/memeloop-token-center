@@ -2165,6 +2165,26 @@ pub(crate) async fn record_request_finished_in_transaction(
     .await
 }
 
+pub(super) async fn record_early_terminal_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request: &FinishRequest,
+    completed_at: i64,
+) -> Result<bool, AppError> {
+    record_request_finished_with_basis_and_metering_in_transaction(
+        transaction,
+        request,
+        completed_at,
+        Some(true),
+        Some(crate::model::RequestUsageBasis::NotObserved),
+        None,
+        TerminalMetadata {
+            cause: Some(crate::model::RequestTerminalCause::GatewayPreAdmission),
+            cache_coverage: None,
+        },
+    )
+    .await
+}
+
 async fn record_request_finished_with_basis_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     request: &FinishRequest,

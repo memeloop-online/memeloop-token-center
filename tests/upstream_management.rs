@@ -179,6 +179,7 @@ async fn providers_read_refresh_metadata_is_scoped_optional_and_non_blocking() {
     assert_eq!(rows[0]["oauth_refresh"]["access_state"], "expired");
     assert_eq!(rows[0]["oauth_refresh"]["refresh_state"], "outcome_unknown");
     assert_eq!(rows[0]["oauth_refresh"]["reauthorization_required"], false);
+    assert_eq!(rows[0]["oauth_refresh"]["automatic_refresh_paused"], true);
     for forbidden in [
         "read-projection-fixture-access",
         "read-projection-fixture-refresh",

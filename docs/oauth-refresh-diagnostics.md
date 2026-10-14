@@ -20,6 +20,12 @@ The projection provides:
 - `reauthorization_required`, true only when a new refresh attempt has an
   explicit supported rejection such as `invalid_grant`. Access expiry,
   generic HTTP 401/403, and historical unknown attempts do not establish this.
+- `automatic_refresh_paused`, true when the current generation has a started
+  attempt with no saved result and its refresh state is `outcome_unknown` or
+  `reauthorization_required`. This is an observation of the existing replay
+  protection, not a new scheduling gate or proof of invalid authorization.
+  Active attempts, saved results awaiting local completion, and access expiry
+  alone do not set it. Clients predating this field can ignore it.
 
 Administrative `status`, `can_refresh` and `can_reauthorize` keep their existing
 meanings. Diagnostics do not affect routing, model visibility, availability
@@ -56,3 +62,78 @@ The stored diagnostic is a per-generation latest failure snapshot, not an
 immutable history of every attempt. Kimi errors are typed without logging
 provider response content; unsupported provider error formats remain unknown.
 This change does not recover or reauthorize existing production accounts.
+
+## Kimi timeout and recovery boundary
+
+Kimi refresh has a 120-second request and operation budget, replacing the
+previous ten-second cutoff. The
+durable `request_started_at` marker is written before executing the request:
+it is a replay-safety boundary, not proof that the provider received a POST.
+A timeout can occur while connecting, awaiting headers, or reading the body.
+New body-deadline diagnostics preserve an already observed HTTP status; a
+missing status does not establish a particular network failure phase for
+historical attempts. A status without a complete response does not establish
+that a replacement credential was received or that refresh succeeded.
+
+The worker checks expiring credentials every minute, five minutes ahead of
+expiry. It excludes a generation with a started request and no saved result,
+even after lease expiry. Only undispatched expired leases can be reclaimed;
+saved encrypted results can be finalized locally without another remote POST.
+Without provider-confirmed idempotency or token-reuse semantics, do not replay
+an unknown refresh, clear its lease, or infer `invalid_grant` from access expiry.
+An operator alert should say that automatic refresh is paused because its
+result is unconfirmed, not that the user failed to sign in. Do not automatically
+initiate authorization. A later user-supplied authorization supersedes the old
+generation; its healthy state is not evidence that the timeout cause was fixed.
+
+## Kimi prevention and bounded recovery
+
+The official Kimi CLI at revision
+[`9ab1286b`](https://github.com/MoonshotAI/kimi-cli/blob/9ab1286b8fe4e6bcd116949a27ce5e0ac3389c82/src/kimi_cli/utils/aiohttp.py)
+uses a 120-second total budget, 60-second socket-read budget and 15-second
+connection budget. MTC adopts the total budget for refresh only; its existing
+five-second connector limit and shared TLS/proxy validation remain unchanged.
+This avoids discarding a valid exchange solely because headers or the complete
+body take longer than ten seconds. The byte bound still applies.
+
+The [official refresh implementation](https://github.com/MoonshotAI/kimi-cli/blob/9ab1286b8fe4e6bcd116949a27ce5e0ac3389c82/src/kimi_cli/auth/oauth.py)
+retries transient errors, coordinates local processes with a file lock, reloads
+persisted tokens and atomically replaces the credential file on success. This
+is client behavior, not a server guarantee of refresh-token reuse or remote
+idempotency. MTC does not copy the ambiguous POST retry behavior.
+
+Only a connector-classified failure from the fresh no-retry Kimi HTTP client
+can undo its own dispatch marker. The transition locks the account and matches
+the claimed credential generation and idempotency key; a pending result or
+superseding credential prevents release. Normal cleanup then makes that
+unconsumed credential eligible for the next worker pass. Failure to persist
+this transition leaves the marker in place. An ordinary total timeout, a
+received HTTP rejection or a disconnect after POST does not release it.
+
+A complete Kimi result is sealed once and retained for up to seven local
+staging/finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff.
+Only storage/internal failures are retried. Every attempt reuses the same
+ciphertext and existing generation/claim fences, and never calls the provider.
+Other providers keep their original three-attempt behavior. An exhausted local
+failure emits a secret-free error with account ID, generation, stage and error
+category so it can be alerted separately from remote rejection.
+
+These are bounded protections, not a guarantee against losing an unstaged
+response during a process crash or a prolonged database outage. Already staged
+results remain durable and use the existing local replay path. Historical
+unknown POSTs stay blocked; no production lease or credential is rewritten by
+deployment of this change.
+
+On worker shutdown, ordinary roles retain their 30-second shared grace. The
+single OAuth-refresh role stops scheduling new work and retains up to180seconds
+to finish the current exchange and local persistence. Both task sets remain
+owned and joined; the OAuth lane is forcibly cancelled with a safe error event
+only at its own bounded deadline. In `all` mode, process shutdown starts this
+OAuth drain concurrently with HTTP connection drain, not after it. Ordinary
+worker roles remain available for in-flight HTTP cleanup until HTTP drain
+finishes, then retain their original 30-second grace. Finishing HTTP drain does
+not restart the OAuth deadline. The existing chart pod termination grace of
+1320seconds accommodates the default 1260second HTTP budget and these concurrent
+drains; neither HTTP grace nor pod settings are changed. A process kill
+or deployment overriding the pod grace below this drain budget can still lose
+an unstaged result.

@@ -698,6 +698,7 @@ pub(in crate::api) async fn update_upstream(
             actor_service_id = ?service.service_id,
             expected_revision = body.expected_updated_at, accepted_revision = account.updated_at,
             policy_version = policy.version, candidate_attempts = policy.candidate_attempts,
+            http_protocol = policy.http_protocol.as_str(),
             failover_deadline_millis = policy.failover_deadline_millis,
             connect_attempts = policy.connect_attempts,
             connect_retry_delay_millis = policy.connect_retry_delay_millis,

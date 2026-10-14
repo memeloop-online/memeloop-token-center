@@ -42,6 +42,7 @@ mod routing;
 pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
+mod transport_protocol;
 mod upstream_error;
 mod upstream_response;
 
@@ -1022,11 +1023,7 @@ async fn proxy_with_cancellation_guard(
         proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
-    let proxy_lifecycle_permit = state
-        .proxy_lifecycle_permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::Overloaded)?;
+    let proxy_lifecycle_permit = state.proxy_lifecycles.start();
     if !memory.try_reserve_json(&body) {
         state
             .metrics
@@ -1036,6 +1033,7 @@ async fn proxy_with_cancellation_guard(
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
     let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    super::early_request::observe_model(original_request_json.get("model"));
     json_parse.finish("completed", None, Some(body.len()));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
     tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
@@ -1065,6 +1063,7 @@ async fn proxy_with_cancellation_guard(
     }
     let request_json = applied.request_json;
     let model = applied.model;
+    super::early_request::observe_model(Some(&Value::String(model.clone())));
     let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
         && official_codex_client
         && crate::api::request_normalization::has_codex_multi_agent_v2_shape(&request_json);
@@ -1097,6 +1096,15 @@ async fn proxy_with_cancellation_guard(
         )
         .await?;
     candidate_query.finish("completed", None, None);
+    tracing::info!(
+        request_id = %request_id,
+        key_id = %key.key_id,
+        tenant_id = %key.tenant_id,
+        model = super::early_request::safe_model(&model),
+        protocol = protocol.name(),
+        candidate_count = candidates.len(),
+        "authorized candidate query completed"
+    );
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
     let strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
@@ -1163,8 +1171,6 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     let upstream_account_id = Some(primary.account_id);
     let model_route_id = Some(primary.route_id);
-    // Queue before durable admission: overload consumes no request record,
-    // reservation, RPM allowance, archive transaction or billable usage.
     let mut dispatch_permit = if codex_transport::is_driver(&primary.driver) {
         match state
             .codex_clients
@@ -1251,6 +1257,7 @@ async fn proxy_with_cancellation_guard(
             return Err(error);
         }
     };
+    super::early_request::mark_admitted();
     cancellation.arm(
         state.db.clone(),
         diagnostic_context,
@@ -1533,6 +1540,18 @@ async fn proxy_with_cancellation_guard(
             }
             result => (result, None),
         };
+        if active_route.is_codex()
+            && let Ok(response) = &result
+        {
+            transport_protocol::record_response(
+                request_id,
+                &active_route.route,
+                selected_candidate_rank,
+                outbound_attempt,
+                response.response.version(),
+                response.response.status(),
+            );
+        }
         attempt.finish(
             if result.is_ok() {
                 "completed"

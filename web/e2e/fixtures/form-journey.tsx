@@ -15,8 +15,8 @@ import type {} from '../support/form-journey-globals';
 import { builtinApiKeyCredential } from './builtin-api-key-credential';
 import { providerEditShape } from './provider-edit-shapes';
 window.formJourneyReads = []; window.formJourneyWrites = 0;
-window.formJourneyQuotaBatchBodies = [];
-window.deferNextFormQuotaBatch = new URLSearchParams(location.search).has('hold-quota-batch');
+window.formJourneyQuotaBulkReads = [];
+window.deferNextFormQuotaBulkRead = new URLSearchParams(location.search).has('hold-quota-bulk-read');
 window.failNextFormWrite = false;
 window.failNextFormNotesWrite = false;
 window.conflictNextFormNotesWrite = false;
@@ -32,8 +32,8 @@ let releaseNotes: (() => void) | undefined;
 window.releaseFormNotesWrite = () => { if (!releaseNotes) throw new Error('No pending notes write'); releaseNotes(); releaseNotes = undefined; };
 let releaseQuota: (() => void) | undefined;
 window.releaseFormQuotaRead = () => { if (!releaseQuota) throw new Error('No pending quota read'); releaseQuota(); releaseQuota = undefined; };
-let releaseQuotaBatch: (() => void) | undefined;
-window.releaseFormQuotaBatch = () => { if (!releaseQuotaBatch) throw new Error('No pending quota batch read'); releaseQuotaBatch(); releaseQuotaBatch = undefined; };
+let releaseQuotaBulkRead: (() => void) | undefined;
+window.releaseFormQuotaBulkRead = () => { if (!releaseQuotaBulkRead) throw new Error('No pending bulk quota read'); releaseQuotaBulkRead(); releaseQuotaBulkRead = undefined; };
 const workflows = new URLSearchParams(location.search).has('workflows');
 const existingRoute = { id: 'route-existing', tenant_external_id: 'fixture', public_model: 'research-model', upstream_model: 'fixture-model', protocol: 'openai', upstream_account_ids: ['account-native'], enabled: true, priority: 0, grant_revision: 1, created_at: 1, updated_at: 1 };
 let routeRows = [existingRoute];
@@ -55,27 +55,10 @@ function formQuotaSnapshot(value: { id: string; tenant_external_id: string; driv
   };
 }
 window.fetch = async (input, init) => {
-  const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin).pathname;
+  const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
+  const path = url.pathname;
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   if (method !== 'GET') {
-    if (method === 'POST' && path === '/internal/v1/upstreams/quota/batch') {
-      // The list auto-read is a read, never a write; answer only the exact
-      // eligible accounts so unexpected identities stay visible.
-      const quotaBatch = JSON.parse(String(init?.body ?? '{}')) as { account_ids?: unknown; fresh?: unknown; trigger?: unknown };
-      if (!Array.isArray(quotaBatch.account_ids) || quotaBatch.fresh !== true || quotaBatch.trigger !== 'bulk') throw new Error('Form fixture quota batch must be a fresh bulk read');
-      window.formJourneyQuotaBatchBodies.push(quotaBatch.account_ids);
-      const knownAccounts = [account, ...(createdProvider ? [createdProvider] : [])];
-      const eligibleAccounts = knownAccounts.filter(value => value.status === 'active');
-      const expectedIds = eligibleAccounts.map(value => value.id);
-      if (expectedIds.length !== quotaBatch.account_ids.length || new Set(quotaBatch.account_ids).size !== quotaBatch.account_ids.length || expectedIds.some(id => !(quotaBatch.account_ids as string[]).includes(id))) throw new Error(`Form fixture quota batch expects exactly the eligible accounts: ${JSON.stringify(expectedIds)}`);
-      if (window.deferNextFormQuotaBatch) {
-        window.deferNextFormQuotaBatch = false;
-        // Hold the response so tests can change the account generation while
-        // the batch is in flight; the late response itself stays stale-fenced.
-        return new Promise<Response>(resolve => { releaseQuotaBatch = () => resolve(new Response(JSON.stringify({ contract_version: 'upstream_quota_batch_v1', results: eligibleAccounts.map(value => ({ status: 'success', upstream_account_id: value.id, snapshot: formQuotaSnapshot(value) })) }), { status: 200 })); });
-      }
-      return new Response(JSON.stringify({ contract_version: 'upstream_quota_batch_v1', results: eligibleAccounts.map(value => ({ status: 'success', upstream_account_id: value.id, snapshot: formQuotaSnapshot(value) })) }), { status: 200 });
-    }
     window.formJourneyWrites++;
     if (workflows && new URLSearchParams(location.search).has('provider-workflow') && method === 'POST' && path === '/internal/v1/upstreams') {
       window.formJourneyLastProviderCreate = JSON.parse(String(init?.body ?? '{}'));
@@ -152,12 +135,20 @@ window.fetch = async (input, init) => {
     }
     return new Response(snapshot, { headers: { 'Cache-Control': 'private, no-store' } });
   }
-  if (new URLSearchParams(location.search).has('quota-generation') && path === '/internal/v1/upstreams/account-native/quota') {
-    const snapshot = formQuotaSnapshot(account);
-    if (window.deferNextFormQuotaRead) {
+  if (/^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(path)) {
+    const knownAccounts = [account, ...(createdProvider ? [createdProvider] : [])];
+    const value = knownAccounts.find(value => path === '/internal/v1/upstreams/' + value.id + '/quota' && value.tenant_external_id === url.searchParams.get('tenant_external_id') && value.status === 'active');
+    const trigger = url.searchParams.get('trigger');
+    if (!value || url.searchParams.get('fresh') !== 'true' || !['bulk', 'manual'].includes(trigger ?? '')) throw new Error('Form quota fixture requires an eligible account, tenant and fresh read');
+    const snapshot = formQuotaSnapshot(value);
+    if (trigger === 'bulk') {
+      window.formJourneyQuotaBulkReads.push(value.id);
+      if (window.deferNextFormQuotaBulkRead) {
+        window.deferNextFormQuotaBulkRead = false;
+        return new Promise<Response>(resolve => { releaseQuotaBulkRead = () => resolve(new Response(JSON.stringify(snapshot))); });
+      }
+    } else if (window.deferNextFormQuotaRead) {
       window.deferNextFormQuotaRead = false;
-      // Deliberately ignore AbortSignal, and preserve the old generation's
-      // response, so the component must fence a late result itself.
       return new Promise<Response>(resolve => { releaseQuota = () => resolve(new Response(JSON.stringify(snapshot))); });
     }
     return new Response(JSON.stringify(snapshot));

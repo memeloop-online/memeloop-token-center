@@ -54,19 +54,49 @@ impl Peer {
         version: http::Version,
         policy: crate::provider::CodexTransportPolicy,
     ) -> Self {
+        Self::with_builder(
+            version,
+            crate::codex_http_protocol_test_builder(
+                policy,
+                crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                version,
+            ),
+        )
+        .await
+    }
+
+    pub(super) async fn for_account(fixture: &CodexRouteFixture, version: http::Version) -> Self {
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let config: Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT config_json FROM upstream_accounts WHERE id = $1",
+            )
+            .bind(fixture.upstream_account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        pool.close().await;
+        let policy =
+            crate::provider::CodexTransportPolicy::parse(config.get("transport_policy")).unwrap();
+        Self::with_builder(
+            version,
+            crate::codex_http_client_builder(policy, crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL),
+        )
+        .await
+    }
+
+    async fn with_builder(version: http::Version, builder: wreq::ClientBuilder) -> Self {
         let fixture = TlsFixture::for_host(HOST).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy =
             wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
-        let client = crate::codex_http_protocol_test_builder(
-            policy,
-            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
-            version,
-        )
-        .tls_cert_store(fixture.roots)
-        .proxy(proxy)
-        .build()
-        .unwrap();
+        let client = builder
+            .tls_cert_store(fixture.roots)
+            .proxy(proxy)
+            .build()
+            .unwrap();
         let (accepted_sender, accepted) = mpsc::unbounded_channel();
         let (cancel_sender, cancelled) = mpsc::unbounded_channel();
         let posts = Arc::new(AtomicUsize::new(0));

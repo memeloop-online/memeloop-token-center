@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,6 +15,26 @@ use futures_util::StreamExt;
 
 pub(crate) mod memory;
 pub(crate) mod request_spool;
+
+#[cfg(test)]
+mod metered_tests;
+
+pub(crate) struct GatewayBodyReadActivity {
+    active: Arc<AtomicUsize>,
+}
+
+impl GatewayBodyReadActivity {
+    pub(crate) fn start(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for GatewayBodyReadActivity {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
@@ -160,7 +180,7 @@ pub(crate) async fn admit_gateway_request_body(
 pub(crate) async fn admit_gateway_request_body_with_memory(
     request: Request,
     permits: Arc<tokio::sync::Semaphore>,
-    responses_permits: Arc<tokio::sync::Semaphore>,
+    _responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
     audio_maximum: usize,
     memory_budget: Option<&memory::ProxyMemoryBudget>,
@@ -172,19 +192,19 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
     // into a fixed low global request cap.
     let (maximum, route_class) =
         gateway_body_limit(request.uri().path(), responses_maximum, audio_maximum);
-    let _responses_body_read_permit = (route_class == GatewayBodyRouteClass::Responses)
-        .then(|| {
-            responses_permits
-                .try_acquire_owned()
-                .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)
-        })
-        .transpose()?;
-    let _body_read_permit = permits
-        .try_acquire_owned()
-        .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?;
     let reservation = memory_budget
         .filter(|_| uses_proxy_memory_budget(request.uri().path()))
         .map(memory::ProxyMemoryBudget::reservation);
+    let byte_metered = route_class == GatewayBodyRouteClass::Default && reservation.is_some();
+    let _body_read_permit = if byte_metered {
+        None
+    } else {
+        Some(
+            permits
+                .try_acquire_owned()
+                .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?,
+        )
+    };
     admit_request_body_for_route(
         request,
         None,
@@ -768,7 +788,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(body_permits.available_permits(), 0);
-        assert_eq!(responses_permits.available_permits(), 0);
+        assert_eq!(responses_permits.available_permits(), 1);
         assert_eq!(spool.snapshot().active_files, 1);
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::task::yield_now().await;
@@ -876,7 +896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_body_has_an_independent_bounded_admission() {
+    async fn responses_body_uses_shared_admission_despite_exhausted_legacy_permits() {
         let standard = Arc::new(tokio::sync::Semaphore::new(1));
         let responses = Arc::new(tokio::sync::Semaphore::new(1));
         let held = responses
@@ -885,24 +905,43 @@ mod tests {
             .expect("responses permit");
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = polls.clone();
-        let rejected = Request::post("/v1/responses")
+        let admitted = Request::post("/v1/responses")
             .body(Body::from_stream(stream::poll_fn(move |_| {
-                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"x"))))
+                let previous = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(
+                    (previous == 0).then_some(Ok::<_, Infallible>(Bytes::from_static(b"x"))),
+                )
             })))
             .expect("responses request");
-        assert!(matches!(
+        assert!(
             admit_gateway_request_body(
-                rejected,
+                admitted,
                 standard.clone(),
                 responses.clone(),
                 16 * 1024 * 1024,
             )
-            .await,
-            Err(GatewayBodyAdmissionError::CapacityExhausted)
-        ));
+            .await
+            .is_ok()
+        );
         assert_eq!(standard.available_permits(), 1);
-        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(responses.available_permits(), 0);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let shared_held = standard.clone().try_acquire_owned().unwrap();
+        for path in ["/v1/responses", "/v1/responses/compact"] {
+            let rejected = Request::post(path).body(Body::empty()).unwrap();
+            assert!(matches!(
+                admit_gateway_request_body(
+                    rejected,
+                    standard.clone(),
+                    responses.clone(),
+                    16 * 1024 * 1024,
+                )
+                .await,
+                Err(GatewayBodyAdmissionError::CapacityExhausted)
+            ));
+        }
+        drop(shared_held);
 
         let ordinary = Request::post("/v1/chat/completions")
             .body(Body::empty())

@@ -6,7 +6,88 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
-import { quotaBatchFixtureResponse } from './support/quota-batch.js';
+import { quotaReadFixtureResponse } from './support/quota-batch.js';
+
+test('production quota row and detail refresh remain independent while another account is pending', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const accounts = ['account-slow', 'account-fast'].map(id => ({ id, name: id, tenant_external_id: 'fixture-a', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 0, config: {}, created_at: 1, updated_at: 1 }));
+    const reads: { id: string; trigger: string | null }[] = [];
+    const pending = new Map<string, (() => void)[]>();
+    const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+    const unexpected: string[] = [];
+    let initialReadsStarted: (() => void) | undefined;
+    const initialReads = new Promise<void>(resolve => { initialReadsStarted = resolve; });
+    let nextReadStarted: (() => void) | undefined;
+    const nextRead = () => new Promise<void>(resolve => { nextReadStarted = resolve; });
+    const release = (id: string) => { const settle = pending.get(id)?.shift(); assert.ok(settle, `pending read for ${id}`); settle(); };
+    await page.route('**/*', async route => {
+      const request = route.request(); const url = new URL(request.url());
+      if (url.origin !== origin || (url.pathname.startsWith('/internal/') && request.method() !== 'GET')) { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
+      if (!url.pathname.startsWith('/internal/')) return route.continue();
+      if (/^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(url.pathname)) {
+        const snapshot = quotaReadFixtureResponse(url, accounts.map(account => ({ id: account.id, tenant: account.tenant_external_id, driver: account.driver })));
+        reads.push({ id: snapshot.upstream_account_id, trigger: url.searchParams.get('trigger') });
+        await new Promise<void>(resolve => {
+          const queued = pending.get(snapshot.upstream_account_id) ?? []; queued.push(resolve); pending.set(snapshot.upstream_account_id, queued);
+          if (reads.length === 2) initialReadsStarted?.();
+          nextReadStarted?.(); nextReadStarted = undefined;
+        });
+        return route.fulfill({ json: snapshot });
+      }
+      if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: accounts });
+      if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: {} }, credential_schema: { type: 'object', properties: { type: { const: 'api_key' }, value: { type: 'string', writeOnly: true } } } }] });
+      if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 1, status: 'ready', models: [], disabled_models: [] } });
+      if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: false } });
+      if (url.pathname.includes('monitoring')) return route.fulfill({ json: { top_upstream_models: [] } });
+      if (url.pathname.includes('availability')) return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
+      return route.fulfill({ json: [] });
+    });
+    await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
+    await initialReads;
+    const slowRow = page.locator('[data-upstream-id="account-slow"] .provider-directory-row');
+    const fastRow = page.locator('[data-upstream-id="account-fast"] .provider-directory-row');
+    const fastRefresh = fastRow.getByRole('button', { name: 'Refresh quota', exact: true });
+    const bulkRefresh = page.getByRole('button', { name: 'Refresh all upstream quotas', exact: true });
+    assert.equal(await slowRow.getByRole('button', { name: 'Refresh quota', exact: true }).isDisabled(), true);
+    assert.equal(await fastRefresh.isDisabled(), true);
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('[data-upstream-id="account-fast"] .provider-directory-actions button')?.matches(':enabled'));
+    assert.equal(await bulkRefresh.isDisabled(), true, 'bulk ownership remains active until the slow row settles');
+    assert.equal(pending.get('account-slow')?.length, 1);
+    const rowRead = nextRead();
+    await fastRefresh.click(); await rowRead;
+    assert.equal(await fastRefresh.isDisabled(), true, 'the row blocks only its own duplicate read');
+    const detail = await manageProviderAccount(page, 'account-fast');
+    const detailRefresh = detail.locator('.upstream-quota-heading button');
+    assert.equal(await detailRefresh.isDisabled(), true, 'detail shares the row in-flight owner');
+    assert.equal(reads.filter(read => read.id === 'account-fast').length, 2);
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('#provider-details-account-fast .upstream-quota-heading button')?.matches(':enabled'));
+    assert.equal(pending.get('account-slow')?.length, 1, 'detail can refresh before the slow row completes');
+    const detailRead = nextRead();
+    await detailRefresh.click(); await detailRead;
+    assert.equal(await detailRefresh.isDisabled(), true);
+    assert.equal(await fastRow.locator('.provider-directory-actions button').first().isDisabled(), true, 'the hidden row shares the detail in-flight owner');
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('#provider-details-account-fast .upstream-quota-heading button')?.matches(':enabled'));
+    await detail.getByRole('button', { name: 'Back to account list', exact: true }).click();
+    assert.equal(await fastRefresh.isEnabled(), true);
+    assert.equal(await slowRow.getByRole('button', { name: 'Refresh quota', exact: true }).isDisabled(), true);
+    release('account-slow');
+    await page.waitForFunction(() => document.querySelector('.quota-read-toolbar button')?.matches(':enabled'));
+    assert.deepEqual(reads.filter(read => read.id === 'account-fast').map(read => read.trigger), ['bulk', 'manual', 'manual']);
+    assert.deepEqual(reads.filter(read => read.id === 'account-slow').map(read => read.trigger), ['bulk']);
+    assert.deepEqual(unexpected, []); assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('independent proxy save updates concurrency metadata without dropping the provider draft', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -32,8 +113,8 @@ test('independent proxy save updates concurrency metadata without dropping the p
     const quotaDetails = page.locator('.provider-detail-workspace .upstream-quota');
     await row.waitFor();
     assert.doesNotMatch(await row.innerText(), /account-native|openai-codex|credential_generation/);
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
-    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBatchBodies), [['account-native']], 'the list auto-read covers exactly the authorized active accounts once');
+    await page.waitForFunction(() => window.formJourneyQuotaBulkReads.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBulkReads), ['account-native'], 'the list auto-read covers exactly the authorized active accounts once');
     await row.getByText('已用 75%', { exact: false }).waitFor();
     assert.doesNotMatch(await row.innerText(), /尚未读取/, 'the list no longer waits for manual quota reads');
     assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
@@ -139,11 +220,11 @@ test('independent proxy save updates concurrency metadata without dropping the p
     // a reset. These reads and the proxy update are in-memory only; no reset
     // endpoint (not even preparation) is allowed by this fixture.
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&quota-generation`);
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
+    await page.waitForFunction(() => window.formJourneyQuotaBulkReads.length === 1);
     // The fixture exposes one available reset credit with a known expiry.
     await row.getByText('重置于', { exact: false }).waitFor();
     await row.getByRole('button', { name: '刷新额度', exact: true }).click();
-    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 1);
+    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 2);
     await row.getByText('重置于', { exact: false }).waitFor();
     assert.doesNotMatch(await row.innerText(), /重置机会最近到期/);
     const quotaSummary = row.locator('.quota-summary');
@@ -169,7 +250,7 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).waitFor();
     await page.evaluate(() => { window.deferNextFormQuotaRead = true; });
     await quotaDetails.getByRole('button', { name: '刷新额度', exact: true }).click();
-    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 2);
+    await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 3);
     await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
     await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.30:1080');
     await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
@@ -183,14 +264,14 @@ test('independent proxy save updates concurrency metadata without dropping the p
       'unknown capability must not allow reset preparation after a credential-generation change',
     );
     // The superseded single read settles without publishing, and the list then
-    // auto-recovers the new generation with exactly one compensating batch read.
-    await page.evaluate(() => { window.deferNextFormQuotaBatch = true; });
+    // auto-recovers the new generation with exactly one compensating read.
+    await page.evaluate(() => { window.deferNextFormQuotaBulkRead = true; });
     await page.evaluate(() => window.releaseFormQuotaRead());
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 2 && document.querySelector('.provider-directory-row')?.textContent?.includes('等待刷新'));
+    await page.waitForFunction(() => window.formJourneyQuotaBulkReads.length === 2 && document.querySelector('.provider-directory-row')?.textContent?.includes('正在刷新额度'));
     const queuedRow = await row.textContent();
-    assert.ok(queuedRow?.includes('等待刷新'), 'the compensating batch queues the hidden list row');
+    assert.ok(queuedRow?.includes('正在刷新额度'), 'the compensating read refreshes the hidden list row');
     assert.doesNotMatch(queuedRow ?? '', /75|代次 1 额度/, 'the fenced old-generation response never publishes');
-    await page.evaluate(() => window.releaseFormQuotaBatch());
+    await page.evaluate(() => window.releaseFormQuotaBulkRead());
     await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.match(await row.innerText(), /25/);
     assert.doesNotMatch(await row.innerText(), /75/);
@@ -220,13 +301,13 @@ test('list quota auto-read stays single in flight and compensates a generation c
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
     });
     await page.addInitScript(() => { localStorage.setItem('mtc-locale', 'zh-CN'); });
-    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&hold-quota-batch`);
+    await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow&hold-quota-bulk-read`);
     const row = page.locator('.provider-directory-row');
     await row.waitFor();
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 1);
-    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBatchBodies), [['account-native']], 'first load auto-reads exactly the eligible accounts');
-    assert.match(await row.innerText(), /等待刷新/, 'first load shows the queued state while the batch is in flight');
-    assert.equal(await page.getByRole('button', { name: '刷新全部上游额度', exact: true }).isDisabled(), true, 'the in-flight batch owns the refresh-all action');
+    await page.waitForFunction(() => window.formJourneyQuotaBulkReads.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBulkReads), ['account-native'], 'first load auto-reads exactly the eligible accounts');
+    assert.match(await row.innerText(), /正在刷新额度/, 'first load shows the reading state while the read is in flight');
+    assert.equal(await page.getByRole('button', { name: '刷新全部上游额度', exact: true }).isDisabled(), true, 'the in-flight bulk read owns the refresh-all action');
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
     await page.locator('.provider-detail-workspace').waitFor();
     await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
@@ -234,10 +315,10 @@ test('list quota auto-read stays single in flight and compensates a generation c
     await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
     await page.locator('.provider-proxy-value input').waitFor();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path === '/internal/v1/upstreams').length >= 2);
-    assert.equal(await page.evaluate(() => window.formJourneyQuotaBatchBodies.length), 1, 'no duplicate batch while the first read is in flight');
-    await page.evaluate(() => window.releaseFormQuotaBatch());
-    await page.waitForFunction(() => window.formJourneyQuotaBatchBodies.length === 2);
-    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBatchBodies), [['account-native'], ['account-native']], 'the settled stale batch triggers exactly one compensating read');
+    assert.equal(await page.evaluate(() => window.formJourneyQuotaBulkReads.length), 1, 'no duplicate read while the first read is in flight');
+    await page.evaluate(() => window.releaseFormQuotaBulkRead());
+    await page.waitForFunction(() => window.formJourneyQuotaBulkReads.length === 2);
+    assert.deepEqual(await page.evaluate(() => window.formJourneyQuotaBulkReads), ['account-native', 'account-native'], 'the settled stale read triggers exactly one compensating read');
     await page.locator('.provider-detail-workspace .upstream-quota-windows').getByText('代次 2 额度', { exact: false }).waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
@@ -323,7 +404,7 @@ test('account deletion clears only its workspace and ordinary tooltips omit tech
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'deletion contracts only use the isolated fixture');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
-        if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [...(!deleted && listedTenant === 'fixture-a' ? [firstId] : []), secondId].map(id => ({ id, tenant: listedTenant, driver: 'http-json' }))) });
+        if (request.method() === 'GET' && /^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(url.pathname)) return route.fulfill({ json: quotaReadFixtureResponse(url, [...(!deleted && listedTenant === 'fixture-a' ? [firstId] : []), secondId].map(id => ({ id, tenant: listedTenant, driver: 'http-json' }))) });
         if (request.method() !== 'GET') {
           assert.equal(request.method(), 'DELETE');
           assert.equal(url.pathname, `/internal/v1/upstreams/${firstId}`);
@@ -436,8 +517,8 @@ test('account workspace returns without retained details, shares list tracks and
         const request = route.request(); const url = new URL(request.url());
         assert.equal(url.origin, origin, 'account contracts never contact a live provider');
         if (!url.pathname.startsWith('/internal/')) return route.continue();
+        if (request.method() === 'GET' && /^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(url.pathname)) return route.fulfill({ json: quotaReadFixtureResponse(url, accounts(listedTenant).map(account => ({ id: account.id, tenant: account.tenant_external_id, driver: account.driver }))) });
         if (request.method() !== 'GET') {
-          if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), accounts(listedTenant).map(account => ({ id: account.id, tenant: account.tenant_external_id, driver: account.driver }))) });
           assert.equal(request.method(), 'PUT');
           assert.equal(url.pathname, '/internal/v1/upstreams/account-fixture-a');
           writes += 1;
