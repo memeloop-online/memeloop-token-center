@@ -114,16 +114,14 @@ impl RequestAttemptBudget {
     where
         F: std::future::Future<Output = Result<ProxyRouteResponse, ProxySendError>>,
     {
-        // The failover window bounds candidate selection. A native compact
-        // already dispatched can compute silently for longer; wait for its
-        // response or client cancellation instead of aborting that work.
-        match self.deadline.filter(|_| !wait_for_compaction) {
-            // Cancellation after dispatch is ambiguous. It never grants another send.
-            Some(deadline) => tokio::time::timeout_at(deadline, send)
-                .await
-                .unwrap_or(Err(ProxySendError::OuterDeadline)),
-            None => send.await,
+        if !wait_for_compaction
+            && self
+                .deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(ProxySendError::OuterDeadline);
         }
+        send.await
     }
 }
 
@@ -289,12 +287,84 @@ mod tests {
             budget.terminal_reason(3),
             Some("upstream_attempts_exhausted")
         );
-        let result = budget.send(std::future::pending(), false).await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let result = budget
+            .send(
+                async { panic!("expired selection must not dispatch") },
+                false,
+            )
+            .await;
         assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
         assert_eq!(
             budget.terminal_reason(1),
             Some("upstream_failover_deadline")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_dispatched_send_outlives_selection_without_replenishing_budget() {
+        let mut budget = RequestAttemptBudget::from_primary(
+            &route(codex_transport::DRIVER, None),
+            Uuid::from_u128(6),
+        )
+        .unwrap();
+        budget.arm();
+        let started = tokio::time::Instant::now();
+        let result = budget
+            .send(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(310)).await;
+                    Err(ProxySendError::NonRetryableTransport(
+                        TransportFailureKind::Http2Reset,
+                    ))
+                },
+                false,
+            )
+            .await;
+        assert_eq!(
+            result.err(),
+            Some(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Http2Reset
+            ))
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(310));
+        assert_eq!(
+            budget.terminal_reason(1),
+            Some("upstream_failover_deadline")
+        );
+        let result = budget
+            .send(async { panic!("expired selection must not replay") }, false)
+            .await;
+        assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatched_send_remains_cancellable_after_selection_deadline() {
+        let mut budget = RequestAttemptBudget::from_primary(
+            &route(codex_transport::DRIVER, None),
+            Uuid::from_u128(7),
+        )
+        .unwrap();
+        budget.arm();
+        let (dropped, mut observed) = tokio::sync::oneshot::channel::<()>();
+        let send = budget.send(
+            async move {
+                let _dropped = dropped;
+                std::future::pending().await
+            },
+            false,
+        );
+        let mut send = Box::pin(send);
+        tokio::select! {
+            _ = &mut send => panic!("selection budget must not cancel dispatched send"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(310)) => {}
+        }
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(send);
+        assert!(observed.await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
