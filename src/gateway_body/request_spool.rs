@@ -10,7 +10,7 @@ use std::{
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -32,12 +32,39 @@ impl RequestSpoolAdmission {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn capture(
         &self,
         body: Body,
         maximum: usize,
         declared_content_length: Option<usize>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        self.capture_with_memory(body, maximum, declared_content_length, None, 0)
+            .await
+    }
+
+    pub(crate) async fn capture_with_memory(
+        &self,
+        body: Body,
+        maximum: usize,
+        declared_content_length: Option<usize>,
+        memory: Option<&Arc<super::memory::ProxyMemoryReservation>>,
+        request_metadata_bytes: usize,
+    ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        let metadata = memory
+            .map(|memory| {
+                memory
+                    .try_reserve_ingress_bytes(
+                        request_metadata_bytes
+                            .saturating_add(std::mem::size_of::<RequestSpoolCapture>())
+                            .saturating_add(std::mem::size_of::<RequestSpool>())
+                            .saturating_add(std::mem::size_of::<std::fs::File>() * 3)
+                            .saturating_add(REQUEST_SPOOL_CHUNK_BYTES),
+                    )
+                    .map(Arc::new)
+                    .ok_or(RequestSpoolCaptureError::MemoryExhausted)
+            })
+            .transpose()?;
         let mut lease = RequestSpoolLease::new(self.budget.clone());
         if let Some(length) = declared_content_length {
             if length > maximum {
@@ -49,15 +76,16 @@ impl RequestSpoolAdmission {
         }
         prepare_directory(self.directory.as_ref()).await?;
         let directory = self.directory.clone();
+        let opening_metadata = metadata.clone();
         let (owner, writer) = tokio::task::spawn_blocking(move || {
+            let _opening_metadata = opening_metadata;
             let owner = tempfile::tempfile_in(directory.as_ref())?;
             let writer = owner.try_clone()?;
             Ok::<_, io::Error>((owner, writer))
         })
         .await
         .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-        let writer = tokio::fs::File::from_std(writer);
+        .map_err(spool_io_error)?;
         let mut capture = RequestSpoolCapture {
             owner: Some(Arc::new(owner)),
             writer,
@@ -69,6 +97,14 @@ impl RequestSpoolAdmission {
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
+            let frame_memory = memory
+                .map(|memory| {
+                    memory
+                        .try_reserve_ingress_bytes(chunk.len())
+                        .map(Arc::new)
+                        .ok_or(RequestSpoolCaptureError::MemoryExhausted)
+                })
+                .transpose()?;
             for piece in chunk.chunks(REQUEST_SPOOL_CHUNK_BYTES) {
                 let next = capture
                     .length
@@ -82,20 +118,22 @@ impl RequestSpoolAdmission {
                     .lease
                     .try_grow(next.saturating_sub(reserved))
                     .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
-                capture
-                    .writer
-                    .write_all(piece)
-                    .await
-                    .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+                let mut writer = capture.writer.try_clone().map_err(spool_io_error)?;
+                let write_metadata = metadata.clone();
+                let write_frame = frame_memory.clone();
+                let write_bytes = piece.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    let _write_metadata = write_metadata;
+                    let _write_frame = write_frame;
+                    std::io::Write::write_all(&mut writer, &write_bytes)
+                })
+                .await
+                .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+                .map_err(spool_io_error)?;
                 capture.hasher.update(piece);
                 capture.length = next;
             }
         }
-        capture
-            .writer
-            .flush()
-            .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
         capture.lease.shrink_to(capture.length);
         let owner = capture
             .owner
@@ -106,6 +144,7 @@ impl RequestSpoolAdmission {
             owner,
             length: capture.length,
             digest,
+            _metadata: metadata,
             _lease: std::mem::replace(
                 &mut capture.lease,
                 RequestSpoolLease::new(self.budget.clone()),
@@ -226,7 +265,7 @@ impl Drop for RequestSpoolLease {
 
 struct RequestSpoolCapture {
     owner: Option<Arc<std::fs::File>>,
-    writer: tokio::fs::File,
+    writer: std::fs::File,
     lease: RequestSpoolLease,
     length: usize,
     hasher: blake3::Hasher,
@@ -236,6 +275,7 @@ pub(crate) struct RequestSpool {
     owner: Arc<std::fs::File>,
     length: usize,
     digest: [u8; 32],
+    _metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     _lease: RequestSpoolLease,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
@@ -277,30 +317,40 @@ impl RequestSpool {
 async fn prepare_directory(directory: &Path) -> Result<(), RequestSpoolCaptureError> {
     tokio::fs::create_dir_all(directory)
         .await
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+        .map_err(spool_io_error)?;
     let mut current = PathBuf::new();
     for component in directory.components() {
         current.push(component.as_os_str());
         let metadata = tokio::fs::symlink_metadata(&current)
             .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+            .map_err(spool_io_error)?;
         if metadata.file_type().is_symlink() {
             return Err(RequestSpoolCaptureError::Unavailable);
         }
     }
     let metadata = tokio::fs::metadata(directory)
         .await
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+        .map_err(spool_io_error)?;
     if !metadata.is_dir() {
         return Err(RequestSpoolCaptureError::Unavailable);
     }
     Ok(())
 }
 
+fn spool_io_error(error: io::Error) -> RequestSpoolCaptureError {
+    tracing::error!(
+        error_kind = ?error.kind(),
+        os_error = error.raw_os_error(),
+        "local request spool I/O unavailable"
+    );
+    RequestSpoolCaptureError::Unavailable
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestSpoolCaptureError {
     TooLarge,
     CapacityExhausted,
+    MemoryExhausted,
     BodyReadRejected,
     Unavailable,
 }

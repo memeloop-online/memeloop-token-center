@@ -195,7 +195,10 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
     let reservation = memory_budget
         .filter(|_| uses_proxy_memory_budget(request.uri().path()))
         .map(memory::ProxyMemoryBudget::reservation);
-    let byte_metered = route_class == GatewayBodyRouteClass::Default && reservation.is_some();
+    let byte_metered = matches!(
+        route_class,
+        GatewayBodyRouteClass::Default | GatewayBodyRouteClass::Responses
+    ) && reservation.is_some();
     let _body_read_permit = if byte_metered {
         None
     } else {
@@ -304,12 +307,30 @@ async fn admit_request_body_for_route(
             deadline,
             request_spool
                 .ok_or(GatewayBodyAdmissionError::RequestSpoolUnavailable)?
-                .capture(body, read_maximum, declared_content_length_usize),
+                .capture_with_memory(
+                    body,
+                    read_maximum,
+                    declared_content_length_usize,
+                    reservation.as_ref(),
+                    std::mem::size_of_val(&parts)
+                        .saturating_add(parts.uri.to_string().len())
+                        .saturating_add(parts.headers.iter().fold(0usize, |bytes, (name, value)| {
+                            bytes.saturating_add(std::mem::size_of::<(
+                                axum::http::HeaderName,
+                                axum::http::HeaderValue,
+                            )>())
+                            .saturating_add(name.as_str().len())
+                            .saturating_add(value.as_bytes().len())
+                        })),
+                ),
         )
         .await?
         .map_err(|error| match error {
             request_spool::RequestSpoolCaptureError::CapacityExhausted => {
                 GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
+            }
+            request_spool::RequestSpoolCaptureError::MemoryExhausted => {
+                GatewayBodyAdmissionError::CapacityExhausted
             }
             request_spool::RequestSpoolCaptureError::Unavailable => {
                 GatewayBodyAdmissionError::RequestSpoolUnavailable
@@ -438,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn declared_body_cannot_poll_without_request_spool_capacity() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let budget = memory::ProxyMemoryBudget::new(256 * 1024);
         let spool = test_request_spool(64 * 1024);
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = polls.clone();
@@ -473,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_responses_body_releases_spool_bytes_after_capacity_rejection() {
-        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        let budget = memory::ProxyMemoryBudget::new(256 * 1024);
         let spool = test_request_spool(16 * 1024);
         let request = Request::builder()
             .method("POST")
