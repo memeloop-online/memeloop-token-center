@@ -167,12 +167,12 @@ pub(super) async fn authenticate_gateway_before_body(
             "messages" | "count_tokens" => "anthropic",
             _ => "openai",
         });
-    let operation = async {
+    let operation = Box::pin(async {
         match admit_authenticated_gateway_body(&state, request, next, diagnostic_context).await {
             Ok(response) => response,
             Err(error) => error.into_response(),
         }
-    };
+    });
     Ok(match protocol {
         Some(protocol) => super::early_request::observe(&state, &key, protocol, operation).await,
         None => operation.await,

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use axum::{http::HeaderValue, response::Response};
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 
 use crate::{AppState, db::EarlyRequestTerminal, error::PublicErrorCode, model::AuthenticatedKey};
@@ -42,7 +43,7 @@ pub(super) async fn observe(
     state: &AppState,
     key: &AuthenticatedKey,
     protocol: &'static str,
-    operation: impl std::future::Future<Output = Response>,
+    operation: BoxFuture<'_, Response>,
 ) -> Response {
     let context = super::proxy_diagnostics::Context::current();
     let created_at = crate::db::unix_millis()
