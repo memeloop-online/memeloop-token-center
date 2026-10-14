@@ -57,7 +57,7 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
             Duration::from_secs(5),
             send_response_usage_request(
                 &fixture,
-                &json!({"model": fixture.model, "input": "small", "stream": true}),
+                &json!({"model": fixture.model, "input": "small", "stream": true, "max_output_tokens": 16}),
             ),
         )
         .await
