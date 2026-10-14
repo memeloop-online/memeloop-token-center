@@ -126,15 +126,7 @@ async fn codex_output_limit_invalid_requests_have_no_admission_side_effects() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     assert!(upstream.received_requests().await.unwrap().is_empty());
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations")
         .fetch_one(&pool)

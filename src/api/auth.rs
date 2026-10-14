@@ -150,16 +150,41 @@ fn control_body_rejection(
 
 pub(super) async fn authenticate_gateway_before_body(
     State(state): State<AppState>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::CONTEXT.try_with(|context| *context).ok();
     let authentication = diagnostic_context
         .map(|context| proxy_diagnostics::Phase::new(context, "gateway_authentication"));
-    let _ = authenticate_downstream(request.headers(), &state).await?;
+    let key = authenticate_downstream(request.headers(), &state).await?;
     if let Some(phase) = authentication {
         phase.finish("completed", None, None);
     }
+    let protocol = (request.method() == axum::http::Method::POST)
+        .then(|| proxy_diagnostics::route_class(request.uri().path()))
+        .flatten()
+        .map(|route| match route {
+            "messages" | "count_tokens" => "anthropic",
+            _ => "openai",
+        });
+    let operation = async {
+        match admit_authenticated_gateway_body(&state, request, next, diagnostic_context).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        }
+    };
+    Ok(match protocol {
+        Some(protocol) => super::early_request::observe(&state, &key, protocol, operation).await,
+        None => operation.await,
+    })
+}
+
+async fn admit_authenticated_gateway_body(
+    state: &AppState,
+    mut request: Request,
+    next: Next,
+    diagnostic_context: Option<proxy_diagnostics::Context>,
+) -> Result<Response, AppError> {
     let audio_request = request.method() == axum::http::Method::POST
         && request.uri().path() == "/v1/audio/transcriptions";
     let mut media_lifecycle_permit = if matches!(
@@ -195,7 +220,7 @@ pub(super) async fn authenticate_gateway_before_body(
         {
             Ok(request) => request,
             Err(error) => {
-                let response = gateway_body_admission_rejection(&state, &request_id, error);
+                let response = gateway_body_admission_rejection(state, &request_id, error);
                 if let Some(phase) = body_read {
                     phase.finish("rejected", Some(response.status().as_u16()), None);
                 }
@@ -312,6 +337,9 @@ fn gateway_request_spool_rejection(code: &'static str, message: &'static str) ->
         Json(json!({"error": {"code": code, "message": message}})),
     )
         .into_response();
+    response
+        .extensions_mut()
+        .insert(crate::error::PublicErrorCode(code));
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));

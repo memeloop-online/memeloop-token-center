@@ -63,12 +63,16 @@ impl DispatchError {
             return crate::error::AppError::BadRequest("invalid Codex transport policy".into())
                 .into_response();
         }
-        (
+        let mut response = (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "1")],
             axum::Json(self.overload_body()),
         )
-            .into_response()
+            .into_response();
+        response
+            .extensions_mut()
+            .insert(crate::error::PublicErrorCode(self.code()));
+        response
     }
 
     pub(crate) fn overload_body(self) -> serde_json::Value {

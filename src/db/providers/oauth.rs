@@ -1394,6 +1394,22 @@ impl Database {
         }
         let generation = current_generation + 1;
         let updated_at = now.max(row.try_get::<i64, _>("updated_at")?.saturating_add(1));
+        if resource_kind == UPSTREAM_OAUTH_REFRESH_RESOURCE
+            && expected_generation == Some(current_generation)
+            && prepared_ciphertext.is_some()
+            && row
+                .try_get::<Option<String>, _>("oauth_session_id")?
+                .is_some()
+        {
+            super::oauth_catalog::carry_forward_refresh_catalog(
+                tx,
+                account_id,
+                &row,
+                &credential,
+                key_material,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND revoked_at IS NULL",
         )

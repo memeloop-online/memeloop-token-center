@@ -156,15 +156,7 @@ async fn invalid_dispatch_policy_is_bad_request_without_retry_after_or_admission
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!response.headers().contains_key(header::RETRY_AFTER));
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
@@ -499,15 +491,7 @@ async fn dispatch_queue_timeout_and_capacity_have_no_durable_admission_side_effe
                 .unwrap();
         assert_eq!(body["error"]["code"], expected);
         drop(held);
-        assert!(
-            fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_only_early_request_failures(&fixture).await;
         assert_eq!(archive_file_count(&fixture.archive_path), 0);
         assert!(upstream.received_requests().await.unwrap().is_empty());
         assert_eq!(

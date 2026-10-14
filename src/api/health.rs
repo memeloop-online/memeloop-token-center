@@ -200,6 +200,7 @@ pub(super) async fn prometheus_metrics(
             + &state.archive.readiness_metrics()
             + &state.persistence.render()
             + &state.routing_persistence.render_routing()
+            + &state.early_requests.metrics()
             + &state.db.gateway_persistence_metrics(),
     )
         .into_response())

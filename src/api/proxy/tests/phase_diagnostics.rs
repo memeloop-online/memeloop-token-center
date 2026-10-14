@@ -33,7 +33,7 @@ async fn unauthorized_responses_request_does_not_poll_or_spool_the_body() {
 }
 
 #[tokio::test]
-async fn early_rejections_return_server_correlation_without_creating_request_records() {
+async fn authenticated_early_rejections_record_server_correlation() {
     let fixture = codex_route_fixture("phase-early-rejections").await;
     let supplied_id = Uuid::new_v4();
     for (path, authorized, body, expected) in [
@@ -97,13 +97,14 @@ async fn early_rejections_return_server_correlation_without_creating_request_rec
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     assert_ne!(id, supplied_id);
+    fixture.state.early_requests.drain_for_test().await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(
-        count, 0,
-        "pre-admission diagnostics must not add database writes"
+        count, 4,
+        "authenticated failures are terminal records; unauthenticated failures are excluded"
     );
     pool.close().await;
 }

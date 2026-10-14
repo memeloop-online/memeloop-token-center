@@ -40,6 +40,7 @@ mod codex_proxy_groups;
 mod codex_quota;
 mod codex_workbuddy;
 mod cursor;
+mod early_terminal;
 mod egress;
 mod filter_assistant;
 mod gateway_persistence;
@@ -516,10 +517,12 @@ async fn missing_custom_bound_neither_reserves_nor_dispatches_and_valid_candidat
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_records")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM request_records WHERE reservation_id <> ''"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         0
     );
     assert!(upstream.received_requests().await.unwrap().is_empty());
@@ -546,7 +549,8 @@ async fn missing_custom_bound_neither_reserves_nor_dispatches_and_valid_candidat
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let _body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    fixture.state.early_requests.drain_for_test().await;
+    wait_for_request_settlement(&fixture, 2).await;
     let reserved_tokens: i64 = sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
         .fetch_one(&pool)
         .await
@@ -1294,16 +1298,7 @@ async fn unpriced_http_json_route_is_rejected_before_any_upstream_request() {
         serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
         "unpriced_model"
     );
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "price admission must precede persistent request creation"
-    );
+    assert_only_early_request_failures(&fixture).await;
     upstream.verify().await;
 }
 
@@ -2707,15 +2702,7 @@ async fn exhausted_proxy_lifecycle_capacity_reports_overload_before_side_effects
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     drop(held);
 }
 
@@ -2861,6 +2848,24 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
     })
     .await
     .unwrap();
+}
+
+async fn assert_only_early_request_failures(fixture: &CodexRouteFixture) {
+    fixture.state.early_requests.drain_for_test().await;
+    let requests = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 100)
+        .await
+        .unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|request| {
+        request.terminal_cause_code.as_deref() == Some("gateway_pre_admission")
+            && !request.billing.billable
+            && request.upstream_account_id.is_none()
+            && request.route_id.is_none()
+            && request.status_code.is_some_and(|status| status >= 400)
+    }));
 }
 
 async fn drain_archive_capture(fixture: &CodexRouteFixture) {
@@ -3326,15 +3331,7 @@ async fn unsupported_codex_protocol_and_chat_shapes_fail_before_side_effects() {
             assert!(body.contains(expected_detail), "{body}");
         }
     }
-    assert!(
-        fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_only_early_request_failures(&fixture).await;
     assert_eq!(archive_file_count(&fixture.archive_path), 0);
     assert!(upstream.received_requests().await.unwrap().is_empty());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -4127,15 +4124,7 @@ async fn malformed_codex_credential_and_config_fail_before_side_effects() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_only_early_request_failures(&fixture).await;
         assert_eq!(archive_file_count(&fixture.archive_path), 0);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations")
