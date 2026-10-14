@@ -129,8 +129,8 @@ config:
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
   # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
   proxyMemoryBudgetBytes: 536870912
-  # Gateway request bodies are admitted independently of proxy lifecycles.
-  # Saturation returns 503 before reading the body; supported range is 1..8192.
+  # Count admission for readers without complete shared byte accounting.
+  # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
   # `/v1/responses` may exceed the normal 4 MiB gateway request. Four dedicated
   # concurrent reads and the separate process disk-byte budget bound admission.

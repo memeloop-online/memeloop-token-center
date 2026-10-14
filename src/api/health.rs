@@ -174,8 +174,9 @@ pub(super) async fn prometheus_metrics(
         proxy_memory_limit_bytes,
         retained_request_memory_used_bytes,
         retained_request_memory_limit_bytes,
-        gateway_body_reads: (state.config.gateway_body_read_concurrency as usize)
-            .saturating_sub(state.gateway_body_read_permits.available_permits()),
+        gateway_body_reads: state
+            .gateway_body_reads
+            .load(std::sync::atomic::Ordering::Acquire),
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
         responses_request_spool_limit_bytes: request_spool.limit_bytes,

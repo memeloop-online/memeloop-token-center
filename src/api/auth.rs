@@ -207,6 +207,8 @@ async fn admit_authenticated_gateway_body(
             .unwrap_or_else(|| safe_gateway_request_id(request.headers()));
         let body_read = diagnostic_context
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
+        let _body_read_activity =
+            crate::gateway_body::GatewayBodyReadActivity::start(state.gateway_body_reads.clone());
         request = match crate::gateway_body::admit_gateway_request_body_with_memory(
             request,
             state.gateway_body_read_permits.clone(),
