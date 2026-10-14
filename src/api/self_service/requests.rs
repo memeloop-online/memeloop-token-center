@@ -177,16 +177,18 @@ pub(in crate::api) async fn request_detail_response(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
 ) -> Result<Response, AppError> {
-    request_detail_response_with_transport_diagnostics(state, refs, Vec::new()).await
+    request_detail_response_with_transport_diagnostics(state, refs, Vec::new(), None).await
 }
 
 pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
     state: &AppState,
     refs: crate::model::RequestArchiveRefs,
     transport_diagnostics: Vec<crate::model::RequestTransportDiagnosticView>,
+    egress_attempts: Option<Vec<crate::db::egress::RequestEgressAttempt>>,
 ) -> Result<Response, AppError> {
     let mut detail = request_detail(state, refs).await;
     detail.transport_diagnostics = transport_diagnostics;
+    detail.egress_attempts = egress_attempts;
     let mut body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;
     if body.len() > MAX_ARCHIVE_DETAIL_RESPONSE {
         detail.request_body = Value::Null;

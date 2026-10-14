@@ -166,6 +166,7 @@ pub(in crate::api::proxy) enum ProxySendError {
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
+    pub(in crate::api::proxy) egress_selection: Option<super::codex::egress::FinalSelection>,
     pub(in crate::api::proxy) response: UpstreamResponse,
     pub(in crate::api::proxy) upstream_activity: crate::metrics::ActivityGuard,
     pub(in crate::api::proxy) codex_retry: CodexRetryTerminalGuard,

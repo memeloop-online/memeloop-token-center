@@ -369,6 +369,35 @@ async fn pre_header_reset_then_success_settles_one_logical_request() {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status_code, Some(200));
+        fixture.state.routing_persistence.drain_for_test().await;
+        let attempts = fixture
+            .state
+            .db
+            .request_egress_attempts(rows[0].request_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
+        assert!(attempts.iter().all(|attempt| attempt.completed));
+        assert!(attempts.iter().all(|attempt| {
+            attempt.upstream_account_id == fixture.upstream_account_id
+                && attempt.route_id == fixture.route_id
+                && attempt.selected.kind == "direct"
+                && attempt.request_payload_bytes.is_some()
+                && attempt.measurement_basis == "application_payload_estimate"
+        }));
+        let final_attempts: Vec<_> = attempts
+            .iter()
+            .filter(|attempt| attempt.final_response)
+            .collect();
+        assert_eq!(final_attempts.len(), 1);
+        assert_eq!(
+            final_attempts[0].response_payload_bytes,
+            Some(completed_codex_sse("recovered").len() as i64)
+        );
+        assert!(attempts.iter().any(|attempt| {
+            !attempt.final_response && attempt.response_payload_bytes.is_none()
+        }));
         assert_exactly_once_side_effects_for(
             &fixture,
             rows[0].request_id,
