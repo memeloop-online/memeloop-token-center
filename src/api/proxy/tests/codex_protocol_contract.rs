@@ -57,8 +57,7 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
 }
 
 async fn streaming(version: http::Version, cancel: bool, silence: bool) {
-    let mut fixture = codex_route_fixture("protocol-stream").await;
-    fixture.state.proxy_lifecycle_permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let fixture = codex_route_fixture("protocol-stream").await;
     super::ha_policy::set_policy(
         &fixture,
         json!({"http_protocol": account_protocol(version)}),
@@ -105,7 +104,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
     }
     assert!(rendered.contains("call-contract"));
     assert!(!rendered.contains("response.completed"));
-    assert!(fixture.state.proxy_lifecycle_permits.try_acquire().is_err());
+    assert_eq!(fixture.state.proxy_lifecycles.active(), 1);
     if silence {
         let started = std::time::Instant::now();
         let until = tokio::time::sleep(Duration::from_secs(310));
@@ -166,13 +165,12 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         1,
         "tool output must never replay"
     );
-    let _permit = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(3),
-        fixture.state.proxy_lifecycle_permits.acquire(),
+        fixture.state.proxy_lifecycles.wait_for_idle(),
     )
     .await
-    .expect("lifecycle permit must be released")
-    .unwrap();
+    .expect("lifecycle permit must be released");
 }
 
 async fn compact(version: http::Version) {

@@ -9,7 +9,7 @@ async fn cancel_before_headers(stream: bool) {
         .expect(1)
         .mount(&upstream)
         .await;
-    let available = fixture.state.proxy_lifecycle_permits.available_permits();
+    let available = fixture.state.proxy_lifecycles.active();
     let mut request = Box::pin(send_codex_route(
         &fixture,
         &upstream,
@@ -40,8 +40,8 @@ async fn cancel_before_headers(stream: bool) {
     assert_eq!(rows[0].status_code, None);
     let request_id = rows[0].request_id;
     assert_eq!(
-        fixture.state.proxy_lifecycle_permits.available_permits(),
-        available - 1
+        fixture.state.proxy_lifecycles.active(),
+        available + 1
     );
     drop(request);
     wait_for_request_settlement(&fixture, 1).await;
@@ -55,7 +55,7 @@ async fn cancel_before_headers(stream: bool) {
     assert_eq!(rows[0].error_code.as_deref(), Some("request_cancelled"));
     assert_eq!(rows[0].cost, "0");
     tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture.state.proxy_lifecycle_permits.available_permits() != available {
+        while fixture.state.proxy_lifecycles.active() != available {
             tokio::task::yield_now().await;
         }
     })
