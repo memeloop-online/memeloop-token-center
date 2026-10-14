@@ -130,10 +130,19 @@ pub async fn wait_for_server_shutdown(
 /// Each role owns one bounded, serial lane. Slow provider calls do not block
 /// projections, maintenance, or observing the server shutdown signal.
 pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>) {
+    run_until_shutdown_with_oauth_stop(state, shutdown.clone(), shutdown).await;
+}
+
+pub async fn run_until_shutdown_with_oauth_stop(
+    state: AppState,
+    shutdown: watch::Receiver<bool>,
+    oauth_shutdown: watch::Receiver<bool>,
+) {
     if *shutdown.borrow() {
         return;
     }
     let (role_stop, role_shutdown) = watch::channel(false);
+    let (oauth_stop, oauth_role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
     let mut oauth_refresh_roles = JoinSet::new();
     let blocking_tasks = BlockingTasks::new();
@@ -167,7 +176,11 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
     macro_rules! periodic {
         ($name:literal, $period:expr, $operation:expr) => {{
             let state = state.clone();
-            let shutdown = role_shutdown.clone();
+            let shutdown = if $name == "oauth_refresh" {
+                oauth_role_shutdown.clone()
+            } else {
+                role_shutdown.clone()
+            };
             let task = async move {
                 let operation = $operation;
                 run_periodic($period, shutdown.clone(), || operation(&state, &shutdown)).await;
@@ -406,13 +419,17 @@ pub async fn run_until_shutdown(state: AppState, shutdown: watch::Receiver<bool>
             refresh_plugin_service_data(state, shutdown, &service_data_blocking).await;
         }
     );
-    supervise_roles_with_oauth_refresh(
+    supervise_roles_with_early_oauth_shutdown(
         roles,
-        oauth_refresh_roles,
+        OAuthRefreshRoles {
+            roles: oauth_refresh_roles,
+            stop: oauth_stop,
+            shutdown: oauth_shutdown,
+            grace: OAUTH_REFRESH_SHUTDOWN_GRACE,
+        },
         role_stop,
         shutdown,
         SHUTDOWN_GRACE,
-        OAUTH_REFRESH_SHUTDOWN_GRACE,
         blocking_tasks,
     )
     .await;
@@ -623,36 +640,100 @@ async fn supervise_roles(
     .await;
 }
 
+#[cfg(test)]
 async fn supervise_roles_with_oauth_refresh(
-    mut roles: JoinSet<&'static str>,
-    mut oauth_refresh_roles: JoinSet<&'static str>,
+    roles: JoinSet<&'static str>,
+    oauth_refresh_roles: JoinSet<&'static str>,
     role_stop: watch::Sender<bool>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     grace: Duration,
     oauth_grace: Duration,
     blocking_tasks: BlockingTasks,
 ) {
-    let mut failed = tokio::select! {
-        biased;
-        _ = wait_for_shutdown(&mut shutdown) => false,
-        result = roles.join_next(), if !roles.is_empty() => {
-            tracing::error!(?result, "worker role exited unexpectedly; stopping worker roles");
-            true
-        }
-        result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => {
-            tracing::error!(?result, "OAuth refresh role exited unexpectedly; stopping worker roles");
-            true
+    supervise_roles_with_early_oauth_shutdown(
+        roles,
+        OAuthRefreshRoles {
+            roles: oauth_refresh_roles,
+            stop: role_stop.clone(),
+            shutdown: shutdown.clone(),
+            grace: oauth_grace,
+        },
+        role_stop,
+        shutdown,
+        grace,
+        blocking_tasks,
+    )
+    .await;
+}
+
+struct OAuthRefreshRoles {
+    roles: JoinSet<&'static str>,
+    stop: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+    grace: Duration,
+}
+
+async fn supervise_roles_with_early_oauth_shutdown(
+    mut roles: JoinSet<&'static str>,
+    oauth: OAuthRefreshRoles,
+    role_stop: watch::Sender<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    grace: Duration,
+    blocking_tasks: BlockingTasks,
+) {
+    let OAuthRefreshRoles {
+        roles: mut oauth_refresh_roles,
+        stop: oauth_stop,
+        shutdown: mut oauth_shutdown,
+        grace: oauth_grace,
+    } = oauth;
+    let mut oauth_stopping = false;
+    let mut oauth_aborted = false;
+    let oauth_deadline = tokio::time::sleep(oauth_grace);
+    tokio::pin!(oauth_deadline);
+    let mut failed = loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => break false,
+            _ = wait_for_shutdown(&mut oauth_shutdown), if !oauth_stopping => {
+                let _ = oauth_stop.send(true);
+                oauth_stopping = true;
+                oauth_deadline.as_mut().reset(tokio::time::Instant::now() + oauth_grace);
+            }
+            _ = &mut oauth_deadline, if oauth_stopping && !oauth_aborted && !oauth_refresh_roles.is_empty() => {
+                tracing::error!(stage = "oauth_refresh_shutdown", "OAuth refresh drain deadline reached; an unpersisted result may be unknown");
+                oauth_refresh_roles.abort_all();
+                oauth_aborted = true;
+            }
+            result = roles.join_next(), if !roles.is_empty() => {
+                tracing::error!(?result, "worker role exited unexpectedly; stopping worker roles");
+                break true;
+            }
+            result = oauth_refresh_roles.join_next(), if !oauth_refresh_roles.is_empty() => {
+                match result {
+                    Some(Ok(_)) if oauth_stopping => {},
+                    Some(Err(error)) if oauth_aborted && error.is_cancelled() => {},
+                    _ => {
+                        tracing::error!(?result, "OAuth refresh role exited unexpectedly; stopping worker roles");
+                        break true;
+                    }
+                }
+            }
         }
     };
     // No new blocking calls may start during drain. Calls already running
     // retain their independent plugin execution deadline and remain joinable.
     let mut blocking = blocking_tasks.close();
     let _ = role_stop.send(true);
+    let _ = oauth_stop.send(true);
     let deadline = tokio::time::sleep(grace);
-    let oauth_deadline = tokio::time::sleep(oauth_grace);
-    tokio::pin!(deadline, oauth_deadline);
+    if !oauth_stopping {
+        oauth_deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + oauth_grace);
+    }
+    tokio::pin!(deadline);
     let mut ordinary_aborted = false;
-    let mut oauth_aborted = false;
     while !roles.is_empty() || !oauth_refresh_roles.is_empty() {
         tokio::select! {
             biased;

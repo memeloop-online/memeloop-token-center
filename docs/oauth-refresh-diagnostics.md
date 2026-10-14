@@ -128,7 +128,12 @@ On worker shutdown, ordinary roles retain their 30-second shared grace. The
 single OAuth-refresh role stops scheduling new work and retains up to180seconds
 to finish the current exchange and local persistence. Both task sets remain
 owned and joined; the OAuth lane is forcibly cancelled with a safe error event
-only at its own bounded deadline. Existing chart pod termination grace1320seconds
-already accommodates this; no pod setting changes are required. A process kill
+only at its own bounded deadline. In `all` mode, process shutdown starts this
+OAuth drain concurrently with HTTP connection drain, not after it. Ordinary
+worker roles remain available for in-flight HTTP cleanup until HTTP drain
+finishes, then retain their original 30-second grace. Finishing HTTP drain does
+not restart the OAuth deadline. The existing chart pod termination grace of
+1320seconds accommodates the default 1260second HTTP budget and these concurrent
+drains; neither HTTP grace nor pod settings are changed. A process kill
 or deployment overriding the pod grace below this drain budget can still lose
 an unstaged result.
