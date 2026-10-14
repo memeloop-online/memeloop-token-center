@@ -71,26 +71,32 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await drawer.getByRole('region', { name: copy.attemptsTitle, exact: true }).evaluate(element => element.scrollIntoView({ block: 'start' }));
       await page.screenshot({ path: `${artifactRoot}/egress-attempts-${locale}-390.png`, fullPage: false });
       const finalAttempt = drawer.locator('[data-egress-attempt="attempt-b"]');
-      await finalAttempt.scrollIntoViewIfNeeded();
-      assert.equal(await finalAttempt.evaluate(element => {
-        const bounds = element.getBoundingClientRect();
-        const drawerBounds = element.closest('[role="dialog"]')!.getBoundingClientRect();
-        return bounds.top >= Math.max(0, drawerBounds.top) && bounds.bottom <= Math.min(innerHeight, drawerBounds.bottom);
-      }), true, 'the final-attempt screenshot includes its heading, directional bytes, completion and disclosure');
+      await finalAttempt.locator('h4').evaluate(element => element.scrollIntoView({ block: 'start' }));
       await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-${locale}-390.png`, fullPage: false });
+      await finalAttempt.getByRole('button', { name: copy.technical, exact: true }).evaluate(element => element.scrollIntoView({ block: 'end' }));
+      await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-bottom-${locale}-390.png`, fullPage: false });
+      const finalFactsVisible = await finalAttempt.evaluate(element => {
+        const facts = element.querySelector('.egress-facts')!.getBoundingClientRect();
+        const completion = element.querySelector('p')!.getBoundingClientRect();
+        const drawerBounds = element.closest('[role="dialog"]')!.getBoundingClientRect();
+        return { top: facts.top, bottom: completion.bottom, viewportTop: Math.max(0, drawerBounds.top), viewportBottom: Math.min(innerHeight, drawerBounds.bottom) };
+      });
+      assert.ok(finalFactsVisible.top >= finalFactsVisible.viewportTop && finalFactsVisible.bottom <= finalFactsVisible.viewportBottom,
+        `the final-attempt bottom frame shows both directional byte values and completion: ${JSON.stringify(finalFactsVisible)}`);
       await finalAttempt.getByRole('button', { name: copy.technical, exact: true }).click();
       await finalAttempt.getByText('attempt-b', { exact: true }).waitFor();
       const identifiers = finalAttempt.locator('.egress-facts').last();
-      await identifiers.scrollIntoViewIfNeeded();
+      await identifiers.evaluate(element => element.scrollIntoView({ block: 'end' }));
       await page.mouse.move(0, 0);
       await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
-      assert.equal(await identifiers.evaluate(element => {
+      await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-identifiers-${locale}-390.png`, fullPage: false });
+      const identifiersVisible = await identifiers.evaluate(element => {
         const bounds = element.getBoundingClientRect();
         const drawerBounds = element.closest('[role="dialog"]')!.getBoundingClientRect();
-        return bounds.top >= Math.max(0, drawerBounds.top) && bounds.bottom <= Math.min(innerHeight, drawerBounds.bottom)
-          && element.scrollWidth <= element.clientWidth;
-      }), true, 'all expanded troubleshooting identifiers are visible without horizontal clipping');
-      await page.screenshot({ path: `${artifactRoot}/egress-attempts-final-identifiers-${locale}-390.png`, fullPage: false });
+        return { top: bounds.top, bottom: bounds.bottom, viewportTop: Math.max(0, drawerBounds.top), viewportBottom: Math.min(innerHeight, drawerBounds.bottom), scrollWidth: element.scrollWidth, clientWidth: element.clientWidth };
+      });
+      assert.ok(identifiersVisible.top >= identifiersVisible.viewportTop && identifiersVisible.bottom <= identifiersVisible.viewportBottom && identifiersVisible.scrollWidth <= identifiersVisible.clientWidth,
+        `all expanded troubleshooting identifiers fit in their own frame: ${JSON.stringify(identifiersVisible)}`);
       assert.deepEqual(errors, []);
       await page.close();
     }
