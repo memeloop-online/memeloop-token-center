@@ -1,4 +1,5 @@
 mod conversations;
+mod early_terminal;
 mod lifecycle;
 mod metered_projection;
 mod pricing_stats;
@@ -13,6 +14,7 @@ pub use conversations::{ConversationDetailFilter, ConversationListFilter};
 pub(crate) use conversations::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
+pub(crate) use early_terminal::EarlyRequestTerminal;
 pub use lifecycle::{
     AttachProxyArchiveResult, FinishMeteredSynchronousRequest, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput,

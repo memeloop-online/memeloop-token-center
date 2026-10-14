@@ -161,7 +161,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) sse_framing_limits: crate::provider::SseFramingLimits,
     pub(super) response_headers: HeaderMap,
     pub(super) buffered_request: BufferedRequest<'a>,
-    pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
+    pub(super) proxy_lifecycle_permit: crate::proxy_lifecycle::ProxyLifecycleActivity,
     pub(super) dispatch_permit: Option<crate::codex_clients::DispatchPermit>,
 }
 

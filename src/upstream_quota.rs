@@ -149,6 +149,22 @@ fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
     })
 }
 
+fn codex_quota_transport_policy(
+    config: &Value,
+    budget: QuotaBudget,
+) -> Result<crate::provider::CodexTransportPolicy, &'static str> {
+    let value = config.get("transport_policy");
+    let mut policy = crate::provider::CodexTransportPolicy::parse(value)?;
+    let total_millis = budget.total.as_millis() as u64;
+    policy.connect_timeout_millis =
+        if value.is_some_and(|policy| policy.get("connect_timeout_millis").is_some()) {
+            policy.connect_timeout_millis.min(total_millis)
+        } else {
+            total_millis
+        };
+    Ok(policy)
+}
+
 #[derive(Clone, Copy)]
 struct QuotaRequestContext {
     account_id: Uuid,
@@ -801,9 +817,6 @@ async fn read_codex(
         .map_err(|_| "credential_invalid")?;
     let account_header = crate::oauth::managed::codex::account_header_value(credential)
         .map_err(|_| "credential_invalid")?;
-    // Never use caller/account base_url or network_scope for these fixed
-    // supplier endpoints. Validate the already-authorized encrypted proxy,
-    // then reuse the account generation's fingerprinted wreq client and policy.
     crate::network::validate_codex_transport(
         USAGE_URL,
         &json!({"network_scope":"public"}),
@@ -824,23 +837,21 @@ async fn read_codex(
         );
         "quota_destination_invalid"
     })?;
-    let http = state
-        .codex_clients
-        .account_transport_snapshot(account, credential, selection.generation)
-        .map_err(|_| {
-            tracing::warn!(
-                operation = "quota_supplier_read",
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                endpoint_kind = "quota_client",
-                trigger = trigger.as_str(),
-                phase = "client",
-                error_kind = "transport_client_unavailable",
-                "quota supplier client setup failed"
-            );
-            "quota_transport_failed"
-        })?;
-    let budget = codex_quota_budget(&account.config).map_err(|_| "quota_destination_invalid")?;
+    let budget = codex_quota_budget(&account.config)?;
+    let policy = codex_quota_transport_policy(&account.config, budget)?;
+    let http = crate::build_codex_http_client_with_policy(policy).map_err(|_| {
+        tracing::warn!(
+            operation = "quota_supplier_read",
+            upstream_account_id = %account.id,
+            credential_generation = account.credential_generation,
+            endpoint_kind = "quota_client",
+            trigger = trigger.as_str(),
+            phase = "client",
+            error_kind = "transport_client_unavailable",
+            "quota supplier client setup failed"
+        );
+        "quota_transport_failed"
+    })?;
     let (credential_header, credential_value) = credential
         .request_header(observation_started_at)
         .map_err(|_| "credential_invalid")?
@@ -1047,7 +1058,13 @@ async fn get_codex_json(
                     retry::Failure::terminal("quota_destination_invalid", "client")
                 })?);
             }
-            let response = request.send().await.map_err(retry::Failure::wreq)?;
+            let response = request.send().await.map_err(|error| {
+                if tokio::time::Instant::now() >= deadline {
+                    retry::Failure::terminal("quota_timeout", "deadline")
+                } else {
+                    retry::Failure::wreq(error)
+                }
+            })?;
             if let Some(failure) =
                 retry::Failure::status(response.status().as_u16(), response.headers())
             {
@@ -1283,6 +1300,44 @@ mod tests {
     }
 
     #[test]
+    fn quota_connections_use_the_read_budget_without_changing_model_defaults() {
+        for (config, expected_millis) in [
+            (json!({}), 20_000),
+            (json!({"transport_policy":{"connect_attempts":4}}), 20_000),
+            (
+                json!({"transport_policy":{"connect_timeout_millis":15000}}),
+                15_000,
+            ),
+            (
+                json!({"transport_policy":{"connect_timeout_millis":1000}}),
+                1_000,
+            ),
+            (
+                json!({"transport_policy":{"connect_timeout_millis":30000}}),
+                20_000,
+            ),
+            (
+                json!({"quota_read_policy":{"total_timeout_millis":10000}}),
+                10_000,
+            ),
+        ] {
+            let budget = codex_quota_budget(&config).unwrap();
+            let policy = codex_quota_transport_policy(&config, budget).unwrap();
+            assert_eq!(policy.connect_timeout_millis, expected_millis);
+            assert_eq!(budget.attempt_limit, 3);
+            let model_policy =
+                crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
+                    .unwrap();
+            assert_eq!(
+                model_policy.connect_timeout_millis,
+                config["transport_policy"]["connect_timeout_millis"]
+                    .as_u64()
+                    .unwrap_or(5_000)
+            );
+        }
+    }
+
+    #[test]
     fn quota_read_trigger_log_values_are_stable() {
         assert_eq!(
             QuotaReadTrigger::from(QuotaRequestTrigger::Manual),
@@ -1302,18 +1357,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_total_budget_allows_a_fifteen_second_proxy_connect_policy() {
+    async fn default_quota_connection_budget_allows_a_slow_proxy_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
-        let config = json!({
-            "transport_policy": {"connect_timeout_millis":15000},
-            "quota_read_policy": {"max_attempts":1}
-        });
+        let config = json!({"quota_read_policy": {"max_attempts":1}});
         let budget = codex_quota_budget(&config).unwrap();
         assert_eq!(budget.total, Duration::from_secs(20));
         assert_eq!(budget.read, Duration::from_secs(8));
         let client = crate::build_codex_http_client_with_policy(
-            crate::provider::CodexTransportPolicy::parse(config.get("transport_policy")).unwrap(),
+            codex_quota_transport_policy(&config, budget).unwrap(),
         )
         .unwrap();
         let task = tokio::spawn(async move {
@@ -1344,8 +1396,6 @@ mod tests {
         assert_eq!(greeting[0], 5);
         let mut methods = vec![0; greeting[1] as usize];
         socket.read_exact(&mut methods).await.unwrap();
-        // Stall inside the proxy handshake, beyond the body-inactivity budget
-        // but still inside the explicitly configured 15-second connection limit.
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(14)).await;
         tokio::task::yield_now().await;

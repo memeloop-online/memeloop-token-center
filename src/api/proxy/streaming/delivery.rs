@@ -138,6 +138,7 @@ fn delivery_error_class(error: &AppError) -> &'static str {
         AppError::NotFound => "owner_missing",
         AppError::BadRequest(_) | AppError::CompactionProducerUnavailable => "invalid_state",
         AppError::Overloaded => "overloaded",
+        AppError::NoAuthorizedUpstreamCandidate => "no_authorized_upstream_candidate",
         AppError::Unauthorized | AppError::Forbidden => "authorization",
         AppError::UnpricedModel
         | AppError::QuotaExceeded

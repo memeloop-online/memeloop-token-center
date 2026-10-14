@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,6 +15,26 @@ use futures_util::StreamExt;
 
 pub(crate) mod memory;
 pub(crate) mod request_spool;
+
+#[cfg(test)]
+mod metered_tests;
+
+pub(crate) struct GatewayBodyReadActivity {
+    active: Arc<AtomicUsize>,
+}
+
+impl GatewayBodyReadActivity {
+    pub(crate) fn start(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for GatewayBodyReadActivity {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
@@ -172,12 +192,19 @@ pub(crate) async fn admit_gateway_request_body_with_memory(
     // into a fixed low global request cap.
     let (maximum, route_class) =
         gateway_body_limit(request.uri().path(), responses_maximum, audio_maximum);
-    let _body_read_permit = permits
-        .try_acquire_owned()
-        .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?;
     let reservation = memory_budget
         .filter(|_| uses_proxy_memory_budget(request.uri().path()))
         .map(memory::ProxyMemoryBudget::reservation);
+    let byte_metered = route_class == GatewayBodyRouteClass::Default && reservation.is_some();
+    let _body_read_permit = if byte_metered {
+        None
+    } else {
+        Some(
+            permits
+                .try_acquire_owned()
+                .map_err(|_| GatewayBodyAdmissionError::CapacityExhausted)?,
+        )
+    };
     admit_request_body_for_route(
         request,
         None,

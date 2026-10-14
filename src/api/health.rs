@@ -174,14 +174,14 @@ pub(super) async fn prometheus_metrics(
         proxy_memory_limit_bytes,
         retained_request_memory_used_bytes,
         retained_request_memory_limit_bytes,
-        gateway_body_reads: (state.config.gateway_body_read_concurrency as usize)
-            .saturating_sub(state.gateway_body_read_permits.available_permits()),
+        gateway_body_reads: state
+            .gateway_body_reads
+            .load(std::sync::atomic::Ordering::Acquire),
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
         responses_request_spool_limit_bytes: request_spool.limit_bytes,
         responses_request_spool_capacity_rejections: request_spool.capacity_rejections,
-        proxy_lifecycles: (state.config.proxy_lifecycle_concurrency as usize)
-            .saturating_sub(state.proxy_lifecycle_permits.available_permits()),
+        proxy_lifecycles: state.proxy_lifecycles.active(),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             .saturating_sub(state.proxy_archive_stream_permits.available_permits()),
         plugin_cache_entries: plugin.cache_entries,
@@ -200,6 +200,7 @@ pub(super) async fn prometheus_metrics(
             + &state.archive.readiness_metrics()
             + &state.persistence.render()
             + &state.routing_persistence.render_routing()
+            + &state.early_requests.metrics()
             + &state.db.gateway_persistence_metrics(),
     )
         .into_response())

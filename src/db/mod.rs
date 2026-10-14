@@ -75,6 +75,7 @@ mod plugin_service_data;
 mod projection_lock;
 mod providers;
 mod requests;
+pub(crate) use requests::EarlyRequestTerminal;
 mod rotation;
 mod routing;
 pub use routing::egress;

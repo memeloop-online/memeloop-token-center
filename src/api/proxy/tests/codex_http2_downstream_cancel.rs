@@ -172,8 +172,7 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         (true, true, false) => "h2-downstream-pre-header-rst",
         (false, true, false) => "h2-downstream-pre-header-tcp-close",
     };
-    let mut fixture = codex_route_fixture(label).await;
-    fixture.state.proxy_lifecycle_permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let fixture = codex_route_fixture(label).await;
     let route = single_dispatch_route(&fixture).await;
     fixture.state.codex_clients.install_test_client(
         crate::build_codex_http2_test_client(
@@ -261,7 +260,7 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         assert!(!rendered.contains("[DONE]"));
         body = Some(response_body);
     }
-    assert!(fixture.state.proxy_lifecycle_permits.try_acquire().is_err());
+    assert_eq!(fixture.state.proxy_lifecycles.active(), 1);
     assert!(matches!(
         fixture
             .state
@@ -286,13 +285,12 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         .expect("downstream cancellation must cancel the silent upstream immediately")
         .unwrap();
     assert_eq!(reason, http2::Reason::CANCEL);
-    let _lifecycle = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(3),
-        fixture.state.proxy_lifecycle_permits.acquire(),
+        fixture.state.proxy_lifecycles.wait_for_idle(),
     )
     .await
-    .expect("lifecycle permit must be returned without upstream EOF")
-    .unwrap();
+    .expect("lifecycle permit must be returned without upstream EOF");
     let _dispatch = fixture
         .state
         .codex_clients

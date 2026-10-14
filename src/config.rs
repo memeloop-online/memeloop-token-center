@@ -156,14 +156,12 @@ pub struct Config {
     pub database_max_connections: u32,
     #[serde(default)]
     pub terminal_projection_enabled: bool,
-    /// Maximum complete proxy lifecycles retained by one gateway process.
-    /// Service saturation is distinct from a credential policy limit and is
-    /// reported as HTTP 503, never as a per-key 429.
+    /// Legacy deployment compatibility value; lifecycle admission uses bytes.
     pub proxy_lifecycle_concurrency: u32,
     /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
     pub proxy_memory_budget_bytes: u32,
-    /// Maximum gateway request bodies buffered concurrently. The permit covers
-    /// only the bounded body read, not the complete proxy lifecycle.
+    /// Maximum concurrent readers without complete shared byte admission.
+    /// Byte-metered default text bodies do not consume these count permits.
     pub gateway_body_read_concurrency: u32,
     /// Maximum `/v1/responses` request body size. It is separately admitted so
     /// its 16 MiB default cannot consume all general body-read capacity.

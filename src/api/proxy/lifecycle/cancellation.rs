@@ -11,7 +11,7 @@ struct CancelledRequest {
     context: proxy_diagnostics::Context,
     tenant_id: Uuid,
     reservation: UsageReservation,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::proxy_lifecycle::ProxyLifecycleActivity,
 }
 
 impl CancellationGuard {
@@ -21,7 +21,7 @@ impl CancellationGuard {
         context: proxy_diagnostics::Context,
         tenant_id: Uuid,
         reservation: UsageReservation,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: crate::proxy_lifecycle::ProxyLifecycleActivity,
     ) {
         self.owner = Some(CancelledRequest {
             database,
@@ -38,7 +38,7 @@ impl CancellationGuard {
 
     pub(in crate::api::proxy) fn handoff(
         &mut self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    ) -> Result<crate::proxy_lifecycle::ProxyLifecycleActivity, AppError> {
         self.owner
             .take()
             .map(|owner| owner.permit)
