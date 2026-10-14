@@ -8,6 +8,87 @@ import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 import { providerConnectionCopy } from '../src/operator/providerConnectionCopy.js';
 import { quotaReadFixtureResponse } from './support/quota-batch.js';
 
+test('production quota row and detail refresh remain independent while another account is pending', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const accounts = ['account-slow', 'account-fast'].map(id => ({ id, name: id, tenant_external_id: 'fixture-a', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 0, config: {}, created_at: 1, updated_at: 1 }));
+    const reads: { id: string; trigger: string | null }[] = [];
+    const pending = new Map<string, (() => void)[]>();
+    const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+    const unexpected: string[] = [];
+    let initialReadsStarted: (() => void) | undefined;
+    const initialReads = new Promise<void>(resolve => { initialReadsStarted = resolve; });
+    let nextReadStarted: (() => void) | undefined;
+    const nextRead = () => new Promise<void>(resolve => { nextReadStarted = resolve; });
+    const release = (id: string) => { const settle = pending.get(id)?.shift(); assert.ok(settle, `pending read for ${id}`); settle(); };
+    await page.route('**/*', async route => {
+      const request = route.request(); const url = new URL(request.url());
+      if (url.origin !== origin || (url.pathname.startsWith('/internal/') && request.method() !== 'GET')) { unexpected.push(`${request.method()} ${url.pathname}`); return route.abort(); }
+      if (!url.pathname.startsWith('/internal/')) return route.continue();
+      if (/^\/internal\/v1\/upstreams\/[^/]+\/quota$/.test(url.pathname)) {
+        const snapshot = quotaReadFixtureResponse(url, accounts.map(account => ({ id: account.id, tenant: account.tenant_external_id, driver: account.driver })));
+        reads.push({ id: snapshot.upstream_account_id, trigger: url.searchParams.get('trigger') });
+        await new Promise<void>(resolve => {
+          const queued = pending.get(snapshot.upstream_account_id) ?? []; queued.push(resolve); pending.set(snapshot.upstream_account_id, queued);
+          if (reads.length === 2) initialReadsStarted?.();
+          nextReadStarted?.(); nextReadStarted = undefined;
+        });
+        return route.fulfill({ json: snapshot });
+      }
+      if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: accounts });
+      if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'http-json', display_name: 'Fixture provider', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: {} }, credential_schema: { type: 'object', properties: { type: { const: 'api_key' }, value: { type: 'string', writeOnly: true } } } }] });
+      if (url.pathname.endsWith('/models')) return route.fulfill({ json: { account_id: url.pathname.split('/')[4], credential_generation: 1, status: 'ready', models: [], disabled_models: [] } });
+      if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: false } });
+      if (url.pathname.includes('monitoring')) return route.fulfill({ json: { top_upstream_models: [] } });
+      if (url.pathname.includes('availability')) return route.fulfill({ json: { tenant_external_id: 'fixture-a', accounts: [] } });
+      return route.fulfill({ json: [] });
+    });
+    await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
+    await initialReads;
+    const slowRow = page.locator('[data-upstream-id="account-slow"] .provider-directory-row');
+    const fastRow = page.locator('[data-upstream-id="account-fast"] .provider-directory-row');
+    const fastRefresh = fastRow.getByRole('button', { name: 'Refresh quota', exact: true });
+    const bulkRefresh = page.getByRole('button', { name: 'Refresh all upstream quotas', exact: true });
+    assert.equal(await slowRow.getByRole('button', { name: 'Refresh quota', exact: true }).isDisabled(), true);
+    assert.equal(await fastRefresh.isDisabled(), true);
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('[data-upstream-id="account-fast"] .provider-directory-actions button')?.matches(':enabled'));
+    assert.equal(await bulkRefresh.isDisabled(), true, 'bulk ownership remains active until the slow row settles');
+    assert.equal(pending.get('account-slow')?.length, 1);
+    const rowRead = nextRead();
+    await fastRefresh.click(); await rowRead;
+    assert.equal(await fastRefresh.isDisabled(), true, 'the row blocks only its own duplicate read');
+    const detail = await manageProviderAccount(page, 'account-fast');
+    const detailRefresh = detail.locator('.upstream-quota-heading button');
+    assert.equal(await detailRefresh.isDisabled(), true, 'detail shares the row in-flight owner');
+    assert.equal(reads.filter(read => read.id === 'account-fast').length, 2);
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('#provider-details-account-fast .upstream-quota-heading button')?.matches(':enabled'));
+    assert.equal(pending.get('account-slow')?.length, 1, 'detail can refresh before the slow row completes');
+    const detailRead = nextRead();
+    await detailRefresh.click(); await detailRead;
+    assert.equal(await detailRefresh.isDisabled(), true);
+    assert.equal(await fastRefresh.isDisabled(), true, 'the hidden row shares the detail in-flight owner');
+    release('account-fast');
+    await page.waitForFunction(() => document.querySelector('#provider-details-account-fast .upstream-quota-heading button')?.matches(':enabled'));
+    await detail.getByRole('button', { name: 'Back to account list', exact: true }).click();
+    assert.equal(await fastRefresh.isEnabled(), true);
+    assert.equal(await slowRow.getByRole('button', { name: 'Refresh quota', exact: true }).isDisabled(), true);
+    release('account-slow');
+    await page.waitForFunction(() => document.querySelector('.quota-read-toolbar button')?.matches(':enabled'));
+    assert.deepEqual(reads.filter(read => read.id === 'account-fast').map(read => read.trigger), ['bulk', 'manual', 'manual']);
+    assert.deepEqual(reads.filter(read => read.id === 'account-slow').map(read => read.trigger), ['bulk']);
+    assert.deepEqual(unexpected, []); assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('independent proxy save updates concurrency metadata without dropping the provider draft', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
