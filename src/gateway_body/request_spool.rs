@@ -2,7 +2,7 @@ use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -58,6 +58,7 @@ impl RequestSpoolAdmission {
                         request_metadata_bytes
                             .saturating_add(std::mem::size_of::<RequestSpoolCapture>())
                             .saturating_add(std::mem::size_of::<RequestSpool>())
+                            .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>())
                             .saturating_add(std::mem::size_of::<std::fs::File>() * 3)
                             .saturating_add(REQUEST_SPOOL_CHUNK_BYTES),
                     )
@@ -65,20 +66,24 @@ impl RequestSpoolAdmission {
                     .ok_or(RequestSpoolCaptureError::MemoryExhausted)
             })
             .transpose()?;
-        let mut lease = RequestSpoolLease::new(self.budget.clone());
+        let lease = Arc::new(Mutex::new(RequestSpoolLease::new(self.budget.clone())));
         if let Some(length) = declared_content_length {
             if length > maximum {
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
             lease
+                .lock()
+                .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                 .try_grow(length)
                 .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
         }
         prepare_directory(self.directory.as_ref()).await?;
         let directory = self.directory.clone();
         let opening_metadata = metadata.clone();
+        let opening_lease = lease.clone();
         let (owner, writer) = tokio::task::spawn_blocking(move || {
             let _opening_metadata = opening_metadata;
+            let _opening_lease = opening_lease;
             let owner = tempfile::tempfile_in(directory.as_ref())?;
             let writer = owner.try_clone()?;
             Ok::<_, io::Error>((owner, writer))
@@ -113,18 +118,25 @@ impl RequestSpoolAdmission {
                 if next > maximum {
                     return Err(RequestSpoolCaptureError::TooLarge);
                 }
-                let reserved = capture.lease.bytes();
-                capture
-                    .lease
-                    .try_grow(next.saturating_sub(reserved))
-                    .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
+                {
+                    let mut lease = capture
+                        .lease
+                        .lock()
+                        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+                    let reserved = lease.bytes();
+                    lease
+                        .try_grow(next.saturating_sub(reserved))
+                        .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
+                }
                 let mut writer = capture.writer.try_clone().map_err(spool_io_error)?;
                 let write_metadata = metadata.clone();
                 let write_frame = frame_memory.clone();
+                let write_lease = capture.lease.clone();
                 let write_bytes = piece.to_vec();
                 tokio::task::spawn_blocking(move || {
                     let _write_metadata = write_metadata;
                     let _write_frame = write_frame;
+                    let _write_lease = write_lease;
                     std::io::Write::write_all(&mut writer, &write_bytes)
                 })
                 .await
@@ -134,7 +146,11 @@ impl RequestSpoolAdmission {
                 capture.length = next;
             }
         }
-        capture.lease.shrink_to(capture.length);
+        capture
+            .lease
+            .lock()
+            .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+            .shrink_to(capture.length);
         let owner = capture
             .owner
             .take()
@@ -145,10 +161,7 @@ impl RequestSpoolAdmission {
             length: capture.length,
             digest,
             _metadata: metadata,
-            _lease: std::mem::replace(
-                &mut capture.lease,
-                RequestSpoolLease::new(self.budget.clone()),
-            ),
+            _lease: capture.lease.clone(),
             #[cfg(test)]
             read_count: self.read_count.clone(),
         })
@@ -266,7 +279,7 @@ impl Drop for RequestSpoolLease {
 struct RequestSpoolCapture {
     owner: Option<Arc<std::fs::File>>,
     writer: std::fs::File,
-    lease: RequestSpoolLease,
+    lease: Arc<Mutex<RequestSpoolLease>>,
     length: usize,
     hasher: blake3::Hasher,
 }
@@ -276,7 +289,7 @@ pub(crate) struct RequestSpool {
     length: usize,
     digest: [u8; 32],
     _metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    _lease: RequestSpoolLease,
+    _lease: Arc<Mutex<RequestSpoolLease>>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
 }

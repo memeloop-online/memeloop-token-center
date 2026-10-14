@@ -314,14 +314,18 @@ async fn admit_request_body_for_route(
                     reservation.as_ref(),
                     std::mem::size_of_val(&parts)
                         .saturating_add(parts.uri.to_string().len())
-                        .saturating_add(parts.headers.iter().fold(0usize, |bytes, (name, value)| {
-                            bytes.saturating_add(std::mem::size_of::<(
-                                axum::http::HeaderName,
-                                axum::http::HeaderValue,
-                            )>())
-                            .saturating_add(name.as_str().len())
-                            .saturating_add(value.as_bytes().len())
-                        })),
+                        .saturating_add(parts.headers.iter().fold(
+                            0usize,
+                            |bytes, (name, value)| {
+                                bytes
+                                    .saturating_add(std::mem::size_of::<(
+                                        axum::http::HeaderName,
+                                        axum::http::HeaderValue,
+                                    )>())
+                                    .saturating_add(name.as_str().len())
+                                    .saturating_add(value.as_bytes().len())
+                            },
+                        )),
                 ),
         )
         .await?

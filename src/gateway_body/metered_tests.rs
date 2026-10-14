@@ -60,7 +60,12 @@ async fn responses_full_memory_rejects_before_poll_or_spool_open() {
             Ok::<_, Infallible>(bytes::Bytes::from_static(b"{}"))
         }));
         assert!(matches!(
-            admit(Request::post(path).body(body).unwrap(), Some(&budget), &spool).await,
+            admit(
+                Request::post(path).body(body).unwrap(),
+                Some(&budget),
+                &spool
+            )
+            .await,
             Err(GatewayBodyAdmissionError::CapacityExhausted)
         ));
         assert!(!polled.load(Ordering::Acquire));
@@ -79,10 +84,13 @@ async fn responses_frame_budget_and_spool_owner_release_independently() {
         let budget = memory::ProxyMemoryBudget::new(128 * 1024);
         assert!(matches!(
             admit(
-                Request::post(path).body(Body::from(vec![b'x'; 256 * 1024])).unwrap(),
+                Request::post(path)
+                    .body(Body::from(vec![b'x'; 256 * 1024]))
+                    .unwrap(),
                 Some(&budget),
                 &spool
-            ).await,
+            )
+            .await,
             Err(GatewayBodyAdmissionError::CapacityExhausted)
         ));
         assert_eq!(budget.snapshot().0, 0);
@@ -92,10 +100,20 @@ async fn responses_frame_budget_and_spool_owner_release_independently() {
         let admitted = admit(
             Request::post(path).body(Body::from("{}")).unwrap(),
             Some(&budget),
-            &spool
-        ).await.unwrap();
-        let owner = admitted.extensions().get::<Arc<request_spool::RequestSpool>>().unwrap().clone();
-        let reservation = admitted.extensions().get::<Arc<memory::ProxyMemoryReservation>>().unwrap().clone();
+            &spool,
+        )
+        .await
+        .unwrap();
+        let owner = admitted
+            .extensions()
+            .get::<Arc<request_spool::RequestSpool>>()
+            .unwrap()
+            .clone();
+        let reservation = admitted
+            .extensions()
+            .get::<Arc<memory::ProxyMemoryReservation>>()
+            .unwrap()
+            .clone();
         let metadata_bytes = budget.snapshot().0;
         drop(admitted);
         reservation.release_rejected_request();
