@@ -63,6 +63,7 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       assert.ok((await drawer.innerText()).includes(copy.final));
       assert.ok((await drawer.innerText()).includes(copy.noEof));
       assert.match(await drawer.innerText(), /HTTP\/2/);
+      assert.match(await drawer.innerText(), /Research account/);
       assert.doesNotMatch(await drawer.innerText(), /credential-canary|attempt-a|attempt-b/);
       await drawer.getByRole('region', { name: copy.attemptsTitle, exact: true }).scrollIntoViewIfNeeded();
       await page.mouse.move(0, 0);

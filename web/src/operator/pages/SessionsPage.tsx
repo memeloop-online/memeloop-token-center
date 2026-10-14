@@ -3,8 +3,9 @@ import { api } from '../../api.js';
 import { DrawerFrame, RequestDiagnostics } from '../../components.js';
 import { Button, Disclosure, LoadingState, PageLoadingRegion } from '../../design-system/index.js';
 import { useI18n } from '../../i18n.js';
-import type { RequestDetail, RequestView } from '../../types.js';
+import type { RequestDetail, RequestView, UpstreamAccount } from '../../types.js';
 import { RequestEgressDetails } from '../RequestEgressDetails';
+import { useOperatorResource } from '../hooks/useOperatorResource';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
 import { messageOf, queryForTenant } from '../scope/operatorShared.js';
 import {
@@ -62,6 +63,10 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   }
 
   const scopedSelection = requestDetailSelectionInScope(requestSelection, scopeKey);
+  const accounts = useOperatorResource(Boolean(scopedSelection.detail?.egress_attempts?.length), scopeKey,
+    signal => api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token, { signal }), '');
+  const accountNames = accounts.state.kind === 'ready' && !accounts.state.refreshError
+    ? new Map(accounts.state.value.map(account => [account.id, account.name])) : undefined;
   const closeRequestDetail = () => {
     detailRequests.current.invalidate();
     setRequestSelection(emptyRequestDetailSelection());
@@ -97,7 +102,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
       </>}
       {scopedSelection.detail && <>
           <RequestDiagnostics request={scopedSelection.detail} />
-          <RequestEgressDetails attempts={scopedSelection.detail.egress_attempts} />
+          <RequestEgressDetails attempts={scopedSelection.detail.egress_attempts} accountNames={accountNames} />
           <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
             <span><b>{t('self.archive')}</b>{scopedSelection.detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
             {scopedSelection.detail.provenance && <span><b>{t('request.provenance')}</b>{scopedSelection.detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {scopedSelection.detail.provenance.source}</span>}

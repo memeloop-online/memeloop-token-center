@@ -39,6 +39,7 @@ const json = (value: unknown) => new Response(JSON.stringify(value), { headers: 
 window.fetch = async (input) => {
   const url = new URL(String(input), location.origin);
   if (url.pathname === '/internal/v1/upstreams') {
+    if (new URLSearchParams(location.search).has('egress')) return json([{ id: 'account-a', name: 'Research account' }]);
     if (new URLSearchParams(location.search).has('directory-error')) {
       return new Response('secret-directory-body-canary', { status: 503, headers: { 'x-mtc-request-id': '01900000-0000-7000-8000-000000000001' } });
     }
