@@ -259,3 +259,63 @@ async fn native_compaction_waits_past_failover_and_transport_deadlines() {
     );
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn ordinary_codex_headers_after_310_seconds_settle_once_without_standby_replay() {
+    let fixture = codex_route_fixture("ordinary-selection-deadline").await;
+    add_codex_standby_route(
+        &fixture,
+        "codex-route-ordinary-selection-deadline",
+        "account-456",
+    )
+    .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(310))
+                .set_body_raw(
+                    completed_codex_sse("ordinary completed"),
+                    "text/event-stream",
+                ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "ordinary request", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("ordinary completed")
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    upstream.verify().await;
+}
