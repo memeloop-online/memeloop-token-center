@@ -70,7 +70,10 @@ async fn body_activity_counts_metered_and_gated_reads_and_releases_on_cancel() {
         .await
         .unwrap();
         assert_eq!(fixture.state.gateway_body_reads.load(Ordering::Acquire), 1);
-        assert_eq!(fixture.state.gateway_body_read_permits.available_permits(), 0);
+        assert_eq!(
+            fixture.state.gateway_body_read_permits.available_permits(),
+            0
+        );
         if !gated {
             assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 12 * 1024 * 1024);
         }
@@ -78,7 +81,10 @@ async fn body_activity_counts_metered_and_gated_reads_and_releases_on_cancel() {
         drop(request);
         assert_eq!(fixture.state.gateway_body_reads.load(Ordering::Acquire), 0);
         assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
-        assert_eq!(fixture.state.gateway_body_read_permits.available_permits(), usize::from(gated));
+        assert_eq!(
+            fixture.state.gateway_body_read_permits.available_permits(),
+            usize::from(gated)
+        );
         body_metric(&fixture.state, &service.token, 0).await;
         let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
             .oneshot(

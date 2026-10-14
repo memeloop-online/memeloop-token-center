@@ -37,11 +37,21 @@ async fn metered_text_reads_bypass_count_and_refund_unused_bytes() {
             .body(Body::from("{}"))
             .unwrap();
         let admitted = admit(request, Some(&budget), &spool).await.unwrap();
-        assert!(admitted.extensions().get::<Arc<memory::ProxyMemoryReservation>>().is_some());
+        assert!(
+            admitted
+                .extensions()
+                .get::<Arc<memory::ProxyMemoryReservation>>()
+                .is_some()
+        );
         let used = budget.snapshot().0;
         assert!(used >= 2 * memory::REQUEST_MEMORY_WEIGHT);
         assert!(used < MAX_DEFAULT_BODY * memory::REQUEST_MEMORY_WEIGHT);
-        assert_eq!(to_bytes(admitted.into_body(), MAX_DEFAULT_BODY).await.unwrap(), "{}");
+        assert_eq!(
+            to_bytes(admitted.into_body(), MAX_DEFAULT_BODY)
+                .await
+                .unwrap(),
+            "{}"
+        );
         assert_eq!(budget.snapshot().0, 0);
     }
     assert_eq!(spool.snapshot().active_files, 0);
@@ -88,7 +98,12 @@ async fn readers_without_complete_byte_admission_keep_the_count_gate() {
         "/self/unclassified",
     ] {
         assert!(matches!(
-            admit(Request::post(path).body(Body::empty()).unwrap(), Some(&budget), &spool).await,
+            admit(
+                Request::post(path).body(Body::empty()).unwrap(),
+                Some(&budget),
+                &spool
+            )
+            .await,
             Err(GatewayBodyAdmissionError::CapacityExhausted)
         ));
         assert_eq!(budget.snapshot().0, 0);
@@ -96,7 +111,12 @@ async fn readers_without_complete_byte_admission_keep_the_count_gate() {
     }
     for path in TEXT_ROUTES {
         assert!(matches!(
-            admit(Request::post(path).body(Body::empty()).unwrap(), None, &spool).await,
+            admit(
+                Request::post(path).body(Body::empty()).unwrap(),
+                None,
+                &spool
+            )
+            .await,
             Err(GatewayBodyAdmissionError::CapacityExhausted)
         ));
     }

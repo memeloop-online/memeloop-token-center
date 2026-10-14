@@ -24,8 +24,8 @@ use crate::{
 
 mod anthropic_bridge;
 mod archive_terminal;
-mod buffered_responses_incomplete;
 mod body_read_activity;
+mod buffered_responses_incomplete;
 mod cancellation;
 mod chat_sse_usage;
 #[cfg(feature = "experimental-plugin-revisions")]
