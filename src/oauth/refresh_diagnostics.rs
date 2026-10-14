@@ -113,6 +113,7 @@ pub(crate) struct OAuthRefreshStatus {
     pub failure_class: Option<OAuthRefreshFailureKind>,
     pub http_status: Option<u16>,
     pub reauthorization_required: bool,
+    pub automatic_refresh_paused: bool,
 }
 
 pub(crate) struct OAuthRefreshMetadata {
@@ -177,6 +178,12 @@ impl OAuthRefreshMetadata {
                 .as_ref()
                 .and_then(|value| value.failure.http_status),
             reauthorization_required: refresh_state == OAuthRefreshState::ReauthorizationRequired,
+            automatic_refresh_paused: self.request_started_at.is_some()
+                && !self.has_pending
+                && matches!(
+                    refresh_state,
+                    OAuthRefreshState::OutcomeUnknown | OAuthRefreshState::ReauthorizationRequired
+                ),
         }
     }
 }
@@ -215,6 +222,7 @@ mod tests {
         assert_eq!(status.access_state, OAuthAccessState::Expired);
         assert_eq!(status.refresh_state, OAuthRefreshState::OutcomeUnknown);
         assert!(!status.reauthorization_required);
+        assert!(status.automatic_refresh_paused);
         assert!(status.attempt_finished_at.is_none());
         assert!(status.failure_class.is_none());
     }
@@ -277,5 +285,28 @@ mod tests {
         assert_eq!(status.refresh_state, OAuthRefreshState::NotObserved);
         assert_eq!(status.access_state, OAuthAccessState::Unknown);
         assert!(!status.reauthorization_required);
+        assert!(!status.automatic_refresh_paused);
+    }
+
+    #[test]
+    fn automatic_refresh_pause_is_not_expiry_or_an_active_or_saved_attempt() {
+        let active = metadata().status(7);
+        assert_eq!(active.refresh_state, OAuthRefreshState::InProgress);
+        assert!(!active.automatic_refresh_paused);
+        let mut pending = metadata();
+        pending.has_pending = true;
+        let pending = pending.status(30);
+        assert_eq!(pending.refresh_state, OAuthRefreshState::PendingLocal);
+        assert!(!pending.automatic_refresh_paused);
+        let mut expired = metadata();
+        expired.request_started_at = None;
+        let expired = expired.status(30);
+        assert_eq!(expired.access_state, OAuthAccessState::Expired);
+        assert!(!expired.automatic_refresh_paused);
+        let mut rejected = metadata();
+        rejected.diagnostic_json = Some(serde_json::to_string(&diagnostic()).unwrap());
+        let rejected = rejected.status(30);
+        assert!(rejected.reauthorization_required);
+        assert!(rejected.automatic_refresh_paused);
     }
 }
