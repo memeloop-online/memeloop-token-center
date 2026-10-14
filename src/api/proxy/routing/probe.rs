@@ -112,6 +112,104 @@ pub(crate) fn current_gateway_failure_domain() -> &'static str {
     gateway_failure_domain_identity().failure_domain.as_str()
 }
 
+pub(super) struct PreparationFailure {
+    pub request_id: Uuid,
+    pub route_id: Uuid,
+    pub upstream_account_id: Uuid,
+    pub credential_generation: i64,
+    pub transport_revision: i64,
+    pub failure_stage: &'static str,
+}
+
+pub(super) fn record_preparation_failure(state: &AppState, failure: PreparationFailure) {
+    let database = state.routing_persistence_db.clone();
+    let identity = gateway_failure_domain_identity().clone();
+    state.routing_persistence.submit(4096, async move {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            database.record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
+                request_id: failure.request_id,
+                route_id: failure.route_id,
+                upstream_account_id: failure.upstream_account_id,
+                credential_generation: failure.credential_generation,
+                transport_revision: failure.transport_revision,
+                failure_kind: "preparation",
+                failure_stage: failure.failure_stage,
+                gateway_pod: &identity.pod,
+                gateway_node: identity.node.as_deref(),
+                failure_domain: &identity.failure_domain,
+            }),
+        )
+        .await
+        .map_err(|_| AppError::Internal)?
+    });
+}
+
+#[cfg(test)]
+mod preparation_diagnostic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preparation_failure_is_durable_without_account_health_mutation() {
+        let (state, _directory) = crate::api::tests::test_state().await;
+        let request_id = Uuid::now_v7();
+        let route_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        record_preparation_failure(
+            &state,
+            PreparationFailure {
+                request_id,
+                route_id,
+                upstream_account_id: account_id,
+                credential_generation: 7,
+                transport_revision: 42,
+                failure_stage: "dns_timeout",
+            },
+        );
+        let diagnostics = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rows = state
+                    .db
+                    .request_upstream_transport_diagnostics(request_id)
+                    .await
+                    .unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("preparation diagnostic must survive independently of request logs");
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.route_id, route_id);
+        assert_eq!(diagnostic.upstream_account_id, account_id);
+        assert_eq!(diagnostic.credential_generation, 7);
+        assert_eq!(diagnostic.transport_revision, 42);
+        assert_eq!(diagnostic.failure_kind, "preparation");
+        assert_eq!(diagnostic.failure_stage, "dns_timeout");
+        assert_eq!(diagnostic.gateway_pod, gateway_failure_domain_identity().pod);
+        let pool = sqlx::AnyPool::connect(&state.config.database_url)
+            .await
+            .unwrap();
+        for table in [
+            "upstream_account_health",
+            "upstream_connection_failure_domains",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE upstream_account_id = $1"
+            ))
+            .bind(account_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 0);
+        }
+        pool.close().await;
+    }
+}
+
 pub(crate) struct SharedProbePermit {
     limiter: Arc<SharedProbeLimiter>,
 }
