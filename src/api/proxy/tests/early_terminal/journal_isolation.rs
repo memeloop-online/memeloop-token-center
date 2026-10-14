@@ -167,7 +167,7 @@ async fn journal_wait_timeout_is_explicit_and_recovery_projects_only_once() {
         "SELECT COUNT(*) FROM request_events WHERE event_kind = 'finished'",
         "SELECT COUNT(*) FROM request_stats_facts WHERE status_class = 'failure'",
     ] {
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement.into()))
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement.to_owned()))
             .fetch_one(&pool)
             .await
             .unwrap();
