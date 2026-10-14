@@ -64,20 +64,31 @@ pub trait OAuthRefreshRequestGuard: Send + Sync {
     /// Persist any caller-owned one-way boundary required before dispatching a
     /// refresh-token request.
     async fn mark_request_started(&self) -> Result<(), AppError>;
+
+    async fn mark_request_not_sent(&self, _error: &reqwest::Error) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct DurableOAuthRefreshRequestGuard<'a> {
     database: &'a Database,
     account_id: Uuid,
     idempotency_key: &'a str,
+    credential_generation: i64,
 }
 
 impl<'a> DurableOAuthRefreshRequestGuard<'a> {
-    pub(crate) fn new(database: &'a Database, account_id: Uuid, idempotency_key: &'a str) -> Self {
+    pub(crate) fn new(
+        database: &'a Database,
+        account_id: Uuid,
+        idempotency_key: &'a str,
+        credential_generation: i64,
+    ) -> Self {
         Self {
             database,
             account_id,
             idempotency_key,
+            credential_generation,
         }
     }
 }
@@ -87,6 +98,21 @@ impl OAuthRefreshRequestGuard for DurableOAuthRefreshRequestGuard<'_> {
     async fn mark_request_started(&self) -> Result<(), AppError> {
         self.database
             .mark_upstream_oauth_refresh_request_started(self.account_id, self.idempotency_key)
+            .await
+    }
+
+    async fn mark_request_not_sent(&self, error: &reqwest::Error) -> Result<(), AppError> {
+        if !error.is_connect() {
+            return Err(AppError::Conflict(
+                "OAuth refresh request has no connector proof that it was not sent".into(),
+            ));
+        }
+        self.database
+            .mark_upstream_oauth_refresh_request_not_sent(
+                self.account_id,
+                self.idempotency_key,
+                self.credential_generation,
+            )
             .await
     }
 }

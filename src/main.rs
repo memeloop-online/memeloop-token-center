@@ -278,40 +278,63 @@ async fn run() -> Result<(), &'static str> {
             let listener = TcpListener::bind(address)
                 .await
                 .map_err(|_| "listen_bind_failed")?;
-            let (worker_shutdown, mut worker_task) = if role.runs_worker() {
+            let (worker_shutdown, oauth_shutdown, worker_task) = if role.runs_worker() {
                 let (sender, receiver) = watch::channel(false);
-                let task = tokio::spawn(worker::run_until_shutdown(state.clone(), receiver));
-                (Some(sender), Some(task))
+                let (oauth_sender, oauth_receiver) = watch::channel(false);
+                let task = tokio::spawn(worker::run_until_shutdown_with_oauth_stop(
+                    state.clone(),
+                    receiver,
+                    oauth_receiver,
+                ));
+                (Some(sender), Some(oauth_sender), Some(task))
             } else {
-                (None, None)
+                (None, None, None)
             };
             info!(%address, ?role, "token center listening");
-            let mut worker_failed = false;
-            let result = memeloop_token_center::server::serve(
+            serve_with_worker_shutdown(
                 listener,
                 api::router_for_role(state, role),
-                async {
-                    worker_failed =
-                        wait_for_server_shutdown(shutdown_signal(), &mut worker_task).await;
-                },
+                shutdown_signal(),
+                worker_task,
+                worker_shutdown,
+                oauth_shutdown,
             )
-            .await;
-            if let Some(sender) = worker_shutdown {
-                let _ = sender.send(true);
-            }
-            // The worker owns its deadline and joins all roles. A second
-            // timeout here could interrupt its abort-and-join cleanup.
-            if let Some(task) = worker_task {
-                worker_failed |= task.await.is_err();
-            }
-            if worker_failed {
-                return Err("worker_task_failed");
-            }
-            result.map_err(|_| "http_server_failed")?;
+            .await?;
         }
     }
 
     Ok(())
+}
+
+async fn serve_with_worker_shutdown(
+    listener: TcpListener,
+    app: axum::Router,
+    signal: impl std::future::Future<Output = ()>,
+    mut worker_task: Option<tokio::task::JoinHandle<()>>,
+    worker_shutdown: Option<watch::Sender<bool>>,
+    oauth_shutdown: Option<watch::Sender<bool>>,
+) -> Result<(), &'static str> {
+    let mut worker_failed = false;
+    let result = memeloop_token_center::server::serve(listener, app, async {
+        worker_failed = wait_for_server_shutdown(signal, &mut worker_task).await;
+        if let Some(sender) = &oauth_shutdown {
+            let _ = sender.send(true);
+        }
+    })
+    .await;
+    if let Some(sender) = oauth_shutdown {
+        let _ = sender.send(true);
+    }
+    if let Some(sender) = worker_shutdown {
+        let _ = sender.send(true);
+    }
+    if let Some(task) = worker_task {
+        worker_failed |= task.await.is_err();
+    }
+    if worker_failed {
+        return Err("worker_task_failed");
+    }
+    result.map_err(|_| "http_server_failed")
 }
 
 async fn shutdown_signal() {
@@ -341,6 +364,123 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn all_mode_starts_oauth_drain_before_long_http_drain_and_joins_both() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::sync::{Notify, oneshot};
+
+        let http_started = Arc::new(Notify::new());
+        let release_http = Arc::new(Notify::new());
+        let app = axum::Router::new().route(
+            "/held",
+            axum::routing::get({
+                let http_started = http_started.clone();
+                let release_http = release_http.clone();
+                move || {
+                    let http_started = http_started.clone();
+                    let release_http = release_http.clone();
+                    async move {
+                        http_started.notify_one();
+                        release_http.notified().await;
+                        "complete HTTP result"
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (worker_stop, mut worker_shutdown) = watch::channel(false);
+        let (oauth_stop, mut oauth_shutdown) = watch::channel(false);
+        let mut observed_oauth_shutdown = oauth_shutdown.clone();
+        let ordinary_stopped = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(AtomicUsize::new(0));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let (begin_exchange, exchange_ready) = oneshot::channel();
+        let (exchange_started, observed_exchange) = oneshot::channel();
+        let worker = tokio::spawn({
+            let ordinary_stopped = ordinary_stopped.clone();
+            let saved = saved.clone();
+            let exchanges = exchanges.clone();
+            async move {
+                let refresh = async {
+                    exchange_ready.await.unwrap();
+                    let mut started = Some(exchange_started);
+                    let mut ticks = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = oauth_shutdown.changed() => break,
+                            _ = ticks.tick() => {
+                                exchanges.fetch_add(1, Ordering::SeqCst);
+                                if let Some(started) = started.take() {
+                                    started.send(()).unwrap();
+                                }
+                                tokio::time::sleep(Duration::from_secs(120)).await;
+                                saved.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                };
+                let ordinary = async {
+                    worker_shutdown.changed().await.unwrap();
+                    ordinary_stopped.fetch_add(1, Ordering::SeqCst);
+                };
+                tokio::join!(refresh, ordinary);
+            }
+        });
+        let (terminate, termination) = oneshot::channel();
+        let process = tokio::spawn(serve_with_worker_shutdown(
+            listener,
+            app,
+            async { termination.await.unwrap() },
+            Some(worker),
+            Some(worker_stop),
+            Some(oauth_stop),
+        ));
+        let request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .http1_only()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/held"))
+                .send()
+                .await
+                .unwrap()
+        });
+        http_started.notified().await;
+        tokio::time::pause();
+        begin_exchange.send(()).unwrap();
+        observed_exchange.await.unwrap();
+        let started = tokio::time::Instant::now();
+        terminate.send(()).unwrap();
+        observed_oauth_shutdown.changed().await.unwrap();
+        assert!(*observed_oauth_shutdown.borrow());
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(saved.load(Ordering::SeqCst), 1);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_stopped.load(Ordering::SeqCst), 0);
+        assert!(!process.is_finished());
+        assert!(!request.is_finished());
+        tokio::time::advance(Duration::from_secs(1139)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1260));
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_stopped.load(Ordering::SeqCst), 0);
+        release_http.notify_one();
+        tokio::time::resume();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "complete HTTP result");
+        assert_eq!(process.await.unwrap(), Ok(()));
+        assert_eq!(ordinary_stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(saved.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn exact_projection_backfill_requires_manifest_and_defaults_to_preview() {

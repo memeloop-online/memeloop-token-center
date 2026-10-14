@@ -16,7 +16,7 @@ pub const BASE_URL: &str = "https://api.kimi.com/coding";
 pub const TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
 pub(crate) const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const SCHEMA: &str = "kimi-oauth-v1";
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -302,16 +302,22 @@ async fn refresh_with_client(
     request_guard.mark_request_started().await?;
     let mut response_status = None;
     let operation = async {
-        let response = client.execute(request).await.map_err(|error| {
-            refresh_failure(
-                if error.is_timeout() {
-                    OAuthRefreshFailureKind::Timeout
-                } else {
-                    OAuthRefreshFailureKind::Network
-                },
-                None,
-            )
-        })?;
+        let response = match client.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                if error.is_connect() {
+                    request_guard.mark_request_not_sent(&error).await?;
+                }
+                return Err(refresh_failure(
+                    if error.is_timeout() {
+                        OAuthRefreshFailureKind::Timeout
+                    } else {
+                        OAuthRefreshFailureKind::Network
+                    },
+                    None,
+                ));
+            }
+        };
         let status = response.status().as_u16();
         response_status = Some(status);
         let bytes = super::super::bounded_body(response)
@@ -586,7 +592,10 @@ mod tests {
                 }
             }
         });
-        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let guard = UnsentRequestGuard {
+            started: AtomicBool::new(false),
+            not_sent: AtomicBool::new(false),
+        };
         let error = refresh_at(
             &crate::build_http_client().unwrap(),
             &credential("fixture-device"),
@@ -597,7 +606,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AppError::OAuthRefresh(_)));
-        assert!(guard.0.load(Ordering::SeqCst));
+        assert!(guard.started.load(Ordering::SeqCst));
+        assert!(!guard.not_sent.load(Ordering::SeqCst));
         shutdown.send(()).unwrap();
         server.await.unwrap();
         assert_eq!(
@@ -641,7 +651,10 @@ mod tests {
                 }
             }
         });
-        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let guard = UnsentRequestGuard {
+            started: AtomicBool::new(false),
+            not_sent: AtomicBool::new(false),
+        };
         let error = refresh_at(
             &crate::build_http_client().unwrap(),
             &credential("fixture-device"),
@@ -662,7 +675,8 @@ mod tests {
             OAuthRefreshFailureKind::Timeout | OAuthRefreshFailureKind::ResponseBody
         ));
         assert!(!failure.requires_reauthorization());
-        assert!(guard.0.load(Ordering::SeqCst));
+        assert!(guard.started.load(Ordering::SeqCst));
+        assert!(!guard.not_sent.load(Ordering::SeqCst));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -674,6 +688,192 @@ mod tests {
     #[tokio::test]
     async fn refresh_timeout_after_headers_preserves_status_without_replay() {
         assert_stalled_refresh_preserves_observed_status(Some(200)).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_accepts_a_complete_rotated_result_after_the_old_ten_second_cutoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=fixture-refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(11))
+                    .set_body_json(json!({
+                        "access_token": "delayed-access",
+                        "refresh_token": "delayed-refresh",
+                        "expires_in": 900
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let guard = RecordingRequestGuard(AtomicBool::new(false));
+        let result = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &credential("fixture-device"),
+            true,
+            &format!("{}/token", server.uri()),
+            &guard,
+        )
+        .await
+        .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["access_token"], "delayed-access");
+        assert_eq!(result["refresh_token"], "delayed-refresh");
+        assert!(guard.0.load(Ordering::SeqCst));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_slow_body_is_durably_installed_once_without_another_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = http1_request::read_bounded_http1_request(&mut connection)
+                    .await
+                    .unwrap();
+                assert_eq!(request.method, "POST");
+                assert_eq!(request.path, "/token");
+                assert_eq!(request.body, format!(
+                "client_id={CLIENT_ID}&grant_type=refresh_token&refresh_token=fixture-refresh"
+            ).into_bytes());
+                let body = serde_json::to_vec(&json!({
+                    "access_token": "slow-body-access",
+                    "refresh_token": "slow-body-refresh",
+                    "expires_in": 900
+                }))
+                .unwrap();
+                connection
+                    .write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                connection.write_all(&body[..1]).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                connection.write_all(&body[1..]).await.unwrap();
+            });
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("kimi-slow-body.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"kimi-slow-body-fixture-pepper";
+        let account = database
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: "kimi-slow-body".into(),
+                    name: "Kimi slow body".into(),
+                    driver: PROVIDER_DRIVER.into(),
+                    config: native_import_config(),
+                    credential: credential("fixture-device"),
+                    oauth_session_id: Some(uuid::Uuid::now_v7()),
+                    oauth_driver: Some(PROVIDER_DRIVER.into()),
+                    oauth_refresh_url: Some(TOKEN_ENDPOINT.into()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        database
+            .claim_upstream_oauth_refresh(account.id, "slow-body-refresh", pepper)
+            .await
+            .unwrap();
+        let guard = crate::oauth::DurableOAuthRefreshRequestGuard::new(
+            &database,
+            account.id,
+            "slow-body-refresh",
+            1,
+        );
+        let received = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &credential("fixture-device"),
+            true,
+            &format!("http://{address}/token"),
+            &guard,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let saved = database
+            .finish_kimi_oauth_refresh(account.id, received, "slow-body-refresh", pepper)
+            .await
+            .unwrap();
+        assert_eq!(saved.credential_generation, 2);
+        let (_, stored) = database
+            .upstream_account_with_credential(account.id, pepper)
+            .await
+            .unwrap();
+        let stored = serde_json::to_value(stored).unwrap();
+        assert_eq!(stored["access_token"], "slow-body-access");
+        assert_eq!(stored["refresh_token"], "slow-body-refresh");
+        let replay = database
+            .claim_upstream_oauth_refresh(account.id, "slow-body-refresh", pepper)
+            .await
+            .unwrap();
+        let crate::db::ClaimUpstreamOAuthRefreshResult::Replay(replay) = replay else {
+            panic!("saved refresh must replay locally without another POST");
+        };
+        assert_eq!(replay.credential_generation, 2);
+    }
+
+    struct UnsentRequestGuard {
+        started: AtomicBool,
+        not_sent: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl OAuthRefreshRequestGuard for UnsentRequestGuard {
+        async fn mark_request_started(&self) -> Result<(), AppError> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn mark_request_not_sent(&self, error: &reqwest::Error) -> Result<(), AppError> {
+            assert!(error.is_connect());
+            assert!(self.started.load(Ordering::SeqCst));
+            self.not_sent.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_connector_failure_is_proven_unsent_without_a_second_attempt() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = proxy.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 255]).await.unwrap();
+        });
+        let guard = UnsentRequestGuard {
+            started: AtomicBool::new(false),
+            not_sent: AtomicBool::new(false),
+        };
+        let proxy_url = format!("socks5h://{address}");
+        let client = crate::build_no_retry_http_client(Some(&proxy_url), &[]).unwrap();
+        let result = refresh_with_client(
+            &client,
+            &with_proxy(credential("fixture-device"), proxy_url),
+            "https://kimi-refresh.test/token",
+            &guard,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(AppError::OAuthRefresh(_))));
+        assert!(guard.not_sent.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
