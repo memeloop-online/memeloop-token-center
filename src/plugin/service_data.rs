@@ -338,6 +338,7 @@ impl PluginRuntime {
                 limits,
                 deadline,
                 http_body_limit: endpoint.max_body_bytes,
+                http_diagnostic: super::PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -363,6 +364,18 @@ impl PluginRuntime {
                 )
             })?
             .map_err(|error| {
+                let diagnostic = &store.data().http_diagnostic;
+                tracing::warn!(
+                    plugin_id = %plugin.manifest.id,
+                    endpoint_id = %endpoint.id,
+                    guest_error_code = service_data_guest_error_code(&error),
+                    origin_slot = ?diagnostic.origin_slot,
+                    robots = diagnostic.robots,
+                    http_status = ?diagnostic.status,
+                    host_stage = diagnostic.stage,
+                    host_failure_code = diagnostic.failure_code,
+                    "plugin service data collector returned an error"
+                );
                 PluginServiceDataCollectionFailure::new(
                     PluginServiceDataRefreshErrorCode::ComponentExecution,
                     plugin_reported_error(&plugin.manifest.id, "service-data-collect", &error),
@@ -385,6 +398,12 @@ impl PluginRuntime {
                 )
             })?
             .map_err(|error| {
+                tracing::warn!(
+                    plugin_id = %plugin.manifest.id,
+                    endpoint_id = %endpoint.id,
+                    guest_error_code = service_data_guest_error_code(&error),
+                    "plugin service data normalizer returned an error"
+                );
                 PluginServiceDataCollectionFailure::new(
                     PluginServiceDataRefreshErrorCode::ComponentExecution,
                     plugin_reported_error(&plugin.manifest.id, "service-data-normalize", &error),
@@ -474,6 +493,28 @@ fn component_execution_code(deadline: Instant) -> PluginServiceDataRefreshErrorC
     }
 }
 
+fn service_data_guest_error_code(error: &str) -> &'static str {
+    match error {
+        "invalid_config" => "invalid_config",
+        "unapproved_source_config" => "unapproved_source_config",
+        "invalid_collector" => "invalid_collector",
+        "invalid_normalizer" => "invalid_normalizer",
+        "network" => "network",
+        "invalid_http_envelope" => "invalid_http_envelope",
+        "http_status" => "http_status",
+        "body_limit" => "body_limit",
+        "content_type" => "content_type",
+        "robots_unavailable" => "robots_unavailable",
+        "robots_denied" => "robots_denied",
+        "missing_source_date" => "missing_source_date",
+        "invalid_source_date" => "invalid_source_date",
+        "invalid_json" => "invalid_json",
+        "invalid_payload" => "invalid_payload",
+        "component_output" => "component_output",
+        _ => "reported_error",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -484,6 +525,44 @@ mod tests {
 
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn guest_diagnostics_accept_only_exact_fixed_codes() {
+        for code in [
+            "invalid_config",
+            "unapproved_source_config",
+            "invalid_collector",
+            "invalid_normalizer",
+            "network",
+            "invalid_http_envelope",
+            "http_status",
+            "body_limit",
+            "content_type",
+            "robots_unavailable",
+            "robots_denied",
+            "missing_source_date",
+            "invalid_source_date",
+            "invalid_json",
+            "invalid_payload",
+            "component_output",
+        ] {
+            assert_eq!(service_data_guest_error_code(code), code);
+            assert_eq!(
+                service_data_guest_error_code(&format!("{code}: private data")),
+                "reported_error"
+            );
+        }
+        for private in [
+            "",
+            "Bearer private-token",
+            "https://user:password@example.com/private",
+            "{\"secret\":\"private\"}",
+            "network\nprivate-token",
+            "NETWORK",
+        ] {
+            assert_eq!(service_data_guest_error_code(private), "reported_error");
+        }
+    }
 
     fn service_data_component() -> Vec<u8> {
         let mut module = wat::parse_str(
