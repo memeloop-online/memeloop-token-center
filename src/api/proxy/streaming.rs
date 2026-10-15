@@ -755,7 +755,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                     }
                     Err(error_code) => {
-                        drop(upstream_stream);
+                        upstream_stream = Box::pin(futures_util::stream::empty());
                         transport_error = Some(transport_error_with_downstream_precedence(
                             downstream_closed_observed || body_sender.is_closed(),
                             error_code,
