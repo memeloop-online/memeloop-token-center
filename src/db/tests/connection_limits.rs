@@ -27,6 +27,29 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for PoolLogCapture {
 }
 
 #[tokio::test]
+async fn write_transaction_future_bounds_inline_acquisition_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("write-future-layout.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let transaction = database.begin_write_transaction();
+    let bounded_bytes = std::mem::size_of_val(&transaction);
+    let inline = database.pool.begin_with("BEGIN IMMEDIATE");
+    let inline_bytes = std::mem::size_of_val(&inline);
+    drop(inline);
+    // Bound the state embedded by all write callers, independently of the
+    // request thread's stack size and SQLx's internal acquisition layout.
+    assert!(bounded_bytes <= 256, "write future: {bounded_bytes} bytes");
+    assert!(
+        bounded_bytes < inline_bytes,
+        "write future {bounded_bytes} must isolate inline SQLx acquisition {inline_bytes}"
+    );
+    transaction.await.unwrap().rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_options() {
     use tracing::instrument::WithSubscriber;
 

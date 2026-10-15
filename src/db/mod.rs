@@ -614,15 +614,17 @@ impl Database {
         // reserved the database. Claim the SQLite write reservation at BEGIN
         // so the configured busy handler can wait and serialize test/local
         // writers. PostgreSQL keeps its normal transaction semantics.
-        self.pool
-            .begin_with(match self.backend {
-                DatabaseBackend::PostgreSql => "BEGIN",
-                DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
-            })
-            .await
-            .inspect_err(|error| {
-                self.observe_pool_timeout("write_transaction", started, error);
-            })
+        // Keep SQLx's acquisition state out of every enclosing write future.
+        // Gateway completion awaits several layers of these futures on the
+        // request task; retaining acquisition inline compounds stack pressure.
+        Box::pin(self.pool.begin_with(match self.backend {
+            DatabaseBackend::PostgreSql => "BEGIN",
+            DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
+        }))
+        .await
+        .inspect_err(|error| {
+            self.observe_pool_timeout("write_transaction", started, error);
+        })
     }
 
     fn observe_pool_timeout(
