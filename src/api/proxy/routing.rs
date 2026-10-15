@@ -160,7 +160,7 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 Protocol::OpenAiResponsesCompact | Protocol::OpenAiAlphaSearch
             )
-            || (http_json && multi_agent_responses)
+            || (http_json && multi_agent_responses && responses_chat.is_none())
             || (new_api
                 && matches!(
                     protocol,

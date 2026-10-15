@@ -331,3 +331,283 @@ async fn same_model_accounts_are_explicitly_pinned_to_native_or_chat_transport()
     native_upstream.verify().await;
     chat_upstream.verify().await;
 }
+
+async fn multi_agent_chat_limit_fixture(upstream: &MockServer) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_contract_driver_model_and_config(
+        "multi-agent-chat-limit",
+        upstream.uri(),
+        0,
+        Some("openai-chat-usage-only"),
+        "http-json",
+        "glm-compatible-model",
+        json!({"responses_transport":"chat_completions"}),
+    )
+    .await
+}
+
+fn multi_agent_chat_limit_request(
+    fixture: &CodexRouteFixture,
+    stream: bool,
+    limit: Option<i64>,
+) -> Value {
+    let mut request: Value = serde_json::from_str(include_str!(
+        "../../kimi_transport/fixtures/codex-multi-agent-v2.json"
+    ))
+    .unwrap();
+    request["model"] = json!(fixture.model);
+    request["stream"] = json!(stream);
+    request.as_object_mut().unwrap().remove("max_output_tokens");
+    if let Some(limit) = limit {
+        request["max_output_tokens"] = json!(limit);
+    }
+    request
+}
+
+fn assert_multi_agent_chat_limit_wire(forwarded: &Value, limit: Option<i64>) {
+    assert_eq!(
+        forwarded.get("max_tokens"),
+        limit.map(|limit| json!(limit)).as_ref()
+    );
+    assert!(forwarded.get("max_output_tokens").is_none());
+    assert!(forwarded.get("max_completion_tokens").is_none());
+    assert!(
+        forwarded["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["role"] == "user"))
+    );
+}
+
+#[tokio::test]
+async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
+    for stream in [false, true] {
+        for limit in [Some(4096), Some(5000), None] {
+            let upstream = MockServer::start().await;
+            let fixture = multi_agent_chat_limit_fixture(&upstream).await;
+            let usage = json!({"prompt_tokens":5,"completion_tokens":5000,"total_tokens":5005});
+            let template = if stream {
+                let chunk = |choices: Value, usage: Value| {
+                    json!({
+                        "id":"chat_transport", "object":"chat.completion.chunk", "model":fixture.upstream_model,
+                        "choices":choices, "usage":usage
+                    })
+                };
+                let chunks = [
+                    chunk(
+                        json!([{"index":0,"delta":{"role":"assistant","content":"translated response"},"finish_reason":null}]),
+                        Value::Null,
+                    ),
+                    chunk(
+                        json!([{"index":0,"delta":{},"finish_reason":"stop"}]),
+                        Value::Null,
+                    ),
+                    chunk(json!([]), usage),
+                ];
+                let mut body = chunks
+                    .iter()
+                    .map(|chunk| format!("data: {chunk}\n\n"))
+                    .collect::<String>();
+                body.push_str("data: [DONE]\n\n");
+                ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"chat_transport", "object":"chat.completion", "model":fixture.upstream_model,
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"translated response"},"finish_reason":"stop"}],
+                    "usage":usage
+                }))
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(template)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let request = multi_agent_chat_limit_request(&fixture, stream, limit);
+            let response = send_official_responses(&fixture, &request).await;
+            let rejected = limit == Some(4096);
+            assert_eq!(
+                response.status(),
+                if rejected && !stream {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            if stream {
+                let body = String::from_utf8(delivered.to_vec()).unwrap();
+                assert!(body.contains("response.completed"));
+                assert!(body.contains("translated response"));
+                assert!(body.contains(r#""output_tokens":5000"#));
+            } else {
+                let body: Value = serde_json::from_slice(&delivered).unwrap();
+                if rejected {
+                    assert_eq!(body["error"]["message"], "upstream returned invalid usage");
+                } else {
+                    assert_eq!(
+                        body["output"][0]["content"][0]["text"],
+                        "translated response"
+                    );
+                    assert_eq!(body["usage"]["output_tokens"], 5000);
+                }
+            }
+            wait_for_request_settlement(&fixture, 1).await;
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status_code, Some(if rejected { 502 } else { 200 }));
+            assert_eq!(
+                rows[0].error_code.as_deref(),
+                rejected.then_some("upstream_invalid_usage")
+            );
+            assert_eq!(
+                (rows[0].input_tokens, rows[0].output_tokens),
+                if rejected { (0, 0) } else { (5, 5000) }
+            );
+            assert_eq!(
+                rows[0].cost.parse::<Decimal>().unwrap(),
+                Decimal::new(if rejected { 0 } else { 5005 }, 6)
+            );
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            let row = sqlx::query("SELECT r.price_snapshot_json, r.reserved_tokens, r.status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id")
+                .fetch_one(&pool).await.unwrap();
+            let snapshot: Value =
+                serde_json::from_str(&row.get::<String, _>("price_snapshot_json")).unwrap();
+            assert_eq!(snapshot.get("output_token_limit"), Some(&json!(limit)));
+            assert!(row.get::<i64, _>("reserved_tokens") >= limit.unwrap_or(4096));
+            assert_eq!(row.get::<String, _>("status"), "settled");
+            assert_eq!(row.get::<i64, _>("ledgers"), 1);
+            assert_eq!(row.get::<i64, _>("events"), 1);
+            pool.close().await;
+            let received = upstream.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1);
+            assert_multi_agent_chat_limit_wire(&received[0].body_json::<Value>().unwrap(), limit);
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish() {
+    for limit in [Some(4096), Some(5000), None] {
+        let upstream = MockServer::start().await;
+        let fixture = multi_agent_chat_limit_fixture(&upstream).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let body = multi_agent_chat_limit_request(&fixture, false, limit);
+        let mut request = Box::pin(send_official_responses(&fixture, &body));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut request => panic!("recovery fixture must not return headers"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if upstream.received_requests().await.unwrap().len() == 1 { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let received = upstream.received_requests().await.unwrap();
+        assert_multi_agent_chat_limit_wire(&received[0].body_json::<Value>().unwrap(), limit);
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let row = sqlx::query("SELECT r.*, q.id AS request_id, q.tenant_id FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id")
+            .fetch_one(&pool).await.unwrap();
+        let request_id = Uuid::parse_str(&row.get::<String, _>("request_id")).unwrap();
+        let tenant_id = Uuid::parse_str(&row.get::<String, _>("tenant_id")).unwrap();
+        let snapshot: Value =
+            serde_json::from_str(&row.get::<String, _>("price_snapshot_json")).unwrap();
+        assert_eq!(snapshot.get("output_token_limit"), Some(&json!(limit)));
+        let price: crate::model::ModelPrice = serde_json::from_value(snapshot).unwrap();
+        let reservation = crate::model::UsageReservation {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).unwrap(),
+            account_id: fixture.credit_account_id,
+            key_id: fixture.key_id,
+            enforcement_mode: crate::model::EnforcementMode::from_storage(
+                &row.get::<String, _>("enforcement_mode"),
+            )
+            .unwrap(),
+            reserved_micros: row.get("reserved_micros"),
+            input_micros_per_million: price.input_micros_per_million,
+            output_micros_per_million: price.output_micros_per_million,
+            price_tiers: price.tiers,
+            rate_window_start: row.get("rate_window_start"),
+            reserved_tokens: row.get("reserved_tokens"),
+        };
+        let recovered = crate::db::Database::connect(&fixture.database_url)
+            .await
+            .unwrap();
+        let response_object = format!("gap://{request_id}/response");
+        let finish = FinishProxyRequest {
+            terminal_cause: None,
+            usage_basis: Some(crate::model::RequestUsageBasis::ProviderReported),
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: reservation.reserved_tokens - limit.unwrap_or(4096),
+            output_token_ceiling: limit.unwrap_or(4096),
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 5000,
+                ..TokenUsage::default()
+            },
+            error_code: None,
+            response_object: &response_object,
+            routing_session_id: None,
+            routing_terminal_observed_at: None,
+            conversation: None,
+        };
+        let rejected = limit == Some(4096);
+        let first = recovered
+            .finish_proxy_request(finish.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, FinishProxyRequestResult::Finished { usage_invalid, .. } if usage_invalid == rejected)
+        );
+        assert!(
+            matches!(recovered.finish_proxy_request(finish).await.unwrap(), FinishProxyRequestResult::AlreadyFinished { status_code, .. } if status_code == if rejected { 502 } else { 200 })
+        );
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.state.proxy_lifecycles.active() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let terminal = sqlx::query("SELECT q.status_code, q.output_tokens, q.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM request_records q WHERE q.id = $1")
+            .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            terminal.get::<i64, _>("status_code"),
+            if rejected { 502 } else { 200 }
+        );
+        assert_eq!(
+            terminal.get::<i64, _>("output_tokens"),
+            if rejected { 0 } else { 5000 }
+        );
+        assert_eq!(
+            terminal.get::<i64, _>("cost_micros"),
+            if rejected { 0 } else { 5005 }
+        );
+        assert_eq!(terminal.get::<i64, _>("ledgers"), 1);
+        assert_eq!(terminal.get::<i64, _>("events"), 1);
+        pool.close().await;
+        recovered.close().await;
+        upstream.verify().await;
+    }
+}
