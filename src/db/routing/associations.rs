@@ -557,7 +557,7 @@ pub(super) async fn candidate_upstream_ids(
     tenant_id: &str,
     route_id: Uuid,
 ) -> Result<Vec<Uuid>, AppError> {
-    let rows = sqlx::query("SELECT candidates.id FROM (SELECT upstream_account_id AS id FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2 UNION SELECT m.upstream_account_id AS id FROM model_route_included_provider_groups i JOIN upstream_account_provider_groups m ON m.tenant_id = i.tenant_id AND m.provider_group_id = i.provider_group_id WHERE i.tenant_id = $1 AND i.model_route_id = $2) candidates JOIN upstream_accounts a ON a.id = candidates.id AND a.tenant_id = $1 AND a.status = 'active' WHERE NOT EXISTS (SELECT 1 FROM model_route_excluded_provider_groups e JOIN upstream_account_provider_groups x ON x.tenant_id = e.tenant_id AND x.provider_group_id = e.provider_group_id WHERE e.tenant_id = $1 AND e.model_route_id = $2 AND x.upstream_account_id = candidates.id) ORDER BY candidates.id")
+    let rows = sqlx::query("SELECT DISTINCT candidate.upstream_account_id AS id FROM model_route_eligible_upstream_accounts candidate JOIN upstream_accounts account ON account.id = candidate.upstream_account_id AND account.tenant_id = candidate.tenant_id AND account.status = 'active' WHERE candidate.tenant_id = $1 AND candidate.model_route_id = $2 ORDER BY id")
         .bind(tenant_id).bind(route_id.to_string()).fetch_all(pool).await?;
     rows.into_iter()
         .map(|row| super::super::parse_uuid(row.try_get("id")?))

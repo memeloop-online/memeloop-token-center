@@ -94,8 +94,8 @@ async fn exercise(database_url: String) {
         .await
         .unwrap();
     let (status, error) = request(&state, &denied.key, "/v1/chat/completions", body.clone()).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(error["error"]["code"], "no_authorized_upstream_candidate");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"]["code"], "forbidden");
     assert_eq!(financial_counts(&pool, denied.key_id).await, (0, 0));
     assert!(upstream.received_requests().await.unwrap().is_empty());
     let (status, response) = request(&state, &key.key, "/v1/chat/completions", body).await;
