@@ -97,11 +97,11 @@ async fn send_ordinary(fixture: &CodexRouteFixture, chat: bool, request: &Value)
     }
 }
 
-fn ordinary_sse(chat: bool, output_tokens: i64) -> String {
+fn ordinary_sse(chat: bool, model: &str, output_tokens: i64) -> String {
     if chat {
-        let delta = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"uncapped response"},"finish_reason":null}]});
-        let stop = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
-        let usage = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":output_tokens,"total_tokens":3 + output_tokens}});
+        let delta = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"uncapped response"},"finish_reason":null}]});
+        let stop = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let usage = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","model":model,"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":output_tokens,"total_tokens":3 + output_tokens}});
         format!("data: {delta}\n\ndata: {stop}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
     } else {
         let completed = completed_response_with_usage(3, output_tokens);
@@ -153,8 +153,10 @@ async fn ordinary_missing_metadata_delivers_and_settles_over_estimate_with_bound
                     }
                     let expected_wire = request.clone();
                     let template = if stream {
-                        ResponseTemplate::new(200)
-                            .set_body_raw(ordinary_sse(chat, 5000), "text/event-stream")
+                        ResponseTemplate::new(200).set_body_raw(
+                            ordinary_sse(chat, &fixture.model, 5000),
+                            "text/event-stream",
+                        )
                     } else {
                         ResponseTemplate::new(200).set_body_json(ordinary_response(chat, 5000))
                     };
@@ -183,7 +185,8 @@ async fn ordinary_missing_metadata_delivers_and_settles_over_estimate_with_bound
                     if stream {
                         assert_eq!(
                             String::from_utf8(delivered.to_vec()).unwrap(),
-                            ordinary_sse(chat, 5000)
+                            ordinary_sse(chat, &fixture.model, 5000),
+                            "{driver} chat={chat} balance={balance}"
                         );
                     } else {
                         assert_eq!(
