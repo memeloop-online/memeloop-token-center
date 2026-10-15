@@ -17,6 +17,7 @@ import { OperatorAccessSettings } from './OperatorAccessSettings';
 import { isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { isPluginRouteKey } from '../app/routes';
 import { useGuardedNavigation } from '../app/NavigationGuard';
+import { resolvePluginNavigationContext, type PluginNavigationContext } from './pluginNavigationContext';
 import { IdentityPage } from './pages/IdentityPage';
 import { identityCopy } from './identityCopy';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy';
@@ -24,6 +25,7 @@ import { currentProxyGroupNavigationContext, type ProxyGroupNavigationContext } 
 import { LoadingState, PageLoadingRegion } from '../design-system';
 import {
   PluginContributionPage,
+  PluginModelRouteActions,
   PluginOverviewCards,
   PluginPageExtensions,
   registerOperatorPluginContributions,
@@ -104,6 +106,12 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     };
   }
   const activeRoute = route ?? internalRoute;
+  const [pluginNavigationContext, setPluginNavigationContext] = useState<PluginNavigationContext>();
+  const pluginContext = resolvePluginNavigationContext(pluginNavigationContext, activeRoute, credentialScope.current.generation, scope.tenant);
+  useEffect(() => { setPluginNavigationContext(undefined); }, [scope.activeCredential, scope.tenant]);
+  useEffect(() => {
+    setPluginNavigationContext(current => current?.route === activeRoute ? current : undefined);
+  }, [activeRoute]);
   const pageScopeKey = `${credentialScope.current.generation}:${scope.tenant}:${activeRoute === 'service-credentials' ? 'tenants' : activeRoute}`;
   const requestRefresh = useRequestRefreshPreference();
   const stream = useOperatorRequestStream({
@@ -135,9 +143,10 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     if (scope.tenant !== proxyContext.tenant) scope.setTenant(proxyContext.tenant);
   }, [activeRoute, proxyContext, scope.activeCredential, scope.validated, scope.tenants, scope.tenant, scope.setTenant]);
 
-  async function navigate(next: OperatorApplicationRoute, context?: ProxyGroupNavigationContext) {
+  async function navigate(next: OperatorApplicationRoute, context?: ProxyGroupNavigationContext, pluginContext?: Record<string, unknown>) {
     if (next === activeRoute) return false;
     return guardedNavigation(() => {
+      setPluginNavigationContext(pluginContext ? { route: next, credentialGeneration: credentialScope.current.generation, tenant: scope.tenant, value: pluginContext } : undefined);
       if (route === undefined) setInternalRoute(next);
       onRouteChange?.(next, context);
       requestAnimationFrame(() => document.getElementById('app-main-content')?.focus({ preventScroll: true }));
@@ -155,8 +164,8 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     navigate('proxy-groups', context);
   }
 
-  function navigateFromPlugin(next: string) {
-    if (isOperatorRouteKey(next) || (isPluginRouteKey(next) && pluginRegistry.pages.has(next))) navigate(next);
+  function navigateFromPlugin(next: string, context?: Record<string, unknown>) {
+    if (isOperatorRouteKey(next) || (isPluginRouteKey(next) && pluginRegistry.pages.has(next))) void navigate(next, undefined, context);
   }
 
   function changeRouteByKeyboard(event: KeyboardEvent<HTMLButtonElement>, current: OperatorRouteKey) {
@@ -231,7 +240,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
           navigate('pricing');
         }} />; break;
         case 'proxy-groups': page = <ProxyGroupsPage token={scope.activeCredential} tenant={scope.tenant} initialAccountId={!proxyContext.tenant || proxyContext.tenant === scope.tenant ? proxyContext.accountId : undefined} onBack={() => navigate('providers')} />; break;
-        case 'routes': page = <RoutesPage {...pageProps} />; break;
+        case 'routes': page = <RoutesPage {...pageProps} renderModelRouteActions={(modelRoute) => <PluginModelRouteActions actions={pluginRegistry.modelRouteActions} modelRoute={modelRoute} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />} />; break;
         case 'pricing': page = <PricingPage {...pageProps} />; break;
         case 'tenants': page = <IdentityPage tab="tenants" onNavigate={navigateIdentityTab}><TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} /></IdentityPage>; break;
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
@@ -250,7 +259,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     } else {
       const registered = pluginRegistry.pages.get(activeRoute);
       page = registered
-        ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
+        ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} context={pluginContext} />
         : <div className="notice error" role="alert">This plugin page is no longer installed or available.</div>;
     }
   // A settings user may explicitly replace a credential while tenant

@@ -929,7 +929,8 @@ export type PluginOperatorUiSlot =
   | 'operator.sidebar.tab'
   | 'operator.overview.card'
   | 'operator.page.before'
-  | 'operator.page.after';
+  | 'operator.page.after'
+  | 'operator.model-route.action';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 export type PluginOperatorUiPresentation = 'health_intelligence_v1' | 'projection_v1';
 export type PluginOperatorUiRenderer = 'typed_data_v1' | 'component_v1';
