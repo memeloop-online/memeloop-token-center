@@ -105,6 +105,7 @@ export interface RequestSessionContext {
 }
 
 export interface RequestDetail extends RequestView {
+  egress_attempts?: RequestEgressAttempt[];
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
@@ -117,6 +118,63 @@ export interface RequestDetail extends RequestView {
     proof_digest: string;
   };
   transport_diagnostics?: RequestTransportDiagnostic[];
+}
+
+export interface SelectedRequestEgress {
+  kind: 'proxy' | 'direct' | 'unknown';
+  group_id: string | null;
+  group_version: number | null;
+  group_name: string | null;
+  member_id: string | null;
+  member_name: string | null;
+  scheme: string | null;
+  host: string | null;
+  port: number | null;
+}
+
+export interface RequestEgressAttempt {
+  request_id: string;
+  attempt_id: string;
+  outbound_attempt: number;
+  connect_attempt: number;
+  route_id: string;
+  upstream_account_id: string;
+  credential_generation: number;
+  transport_revision: number;
+  observed_at: number;
+  selected: SelectedRequestEgress;
+  transport: Record<string, unknown>;
+  connection_binding: Record<string, unknown> | null;
+  request_payload_bytes: number | null;
+  response_payload_bytes: number | null;
+  completed: boolean;
+  final_response: boolean;
+  response_body_complete: boolean;
+  measurement_basis: 'application_payload_estimate';
+}
+
+export interface RequestEgressSummary {
+  selected: SelectedRequestEgress;
+  recorded_attempts: number;
+  completed_attempts: number;
+  final_response_attempts: number;
+  request_known_attempts: number;
+  response_known_attempts: number;
+  request_payload_bytes: number | null;
+  response_payload_bytes: number | null;
+  measurement_basis: 'application_payload_estimate';
+  wire_bytes: null;
+  supplier_billed_bytes: null;
+}
+
+export interface RequestEgressSummaryResponse {
+  start: number;
+  end: number;
+  coverage: 'recorded_codex_attempts_only';
+  measurement_basis: 'application_payload_estimate';
+  wire_bytes: null;
+  supplier_billed_bytes: null;
+  groups: RequestEgressSummary[];
 }
 
 export interface RequestTransportDiagnostic {
