@@ -478,9 +478,10 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(await editSave.isEnabled(), false, 'changing accounts must clear persisted custom consent');
   await imageEditor.getByRole('button', { name: '移除 Browser UI Seedance', exact: true }).click();
   assert.equal(await editSave.isEnabled(), false, 'returning to the saved account set must not revive consent');
-  await imageEditor.getByLabel('上游模型').fill('');
+  const editedModel = imageEditor.getByRole('combobox', { name: '上游模型', exact: true });
+  await editedModel.fill('');
   assert.equal(await editSave.isEnabled(), false, 'an empty model cannot authorize submission');
-  await imageEditor.getByLabel('上游模型').fill('browser-workflow-v1');
+  await editedModel.fill('browser-workflow-v1');
   assert.equal(await editSave.isEnabled(), true, 'entering the model again records a new scoped choice');
   const editedImageResponse = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/model-routes/${imageRoute.id}`) && response.request().method() === 'PUT');
   await editSave.click();
