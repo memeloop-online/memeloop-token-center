@@ -36,6 +36,7 @@ use tower_http::{
 use uuid::Uuid;
 
 mod anthropic;
+mod api_schema;
 mod audio;
 mod auth;
 mod billing;
@@ -57,6 +58,7 @@ mod model_picker;
 mod model_routes;
 mod monitoring_snapshot;
 mod new_api_transport;
+mod operator_inference;
 pub(crate) mod plugin_execution;
 mod plugins;
 pub(crate) mod proxy;

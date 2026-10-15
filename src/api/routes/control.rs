@@ -3,6 +3,14 @@ use super::super::*;
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route(
+            "/internal/v1/api-schema",
+            get(super::super::api_schema::discover),
+        )
+        .route(
+            "/internal/v1/inference/chat/completions",
+            post(super::super::operator_inference::chat_completions),
+        )
+        .route(
             "/internal/v1/transport-proxy-groups/access",
             get(transport_group_access),
         )

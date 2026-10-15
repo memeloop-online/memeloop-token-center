@@ -449,3 +449,9 @@ test("image quarantine reconciliation never implies successful delivery or a res
   assert.match(api, /service\.service_id\.ok_or\(AppError::Forbidden\)/);
   assert.match(api, /image-generation-quarantine-idempotency-v1/);
 });
+
+// Discovery embeds the generated JSON; keep it semantically equal to YAML.
+test("runtime discovery JSON matches the canonical OpenAPI contract", () => {
+  const embedded = JSON.parse(readFileSync(new URL("../../openapi/openapi.json", import.meta.url), "utf8"));
+  assert.deepEqual(embedded, cloneDocument());
+});
