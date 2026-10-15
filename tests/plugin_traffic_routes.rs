@@ -89,7 +89,7 @@ fn component_from_core_wat(source: &str) -> Vec<u8> {
 }
 
 fn policy_wat(body: &str) -> String {
-    let source = include_str!("../examples/plugins/policy-rewrite/plugin.wat");
+    let source = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat");
     let (prefix, tail) = source
         .split_once(";; BEGIN POST-AUTH BODY")
         .expect("post-auth start marker");

@@ -104,7 +104,7 @@ async fn register_nonempty(state: &AppState, directory: &Path) -> PathBuf {
     let package = root.join("export-fixture");
     std::fs::create_dir_all(&package).unwrap();
     let mut manifest: Value = serde_json::from_str(include_str!(
-        "../../../../examples/plugins/policy-rewrite/plugin.json"
+        "../../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.json"
     ))
     .unwrap();
     manifest["id"] = json!("export-fixture");
@@ -114,7 +114,7 @@ async fn register_nonempty(state: &AppState, directory: &Path) -> PathBuf {
     )
     .unwrap();
     let mut module = wat::parse_str(include_str!(
-        "../../../../examples/plugins/policy-rewrite/plugin.wat"
+        "../../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat"
     ))
     .unwrap();
     let mut resolve = Resolve::default();

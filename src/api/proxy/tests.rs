@@ -2493,7 +2493,7 @@ async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
     let mut config = Config::for_test(database_url);
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(directory.path().join("archive").display().to_string());
-    config.plugin_dir = Some("examples/plugins".to_owned());
+    config.plugin_dir = Some(".plugin-examples/examples/plugins".to_owned());
     let state = AppState::initialize(config).await.unwrap();
     let tenant = "secondary-component";
     let requested_model = "requested-model";
