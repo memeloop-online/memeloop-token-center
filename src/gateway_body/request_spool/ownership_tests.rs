@@ -25,6 +25,14 @@ const ROUTES: [&str; 2] = ["/v1/responses", "/v1/responses/compact"];
 const TRANSPORT_SIZED_FRAMES: [usize; 2] = [16 * 1024, 64 * 1024];
 const BUDGET_BYTES: u32 = 1024 * 1024;
 
+#[test]
+fn pause_hooks_do_not_enlarge_cloned_admission_state() {
+    assert_eq!(
+        std::mem::size_of::<RequestSpoolAdmission>(),
+        std::mem::size_of::<[Arc<()>; 3]>()
+    );
+}
+
 #[derive(Default)]
 pub(super) struct BlockingPause {
     entered: Notify,
@@ -170,7 +178,7 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                         directory.path().to_owned(),
                         BUDGET_BYTES as usize,
                     );
-                    spool.blocking_write = Some(pause.clone());
+                    Arc::get_mut(&mut spool.budget).unwrap().blocking_write = Some(pause.clone());
                     let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
                     let held = budget.reservation();
                     let held_bytes = BUDGET_BYTES as usize - metadata - frame_allowance;
@@ -232,9 +240,9 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 let mut spool =
                     RequestSpoolAdmission::new(directory.path().to_owned(), BUDGET_BYTES as usize);
                 if pause_open {
-                    spool.blocking_open = Some(pause.clone());
+                    Arc::get_mut(&mut spool.budget).unwrap().blocking_open = Some(pause.clone());
                 } else {
-                    spool.blocking_write = Some(pause.clone());
+                    Arc::get_mut(&mut spool.budget).unwrap().blocking_write = Some(pause.clone());
                 }
                 let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
                 let held = budget.reservation();
@@ -275,8 +283,8 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 assert_eq!(spool.snapshot().active_files, 0);
                 drop(held);
                 assert_eq!(budget.snapshot().0, 0);
-                spool.blocking_open = None;
-                spool.blocking_write = None;
+                Arc::get_mut(&mut spool.budget).unwrap().blocking_open = None;
+                Arc::get_mut(&mut spool.budget).unwrap().blocking_write = None;
                 let recovered = admit(path, Body::from("x"), Some(1), &budget, &spool)
                     .await
                     .unwrap();

@@ -23,10 +23,6 @@ pub(crate) struct RequestSpoolAdmission {
     budget: Arc<RequestSpoolBudget>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
-    #[cfg(test)]
-    blocking_open: Option<Arc<ownership_tests::BlockingPause>>,
-    #[cfg(test)]
-    blocking_write: Option<Arc<ownership_tests::BlockingPause>>,
 }
 
 impl RequestSpoolAdmission {
@@ -36,10 +32,6 @@ impl RequestSpoolAdmission {
             budget: Arc::new(RequestSpoolBudget::new(limit_bytes)),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            blocking_open: None,
-            #[cfg(test)]
-            blocking_write: None,
         }
     }
 
@@ -93,7 +85,7 @@ impl RequestSpoolAdmission {
         let opening_metadata = metadata.clone();
         let opening_lease = lease.clone();
         #[cfg(test)]
-        let blocking_open = self.blocking_open.clone();
+        let blocking_open = self.budget.blocking_open.clone();
         let opening = tokio::task::spawn_blocking(move || {
             let _opening_metadata = opening_metadata;
             let _opening_lease = opening_lease;
@@ -106,7 +98,7 @@ impl RequestSpoolAdmission {
             Ok::<_, io::Error>((owner, writer))
         });
         #[cfg(test)]
-        if let Some(pause) = &self.blocking_open {
+        if let Some(pause) = &self.budget.blocking_open {
             pause.record(&opening);
         }
         let (owner, writer) = opening
@@ -159,7 +151,7 @@ impl RequestSpoolAdmission {
                 let write_lease = capture.lease.clone();
                 let write_bytes = piece.to_vec();
                 #[cfg(test)]
-                let blocking_write = self.blocking_write.clone();
+                let blocking_write = self.budget.blocking_write.clone();
                 let writing = tokio::task::spawn_blocking(move || {
                     let _write_metadata = write_metadata;
                     let _write_frame = write_frame;
@@ -171,7 +163,7 @@ impl RequestSpoolAdmission {
                     std::io::Write::write_all(&mut writer, &write_bytes)
                 });
                 #[cfg(test)]
-                if let Some(pause) = &self.blocking_write {
+                if let Some(pause) = &self.budget.blocking_write {
                     pause.record(&writing);
                 }
                 writing
@@ -226,6 +218,10 @@ struct RequestSpoolBudget {
     limit_bytes: usize,
     active_files: AtomicUsize,
     capacity_rejections: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    blocking_open: Option<Arc<ownership_tests::BlockingPause>>,
+    #[cfg(test)]
+    blocking_write: Option<Arc<ownership_tests::BlockingPause>>,
 }
 
 impl RequestSpoolBudget {
@@ -235,6 +231,10 @@ impl RequestSpoolBudget {
             limit_bytes,
             active_files: AtomicUsize::new(0),
             capacity_rejections: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            blocking_open: None,
+            #[cfg(test)]
+            blocking_write: None,
         }
     }
 
