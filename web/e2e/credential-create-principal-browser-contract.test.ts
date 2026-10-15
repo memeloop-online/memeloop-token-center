@@ -99,8 +99,12 @@ test('client credential creation names the principal once and binds existing pri
       page.once('dialog', dialog => dialog.accept());
       await page.locator('.one-time .one-time-close').click();
 
+      // A successful creation closes the journey; reopen it for the next one.
+      await toggle.click();
       await aliasInput.fill(english ? 'Research second key' : '研发第二个凭据');
-      await create.getByRole('button', { name: english ? 'Bind an existing principal (optional)' : '绑定已有主体（可选）', exact: true }).click();
+      const bindingToggle = create.getByRole('button', { name: english ? 'Bind an existing principal (optional)' : '绑定已有主体（可选）', exact: true });
+      await bindingToggle.click();
+      assert.equal(await bindingToggle.getAttribute('aria-expanded'), 'true', 'the optional binding disclosure opens');
       const principal = create.getByRole('combobox', { name: english ? 'Principal' : '用户主体', exact: true });
       await principal.click();
       await page.getByRole('option', { name: 'tenant-a-principal', exact: true }).click();
@@ -118,6 +122,8 @@ test('client credential creation names the principal once and binds existing pri
       page.once('dialog', dialog => dialog.accept());
       await page.locator('.one-time .one-time-close').click();
 
+      // The binding disclosure stays mounted and open across creations.
+      await toggle.click();
       await aliasInput.fill(english ? 'Side project' : '旁支项目');
       await principal.fill(english ? 'custom-owner' : '自定义主体');
       await create.locator('button[type="submit"]').click();
@@ -128,6 +134,7 @@ test('client credential creation names the principal once and binds existing pri
       assert.equal(body.principal_external_id, english ? 'custom-owner' : '自定义主体', 'a freeform principal still flows through for new owners');
       page.once('dialog', dialog => dialog.accept());
       await page.locator('.one-time .one-time-close').click();
+      await toggle.click();
       assert.equal(await principal.inputValue(), '', 'a successful creation resets the optional binding');
       await page.close();
     }

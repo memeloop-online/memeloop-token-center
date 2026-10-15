@@ -1581,7 +1581,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const principalQuery = createPrincipalOverride.trim().toLocaleLowerCase();
   const principalField = <AdvancedFormSection title={t('credentials.principalBinding')} description={t('credentials.principalBindingHint')}>
     <label htmlFor={principalBindingId}>{t('schema.Principal')}
-      <Combobox id={principalBindingId} freeform value={createPrincipalOverride} placeholder={t('credentials.principalBindingPlaceholder')}
+      <Combobox id={principalBindingId} freeform value={createPrincipalOverride} aria-label={t('schema.Principal')} placeholder={t('credentials.principalBindingPlaceholder')}
         input={{ maxLength: 200, autoComplete: 'off', onChange: event => setCreatePrincipalOverride(event.target.value) }}
         onOptionSelect={(_, data) => setCreatePrincipalOverride(data.optionText ?? '')}>
         {existingPrincipals.filter(principal => !principalQuery || principal.toLocaleLowerCase().includes(principalQuery)).map(principal => <Option key={principal} value={principal} text={principal}>{principal}</Option>)}
