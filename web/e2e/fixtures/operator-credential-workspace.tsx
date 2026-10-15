@@ -109,11 +109,11 @@ function json(value: unknown, status = 200) {
   });
 }
 
-function credential(alias: string, tenant: string, keyId: string) {
+function credential(alias: string, tenant: string, keyId: string, principal?: string) {
   return {
     key_id: keyId,
     tenant_external_id: tenant,
-    principal_external_id: `${tenant}-principal`,
+    principal_external_id: principal ?? `${tenant}-principal`,
     alias,
     status: 'active',
     currency: 'USD',
@@ -237,6 +237,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       // Match the API's descending (created_at, key_id) keyset order.
       // These rows share a timestamp, and key-other sorts before key-form.
       ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
+      // A legacy identity whose external ID legitimately carries surrounding
+      // whitespace; picking it must bind the exact ID, never a trimmed rewrite.
+      ...(parameters.has('padded-principal') ? [credential('Padded owner client', 'tenant-a', 'key-padded', ' padded-owner ')] : []),
       credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
     ]);
     if (url.pathname === '/internal/v1/keys/key-form/rotate' && method === 'POST') return json({ key: 'mtc_fixture_rotated' });

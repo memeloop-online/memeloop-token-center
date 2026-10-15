@@ -99,8 +99,15 @@ test('client credential creation names the principal once and binds existing pri
       page.once('dialog', dialog => dialog.accept());
       await page.locator('.one-time .one-time-close').click();
 
-      // A successful creation closes the journey; reopen it for the next one.
-      await toggle.click();
+      // A successful creation closes the journey; reopen it through the real
+      // workspace toggle before touching the form again.
+      const reopenCreate = async () => {
+        await page.locator('.one-time').waitFor({ state: 'hidden' });
+        await toggle.click();
+        assert.equal(await create.getAttribute('data-open'), 'true', 'the workspace toggle genuinely reopens the create form');
+        await aliasInput.waitFor({ state: 'visible' });
+      };
+      await reopenCreate();
       await aliasInput.fill(english ? 'Research second key' : '研发第二个凭据');
       const bindingToggle = create.getByRole('button', { name: english ? 'Bind an existing principal (optional)' : '绑定已有主体（可选）', exact: true });
       await bindingToggle.click();
@@ -123,7 +130,7 @@ test('client credential creation names the principal once and binds existing pri
       await page.locator('.one-time .one-time-close').click();
 
       // The binding disclosure stays mounted and open across creations.
-      await toggle.click();
+      await reopenCreate();
       await aliasInput.fill(english ? 'Side project' : '旁支项目');
       await principal.fill(english ? 'custom-owner' : '自定义主体');
       assert.equal(await principal.inputValue(), english ? 'custom-owner' : '自定义主体', 'the freeform principal stays as typed');
@@ -135,10 +142,33 @@ test('client credential creation names the principal once and binds existing pri
       assert.equal(body.principal_external_id, english ? 'custom-owner' : '自定义主体', 'a freeform principal still flows through for new owners');
       page.once('dialog', dialog => dialog.accept());
       await page.locator('.one-time .one-time-close').click();
-      await toggle.click();
+      await reopenCreate();
       assert.equal(await principal.inputValue(), '', 'a successful creation resets the optional binding');
       await page.close();
     }
+
+    const padded = await browser.newPage();
+    await padded.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await padded.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form&padded-principal=1`);
+    await padded.getByText('Research workspace', { exact: true }).waitFor();
+    const paddedCreate = padded.locator('.create-journey');
+    await paddedCreate.locator(':scope > .journey-heading [data-workspace-toggle]').click();
+    await paddedCreate.locator('#root_alias').fill('Legacy owner key');
+    await paddedCreate.getByRole('button', { name: 'Bind an existing principal (optional)', exact: true }).click();
+    await paddedCreate.getByRole('combobox', { name: 'Principal', exact: true }).click();
+    // The accessible name collapses whitespace; the submitted identity must not.
+    const paddedOption = padded.getByRole('option').filter({ hasText: 'padded-owner' });
+    await paddedOption.waitFor();
+    assert.equal(await paddedOption.textContent(), ' padded-owner ');
+    await paddedOption.click();
+    assert.equal(await paddedCreate.getByRole('combobox', { name: 'Principal', exact: true }).inputValue(), ' padded-owner ', 'picking an existing identity keeps its exact spelling');
+    await paddedCreate.locator('button[type="submit"]').click();
+    await padded.locator('.one-time').getByText('mtc_fixture_created', { exact: true }).waitFor();
+    const paddedPosts = await padded.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'POST' && request.path === '/internal/v1/keys'));
+    assert.equal(paddedPosts.length, 1);
+    assert.equal(JSON.parse(paddedPosts[0].body!).principal_external_id, ' padded-owner ', 'the exact existing principal is bound, never a trimmed rewrite');
+    assert.equal(JSON.parse(paddedPosts[0].body!).alias, 'Legacy owner key');
+    await padded.close();
 
     const duplicate = await browser.newPage();
     await duplicate.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
