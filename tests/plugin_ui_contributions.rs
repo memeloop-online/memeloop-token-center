@@ -241,6 +241,15 @@ async fn component_operator_contributions_support_tabs_and_existing_page_slots()
             "module_entry": "assets/operator-ui.mjs",
             "component_id": "provider-intelligence",
             "data_endpoint": "health"
+        },
+        {
+            "id": "model-route-action",
+            "slot": "operator.model-route.action",
+            "label": "Open route extension",
+            "icon": "plug",
+            "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs",
+            "component_id": "route-action"
         }
     ]);
     write_package(&plugins, "component-ui", &manifest);
@@ -285,4 +294,34 @@ async fn component_operator_contributions_support_tabs_and_existing_page_slots()
         to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
         b"export function activateOperatorUi() {}\n"
     );
+}
+
+#[tokio::test]
+async fn model_route_actions_reject_declarative_renderers_and_navigation_fields() {
+    for (name, extra) in [
+        ("typed", serde_json::json!({"renderer": "typed_data_v1", "data_endpoint": "health"})),
+        ("route", serde_json::json!({"route": "extension"})),
+        ("category", serde_json::json!({"category": {"id": "monitoring"}})),
+        ("target", serde_json::json!({"target_route": "routes"})),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = directory.path().join("plugins");
+        let mut manifest = fixture()["installed"][0].clone();
+        let mut action = serde_json::json!({
+            "id": "model-route-action", "slot": "operator.model-route.action",
+            "label": "Route extension", "icon": "plug", "renderer": "component_v1",
+            "module_entry": "assets/operator-ui.mjs", "component_id": "route-action"
+        });
+        action.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        if name == "typed" {
+            action.as_object_mut().unwrap().remove("module_entry");
+            action.as_object_mut().unwrap().remove("component_id");
+        }
+        manifest["contributions"]["operator_ui"] = serde_json::json!([action]);
+        write_package(&plugins, name, &manifest);
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("ui.db").display());
+        let mut config = Config::for_test(database_url);
+        config.plugin_dir = Some(plugins.display().to_string());
+        assert!(AppState::initialize(config).await.is_err(), "invalid action {name}");
+    }
 }
