@@ -669,7 +669,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
     let legacy_observation_id = Uuid::now_v7();
     let legacy_request_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version) VALUES ($1, $2, $3, $4, '[]', $5, 2)",
+        "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version) VALUES ($1, $2, $3, $4, '{\"context_prefix_v1\":null,\"atom_count\":0}', $5, 2)",
     )
     .bind(legacy_observation_id.to_string())
     .bind(&parent_cluster)

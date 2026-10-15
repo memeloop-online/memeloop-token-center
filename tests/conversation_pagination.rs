@@ -1926,7 +1926,7 @@ async fn sqlite_110k_history_is_keyset_paginated_and_uses_covering_indexes() {
     .await
     .expect("110k request history");
     sqlx::query(
-        "WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 110001) INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, client_name, created_at, inference_version, compaction) SELECT printf('20000000-0000-7000-8000-%012x', value), $1, printf('00000000-0000-7000-8000-%012x', value), $2, '[]', 'Codex', $3 + value, 2, 0 FROM sequence",
+        "WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 110001) INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, client_name, created_at, inference_version, compaction) SELECT printf('20000000-0000-7000-8000-%012x', value), $1, printf('00000000-0000-7000-8000-%012x', value), $2, '{\"context_prefix_v1\":null,\"atom_count\":0}', 'Codex', $3 + value, 2, 0 FROM sequence",
     )
     .bind(cluster_id.to_string())
     .bind(fixture.key.key_id.to_string())

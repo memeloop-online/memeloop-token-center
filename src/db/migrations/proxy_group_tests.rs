@@ -153,10 +153,6 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DROP TABLE conversation_prefix_storage_policy")
-        .execute(&database.pool)
-        .await
-        .unwrap();
     sqlx::query("DROP TABLE request_egress_attempts")
         .execute(&database.pool)
         .await

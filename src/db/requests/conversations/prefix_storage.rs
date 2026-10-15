@@ -7,13 +7,20 @@ use super::*;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Fingerprint {
-    context_prefix_v1: Option<String>,
-    atom_count: usize,
+pub(crate) struct Fingerprint {
+    #[serde(deserialize_with = "required_head")]
+    pub(crate) context_prefix_v1: Option<String>,
+    pub(crate) atom_count: usize,
+}
+
+fn required_head<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(deserializer)
 }
 
 impl Fingerprint {
-    pub(super) fn from_hashes(hashes: &[String]) -> Self {
+    pub(crate) fn from_hashes(hashes: &[String]) -> Self {
         let mut parent = None;
         for hash in hashes {
             parent = Some(crate::conversation::digest_parts(parent.as_deref(), hash));
@@ -25,15 +32,15 @@ impl Fingerprint {
     }
 }
 
-struct StoredNode {
-    parent: Option<String>,
-    atom: String,
-    depth: i64,
+pub(crate) struct StoredNode {
+    pub(crate) parent: Option<String>,
+    pub(crate) atom: String,
+    pub(crate) depth: i64,
 }
 
 #[derive(Default)]
-pub(super) struct PrefixPaths {
-    nodes: HashMap<String, StoredNode>,
+pub(crate) struct PrefixPaths {
+    pub(crate) nodes: HashMap<String, StoredNode>,
 }
 
 fn invalid_path() -> AppError {
@@ -41,7 +48,7 @@ fn invalid_path() -> AppError {
 }
 
 impl PrefixPaths {
-    pub(super) fn ancestors(&self, head: Option<&str>) -> Result<HashSet<String>, AppError> {
+    pub(crate) fn ancestors(&self, head: Option<&str>) -> Result<HashSet<String>, AppError> {
         let mut result = HashSet::new();
         let mut cursor = head;
         let mut child_depth = None;
@@ -65,7 +72,7 @@ impl PrefixPaths {
 
     /// With no expected count this reconstructs the complete leaf losslessly.
     /// The fingerprint reader supplies its exact count, never an empty fallback.
-    pub(super) fn hashes(
+    pub(crate) fn hashes(
         &self,
         head: Option<&str>,
         count: Option<usize>,
@@ -86,7 +93,7 @@ impl PrefixPaths {
     }
 }
 
-fn decode(encoded: &str) -> Result<Fingerprint, AppError> {
+pub(crate) fn decode(encoded: &str) -> Result<Fingerprint, AppError> {
     let fingerprint: Fingerprint = serde_json::from_str(encoded).map_err(|_| invalid_path())?;
     if fingerprint.atom_count > MAX_CONVERSATION_FINGERPRINT_ATOMS
         || (fingerprint.atom_count == 0) != fingerprint.context_prefix_v1.is_none()
@@ -96,37 +103,16 @@ fn decode(encoded: &str) -> Result<Fingerprint, AppError> {
     Ok(fingerprint)
 }
 
-pub(super) fn candidate_hashes(row: &AnyRow, paths: &PrefixPaths) -> Result<Vec<String>, AppError> {
-    let encoded: Option<String> = row.try_get("atom_hashes_json")?;
-    match encoded {
-        Some(encoded) if encoded.starts_with('[') => {
-            let mut hashes: Vec<String> =
-                serde_json::from_str(&encoded).map_err(|_| invalid_path())?;
-            hashes.truncate(MAX_CONVERSATION_FINGERPRINT_ATOMS);
-            Ok(hashes)
-        }
-        Some(encoded) => {
-            let fingerprint = decode(&encoded)?;
-            paths.hashes(
-                fingerprint.context_prefix_v1.as_deref(),
-                Some(fingerprint.atom_count),
-            )
-        }
-        None => {
-            // Historical uncapped JSON is not sent over SQL merely to discard
-            // its tail. Recover its bounded inference view from the full leaf.
-            let leaf: Option<String> = row.try_get("leaf_node_hash")?;
-            if leaf.is_none() {
-                return Err(invalid_path());
-            }
-            let mut hashes = paths.hashes(leaf.as_deref(), None)?;
-            hashes.truncate(MAX_CONVERSATION_FINGERPRINT_ATOMS);
-            Ok(hashes)
-        }
-    }
+pub(crate) fn candidate_hashes(row: &AnyRow, paths: &PrefixPaths) -> Result<Vec<String>, AppError> {
+    let encoded: String = row.try_get("atom_hashes_json")?;
+    let fingerprint = decode(&encoded)?;
+    paths.hashes(
+        fingerprint.context_prefix_v1.as_deref(),
+        Some(fingerprint.atom_count),
+    )
 }
 
-pub(super) async fn load_candidate_paths(
+pub(crate) async fn load_candidate_paths(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     candidates: &[AnyRow],
@@ -137,21 +123,19 @@ pub(super) async fn load_candidate_paths(
         roots.insert(leaf.to_owned());
     }
     for row in candidates {
-        let encoded: Option<String> = row.try_get("atom_hashes_json")?;
-        match encoded {
-            Some(encoded) if encoded.starts_with('[') => {}
-            Some(encoded) => {
-                if let Some(head) = decode(&encoded)?.context_prefix_v1 {
-                    roots.insert(head);
-                }
-            }
-            None => {
-                if let Some(leaf) = row.try_get::<Option<String>, _>("leaf_node_hash")? {
-                    roots.insert(leaf);
-                }
-            }
+        let encoded: String = row.try_get("atom_hashes_json")?;
+        if let Some(head) = decode(&encoded)?.context_prefix_v1 {
+            roots.insert(head);
         }
     }
+    load_paths(transaction, tenant_id, roots).await
+}
+
+pub(crate) async fn load_paths(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    roots: std::collections::BTreeSet<String>,
+) -> Result<PrefixPaths, ConversationContentError> {
     if roots.is_empty() {
         return Ok(PrefixPaths::default());
     }
@@ -189,4 +173,4 @@ pub(super) async fn load_candidate_paths(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

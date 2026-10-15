@@ -16,6 +16,8 @@ fn reference_encoding_is_explicit_and_malformed_paths_are_rejected() {
         r#"{"context_prefix_v1":"missing","atom_count":0}"#,
         r#"{"context_prefix_v1":"missing","atom_count":1025}"#,
         r#"{"context_prefix_v2":null,"atom_count":0}"#,
+        r#"{"atom_count":0}"#,
+        "[]",
     ] {
         assert!(decode(encoded).is_err());
     }
@@ -26,7 +28,7 @@ fn reference_encoding_is_explicit_and_malformed_paths_are_rejected() {
     );
 }
 
-async fn key(database: &Database, tenant: &str) -> AuthenticatedKey {
+pub(crate) async fn key(database: &Database, tenant: &str) -> AuthenticatedKey {
     let issued = database
         .create_key(
             CreateKeyInput {
@@ -48,7 +50,7 @@ async fn key(database: &Database, tenant: &str) -> AuthenticatedKey {
         .unwrap()
 }
 
-async fn observe(
+pub(crate) async fn observe(
     database: &Database,
     key: &AuthenticatedKey,
     body: &serde_json::Value,
@@ -84,7 +86,7 @@ async fn observe(
     cluster
 }
 
-async fn load(
+pub(crate) async fn load(
     database: &Database,
     tenant: Uuid,
     request: Uuid,
@@ -120,28 +122,34 @@ async fn contract(url: &str) {
         .collect();
     let base_body = json!({"input": base});
     let default_hints = ConversationHints::default();
-    let legacy_id = Uuid::now_v7();
+    let base_id = Uuid::now_v7();
     let cluster = observe(
         &database,
         &first,
         &base_body,
         &default_hints,
-        legacy_id,
+        base_id,
         now,
         true,
     )
     .await;
-    let legacy: String = sqlx::query_scalar(
+    let base_reference: String = sqlx::query_scalar(
         "SELECT atom_hashes_json FROM conversation_observations WHERE request_id = $1",
     )
-    .bind(legacy_id.to_string())
+    .bind(base_id.to_string())
     .fetch_one(&database.pool)
     .await
     .unwrap();
     assert!(
-        legacy.starts_with('['),
-        "migration must retain old-reader-compatible writes"
+        decode(&base_reference).is_ok(),
+        "latest writers are always enabled"
     );
+    let all_hashes: Vec<_> = extract_atoms(&base_body)
+        .into_iter()
+        .map(|atom| atom.content_hash)
+        .collect();
+    let repeated_array =
+        serde_json::to_string(&all_hashes[..MAX_CONVERSATION_FINGERPRINT_ATOMS]).unwrap();
     let nodes_before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM context_nodes WHERE tenant_id = $1")
             .bind(first.tenant_id.to_string())
@@ -149,13 +157,6 @@ async fn contract(url: &str) {
             .await
             .unwrap();
     assert_eq!(nodes_before, PREFIX as i64);
-    sqlx::query(
-        "UPDATE conversation_prefix_storage_policy SET reference_writes = 1 WHERE singleton = 1",
-    )
-    .execute(&database.pool)
-    .await
-    .unwrap();
-
     let mut expected_nodes = PREFIX;
     let mut requests = Vec::new();
     for index in 0..OBSERVATIONS {
@@ -212,13 +213,13 @@ async fn contract(url: &str) {
         "no duplicate prefix tree"
     );
     let reference_bytes: i64 = sqlx::query_scalar("SELECT SUM(LENGTH(atom_hashes_json)) FROM conversation_observations WHERE key_id = $1 AND request_id <> $2")
-        .bind(first.key_id.to_string()).bind(legacy_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    let repeated_array_bytes = legacy.len() * OBSERVATIONS;
+        .bind(first.key_id.to_string()).bind(base_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    let repeated_array_bytes = repeated_array.len() * OBSERVATIONS;
     assert!(reference_bytes * 100 < repeated_array_bytes as i64);
     // Fifty observations share one actual prefix path, not fifty SQL lookups
     // or fifty copies of the common ancestors in the recursive result.
     let candidates = sqlx::query("SELECT atom_hashes_json, leaf_node_hash FROM conversation_observations WHERE key_id = $1 AND request_id <> $2 ORDER BY created_at DESC LIMIT 50")
-        .bind(first.key_id.to_string()).bind(legacy_id.to_string()).fetch_all(&database.pool).await.unwrap();
+        .bind(first.key_id.to_string()).bind(base_id.to_string()).fetch_all(&database.pool).await.unwrap();
     let mut transaction = database.begin_write_transaction().await.unwrap();
     let shared = load_candidate_paths(
         &mut transaction,
@@ -339,34 +340,6 @@ async fn contract(url: &str) {
         load_candidate_paths(&mut transaction, &Uuid::now_v7().to_string(), &[row], None)
             .await
             .is_err()
-    );
-    transaction.rollback().await.unwrap();
-
-    // Old uncapped rows remain readable without substituting [] for real history.
-    let all_hashes: Vec<_> = extract_atoms(&base_body)
-        .into_iter()
-        .map(|atom| atom.content_hash)
-        .collect();
-    sqlx::query("UPDATE conversation_observations SET atom_hashes_json = $1 WHERE request_id = $2")
-        .bind(serde_json::to_string(&all_hashes).unwrap())
-        .bind(legacy_id.to_string())
-        .execute(&database.pool)
-        .await
-        .unwrap();
-    let oversized = sqlx::query("SELECT CASE WHEN LENGTH(atom_hashes_json) <= 70000 THEN atom_hashes_json ELSE NULL END AS atom_hashes_json, leaf_node_hash FROM conversation_observations WHERE request_id = $1")
-        .bind(legacy_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    let mut transaction = database.begin_write_transaction().await.unwrap();
-    let paths = load_candidate_paths(
-        &mut transaction,
-        &first.tenant_id.to_string(),
-        std::slice::from_ref(&oversized),
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        candidate_hashes(&oversized, &paths).unwrap(),
-        all_hashes[..MAX_CONVERSATION_FINGERPRINT_ATOMS]
     );
     transaction.rollback().await.unwrap();
 

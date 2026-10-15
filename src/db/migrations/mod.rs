@@ -1,6 +1,7 @@
 use super::*;
 
 mod credential_plaintext;
+mod observation_prefix;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionMaintenanceReport {
@@ -664,7 +665,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 127,
-        name: "conversation prefix reference write policy",
+        name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
 ];
@@ -1315,7 +1316,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 127,
-        name: "conversation prefix reference write policy",
+        name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
 ];
@@ -1587,6 +1588,9 @@ pub(super) async fn apply_migration_range(
                 "database migration execution failed"
             );
             return Err(error);
+        }
+        if migration.version == 127 {
+            observation_prefix::convert(transaction).await?;
         }
         sqlx::query(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
