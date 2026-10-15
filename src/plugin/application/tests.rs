@@ -25,7 +25,9 @@ fn write_inventory(root: &std::path::Path, second: bool) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    let mut source = include_str!("../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat").to_owned();
+    let mut source =
+        include_str!("../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat")
+            .to_owned();
     if second {
         // Equal-length replacements preserve the fixture's canonical ABI offsets.
         source = source

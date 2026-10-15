@@ -187,8 +187,11 @@ fn checked_in_example_component_is_reproducible_from_auditable_wat() {
 #[tokio::test]
 async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = PluginRuntime::load(Some(".plugin-examples/examples/plugins"), database(directory.path()).await)
-        .expect("load checked-in example");
+    let runtime = PluginRuntime::load(
+        Some(".plugin-examples/examples/plugins"),
+        database(directory.path()).await,
+    )
+    .expect("load checked-in example");
 
     let manifests = runtime.manifests();
     assert_eq!(manifests.len(), 1);
@@ -766,8 +769,9 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");
     fs::create_dir(&plugins).unwrap();
-    let streaming_wat = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat")
-        .replace("\\22streaming\\22:false}", "\\22streaming\\22:true }");
+    let streaming_wat =
+        include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat")
+            .replace("\\22streaming\\22:false}", "\\22streaming\\22:true }");
     write_component_provider_package(&plugins, "streaming", &streaming_wat, 1024);
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
         .expect("load streaming fixture");
