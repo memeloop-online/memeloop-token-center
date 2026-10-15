@@ -222,6 +222,7 @@ pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 #[derive(Clone)]
 pub struct Database {
     pool: AnyPool,
+    pool_role: &'static str,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -424,7 +425,11 @@ impl Database {
         stage: DatabaseReadinessStage,
     ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
         progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
-        let connection = self.pool.acquire().await?;
+        let started = tokio::time::Instant::now();
+        let connection = self.pool.acquire().await.map_err(|error| {
+            self.observe_pool_timeout("readiness", started, &error);
+            error
+        })?;
         progress.enter(stage, DatabaseReadinessPhase::Query).await;
         Ok(connection)
     }
@@ -589,6 +594,10 @@ impl Database {
                 backend,
             )?),
             pool,
+            pool_role: match profile {
+                ConnectionProfile::Serve => "serve",
+                ConnectionProfile::Migration => "migration",
+            },
             backend,
             terminal_projection_enabled: false,
             #[cfg(test)]
@@ -599,6 +608,7 @@ impl Database {
     pub(crate) async fn begin_write_transaction(
         &self,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
+        let started = tokio::time::Instant::now();
         // SQLite's default deferred transaction can fail immediately with
         // SQLITE_BUSY when a read-before-write transaction races another
         // writer: the shared lock cannot be upgraded after that writer has
@@ -611,11 +621,41 @@ impl Database {
                 DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
             })
             .await
+            .map_err(|error| {
+                self.observe_pool_timeout("write_transaction", started, &error);
+                error
+            })
+    }
+
+    fn observe_pool_timeout(
+        &self,
+        operation: &'static str,
+        started: tokio::time::Instant,
+        error: &sqlx::Error,
+    ) {
+        if matches!(error, sqlx::Error::PoolTimedOut) {
+            let pool_size = self.pool.size();
+            let pool_idle = self.pool.num_idle();
+            tracing::warn!(
+                operation,
+                pool_role = self.pool_role,
+                phase = "acquire",
+                error_kind = "pool_timeout",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                pool_max = self.pool.options().get_max_connections(),
+                pool_size,
+                pool_idle,
+                pool_in_use = (pool_size as usize).saturating_sub(pool_idle),
+                acquire_timeout_ms = self.pool.options().get_acquire_timeout().as_millis() as u64,
+                "database pool acquisition timed out"
+            );
+        }
     }
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
             gateway_persistence: self.gateway_persistence.clone(),
+            pool_role: "independent_persistence",
             pool: self
                 .pool
                 .options()

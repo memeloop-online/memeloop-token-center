@@ -147,6 +147,7 @@ impl Database {
             let pepper = pepper.to_vec();
             let mut database = self.clone();
             database.pool = self.gateway_persistence.pool.clone();
+            database.pool_role = "gateway_archive";
             let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
             tokio::spawn(async move {
                 let _permits = permits;
