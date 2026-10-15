@@ -183,10 +183,9 @@ use crate::{
     plugin::{PreparedProviderRequest, memeloop::token_center::types::RequestContext},
     provider::{ResolvedUpstream, UpstreamCredential, validate_config},
     proxy_lifecycle::{
-        MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_LIFETIME, MAX_PROXY_STREAM_LIFETIME,
-        abandon_proxy_archive_attempt, confirm_proxy_delivery_with_retry,
-        finish_proxy_request_with_retry, prepare_proxy_delivery_with_retry,
-        response_archive_requires_cleanup,
+        MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_FINALIZATION_LIFETIME, abandon_proxy_archive_attempt,
+        confirm_proxy_delivery_with_retry, finish_proxy_request_with_retry,
+        prepare_proxy_delivery_with_retry, response_archive_requires_cleanup,
     },
 };
 

@@ -63,13 +63,12 @@ async fn downstream_close_interrupts_a_pending_upstream_poll() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn progress_heartbeat_interrupts_a_quiet_upstream_before_stream_timeout() {
+async fn progress_heartbeat_interrupts_a_quiet_upstream() {
     let (body_sender, _body_receiver) = tokio::sync::mpsc::channel(1);
     let heartbeat_at = tokio::time::Instant::now() + Duration::from_secs(15);
     let poll = poll_upstream_downstream_or_progress_heartbeat(
         &body_sender,
         std::future::pending::<()>(),
-        tokio::time::Instant::now() + Duration::from_secs(20),
         Some(heartbeat_at),
     );
     tokio::pin!(poll);

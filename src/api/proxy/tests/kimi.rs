@@ -159,7 +159,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 state: &fixture.state,
                 reservation,
                 request_id,
-                started: Instant::now(),
+                memory_admission_wait: Duration::from_secs(30),
                 input_token_ceiling: 20,
                 output_token_ceiling: 8,
                 requested_service_tier: None,

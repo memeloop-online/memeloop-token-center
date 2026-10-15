@@ -17,7 +17,7 @@ use super::super::sse::{
 #[cfg(test)]
 use super::MAX_RESPONSES_SSE_EVENT_BYTES;
 use super::{
-    MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS, Protocol, TokenUsage,
+    MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS, Protocol, TokenUsage,
     upstream_response::UpstreamResponse,
 };
 use crate::provider::{CodexChatControlPolicy, CodexResponsesOutputLimitPolicy};
@@ -1886,7 +1886,7 @@ fn response_chat_content(
 pub(super) async fn buffer_response(
     response: UpstreamResponse,
     memory: &std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
-    started: std::time::Instant,
+    memory_admission_wait: std::time::Duration,
     conversation: Option<&super::ProxyConversation>,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<BufferedCodexResponse, &'static str> {
@@ -1912,8 +1912,7 @@ pub(super) async fn buffer_response(
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(MAX_PROXY_RESPONSE_BODY)
         .min(MAX_PROXY_RESPONSE_BODY);
-    let deadline =
-        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
+    let deadline = tokio::time::Instant::now() + memory_admission_wait;
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
@@ -1936,9 +1935,7 @@ pub(super) async fn buffer_response(
     let mut total = 0_usize;
     let mut stream = response.bytes_stream();
     loop {
-        let next = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| "upstream_timeout")?;
+        let next = stream.next().await;
         let Some(next) = next else { break };
         let chunk = next?;
         if !chunk.is_empty()

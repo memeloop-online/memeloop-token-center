@@ -99,6 +99,9 @@ pub(crate) use projection_lock::{
     lock_request_stats_projection_rebuild_in_transaction,
     lock_request_stats_projection_writer_in_transaction,
 };
+pub(crate) use requests::owner::{
+    ProxyRequestOwner, REQUEST_OWNER_HEARTBEAT_MILLIS, REQUEST_OWNER_LEASE_MILLIS,
+};
 use rotation::*;
 use rows::generation_asset_download;
 pub use session_analytics::{LogicalSessionListFilter, MAX_SESSION_SUMMARY_IDENTITIES};

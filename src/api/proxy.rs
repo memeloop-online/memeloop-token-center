@@ -605,7 +605,7 @@ async fn finish_non_sse_proxy_response(
         upstream,
         MAX_PROXY_RESPONSE_BODY,
         &buffered_request.memory,
-        buffered_request.started,
+        buffered_request.memory_admission_wait,
         false,
         buffered_request.conversation.as_ref(),
     )
@@ -983,7 +983,13 @@ async fn proxy_with_identity_and_conversation_spool(
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
     let mut cancellation = lifecycle::CancellationGuard::default();
-    let result = proxy_with_cancellation_guard(
+    let owner_loss = cancellation.owner_loss();
+    let result = tokio::select! {
+        biased;
+        _ = crate::proxy_lifecycle::wait_for_owner_loss(Some(owner_loss.clone())) => {
+            return Err(AppError::Internal);
+        }
+        result = proxy_with_cancellation_guard(
         state,
         headers,
         body,
@@ -993,9 +999,11 @@ async fn proxy_with_identity_and_conversation_spool(
         memory,
         conversation_spool,
         &mut cancellation,
-    )
-    .await;
-    cancellation.disarm();
+        ) => result,
+    };
+    if !*owner_loss.borrow() {
+        cancellation.disarm();
+    }
     result
 }
 
@@ -1265,6 +1273,7 @@ async fn proxy_with_cancellation_guard(
         started_request.reservation.clone(),
         proxy_lifecycle_permit,
     );
+    cancellation.acquire_owner().await?;
     match started_request.archive_admission {
         crate::db::RequestArchiveAdmission::Captured
         | crate::db::RequestArchiveAdmission::Queued => {}
@@ -1316,7 +1325,7 @@ async fn proxy_with_cancellation_guard(
         state: &state,
         reservation,
         request_id,
-        started: Instant::now(),
+        memory_admission_wait: Duration::from_millis(memory_wait),
         input_token_ceiling,
         output_token_ceiling,
         requested_service_tier,
@@ -1818,7 +1827,7 @@ async fn proxy_with_cancellation_guard(
                 upstream,
                 MAX_PROXY_RESPONSE_BODY,
                 &buffered_request.memory,
-                buffered_request.started,
+                buffered_request.memory_admission_wait,
                 false,
                 buffered_request.conversation.as_ref(),
             )
@@ -1954,7 +1963,7 @@ async fn proxy_with_cancellation_guard(
         let buffered = match codex_transport::buffer_response(
             upstream,
             &buffered_request.memory,
-            buffered_request.started,
+            buffered_request.memory_admission_wait,
             buffered_request.conversation.as_ref(),
             sse_framing_limits,
         )
@@ -2441,9 +2450,7 @@ struct BufferedRequest<'a> {
     state: &'a AppState,
     reservation: crate::model::UsageReservation,
     request_id: Uuid,
-    // Admission/resource budget clock; persisted latency uses the ingress
-    // diagnostic context instead. Moving this clock would change deadlines.
-    started: Instant,
+    memory_admission_wait: Duration,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
     requested_service_tier: Option<String>,
@@ -2643,7 +2650,7 @@ async fn execute_component_provider(
         upstream.into(),
         maximum.min(MAX_PROXY_RESPONSE_BODY),
         &request.memory,
-        request.started,
+        request.memory_admission_wait,
         true,
         request.conversation.as_ref(),
     )
@@ -2999,12 +3006,53 @@ async fn finish_unarchived_proxy_response(
 
 async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &str,
+    usage: (TokenUsage, crate::model::RequestUsageBasis),
+    error_code: Option<String>,
+    policy: BufferedFinishPolicy,
+) -> Result<Response, AppError> {
+    let deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
+    let finalization = finish_buffered_request_before_deadline(
+        request,
+        status,
+        body,
+        content_type,
+        usage,
+        error_code,
+        policy,
+        deadline,
+    );
+    match run_bounded_proxy_lifecycle(deadline, finalization).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = request
+                .state
+                .db
+                .expire_proxy_lifecycle_deadline(
+                    request.request_id,
+                    request.tenant_id,
+                    &request.reservation,
+                    proxy_diagnostics::Context::for_request(request.request_id)
+                        .elapsed_millis_at(Instant::now()),
+                )
+                .await;
+            Err(AppError::Internal)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_buffered_request_before_deadline(
+    request: &BufferedRequest<'_>,
     mut status: StatusCode,
     mut body: Bytes,
     content_type: &str,
     usage: (TokenUsage, crate::model::RequestUsageBasis),
     mut error_code: Option<String>,
     policy: BufferedFinishPolicy,
+    projection_deadline: tokio::time::Instant,
 ) -> Result<Response, AppError> {
     let BufferedFinishPolicy {
         upstream_attribution,
@@ -3051,8 +3099,6 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         .conversation
         .as_ref()
         .and_then(|conversation| conversation.hints.session_id.clone());
-    let projection_deadline =
-        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(request.started.elapsed());
     let conversation = if let Some(conversation) = request.conversation.as_ref() {
         match conversation
             .project(&request.memory, projection_deadline)

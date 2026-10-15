@@ -1,0 +1,150 @@
+use super::*;
+use crate::db::{ProxyRequestOwner, REQUEST_OWNER_HEARTBEAT_MILLIS, REQUEST_OWNER_LEASE_MILLIS};
+use tokio::sync::watch;
+
+pub(super) struct RequestOwnerLease {
+    task: tokio::task::JoinHandle<()>,
+    lost: watch::Receiver<bool>,
+}
+
+impl RequestOwnerLease {
+    pub(super) async fn acquire(
+        database: Database,
+        identity: ProxyRequestOwner,
+        lost: watch::Sender<bool>,
+    ) -> Result<Self, AppError> {
+        let started = tokio::time::Instant::now();
+        let acquired = tokio::time::timeout(
+            Duration::from_millis(REQUEST_OWNER_HEARTBEAT_MILLIS as u64),
+            database.acquire_proxy_request_owner(&identity),
+        )
+        .await;
+        if !matches!(acquired, Ok(Ok(true))) {
+            lost.send_replace(true);
+            return Err(AppError::Internal);
+        }
+        let receiver = lost.subscribe();
+        let task = tokio::spawn(async move {
+            renew_owner_until_lost(started, lost, || async {
+                if database.renew_proxy_request_owner(&identity).await? {
+                    Ok(RenewalStatus::Active)
+                } else if database.proxy_request_owner_finished(&identity).await? {
+                    Ok(RenewalStatus::Finished)
+                } else {
+                    Ok(RenewalStatus::Lost)
+                }
+            })
+            .await;
+        });
+        Ok(Self {
+            task,
+            lost: receiver,
+        })
+    }
+
+    pub(super) fn loss(&self) -> watch::Receiver<bool> {
+        self.lost.clone()
+    }
+}
+
+impl Drop for RequestOwnerLease {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+enum RenewalStatus {
+    Active,
+    Finished,
+    Lost,
+}
+
+async fn renew_owner_until_lost<F, Renewal>(
+    started: tokio::time::Instant,
+    lost: watch::Sender<bool>,
+    mut renew: F,
+) where
+    F: FnMut() -> Renewal,
+    Renewal: std::future::Future<Output = Result<RenewalStatus, AppError>>,
+{
+    let lifetime = Duration::from_millis(REQUEST_OWNER_LEASE_MILLIS as u64);
+    let interval = Duration::from_millis(REQUEST_OWNER_HEARTBEAT_MILLIS as u64);
+    let mut confirmed = started;
+    loop {
+        let deadline = confirmed + lifetime;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        let renewal_started = tokio::time::Instant::now();
+        match tokio::time::timeout_at(deadline.min(renewal_started + interval), renew()).await {
+            Ok(Ok(RenewalStatus::Active)) => confirmed = renewal_started,
+            Ok(Ok(RenewalStatus::Finished)) => return,
+            Ok(Ok(RenewalStatus::Lost)) => break,
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    lost.send_replace(true);
+}
+
+pub(crate) async fn wait_for_owner_loss(receiver: Option<watch::Receiver<bool>>) {
+    let Some(mut receiver) = receiver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn live_owner_renews_beyond_thirty_minutes_without_a_total_deadline() {
+        let (lost, receiver) = watch::channel(false);
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let observed = renewals.clone();
+        let task = tokio::spawn(renew_owner_until_lost(
+            tokio::time::Instant::now(),
+            lost,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(RenewalStatus::Active))
+            },
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            tokio::time::advance(Duration::from_millis(REQUEST_OWNER_HEARTBEAT_MILLIS as u64))
+                .await;
+            tokio::task::yield_now().await;
+            assert!(!*receiver.borrow());
+        }
+        assert!(renewals.load(Ordering::SeqCst) >= 100);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrenewable_owner_loses_authority_at_the_last_confirmed_lease() {
+        let (lost, mut receiver) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        renew_owner_until_lost(started, lost, || {
+            std::future::ready(Err(AppError::Internal))
+        })
+        .await;
+        assert!(*receiver.borrow_and_update());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(REQUEST_OWNER_LEASE_MILLIS as u64)
+        );
+    }
+}

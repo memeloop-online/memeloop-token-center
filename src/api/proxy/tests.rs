@@ -49,6 +49,7 @@ mod group_routing;
 mod ha_policy;
 mod kimi;
 mod lifecycle_activity;
+mod lifecycle_duration;
 mod memory_admission;
 mod memory_metrics;
 mod passthrough_reservation;

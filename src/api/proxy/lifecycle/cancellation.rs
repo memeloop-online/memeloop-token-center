@@ -1,9 +1,18 @@
 use super::*;
 use crate::model::UsageReservation;
 
-#[derive(Default)]
 pub(in crate::api::proxy) struct CancellationGuard {
     owner: Option<CancelledRequest>,
+    lost: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for CancellationGuard {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            lost: tokio::sync::watch::channel(false).0,
+        }
+    }
 }
 
 struct CancelledRequest {
@@ -15,6 +24,28 @@ struct CancelledRequest {
 }
 
 impl CancellationGuard {
+    pub(in crate::api::proxy) fn owner_loss(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lost.subscribe()
+    }
+
+    pub(in crate::api::proxy) async fn acquire_owner(&mut self) -> Result<(), AppError> {
+        let owner = self.owner.as_mut().ok_or(AppError::Internal)?;
+        owner
+            .permit
+            .acquire_owner(
+                owner.database.clone(),
+                crate::db::ProxyRequestOwner {
+                    request_id: owner.context.request_id,
+                    tenant_id: owner.tenant_id,
+                    key_id: owner.reservation.key_id,
+                    reservation_id: owner.reservation.id,
+                    token: Uuid::now_v7(),
+                },
+                self.lost.clone(),
+            )
+            .await
+    }
+
     pub(in crate::api::proxy) fn arm(
         &mut self,
         database: Database,

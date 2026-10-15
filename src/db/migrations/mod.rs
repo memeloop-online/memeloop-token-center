@@ -652,6 +652,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request selected egress attempt payload estimates",
         sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
     },
+    Migration {
+        version: 125,
+        name: "ordinary proxy request owner lease",
+        sql: include_str!("../../../migrations/common/0125_proxy_request_owner_lease.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1287,6 +1292,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 124,
         name: "request selected egress attempt payload estimates",
         sql: include_str!("../../../migrations/common/0124_request_egress_attempts.sql"),
+    },
+    Migration {
+        version: 125,
+        name: "ordinary proxy request owner lease",
+        sql: include_str!("../../../migrations/common/0125_proxy_request_owner_lease.sql"),
     },
 ];
 

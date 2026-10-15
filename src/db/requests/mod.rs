@@ -2,6 +2,7 @@ mod conversations;
 mod early_terminal;
 mod lifecycle;
 mod metered_projection;
+pub(crate) mod owner;
 mod pricing_stats;
 mod queries;
 mod session_routing;
