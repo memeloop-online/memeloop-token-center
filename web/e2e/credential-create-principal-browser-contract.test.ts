@@ -126,6 +126,7 @@ test('client credential creation names the principal once and binds existing pri
       await toggle.click();
       await aliasInput.fill(english ? 'Side project' : '旁支项目');
       await principal.fill(english ? 'custom-owner' : '自定义主体');
+      assert.equal(await principal.inputValue(), english ? 'custom-owner' : '自定义主体', 'the freeform principal stays as typed');
       await create.locator('button[type="submit"]').click();
       await page.locator('.one-time').getByText('mtc_fixture_created', { exact: true }).waitFor();
       posts = await createdPosts();
