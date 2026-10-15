@@ -26,6 +26,12 @@ mod final_group_semantics;
 #[path = "security_routing_groups/group_strategy.rs"]
 mod group_strategy;
 
+#[path = "security_routing_groups/group_custom.rs"]
+mod group_custom;
+
+#[path = "security_routing_groups/group_custom_finance.rs"]
+mod group_custom_finance;
+
 async fn api_json(state: &AppState, method: &str, path: String, body: Value) -> StatusCode {
     api::router(state.clone())
         .oneshot(

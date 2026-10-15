@@ -158,6 +158,21 @@ pub(super) async fn replace_route_associations(
         ensure_explicit_custom_reservation_bounds(tx, tenant_id, upstream_model, upstream_ids)
             .await?;
     }
+    sqlx::query(
+        "DELETE FROM model_route_group_catalog_evidence \
+         WHERE tenant_id = $1 AND model_route_id = $2 AND ($3 = 0 OR NOT EXISTS (\
+           SELECT 1 FROM model_routes route \
+           WHERE route.tenant_id = model_route_group_catalog_evidence.tenant_id \
+             AND route.id = model_route_group_catalog_evidence.model_route_id \
+             AND route.upstream_model = model_route_group_catalog_evidence.upstream_model \
+             AND route.protocol = model_route_group_catalog_evidence.protocol\
+         ))",
+    )
+    .bind(tenant_id)
+    .bind(route_id.to_string())
+    .bind(i64::from(custom_model_confirmed))
+    .execute(&mut **tx)
+    .await?;
     for table in [
         "model_route_upstream_accounts",
         "model_route_included_provider_groups",
@@ -187,11 +202,16 @@ pub(super) async fn replace_route_associations(
         custom_model_confirmed,
     )
     .await?;
+    insert_included_provider_groups(
+        tx,
+        tenant_id,
+        route_id,
+        included_provider_group_ids,
+        now,
+        custom_model_confirmed,
+    )
+    .await?;
     for (table, group_ids) in [
-        (
-            "model_route_included_provider_groups",
-            included_provider_group_ids,
-        ),
         (
             "model_route_excluded_provider_groups",
             excluded_provider_group_ids,
@@ -319,6 +339,38 @@ async fn insert_upstream_accounts(
                 .bind(route_id.to_string())
                 .bind(account_id.to_string())
                 .bind(upstream_model)
+                .bind(now)
+                .bind(catalog_policy);
+        }
+        query.execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn insert_included_provider_groups(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    route_id: Uuid,
+    group_ids: &[Uuid],
+    now: i64,
+    custom_model_confirmed: bool,
+) -> Result<(), AppError> {
+    let catalog_policy = if custom_model_confirmed {
+        "explicit_custom"
+    } else {
+        "required"
+    };
+    for chunk in group_ids.chunks(ASSOCIATION_CHUNK_SIZE) {
+        let sql = format!(
+            "INSERT INTO model_route_included_provider_groups (tenant_id, model_route_id, provider_group_id, created_at, catalog_policy) VALUES {}",
+            values_placeholders(5, chunk.len(), None)
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for group_id in chunk {
+            query = query
+                .bind(tenant_id)
+                .bind(route_id.to_string())
+                .bind(group_id.to_string())
                 .bind(now)
                 .bind(catalog_policy);
         }

@@ -121,7 +121,7 @@ pub(super) async fn route_relations_match_in_transaction(
     )
     .await?;
     let actual_custom = sqlx::query(
-        "SELECT 1 FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' LIMIT 1",
+        "SELECT 1 FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' UNION ALL SELECT 1 FROM model_route_included_provider_groups WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' LIMIT 1",
     )
     .bind(tenant_id)
     .bind(route_id.to_string())

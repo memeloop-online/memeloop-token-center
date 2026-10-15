@@ -657,6 +657,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "ordinary proxy request owner lease",
         sql: include_str!("../../../migrations/common/0125_proxy_request_owner_lease.sql"),
     },
+    Migration {
+        version: 126,
+        name: "dynamic group custom model catalog policy",
+        sql: include_str!("../../../migrations/common/0126_group_custom_catalog_policy.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1297,6 +1302,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 125,
         name: "ordinary proxy request owner lease",
         sql: include_str!("../../../migrations/common/0125_proxy_request_owner_lease.sql"),
+    },
+    Migration {
+        version: 126,
+        name: "dynamic group custom model catalog policy",
+        sql: include_str!("../../../migrations/common/0126_group_custom_catalog_policy.sql"),
     },
 ];
 

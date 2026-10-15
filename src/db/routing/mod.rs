@@ -1,4 +1,5 @@
 mod associations;
+mod catalog_policy;
 mod create_idempotency;
 pub mod egress;
 mod equivalence;
@@ -25,6 +26,7 @@ pub(in crate::db) use associations::{
     bump_model_route_relation_timestamps, bump_route_group_relation_timestamps,
     ensure_explicit_custom_reservation_bounds, ensure_route_has_eligible_candidate,
 };
+pub(in crate::db) use catalog_policy::record_group_catalog_evidence;
 pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
