@@ -220,7 +220,9 @@ impl UpstreamResponse {
     ) -> Self {
         // Start the first inactivity window when headers arrive, not when a
         // downstream consumer eventually asks for the first body chunk.
-        let first_read_deadline = tokio::time::Instant::now() + read_timeout;
+        let first_read_deadline = tokio::time::Instant::now()
+            .checked_add(read_timeout)
+            .unwrap_or(request_deadline);
         let parts = self.into_parts();
         let timed = stream::unfold(
             (parts.stream, first_read_deadline, false),
@@ -249,7 +251,9 @@ impl UpstreamResponse {
                             let empty: UpstreamByteStream = Box::pin(stream::empty());
                             return Some((chunk, (empty, read_deadline, true)));
                         }
-                        read_deadline = tokio::time::Instant::now() + read_timeout;
+                        read_deadline = tokio::time::Instant::now()
+                            .checked_add(read_timeout)
+                            .unwrap_or(request_deadline);
                         Some((chunk, (upstream, read_deadline, false)))
                     }
                     Ok(None) => None,
@@ -571,6 +575,77 @@ mod tests {
             tokio::time::Instant::now() - now,
             std::time::Duration::from_millis(2_800)
         );
+    }
+
+    fn largest_representable_read_timeout(now: tokio::time::Instant) -> std::time::Duration {
+        let mut minimum = 0_u64;
+        let mut maximum = u64::MAX;
+        while minimum < maximum {
+            let midpoint = minimum + (maximum - minimum) / 2 + 1;
+            if now
+                .checked_add(std::time::Duration::from_secs(midpoint))
+                .is_some()
+            {
+                minimum = midpoint;
+            } else {
+                maximum = midpoint - 1;
+            }
+        }
+        std::time::Duration::from_secs(minimum)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_read_overflow_after_send_uses_the_frozen_request_deadline() {
+        let started = tokio::time::Instant::now();
+        let read_timeout = largest_representable_read_timeout(started);
+        assert!(started.checked_add(read_timeout).is_some());
+        let request_deadline = started + std::time::Duration::from_secs(10);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            tokio::time::Instant::now()
+                .checked_add(read_timeout)
+                .is_none()
+        );
+        let response = delayed_body(vec![std::time::Duration::from_secs(20)])
+            .with_body_timeouts(request_deadline, read_timeout);
+        let mut body = response.bytes_stream();
+        assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_REQUEST_TIMEOUT));
+        assert!(body.next().await.is_none());
+        assert_eq!(tokio::time::Instant::now(), request_deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_read_overflow_uses_the_frozen_request_deadline() {
+        let started = tokio::time::Instant::now();
+        let read_timeout = largest_representable_read_timeout(started);
+        assert!(started.checked_add(read_timeout).is_some());
+        let request_deadline = started + std::time::Duration::from_secs(10);
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(
+                stream::iter(vec![
+                    Ok(Bytes::from_static(b"first")),
+                    Ok(Bytes::from_static(b"second")),
+                ])
+                .chain(stream::pending()),
+            ),
+        }
+        .with_body_timeouts(request_deadline, read_timeout);
+        let mut body = response.bytes_stream();
+        assert!(body.next().await.unwrap().is_ok());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(
+            tokio::time::Instant::now()
+                .checked_add(read_timeout)
+                .is_none()
+        );
+        assert_eq!(body.next().await.unwrap(), Err(UPSTREAM_REQUEST_TIMEOUT));
+        assert!(body.next().await.is_none());
+        assert_eq!(tokio::time::Instant::now(), request_deadline);
     }
 
     #[tokio::test(start_paused = true)]
