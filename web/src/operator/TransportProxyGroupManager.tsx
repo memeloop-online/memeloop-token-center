@@ -34,6 +34,10 @@ const ProxyGroupContext = createContext<{
   open: (accountId: string) => void;
 } | null>(null);
 
+export function useTransportProxyGroups() {
+  return useContext(ProxyGroupContext);
+}
+
 export function TransportProxyGroups(props: Props & { children: ReactNode; onNavigate?: (accountId?: string) => void }) {
   const { locale } = useI18n();
   const copy = transportProxyGroupCopy(locale);
@@ -71,6 +75,24 @@ export function TransportProxyGroupAction({ accountId, disabled = false }: { acc
     {context.reason && <span id={description} className="muted" role="status">{context.reason}</span>}
     {context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
   </div>;
+}
+
+export function TransportProxyGroupFields({ groups, groupId, initialMember, onGroupChange, onMemberChange, disabled = false, emptyLabel }: {
+  groups: TransportProxyGroup[]; groupId: string; initialMember: string;
+  onGroupChange: (value: string) => void; onMemberChange: (value: string) => void;
+  disabled?: boolean; emptyLabel?: string;
+}) {
+  const { locale } = useI18n();
+  const copy = transportProxyGroupCopy(locale);
+  const selectedGroup = groups.find(group => group.id === groupId);
+  return <>
+    <Field label={copy.targetGroup}><Select value={groupId} disabled={disabled} onChange={event => onGroupChange(event.target.value)}>
+      <option value="">{emptyLabel ?? copy.selectGroup}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
+    </Select></Field>
+    <Field label={copy.initialExit}><Select value={initialMember} disabled={disabled || !selectedGroup} onChange={event => onMemberChange(event.target.value)}>
+      <option value="">{copy.selectExit}</option>{selectedGroup?.members.map(member => <option key={member.id} value={member.id}>{member.label}</option>)}
+    </Select></Field>
+  </>;
 }
 
 export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = 'ready', onChanged, closeRequest, initialAccountId }: Props & { initialAccountId?: string; closeRequest: RefObject<(() => Promise<boolean>) | null> }) {
@@ -341,12 +363,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
               <p>{copy.observedExit}: {binding.runtime.selected_member_id ? boundGroup?.members.find(member => member.id === binding.runtime.selected_member_id)?.label ?? copy.refreshRequired : copy.noSelection}</p>
               <p className="muted">{copy.runtimeHint}</p>
             </Disclosure>
-            <Field label={copy.targetGroup}><Select value={groupId} onChange={event => { setGroupId(event.target.value); setInitialMember(''); }}>
-              <option value="">{copy.selectGroup}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
-            </Select></Field>
-            <Field label={copy.initialExit}><Select value={initialMember} disabled={!selectedGroup} onChange={event => setInitialMember(event.target.value)}>
-              <option value="">{copy.selectExit}</option>{selectedGroup?.members.map(member => <option key={member.id} value={member.id}>{member.label}</option>)}
-            </Select></Field>
+            <TransportProxyGroupFields groups={groups} groupId={groupId} initialMember={initialMember} onGroupChange={value => { setGroupId(value); setInitialMember(''); }} onMemberChange={setInitialMember} />
             <Button type="button" appearance="primary" disabled={!selectedGroup || !initialMember} onClick={() => void changeBinding(false)}>{copy.saveBinding}</Button>
             {boundGroup && <>
               <Field label={copy.retainedExit}><Select value={singleMember} onChange={event => setSingleMember(event.target.value)}>

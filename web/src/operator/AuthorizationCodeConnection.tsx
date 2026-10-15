@@ -17,6 +17,10 @@ import { OAuthLoginLinkActions } from './OAuthLoginLinkActions';
 import { authorizationStartError, canReauthorizeAccount, isAuthorizationIdentityMismatch, isFragmentManualCodeRejection, validAuthorizationCallback, validFragmentManualCode, type AuthorizationCodeSession } from './authorizationCode';
 import { fluentFormWidgets } from './FluentFormWidgets';
 import { providerConnectionCopy } from './providerConnectionCopy';
+import { TransportProxyGroupFields, useTransportProxyGroups } from './TransportProxyGroupManager';
+import { transportProxyGroupCopy } from './transportProxyGroupCopy';
+import { transportProxyError, transportProxyGroupsPath, transportProxyRequest, type TransportProxyGroup } from './transportProxyGroups';
+import { useOperatorResource } from './hooks/useOperatorResource';
 
 /** Key by credential, tenant and provider at the call site; no browser persistence. */
 export function AuthorizationCodeConnection({ token, tenant, provider, existing, onChanged, onLock, connectionEditing = false, onEditName }: {
@@ -33,6 +37,22 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [useProxy, setUseProxy] = useState(false);
   const [proxy, setProxy] = useState('');
+  const [groupId, setGroupId] = useState('');
+  const [initialMember, setInitialMember] = useState('');
+  const groupCopy = transportProxyGroupCopy(locale);
+  const groupAccess = useTransportProxyGroups();
+  const groupsResource = useOperatorResource(!existing && Boolean(token && tenant && groupAccess?.allowed), `${token}\0${tenant}\0${provider.id}`, async signal => {
+    try {
+      const result = await transportProxyRequest<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}?${new URLSearchParams({ tenant_external_id: tenant })}`, token, { signal });
+      return result.items;
+    } catch (reason) { throw new Error(transportProxyError(reason, locale, 'read')); }
+  }, groupCopy.errors.load);
+  const groupsState = groupsResource.state;
+  const groupsReady = groupsState.kind === 'ready' && !groupsState.refreshing && !groupsState.refreshError;
+  const groups = groupsState.kind === 'ready' ? groupsState.value : [];
+  const selectedGroup = groupsReady ? groups.find(group => group.id === groupId && group.tenant_external_id === tenant) : undefined;
+  const selectedMember = selectedGroup?.members.find(member => member.id === initialMember);
+  const groupValid = !groupId || Boolean(selectedGroup && selectedMember);
   const [session, setSession] = useState<AuthorizationCodeSession>();
   const [recoveryDeadline, setRecoveryDeadline] = useState<number>();
   const [callback, setCallback] = useState('');
@@ -50,14 +70,15 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
   if (existing && !canReauthorizeAccount(existing, provider)) return <p role="status">{copy.reauthorize}</p>;
 
   async function start(providerConfig: Record<string, unknown>) {
-    if (!token || !tenant || !name.trim() || connectionEditing || inFlight.current || session || (useProxy && !isGenericProxyUrlInput(proxy.trim()))) return;
+    if (!token || !tenant || !name.trim() || connectionEditing || inFlight.current || session || !groupValid || (useProxy && !isGenericProxyUrlInput(proxy.trim()))) return;
     inFlight.current = true; setBusy(true); setError(''); setNotice('');
     try {
       const result = await api<AuthorizationCodeSession>('/internal/v1/oauth/authorization-code/start', token, {
         method: 'POST', cache: 'no-store', referrerPolicy: 'no-referrer',
         body: JSON.stringify({ tenant_external_id: tenant, account_name: existing?.name ?? name.trim(), provider_driver: provider.id,
           ...(existing ? { upstream_account_id: existing.id } : { provider_config: providerConfig,
-            ...(useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: 'private' } : {}) }) }),
+            ...(selectedGroup && selectedMember ? { transport_proxy_group: { group_id: selectedGroup.id, expected_group_version: selectedGroup.version, initial_member_id: selectedMember.id } }
+              : useProxy ? { proxy_url: proxy.trim(), proxy_network_scope: 'private' } : {}) }) }),
       });
       if (!live.current) return;
       setSession(result); setRecoveryDeadline(result.recovery_expires_at); setProxy('');
@@ -103,15 +124,24 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     {confirmationDialog}<p className="field-hint">{existing ? copy.reauthorizeHelp : copy.help}</p>
     <p>{t('providers.provider')}: {provider.display_name} · {t('operator.tenant')}: {tenantDisplayName(tenant, locale)}</p>
     {existing ? <FormSection title={providerConnectionCopy(locale).displayName}><p>{existing.name}</p>{onEditName && <Button appearance="secondary" type="button" disabled={connectionEditing || busy || Boolean(session) || submitted || saved.current} onClick={() => { if (!live.current || connectionEditing || inFlight.current || busy || session || submitted || saved.current) return; onEditName(); }}>{providerConnectionCopy(locale).editDisplayName}</Button>}</FormSection> : <FormSection title={t('connection.identitySection')}><label>{t('providers.name')}<Input required maxLength={200} disabled={busy || Boolean(session) || submitted} value={name} onChange={event => setName(event.target.value)} /></label></FormSection>}
-    <p>{copy.network}: {existing ? copy.retainedNetwork : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
+    <p>{copy.network}: {existing ? copy.retainedNetwork : selectedGroup ? `${groupCopy.title} · ${selectedGroup.name}` : groupId ? groupCopy.refreshRequired : useProxy ? `${copy.proxy} · ${copy.private}` : copy.direct}</p>
     {existing && !session && !submitted && <Button appearance="primary" type="button" disabled={!token || !tenant || busy || connectionEditing} onClick={() => void start({})}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>}
     {!existing && !session && !submitted && <>
       <FormSection title={t('connection.title')}>
-        <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => setUseProxy(data.checked === true)} />
+        {groupsState.kind === 'ready' && groupAccess?.allowed && <>
+          <p className="field-hint">{groupCopy.loginHint}</p>
+          <TransportProxyGroupFields groups={groups} groupId={groupId} initialMember={initialMember} disabled={busy || !groupsReady} emptyLabel={groupCopy.noGroup} onGroupChange={value => { setGroupId(value); setInitialMember(''); if (value) { setUseProxy(false); setProxy(''); } }} onMemberChange={setInitialMember} />
+          <Button type="button" appearance="secondary" disabled={busy || !groupsReady} onClick={() => void groupsResource.reload()}>{groupCopy.refresh}</Button>
+        </>}
+        {(groupsState.kind === 'failed' || groupsState.kind === 'ready' && groupsState.refreshError) && <>
+          <p role="alert">{groupCopy.errors.load}</p><Button type="button" appearance="secondary" disabled={busy} onClick={() => void groupsResource.reload()}>{groupCopy.retry}</Button>
+        </>}
+        {groupId && !groupAccess?.allowed && <p role="alert">{groupAccess?.reason ?? groupCopy.unavailable}</p>}
+        <Checkbox label={t('connection.useAccountProxy')} checked={useProxy} disabled={busy} onChange={(_, data) => { setUseProxy(data.checked === true); setGroupId(''); setInitialMember(''); }} />
         {useProxy && <ProxyInput generic required value={proxy} onChange={setProxy} disabled={busy} hint={t('connection.oauthProxyHint')} />}
       </FormSection>
       <RjsfForm schema={providerConfigSchema(localizeSchema(connectionSchema(provider.config_schema as RJSFSchema, t('connection.endpointHint')), locale), locale)} formContext={{ providerConfigRoot: true }} formData={config} onChange={({ formData }) => setConfig(formData ?? {})} disabled={busy} validator={safeValidator} templates={upstreamFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void start(formData ?? {})}>
-        <Button appearance="primary" type="submit" disabled={!token || !tenant || !name.trim() || busy || (useProxy && !isGenericProxyUrlInput(proxy.trim()))}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>
+        <Button appearance="primary" type="submit" disabled={!token || !tenant || !name.trim() || busy || !groupValid || (useProxy && !isGenericProxyUrlInput(proxy.trim()))}>{t(busy ? 'common.loading' : 'common.startLogin')}</Button>
       </RjsfForm>
     </>}
     {session && !submitted && <>
@@ -133,7 +163,7 @@ export function AuthorizationCodeConnection({ token, tenant, provider, existing,
     }}>{copy.check}</Button>}
     <Button type="button" appearance="secondary" disabled={busy} onClick={async () => {
       if (!await confirm(copy.abandon) || !live.current) return;
-      setSession(undefined); setRecoveryDeadline(undefined); setCallback(''); setProxy(''); setConfig({}); setSubmitted(false); consumed.current = false; saved.current = false; setError(''); setNotice('');
+      setSession(undefined); setRecoveryDeadline(undefined); setCallback(''); setProxy(''); setGroupId(''); setInitialMember(''); setConfig({}); setSubmitted(false); consumed.current = false; saved.current = false; setError(''); setNotice('');
     }}>{copy.reset}</Button>
   </section>;
 }
