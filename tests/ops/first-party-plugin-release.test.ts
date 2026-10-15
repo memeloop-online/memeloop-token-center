@@ -49,7 +49,7 @@ test('dispatch selects only a closed first-party package, never execution-sensit
   for (const name of ['model-guard', 'preferred-account']) {
     const item = firstPartyPackage(name);
     assert.equal(item.id, `mtc-${name}`);
-    assert.equal(item.crate, `plugin-sources/${name}`);
+    assert.equal(item.crate, `.plugin-examples/plugin-sources/${name}`);
     assert.equal(item.source, `ghcr.io/memeloop-online/mtc-${name}`);
     assert.equal(packageEnvironment(name), `PLUGIN_ID=${item.id}\nPLUGIN_CRATE=${item.crate}\nPLUGIN_WASM=${item.wasm}\nPLUGIN_SOURCE=${item.source}\nPLUGIN_HOST_TEST=${item.hostTest}\n`);
   }
@@ -77,7 +77,7 @@ test('dispatch selects only a closed first-party package, never execution-sensit
 });
 
 test('Model Guard default has no rewrite, provider, or host capability', () => {
-  const manifest = JSON.parse(readFileSync(join(root, 'plugin-sources/model-guard/plugin.json'), 'utf8'));
+  const manifest = JSON.parse(readFileSync(join(root, '.plugin-examples/plugin-sources/model-guard/plugin.json'), 'utf8'));
   assert.deepEqual(manifest.capabilities, []);
   assert.deepEqual(manifest.contributions.providers, []);
   assert.equal(manifest.contributions.traffic_policy, true);
@@ -87,7 +87,7 @@ test('Model Guard default has no rewrite, provider, or host capability', () => {
 });
 
 test('Model Guard component exports do not enter the native test cdylib', () => {
-  const source = readFileSync(join(root, 'plugin-sources/model-guard/src/lib.rs'), 'utf8');
+  const source = readFileSync(join(root, '.plugin-examples/plugin-sources/model-guard/src/lib.rs'), 'utf8');
   assert.match(source, /#\[cfg\(target_arch = "wasm32"\)\]\s*export!\(ModelGuard\);/);
   const workflow = readFileSync(join(root, '.github/workflows/publish-first-party-plugin.yml'), 'utf8');
   assert.match(workflow, /cargo test --locked --manifest-path "\$PLUGIN_CRATE\/Cargo.toml"/);
@@ -95,10 +95,10 @@ test('Model Guard component exports do not enter the native test cdylib', () => 
 });
 
 test('unbuilt plugin sources do not pollute the existing loadable plugin root', () => {
-  assert(existsSync(join(root, 'plugin-sources/model-guard/Cargo.toml')));
-  for (const entry of readdirSync(join(root, 'plugins'), { withFileTypes: true })) {
+  assert(existsSync(join(root, '.plugin-examples/plugin-sources/model-guard/Cargo.toml')));
+  for (const entry of readdirSync(join(root, '.plugin-examples/plugins'), { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-    const packageRoot = join(root, 'plugins', entry.name);
+    const packageRoot = join(root, '.plugin-examples/plugins', entry.name);
     assert(existsSync(join(packageRoot, 'plugin.json')), `${entry.name} must be an actual package, not a source grouping directory`);
     const manifest = JSON.parse(readFileSync(join(packageRoot, 'plugin.json'), 'utf8'));
     if (manifest.wasm) assert(existsSync(join(packageRoot, manifest.wasm)), `${entry.name} requires its built component`);

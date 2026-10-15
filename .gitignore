@@ -17,3 +17,5 @@ web/e2e-artifacts/
 /tests/load/results/local-*.json
 node_modules/
 dist/
+
+/.plugin-examples/

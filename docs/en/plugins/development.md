@@ -1,5 +1,10 @@
 # Plugin development
 
+Example plugin sources and installable fixtures live in [memeloop-token-center-example-plugins](https://github.com/memeloop-online/memeloop-token-center-example-plugins). The host CI checks out a reviewed immutable revision under `.plugin-examples`; production builds do not bundle these examples.
+
+To run host tests outside CI, check out the same revision recorded in `.github/actions/checkout-plugin-examples/action.yml` into `.plugin-examples` first. Example sources are intentionally absent from the host repository.
+
+
 This page covers the minimum end-to-end loop for an MTC plugin: implement WIT exports → write `plugin.json` → package and sign as OCI → submit it to the deployment's release process. The authoritative interface is [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit) (current package version `memeloop:token-center@0.2.0`) and the [manifest schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json).
 
 ## WIT ABI

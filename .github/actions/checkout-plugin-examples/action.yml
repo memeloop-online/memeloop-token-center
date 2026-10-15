@@ -1,0 +1,11 @@
+name: Check out reviewed plugin examples
+description: Immutable external fixtures and guest sources for host acceptance
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        repository: memeloop-online/memeloop-token-center-example-plugins
+        ref: 5dd8b2b74648dc65aa3ebc89a51cdad0c5e6dccc
+        path: .plugin-examples
+        persist-credentials: false
