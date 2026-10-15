@@ -662,6 +662,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "dynamic group custom model catalog policy",
         sql: include_str!("../../../migrations/common/0126_group_custom_catalog_policy.sql"),
     },
+    Migration {
+        version: 127,
+        name: "conversation prefix reference write policy",
+        sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1307,6 +1312,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 126,
         name: "dynamic group custom model catalog policy",
         sql: include_str!("../../../migrations/common/0126_group_custom_catalog_policy.sql"),
+    },
+    Migration {
+        version: 127,
+        name: "conversation prefix reference write policy",
+        sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
 ];
 
