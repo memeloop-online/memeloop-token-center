@@ -46,7 +46,10 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&119));
     assert!(versions.contains(&120));
     assert!(versions.contains(&121));
+    assert!(versions.contains(&125));
     for statement in [
+        "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
+        "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
         "ALTER TABLE request_records DROP COLUMN cache_known_read_tokens",
         "ALTER TABLE request_stats_facts DROP COLUMN cache_known_input_tokens",
@@ -101,7 +104,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125)",
     )
     .execute(&database.pool)
     .await
@@ -158,13 +161,13 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124]);
+    assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125]);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
         .unwrap();
     assert_eq!(count, 0);
-    sqlx::query("SELECT terminal_cause_code FROM request_records LIMIT 1")
+    sqlx::query("SELECT terminal_cause_code, proxy_owner_token, proxy_owner_expires_at FROM request_records LIMIT 1")
         .fetch_optional(&database.pool)
         .await
         .unwrap();
@@ -182,7 +185,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124]);
+        assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125]);
     }
 }
 
