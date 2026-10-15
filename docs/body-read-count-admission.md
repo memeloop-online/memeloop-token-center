@@ -33,3 +33,11 @@ Do not replace them with another guessed request/file count.
 This change preserves authentication, tenant policy, journal recording,
 settlement and all byte/disk budgets. It adds no upload timeout and does not
 lower concurrency. Validation runs through normal GitHub Actions.
+
+Focused ownership tests use synthetic 64 KiB and 16 KiB frames corresponding to
+the current HTTP/1 read-buffer bound and locked Hyper HTTP/2 default. They check
+metadata/first-frame budget boundaries, dishonest Content-Length, and leases
+held by paused blocking open/write tasks after caller cancellation. These helper
+tests do not exercise the wire transport or prove pre-poll coverage of arbitrary
+Body producers, downstream replay cancellation, or total process RSS. Changes
+to transport bounds or frame coalescing require revisiting that assumption.

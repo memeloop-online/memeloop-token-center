@@ -14,12 +14,19 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+mod ownership_tests;
+
 #[derive(Clone)]
 pub(crate) struct RequestSpoolAdmission {
     directory: Arc<PathBuf>,
     budget: Arc<RequestSpoolBudget>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    blocking_open: Option<Arc<ownership_tests::BlockingPause>>,
+    #[cfg(test)]
+    blocking_write: Option<Arc<ownership_tests::BlockingPause>>,
 }
 
 impl RequestSpoolAdmission {
@@ -29,6 +36,10 @@ impl RequestSpoolAdmission {
             budget: Arc::new(RequestSpoolBudget::new(limit_bytes)),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            blocking_open: None,
+            #[cfg(test)]
+            blocking_write: None,
         }
     }
 
@@ -81,16 +92,27 @@ impl RequestSpoolAdmission {
         let directory = self.directory.clone();
         let opening_metadata = metadata.clone();
         let opening_lease = lease.clone();
-        let (owner, writer) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let blocking_open = self.blocking_open.clone();
+        let opening = tokio::task::spawn_blocking(move || {
             let _opening_metadata = opening_metadata;
             let _opening_lease = opening_lease;
             let owner = tempfile::tempfile_in(directory.as_ref())?;
             let writer = owner.try_clone()?;
+            #[cfg(test)]
+            if let Some(pause) = blocking_open {
+                pause.block();
+            }
             Ok::<_, io::Error>((owner, writer))
-        })
-        .await
-        .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-        .map_err(spool_io_error)?;
+        });
+        #[cfg(test)]
+        if let Some(pause) = &self.blocking_open {
+            pause.record(&opening);
+        }
+        let (owner, writer) = opening
+            .await
+            .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+            .map_err(spool_io_error)?;
         let mut capture = RequestSpoolCapture {
             owner: Some(Arc::new(owner)),
             writer,
@@ -136,15 +158,26 @@ impl RequestSpoolAdmission {
                 let write_frame = frame_memory.clone();
                 let write_lease = capture.lease.clone();
                 let write_bytes = piece.to_vec();
-                tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let blocking_write = self.blocking_write.clone();
+                let writing = tokio::task::spawn_blocking(move || {
                     let _write_metadata = write_metadata;
                     let _write_frame = write_frame;
                     let _write_lease = write_lease;
+                    #[cfg(test)]
+                    if let Some(pause) = blocking_write {
+                        pause.block();
+                    }
                     std::io::Write::write_all(&mut writer, &write_bytes)
-                })
-                .await
-                .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-                .map_err(spool_io_error)?;
+                });
+                #[cfg(test)]
+                if let Some(pause) = &self.blocking_write {
+                    pause.record(&writing);
+                }
+                writing
+                    .await
+                    .map_err(|_| RequestSpoolCaptureError::Unavailable)?
+                    .map_err(spool_io_error)?;
                 capture.hasher.update(piece);
                 capture.length = next;
             }
