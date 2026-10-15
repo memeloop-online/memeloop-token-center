@@ -7,12 +7,15 @@ test('plugin bridge pins authentication, tenant, transport and abort signal', as
   const controller = new AbortController();
   let observed: { path: string; init: RequestInit } | undefined;
   globalThis.fetch = async (path, init) => {
+    if (String(path) === '/internal/v1/api-schema') return new Response(JSON.stringify({ paths: {
+      '/internal/v1/resources': { post: { requestBody: { content: { 'application/json': { schema: { properties: { tenant_external_id: { type: 'string' } } } } } } } },
+    } }));
     observed = { path: String(path), init: init! };
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };
   try {
     const result = await createOperatorApiBridge('host-secret', 'active-tenant')({
-      path: '/internal/v1/resources?tenant_external_id=other&limit=2',
+      path: '/internal/v1/resources?%74enant_external_id=other&tenant_external_id=third&limit=2',
       method: 'POST', body: { tenant_external_id: 'other', value: 3 }, signal: controller.signal,
     });
     assert.deepEqual(result, { ok: true });
@@ -52,5 +55,59 @@ test('plugin bridge preserves server RBAC failures and cancellation', async () =
 test('plugin bridge cannot select a tenant while host scope is empty', async () => {
   const request = createOperatorApiBridge('credential', '');
   await assert.rejects(request({ path: '/internal/v1/resources?tenant_external_id=other' }), /active tenant/);
-  await assert.rejects(request({ path: '/internal/v1/resources', method: 'POST', body: { tenant_external_id: 'other' } }), /active tenant/);
+  // A tenant-bearing body is rejected before issuing any request.
+  await assert.rejects(request({ path: '/v1/resources', method: 'POST', body: { tenant_external_id: 'other' } }), /active tenant/);
+});
+
+
+test('plugin bridge injects omitted JSON tenants using cached discovery, preserving global bodies', async () => {
+  const originalFetch = globalThis.fetch;
+  let discoveries = 0;
+  const sent: unknown[] = [];
+  globalThis.fetch = async (path, init) => {
+    if (String(path) === '/internal/v1/api-schema') {
+      discoveries += 1;
+      return new Response(JSON.stringify({
+        paths: {
+          '/internal/v1/keys': { post: { requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/Create' } } } } } },
+          '/internal/v1/global/{id}': { put: { requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { value: { type: 'number' } }, additionalProperties: false } } } } } },
+        },
+        components: { schemas: { Create: { allOf: [{ properties: { tenant_external_id: { type: 'string', default: 'default' } } }] } } },
+      }));
+    }
+    sent.push(JSON.parse(String(init!.body)));
+    return new Response('{}');
+  };
+  try {
+    const request = createOperatorApiBridge('credential', 'selected');
+    await request({ path: '/internal/v1/keys?%74enant_external_id=other&tenant_external_id=third', method: 'POST', body: { alias: 'created' } });
+    await request({ path: '/internal/v1/global/id', method: 'PUT', body: { value: 3 } });
+    assert.deepEqual(sent, [{ alias: 'created', tenant_external_id: 'selected' }, { value: 3 }]);
+    assert.equal(discoveries, 1);
+    await assert.rejects(request({ path: '/internal/v1/undocumented', method: 'POST', body: {} }), /absent from/);
+    assert.equal(sent.length, 2);
+    await assert.rejects(createOperatorApiBridge('credential', '')({ path: '/internal/v1/keys', method: 'POST', body: { alias: 'created' } }), /require an active tenant/);
+    assert.equal(sent.length, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('aborted discovery does not poison subsequent writes', async () => {
+  const originalFetch = globalThis.fetch;
+  let discoveries = 0;
+  globalThis.fetch = async (path, init) => {
+    init?.signal?.throwIfAborted();
+    if (String(path) === '/internal/v1/api-schema') {
+      discoveries += 1;
+      return new Response(JSON.stringify({ paths: { '/internal/v1/global': { post: {} } } }));
+    }
+    return new Response('{}');
+  };
+  try {
+    const request = createOperatorApiBridge('credential', 'selected');
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(request({ path: '/internal/v1/global', method: 'POST', body: {}, signal: controller.signal }));
+    await request({ path: '/internal/v1/global', method: 'POST', body: {} });
+    assert.equal(discoveries, 1);
+  } finally { globalThis.fetch = originalFetch; }
 });
