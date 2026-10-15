@@ -25,6 +25,9 @@ use uuid::Uuid;
 
 use crate::plugin::{PluginManifest, validate_plugin_package};
 
+mod egress;
+pub use egress::InstallProxyCredentials;
+
 pub use crate::plugin_runtime_companions::{COSIGN_VERIFIER_FILENAME, COSIGN_VERIFIER_VERSION};
 
 pub const PLUGIN_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.memeloop.token-center.plugin.v1";
@@ -75,6 +78,7 @@ impl RegistryCredentials {
 #[derive(Clone)]
 pub struct InstallPluginOptions {
     pub egress_proxy: Option<String>,
+    pub egress_proxy_credentials: Option<InstallProxyCredentials>,
     pub reference: String,
     pub plugin_root: PathBuf,
     pub allowed_sources: BTreeSet<String>,
@@ -645,7 +649,10 @@ pub async fn install_plugin_oci(
             .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
     }
     let runner = SystemCosignRunner {
-        egress_proxy: options.egress_proxy.clone(),
+        egress_proxy: egress::proxy_url(
+            options.egress_proxy.as_deref(),
+            options.egress_proxy_credentials.as_ref(),
+        )?,
     };
     if let Some(identity) = &options.cosign_keyless {
         if !options.cosign_public_keys.is_empty() {
@@ -668,8 +675,15 @@ pub async fn install_plugin_oci(
     install_plugin_oci_with_verifier(options, &verifier, false).await
 }
 
-fn registry_client_config(options: &InstallPluginOptions, allow_plain_http: bool) -> ClientConfig {
-    ClientConfig {
+fn registry_client_config(
+    options: &InstallPluginOptions,
+    allow_plain_http: bool,
+) -> Result<ClientConfig, PluginDistributionError> {
+    let proxy = egress::proxy_url(
+        options.egress_proxy.as_deref(),
+        options.egress_proxy_credentials.as_ref(),
+    )?;
+    Ok(ClientConfig {
         protocol: if allow_plain_http {
             ClientProtocol::Http
         } else {
@@ -678,11 +692,11 @@ fn registry_client_config(options: &InstallPluginOptions, allow_plain_http: bool
         max_concurrent_download: 1,
         read_timeout: Some(Duration::from_secs(60)),
         connect_timeout: Some(Duration::from_secs(10)),
-        https_proxy: options.egress_proxy.clone(),
-        http_proxy: options.egress_proxy.clone(),
-        no_proxy: options.egress_proxy.as_ref().map(|_| String::new()),
+        https_proxy: proxy.clone(),
+        http_proxy: proxy.clone(),
+        no_proxy: proxy.as_ref().map(|_| String::new()),
         ..Default::default()
-    }
+    })
 }
 
 async fn install_plugin_oci_with_verifier(
@@ -690,6 +704,7 @@ async fn install_plugin_oci_with_verifier(
     verifier: &dyn SignatureVerifier,
     allow_plain_http: bool,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
+    let client_config = registry_client_config(options, allow_plain_http)?;
     if let Some(proxy) = &options.egress_proxy {
         crate::network::validate_install_egress_proxy(proxy)
             .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
@@ -722,8 +737,7 @@ async fn install_plugin_oci_with_verifier(
         .verify(&verified_reference, expected_digest, &options.credentials)
         .await?;
 
-    let client = Client::try_from(registry_client_config(options, allow_plain_http))
-        .map_err(|_| PluginDistributionError::Registry)?;
+    let client = Client::try_from(client_config).map_err(|_| PluginDistributionError::Registry)?;
     let auth = options.credentials.oci_auth();
     let (manifest, resolved_digest) = tokio::time::timeout(
         OCI_OPERATION_TIMEOUT,

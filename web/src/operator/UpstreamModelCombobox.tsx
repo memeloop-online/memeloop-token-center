@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 import { ModelPicker, type ModelPickerOption } from '../ModelPicker';
 import type { ProviderType, UpstreamAccount } from '../types';
 import { providerDisplayName } from './providerDisplayName';
-import { catalogEvidenceVerified, confirmationForScope, modelConfirmationValidity } from './modelConfirmation';
+import { catalogEvidenceVerified, confirmationForScope, modelConfirmationValidity, type ModelConfirmation } from './modelConfirmation';
 
 interface CatalogModel {
   id: string;
@@ -47,33 +47,33 @@ interface Props {
   onChange: (value: string) => void;
   onProtocolInferred?: (protocol: string) => void;
   customModelConfirmed: boolean;
+  existingSelection?: boolean;
   onValidityChange: (valid: boolean, allowCustom: boolean) => void;
   upstreams?: UpstreamAccount[];
   providers?: ProviderType[];
 }
 
-export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, onProtocolInferred, customModelConfirmed, onValidityChange, upstreams = [], providers = [] }: Props) {
+export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, onProtocolInferred, customModelConfirmed, existingSelection = false, onValidityChange, upstreams = [], providers = [] }: Props) {
   const { locale, t } = useI18n();
   const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
-  const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
+  const selectionSourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, protocol]);
+  const selectionScope = (model: string) => JSON.stringify([token, tenant, selectionSourceKey, model]);
+  const confirmationScope = selectionScope(value);
   const [catalogResult, setCatalogResult] = useState<{ scope: string; data?: AggregateCatalog; error?: string }>();
   const [syncLoading, setLoading] = useState(false);
   const [syncError, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
   const [open, setOpen] = useState(false);
   const [accountCatalogs, setAccountCatalogs] = useState<Map<string, AccountCatalog>>(new Map());
-  // Persisted consent applies only to the scope first opened for editing.
-  // Never restore that prop after an account, group, membership or model change.
-  const [customConfirmation, setCustomConfirmation] = useState({ scope: confirmationScope, confirmed: customModelConfirmed });
+  const [customConfirmation, setCustomConfirmation] = useState<ModelConfirmation>({ scope: confirmationScope, confirmed: existingSelection && customModelConfirmed, selection: existingSelection ? 'existing' : undefined });
   const scopedConfirmation = confirmationForScope(customConfirmation, confirmationScope);
   const customConfirmed = scopedConfirmation.confirmed;
-  const setCustomConfirmed = (confirmed: boolean) => setCustomConfirmation({ scope: confirmationScope, confirmed });
   useLayoutEffect(() => {
     if (customConfirmation.scope !== confirmationScope) setCustomConfirmation(scopedConfirmation);
   }, [confirmationScope, customConfirmation.scope]);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [retryScope, setRetryScope] = useState('');
-  const catalogScope = JSON.stringify([confirmationScope, refreshVersion]);
+  const catalogScope = JSON.stringify([confirmationScope, sourceKey, refreshVersion]);
   const catalog = catalogResult?.scope === catalogScope ? catalogResult.data : undefined;
   const validityCallback = useRef(onValidityChange);
   useLayoutEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
@@ -84,12 +84,11 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const catalogPending = Boolean(token && tenant && hasCandidates && !scopedResult);
   const loading = syncLoading || catalogPending;
   const error = scopedResult?.error || syncError;
-  const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
-  const evidenceVerified = catalogEvidenceVerified(catalog, customAllowed ? new Set(accountIds).size : undefined, (protocol === 'generation' || protocol === 'openai-audio') && customAllowed);
+  const explicitOnly = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
+  const evidenceVerified = catalogEvidenceVerified(catalog, explicitOnly ? new Set(accountIds).size : undefined, (protocol === 'generation' || protocol === 'openai-audio') && explicitOnly);
   const catalogVerified = evidenceVerified && !loading && !error;
   const catalogUnresolved = Boolean(catalog) && !evidenceVerified;
-  const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)
-    && account.driver === 'openai-codex' && account.connection_method === 'oauth');
+  const hasCodex = upstreams.some((account) => syncAccountIds.includes(account.id) && account.driver === 'openai-codex');
 
   useEffect(() => {
     // The scope check above hides the previous result immediately, before
@@ -142,19 +141,20 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
 
   const options = useMemo(() => (catalog?.data ?? []).filter((model) => (model.protocol === protocol || model.protocol === 'any')
     && (!value.trim() || model.id.toLowerCase().includes(value.trim().toLowerCase()))), [catalog, protocol, value]);
-  const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
-  // The runtime accepts a current-generation snapshot while it is ready or
-  // stale, and excludes accounts without a matching catalog entry. Mirror
-  // that safe restriction here. A stale or partial snapshot must not turn a
-  // discovered model into an explicit_custom bypass.
-  const { needsCustomConfirmation, allowCustom, valid } = modelConfirmationValidity({
-    hasValue: Boolean(value.trim()), catalogListed: Boolean(selected), customAllowed, customConfirmed,
+  const selected = catalog?.data.find((model) => model.id === value.trim() && (model.protocol === protocol || model.protocol === 'any'));
+  useLayoutEffect(() => {
+    if (selected && scopedConfirmation.selection === 'custom') setCustomConfirmation({ scope: confirmationScope, confirmed: false, selection: 'catalog' });
+  }, [Boolean(selected), confirmationScope, scopedConfirmation.selection]);
+  const { unverified, allowCustom, valid } = modelConfirmationValidity({
+    hasValue: Boolean(value.trim()), catalogListed: Boolean(selected), customConfirmed, selection: scopedConfirmation.selection,
     catalogVerified,
   });
-  useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
+  const canSave = Boolean(token && tenant && hasCandidates && valid);
+  useLayoutEffect(() => validityCallback.current(canSave, allowCustom), [canSave, allowCustom]);
 
   const choose = (model: CatalogModel) => {
-    onChange(model.id); setCustomConfirmed(false);
+    setCustomConfirmation({ scope: selectionScope(model.id), confirmed: false, selection: 'catalog' });
+    onChange(model.id);
     if (model.protocol !== 'any') onProtocolInferred?.(model.protocol);
   };
   const sync = async () => {
@@ -194,7 +194,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     <ModelPicker label={t('routes.upstreamModel')} editable invalid={catalogVerified && !valid && Boolean(value.trim())} value={value} options={groupedOptions} loading={loading} error={error} onOpen={() => setOpen(true)} onChange={(next) => {
       const option = options.find((model) => model.id === next);
       if (option) choose(option);
-      else { onChange(next); setCustomConfirmed(false); }
+      else { setCustomConfirmation({ scope: selectionScope(next), confirmed: Boolean(next.trim()), selection: next.trim() ? 'custom' : undefined }); onChange(next); }
     }} />
     <div className="catalog-status">
       <small className="field-hint" role="status">{loading ? t('routes.catalogLoading') : error || (catalogUnresolved ? t('routes.catalogUnresolved') : syncMessage || (selected ? (catalog && catalog.stale_account_count > 0 ? t('routes.catalogLastVerified') : selected.complete_coverage ? t('routes.catalogVerified') : t('routes.catalogRestricted')) : catalog ? t('routes.catalogReady') : t('routes.selectCandidatesFirst')))}</small>
@@ -205,10 +205,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       }}>{t('common.retry')}</button>}
       {syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}
     </div>
-    {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
-    {needsCustomConfirmation && hasExplicitCodexOAuth && <small className="field-hint">{locale === 'zh-CN' ? '缺少模型信息时，需先同步后使用。' : 'Sync missing model information before use.'}</small>}
-    {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
-      {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
-    </div>}
+    {unverified && <div className="notice warning compact">{t('routes.catalogUnverified')}</div>}
+    {hasCodex && <small className="field-hint">{t('routes.codexCapabilityHint')}</small>}
   </div>;
 }

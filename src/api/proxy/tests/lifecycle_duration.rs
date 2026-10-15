@@ -124,6 +124,7 @@ async fn stream_fixture(
             memory_admission_wait: Duration::from_secs(30),
             input_token_ceiling: 10,
             output_token_ceiling: 20,
+            output_token_limit: Some(20),
             requested_service_tier: None,
             conversation: None,
             protocol: Protocol::OpenAiResponses,

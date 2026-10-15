@@ -166,6 +166,7 @@ struct AuthorizedProxyRoutes {
     remaining_candidates: std::vec::IntoIter<AuthorizedUpstreamCandidate>,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
+    output_token_limit: Option<i64>,
     output_choice_count: i64,
 }
 
@@ -216,13 +217,14 @@ async fn prepare_authorized_proxy_routes(
         return Err(exhausted_candidate_error(protocol, request_json, &summary)?);
     };
     candidate_preparation.finish("completed", None, None);
-    let (input_token_ceiling, output_token_ceiling) =
+    let (input_token_ceiling, output_token_ceiling, output_token_limit) =
         candidate_reservation_bounds(&primary, original_body_length, output_choice_count)?;
     Ok(AuthorizedProxyRoutes {
         primary,
         remaining_candidates,
         input_token_ceiling,
         output_token_ceiling,
+        output_token_limit,
         output_choice_count,
     })
 }
@@ -236,6 +238,7 @@ async fn next_sendable_proxy_route(
         reservation,
         input_token_ceiling,
         output_token_ceiling,
+        output_token_limit,
         original_body_length,
         output_choice_count,
         assigned_route,
@@ -321,7 +324,7 @@ async fn next_sendable_proxy_route(
             failover_reason = Some(UpstreamHealthReason::Unavailable);
             continue;
         }
-        let (next_input_token_ceiling, next_output_token_ceiling) =
+        let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
         let admission = if let Some(snapshot) = state.group_routing.as_ref()
             && let Some((allow_probe, cooldown_ms)) = snapshot
@@ -413,8 +416,10 @@ async fn next_sendable_proxy_route(
             reservation,
             input_token_ceiling,
             output_token_ceiling,
+            output_token_limit,
             next_input_token_ceiling,
             next_output_token_ceiling,
+            next_output_token_limit,
             assigned_route,
             failover_reason,
             planned,
@@ -468,7 +473,7 @@ async fn next_sendable_proxy_route(
         if planned.is_component() {
             return Err(AppError::Internal);
         }
-        let (next_input_token_ceiling, next_output_token_ceiling) =
+        let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
         let transport_policy = routing::runtime_transport_policy(
             &planned.route.config,
@@ -501,8 +506,10 @@ async fn next_sendable_proxy_route(
                     reservation,
                     input_token_ceiling,
                     output_token_ceiling,
+                    output_token_limit,
                     next_input_token_ceiling,
                     next_output_token_ceiling,
+                    next_output_token_limit,
                     assigned_route,
                     failover_reason,
                     planned,
@@ -539,7 +546,7 @@ async fn next_sendable_proxy_route(
                 route,
                 preparation_now: unix_millis(),
             })?;
-            let (next_input, next_output) =
+            let (next_input, next_output, next_output_limit) =
                 candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
             prepare_admitted_proxy_route(AdmittedProxyRouteInput {
                 request,
@@ -547,8 +554,10 @@ async fn next_sendable_proxy_route(
                 reservation,
                 input_token_ceiling,
                 output_token_ceiling,
+                output_token_limit,
                 next_input_token_ceiling: next_input,
                 next_output_token_ceiling: next_output,
+                next_output_token_limit: next_output_limit,
                 assigned_route,
                 failover_reason,
                 planned,
@@ -882,6 +891,7 @@ async fn execute_component_primary(
                 reservation: &request.reservation,
                 input_token_ceiling: next_input_token_ceiling,
                 output_token_ceiling: request.output_token_ceiling,
+                output_token_limit: request.output_token_limit,
                 upstream_model: &active_route.route.upstream_model,
                 expected_assignment: assignment,
                 next_assignment: assignment,
@@ -1222,6 +1232,7 @@ async fn proxy_with_cancellation_guard(
     price_lookup.finish("completed", None, None);
     let input_token_ceiling = route_plan.input_token_ceiling;
     let output_token_ceiling = route_plan.output_token_ceiling;
+    let output_token_limit = route_plan.output_token_limit;
     let requested_service_tier = requested_service_tier(&request_json, &price)?;
     route_preparation.finish("completed", None, None);
     let admission = proxy_diagnostics::Phase::account(
@@ -1255,6 +1266,7 @@ async fn proxy_with_cancellation_guard(
             state.config.key_pepper.as_bytes(),
             state.config.archive_spool_compression_enabled,
             Some(&primary.upstream_model),
+            output_token_limit,
         )
         .await
     {
@@ -1328,6 +1340,7 @@ async fn proxy_with_cancellation_guard(
         memory_admission_wait: Duration::from_millis(memory_wait),
         input_token_ceiling,
         output_token_ceiling,
+        output_token_limit,
         requested_service_tier,
         conversation,
         protocol,
@@ -1391,6 +1404,7 @@ async fn proxy_with_cancellation_guard(
         remaining_candidates,
         input_token_ceiling: _,
         output_token_ceiling: _,
+        output_token_limit: _,
         output_choice_count,
     } = route_plan;
     if primary.is_component() {
@@ -1437,6 +1451,7 @@ async fn proxy_with_cancellation_guard(
             reservation: &mut buffered_request.reservation,
             input_token_ceiling: &mut buffered_request.input_token_ceiling,
             output_token_ceiling: &mut buffered_request.output_token_ceiling,
+            output_token_limit: &mut buffered_request.output_token_limit,
             original_body_length: request_body_length,
             output_choice_count,
             assigned_route: &mut assigned_route,
@@ -2453,6 +2468,7 @@ struct BufferedRequest<'a> {
     memory_admission_wait: Duration,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
+    output_token_limit: Option<i64>,
     requested_service_tier: Option<String>,
     conversation: Option<ProxyConversation>,
     protocol: Protocol,
@@ -2739,7 +2755,10 @@ async fn execute_component_provider(
     let usage_is_valid = input_tokens.is_some_and(|tokens| {
         (0..=MAX_REPORTED_TOKENS).contains(&tokens) && tokens <= request.input_token_ceiling
     }) && output_tokens.is_some_and(|tokens| {
-        (0..=MAX_REPORTED_TOKENS).contains(&tokens) && tokens <= request.output_token_ceiling
+        (0..=MAX_REPORTED_TOKENS).contains(&tokens)
+            && request
+                .output_token_limit
+                .is_none_or(|limit| tokens <= limit)
     });
     if !usage_is_valid {
         if let Some(attempt) = upstream_attempt.as_mut() {
@@ -3066,10 +3085,10 @@ async fn finish_buffered_request_before_deadline(
     };
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
-    let usage = match crate::db::normalize_proxy_usage(
+    let usage = match crate::db::normalize_proxy_usage_with_output_limit(
         &usage,
         request.input_token_ceiling,
-        request.output_token_ceiling,
+        request.output_token_limit,
         request.requested_service_tier.as_deref(),
     ) {
         Ok(usage) => usage,

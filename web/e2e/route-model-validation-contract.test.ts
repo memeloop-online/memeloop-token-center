@@ -11,21 +11,21 @@ test('aggregate evidence counts candidates, not just HTTP success or returned mo
   ]) {
     for (const customConfirmed of [false, true]) for (const catalogListed of [false, true]) {
       assert.equal(catalogEvidenceVerified(catalog), false);
-      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed, customAllowed: true, customConfirmed, catalogVerified: catalogEvidenceVerified(catalog) }), {
-        needsCustomConfirmation: false, allowCustom: false, valid: false,
+      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed, customConfirmed, catalogVerified: catalogEvidenceVerified(catalog) }), {
+        unverified: true, allowCustom: false, valid: false,
       });
     }
   }
   const stale = { eligible_account_count: 2, unknown_account_count: 0, stale_account_count: 2 };
   assert.equal(catalogEvidenceVerified(stale, 2), true, 'current-generation stale snapshots remain evidence');
-  assert.equal(catalogEvidenceVerified(stale, 3), false, 'an omitted explicit candidate cannot authorize a custom bypass');
+  assert.equal(catalogEvidenceVerified(stale, 3), false, 'an omitted explicit candidate is not verified coverage');
   assert.equal(catalogEvidenceVerified(undefined), false);
 });
 
-test('only terminal unsupported discovery can exempt pure explicit generation candidates', () => {
+test('terminal unsupported discovery is distinguished from incomplete coverage', () => {
   const unsupported = { eligible_account_count: 2, unknown_account_count: 2, unsupported_account_count: 2, stale_account_count: 0 };
   assert.equal(catalogEvidenceVerified(unsupported, 2, true), true);
-  assert.equal(catalogEvidenceVerified(unsupported, 2, false), false, 'text and group routes cannot opt into custom unsupported discovery');
+  assert.equal(catalogEvidenceVerified(unsupported, 2, false), false, 'unsupported discovery does not verify text-model coverage');
   for (const patch of [
     { unsupported_account_count: 1 },
     { unsupported_account_count: 3 },
@@ -37,26 +37,21 @@ test('only terminal unsupported discovery can exempt pure explicit generation ca
   ]) assert.equal(catalogEvidenceVerified({ ...unsupported, ...patch }, 2, true), false, JSON.stringify(patch));
 });
 
-test('unresolved catalog evidence neither accuses a model nor permits custom bypass', () => {
+test('unresolved catalog evidence alone cannot silently authorize a custom model', () => {
   for (const catalogListed of [false, true]) {
     for (const customConfirmed of [false, true]) {
-      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed, customAllowed: true, customConfirmed, catalogVerified: false }), {
-        needsCustomConfirmation: false, allowCustom: false, valid: false,
+      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed, customConfirmed, catalogVerified: false }), {
+        unverified: true, allowCustom: false, valid: false,
       });
     }
   }
 });
 
-test('settled catalog preserves discovered-model restrictions and explicit custom consent', () => {
-  assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed: true, customAllowed: true, customConfirmed: true, catalogVerified: true }), {
-    needsCustomConfirmation: false, allowCustom: false, valid: true,
+test('listed and partial catalog choices stay restricted rather than becoming custom', () => {
+  assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed: true, selection: 'custom', customConfirmed: true, catalogVerified: true }), {
+    unverified: false, allowCustom: false, valid: true,
   });
-  for (const customAllowed of [false, true]) {
-    for (const customConfirmed of [false, true]) {
-      const allowed = customAllowed && customConfirmed;
-      assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed: false, customAllowed, customConfirmed, catalogVerified: true }), {
-        needsCustomConfirmation: true, allowCustom: allowed, valid: allowed,
-      });
-    }
-  }
+  assert.deepEqual(modelConfirmationValidity({ hasValue: true, catalogListed: true, selection: 'catalog', customConfirmed: false, catalogVerified: false }), {
+    unverified: true, allowCustom: false, valid: true,
+  });
 });

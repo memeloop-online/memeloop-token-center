@@ -10,6 +10,7 @@ pub(in crate::api::proxy) struct NextSendableProxyRouteInput<'a> {
     pub(in crate::api::proxy) reservation: &'a mut UsageReservation,
     pub(in crate::api::proxy) input_token_ceiling: &'a mut i64,
     pub(in crate::api::proxy) output_token_ceiling: &'a mut i64,
+    pub(in crate::api::proxy) output_token_limit: &'a mut Option<i64>,
     pub(in crate::api::proxy) original_body_length: usize,
     pub(in crate::api::proxy) output_choice_count: i64,
     pub(in crate::api::proxy) assigned_route: &'a mut (Uuid, Uuid),
@@ -35,8 +36,10 @@ pub(in crate::api::proxy) struct AdmittedProxyRouteInput<'a> {
     pub(in crate::api::proxy) reservation: &'a mut UsageReservation,
     pub(in crate::api::proxy) input_token_ceiling: &'a mut i64,
     pub(in crate::api::proxy) output_token_ceiling: &'a mut i64,
+    pub(in crate::api::proxy) output_token_limit: &'a mut Option<i64>,
     pub(in crate::api::proxy) next_input_token_ceiling: i64,
     pub(in crate::api::proxy) next_output_token_ceiling: i64,
+    pub(in crate::api::proxy) next_output_token_limit: Option<i64>,
     pub(in crate::api::proxy) assigned_route: &'a mut (Uuid, Uuid),
     pub(in crate::api::proxy) failover_reason: Option<UpstreamHealthReason>,
     pub(in crate::api::proxy) planned: PlannedProxyRoute,
@@ -56,8 +59,10 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
         reservation,
         input_token_ceiling,
         output_token_ceiling,
+        output_token_limit,
         next_input_token_ceiling,
         next_output_token_ceiling,
+        next_output_token_limit,
         assigned_route,
         failover_reason,
         planned,
@@ -102,6 +107,7 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
     if *assigned_route != next_assignment
         || *input_token_ceiling != next_input_token_ceiling
         || *output_token_ceiling != next_output_token_ceiling
+        || *output_token_limit != next_output_token_limit
     {
         let resized = match state
             .db
@@ -113,6 +119,7 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
                 reservation,
                 input_token_ceiling: next_input_token_ceiling,
                 output_token_ceiling: next_output_token_ceiling,
+                output_token_limit: next_output_token_limit,
                 upstream_model: &planned.route.upstream_model,
                 expected_assignment: *assigned_route,
                 next_assignment,
@@ -145,6 +152,7 @@ pub(in crate::api::proxy) async fn prepare_admitted_proxy_route(
         *assigned_route = next_assignment;
         *input_token_ceiling = next_input_token_ceiling;
         *output_token_ceiling = next_output_token_ceiling;
+        *output_token_limit = next_output_token_limit;
     }
     let prepared = match materialize_proxy_route(state, planned).await {
         Ok(prepared) => prepared,

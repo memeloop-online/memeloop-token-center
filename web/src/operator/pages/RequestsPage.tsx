@@ -10,6 +10,7 @@ import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
+import { RequestEgressDetails } from '../RequestEgressDetails';
 import type { SessionStreamState } from '../SessionMonitor';
 import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
@@ -363,7 +364,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
       <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     </section>}
-    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
+    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
@@ -424,12 +425,13 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
+function RequestDrawer({ detail, upstreamName, accountNames, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
     <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
+    <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}

@@ -205,6 +205,7 @@ async fn cancellation_reloads_resized_reservation_and_settles_once() {
             input_token_ceiling: 17,
             output_token_ceiling: 31,
             upstream_model: &fixture.upstream_model,
+            output_token_limit: None,
             expected_assignment: (fixture.upstream_account_id, fixture.route_id),
             next_assignment: (fixture.upstream_account_id, fixture.route_id),
         })
@@ -218,15 +219,29 @@ async fn cancellation_reloads_resized_reservation_and_settles_once() {
         .mark_proxy_delivery_started(request_id, key.tenant_id, &resized)
         .await
         .unwrap();
+    let recovery_pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let durable: (i64, i64, String) = sqlx::query_as("SELECT q.input_tokens, q.output_tokens, r.price_snapshot_json FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1")
+        .bind(request_id.to_string()).fetch_one(&recovery_pool).await.unwrap();
+    assert_eq!((durable.0, durable.1), (17, 31));
+    assert_eq!(
+        serde_json::from_str::<Value>(&durable.2)
+            .unwrap()
+            .get("output_token_limit"),
+        Some(&Value::Null)
+    );
+    recovery_pool.close().await;
+    let recovered_database = crate::db::Database::connect(&fixture.database_url)
+        .await
+        .unwrap();
     assert!(matches!(
-        database
+        recovered_database
             .finish_cancelled_proxy_request(request_id, key.tenant_id, &reservation, 100,)
             .await
             .unwrap(),
         FinishProxyRequestResult::Finished { .. }
     ));
     assert!(matches!(
-        database
+        recovered_database
             .finish_cancelled_proxy_request(request_id, key.tenant_id, &reservation, 200,)
             .await
             .unwrap(),
@@ -236,7 +251,7 @@ async fn cancellation_reloads_resized_reservation_and_settles_once() {
         }
     ));
     assert!(matches!(
-        database
+        recovered_database
             .expire_proxy_lifecycle_deadline(request_id, key.tenant_id, &resized, 300,)
             .await
             .unwrap(),

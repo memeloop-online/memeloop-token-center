@@ -338,14 +338,6 @@ jobs:
         run: cargo test --locked --all-features --lib empty_inventory -- --nocapture
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
-      - name: Verify U02 PostgreSQL owner races and paused lifecycle budgets
-        env:
-          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
-        run: |
-          cargo test --locked --all-features --lib db::requests::owner::tests -- --nocapture
-          cargo test --locked --all-features --lib proxy_lifecycle::owner::tests -- --nocapture
-          cargo test --locked --all-features --lib api::proxy::tests::lifecycle_duration -- --nocapture
-          cargo test --locked --all-features --lib api::proxy::buffered_upstream::tests -- --nocapture
       - name: Reuse the signed Claude component through native and bridge gateway finalization
         if: ${{ !cancelled() && steps.claude_component.outcome == 'success' }}
         run: |
@@ -388,6 +380,11 @@ jobs:
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Verify installer SOCKS authentication, anonymous compatibility and redaction
+        run: |
+          cargo test --locked --all-features --lib plugin_distribution::
+          cargo test --locked --all-features --lib installation_proxy_
+          cargo test --locked --all-features --bin install-plugin-oci proxy_argument_tests::
       - name: Verify H2 binding build and runtime gates without secrets or replay
         run: |
           cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture

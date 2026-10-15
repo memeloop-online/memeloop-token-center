@@ -173,6 +173,11 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
+        self.permits.clone().try_acquire_many_owned(units).ok()
+    }
+
     /// Reserve one request-local envelope for the two independently retained
     /// SSE maxima: framing/sanitizer state and terminal delivery state. This turns the
     /// configured per-stream byte ceiling into process-wide concurrency
