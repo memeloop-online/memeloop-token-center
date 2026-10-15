@@ -989,7 +989,7 @@ async fn proxy_with_identity_and_conversation_spool(
         _ = crate::proxy_lifecycle::wait_for_owner_loss(Some(owner_loss.clone())) => {
             return Err(AppError::Internal);
         }
-        result = proxy_with_cancellation_guard(
+        result = Box::pin(proxy_with_cancellation_guard(
         state,
         headers,
         body,
@@ -999,7 +999,7 @@ async fn proxy_with_identity_and_conversation_spool(
         memory,
         conversation_spool,
         &mut cancellation,
-        ) => result,
+        )) => result,
     };
     if !*owner_loss.borrow() {
         cancellation.disarm();
@@ -3014,7 +3014,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     policy: BufferedFinishPolicy,
 ) -> Result<Response, AppError> {
     let deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
-    let finalization = finish_buffered_request_before_deadline(
+    let finalization = Box::pin(finish_buffered_request_before_deadline(
         request,
         status,
         body,
@@ -3023,7 +3023,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         error_code,
         policy,
         deadline,
-    );
+    ));
     match run_bounded_proxy_lifecycle(deadline, finalization).await {
         Ok(result) => result,
         Err(_) => {

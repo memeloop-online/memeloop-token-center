@@ -22,9 +22,10 @@ impl Database {
         &self,
         owner: &ProxyRequestOwner,
     ) -> Result<bool, AppError> {
-        Ok(sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL")
+        Ok(sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND proxy_owner_token = $5 AND completed_at IS NOT NULL AND (error_code IS NULL OR error_code <> 'request_expired')")
             .bind(owner.request_id.to_string()).bind(owner.tenant_id.to_string())
             .bind(owner.key_id.to_string()).bind(owner.reservation_id.to_string())
+            .bind(owner.token.to_string())
             .fetch_optional(&self.pool).await?.is_some())
     }
 

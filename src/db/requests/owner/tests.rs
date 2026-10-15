@@ -282,6 +282,13 @@ async fn postgres_live_owner_survives_thirty_minutes_and_dead_owner_is_reaped_on
     ));
     fixture.assert_once(&owner, 200, 12).await;
     assert!(
+        fixture
+            .database
+            .proxy_request_owner_finished(&owner)
+            .await
+            .unwrap()
+    );
+    assert!(
         !fixture
             .replica
             .renew_proxy_request_owner(&owner)
@@ -311,6 +318,13 @@ async fn postgres_live_owner_survives_thirty_minutes_and_dead_owner_is_reaped_on
         }
     ));
     fixture.assert_once(&dead, 504, 0).await;
+    assert!(
+        !fixture
+            .database
+            .proxy_request_owner_finished(&dead)
+            .await
+            .unwrap()
+    );
     assert_eq!(
         fixture
             .replica

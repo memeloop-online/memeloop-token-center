@@ -220,7 +220,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let deadline_tenant_id = tenant_id;
         let mut wait_diagnostics = wait_diagnostics::WaitDiagnostics::default();
         let waits = &mut wait_diagnostics;
-        let lifecycle = async move {
+        let lifecycle = Box::pin(async move {
             let stream_phase = proxy_diagnostics::Phase::account(
                 diagnostic_context,
                 "upstream_stream",
@@ -983,8 +983,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 // it settled its work, not proof that persistence succeeded.
                 terminal_phase.finish("returned", None, None);
             };
-            run_bounded_proxy_lifecycle(lifecycle_deadline, finalization).await
-        };
+            run_bounded_proxy_lifecycle(lifecycle_deadline, Box::pin(finalization)).await
+        });
         let lifecycle_result = tokio::select! {
             biased;
             _ = crate::proxy_lifecycle::wait_for_owner_loss(owner_loss) => Err("request_owner_lost"),
