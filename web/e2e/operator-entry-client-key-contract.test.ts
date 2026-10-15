@@ -42,16 +42,22 @@ test('only a server 401 against the client-key shape shows the portal guidance',
 });
 
 test('a rejected credential is never stored and never shown as signed in', () => {
-  assert.match(scope, /: \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \}/);
+  assert.match(scope, /return \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \}/);
   assert.match(scope, /dispatch\(\{ type: 'authentication-rejected', message \}\)/);
 });
 
-test('only a real 401 or an explicit user clear removes the remembered credential', () => {
+test('a 403 permission denial is a rejection with the server message, never a 503-style outage', () => {
+  assert.match(scope, /reason instanceof ApiError && reason\.status === 403/);
+  assert.match(scope, /authentication-rejected', message: messageOf\(reason, t\('common\.connectionFailed'\)\)/);
+  assert.match(scope, /reason\.status === 403\) \{\s*clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-rejected'/);
+});
+
+test('only a definitive 401 or 403, or an explicit user clear, removes the remembered credential', () => {
   const clearSites = [...scope.matchAll(/clearRememberedCredential\('operator'\)/g)].map((match) => match.index ?? 0);
-  assert.equal(clearSites.length, 3, 'two 401 rejections and the explicit clear control');
+  assert.equal(clearSites.length, 4, '401 and 403 rejections in authenticate and refresh, plus the explicit clear control');
   for (const at of clearSites) {
     const context = scope.slice(Math.max(0, at - 320), at);
-    assert.ok(/reason\.status === 401|function clearCredential/.test(context), 'every clearing site follows a 401 or the explicit clear control');
+    assert.ok(/reason\.status === 401|reason\.status === 403|function clearCredential/.test(context), 'every clearing site follows a definitive rejection or the explicit clear control');
   }
 });
 
@@ -60,7 +66,6 @@ test('a network, 502, 503 or database outage preserves the session, page and dra
   assert.match(scope, /dispatch\(\{ type: 'authentication-unavailable', message: outageMessage\(reason\), candidate \}\)/);
   assert.match(scope, /state\.validated && \(state\.status\.kind === 'ready' \|\| state\.status\.kind === 'unavailable'\)/);
   assert.match(scope, /t\('operator\.serviceUnavailable'\)/);
-  assert.match(scope, /t\('operator\.accessForbidden'\)/);
   assert.match(scope, /apiDiagnosticMessage\(reason, t\('common\.connectionFailed'\)/);
 });
 
@@ -105,7 +110,6 @@ test('rejection and portal-guidance copy exists in both locales', () => {
   assert.equal(i18n.match(/'operator\.clientKeyRejected': '/g)?.length, 2);
   assert.equal(i18n.match(/'operator\.clientCredentialPortalHint': '/g)?.length, 2);
   assert.equal(i18n.match(/'operator\.serviceUnavailable': '/g)?.length, 2);
-  assert.equal(i18n.match(/'operator\.accessForbidden': '/g)?.length, 2);
   assert.match(i18n, /'operator\.clientKeyRejected': '[^']*mts_[^']*个人中心[^']*'/);
   assert.match(i18n, /'operator\.clientKeyRejected': '[^']*service credential[^']*portal[^']*'/);
   assert.match(i18n, /'operator\.clientCredentialPortalHint': '[^']*mtc_[^']*个人中心[^']*'/);

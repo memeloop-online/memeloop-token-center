@@ -96,9 +96,7 @@ export function useOperatorScope() {
       requestId: t('request.correlationId'),
       streamInterrupted: t('request.streamInterrupted'),
     });
-    return reason instanceof ApiError && reason.status === 403
-      ? `${t('operator.accessForbidden')} · ${diagnostic}`
-      : `${t('operator.serviceUnavailable')} · ${diagnostic}`;
+    return `${t('operator.serviceUnavailable')} · ${diagnostic}`;
   }
 
   async function authenticate(rawCandidate: string) {
@@ -119,9 +117,9 @@ export function useOperatorScope() {
       dispatch({ type: 'authenticated', credential: candidate, tenants, tenant });
     } catch (reason) {
       if (request !== sequence.current) return;
-      // Only a definitive 401 (including explicit revocation) ends the
-      // authorization and clears the remembered credential. A network
-      // failure, 502/503 or an unavailable database keeps the saved
+      // Only a definitive authorization answer ends the session: a 401
+      // rejection (including explicit revocation) or a 403 permission denial.
+      // A network failure, 502/503 or an unavailable database keeps the saved
       // credential, the ready read-only page and the unsubmitted draft, and
       // is surfaced as an explicit outage with retry instead of a sign-in.
       if (reason instanceof ApiError && reason.status === 401) {
@@ -130,6 +128,14 @@ export function useOperatorScope() {
           ? t('operator.clientKeyRejected')
           : messageOf(reason, t('common.connectionFailed'));
         dispatch({ type: 'authentication-rejected', message });
+        return;
+      }
+      // A 403 is a definitive permission answer, not a transient outage: the
+      // sign-in surface returns with the server's own denial message and is
+      // never conflated with a retryable 503.
+      if (reason instanceof ApiError && reason.status === 403) {
+        clearRememberedCredential('operator');
+        dispatch({ type: 'authentication-rejected', message: messageOf(reason, t('common.connectionFailed')) });
         return;
       }
       dispatch({ type: 'authentication-unavailable', message: outageMessage(reason), candidate });
@@ -162,7 +168,7 @@ export function useOperatorScope() {
       dispatch({ type: 'tenants-refreshed', tenants, tenant });
     } catch (reason) {
       if (request !== sequence.current || stateRef.current.credential !== credential) return;
-      if (reason instanceof ApiError && reason.status === 401) {
+      if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) {
         clearRememberedCredential('operator');
         dispatch({ type: 'authentication-rejected', message: messageOf(reason, t('common.connectionFailed')) });
         return;
