@@ -3,6 +3,7 @@ import {
   Suspense,
   lazy,
   useMemo,
+  useRef,
   useState,
   type ComponentType,
   type ErrorInfo,
@@ -142,6 +143,10 @@ function PluginComponent({
     () => lazy(() => componentLoad(url, pluginId, pluginVersion, contribution.component_id!)),
     [contribution.component_id, pluginId, pluginVersion, retry, url],
   );
+  // Parent renders must not replace the API object and restart plugin work.
+  // Navigation still uses the latest guard and route registry.
+  const navigationRef = useRef(onNavigate);
+  navigationRef.current = onNavigate;
   const hostApi = useMemo<OperatorUiHostApiV1>(() => {
     const requestApi = createOperatorApiBridge(credential, tenantExternalId);
     return {
@@ -153,9 +158,9 @@ function PluginComponent({
       },
       requestApi,
       discoverApi: (signal?: AbortSignal) => requestApi<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
-      navigate: onNavigate,
+      navigate: (route, context) => navigationRef.current(route, context),
     };
-  }, [credential, onNavigate, pluginId, serviceEndpointIds, tenantExternalId]);
+  }, [credential, pluginId, serviceEndpointIds, tenantExternalId]);
 
   return <Suspense fallback={<div className="empty" role="status">Loading plugin view…</div>}>
     <LazyComponent
