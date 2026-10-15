@@ -143,3 +143,148 @@ fn operator_bridge_requires_nonstreaming_json() {
     assert!(validate_request(&json!({"stream":false})).is_ok());
     assert!(validate_request(&json!({})).is_ok());
 }
+
+#[tokio::test]
+async fn control_inference_returns_tool_calls_and_settles_selected_billing_key() {
+    use crate::{
+        db::{CreateModelRouteInput, CreateUpstreamAccountInput},
+        provider::UpstreamCredential,
+    };
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header as header_matcher, method, path},
+    };
+    let upstream = MockServer::start().await;
+    let completion = json!({
+        "id":"chatcmpl-operator-fixture", "object":"chat.completion", "created":1, "model":"fixture",
+        "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{
+            "id":"call-fixture", "type":"function", "function":{"name":"inspect","arguments":"{}"}
+        }]},"finish_reason":"tool_calls"}],
+        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header_matcher("authorization", "Bearer provider-fixture"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&completion))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let (state, _directory) = crate::api::tests::test_state().await;
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "inference-success".into(),
+                name: "inference-upstream".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":upstream.uri(),"network_scope":"public"}),
+                credential: UpstreamCredential::ApiKey {
+                    value: "provider-fixture".into(),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "inference-success".into(),
+            public_model: "fixture".into(),
+            upstream_account_id: account.id,
+            upstream_model: "fixture".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let key = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: "inference-success".into(),
+                principal_external_id: "billing-owner".into(),
+                alias: "selected-billing-key".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price("fixture", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "inference-writer".into(),
+                scopes: vec!["keys:write".into()],
+                tenant_external_id: Some("inference-success".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = router_for_role(state.clone(), RuntimeRole::Control)
+        .oneshot(inference(&service.token, key.key_id))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap();
+    let actual: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(actual["choices"], completion["choices"]);
+    assert_eq!(actual["usage"], completion["usage"]);
+    let output = String::from_utf8_lossy(&bytes);
+    for secret in [&key.key, &service.token] {
+        assert!(!output.contains(secret));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let rows = state.db.list_requests(key.key_id, 10).await.unwrap();
+            if rows.len() == 1 && rows[0].status_code.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let rows = state.db.list_requests(key.key_id, 10).await.unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    let settlements = state
+        .db
+        .list_account_settlements(key.account_id, 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(settlements.items.len(), 1);
+    assert_eq!(settlements.items[0].key_id, key.key_id);
+    assert_eq!(
+        Decimal::from_str(&settlements.items[0].cost).unwrap(),
+        Decimal::new(5, 6)
+    );
+    let forwarded = upstream.received_requests().await.unwrap();
+    assert_eq!(forwarded.len(), 1);
+    for value in forwarded[0].headers.values() {
+        assert!(!value.to_str().unwrap_or_default().contains(&key.key));
+        assert!(!value.to_str().unwrap_or_default().contains(&service.token));
+    }
+    assert!(!String::from_utf8_lossy(&forwarded[0].body).contains(&key.key));
+    assert!(!String::from_utf8_lossy(&forwarded[0].body).contains(&service.token));
+}
