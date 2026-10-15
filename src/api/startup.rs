@@ -43,8 +43,7 @@ impl StartupRouter {
     pub fn failed(&self, role: RuntimeRole, error: &crate::InitializationError) {
         use crate::{InitializationError, error::AppError};
         let (code, message) = match error {
-            InitializationError::Database(AppError::DatabaseUnavailable(failure))
-            | InitializationError::Dependency(AppError::DatabaseUnavailable(failure)) =>
+            InitializationError::Database(AppError::DatabaseUnavailable(failure)) =>
                 (failure.code(), failure.to_string()),
             InitializationError::Database(_) => (
                 "database_initialization_failed",
@@ -74,7 +73,10 @@ async fn dispatch(State(state): State<StartupRouter>, request: Request) -> Respo
 fn degraded_router(role: RuntimeRole, code: &'static str, message: &str, root: PathBuf) -> Router {
     let body = json!({
         "status": "not_ready",
-        "checks": {"application": "failed", "database": "unknown", "archive": "unknown"},
+        "checks": {
+            "application": if code == "service_initializing" { "initializing" } else { "failed" },
+            "database": "unknown", "database_schema": {"status": "unknown"}, "archive": "unknown"
+        },
         "error": {"code": code, "message": message},
     });
     let unavailable = move || {

@@ -31,7 +31,7 @@ test('service footer preserves shell, distinguishes dependency failures and hist
       const footer = page.locator('footer');
       await footer.waitFor();
       await page.getByRole('heading', { name: 'Existing application shell' }).waitFor();
-      assert.match(await footer.innerText(), locale === 'en' ? /storage.*full/i : /存储空间已满/);
+      assert.match(await footer.innerText(), locale === 'en' ? /full storage/i : /存储空间已满/);
       assert.match(await footer.innerText(), locale === 'en' ? /do not need to re-enter/ : /无需重新填写/);
       for (const width of [320, 1440]) {
         await page.setViewportSize({ width, height: 900 });

@@ -116,7 +116,9 @@ paths:
         cache, so probe bursts do not amplify dependency traffic. Database reachability
         and the complete migration registry determine the HTTP status. An archive failure
         is returned as HTTP 200 with `status: degraded` and `checks.archive: failed`;
-        archive-dependent image/video operations still fail closed.
+        archive-dependent image/video operations still fail closed. Before application
+        initialization completes, returns 503 with unknown dependency checks and a fixed
+        initialization error code; process liveness remains available.
       security: []
       responses:
         '200':
@@ -126,6 +128,32 @@ paths:
               schema: { $ref: '#/components/schemas/Readiness' }
         '503':
           description: PostgreSQL readiness failed, timed out, or its schema is missing a migration required by this binary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /ui-assets/service-status:
+    get:
+      tags: [System]
+      operationId: getWebsiteServiceStatus
+      summary: Read dependency status while the existing website shell remains available
+      description: |
+        Available through the existing static asset Ingress prefix, including before
+        AppState initialization. Uses the existing readiness cache after initialization.
+        Contains fixed public diagnostics only; does not authorize data access or forwarding.
+        last_database_error is the last failure observed in this process, with Unix seconds.
+        Read readiness does not establish that database writes have recovered.
+        Deploy the chart's static-only web Service/routing to retain this path when
+        Kubernetes withdraws the API Service's unready endpoints.
+      security: []
+      responses:
+        '200':
+          description: Database read health is ready; archive may be degraded. Historical failure evidence may remain.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Application initialization or database readiness is unavailable. Credentials remain unverified.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
@@ -7430,7 +7458,8 @@ components:
           additionalProperties: false
           required: [database, database_schema, archive]
           properties:
-            database: { type: string, enum: [ok, failed] }
+            application: { type: string, enum: [initializing, failed] }
+            database: { type: string, enum: [ok, failed, unknown] }
             database_schema:
               type: object
               additionalProperties: false
@@ -7440,7 +7469,23 @@ components:
                 required_version: { type: integer, format: int64, minimum: 0 }
                 latest_applied_version: { type: [integer, 'null'], format: int64, minimum: 0 }
                 missing_migration_count: { type: integer, minimum: 0 }
-            archive: { type: string, enum: [ok, failed] }
+            archive: { type: string, enum: [ok, failed, unknown] }
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [service_initializing, database_storage_full, database_unavailable, database_initialization_failed, application_initialization_failed, database_schema_outdated]
+            message: { type: string }
+        last_database_error:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [code, observed_at]
+          properties:
+            code: { type: string, enum: [database_storage_full, database_unavailable] }
+            observed_at: { type: integer, format: int64, minimum: 0, description: Unix seconds of the last failure observed in this process; not a current write-health assertion. }
     VersionInfo:
       type: object
       additionalProperties: false

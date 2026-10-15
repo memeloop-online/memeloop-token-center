@@ -111,8 +111,6 @@ pub struct AppState {
 pub enum InitializationError {
     #[error("database initialization failed")]
     Database(crate::error::AppError),
-    #[error("startup dependency failed")]
-    Dependency(crate::error::AppError),
     #[error("archive initialization failed")]
     Archive,
     #[error("plugin initialization failed")]
@@ -123,6 +121,15 @@ pub enum InitializationError {
     ProxyMemoryBudget,
     #[error("invalid transport proxy groups")]
     TransportProxyGroups,
+}
+
+fn plugin_initialization_error(error: crate::error::AppError) -> InitializationError {
+    match error {
+        crate::error::AppError::DatabaseUnavailable(_) | crate::error::AppError::Overloaded => {
+            InitializationError::Database(error)
+        }
+        _ => InitializationError::Plugin,
+    }
 }
 
 impl AppState {
@@ -181,7 +188,7 @@ impl AppState {
         plugins
             .validate_stored_configurations()
             .await
-            .map_err(InitializationError::Dependency)?;
+            .map_err(plugin_initialization_error)?;
         let mut providers = ProviderCatalog::builtins();
         providers
             .extend(plugins.provider_types())
@@ -200,7 +207,7 @@ impl AppState {
                         &plugins,
                     )
                     .await
-                    .map_err(InitializationError::Dependency)?
+                    .map_err(plugin_initialization_error)?
                     .with_installation_policy_file(
                         config
                             .plugin_install_policy_file

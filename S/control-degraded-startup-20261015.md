@@ -47,3 +47,6 @@
 第一轮只读源码审查已覆盖启动顺序、原 auth 链、静态路径验证、no-store、安全响应头、health 语义、Ingress 白名单及 ServiceMonitor 不选择 `-web` 组件。仅执行独立 Rust 文件格式化；没有运行本地 tests/build/check/install，也不把格式化当成测试通过。
 
 新增 CI 回归：故障时原静态壳与资源 200、liveness 200/readiness 503、私密/写入/转发路径拒绝、恢复后原认证仍拒绝无效凭据、驱动分类证据边界、Helm 静态与 API backend 分离、中英文 footer/历史写入失败/320px 布局。使用既有 GHA；提交/PR 和实际 CI 状态在交付时补充。最多两轮 review，无 sub-agent，无 Wiki。
+
+
+PR：[#634](https://github.com/memeloop-online/memeloop-token-center/pull/634)，首提交 `5fc505ad`。第一轮 [GHA 38767919986](https://github.com/memeloop-online/memeloop-token-center/actions/runs/38767919986) 的安全、依赖、migration-smoke、memory-binary/service release input 构建通过；API contract 缺少新状态路径边界、原插件校验失败类别回归、新浏览器英文词序断言失败。第二轮修正：补全 OpenAPI/边界及 unknown 初始化健康形状，仅保留明确数据库错误细节而保留普通插件校验 `InitializationError::Plugin`，修正英文断言词序。未放宽 auth、测试门禁或更改他人 plugin 文件。最终 CI 按实际状态交付，不声称首轮通过。
