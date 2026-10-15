@@ -6,7 +6,7 @@ export declare const OPERATOR_UI_PACKAGE_API_V1: 'operator-ui-package-v1';
 
 export interface OperatorUiContributionV1 {
   id: string;
-  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after';
+  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after' | 'operator.model-route.action';
   category?: { id: string; label?: string | null } | null;
   route?: string | null;
   target_route?: string | null;
@@ -37,9 +37,19 @@ export interface OperatorUiServiceDataResponseV1 {
   };
 }
 
+export interface OperatorUiApiRequestV1 {
+  /** Absolute same-origin API path; the host supplies authentication and tenant scope. */
+  path: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+  body?: unknown;
+  signal?: AbortSignal;
+}
+
 export interface OperatorUiHostApiV1 {
+  requestApi<T = unknown>(request: OperatorUiApiRequestV1): Promise<T>;
+  discoverApi(signal?: AbortSignal): Promise<Record<string, unknown>>;
   loadServiceData(endpointId: string, signal?: AbortSignal): Promise<OperatorUiServiceDataResponseV1>;
-  navigate(route: string): void;
+  navigate(route: string, context?: Record<string, unknown>): void;
 }
 
 export interface OperatorUiComponentPropsV1 {
@@ -50,6 +60,7 @@ export interface OperatorUiComponentPropsV1 {
   locale: string;
   compact: boolean;
   api: OperatorUiHostApiV1;
+  context?: Record<string, unknown>;
 }
 
 export interface OperatorUiPackageV1 {

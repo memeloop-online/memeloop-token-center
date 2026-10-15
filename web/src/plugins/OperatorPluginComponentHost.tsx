@@ -11,6 +11,7 @@ import {
 import * as ReactRuntime from 'react';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
+import { createOperatorApiBridge } from './operatorApiBridge.js';
 import type { PluginOperatorUiContribution, PluginServiceDataResponse } from '../types.js';
 import {
   OPERATOR_UI_PACKAGE_API_V1,
@@ -32,7 +33,8 @@ export interface OperatorPluginComponentHostProps {
   tenantExternalId: string;
   locale: string;
   compact?: boolean;
-  onNavigate: (route: string) => void;
+  context?: Record<string, unknown>;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
 }
 
 interface BoundaryProps {
@@ -132,6 +134,7 @@ function PluginComponent({
   locale,
   compact,
   onNavigate,
+  context,
   retry,
 }: OperatorPluginComponentHostProps & { compact: boolean; retry: number }) {
   const url = moduleUrl(pluginId, pluginVersion, contribution);
@@ -146,6 +149,8 @@ function PluginComponent({
       }
       return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
     },
+    requestApi: createOperatorApiBridge(credential, tenantExternalId),
+    discoverApi: (signal?: AbortSignal) => createOperatorApiBridge(credential, tenantExternalId)<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
     navigate: onNavigate,
   }), [credential, onNavigate, pluginId, serviceEndpointIds, tenantExternalId]);
 
@@ -158,6 +163,7 @@ function PluginComponent({
       locale={locale}
       compact={compact}
       api={hostApi}
+      context={context}
     />
   </Suspense>;
 }
