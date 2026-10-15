@@ -37,7 +37,7 @@ type ScopeAction =
   | { type: 'authenticate'; candidate: string }
   | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string }
   | { type: 'tenants-refreshed'; tenants: TenantView[]; tenant: string }
-  | { type: 'authentication-rejected'; message: string }
+  | { type: 'authentication-failed'; message: string; preserve: boolean }
   | { type: 'authentication-unavailable'; message: string; candidate: string }
   | { type: 'select-tenant'; tenant: string }
   | { type: 'clear' };
@@ -71,8 +71,10 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
       };
     case 'tenants-refreshed':
       return { ...state, tenants: action.tenants, tenant: action.tenant };
-    case 'authentication-rejected':
-      return { credential: '', validated: false, credentialInput: state.credentialInput, tenant: '', tenants: [], status: { kind: 'failed', message: action.message } };
+    case 'authentication-failed':
+      return action.preserve
+        ? { ...state, status: { kind: 'failed', message: action.message } }
+        : { credential: '', validated: false, credentialInput: state.credentialInput, tenant: '', tenants: [], status: { kind: 'failed', message: action.message } };
     case 'authentication-unavailable':
       return { ...state, status: { kind: 'unavailable', message: action.message, candidate: action.candidate } };
     case 'select-tenant':
@@ -117,25 +119,26 @@ export function useOperatorScope() {
       dispatch({ type: 'authenticated', credential: candidate, tenants, tenant });
     } catch (reason) {
       if (request !== sequence.current) return;
-      // Only a definitive authorization answer ends the session: a 401
-      // rejection (including explicit revocation) or a 403 permission denial.
-      // A network failure, 502/503 or an unavailable database keeps the saved
-      // credential, the ready read-only page and the unsubmitted draft, and
-      // is surfaced as an explicit outage with retry instead of a sign-in.
+      // Only a definitive 401 (including explicit revocation) ends the
+      // authorization and clears the remembered credential. A 403 permission
+      // denial surfaces the server's own message without an outage retry: a
+      // validated session keeps its credential and ready page, while an
+      // unproven candidate is dropped. A network failure, 502/503 or an
+      // unavailable database keeps the saved credential, the ready read-only
+      // page and the unsubmitted draft, and is surfaced as an explicit
+      // outage with retry instead of a sign-in.
       if (reason instanceof ApiError && reason.status === 401) {
         clearRememberedCredential('operator');
         const message = isOrdinaryClientCredential(candidate)
           ? t('operator.clientKeyRejected')
           : messageOf(reason, t('common.connectionFailed'));
-        dispatch({ type: 'authentication-rejected', message });
+        dispatch({ type: 'authentication-failed', message, preserve: false });
         return;
       }
-      // A 403 is a definitive permission answer, not a transient outage: the
-      // sign-in surface returns with the server's own denial message and is
-      // never conflated with a retryable 503.
       if (reason instanceof ApiError && reason.status === 403) {
-        clearRememberedCredential('operator');
-        dispatch({ type: 'authentication-rejected', message: messageOf(reason, t('common.connectionFailed')) });
+        const preserve = before.validated && Boolean(before.credential);
+        if (!preserve) clearRememberedCredential('operator');
+        dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), preserve });
         return;
       }
       dispatch({ type: 'authentication-unavailable', message: outageMessage(reason), candidate });
@@ -168,18 +171,23 @@ export function useOperatorScope() {
       dispatch({ type: 'tenants-refreshed', tenants, tenant });
     } catch (reason) {
       if (request !== sequence.current || stateRef.current.credential !== credential) return;
-      if (reason instanceof ApiError && (reason.status === 401 || reason.status === 403)) {
+      if (reason instanceof ApiError && reason.status === 401) {
         clearRememberedCredential('operator');
-        dispatch({ type: 'authentication-rejected', message: messageOf(reason, t('common.connectionFailed')) });
+        dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), preserve: false });
+        return;
+      }
+      if (reason instanceof ApiError && reason.status === 403) {
+        dispatch({ type: 'authentication-failed', message: messageOf(reason, t('common.connectionFailed')), preserve: true });
         return;
       }
       dispatch({ type: 'authentication-unavailable', message: outageMessage(reason), candidate: credential });
     }
   }
 
-  // A credential that only failed tenant discovery through an outage is never
-  // promoted: pages and streams stay gated on a validated identity.
-  const activeCredential = state.validated && (state.status.kind === 'ready' || state.status.kind === 'unavailable')
+  // A credential that only failed tenant discovery through an outage or a
+  // denial is never promoted on its own: pages and streams stay gated on a
+  // validated identity. A preserved failure keeps the validated session live.
+  const activeCredential = state.validated && (state.status.kind === 'ready' || state.status.kind === 'failed' || state.status.kind === 'unavailable')
     ? state.credential
     : '';
   const writeTenant = state.tenant;
