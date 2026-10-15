@@ -542,12 +542,7 @@ jobs:
           cache: npm
       - name: Install pinned TypeScript operator dependencies
         run: npm ci
-      - name: Compare Axum source routes, role boundaries, and OpenAPI
-        run: |
-          node --test tests/ops/test-openapi-contract.ts
-          node tests/ops/check-openapi-contract.ts \
-            --output /tmp/memeloop-token-center-route-contract.json
-      - name: Generate JSON from the validated OpenAPI source
+      - name: Generate JSON from the OpenAPI source
         run: |
           node --input-type=module <<'NODE'
           import { readFileSync, writeFileSync } from 'node:fs';
@@ -562,6 +557,11 @@ jobs:
           path: /tmp/memeloop-token-center-openapi.json
           if-no-files-found: error
           retention-days: 14
+      - name: Compare Axum source routes, role boundaries, and OpenAPI
+        run: |
+          node --test tests/ops/test-openapi-contract.ts
+          node tests/ops/check-openapi-contract.ts \
+            --output /tmp/memeloop-token-center-route-contract.json
       - name: Retain the resolved route contract
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
