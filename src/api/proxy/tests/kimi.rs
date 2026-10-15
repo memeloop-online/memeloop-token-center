@@ -470,7 +470,7 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         translated,
         MAX_PROXY_RESPONSE_BODY,
         &memory,
-        Instant::now(),
+        Duration::from_secs(30),
         false,
         None,
     )

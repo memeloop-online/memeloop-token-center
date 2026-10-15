@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::proxy::streaming::{StreamingResponse, stream_response};
 
 #[tokio::test(start_paused = true)]
 async fn buffered_codex_terminal_can_arrive_after_twenty_minutes() {
@@ -102,7 +103,9 @@ async fn stream_fixture(
             fixture.upstream_account_id,
             1,
             1,
-            UpstreamAttemptAdmission::Healthy { failure_epoch: 0 },
+            UpstreamAttemptAdmission::Healthy {
+                failure_epoch: Uuid::nil(),
+            },
             None,
         ),
         strict_openai_chat_usage: false,
