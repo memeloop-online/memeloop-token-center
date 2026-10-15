@@ -131,7 +131,7 @@ pub(super) async fn load_candidate_paths(
     tenant_id: &str,
     candidates: &[AnyRow],
     current_leaf: Option<&str>,
-) -> Result<PrefixPaths, AppError> {
+) -> Result<PrefixPaths, ConversationContentError> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(leaf) = current_leaf {
         roots.insert(leaf.to_owned());
