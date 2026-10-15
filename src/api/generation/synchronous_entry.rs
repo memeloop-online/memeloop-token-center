@@ -439,7 +439,7 @@ mod tests {
             directory.path().join("native-image.db").display()
         );
         let mut config = Config::for_test(database_url.clone());
-        config.plugin_dir = Some("plugins".into());
+        config.plugin_dir = Some(".plugin-examples/plugins".into());
         let state = AppState::initialize(config).await.unwrap();
         let tenant = "native-image-fixture";
         let upstream_account = state.db.create_upstream_account(CreateUpstreamAccountInput {
