@@ -338,7 +338,10 @@ impl PluginRuntime {
                 limits,
                 deadline,
                 http_body_limit: endpoint.max_body_bytes,
-                http_diagnostic: super::PluginHttpDiagnostic::default(),
+                http_diagnostic: super::PluginHttpDiagnostic {
+                    stage: "not_called",
+                    ..super::PluginHttpDiagnostic::default()
+                },
             },
         );
         store.limiter(|state| &mut state.limits);

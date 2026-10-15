@@ -2048,7 +2048,7 @@ impl memeloop::token_center::host::Host for HostState {
             }
             Ok::<_, String>((status, response_headers, response_body))
         })?;
-        self.http_diagnostic.stage = "response_encoding";
+        self.http_diagnostic.stage = "response_received";
         serde_json::to_vec(&serde_json::json!({
             "status": status,
             "headers": response_headers,
@@ -3825,6 +3825,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("forbidden header"), "{error}");
+        assert_eq!(state.http_diagnostic.origin_slot, Some(0));
+        assert_eq!(state.http_diagnostic.stage, "request_validation");
+        assert_eq!(state.http_diagnostic.status, None);
+        state.http_diagnostic.status = Some(599);
+        state.http_diagnostic.failure_code = Some("timeout");
+        state.http_diagnostic.robots = true;
+        let error = memeloop::token_center::host::Host::http_request(
+            &mut state,
+            "GET".to_owned(),
+            "https://private:credential@does-not-resolve.invalid/robots.txt".to_owned(),
+            "{}".to_owned(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("without credentials"));
+        assert_eq!(state.http_diagnostic.origin_slot, None);
+        assert_eq!(state.http_diagnostic.status, None);
+        assert_eq!(state.http_diagnostic.failure_code, None);
+        assert!(!state.http_diagnostic.robots);
+        assert_eq!(state.http_diagnostic.stage, "request_validation");
     }
 
     #[test]
