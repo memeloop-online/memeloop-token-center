@@ -176,7 +176,7 @@ paths:
 
   /internal/v1/api-schema:
     get:
-      tags: [Operations]
+      tags: [System]
       operationId: discoverApiSchema
       summary: Discover the complete OpenAPI contract
       description: Authentication does not grant permission to invoke discovered operations.
@@ -203,6 +203,8 @@ paths:
         completions are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
       requestBody:
         required: true
         content:
