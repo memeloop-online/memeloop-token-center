@@ -1,5 +1,259 @@
 use super::*;
 
+#[test]
+fn optional_openai_output_limits_are_not_injected_and_explicit_values_are_preserved() {
+    for (protocol, fields) in [
+        (
+            Protocol::OpenAiChat,
+            &["max_tokens", "max_completion_tokens"][..],
+        ),
+        (Protocol::OpenAiResponses, &["max_output_tokens"][..]),
+    ] {
+        let original = json!({"model":"fixture-model"});
+        let mut request = original.clone();
+        assert_eq!(
+            inject_controlled_output_ceiling(protocol, &mut request).unwrap(),
+            None
+        );
+        assert_eq!(request, original);
+        for field in fields {
+            for limit in [0, 17, 65_536, MAX_REPORTED_TOKENS] {
+                let mut request = original.clone();
+                request[*field] = json!(limit);
+                let expected = request.clone();
+                assert_eq!(
+                    inject_controlled_output_ceiling(protocol, &mut request).unwrap(),
+                    Some(limit)
+                );
+                assert_eq!(request, expected);
+            }
+            for invalid in [json!(-1), json!(1.5), json!("17"), Value::Null] {
+                let mut request = original.clone();
+                request[*field] = invalid;
+                assert!(inject_controlled_output_ceiling(protocol, &mut request).is_err());
+            }
+        }
+    }
+    assert!(
+        inject_controlled_output_ceiling(
+            Protocol::OpenAiChat,
+            &mut json!({"max_tokens":17,"max_completion_tokens":17}),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn mandatory_anthropic_output_limit_keeps_its_existing_default_and_explicit_value() {
+    let mut request = json!({"model":"fixture-model"});
+    assert_eq!(
+        inject_controlled_output_ceiling(Protocol::AnthropicMessages, &mut request).unwrap(),
+        Some(4096)
+    );
+    assert_eq!(request["max_tokens"], 4096);
+    request["max_tokens"] = json!(8192);
+    let expected = request.clone();
+    assert_eq!(
+        inject_controlled_output_ceiling(Protocol::AnthropicMessages, &mut request).unwrap(),
+        Some(8192)
+    );
+    assert_eq!(request, expected);
+    for protocol in [Protocol::OpenAiEmbeddings, Protocol::AnthropicCountTokens] {
+        let mut request = json!({"model":"fixture-model"});
+        let expected = request.clone();
+        assert_eq!(
+            inject_controlled_output_ceiling(protocol, &mut request).unwrap(),
+            Some(0)
+        );
+        assert_eq!(request, expected);
+    }
+}
+
+fn ordinary_request(fixture: &CodexRouteFixture, chat: bool) -> Value {
+    if chat {
+        json!({"model":fixture.model,"messages":[{"role":"user","content":"hello"}],"stream":false})
+    } else {
+        json!({"model":fixture.model,"input":"hello","stream":false})
+    }
+}
+
+fn ordinary_response(chat: bool, output_tokens: i64) -> Value {
+    if chat {
+        json!({
+            "id":"resp-usage-contract","object":"chat.completion",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"uncapped response"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":output_tokens,"total_tokens":3 + output_tokens}
+        })
+    } else {
+        completed_response_with_usage(3, output_tokens)
+    }
+}
+
+async fn send_ordinary(fixture: &CodexRouteFixture, chat: bool, request: &Value) -> Response {
+    if chat {
+        send_chat_usage_request(fixture, request).await
+    } else {
+        send_response_usage_request(fixture, request).await
+    }
+}
+
+#[tokio::test]
+async fn ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_once() {
+    for driver in ["http-json", "new-api"] {
+        for chat in [false, true] {
+            let upstream = MockServer::start().await;
+            let fixture = fixture("ordinary-output", &upstream, driver).await;
+            let request = ordinary_request(&fixture, chat);
+            let expected_wire = request.clone();
+            Mock::given(method("POST"))
+                .and(path(if chat {
+                    "/v1/chat/completions"
+                } else {
+                    "/v1/responses"
+                }))
+                .and(move |request: &wiremock::Request| {
+                    request.body_json::<Value>().unwrap() == expected_wire
+                })
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ordinary_response(chat, 5000)),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let response = send_ordinary(&fixture, chat, &request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&delivered).unwrap(),
+                ordinary_response(chat, 5000)
+            );
+            wait_for_request_settlement(&fixture, 1).await;
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status_code, Some(200));
+            assert_eq!(rows[0].error_code, None);
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5000));
+            assert_eq!(
+                rows[0].cost.parse::<Decimal>().unwrap(),
+                Decimal::new(5003, 6)
+            );
+            assert_exactly_once_side_effects(
+                &fixture,
+                rows[0].request_id,
+                if chat {
+                    None
+                } else {
+                    Some("resp-usage-contract")
+                },
+            )
+            .await;
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            let reserved: i64 =
+                sqlx::query_scalar("SELECT reserved_tokens FROM usage_reservations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(reserved >= 65_536);
+            pool.close().await;
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constraint() {
+    for (chat, field) in [
+        (true, "max_tokens"),
+        (true, "max_completion_tokens"),
+        (false, "max_output_tokens"),
+    ] {
+        for reported in [17, 18] {
+            let upstream = MockServer::start().await;
+            let fixture = fixture("ordinary-explicit-output", &upstream, "http-json").await;
+            let mut request = ordinary_request(&fixture, chat);
+            request[field] = json!(17);
+            let expected_wire = request.clone();
+            Mock::given(method("POST"))
+                .and(move |request: &wiremock::Request| {
+                    request.body_json::<Value>().unwrap() == expected_wire
+                })
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ordinary_response(chat, reported)),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let response = send_ordinary(&fixture, chat, &request).await;
+            assert_eq!(
+                response.status(),
+                if reported == 17 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            wait_for_request_settlement(&fixture, 1).await;
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].output_tokens, if reported == 17 { 17 } else { 0 });
+            assert_eq!(
+                rows[0].error_code.as_deref(),
+                if reported == 17 {
+                    None
+                } else {
+                    Some("upstream_invalid_usage")
+                }
+            );
+            upstream.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_openai_trusted_reservations_require_funding_before_any_post() {
+    for chat in [false, true] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let fixture = fixture("ordinary-unfunded-output", &upstream, "http-json").await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        sqlx::query("UPDATE credit_accounts SET available_micros = 10000 WHERE id = $1")
+            .bind(fixture.credit_account_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = send_ordinary(&fixture, chat, &ordinary_request(&fixture, chat)).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("balance_exhausted"));
+        let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
+        pool.close().await;
+        upstream.verify().await;
+    }
+}
+
 async fn fixture(label: &str, upstream: &MockServer, driver: &str) -> CodexRouteFixture {
     let fixture = response_usage_fixture_with_uri_contract_and_driver(
         label,

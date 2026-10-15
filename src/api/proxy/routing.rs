@@ -175,7 +175,7 @@ pub(super) fn plan_proxy_route(
                 &route.upstream_model,
             )?
         }
-        None => inject_controlled_output_ceiling(
+        None => match inject_controlled_output_ceiling(
             if responses_chat.is_some() {
                 Protocol::OpenAiChat
             } else if responses_anthropic.is_some() {
@@ -184,7 +184,10 @@ pub(super) fn plan_proxy_route(
                 protocol
             },
             &mut forwarded_json,
-        )?,
+        )? {
+            Some(ceiling) => ceiling,
+            None => configured_output_reservation_bound(&route.config, &route.upstream_model)?,
+        },
     };
     let upstream_stream =
         forwarded_json.get("stream").and_then(Value::as_bool) == Some(true) && !compact_v2_bridge;
@@ -281,6 +284,13 @@ pub(super) fn passthrough_output_reservation_bound(
             .filter(|limit| (0..=MAX_REPORTED_TOKENS).contains(limit))
             .ok_or_else(|| AppError::BadRequest("max_output_tokens is invalid".into()));
     }
+    configured_output_reservation_bound(config, upstream_model)
+}
+
+fn configured_output_reservation_bound(
+    config: &Value,
+    upstream_model: &str,
+) -> Result<i64, AppError> {
     // Pass-through envelopes cannot assume an output cap that was never sent
     // to the supplier. Reserve a trusted per-model bound before dispatch;
     // actual usage still must fit the reservation at settlement.

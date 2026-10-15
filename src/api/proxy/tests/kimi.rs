@@ -738,9 +738,12 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         .and(body_partial_json(json!({
             "model": fixture.model,
             "messages": [{"role":"user"}],
-            "stream": false,
-            "max_completion_tokens": 4096
+            "stream": false
         })))
+        .and(|request: &wiremock::Request| {
+            let value: Value = request.body_json().unwrap();
+            value.get("max_completion_tokens").is_none() && value.get("max_tokens").is_none()
+        })
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "fake-buffered",
             "choices": [{
@@ -806,9 +809,12 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                 {"type":"text","text":"readable delegated task"}
             ]}],
             "stream": true,
-            "stream_options": {"include_usage": true},
-            "max_completion_tokens": 4096
+            "stream_options": {"include_usage": true}
         })))
+        .and(|request: &wiremock::Request| {
+            let value: Value = request.body_json().unwrap();
+            value.get("max_completion_tokens").is_none() && value.get("max_tokens").is_none()
+        })
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             [
                 format!(

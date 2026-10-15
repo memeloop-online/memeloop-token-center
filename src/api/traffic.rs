@@ -235,22 +235,18 @@ impl Protocol {
 pub(super) fn inject_controlled_output_ceiling(
     protocol: Protocol,
     request: &mut Value,
-) -> Result<i64, AppError> {
+) -> Result<Option<i64>, AppError> {
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".to_owned()))?;
     let (accepted_fields, injected_field, default) = match protocol {
-        Protocol::OpenAiChat => (
-            &["max_completion_tokens", "max_tokens"][..],
-            Some("max_completion_tokens"),
-            4_096,
-        ),
-        Protocol::OpenAiResponses => (&["max_output_tokens"][..], Some("max_output_tokens"), 4_096),
-        Protocol::AnthropicMessages => (&["max_tokens"][..], Some("max_tokens"), 4_096),
+        Protocol::OpenAiChat => (&["max_completion_tokens", "max_tokens"][..], None, None),
+        Protocol::OpenAiResponses => (&["max_output_tokens"][..], None, None),
+        Protocol::AnthropicMessages => (&["max_tokens"][..], Some("max_tokens"), Some(4_096)),
         Protocol::OpenAiEmbeddings
         | Protocol::AnthropicCountTokens
         | Protocol::OpenAiResponsesCompact
-        | Protocol::OpenAiAlphaSearch => (&[][..], None, 0),
+        | Protocol::OpenAiAlphaSearch => (&[][..], None, Some(0)),
     };
     if matches!(protocol, Protocol::OpenAiChat)
         && object.contains_key("max_completion_tokens")
@@ -270,10 +266,10 @@ pub(super) fn inject_controlled_output_ceiling(
                     "{field} must be between 0 and {MAX_REPORTED_TOKENS}"
                 )));
             }
-            return Ok(ceiling);
+            return Ok(Some(ceiling));
         }
     }
-    if let Some(field) = injected_field {
+    if let (Some(field), Some(default)) = (injected_field, default) {
         object.insert(field.to_owned(), Value::from(default));
     }
     Ok(default)
