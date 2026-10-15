@@ -15,6 +15,7 @@ function resolveSchema(document: SchemaObject, value: unknown, seen = new Set<st
   seen.add(schema.$ref);
   let target: unknown = document;
   for (const part of schema.$ref.slice(2).split('/')) target = object(target)?.[part.replaceAll('~1', '/').replaceAll('~0', '~')];
+  if (!object(target)) throw new Error('API schema reference cannot be resolved');
   return resolveSchema(document, target, seen);
 }
 
