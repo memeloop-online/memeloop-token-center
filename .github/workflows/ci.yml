@@ -547,6 +547,21 @@ jobs:
           node --test tests/ops/test-openapi-contract.ts
           node tests/ops/check-openapi-contract.ts \
             --output /tmp/memeloop-token-center-route-contract.json
+      - name: Generate JSON from the validated OpenAPI source
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { parse } from 'yaml';
+          const document = parse(readFileSync('openapi/openapi.yaml', 'utf8'), { uniqueKeys: true });
+          writeFileSync('/tmp/memeloop-token-center-openapi.json', JSON.stringify(document, null, 2) + '\n');
+          NODE
+      - name: Retain the generated OpenAPI JSON
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: openapi-json-${{ github.sha }}
+          path: /tmp/memeloop-token-center-openapi.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Retain the resolved route contract
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
