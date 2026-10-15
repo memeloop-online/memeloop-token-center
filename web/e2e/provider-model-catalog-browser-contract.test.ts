@@ -109,7 +109,7 @@ test('provider sync consumes its combined catalog result and keeps price outcome
   }
 });
 
-test('removed models do not enter the actual route picker aggregate', { timeout: 60_000 }, async () => {
+test('removed models stay out of catalog options while manual entry records explicit custom intent', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -149,13 +149,16 @@ test('removed models do not enter the actual route picker aggregate', { timeout:
     const picker = page.getByRole('combobox', { name: 'Upstream model', exact: true });
     await picker.click();
     await page.getByRole('option', { name: /active-model/i }).waitFor();
+    assert.equal(await page.locator('[data-custom]').textContent(), 'false', 'catalog evidence does not grant custom intent');
     await picker.fill('retired-model');
     await retiredSearchStarted;
     assert.equal(retiredSearches, 1, 'the editable route picker searches the aggregate endpoint, not the disabled catalog history');
     completeRetiredSearch();
     await page.getByText('No matching catalog model', { exact: true }).waitFor();
     assert.equal(await page.getByRole('option').count(), 0, 'the aggregate-backed route picker does not offer a removed model');
-    assert.equal(await page.getByRole('button', { name: 'Save route', exact: true }).isDisabled(), true, 'a removed model cannot become a route through picker selection');
+    assert.equal(await picker.inputValue(), 'retired-model', 'manual entry remains distinct from a catalog option');
+    assert.equal(await page.getByRole('button', { name: 'Save route', exact: true }).isEnabled(), true, 'explicit manual entry can be submitted without catalog confirmation');
+    assert.equal(await page.locator('[data-custom]').textContent(), 'true', 'manual entry records the existing explicit-custom policy');
   } finally {
     await browser.close();
     await server.close();

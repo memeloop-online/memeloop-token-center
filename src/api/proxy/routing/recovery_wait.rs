@@ -10,10 +10,7 @@ use tokio::{
     time::Instant,
 };
 
-// The request retains its existing byte reservation while waiting. Bound the
-// total retained cohort separately from the smaller fair DB polling cohort.
 // A poll permit covers one check only and is released before the recheck sleep.
-static WAITERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
 static POLLERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const RECHECK: Duration = Duration::from_millis(250);
 
@@ -66,7 +63,6 @@ impl Drop for WaitObservation {
 async fn bounded_wait<T, F, Fut>(
     deadline: Instant,
     permits: Arc<Semaphore>,
-    metrics: Option<&crate::metrics::Metrics>,
     check: F,
 ) -> Result<Option<T>, AppError>
 where
@@ -76,9 +72,7 @@ where
     bounded_wait_with_recheck(
         deadline,
         RECHECK,
-        Arc::new(Semaphore::new(64)),
         permits,
-        metrics,
         crate::api::proxy_diagnostics::Context::current().request_id,
         check,
     )
@@ -88,9 +82,7 @@ where
 async fn bounded_wait_with_recheck<T, F, Fut>(
     deadline: Instant,
     recheck: Duration,
-    waiters: Arc<Semaphore>,
     pollers: Arc<Semaphore>,
-    metrics: Option<&crate::metrics::Metrics>,
     request_id: Uuid,
     mut check: F,
 ) -> Result<Option<T>, AppError>
@@ -105,16 +97,6 @@ where
         check_ms: 0,
         sleep_ms: 0,
         outcome: "not_completed",
-    };
-    let Ok(_waiter) = waiters.try_acquire_owned() else {
-        observation.outcome = "capacity_rejected";
-        if let Some(metrics) = metrics {
-            metrics.observe_upstream_health(
-                UpstreamHealthEvent::Skipped,
-                UpstreamHealthReason::RecoveryWaitCapacity,
-            );
-        }
-        return Ok(None);
     };
     loop {
         if Instant::now() >= deadline {
@@ -193,94 +175,85 @@ pub(crate) async fn wait(
     let (deadline, recheck) = policy.map_or((deadline, RECHECK), |(snapshot, policy)| {
         policy.recovery_timing(snapshot, deadline, RECHECK)
     });
-    bounded_wait_with_recheck(
-        deadline,
-        recheck,
-        WAITERS.clone(),
-        POLLERS.clone(),
-        Some(&state.metrics),
-        request_id,
-        |permit| {
-            let mut route = route.clone();
-            let state = state.clone();
-            // Owned checks finish lease publication/cleanup after caller cancellation;
-            // the permit remains charged until that database work actually ends.
-            let task = tokio::spawn(async move {
-                let _permit = permit;
-                if refresh_route_snapshot(&state, &mut route).await?
-                    != PreparedRouteReadiness::Ready
-                    || route
-                        .credential
-                        .expires_at()
-                        .is_some_and(|expiry| expiry <= unix_millis())
-                {
-                    return Ok(Check::Stop);
+    bounded_wait_with_recheck(deadline, recheck, POLLERS.clone(), request_id, |permit| {
+        let mut route = route.clone();
+        let state = state.clone();
+        // Owned checks finish lease publication/cleanup after caller cancellation;
+        // the permit remains charged until that database work actually ends.
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            if refresh_route_snapshot(&state, &mut route).await? != PreparedRouteReadiness::Ready
+                || route
+                    .credential
+                    .expires_at()
+                    .is_some_and(|expiry| expiry <= unix_millis())
+            {
+                return Ok(Check::Stop);
+            }
+            let admission = if let Some(snapshot) = state.group_routing.as_ref()
+                && let Some((allow_probe, cooldown_ms)) = snapshot
+                    .policy(
+                        route.route_id,
+                        route.account_id,
+                        route.credential_generation,
+                    )
+                    .and_then(|policy| policy.transient_probe_controls())
+            {
+                state
+                    .db
+                    .claim_upstream_account_attempt_at_revision_with_strategy(
+                        snapshot.tenant_id,
+                        route.account_id,
+                        route.credential_generation,
+                        route.transport_revision,
+                        state.config.upstream_health,
+                        allow_probe,
+                        Some(cooldown_ms),
+                        true,
+                        Some(current_gateway_failure_domain()),
+                    )
+                    .await?
+            } else {
+                state
+                    .db
+                    .claim_transient_recovery_attempt_at_revision(
+                        route.account_id,
+                        route.credential_generation,
+                        route.transport_revision,
+                        state.config.upstream_health,
+                        Some(current_gateway_failure_domain()),
+                    )
+                    .await?
+            };
+            match admission {
+                UpstreamAttemptAdmission::Unavailable {
+                    transient_wait_eligible: true,
+                    ..
+                } => {
+                    #[cfg(test)]
+                    test_checkpoint(route.account_id).notify_one();
+                    Ok(Check::Retry)
                 }
-                let admission = if let Some(snapshot) = state.group_routing.as_ref()
-                    && let Some((allow_probe, cooldown_ms)) = snapshot
-                        .policy(
-                            route.route_id,
-                            route.account_id,
-                            route.credential_generation,
-                        )
-                        .and_then(|policy| policy.transient_probe_controls())
-                {
-                    state
-                        .db
-                        .claim_upstream_account_attempt_at_revision_with_strategy(
-                            snapshot.tenant_id,
-                            route.account_id,
-                            route.credential_generation,
-                            route.transport_revision,
-                            state.config.upstream_health,
-                            allow_probe,
-                            Some(cooldown_ms),
-                            true,
-                            Some(current_gateway_failure_domain()),
-                        )
-                        .await?
-                } else {
-                    state
-                        .db
-                        .claim_transient_recovery_attempt_at_revision(
-                            route.account_id,
-                            route.credential_generation,
-                            route.transport_revision,
-                            state.config.upstream_health,
-                            Some(current_gateway_failure_domain()),
-                        )
-                        .await?
-                };
-                match admission {
-                    UpstreamAttemptAdmission::Unavailable {
-                        transient_wait_eligible: true,
-                        ..
-                    } => {
-                        #[cfg(test)]
-                        test_checkpoint(route.account_id).notify_one();
-                        Ok(Check::Retry)
-                    }
-                    UpstreamAttemptAdmission::Unavailable { .. } => Ok(Check::Stop),
-                    UpstreamAttemptAdmission::Healthy { .. }
-                    | UpstreamAttemptAdmission::Probe { .. } => {
-                        let guard = UpstreamAttemptGuard::new(
-                            &state,
-                            request_id,
-                            route.route_id,
-                            route.account_id,
-                            route.credential_generation,
-                            route.transport_revision,
-                            admission,
-                            None,
-                        );
-                        Ok(Check::Ready((route, admission, guard)))
-                    }
-                    UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
+                UpstreamAttemptAdmission::Unavailable { .. } => Ok(Check::Stop),
+                UpstreamAttemptAdmission::Healthy { .. }
+                | UpstreamAttemptAdmission::Probe { .. } => {
+                    let guard = UpstreamAttemptGuard::new(
+                        &state,
+                        request_id,
+                        route.route_id,
+                        route.account_id,
+                        route.credential_generation,
+                        route.transport_revision,
+                        admission,
+                        None,
+                    );
+                    Ok(Check::Ready((route, admission, guard)))
                 }
-            });
-            async move { task.await.map_err(|_| AppError::Internal)? }
-        },
-    )
+                UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
+            }
+        });
+        async move { task.await.map_err(|_| AppError::Internal)? }
+    })
     .await
 }
 
@@ -318,8 +291,6 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
             RECHECK,
             Arc::new(Semaphore::new(1)),
-            Arc::new(Semaphore::new(1)),
-            None,
             request_id,
             |_| {
                 checks += 1;
@@ -367,7 +338,6 @@ mod tests {
             bounded_wait(
                 Instant::now() + Duration::from_secs(20),
                 semaphore,
-                None,
                 |permit| {
                     let (entered, resume, cleanup) = gate.take().unwrap();
                     let task = tokio::spawn(async move {
@@ -399,7 +369,7 @@ mod tests {
         let held = permits.clone().acquire_owned().await.unwrap();
         let calls = AtomicUsize::new(0);
         let deadline = Instant::now() + Duration::from_secs(1);
-        let denied = bounded_wait::<(), _, _>(deadline, permits.clone(), None, |_| async {
+        let denied = bounded_wait::<(), _, _>(deadline, permits.clone(), |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Check::Retry)
         })
@@ -410,7 +380,7 @@ mod tests {
         drop(held);
         let retry_deadline = Instant::now() + Duration::from_secs(1);
         assert!(
-            bounded_wait::<(), _, _>(retry_deadline, permits.clone(), None, |_| async {
+            bounded_wait::<(), _, _>(retry_deadline, permits.clone(), |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Check::Retry)
             })
@@ -432,7 +402,6 @@ mod tests {
             bounded_wait::<u8, _, _>(
                 Instant::now() + Duration::from_secs(5),
                 semaphore,
-                None,
                 |_| async { Ok(Check::Ready(9)) },
             )
             .await
@@ -455,32 +424,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_waiter_capacity_remains_bounded_before_any_poll_or_dispatch() {
-        let waiters = Arc::new(Semaphore::new(1));
-        let held = waiters.clone().acquire_owned().await.unwrap();
+    async fn sixty_five_waiters_queue_fairly_without_rejection_and_keep_four_db_checks() {
+        let pollers = Arc::new(Semaphore::new(4));
+        let held = pollers.clone().acquire_many_owned(4).await.unwrap();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        for request in 0..65 {
+            let release = release.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            let entered = entered.clone();
+            let mut waiting = Box::pin(bounded_wait_with_recheck(
+                Instant::now() + Duration::from_secs(20),
+                RECHECK,
+                pollers.clone(),
+                Uuid::now_v7(),
+                move |permit| {
+                    let release = release.clone();
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let entered = entered.clone();
+                    async move {
+                        let _permit = permit;
+                        let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(concurrent, Ordering::SeqCst);
+                        entered.lock().unwrap().push(request);
+                        release.acquire().await.unwrap().forget();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Check::Ready(request))
+                    }
+                },
+            ));
+            std::future::poll_fn(|context| {
+                assert!(waiting.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            waiters.push(waiting);
+        }
+        assert!(entered.lock().unwrap().is_empty());
+        drop(held);
+        for waiting in waiters.iter_mut().rev() {
+            std::future::poll_fn(|context| {
+                assert!(waiting.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        let mut first = entered.lock().unwrap().clone();
+        first.sort_unstable();
+        assert_eq!(first, vec![0, 1, 2, 3]);
+        assert_eq!(active.load(Ordering::SeqCst), 4);
+        assert_eq!(pollers.available_permits(), 0);
+        release.add_permits(65);
+        for (request, waiting) in waiters.into_iter().enumerate() {
+            assert_eq!(waiting.await.unwrap(), Some(request));
+        }
+        assert_eq!(entered.lock().unwrap().len(), 65);
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(pollers.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_waiter_never_checks_or_blocks_the_next_waiter() {
+        let pollers = Arc::new(Semaphore::new(1));
+        let held = pollers.clone().acquire_owned().await.unwrap();
         let calls = AtomicUsize::new(0);
-        let result = bounded_wait_with_recheck::<(), _, _>(
-            Instant::now() + Duration::from_secs(5),
-            RECHECK,
-            waiters.clone(),
-            Arc::new(Semaphore::new(1)),
-            None,
-            Uuid::now_v7(),
+        let mut cancelled = Box::pin(bounded_wait(
+            Instant::now() + Duration::from_secs(20),
+            pollers.clone(),
             |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Check::Ready(()))
             },
-        )
-        .await
-        .unwrap();
-        assert!(result.is_none());
+        ));
+        std::future::poll_fn(|context| {
+            assert!(cancelled.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut next = Box::pin(bounded_wait(
+            Instant::now() + Duration::from_secs(20),
+            pollers.clone(),
+            |_| async { Ok(Check::Ready(9)) },
+        ));
+        std::future::poll_fn(|context| {
+            assert!(next.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pollers.available_permits(), 0);
         drop(held);
-        assert_eq!(waiters.available_permits(), 1);
+        assert_eq!(next.await.unwrap(), Some(9));
+        assert_eq!(pollers.available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn cancellation_releases_waiter_and_preserves_closed_stop() {
+    async fn cancellation_releases_poll_permit_and_preserves_closed_stop() {
         let permits = Arc::new(Semaphore::new(1));
         let (entered, observed) = tokio::sync::oneshot::channel();
         let semaphore = permits.clone();
@@ -489,7 +535,6 @@ mod tests {
             bounded_wait::<(), _, _>(
                 Instant::now() + Duration::from_secs(20),
                 semaphore,
-                None,
                 |permit| {
                     if let Some(entered) = entered.take() {
                         let _ = entered.send(());
@@ -511,7 +556,6 @@ mod tests {
             bounded_wait::<(), _, _>(
                 Instant::now() + Duration::from_secs(20),
                 permits,
-                None,
                 |_| async { Ok(Check::Stop) }
             )
             .await

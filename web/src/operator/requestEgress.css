@@ -1,0 +1,47 @@
+.request-egress,
+.egress-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.egress-card {
+  padding-block: 16px;
+  border-bottom: 1px solid var(--colorNeutralStroke2);
+}
+
+.egress-selection,
+.egress-facts dd {
+  display: grid;
+  gap: 4px;
+}
+
+.egress-facts,
+.egress-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.egress-facts dd {
+  margin: 4px 0 0;
+}
+
+.egress-facts dt,
+.egress-facts small {
+  color: var(--colorNeutralForeground2);
+}
+
+.egress-controls .fui-Select,
+.egress-controls select {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.proxy-group-addresses {
+  flex-basis: 100%;
+  display: grid;
+  gap: 6px;
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}

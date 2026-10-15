@@ -6,6 +6,7 @@ import type { UpstreamAccount } from '../../types';
 import { useNavigationGuard } from '../../app/NavigationGuard';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import { ProxyGroupWorkspace } from '../TransportProxyGroupManager';
+import { RequestEgressSummaryPanel } from '../RequestEgressSummaryPanel';
 import { transportProxyGroupCopy } from '../transportProxyGroupCopy';
 import { transportProxyGroupsPath, transportProxyRequest } from '../transportProxyGroups';
 import './identityWorkspace.css';
@@ -54,6 +55,7 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
       {initialAccountId && (accounts.state.kind === 'idle' || accounts.state.kind === 'loading') ? <LoadingState label={copy.loadingBinding} level="page" variant="compact" />
         : <ProxyGroupWorkspace key={`${token}\0${tenant}\0${requestedAccount?.id ?? ''}`} token={token} tenant={tenant} accounts={accountsValue}
           initialAccountId={requestedAccount?.id} accountsState={accounts.state.kind === 'ready' ? 'ready' : accounts.state.kind === 'failed' ? 'failed' : 'loading'} onChanged={accounts.reload} closeRequest={closeRequest} />}
+      <RequestEgressSummaryPanel key={`${token}\0${tenant}`} token={token} tenant={tenant} />
     </>}
   </section>;
 }

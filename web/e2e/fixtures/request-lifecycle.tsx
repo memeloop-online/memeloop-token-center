@@ -5,6 +5,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { RequestsPage } from '../../src/operator/pages/RequestsPage';
 import type { RequestDetail, RequestEvent, TypedFilterAst } from '../../src/types';
+import { egressAttempts } from '../support/request-egress-fixtures';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
@@ -13,6 +14,7 @@ import '../../src/operator/operator.css';
 
 declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
+const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
   ? { ...base, status_code: 402, completed_at: 3000, duration_ms: 2000, error_code: 'http_402',
     supplier_error: { code: 'no_active_plan', message: '当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐' } } : undefined;
@@ -25,6 +27,10 @@ const diagnosticFailure = diagnosticParam === 'downstream'
     failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } }
   : undefined;
 let first = supplierFailure ?? diagnosticFailure ?? base;
+if (new URLSearchParams(location.search).has('egress')) first = {
+  ...base, status_code: 502, completed_at: 3000, duration_ms: 2000, error_code: 'upstream_http2_reset',
+  egress_attempts: egressAttempts,
+};
 const second = { ...base, compaction: null, request_id: 'request-b', model: 'model-b', status_code: 200, completed_at: 3000, duration_ms: 2000 };
 let hold = false;
 let release: (() => void) | undefined;
@@ -34,6 +40,7 @@ const json = (value: unknown) => new Response(JSON.stringify(value), { headers: 
 window.fetch = async (input) => {
   const url = new URL(String(input), location.origin);
   if (url.pathname === '/internal/v1/upstreams') {
+    if (new URLSearchParams(location.search).has('egress')) return json([{ id: 'account-a', name: 'Research account' }]);
     if (new URLSearchParams(location.search).has('directory-error')) {
       return new Response('secret-directory-body-canary', { status: 503, headers: { 'x-mtc-request-id': '01900000-0000-7000-8000-000000000001' } });
     }
@@ -80,6 +87,6 @@ function Fixture() {
   useLayoutEffect(() => {
     window.requestLifecycleFixture.scopeCommits.push({ scope: tenant, drawers: document.querySelectorAll('.drawer').length });
   }, [tenant]);
-  return <div data-request-fixture-scope={tenant}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} /><Tooltip content="Background scope help" visible relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
+  return <div data-request-fixture-scope={tenant}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} /><Tooltip content="Background scope help" visible={backgroundHelpVisible} relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible={backgroundHelpVisible} relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

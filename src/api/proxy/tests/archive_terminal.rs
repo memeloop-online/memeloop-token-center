@@ -40,15 +40,18 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
         .expect(1)
         .mount(&upstream)
         .await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({
-            "model": fixture.model, "input": "capture independently", "stream": false
-        }),
-    )
-    .await;
+    let response = fixture
+        .state
+        .db
+        .with_request_archive_capture_for_test(send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({
+                "model": fixture.model, "input": "capture independently", "stream": false
+            }),
+        ))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await

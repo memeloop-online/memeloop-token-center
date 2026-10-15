@@ -404,7 +404,7 @@ impl ProviderCatalog {
                     "default": "public",
                     "description": "Private destinations require a global operator credential."
                 },
-                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "default": 120},
                 "reservation_token_bounds": {
                     "type": "object",
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -902,7 +902,6 @@ impl ProviderCatalog {
         kimi.config_schema["properties"]["timeout_seconds"] = json!({
             "type": "integer",
             "minimum": 1,
-            "maximum": 600,
             "default": 120,
             "description": "Request timeout in seconds, including the complete response stream."
         });

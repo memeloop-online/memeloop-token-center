@@ -154,16 +154,11 @@ async fn early_terminal_database_lock_does_not_hold_failure_response_and_replays
 #[tokio::test]
 async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
     let fixture = codex_route_fixture("early-terminal-body").await;
-    let permits = fixture
-        .state
-        .gateway_body_read_permits
-        .clone()
-        .acquire_many_owned(fixture.state.config.gateway_body_read_concurrency)
-        .await
-        .unwrap();
+    let memory = fixture.state.proxy_memory_budget.reservation();
+    assert!(memory.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
     let response = reject_without_candidates(&fixture).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    drop(permits);
+    drop(memory);
     fixture.state.early_requests.drain_for_test().await;
     let rows = fixture
         .state

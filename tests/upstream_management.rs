@@ -2325,13 +2325,14 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
         Some(json!({
             "tenant_external_id": "tenant-upstream-a",
             "name": "primary-openai-renamed",
-            "config": {"base_url": mock.uri(), "timeout_seconds": 30},
+            "config": {"base_url": mock.uri(), "timeout_seconds": 900},
             "expected_updated_at": upstream.updated_at
         })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let updated = account(updated);
+    assert_eq!(updated.config["timeout_seconds"], 900);
     assert!(updated.updated_at > upstream.updated_at);
     wait_for_authorized_requests(&mock, "Bearer original-secret", 2).await;
 
