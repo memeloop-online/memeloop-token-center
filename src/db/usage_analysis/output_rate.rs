@@ -5,7 +5,6 @@ use crate::model::UsageOutputRate;
 /// compaction observations on every read so late conversation projection cannot
 /// permanently contaminate a throughput rollup. No accounting rows are changed.
 pub(super) fn output_rate_sql(
-    backend: DatabaseBackend,
     granularity: UsageAnalysisGranularity,
     tenant_scoped: bool,
 ) -> String {
@@ -18,23 +17,10 @@ pub(super) fn output_rate_sql(
     } else {
         "CAST($1 AS TEXT) = ''"
     };
-    let retained_join = match backend {
-        DatabaseBackend::PostgreSql => {
-            r#"JOIN LATERAL (
-                SELECT record.id, record.created_at, record.key_id,
-                       record.conversation_cluster_id, record.completed_at,
-                       record.status_code, record.error_code, record.usage_basis,
-                       record.duration_ms, record.output_tokens
-                  FROM request_records record
-                 WHERE record.id = f.request_id AND record.created_at = f.created_at
-                   AND record.created_at >= $2 AND record.created_at <= $3
-                 OFFSET 0
-            ) r ON TRUE"#
-        }
-        DatabaseBackend::Sqlite => {
-            "JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at AND r.created_at >= $2 AND r.created_at <= $3"
-        }
-    };
+    // Keep both timestamp bounds explicit for partition pruning, but let the
+    // planner choose a set join for broad ranges or indexed probes for sparse
+    // scopes. LATERAL + OFFSET 0 forced one retained lookup per fact even for
+    // the global 30-day range, and kept provenance filters above that barrier.
     format!(
         r#"
         SELECT (f.created_at / {bucket_ms}) * {bucket_ms} AS bucket_start,
@@ -42,7 +28,8 @@ pub(super) fn output_rate_sql(
                CAST(SUM(r.output_tokens) AS BIGINT) AS output_tokens,
                CAST(SUM(r.duration_ms) AS BIGINT) AS duration_ms
           FROM request_stats_facts f
-          {retained_join}
+          JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at
+               AND r.created_at >= $2 AND r.created_at <= $3
           LEFT JOIN key_records k ON k.id = f.key_id AND k.tenant_id = f.tenant_id
           LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = f.tenant_id
          WHERE {tenant} AND f.created_at >= $2 AND f.created_at <= $3
@@ -82,12 +69,7 @@ pub(super) async fn attach_output_rates(
     filter: &UsageAnalysisFilter,
     range: ValidatedUsageAnalysisRange,
 ) -> Result<(), AppError> {
-    let backend = if snapshot.transaction.as_mut().backend_name() == "PostgreSQL" {
-        DatabaseBackend::PostgreSql
-    } else {
-        DatabaseBackend::Sqlite
-    };
-    let sql = output_rate_sql(backend, range.granularity, tenant_scoped);
+    let sql = output_rate_sql(range.granularity, tenant_scoped);
     let rows = snapshot
         .fetch_all(
             "output_rate",

@@ -323,39 +323,29 @@ async fn postgres_boundary_queries_use_bounded_fact_index_ranges() {
 
 #[test]
 fn output_rate_retained_lookups_keep_scope_time_and_provenance() {
-    for backend in [DatabaseBackend::PostgreSql, DatabaseBackend::Sqlite] {
+    for granularity in [
+        UsageAnalysisGranularity::Hour,
+        UsageAnalysisGranularity::Day,
+    ] {
         for tenant_scoped in [false, true] {
-            let sql = super::output_rate::output_rate_sql(
-                backend,
-                UsageAnalysisGranularity::Hour,
-                tenant_scoped,
-            );
+            let sql = super::output_rate::output_rate_sql(granularity, tenant_scoped);
             assert!(sql.contains("f.created_at >= $2 AND f.created_at <= $3"));
+            assert!(sql.contains("r.created_at >= $2 AND r.created_at <= $3"));
+            assert!(sql.contains("r.id = f.request_id AND r.created_at = f.created_at"));
             assert!(sql.contains("r.usage_basis = 'provider_reported'"));
             assert!(sql.contains("o.key_id = r.key_id"));
             assert!(sql.contains("o.cluster_id = r.conversation_cluster_id"));
             assert!(sql.contains("o.compaction = 1"));
             assert!(!sql.contains("request_object"));
             assert!(!sql.contains("response_object"));
-            match backend {
-                DatabaseBackend::PostgreSql => {
-                    assert!(sql.contains("JOIN LATERAL"));
-                    assert!(sql.contains("record.id = f.request_id"));
-                    assert!(sql.contains("record.created_at = f.created_at"));
-                    assert!(sql.contains("record.created_at >= $2 AND record.created_at <= $3"));
-                    assert!(sql.contains("OFFSET 0"));
-                }
-                DatabaseBackend::Sqlite => {
-                    assert!(!sql.contains("LATERAL"));
-                    assert!(sql.contains("r.created_at >= $2 AND r.created_at <= $3"));
-                }
-            }
+            assert!(!sql.contains("LATERAL"));
+            assert!(!sql.contains("OFFSET"));
         }
     }
 }
 
 #[tokio::test]
-async fn postgres_output_rate_30d_uses_partition_pruned_parameterized_primary_keys() {
+async fn postgres_output_rate_30d_prunes_history_and_plans_dense_set_join() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -435,11 +425,7 @@ async fn postgres_output_rate_30d_uses_partition_pruned_parameterized_primary_ke
     .execute(&mut connection)
     .await
     .unwrap();
-    let sql = super::output_rate::output_rate_sql(
-        DatabaseBackend::PostgreSql,
-        UsageAnalysisGranularity::Hour,
-        true,
-    );
+    let sql = super::output_rate::output_rate_sql(UsageAnalysisGranularity::Hour, true);
     let bind = |sql| {
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind("rate-tenant")
@@ -483,22 +469,106 @@ async fn postgres_output_rate_30d_uses_partition_pruned_parameterized_primary_ke
         .map(|row| row.get::<String, _>(0))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("Nested Loop"), "{plan}");
-    assert!(
-        plan.contains("Index Scan using request_records_rate_"),
-        "{plan}"
-    );
-    assert!(plan.contains("id = f.request_id"), "{plan}");
-    assert!(plan.contains("created_at = f.created_at"), "{plan}");
-    assert!(
-        !plan.contains("Seq Scan on request_records_rate_"),
-        "{plan}"
-    );
     for partition in 0..64 {
         if ![30, 31].contains(&partition) {
             assert!(
                 !plan.contains(&format!("on request_records_rate_{partition} ")),
                 "{plan}"
+            );
+        }
+    }
+
+    // Unlike the sparse fixture above, a broad range must allow set joins.
+    // Add many matching facts across the selected partitions;
+    // compare planner work against the former forced per-fact lookup, without
+    // using a wall-clock threshold that depends on the CI runner.
+    sqlx::query(
+        "INSERT INTO request_stats_facts
+         SELECT 'dense-' || sequence, 'rate-tenant', 'rate-key',
+                CAST($1 AS BIGINT) + sequence * 60000, 'rate-model', 'openai', '', '', ''
+           FROM generate_series(1, 32000) sequence",
+    )
+    .bind(from)
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO request_records SELECT request_id, created_at, key_id, '',
+             created_at + 1000, 200, '', 'provider_reported', 1000, 20
+           FROM request_stats_facts WHERE request_id LIKE 'dense-%';
+         ANALYZE request_stats_facts;
+         ANALYZE request_records;",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    for tenant_scoped in [false, true] {
+        for granularity in [
+            UsageAnalysisGranularity::Hour,
+            UsageAnalysisGranularity::Day,
+        ] {
+            let sql = super::output_rate::output_rate_sql(granularity, tenant_scoped);
+            // Global queries require an empty tenant binding, as in production.
+            let tenant = if tenant_scoped { "rate-tenant" } else { "" };
+            let query = |sql| {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(tenant)
+                    .bind(from)
+                    .bind(to)
+                    .bind("rate-key")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+                    .bind("")
+            };
+            let rows = query(sql.clone()).fetch_all(&mut connection).await.unwrap();
+            for (column, expected) in [
+                ("requests", 32003),
+                ("output_tokens", 640060),
+                ("duration_ms", 32003000),
+            ] {
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.get::<i64, _>(column))
+                        .sum::<i64>(),
+                    expected
+                );
+            }
+            let forced = sql.replace(
+                "JOIN request_records r ON r.id = f.request_id AND r.created_at = f.created_at\n               AND r.created_at >= $2 AND r.created_at <= $3",
+                "JOIN LATERAL (SELECT record.* FROM request_records record
+                 WHERE record.id = f.request_id AND record.created_at = f.created_at
+                   AND record.created_at >= $2 AND record.created_at <= $3 OFFSET 0) r ON TRUE",
+            );
+            assert_ne!(forced, sql);
+            let mut costs = Vec::new();
+            for candidate in [sql, forced] {
+                let row = query(format!("EXPLAIN (FORMAT TEXT) {candidate}"))
+                    .fetch_one(&mut connection)
+                    .await
+                    .unwrap();
+                let plan: String = row.get(0);
+                let total_cost = plan
+                    .split("cost=")
+                    .nth(1)
+                    .unwrap()
+                    .split("..")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap();
+                costs.push(total_cost);
+            }
+            assert!(
+                costs[0] < costs[1],
+                "set join must cost less than forced probes: {costs:?}"
             );
         }
     }
