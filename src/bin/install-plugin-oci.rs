@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use clap::Parser;
 use memeloop_token_center::plugin_distribution::{
-    CosignKeylessIdentity, InstallPluginOptions, RegistryCredentials, install_plugin_oci,
-    verify_cosign_runtime,
+    CosignKeylessIdentity, InstallPluginOptions, InstallProxyCredentials, RegistryCredentials,
+    install_plugin_oci, verify_cosign_runtime,
 };
 
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
@@ -16,6 +16,10 @@ const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 struct Arguments {
     #[arg(long)]
     egress_proxy: Option<String>,
+    #[arg(long, requires_all = ["egress_proxy", "egress_proxy_password_file"])]
+    egress_proxy_username_file: Option<PathBuf>,
+    #[arg(long, requires_all = ["egress_proxy", "egress_proxy_username_file"])]
+    egress_proxy_password_file: Option<PathBuf>,
     /// OCI reference. Tags are rejected; @sha256:<digest> is mandatory.
     #[cfg_attr(
         feature = "experimental-plugin-revisions",
@@ -122,6 +126,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
+    let egress_proxy_credentials = match (
+        &arguments.egress_proxy_username_file,
+        &arguments.egress_proxy_password_file,
+    ) {
+        (Some(username), Some(password)) => {
+            Some(InstallProxyCredentials::from_files(username, password)?)
+        }
+        (None, None) => None,
+        _ => return Err("proxy credential file pair required".into()),
+    };
     let plugin_root = match &arguments.publication_attempt_id {
         Some(attempt_id) => {
             let attempt = uuid::Uuid::parse_str(attempt_id)?;
@@ -152,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect::<Result<Vec<_>, _>>()?;
     let installation = InstallPluginOptions {
         egress_proxy: arguments.egress_proxy,
+        egress_proxy_credentials,
         reference: arguments.reference.unwrap_or_default(),
         plugin_root: plugin_root.clone(),
         allowed_sources: arguments
@@ -385,6 +400,53 @@ fn read_bounded_file(
         return Err(format!("{kind} file is empty, invalid, or too large").into());
     }
     Ok(std::fs::read(path)?)
+}
+
+#[cfg(test)]
+mod proxy_argument_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_credentials_require_a_file_pair_and_explicit_endpoint() {
+        let base = [
+            "install-plugin-oci",
+            "ghcr.io/example/plugin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--plugin-dir",
+            "/plugins",
+            "--allowed-source",
+            "ghcr.io/example/plugin",
+            "--cosign-public-key",
+            "/keys/public.pem",
+        ];
+        assert!(Arguments::try_parse_from(base).is_ok());
+        let mut paired = base.to_vec();
+        paired.extend([
+            "--egress-proxy-username-file",
+            "/private/username",
+            "--egress-proxy-password-file",
+            "/private/password",
+        ]);
+        assert!(Arguments::try_parse_from(&paired).is_err());
+        paired.extend(["--egress-proxy", "socks5h://100.64.0.2:1080"]);
+        let arguments = Arguments::try_parse_from(&paired).unwrap();
+        assert!(matches!(
+            credentials(&arguments).unwrap(),
+            RegistryCredentials::Anonymous
+        ));
+        for flag in [
+            "--egress-proxy-username-file",
+            "--egress-proxy-password-file",
+        ] {
+            let mut incomplete = base.to_vec();
+            incomplete.extend([
+                "--egress-proxy",
+                "socks5h://100.64.0.2:1080",
+                flag,
+                "/private/credential",
+            ]);
+            assert!(Arguments::try_parse_from(incomplete).is_err());
+        }
+    }
 }
 
 #[cfg(all(test, feature = "experimental-plugin-revisions"))]

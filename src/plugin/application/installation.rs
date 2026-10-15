@@ -24,6 +24,10 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 struct InstallPolicy {
     #[serde(default)]
     egress_proxy: Option<String>,
+    #[serde(default)]
+    egress_proxy_username_file: Option<PathBuf>,
+    #[serde(default)]
+    egress_proxy_password_file: Option<PathBuf>,
     plugin_root: PathBuf,
     allowed_sources: BTreeSet<String>,
     #[serde(default)]
@@ -138,7 +142,8 @@ impl ApplicationPlugins {
             crate::network::validate_install_egress_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
         }
-        if !policy.plugin_root.is_absolute()
+        if !policy.egress_credentials_valid()
+            || !policy.plugin_root.is_absolute()
             || policy.allowed_sources.is_empty()
             || !policy.signer_policy_valid()
             || policy.cosign_public_keys.len() > 8
@@ -738,11 +743,34 @@ impl CredentialFiles {
 }
 
 impl InstallPolicy {
+    fn egress_credentials_valid(&self) -> bool {
+        match (
+            &self.egress_proxy_username_file,
+            &self.egress_proxy_password_file,
+        ) {
+            (None, None) => true,
+            (Some(username), Some(password)) => {
+                self.egress_proxy.is_some() && username.is_absolute() && password.is_absolute()
+            }
+            _ => false,
+        }
+    }
+
     fn apply_egress(&self, command: &mut tokio::process::Command) -> Result<(), AppError> {
+        if !self.egress_credentials_valid() {
+            return Err(AppError::Forbidden);
+        }
         if let Some(proxy) = &self.egress_proxy {
             crate::network::validate_install_egress_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
             command.arg("--egress-proxy").arg(proxy);
+        }
+        if let (Some(username), Some(password)) = (
+            &self.egress_proxy_username_file,
+            &self.egress_proxy_password_file,
+        ) {
+            command.arg("--egress-proxy-username-file").arg(username);
+            command.arg("--egress-proxy-password-file").arg(password);
         }
         Ok(())
     }
@@ -1235,6 +1263,10 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     if let Some(proxy) = &policy.egress_proxy {
         trust["egress_proxy"] = json!(proxy);
     }
+    if let Some(username) = &policy.egress_proxy_username_file {
+        trust["egress_proxy_username_file"] = json!(username);
+        trust["egress_proxy_password_file"] = json!(policy.egress_proxy_password_file);
+    }
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.
     if let Some(identity) = &policy.cosign_keyless {
@@ -1321,6 +1353,53 @@ pub(super) async fn append_inventory_file(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn installation_proxy_secret_refs_are_review_bound_and_not_http_inputs() {
+        let mut value = source_signer_policy();
+        value["egress_proxy"] = json!("socks5h://100.64.0.2:1080");
+        let anonymous: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        let original = trust_digest(&anonymous).await.unwrap();
+        value["egress_proxy_username_file"] = json!("/protected/proxy/username");
+        value["egress_proxy_password_file"] = json!("/protected/proxy/password");
+        let policy: InstallPolicy = serde_json::from_value(value.clone()).unwrap();
+        let mut command = tokio::process::Command::new("install-plugin-oci");
+        policy.apply_egress(&mut command).unwrap();
+        assert_eq!(
+            command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "--egress-proxy",
+                "socks5h://100.64.0.2:1080",
+                "--egress-proxy-username-file",
+                "/protected/proxy/username",
+                "--egress-proxy-password-file",
+                "/protected/proxy/password",
+            ]
+        );
+        assert_eq!(command.as_std().get_envs().count(), 0);
+        assert_ne!(original, trust_digest(&policy).await.unwrap());
+        for (field, invalid) in [
+            ("egress_proxy", serde_json::Value::Null),
+            ("egress_proxy_username_file", serde_json::Value::Null),
+            ("egress_proxy_password_file", json!("relative")),
+        ] {
+            let mut changed = value.clone();
+            changed[field] = invalid;
+            let rejected: InstallPolicy = serde_json::from_value(changed).unwrap();
+            let mut command = tokio::process::Command::new("install-plugin-oci");
+            assert!(rejected.apply_egress(&mut command).is_err());
+            assert_eq!(command.as_std().get_args().count(), 0);
+        }
+        for field in ["egress_proxy_username_file", "egress_proxy_password_file"] {
+            let mut request = json!({"inventory_id":"candidate", "packages":[]});
+            request[field] = json!("/private/credential");
+            assert!(serde_json::from_value::<InstallPluginRequest>(request).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn installation_proxy_is_explicit_and_review_bound() {
         let mut value = source_signer_policy();

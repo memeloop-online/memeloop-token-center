@@ -320,6 +320,7 @@ async fn mock_artifact(title: &str, plugin_json: &[u8]) -> (MockServer, TempDir,
         MockArtifact {
             options: InstallPluginOptions {
                 egress_proxy: None,
+                egress_proxy_credentials: None,
                 reference,
                 plugin_root: plugin_root.clone(),
                 allowed_sources: BTreeSet::from([source]),
@@ -421,8 +422,32 @@ fn operator_ui_module_entry_must_be_a_signed_asset_layer() {
 
 #[tokio::test]
 async fn registry_fetch_uses_explicit_socks_remote_dns() {
+    registry_fetch_through_socks(false, true).await;
+}
+
+#[tokio::test]
+async fn registry_fetch_uses_authenticated_socks_remote_dns() {
+    registry_fetch_through_socks(true, true).await;
+}
+
+#[tokio::test]
+async fn registry_fetch_rejects_socks_auth_failure_without_direct_fallback() {
+    registry_fetch_through_socks(true, false).await;
+}
+
+async fn registry_fetch_through_socks(authenticated: bool, accepted: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (server, _directory, mut artifact) = mock_artifact("plugin.json", &plugin_json()).await;
+    let (server, directory, mut artifact) = mock_artifact("plugin.json", &plugin_json()).await;
+    let username = "proxy:user@%";
+    let password = "proxy/pass:#% +";
+    if authenticated {
+        let username_file = directory.path().join("proxy-username");
+        let password_file = directory.path().join("proxy-password");
+        std::fs::write(&username_file, username).unwrap();
+        std::fs::write(&password_file, password).unwrap();
+        artifact.options.egress_proxy_credentials =
+            Some(InstallProxyCredentials::from_files(&username_file, &password_file).unwrap());
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
     let target_address = *server.address();
@@ -434,8 +459,27 @@ async fn registry_fetch_uses_explicit_socks_remote_dns() {
         assert_eq!(greeting[0], 5);
         let mut methods = vec![0; greeting[1] as usize];
         socket.read_exact(&mut methods).await.unwrap();
-        assert!(methods.contains(&0));
-        socket.write_all(&[5, 0]).await.unwrap();
+        if authenticated {
+            assert!(methods.contains(&2));
+            socket.write_all(&[5, 2]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            let username_length = socket.read_u8().await.unwrap();
+            let mut received_username = vec![0; usize::from(username_length)];
+            socket.read_exact(&mut received_username).await.unwrap();
+            let password_length = socket.read_u8().await.unwrap();
+            let mut received_password = vec![0; usize::from(password_length)];
+            socket.read_exact(&mut received_password).await.unwrap();
+            assert_eq!(received_username, username.as_bytes());
+            assert_eq!(received_password, password.as_bytes());
+            socket.write_all(&[1, u8::from(!accepted)]).await.unwrap();
+            if !accepted {
+                observed.send(b"authentication-rejected".to_vec()).unwrap();
+                return;
+            }
+        } else {
+            assert!(methods.contains(&0));
+            socket.write_all(&[5, 0]).await.unwrap();
+        }
         let mut request = [0; 4];
         socket.read_exact(&mut request).await.unwrap();
         assert_eq!(request, [5, 1, 0, 3]);
@@ -461,9 +505,14 @@ async fn registry_fetch_uses_explicit_socks_remote_dns() {
     )
     .parse()
     .unwrap();
-    let config = registry_client_config(&artifact.options, true);
-    assert_eq!(config.http_proxy, artifact.options.egress_proxy);
-    assert_eq!(config.https_proxy, artifact.options.egress_proxy);
+    let config = registry_client_config(&artifact.options, true).unwrap();
+    let expected_proxy = egress::proxy_url(
+        artifact.options.egress_proxy.as_deref(),
+        artifact.options.egress_proxy_credentials.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(config.http_proxy, expected_proxy);
+    assert_eq!(config.https_proxy, expected_proxy);
     assert_eq!(config.no_proxy.as_deref(), Some(""));
     let client = Client::try_from(config).unwrap();
     let result = tokio::time::timeout(
@@ -473,9 +522,19 @@ async fn registry_fetch_uses_explicit_socks_remote_dns() {
     .await;
     relay.abort();
     let _ = relay.await;
-    let (_, resolved) = result.unwrap().unwrap();
-    assert_eq!(resolved, expected_digest);
-    assert_eq!(observation.await.unwrap(), b"registry.invalid");
+    if accepted {
+        let (_, resolved) = result.unwrap().unwrap();
+        assert_eq!(resolved, expected_digest);
+        assert_eq!(observation.await.unwrap(), b"registry.invalid");
+        for request in server.received_requests().await.unwrap() {
+            assert!(!request.headers.contains_key("proxy-authorization"));
+            assert!(!request.headers.contains_key("authorization"));
+        }
+    } else {
+        assert!(result.unwrap().is_err());
+        assert_eq!(observation.await.unwrap(), b"authentication-rejected");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -618,6 +677,7 @@ async fn wrong_key_and_tampered_payload_fail_before_registry_or_storage_access()
     let reference = format!("127.0.0.1:1/test/plugin@{digest}");
     let options = InstallPluginOptions {
         egress_proxy: None,
+        egress_proxy_credentials: None,
         reference: reference.clone(),
         plugin_root: temporary.path().join("plugins"),
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),
@@ -821,6 +881,7 @@ async fn signature_policy_rejects_before_registry_or_storage_access() {
     let digest = format!("sha256:{}", "a".repeat(64));
     let options = InstallPluginOptions {
         egress_proxy: None,
+        egress_proxy_credentials: None,
         reference: format!("127.0.0.1:1/test/plugin@{digest}"),
         plugin_root: temporary.path().join("plugins"),
         allowed_sources: BTreeSet::from(["127.0.0.1:1/test/plugin".to_owned()]),
