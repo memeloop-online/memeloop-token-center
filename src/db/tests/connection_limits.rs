@@ -4,6 +4,139 @@ use sqlx::Row;
 
 use super::super::Database;
 
+#[derive(Clone, Default)]
+struct PoolLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for PoolLogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for PoolLogCapture {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn write_transaction_future_bounds_inline_acquisition_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("write-future-layout.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let transaction = database.begin_write_transaction();
+    let bounded_bytes = std::mem::size_of_val(&transaction);
+    let inline = database.pool.begin_with("BEGIN IMMEDIATE");
+    let inline_bytes = std::mem::size_of_val(&inline);
+    drop(inline);
+    // Bound the state embedded by all write callers, independently of the
+    // request thread's stack size and SQLx's internal acquisition layout.
+    assert!(bounded_bytes <= 256, "write future: {bounded_bytes} bytes");
+    assert!(
+        bounded_bytes < inline_bytes,
+        "write future {bounded_bytes} must isolate inline SQLx acquisition {inline_bytes}"
+    );
+    transaction.await.unwrap().rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_options() {
+    use tracing::instrument::WithSubscriber;
+
+    let directory = tempfile::tempdir().unwrap();
+    let canary = "private-pool-credential-canary";
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join(format!("{canary}.db")).display()
+    );
+    let serve = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let persistence = serve.independent_persistence_pool();
+    let mut archive = serve.clone();
+    archive.pool = serve.gateway_persistence.pool.clone();
+    archive.pool_role = "gateway_archive";
+    for (mut database, role, pool_max, operation) in [
+        (serve, "serve", 1, "readiness"),
+        (
+            persistence,
+            "independent_persistence",
+            2,
+            "write_transaction",
+        ),
+        (archive, "gateway_archive", 1, "write_transaction"),
+    ] {
+        database.pool = database
+            .pool
+            .options()
+            .clone()
+            .acquire_timeout(Duration::from_millis(20))
+            .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+        let mut held = Vec::new();
+        for _connection in 0..pool_max {
+            held.push(database.pool.acquire().await.unwrap());
+        }
+        let capture = PoolLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        async {
+            if operation == "readiness" {
+                let progress = super::super::DatabaseReadinessProgress::new();
+                assert!(matches!(
+                    database
+                        .acquire_readiness_connection(
+                            &progress,
+                            super::super::DatabaseReadinessStage::Ping,
+                        )
+                        .await,
+                    Err(sqlx::Error::PoolTimedOut)
+                ));
+            } else {
+                assert!(matches!(
+                    database.begin_write_transaction().await,
+                    Err(sqlx::Error::PoolTimedOut)
+                ));
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains(canary));
+        assert!(!output.contains(&database_url));
+        let events: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let fields = events
+            .iter()
+            .map(|event| &event["fields"])
+            .find(|fields| fields["message"] == "database pool acquisition timed out")
+            .unwrap();
+        assert_eq!(fields["pool_role"], role);
+        assert_eq!(fields["operation"], operation);
+        assert_eq!(fields["phase"], "acquire");
+        assert_eq!(fields["pool_max"], pool_max);
+        assert_eq!(fields["pool_size"], pool_max);
+        assert_eq!(fields["pool_idle"], 0);
+        assert_eq!(fields["pool_in_use"], pool_max);
+        assert_eq!(fields["acquire_timeout_ms"], 20);
+        assert!(fields["elapsed_ms"].as_u64().unwrap() >= 20);
+        drop(held);
+        database.pool.close().await;
+    }
+}
+
 async fn postgres_timeout(database: &Database, setting: &str) -> String {
     sqlx::query("SELECT current_setting($1) AS value")
         .bind(setting)
