@@ -426,9 +426,8 @@ impl Database {
     ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
         progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
         let started = tokio::time::Instant::now();
-        let connection = self.pool.acquire().await.map_err(|error| {
-            self.observe_pool_timeout("readiness", started, &error);
-            error
+        let connection = self.pool.acquire().await.inspect_err(|error| {
+            self.observe_pool_timeout("readiness", started, error);
         })?;
         progress.enter(stage, DatabaseReadinessPhase::Query).await;
         Ok(connection)
@@ -621,9 +620,8 @@ impl Database {
                 DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
             })
             .await
-            .map_err(|error| {
-                self.observe_pool_timeout("write_transaction", started, &error);
-                error
+            .inspect_err(|error| {
+                self.observe_pool_timeout("write_transaction", started, error);
             })
     }
 
