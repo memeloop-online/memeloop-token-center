@@ -63,8 +63,12 @@ function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null
 // Unknown typed evidence renders nothing; a null stage never adds a phase claim.
 function diagnosticCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
   const diagnostic = request.failure_diagnostic;
-  if (!diagnostic) return null;
   const zh = locale === 'zh-CN';
+  if (request.terminal_cause_code === 'gateway_pre_admission'
+    || (diagnostic?.source === 'gateway' && diagnostic.stage === 'pre_admission' && diagnostic.reason === 'gateway_pre_admission')) {
+    return zh ? '请求在网关准入前失败，尚未转发；具体原因未记录' : 'The request failed before gateway admission and was not forwarded; the specific cause was not recorded';
+  }
+  if (!diagnostic) return null;
   if (diagnostic.source === 'downstream_connection' && diagnostic.reason === 'client_disconnected') {
     return zh ? '客户端在响应交付完成前断开了连接' : 'The client disconnected before response delivery completed';
   }
