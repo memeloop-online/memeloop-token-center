@@ -1263,9 +1263,12 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     if let Some(proxy) = &policy.egress_proxy {
         trust["egress_proxy"] = json!(proxy);
     }
-    if let Some(username) = &policy.egress_proxy_username_file {
+    if let (Some(username), Some(password)) = (
+        &policy.egress_proxy_username_file,
+        &policy.egress_proxy_password_file,
+    ) {
         trust["egress_proxy_username_file"] = json!(username);
-        trust["egress_proxy_password_file"] = json!(policy.egress_proxy_password_file);
+        trust["egress_proxy_password_file"] = json!(password);
     }
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.

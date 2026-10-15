@@ -60,7 +60,9 @@ pub(super) fn proxy_url(
     let invalid = || PluginDistributionError::InvalidEgressProxy;
     let mut proxy = url::Url::parse(proxy.ok_or_else(invalid)?).map_err(|_| invalid())?;
     let encode = |value: &str| {
-        percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+        url::form_urlencoded::byte_serialize(value.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
     };
     proxy
         .set_username(&encode(&credentials.username))
