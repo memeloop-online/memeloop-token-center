@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug)]
-pub(super) enum ConversationContentError {
+pub(crate) enum ConversationContentError {
     Application(AppError),
     Database(sqlx::Error),
 }

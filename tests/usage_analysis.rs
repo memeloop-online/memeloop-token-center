@@ -373,7 +373,7 @@ async fn assert_output_rate_provenance(database_url: String) {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, compaction) VALUES ($1, 'rate-cluster', $2, $3, '[]', 1, 1, 1)")
+    sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, compaction) VALUES ($1, 'rate-cluster', $2, $3, '{\"context_prefix_v1\":null,\"atom_count\":0}', 1, 1, 1)")
         .bind(Uuid::now_v7().to_string()).bind(&id).bind(key.key_id.to_string())
         .execute(&pool).await.unwrap();
     let late = state
