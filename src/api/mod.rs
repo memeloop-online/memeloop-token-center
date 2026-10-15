@@ -76,6 +76,7 @@ mod routing;
 mod self_service;
 mod sessions;
 mod sse;
+pub mod startup;
 mod tenants;
 mod traffic;
 mod transport_proxy_groups;

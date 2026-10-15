@@ -26,3 +26,28 @@ spec:
       targetPort: http
 {{- end }}
 {{- end }}
+{{- /* Static shells must survive readiness withdrawal without changing API routing. */}}
+{{- range $role := list "gateway" "control" "all" }}
+{{- $roleConfig := index $.Values.roles $role }}
+{{- if and $roleConfig.enabled $roleConfig.service.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}-web
+  labels:
+    {{- include "memeloop-token-center.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}-web
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $role }}
+  ports:
+    - name: http
+      port: {{ $roleConfig.service.port }}
+      targetPort: http
+{{- end }}
+{{- end }}

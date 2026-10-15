@@ -8,14 +8,18 @@ pub(super) async fn portal_index() -> Response {
     web_index().await
 }
 
-fn web_root() -> PathBuf {
+pub(super) fn web_root() -> PathBuf {
     std::env::var_os("MTC_WEB_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/share/memeloop-token-center/web"))
 }
 
 async fn web_index() -> Response {
-    let mut response = match tokio::fs::read(web_root().join("index.html")).await {
+    index_at(web_root()).await
+}
+
+pub(super) async fn index_at(root: PathBuf) -> Response {
+    let mut response = match tokio::fs::read(root.join("index.html")).await {
         Ok(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
         Err(error) => {
             tracing::error!(%error, "built web application is unavailable");
@@ -59,6 +63,14 @@ pub(super) async fn web_asset(State(state): State<AppState>, Path(path): Path<St
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
+    disk_asset(path).await
+}
+
+pub(super) async fn disk_asset(path: String) -> Response {
+    disk_asset_at(web_root(), path).await
+}
+
+pub(super) async fn disk_asset_at(root: PathBuf, path: String) -> Response {
     let relative = std::path::Path::new(&path);
     if relative.is_absolute()
         || relative
@@ -68,7 +80,7 @@ pub(super) async fn web_asset(State(state): State<AppState>, Path(path): Path<St
         return StatusCode::NOT_FOUND.into_response();
     }
     let content_type = mime_guess::from_path(&path).first_or_octet_stream();
-    match tokio::fs::read(web_root().join(path)).await {
+    match tokio::fs::read(root.join(path)).await {
         Ok(body) => (
             [(
                 header::CONTENT_TYPE,
