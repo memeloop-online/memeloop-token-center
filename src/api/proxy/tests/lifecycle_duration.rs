@@ -171,6 +171,14 @@ async fn sustained_stream_past_twenty_minutes_completes_or_cancels_and_settles_o
             }
         });
         let mut body = response.into_body().into_data_stream();
+        sender
+            .send(Ok(Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-codex\"}}\n\n",
+            )))
+            .await
+            .unwrap();
+        let created = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&created).contains("response.created"));
         for _ in 0..25 {
             sender.send(Ok(Bytes::from_static(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"progress\"}\n\n"))).await.unwrap();
             assert!(body.next().await.unwrap().is_ok());
