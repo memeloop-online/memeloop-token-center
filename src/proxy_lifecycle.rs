@@ -18,6 +18,9 @@ use crate::{
     model::UsageReservation,
 };
 
+mod owner;
+pub(crate) use owner::wait_for_owner_loss;
+
 #[derive(Default)]
 pub(crate) struct ProxyLifecycleCounter {
     active: AtomicUsize,
@@ -28,6 +31,7 @@ impl ProxyLifecycleCounter {
         self.active.fetch_add(1, Ordering::AcqRel);
         ProxyLifecycleActivity {
             counter: self.clone(),
+            owner: None,
         }
     }
 
@@ -45,6 +49,23 @@ impl ProxyLifecycleCounter {
 
 pub(crate) struct ProxyLifecycleActivity {
     counter: Arc<ProxyLifecycleCounter>,
+    owner: Option<owner::RequestOwnerLease>,
+}
+
+impl ProxyLifecycleActivity {
+    pub(crate) async fn acquire_owner(
+        &mut self,
+        database: Database,
+        identity: crate::db::ProxyRequestOwner,
+        lost: tokio::sync::watch::Sender<bool>,
+    ) -> Result<(), AppError> {
+        self.owner = Some(owner::RequestOwnerLease::acquire(database, identity, lost).await?);
+        Ok(())
+    }
+
+    pub(crate) fn owner_loss(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.owner.as_ref().map(owner::RequestOwnerLease::loss)
+    }
 }
 
 impl Drop for ProxyLifecycleActivity {
@@ -53,10 +74,7 @@ impl Drop for ProxyLifecycleActivity {
     }
 }
 
-pub(crate) const MAX_PROXY_STREAM_LIFETIME: Duration = Duration::from_secs(20 * 60);
 pub(crate) const MAX_PROXY_FINALIZATION_LIFETIME: Duration = Duration::from_secs(30);
-pub(crate) const MAX_PROXY_LIFETIME: Duration =
-    MAX_PROXY_STREAM_LIFETIME.saturating_add(MAX_PROXY_FINALIZATION_LIFETIME);
 pub(crate) const MAX_DOWNSTREAM_SEND_WAIT: Duration = Duration::from_secs(30);
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(10),

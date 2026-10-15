@@ -57,12 +57,10 @@ fn summary_contains_only_fixed_metadata_fields() {
 async fn quiet_body_wait_survives_heartbeat_cancellation_without_counting_send_time() {
     let mut diagnostics = WaitDiagnostics::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     for _ in 0..21 {
         let next = poll_upstream_downstream_or_progress_heartbeat(
             &sender,
             diagnostics.upstream(std::future::pending::<()>()),
-            deadline,
             Some(tokio::time::Instant::now() + Duration::from_secs(15)),
         )
         .await;

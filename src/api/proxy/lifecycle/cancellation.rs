@@ -1,9 +1,18 @@
 use super::*;
 use crate::model::UsageReservation;
 
-#[derive(Default)]
 pub(in crate::api::proxy) struct CancellationGuard {
     owner: Option<CancelledRequest>,
+    lost: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for CancellationGuard {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            lost: tokio::sync::watch::channel(false).0,
+        }
+    }
 }
 
 struct CancelledRequest {
@@ -15,6 +24,28 @@ struct CancelledRequest {
 }
 
 impl CancellationGuard {
+    pub(in crate::api::proxy) fn owner_loss(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lost.subscribe()
+    }
+
+    pub(in crate::api::proxy) async fn acquire_owner(&mut self) -> Result<(), AppError> {
+        let owner = self.owner.as_mut().ok_or(AppError::Internal)?;
+        owner
+            .permit
+            .acquire_owner(
+                owner.database.clone(),
+                crate::db::ProxyRequestOwner {
+                    request_id: owner.context.request_id,
+                    tenant_id: owner.tenant_id,
+                    key_id: owner.reservation.key_id,
+                    reservation_id: owner.reservation.id,
+                    token: Uuid::now_v7(),
+                },
+                self.lost.clone(),
+            )
+            .await
+    }
+
     pub(in crate::api::proxy) fn arm(
         &mut self,
         database: Database,
@@ -57,15 +88,22 @@ impl Drop for CancellationGuard {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        runtime.spawn(async move {
+        let settlement = async move {
             let _permit = owner.permit;
             for delay_ms in [0, 10, 50, 200] {
                 if delay_ms != 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                match owner.database.finish_cancelled_proxy_request(
-                    request_id, owner.tenant_id, &owner.reservation, duration_ms,
-                ).await {
+                match owner
+                    .database
+                    .finish_cancelled_proxy_request(
+                        request_id,
+                        owner.tenant_id,
+                        &owner.reservation,
+                        duration_ms,
+                    )
+                    .await
+                {
                     Ok(_) => {
                         tracing::info!(%request_id, stage = "request_cancellation_settled", "proxy cancellation settlement completed");
                         return;
@@ -78,6 +116,14 @@ impl Drop for CancellationGuard {
                 }
             }
             tracing::error!(%request_id, stage = "request_cancellation_reconcile_failed", "proxy cancellation requires orphan reconciliation");
+        };
+        runtime.spawn(async move {
+            if tokio::time::timeout(MAX_PROXY_FINALIZATION_LIFETIME, settlement)
+                .await
+                .is_err()
+            {
+                tracing::error!(%request_id, stage = "request_cancellation_reconcile_timeout", "proxy cancellation requires orphan reconciliation");
+            }
         });
     }
 }

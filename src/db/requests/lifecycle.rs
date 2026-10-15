@@ -1264,6 +1264,7 @@ impl Database {
             ProxyRequestUpstreamAttribution::KeepSelected,
             Some(&input),
             self.terminal_projection_enabled,
+            false,
         )
         .await
     }
@@ -1283,6 +1284,7 @@ impl Database {
             ProxyRequestUpstreamAttribution::KeepSelected,
             None,
             self.terminal_projection_enabled,
+            false,
         )
         .await
     }
@@ -1300,6 +1302,7 @@ impl Database {
             upstream_attribution,
             None,
             self.terminal_projection_enabled,
+            false,
         )
         .await
     }
@@ -1318,6 +1321,7 @@ impl Database {
             upstream_attribution,
             None,
             self.terminal_projection_enabled,
+            false,
         )
         .await
     }
@@ -1333,6 +1337,23 @@ impl Database {
             .await
     }
 
+    pub(crate) async fn finish_orphaned_proxy_request(
+        &self,
+        input: FinishProxyRequest<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_proxy_request_inner(
+            input,
+            None,
+            None,
+            ProxyRequestUpstreamAttribution::KeepSelected,
+            None,
+            self.terminal_projection_enabled,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn finish_proxy_request_inner(
         &self,
         input: FinishProxyRequest<'_>,
@@ -1341,6 +1362,7 @@ impl Database {
         upstream_attribution: ProxyRequestUpstreamAttribution,
         metered: Option<&FinishMeteredSynchronousRequest<'_>>,
         defer_projection: bool,
+        reap_orphan: bool,
     ) -> Result<FinishProxyRequestResult, AppError> {
         if let Some(archive) = buffered_archive
             && (archive.identity().request_id != input.request_id
@@ -1420,6 +1442,17 @@ impl Database {
         .bind(&reservation_id)
         .execute(&mut *transaction)
         .await?;
+            if reap_orphan && claimed.rows_affected() == 1 {
+                let expires_at: Option<i64> = sqlx::query_scalar("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
+                    .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
+                    .fetch_one(&mut *transaction).await?;
+                let owner_now = self.request_owner_now(&mut transaction).await?;
+                if expires_at.is_some_and(|expires_at| expires_at > owner_now) {
+                    return Err(AppError::Conflict(
+                        "proxy request owner is still live".into(),
+                    ));
+                }
+            }
             if claimed.rows_affected() == 1 && sqlx::query("SELECT 1 FROM request_records WHERE id = $1 AND key_id = $2 AND submission_started_at IS NOT NULL")
                 .bind(&request_id).bind(&key_id).fetch_optional(&mut *transaction).await?.is_some() {
                 return Err(AppError::Conflict("submitted image requires authoritative image settlement or quarantine".into()));

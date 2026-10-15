@@ -321,7 +321,7 @@ async fn admitted_invalid_dispatch_policy_finishes_as_configuration_error_withou
         state: &fixture.state,
         reservation,
         request_id,
-        started: Instant::now(),
+        memory_admission_wait: Duration::from_secs(30),
         input_token_ceiling: 20,
         output_token_ceiling: 8,
         output_token_limit: Some(8),

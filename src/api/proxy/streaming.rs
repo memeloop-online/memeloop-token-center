@@ -24,7 +24,6 @@ enum DownstreamAwarePoll<T> {
 enum StreamPoll<T> {
     Upstream(DownstreamAwarePoll<T>),
     ProgressHeartbeat,
-    TimedOut,
 }
 
 // Codex treats an SSE connection with no Responses protocol event for about
@@ -76,28 +75,18 @@ async fn poll_upstream_or_downstream_closed<T>(
 async fn poll_upstream_downstream_or_progress_heartbeat<T>(
     body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     upstream: impl std::future::Future<Output = T>,
-    stream_deadline: tokio::time::Instant,
     progress_heartbeat_deadline: Option<tokio::time::Instant>,
 ) -> StreamPoll<T> {
-    let upstream_poll = tokio::time::timeout_at(
-        stream_deadline,
-        poll_upstream_or_downstream_closed(body_sender, upstream),
-    );
+    let upstream_poll = poll_upstream_or_downstream_closed(body_sender, upstream);
     tokio::pin!(upstream_poll);
     if let Some(progress_heartbeat_deadline) = progress_heartbeat_deadline {
         tokio::select! {
             biased;
-            result = &mut upstream_poll => match result {
-                Ok(poll) => StreamPoll::Upstream(poll),
-                Err(_) => StreamPoll::TimedOut,
-            },
+            result = &mut upstream_poll => StreamPoll::Upstream(result),
             _ = tokio::time::sleep_until(progress_heartbeat_deadline) => StreamPoll::ProgressHeartbeat,
         }
     } else {
-        match upstream_poll.await {
-            Ok(poll) => StreamPoll::Upstream(poll),
-            Err(_) => StreamPoll::TimedOut,
-        }
+        StreamPoll::Upstream(upstream_poll.await)
     }
 }
 
@@ -225,19 +214,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
-        let lifecycle_started = tokio::time::Instant::now();
-        let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
-        let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
-        // The bounded lifecycle below owns these values. Keep exact copies for
-        // the timeout convergence path, which must not infer delivery from a
-        // task that Tokio has just cancelled.
+        let owner_loss = _proxy_lifecycle_permit.owner_loss();
         let deadline_database = background_state.db.clone();
         let deadline_metrics = background_state.metrics.clone();
         let deadline_reservation = reservation.clone();
         let deadline_tenant_id = tenant_id;
         let mut wait_diagnostics = wait_diagnostics::WaitDiagnostics::default();
         let waits = &mut wait_diagnostics;
-        let lifecycle = async move {
+        let lifecycle = Box::pin(async move {
             let stream_phase = proxy_diagnostics::Phase::account(
                 diagnostic_context,
                 "upstream_stream",
@@ -326,7 +310,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     match poll_upstream_downstream_or_progress_heartbeat(
                         &body_sender,
                         waits.upstream(upstream_stream.next()),
-                        stream_deadline,
                         progress_heartbeat_deadline,
                     )
                     .await
@@ -377,25 +360,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 Err(_) => transport_error = Some("downstream_backpressure"),
                             }
                             drop(archive_sender.take());
-                            break;
-                        }
-                        StreamPoll::TimedOut => {
-                            drop(upstream_stream);
-                            transport_error = Some(transport_error_with_downstream_precedence(
-                                downstream_closed_observed || body_sender.is_closed(),
-                                "upstream_timeout",
-                            ));
-                            drop(archive_sender.take());
-                            let _ = tokio::time::timeout(
-                                MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.send(downstream_stream_failure(
-                                    protocol,
-                                    is_sse,
-                                    responses_streaming_sanitizer.as_ref(),
-                                    "upstream stream timed out",
-                                )),
-                            )
-                            .await;
                             break;
                         }
                     }
@@ -792,7 +756,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                     }
                     Err(error_code) => {
-                        drop(upstream_stream);
+                        upstream_stream = Box::pin(futures_util::stream::empty());
                         transport_error = Some(transport_error_with_downstream_precedence(
                             downstream_closed_observed || body_sender.is_closed(),
                             error_code,
@@ -812,6 +776,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 }
             }
+            drop(upstream_stream);
             stream_phase.finish(
                 transport_error.unwrap_or("completed"),
                 Some(status.as_u16()),
@@ -982,43 +947,51 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let response_archive_attempt = None;
             let terminal_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
-            #[cfg(test)]
-            finalization_test_gate::wait(request_id).await;
-            finalize_streaming_lifecycle(StreamingFinalizationInput {
-                output_timing,
-                state: &background_state,
-                status_code,
-                protocol,
-                is_codex_route,
-                codex_retry,
-                upstream_attempt,
-                request_id,
-                reservation,
-                diagnostic_context,
-                input_token_ceiling,
-                output_token_ceiling,
-                output_token_limit,
-                requested_service_tier,
-                conversation,
-                memory: request_memory,
-                lifecycle_deadline,
-                tenant_id,
-                transport_error,
-                delivered_billable,
-                sse_summary,
-                usage_capture,
-                response_archive_attempt,
-                stored_response,
-                gap_response,
-                routing_terminal_observed_at,
-                routing_terminal_pre_published,
-            })
-            .await;
-            // This function handles its own database failures; returned means
-            // it settled its work, not proof that persistence succeeded.
-            terminal_phase.finish("returned", None, None);
+            let lifecycle_deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
+            let finalization = async move {
+                #[cfg(test)]
+                finalization_test_gate::wait(request_id).await;
+                finalize_streaming_lifecycle(StreamingFinalizationInput {
+                    output_timing,
+                    state: &background_state,
+                    status_code,
+                    protocol,
+                    is_codex_route,
+                    codex_retry,
+                    upstream_attempt,
+                    request_id,
+                    reservation,
+                    diagnostic_context,
+                    input_token_ceiling,
+                    output_token_ceiling,
+                    output_token_limit,
+                    requested_service_tier,
+                    conversation,
+                    memory: request_memory,
+                    lifecycle_deadline,
+                    tenant_id,
+                    transport_error,
+                    delivered_billable,
+                    sse_summary,
+                    usage_capture,
+                    response_archive_attempt,
+                    stored_response,
+                    gap_response,
+                    routing_terminal_observed_at,
+                    routing_terminal_pre_published,
+                })
+                .await;
+                // This function handles its own database failures; returned means
+                // it settled its work, not proof that persistence succeeded.
+                terminal_phase.finish("returned", None, None);
+            };
+            run_bounded_proxy_lifecycle(lifecycle_deadline, Box::pin(finalization)).await
+        });
+        let lifecycle_result = tokio::select! {
+            biased;
+            _ = crate::proxy_lifecycle::wait_for_owner_loss(owner_loss) => Err("request_owner_lost"),
+            result = lifecycle => result.map_err(|_| "finalization_deadline"),
         };
-        let lifecycle_result = run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle).await;
         wait_diagnostics.emit(
             request_id,
             if lifecycle_result.is_err() {
@@ -1027,20 +1000,23 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 "lifecycle_returned"
             },
         );
-        if lifecycle_result.is_err() {
+        if let Err(reason) = lifecycle_result {
             tracing::error!(
                 %request_id,
-                stage = "lifecycle_deadline",
-                "proxy request lifecycle exceeded its absolute deadline"
+                stage = reason,
+                "proxy owner or terminal settlement could not continue"
             );
-            match deadline_database
-                .expire_proxy_lifecycle_deadline(
+            match tokio::time::timeout(
+                MAX_PROXY_FINALIZATION_LIFETIME,
+                deadline_database.expire_proxy_lifecycle_deadline(
                     request_id,
                     deadline_tenant_id,
                     &deadline_reservation,
                     diagnostic_context.elapsed_millis_at(Instant::now()),
-                )
-                .await
+                ),
+            )
+            .await
+            .unwrap_or(Err(AppError::Internal))
             {
                 Ok(FinishProxyRequestResult::Finished { .. }) => {
                     deadline_metrics.observe_proxy_lifecycle_deadline(

@@ -4,7 +4,6 @@ use super::*;
 pub(super) enum BoundedUpstreamError {
     ContentEncoding,
     MemoryCapacity,
-    Timeout,
     ReadTimeout,
     RequestTimeout,
     ResponseTooLarge,
@@ -30,7 +29,6 @@ impl BoundedUpstreamError {
         match self {
             Self::ContentEncoding => "upstream_invalid_content_encoding",
             Self::MemoryCapacity => "upstream_response_memory_capacity",
-            Self::Timeout => "upstream_timeout",
             Self::ReadTimeout => upstream_response::UPSTREAM_READ_TIMEOUT,
             Self::RequestTimeout => upstream_response::UPSTREAM_REQUEST_TIMEOUT,
             Self::ResponseTooLarge => "upstream_response_too_large",
@@ -86,7 +84,7 @@ pub(super) async fn read_bounded_upstream(
     response: UpstreamResponse,
     maximum: usize,
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
-    started: Instant,
+    memory_admission_wait: Duration,
     reserve_adapter_maximum: bool,
     conversation: Option<&ProxyConversation>,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
@@ -109,8 +107,7 @@ pub(super) async fn read_bounded_upstream(
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(maximum)
         .min(maximum);
-    let deadline =
-        tokio::time::Instant::now() + MAX_PROXY_LIFETIME.saturating_sub(started.elapsed());
+    let deadline = tokio::time::Instant::now() + memory_admission_wait;
     let reservation_maximum = if reserve_adapter_maximum {
         maximum
     } else {
@@ -139,10 +136,7 @@ pub(super) async fn read_bounded_upstream(
     let maximum = declared_maximum;
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
-        .await
-        .map_err(|_| BoundedUpstreamError::Timeout)?
-    {
+    while let Some(chunk) = stream.next().await {
         // Never retain or display reqwest's error: its URL can contain
         // credential-bearing upstream configuration.
         let chunk = chunk.map_err(BoundedUpstreamError::from_stream_error)?;
@@ -169,6 +163,41 @@ pub(super) async fn read_bounded_upstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_body_outlives_twenty_minutes_without_relaxing_byte_admission() {
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: Some(2),
+            stream: Box::pin(futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(1500)).await;
+                Ok(Bytes::from_static(b"{}"))
+            })),
+        };
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(
+            crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
+        );
+        let memory = budget.reservation();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            read_bounded_upstream(
+                response,
+                1024,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None
+            )
+            .await
+            .unwrap(),
+            b"{}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1500));
+        drop(memory);
+        assert_eq!(budget.snapshot().0, 0);
+    }
 
     #[test]
     fn local_response_boundaries_are_inconclusive_health_evidence() {
@@ -216,7 +245,15 @@ mod tests {
         };
         let memory = budget.reservation();
         let read = tokio::spawn(async move {
-            read_bounded_upstream(response, 1024, &memory, Instant::now(), false, None).await
+            read_bounded_upstream(
+                response,
+                1024,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await
         });
         budget.wait_for_response_reservation_for_test().await;
         assert!(!polled.load(Ordering::SeqCst));
@@ -260,8 +297,15 @@ mod tests {
                 crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             );
             let memory = budget.reservation();
-            let result =
-                read_bounded_upstream(response, 1024, &memory, Instant::now(), false, None).await;
+            let result = read_bounded_upstream(
+                response,
+                1024,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await;
             assert_eq!(result.unwrap_err().code(), expected);
         }
     }
