@@ -229,10 +229,8 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 let directory = tempfile::tempdir().unwrap();
                 let pause = Arc::new(BlockingPause::default());
                 let resume = ResumeOnDrop(pause.clone());
-                let mut spool = RequestSpoolAdmission::new(
-                    directory.path().to_owned(),
-                    BUDGET_BYTES as usize,
-                );
+                let mut spool =
+                    RequestSpoolAdmission::new(directory.path().to_owned(), BUDGET_BYTES as usize);
                 if pause_open {
                     spool.blocking_open = Some(pause.clone());
                 } else {
