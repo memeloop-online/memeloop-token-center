@@ -74,7 +74,7 @@ test('a failed tenant refresh is classified the same way instead of surfacing as
   assert.ok(refreshAt > -1);
   const refresh = scope.slice(refreshAt);
   assert.match(refresh, /\} catch \(reason\) \{/);
-  assert.match(refresh, /reason instanceof ApiError && reason\.status === 401/);
+  assert.match(refresh, /reason instanceof ApiError && \(reason\.status === 401 \|\| reason\.status === 403\)/);
   assert.match(refresh, /dispatch\(\{ type: 'authentication-unavailable', message: outageMessage\(reason\), candidate: credential \}\)/);
 });
 
