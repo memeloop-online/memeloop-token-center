@@ -69,6 +69,12 @@ FROM model_route_upstream_accounts association
 JOIN selected_routes selected ON selected.route_id = association.model_route_id
 WHERE association.catalog_policy = 'explicit_custom'
 UNION ALL
+SELECT 'custom_model_confirmed', association.model_route_id,
+       association.provider_group_id, CAST(NULL AS BIGINT)
+FROM model_route_included_provider_groups association
+JOIN selected_routes selected ON selected.route_id = association.model_route_id
+WHERE association.catalog_policy = 'explicit_custom'
+UNION ALL
 SELECT 'grant_revision', revision.model_route_id,
        CAST(NULL AS TEXT), revision.revision
 FROM routing_grant_relation_revisions revision
