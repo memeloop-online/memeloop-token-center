@@ -5,6 +5,93 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
+test('plugin first OAuth start sends the chosen tenant group snapshot without individual proxy authority', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const starts: Record<string, unknown>[] = [];
+    await page.route('**/internal/v1/transport-proxy-groups**', async route => {
+      assert.equal(route.request().method(), 'GET');
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: true } });
+      assert.equal(url.searchParams.get('tenant_external_id'), 'fixture-a');
+      return route.fulfill({ json: { items: [{ id: 'fixture-group', tenant_external_id: 'fixture-a', name: 'Shared network', version: 7, bound_account_count: 0, members: [{ id: 'fixture-member', label: 'Existing exit', scheme: 'socks5h', remote_dns: true, has_auth: true }] }] } });
+    });
+    await page.route('**/internal/v1/oauth/**', async route => {
+      assert.ok(route.request().url().endsWith('/authorization-code/start'), 'no completion or token exchange before user login');
+      starts.push(route.request().postDataJSON());
+      return route.fulfill({ json: { login_url: 'https://login.example.invalid/authorize', session_token: 'fixture-session', expires_at: Date.now() + 600_000 } });
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?groups`);
+    const start = page.getByRole('button', { name: '开始登录', exact: true });
+    const singleProxy = page.getByRole('checkbox', { name: '使用账号网络代理', exact: true });
+    await singleProxy.check();
+    await page.getByLabel(/^代理地址/).fill('socks5h://fixture-only@10.0.0.8:1080');
+    await page.getByLabel('目标代理组', { exact: true }).selectOption('fixture-group');
+    assert.equal(await singleProxy.isChecked(), false);
+    assert.equal(await page.getByLabel(/^代理地址/).count(), 0);
+    assert.equal(await start.isDisabled(), true);
+    await page.getByLabel('起始出口', { exact: true }).selectOption('fixture-member');
+    await start.click();
+    await page.getByRole('link', { name: '打开授权页', exact: true }).waitFor();
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].tenant_external_id, 'fixture-a');
+    assert.equal(starts[0].provider_driver, 'fixture-plugin');
+    assert.deepEqual(starts[0].transport_proxy_group, { group_id: 'fixture-group', expected_group_version: 7, initial_member_id: 'fixture-member' });
+    for (const field of ['proxy_url', 'proxy_network_scope', 'client', 'upstream_account_id']) assert.equal(field in starts[0], false);
+    assert.doesNotMatch(await page.locator('body').innerText(), /fixture-only|fixture-session/);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('selected OAuth group fails closed during refresh and after exit removal, then scope change clears the draft', { timeout: 60_000 }, async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    let groupReads = 0;
+    let starts = 0;
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>(resolve => { releaseRefresh = resolve; });
+    await page.route('**/internal/v1/transport-proxy-groups**', async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/access')) return route.fulfill({ json: { can_manage: true } });
+      if (url.searchParams.get('tenant_external_id') === 'fixture-b') return route.fulfill({ json: { items: [] } });
+      groupReads++;
+      if (groupReads === 2) await refreshGate;
+      return route.fulfill({ json: { items: [{ id: 'fixture-group', tenant_external_id: 'fixture-a', name: 'Shared network', version: groupReads, bound_account_count: 0, members: [{ id: groupReads === 1 ? 'original-member' : 'replacement-member', label: 'Existing exit', scheme: 'socks5h', remote_dns: true, has_auth: false }] }] } });
+    });
+    await page.route('**/internal/v1/oauth/**', async route => { starts++; return route.fulfill({ status: 500, json: {} }); });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/authorization-code.html?groups`);
+    const start = page.getByRole('button', { name: '开始登录', exact: true });
+    await page.getByLabel('目标代理组', { exact: true }).selectOption('fixture-group');
+    await page.getByLabel('起始出口', { exact: true }).selectOption('original-member');
+    assert.equal(await start.isEnabled(), true);
+    await page.getByRole('button', { name: '刷新配置', exact: true }).click();
+    assert.equal(await page.getByLabel('目标代理组', { exact: true }).isDisabled(), true);
+    assert.equal(await start.isDisabled(), true);
+    releaseRefresh();
+    await page.getByLabel('起始出口', { exact: true }).locator('option[value="replacement-member"]').waitFor({ state: 'attached' });
+    assert.equal(await start.isDisabled(), true, 'removed selected exit never falls back to direct or a different exit');
+    assert.equal(starts, 0);
+    await page.getByRole('button', { name: 'Switch scope', exact: true }).click();
+    await page.getByText(/fixture-b/).first().waitFor();
+    await page.getByLabel('目标代理组', { exact: true }).waitFor();
+    assert.equal(await page.getByLabel('目标代理组', { exact: true }).inputValue(), '');
+    assert.equal(await start.isEnabled(), true, 'new tenant has a separate direct draft');
+    assert.equal(starts, 0);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('plugin OAuth uses default client, full callback once, safe errors and isolated scope', { timeout: 60_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
