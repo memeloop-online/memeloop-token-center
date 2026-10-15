@@ -380,6 +380,11 @@ jobs:
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Verify installer SOCKS authentication, anonymous compatibility and redaction
+        run: |
+          cargo test --locked --all-features --lib plugin_distribution::
+          cargo test --locked --all-features --lib installation_proxy_
+          cargo test --locked --all-features --bin install-plugin-oci proxy_argument_tests::
       - name: Verify H2 binding build and runtime gates without secrets or replay
         run: |
           cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
