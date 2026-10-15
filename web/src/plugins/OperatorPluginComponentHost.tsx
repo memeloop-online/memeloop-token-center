@@ -142,17 +142,20 @@ function PluginComponent({
     () => lazy(() => componentLoad(url, pluginId, pluginVersion, contribution.component_id!)),
     [contribution.component_id, pluginId, pluginVersion, retry, url],
   );
-  const hostApi = useMemo<OperatorUiHostApiV1>(() => ({
-    loadServiceData(endpointId: string, signal?: AbortSignal) {
-      if (!serviceEndpointIds.includes(endpointId)) {
-        return Promise.reject(new Error(`Unknown service-data endpoint: ${endpointId}`));
-      }
-      return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
-    },
-    requestApi: createOperatorApiBridge(credential, tenantExternalId),
-    discoverApi: (signal?: AbortSignal) => createOperatorApiBridge(credential, tenantExternalId)<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
-    navigate: onNavigate,
-  }), [credential, onNavigate, pluginId, serviceEndpointIds, tenantExternalId]);
+  const hostApi = useMemo<OperatorUiHostApiV1>(() => {
+    const requestApi = createOperatorApiBridge(credential, tenantExternalId);
+    return {
+      loadServiceData(endpointId: string, signal?: AbortSignal) {
+        if (!serviceEndpointIds.includes(endpointId)) {
+          return Promise.reject(new Error(`Unknown service-data endpoint: ${endpointId}`));
+        }
+        return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
+      },
+      requestApi,
+      discoverApi: (signal?: AbortSignal) => requestApi<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
+      navigate: onNavigate,
+    };
+  }, [credential, onNavigate, pluginId, serviceEndpointIds, tenantExternalId]);
 
   return <Suspense fallback={<div className="empty" role="status">Loading plugin view…</div>}>
     <LazyComponent
