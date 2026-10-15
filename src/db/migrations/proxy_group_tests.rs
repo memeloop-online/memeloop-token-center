@@ -97,7 +97,7 @@ async fn upgrade_contract(database: &Database) {
         include_str!("../../../migrations/common/0046_route_catalog_policy.sql")
             .split_once("CREATE VIEW ")
             .unwrap();
-    sqlx::raw_sql(&format!("CREATE VIEW {original_view}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE VIEW {original_view}")))
         .execute(&database.pool)
         .await
         .unwrap();
