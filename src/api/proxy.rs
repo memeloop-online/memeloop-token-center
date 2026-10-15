@@ -3027,17 +3027,17 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     match run_bounded_proxy_lifecycle(deadline, finalization).await {
         Ok(result) => result,
         Err(_) => {
-            let _ = request
-                .state
-                .db
-                .expire_proxy_lifecycle_deadline(
+            let _ = tokio::time::timeout(
+                MAX_PROXY_FINALIZATION_LIFETIME,
+                request.state.db.expire_proxy_lifecycle_deadline(
                     request.request_id,
                     request.tenant_id,
                     &request.reservation,
                     proxy_diagnostics::Context::for_request(request.request_id)
                         .elapsed_millis_at(Instant::now()),
-                )
-                .await;
+                ),
+            )
+            .await;
             Err(AppError::Internal)
         }
     }

@@ -1004,14 +1004,17 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 stage = reason,
                 "proxy owner or terminal settlement could not continue"
             );
-            match deadline_database
-                .expire_proxy_lifecycle_deadline(
+            match tokio::time::timeout(
+                MAX_PROXY_FINALIZATION_LIFETIME,
+                deadline_database.expire_proxy_lifecycle_deadline(
                     request_id,
                     deadline_tenant_id,
                     &deadline_reservation,
                     diagnostic_context.elapsed_millis_at(Instant::now()),
-                )
-                .await
+                ),
+            )
+            .await
+            .unwrap_or(Err(AppError::Internal))
             {
                 Ok(FinishProxyRequestResult::Finished { .. }) => {
                     deadline_metrics.observe_proxy_lifecycle_deadline(

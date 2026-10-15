@@ -134,6 +134,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn terminal_cleanup_timeout_drops_the_owner_and_stops_renewal() {
+        let (lost, receiver) = watch::channel(false);
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let observed = renewals.clone();
+        let task = tokio::spawn(renew_owner_until_lost(
+            tokio::time::Instant::now(),
+            lost,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(RenewalStatus::Active))
+            },
+        ));
+        let counter = Arc::new(ProxyLifecycleCounter::default());
+        let mut permit = counter.start();
+        permit.owner = Some(RequestOwnerLease {
+            task,
+            lost: receiver,
+        });
+        assert!(
+            tokio::time::timeout(MAX_PROXY_FINALIZATION_LIFETIME, async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(counter.active(), 0);
+        let stopped = renewals.load(Ordering::SeqCst);
+        assert_eq!(stopped, 1);
+        tokio::time::advance(Duration::from_secs(1900)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(renewals.load(Ordering::SeqCst), stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn unrenewable_owner_loses_authority_at_the_last_confirmed_lease() {
         let (lost, mut receiver) = watch::channel(false);
         let started = tokio::time::Instant::now();

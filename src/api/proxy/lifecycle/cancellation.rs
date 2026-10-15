@@ -88,15 +88,22 @@ impl Drop for CancellationGuard {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        runtime.spawn(async move {
+        let settlement = async move {
             let _permit = owner.permit;
             for delay_ms in [0, 10, 50, 200] {
                 if delay_ms != 0 {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                match owner.database.finish_cancelled_proxy_request(
-                    request_id, owner.tenant_id, &owner.reservation, duration_ms,
-                ).await {
+                match owner
+                    .database
+                    .finish_cancelled_proxy_request(
+                        request_id,
+                        owner.tenant_id,
+                        &owner.reservation,
+                        duration_ms,
+                    )
+                    .await
+                {
                     Ok(_) => {
                         tracing::info!(%request_id, stage = "request_cancellation_settled", "proxy cancellation settlement completed");
                         return;
@@ -109,6 +116,14 @@ impl Drop for CancellationGuard {
                 }
             }
             tracing::error!(%request_id, stage = "request_cancellation_reconcile_failed", "proxy cancellation requires orphan reconciliation");
+        };
+        runtime.spawn(async move {
+            if tokio::time::timeout(MAX_PROXY_FINALIZATION_LIFETIME, settlement)
+                .await
+                .is_err()
+            {
+                tracing::error!(%request_id, stage = "request_cancellation_reconcile_timeout", "proxy cancellation requires orphan reconciliation");
+            }
         });
     }
 }
