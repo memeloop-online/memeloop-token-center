@@ -171,5 +171,5 @@ Installation references must pin a digest (never a tag). The deployment release 
 
 ## Boundaries
 
-- The extension points listed here are the complete current ABI: streaming request hooks, arbitrary JavaScript UI, and plugin-created accounts/routes do not exist. Do not design around them as future features.
+- Signed [Operator UI extensions](operator-ui.md) can use the current user's authorized APIs. Streaming request hooks are not part of this ABI.
 - Group routing uses the separate `group-routing-plugin` world; see [Group routing](routing.md).

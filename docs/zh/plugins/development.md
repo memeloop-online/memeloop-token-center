@@ -168,5 +168,5 @@ cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-polic
 
 ## 边界说明
 
-- 本文列出的扩展点是当前 ABI 的全部：流式请求钩子、任意 JavaScript UI、插件自创账户/路由等都不存在，请勿按「将来会有」设计。
+- 经过签名的[管理界面扩展](operator-ui.md)可以使用当前用户有权调用的 API。流式请求钩子不属于当前 ABI。
 - 组路由使用独立的 `group-routing-plugin` world，见[组路由](routing.md)。
