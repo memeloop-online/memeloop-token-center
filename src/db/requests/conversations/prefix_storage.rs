@@ -1,6 +1,6 @@
 //! The observation fingerprint is a view of existing immutable prefix nodes.
 //! It is deliberately distinct from the full semantic leaf: inference has
-//! always used at most 1024 atoms, while the leaf retains the entire sequence.
+//! used at most 1024 atoms in the current writer; the leaf retains the entire sequence.
 use std::collections::HashMap;
 
 use super::*;

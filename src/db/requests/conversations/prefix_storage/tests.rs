@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::io::Write as _;
 
 const PREFIX: usize = 4096;
 const OBSERVATIONS: usize = 96;
@@ -229,10 +230,12 @@ async fn contract(url: &str) {
     .unwrap();
     assert_eq!(shared.nodes.len(), MAX_CONVERSATION_FINGERPRINT_ATOMS);
     transaction.rollback().await.unwrap();
-    println!(
-        "PREFIX_STORAGE prefix_atoms={PREFIX} observations={OBSERVATIONS} legacy_array_bytes={repeated_array_bytes} reference_bytes={reference_bytes} new_nodes={}",
-        nodes_after - nodes_before
-    );
+    // Write directly so the existing all-targets GHA logs retain the measured
+    // evidence even when libtest captures println! output from passing tests.
+    writeln!(std::io::stdout(),
+        "PREFIX_STORAGE prefix_atoms={PREFIX} observations={OBSERVATIONS} legacy_array_bytes={repeated_array_bytes} reference_bytes={reference_bytes} new_nodes={} shared_candidate_nodes={}",
+        nodes_after - nodes_before, shared.nodes.len()
+    ).unwrap();
     if matches!(database.backend, DatabaseBackend::PostgreSql) {
         let physical: i64 = sqlx::query_scalar(
             "SELECT pg_total_relation_size('conversation_observations')::BIGINT",
@@ -435,6 +438,24 @@ async fn contract(url: &str) {
         })
         .await
         .unwrap();
+    database
+        .record_request_finished(FinishRequest {
+            request_id: projected,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            status_code: 200,
+            duration_ms: 1,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            service_tier: None,
+            cost_micros: 0,
+            error_code: None,
+            response_object: "memory://prefix-response".into(),
+        })
+        .await
+        .unwrap();
     let mut transaction = database.begin_write_transaction().await.unwrap();
     let input = ConversationProjectionEnqueueInput {
         request_id: projected,
@@ -492,6 +513,47 @@ async fn contract(url: &str) {
         load(&database, first.tenant_id, projected).await.2,
         all_hashes
     );
+    let empty_request = Uuid::now_v7();
+    observe(
+        &database,
+        &other_key,
+        &json!({}),
+        &default_hints,
+        empty_request,
+        now + 207,
+        true,
+    )
+    .await;
+    let (empty_encoding, empty_fingerprint, empty_full) =
+        load(&database, other_key.tenant_id, empty_request).await;
+    assert_eq!(
+        empty_encoding,
+        r#"{"context_prefix_v1":null,"atom_count":0}"#
+    );
+    assert!(empty_fingerprint.is_empty() && empty_full.is_empty());
+    // A false content_materialized assertion cannot publish a dangling path.
+    let missing_body = json!({"input":"this sequence was never materialized"});
+    let mut transaction = database.begin_write_transaction().await.unwrap();
+    assert!(
+        database
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                ConversationObservationInput {
+                    key: &other_key,
+                    request_id: Uuid::now_v7(),
+                    request_json: &missing_body,
+                    hints: &default_hints,
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: now + 208,
+                    attach_request_record: false,
+                    content_materialized: true,
+                }
+            )
+            .await
+            .is_err()
+    );
+    transaction.rollback().await.unwrap();
     // Same hash with inconsistent node data is rejected before a reference becomes visible.
     let leaf = build_prefix(&extract_atoms(&base_body))
         .pop()

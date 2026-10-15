@@ -29,8 +29,17 @@ payload, materializes content in a separate transaction, then atomically writes
 the observation, request membership and acknowledgement. The representation
 change does not alter the durable outbox envelope or its replay comparison.
 Archive-only inputs use the same transactional observation path with
-`attach_request_record=false`; no CPA migration tooling is added here. External
-importers that directly read this field must be inventoried before activation.
+`attach_request_record=false`; no CPA migration tooling is added here. Read-only inspection of the canonical migration-tools repository found its
+sealed archive runtime pinned to product revision
+`a65097f952e174ac482abe6ff719966fa9d330cb`
+(`ops/lib/session-archive-runtime.ts`). That revision's observation inference
+reader still deserializes arrays with `unwrap_or_default()`. It is a concrete
+old-reader blocker to activation, not merely a hypothetical external reader.
+The tool's snapshot checkpoints/replay/provenance rules remain in its sealed
+runtime; these are not ported into the main product. This PR tests the common
+archive-only observation boundary, not the whole external importer. Upgrading
+and resealing that runtime belongs in the canonical migration-tools repository
+as a separate follow-up before activation. No files there were changed.
 
 ## Implementation design
 
@@ -88,3 +97,21 @@ eligible arrays in bounded resumable batches, preserving leaf/content/request
 and financial data, with explicit rollback and replay checks. Space-return
 procedures require their own capacity, lock and operational authorization.
 No backfill, history deletion or space-return command is included or executed.
+
+
+First GHA: https://github.com/memeloop-online/memeloop-token-center/actions/runs/38749362476
+at source e5ab0277. Migration smoke, fmt, all-target clippy, semantic recovery,
+web, release binary and memory acceptance passed. Packaging exposed omitted
+Helm schema declarations (126 versus new127); both declarations were corrected.
+All-target Rust tests were still running when this checkpoint was written.
+PR: https://github.com/memeloop-online/memeloop-token-center/pull/631
+
+First full Rust run: 1931 library tests passed, 2 new long-prefix tests failed
+at the final projection event because their native request fixture was still
+active. The event correctly rejects unfinished requests. The fixture now uses
+the existing `record_request_finished` API before projection; no product
+precondition was relaxed. Both backends reached the earlier long-prefix checks:
+4096 shared atoms, 96 observations, 96 new nodes, 6,586,464 legacy array bytes
+versus 10,176 reference bytes. These are intermediate evidence from tests that
+subsequently failed, not a claim of whole-test success. PG total observation
+relation size at that point was 376,832 bytes (not an isolated saved-byte estimate).
