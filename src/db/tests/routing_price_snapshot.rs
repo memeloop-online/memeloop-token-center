@@ -1,5 +1,205 @@
 use super::super::*;
 
+async fn optional_output_financial_contract(
+    database: &Database,
+    recovered_database: &Database,
+    balance: i64,
+    budget: Option<i64>,
+    cancelled: bool,
+) {
+    let unique = Uuid::now_v7().to_string();
+    let pepper = b"optional output validity financial contract pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: unique.clone(),
+                principal_external_id: "member".into(),
+                alias: unique.clone(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    max_concurrency: 2,
+                    lifetime_budget: budget.map(|amount| Decimal::new(amount, 6).to_string()),
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::new(balance, 6),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&unique, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_forwarding_request_with_output_limit(
+            StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 4096,
+                protocol: "openai",
+                model: &unique,
+                request_object: &format!("gap://{request_id}/request"),
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            Some(&unique),
+            None,
+        )
+        .await
+        .unwrap();
+    let other_hold = database.reserve_usage(&key, &price, 0, 4000).await.unwrap();
+    assert_eq!(reservation.reserved_micros, 4106);
+    assert_eq!(other_hold.reserved_micros, 4000);
+    database
+        .prepare_proxy_delivery(request_id, key.tenant_id, &reservation, 10, 4096, None)
+        .await
+        .unwrap();
+    database
+        .mark_proxy_delivery_started(request_id, key.tenant_id, &reservation)
+        .await
+        .unwrap();
+    let durable: (i64, i64, String) = sqlx::query_as("SELECT q.input_tokens, q.output_tokens, r.price_snapshot_json FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!((durable.0, durable.1), (10, 4096));
+    let snapshot: serde_json::Value = serde_json::from_str(&durable.2).unwrap();
+    assert_eq!(
+        snapshot.get("output_token_limit"),
+        Some(&serde_json::Value::Null)
+    );
+    database
+        .upsert_model_price(&unique, "USD", Decimal::TEN, Decimal::TEN)
+        .await
+        .unwrap();
+    let mut stale_reservation = reservation.clone();
+    stale_reservation.output_micros_per_million = 99_000_000;
+    let finish = FinishProxyRequest {
+        terminal_cause: None,
+        usage_basis: Some(crate::model::RequestUsageBasis::ProviderReported),
+        first_output_ms: Some(1),
+        generation_duration_ms: None,
+        request_id,
+        tenant_id: key.tenant_id,
+        reservation: &stale_reservation,
+        input_token_ceiling: 10,
+        output_token_ceiling: 4096,
+        requested_service_tier: None,
+        status_code: if cancelled { 499 } else { 200 },
+        duration_ms: 2,
+        usage: TokenUsage {
+            input_tokens: 3,
+            output_tokens: 5000,
+            ..TokenUsage::default()
+        },
+        error_code: cancelled.then_some("client_cancelled"),
+        response_object: "gap://optional-output/response",
+        routing_session_id: None,
+        routing_terminal_observed_at: None,
+        conversation: None,
+    };
+    let (first, second) = tokio::join!(
+        recovered_database.finish_proxy_request(finish.clone()),
+        recovered_database.finish_proxy_request(finish)
+    );
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                FinishProxyRequestResult::Finished {
+                    usage_invalid: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }))
+            .count(),
+        1
+    );
+    let charged = 5003_i64
+        .min(balance - 4000)
+        .min(budget.unwrap_or(i64::MAX) - 4000);
+    let row = sqlx::query("SELECT q.status_code, q.input_tokens, q.output_tokens, q.cost_micros, q.error_code, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledgers FROM request_records q WHERE q.id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(
+        row.get::<i64, _>("status_code"),
+        if cancelled { 499 } else { 200 }
+    );
+    assert_eq!(row.get::<i64, _>("input_tokens"), 3);
+    assert_eq!(row.get::<i64, _>("output_tokens"), 5000);
+    assert_eq!(row.get::<i64, _>("cost_micros"), charged);
+    assert_eq!(
+        row.get::<Option<String>, _>("error_code").as_deref(),
+        cancelled.then_some("client_cancelled")
+    );
+    assert_eq!(row.get::<i64, _>("ledgers"), 1);
+    let account: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(account, (balance - charged - 4000, 4000));
+    let budget_hold: i64 =
+        sqlx::query_scalar("SELECT reserved_micros FROM key_budget_state WHERE key_id = $1")
+            .bind(key.key_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(budget_hold, 4000);
+    assert_eq!(
+        database.settle_usage(&other_hold, 0, 4000).await.unwrap(),
+        4000
+    );
+    let account: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(key.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(account, (balance - charged - 4000, 0));
+}
+
+#[tokio::test]
+async fn optional_output_actual_usage_preserves_other_holds_budgets_and_once_finish() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("output-validity.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let recovered_database = Database::connect(&database_url).await.unwrap();
+    for (balance, budget) in [(20_000, None), (9_000, None), (20_000, Some(9_000))] {
+        for cancelled in [false, true] {
+            optional_output_financial_contract(
+                &database,
+                &recovered_database,
+                balance,
+                budget,
+                cancelled,
+            )
+            .await;
+        }
+    }
+}
+
 async fn snapshot_contract(database: &Database, metered: bool) {
     let unique = Uuid::now_v7().to_string();
     let pepper = b"immutable route price snapshot test pepper over 32 bytes";
@@ -76,6 +276,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
             pepper,
             false,
             Some(&first_model),
+            Some(10),
         )
         .await
         .unwrap()
@@ -90,6 +291,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
             reservation: &original,
             input_token_ceiling: 10,
             output_token_ceiling: 10,
+            output_token_limit: Some(10),
             upstream_model: &second_model,
             expected_assignment: first_assignment,
             next_assignment: second_assignment,
@@ -130,6 +332,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
                 reservation: &original,
                 input_token_ceiling: 10,
                 output_token_ceiling: 10,
+                output_token_limit: Some(10),
                 upstream_model: &first_model,
                 expected_assignment: first_assignment,
                 next_assignment: first_assignment,
@@ -150,6 +353,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
             reservation: &switched,
             input_token_ceiling: 10,
             output_token_ceiling: 10,
+            output_token_limit: Some(10),
             upstream_model: &second_model,
             expected_assignment: second_assignment,
             next_assignment: second_assignment,
@@ -170,6 +374,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
                 reservation: &retained,
                 input_token_ceiling: 10,
                 output_token_ceiling: 10,
+                output_token_limit: Some(10),
                 upstream_model: &first_model,
                 expected_assignment: second_assignment,
                 next_assignment: second_assignment,
@@ -304,6 +509,7 @@ async fn snapshot_contract(database: &Database, metered: bool) {
                 reservation: &switched,
                 input_token_ceiling: 10,
                 output_token_ceiling: 10,
+                output_token_limit: Some(10),
                 upstream_model: &first_model,
                 expected_assignment: second_assignment,
                 next_assignment: first_assignment,
@@ -423,6 +629,22 @@ async fn postgres_same_amount_failover_replaces_price_snapshot_not_admission() {
             .await;
         }
     }
+    let recovered_database = Database::connect_with_max(isolated.as_str(), 4)
+        .await
+        .unwrap();
+    for (balance, budget) in [(20_000, None), (9_000, None), (20_000, Some(9_000))] {
+        for cancelled in [false, true] {
+            optional_output_financial_contract(
+                &database,
+                &recovered_database,
+                balance,
+                budget,
+                cancelled,
+            )
+            .await;
+        }
+    }
+    recovered_database.close().await;
     database.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)

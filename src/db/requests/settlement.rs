@@ -247,9 +247,23 @@ pub fn normalize_proxy_usage(
     output_token_ceiling: i64,
     requested_service_tier: Option<&str>,
 ) -> Result<TokenUsage, AppError> {
+    normalize_proxy_usage_with_output_limit(
+        usage,
+        input_token_ceiling,
+        Some(output_token_ceiling),
+        requested_service_tier,
+    )
+}
+
+pub(crate) fn normalize_proxy_usage_with_output_limit(
+    usage: &TokenUsage,
+    input_token_ceiling: i64,
+    output_token_limit: Option<i64>,
+    requested_service_tier: Option<&str>,
+) -> Result<TokenUsage, AppError> {
     validate_token_usage(usage)
         .map_err(|_| AppError::Upstream("upstream returned invalid token usage".to_owned()))?;
-    if input_token_ceiling < 0 || output_token_ceiling < 0 {
+    if input_token_ceiling < 0 || output_token_limit.is_some_and(|limit| limit < 0) {
         return Err(AppError::Internal);
     }
     let total_input = usage
@@ -257,7 +271,9 @@ pub fn normalize_proxy_usage(
         .checked_add(usage.cached_input_tokens)
         .and_then(|tokens| tokens.checked_add(usage.cache_write_tokens))
         .ok_or_else(|| AppError::Upstream("upstream returned invalid token usage".to_owned()))?;
-    if total_input > input_token_ceiling || usage.output_tokens > output_token_ceiling {
+    if total_input > input_token_ceiling
+        || output_token_limit.is_some_and(|limit| usage.output_tokens > limit)
+    {
         return Err(AppError::Upstream(
             "upstream returned invalid token usage".to_owned(),
         ));
@@ -1220,7 +1236,10 @@ async fn settle_token_usage_with_explicit_charge(
             reservation_id = %reservation.id,
             calculated_micros,
             charged_micros = actual_micros,
-            "upstream usage exceeded the account hard balance limit"
+            uncollected_micros = calculated_micros.saturating_sub(actual_micros),
+            reported_input_tokens = usage.input_tokens,
+            reported_output_tokens = usage.output_tokens,
+            "upstream usage charge capped by account balance or key budget"
         );
     }
     let released = reservation

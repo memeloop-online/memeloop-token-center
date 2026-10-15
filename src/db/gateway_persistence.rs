@@ -109,6 +109,7 @@ impl Database {
         pepper: &[u8],
         compression_enabled: bool,
         upstream_model: Option<&str>,
+        output_token_limit: Option<i64>,
     ) -> Result<StartedProxyRequest, AppError> {
         let request_id = input.request_id;
         let tenant_id = input.key.tenant_id;
@@ -116,7 +117,11 @@ impl Database {
             return Err(AppError::Internal);
         }
         let reservation = self
-            .start_proxy_forwarding_request(input, upstream_model)
+            .start_proxy_forwarding_request_with_output_limit(
+                input,
+                upstream_model,
+                output_token_limit,
+            )
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,

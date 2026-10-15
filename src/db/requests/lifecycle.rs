@@ -17,6 +17,128 @@ use tracing::Instrument;
 
 const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4";
 
+async fn persist_output_token_limit(
+    transaction: &mut Transaction<'_, Any>,
+    reservation_id: Uuid,
+    price: &ModelPrice,
+    output_token_limit: Option<i64>,
+) -> Result<(), AppError> {
+    if output_token_limit.is_some_and(|limit| !(0..=1_000_000_000).contains(&limit)) {
+        return Err(AppError::Internal);
+    }
+    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::Internal)?;
+    snapshot["output_token_limit"] = serde_json::json!(output_token_limit);
+    let updated = sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2 AND status = 'reserved'")
+        .bind(serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?)
+        .bind(reservation_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "request output validity snapshot changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn output_token_limit_from_snapshot(
+    snapshot: Option<&str>,
+    legacy_ceiling: i64,
+) -> Result<Option<i64>, AppError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(Some(legacy_ceiling));
+    };
+    let snapshot: serde_json::Value =
+        serde_json::from_str(snapshot).map_err(|_| AppError::Internal)?;
+    match snapshot.get("output_token_limit") {
+        None => Ok(Some(legacy_ceiling)),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .filter(|limit| (0..=1_000_000_000).contains(limit))
+            .map(Some)
+            .ok_or(AppError::Internal),
+    }
+}
+
+#[cfg(test)]
+mod output_validity_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_output_validity_distinguishes_legacy_unknown_and_explicit() {
+        assert_eq!(
+            output_token_limit_from_snapshot(None, 4096).unwrap(),
+            Some(4096)
+        );
+        assert_eq!(
+            output_token_limit_from_snapshot(Some("{}"), 4096).unwrap(),
+            Some(4096)
+        );
+        assert_eq!(
+            output_token_limit_from_snapshot(Some(r#"{"output_token_limit":null}"#), 4096).unwrap(),
+            None
+        );
+        assert_eq!(
+            output_token_limit_from_snapshot(Some(r#"{"output_token_limit":17}"#), 4096).unwrap(),
+            Some(17)
+        );
+        for invalid in [
+            r#"{"output_token_limit":-1}"#,
+            r#"{"output_token_limit":"17"}"#,
+            r#"{"output_token_limit":1000000001}"#,
+        ] {
+            assert!(output_token_limit_from_snapshot(Some(invalid), 4096).is_err());
+        }
+        let usage = TokenUsage {
+            output_tokens: 5000,
+            ..TokenUsage::default()
+        };
+        assert_eq!(
+            normalize_proxy_usage_with_output_limit(&usage, 10, None, None).unwrap(),
+            usage
+        );
+        assert!(normalize_proxy_usage_with_output_limit(&usage, 10, Some(4096), None).is_err());
+        assert!(normalize_proxy_usage_with_output_limit(&usage, 10, Some(17), None).is_err());
+        assert!(
+            normalize_proxy_usage_with_output_limit(
+                &TokenUsage {
+                    output_tokens: -1,
+                    ..TokenUsage::default()
+                },
+                10,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_proxy_usage_with_output_limit(
+                &TokenUsage {
+                    input_tokens: 11,
+                    ..usage.clone()
+                },
+                10,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_proxy_usage_with_output_limit(
+                &TokenUsage {
+                    output_tokens: 1_000_000_001,
+                    ..TokenUsage::default()
+                },
+                10,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+}
+
 #[cfg(test)]
 mod admission_partition_tests {
     use super::ADMISSION_UPSTREAM_MODEL_UPDATE;
@@ -181,6 +303,7 @@ pub(crate) struct SwitchProxyCandidateInput<'a> {
     pub reservation: &'a UsageReservation,
     pub input_token_ceiling: i64,
     pub output_token_ceiling: i64,
+    pub output_token_limit: Option<i64>,
     pub upstream_model: &'a str,
     pub expected_assignment: (Uuid, Uuid),
     pub next_assignment: (Uuid, Uuid),
@@ -273,17 +396,34 @@ impl Database {
         &self,
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, true, None)
+        let output_token_limit = Some(input.output_token_ceiling);
+        self.start_proxy_request_inner(input, None, true, None, output_token_limit)
             .await
             .map(|started| started.reservation)
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_proxy_forwarding_request(
         &self,
         input: StartProxyRequest<'_>,
         upstream_model: Option<&str>,
     ) -> Result<UsageReservation, AppError> {
-        self.start_proxy_request_inner(input, None, false, upstream_model)
+        let output_token_limit = Some(input.output_token_ceiling);
+        self.start_proxy_forwarding_request_with_output_limit(
+            input,
+            upstream_model,
+            output_token_limit,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_proxy_forwarding_request_with_output_limit(
+        &self,
+        input: StartProxyRequest<'_>,
+        upstream_model: Option<&str>,
+        output_token_limit: Option<i64>,
+    ) -> Result<UsageReservation, AppError> {
+        self.start_proxy_request_inner(input, None, false, upstream_model, output_token_limit)
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
@@ -381,8 +521,15 @@ impl Database {
         compression_enabled: bool,
     ) -> Result<StartedProxyRequest, AppError> {
         let started = std::time::Instant::now();
+        let output_token_limit = Some(input.output_token_ceiling);
         let result = self
-            .start_proxy_request_inner(input, Some((body, pepper, compression_enabled)), true, None)
+            .start_proxy_request_inner(
+                input,
+                Some((body, pepper, compression_enabled)),
+                true,
+                None,
+                output_token_limit,
+            )
             .await
             .map_err(|error| match error {
                 AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
@@ -405,6 +552,7 @@ impl Database {
         archive: Option<(&bytes::Bytes, &[u8], bool)>,
         publish_started: bool,
         upstream_model: Option<&str>,
+        output_token_limit: Option<i64>,
     ) -> Result<StartedProxyRequest, AppError> {
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
@@ -477,6 +625,13 @@ impl Database {
             reservation_id,
         )
         .instrument(reservation_span)
+        .await?;
+        persist_output_token_limit(
+            &mut transaction,
+            reservation.id,
+            input.price,
+            output_token_limit,
+        )
         .await?;
         BudgetHold::set_phase(&mut hold, "request_record");
         let started_request = NewRequest {
@@ -701,6 +856,13 @@ impl Database {
             input.input_token_ceiling,
             input.output_token_ceiling,
             unix_millis(),
+        )
+        .await?;
+        persist_output_token_limit(
+            &mut transaction,
+            resized.id,
+            price,
+            input.output_token_limit,
         )
         .await?;
         transaction.commit().await?;
@@ -1597,10 +1759,13 @@ impl Database {
                 false,
             )
         } else {
-            match normalize_proxy_usage(
+            let snapshot: Option<String> = reservation_row.try_get("price_snapshot_json")?;
+            let output_token_limit =
+                output_token_limit_from_snapshot(snapshot.as_deref(), input.output_token_ceiling)?;
+            match normalize_proxy_usage_with_output_limit(
                 &input.usage,
                 input.input_token_ceiling,
-                input.output_token_ceiling,
+                output_token_limit,
                 input.requested_service_tier,
             ) {
                 Ok(usage) => (

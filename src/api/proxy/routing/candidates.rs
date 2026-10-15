@@ -42,7 +42,7 @@ pub(in crate::api::proxy) fn candidate_reservation_bounds(
     planned: &PlannedProxyRoute,
     original_body_length: usize,
     output_choice_count: i64,
-) -> Result<(i64, i64), AppError> {
+) -> Result<(i64, i64, Option<i64>), AppError> {
     let candidate_output_token_ceiling = planned
         .output_token_ceiling
         .checked_mul(output_choice_count)
@@ -55,7 +55,19 @@ pub(in crate::api::proxy) fn candidate_reservation_bounds(
         })?;
     let request_body_ceiling = planned.request_body_ceiling(original_body_length)?;
     let candidate_ceiling = input_reservation_bound(&planned.route, request_body_ceiling)?;
-    Ok((candidate_ceiling, candidate_output_token_ceiling))
+    let output_token_limit = planned
+        .output_token_limit
+        .map(|limit| {
+            limit
+                .checked_mul(output_choice_count)
+                .ok_or(AppError::Internal)
+        })
+        .transpose()?;
+    Ok((
+        candidate_ceiling,
+        candidate_output_token_ceiling,
+        output_token_limit,
+    ))
 }
 
 pub(in crate::api::proxy) fn prepared_input_reservation_bound(

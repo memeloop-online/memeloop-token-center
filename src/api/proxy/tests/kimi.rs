@@ -162,6 +162,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 started: Instant::now(),
                 input_token_ceiling: 20,
                 output_token_ceiling: 8,
+                output_token_limit: Some(8),
                 requested_service_tier: None,
                 conversation: None,
                 protocol,
@@ -738,9 +739,12 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
         .and(body_partial_json(json!({
             "model": fixture.model,
             "messages": [{"role":"user"}],
-            "stream": false,
-            "max_completion_tokens": 4096
+            "stream": false
         })))
+        .and(|request: &wiremock::Request| {
+            let value: Value = request.body_json().unwrap();
+            value.get("max_completion_tokens").is_none() && value.get("max_tokens").is_none()
+        })
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "fake-buffered",
             "choices": [{
@@ -752,7 +756,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                 }]},
                 "finish_reason":"tool_calls"
             }],
-            "usage": {"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+            "usage": {"prompt_tokens":5,"completion_tokens":5000,"total_tokens":5005}
         })))
         .expect(1)
         .mount(&upstream)
@@ -806,9 +810,12 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                 {"type":"text","text":"readable delegated task"}
             ]}],
             "stream": true,
-            "stream_options": {"include_usage": true},
-            "max_completion_tokens": 4096
+            "stream_options": {"include_usage": true}
         })))
+        .and(|request: &wiremock::Request| {
+            let value: Value = request.body_json().unwrap();
+            value.get("max_completion_tokens").is_none() && value.get("max_tokens").is_none()
+        })
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             [
                 format!(
@@ -821,7 +828,7 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
                 ),
                 format!(
                     "data: {}\n\n",
-                    json!({"id":"fake-stream","object":"chat.completion.chunk","model":fixture.model,"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
+                    json!({"id":"fake-stream","object":"chat.completion.chunk","model":fixture.model,"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":5000,"total_tokens":5005}})
                 ),
                 "data: [DONE]\n\n".into(),
             ]
@@ -872,6 +879,38 @@ async fn fake_glm_via_chat_provider_uses_strict_chat_contract_and_reverse_maps_t
     assert!(streamed_body.contains(r#""name":"spawn_agent""#));
     assert!(streamed_body.contains(r#""namespace":"collaboration""#));
     assert!(streamed_body.contains(r#""encrypted_function_args":[]"#));
+    wait_for_request_settlement(&fixture, 2).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.status_code, Some(200));
+        assert_eq!(row.error_code, None);
+        assert_eq!((row.input_tokens, row.output_tokens), (5, 5000));
+        assert_eq!(row.cost.parse::<Decimal>().unwrap(), Decimal::new(5005, 6));
+        assert_exactly_once_side_effects(&fixture, row.request_id, None).await;
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let snapshots: Vec<(i64, String)> =
+        sqlx::query_as("SELECT reserved_tokens, price_snapshot_json FROM usage_reservations")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(snapshots.len(), 2);
+    for (estimate, snapshot) in snapshots {
+        assert!(estimate >= 4096);
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshot)
+                .unwrap()
+                .get("output_token_limit"),
+            Some(&Value::Null)
+        );
+    }
+    pool.close().await;
     upstream.verify().await;
     let forwarded = upstream.received_requests().await.unwrap();
     assert_eq!(forwarded.len(), 2);

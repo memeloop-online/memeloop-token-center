@@ -20,6 +20,7 @@ pub(in crate::api::proxy) struct PlannedProxyRoute {
     pub(in crate::api::proxy) route: ResolvedUpstream,
     pub(super) forwarded_json: Value,
     pub(in crate::api::proxy) output_token_ceiling: i64,
+    pub(in crate::api::proxy) output_token_limit: Option<i64>,
     pub(super) upstream_stream: bool,
     pub(super) codex_downstream_stream: bool,
     pub(super) codex_store_disabled: bool,
