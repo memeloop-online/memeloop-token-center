@@ -97,6 +97,144 @@ async fn send_ordinary(fixture: &CodexRouteFixture, chat: bool, request: &Value)
     }
 }
 
+fn ordinary_sse(chat: bool, output_tokens: i64) -> String {
+    if chat {
+        let delta = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"uncapped response"},"finish_reason":null}]});
+        let stop = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let usage = json!({"id":"resp-usage-contract","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":output_tokens,"total_tokens":3 + output_tokens}});
+        format!("data: {delta}\n\ndata: {stop}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+    } else {
+        let completed = completed_response_with_usage(3, output_tokens);
+        format!(
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
+        )
+    }
+}
+
+#[tokio::test]
+async fn ordinary_missing_metadata_delivers_and_settles_over_estimate_with_bounded_charges() {
+    for driver in ["http-json", "new-api"] {
+        for chat in [false, true] {
+            for stream in [false, true] {
+                for balance in [100_000_i64, 4_800] {
+                    let upstream = MockServer::start().await;
+                    let fixture = response_usage_fixture_with_uri_contract_and_driver(
+                        "missing-output",
+                        upstream.uri(),
+                        0,
+                        Some("openai-chat-usage-only"),
+                        driver,
+                    )
+                    .await;
+                    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+                    sqlx::query("UPDATE credit_accounts SET available_micros = $1 WHERE id = $2")
+                        .bind(balance)
+                        .bind(fixture.credit_account_id.to_string())
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    let config: String = sqlx::query_scalar(
+                        "SELECT config_json FROM upstream_accounts WHERE id = $1",
+                    )
+                    .bind(fixture.upstream_account_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert!(
+                        serde_json::from_str::<Value>(&config)
+                            .unwrap()
+                            .get("reservation_token_bounds")
+                            .is_none()
+                    );
+                    let mut request = ordinary_request(&fixture, chat);
+                    request["stream"] = json!(stream);
+                    if chat && stream {
+                        request["stream_options"] = json!({"include_usage":true});
+                    }
+                    let expected_wire = request.clone();
+                    let template = if stream {
+                        ResponseTemplate::new(200)
+                            .set_body_raw(ordinary_sse(chat, 5000), "text/event-stream")
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(ordinary_response(chat, 5000))
+                    };
+                    Mock::given(method("POST"))
+                        .and(path(if chat {
+                            "/v1/chat/completions"
+                        } else {
+                            "/v1/responses"
+                        }))
+                        .and(move |request: &wiremock::Request| {
+                            request.body_json::<Value>().unwrap() == expected_wire
+                        })
+                        .respond_with(template)
+                        .expect(1)
+                        .mount(&upstream)
+                        .await;
+                    let response = send_ordinary(&fixture, chat, &request).await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{driver} chat={chat} stream={stream} balance={balance}"
+                    );
+                    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                        .await
+                        .unwrap();
+                    if stream {
+                        assert_eq!(
+                            String::from_utf8(delivered.to_vec()).unwrap(),
+                            ordinary_sse(chat, 5000)
+                        );
+                    } else {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&delivered).unwrap(),
+                            ordinary_response(chat, 5000)
+                        );
+                    }
+                    wait_for_request_settlement(&fixture, 1).await;
+                    let rows = fixture
+                        .state
+                        .db
+                        .list_requests(fixture.key_id, 10)
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status_code, Some(200));
+                    assert_eq!(rows[0].error_code, None);
+                    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 5000));
+                    assert_eq!(
+                        rows[0].cost.parse::<Decimal>().unwrap(),
+                        Decimal::new(balance.min(5003), 6)
+                    );
+                    assert_exactly_once_side_effects(
+                        &fixture,
+                        rows[0].request_id,
+                        if chat {
+                            None
+                        } else {
+                            Some("resp-usage-contract")
+                        },
+                    )
+                    .await;
+                    let row = sqlx::query("SELECT reserved_tokens, reserved_micros, actual_micros, price_snapshot_json FROM usage_reservations")
+                        .fetch_one(&pool).await.unwrap();
+                    assert!((4096..4800).contains(&row.get::<i64, _>("reserved_tokens")));
+                    assert!(row.get::<i64, _>("reserved_micros") < balance);
+                    assert_eq!(row.get::<i64, _>("actual_micros"), balance.min(5003));
+                    let snapshot: Value =
+                        serde_json::from_str(&row.get::<String, _>("price_snapshot_json")).unwrap();
+                    assert_eq!(snapshot.get("output_token_limit"), Some(&Value::Null));
+                    let account: (i64, i64) = sqlx::query_as("SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1")
+                        .bind(fixture.credit_account_id.to_string()).fetch_one(&pool).await.unwrap();
+                    assert_eq!(account, (balance - balance.min(5003), 0));
+                    pool.close().await;
+                    upstream.verify().await;
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_once() {
     for driver in ["http-json", "new-api"] {
@@ -164,6 +302,81 @@ async fn ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_on
             pool.close().await;
             upstream.verify().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_missing_metadata_cancellation_before_headers_releases_its_hold() {
+    for stream in [false, true] {
+        let upstream = MockServer::start().await;
+        let fixture = response_usage_fixture_with_uri_contract_and_driver(
+            "missing-output-cancel",
+            upstream.uri(),
+            0,
+            None,
+            "http-json",
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let mut body = ordinary_request(&fixture, false);
+        body["stream"] = json!(stream);
+        let mut request = Box::pin(send_ordinary(&fixture, false, &body));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut request => panic!("cancel fixture must not return headers"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if upstream.received_requests().await.unwrap().len() == 1 { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let snapshot: String = sqlx::query_scalar(
+            "SELECT price_snapshot_json FROM usage_reservations WHERE status = 'reserved'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshot)
+                .unwrap()
+                .get("output_token_limit"),
+            Some(&Value::Null)
+        );
+        drop(request);
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status_code, Some(499));
+        assert_eq!(rows[0].error_code.as_deref(), Some("request_cancelled"));
+        assert_eq!(rows[0].output_tokens, 0);
+        assert_eq!(rows[0].cost, "0");
+        let terminal: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id), (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') FROM request_records q WHERE q.id = $1")
+            .bind(rows[0].request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(terminal, (1, 1));
+        let account: (i64, i64) = sqlx::query_as(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+        )
+        .bind(fixture.credit_account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(account, (1_000_000, 0));
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        pool.close().await;
     }
 }
 

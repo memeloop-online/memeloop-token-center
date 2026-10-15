@@ -16,6 +16,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) diagnostic_context: proxy_diagnostics::Context,
     pub(super) input_token_ceiling: i64,
     pub(super) output_token_ceiling: i64,
+    pub(super) output_token_limit: Option<i64>,
     pub(super) requested_service_tier: Option<String>,
     pub(super) conversation: Option<ProxyConversation>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
@@ -174,6 +175,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         diagnostic_context,
         input_token_ceiling,
         output_token_ceiling,
+        output_token_limit,
         requested_service_tier,
         conversation,
         memory,
@@ -259,10 +261,10 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             }
         }
     };
-    match crate::db::normalize_proxy_usage(
+    match crate::db::normalize_proxy_usage_with_output_limit(
         &usage,
         input_token_ceiling,
-        output_token_ceiling,
+        output_token_limit,
         requested_service_tier.as_deref(),
     ) {
         Ok(normalized) => usage = normalized,

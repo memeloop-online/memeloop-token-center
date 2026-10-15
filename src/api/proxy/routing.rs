@@ -153,8 +153,8 @@ pub(super) fn plan_proxy_route(
     } else {
         None
     };
-    let output_token_ceiling = match codex_plan.as_ref() {
-        Some(plan) => plan.output_token_ceiling,
+    let (output_token_ceiling, output_token_limit) = match codex_plan.as_ref() {
+        Some(plan) => (plan.output_token_ceiling, Some(plan.output_token_ceiling)),
         None if compact_v2_bridge
             || matches!(
                 protocol,
@@ -169,11 +169,19 @@ pub(super) fn plan_proxy_route(
                         | Protocol::OpenAiAlphaSearch
                 )) =>
         {
-            passthrough_output_reservation_bound(
+            let estimate = passthrough_output_reservation_bound(
                 &forwarded_json,
                 &route.config,
                 &route.upstream_model,
-            )?
+            )?;
+            let limit = if matches!(protocol, Protocol::OpenAiResponses) && !compact_v2_bridge {
+                forwarded_json
+                    .get("max_output_tokens")
+                    .and_then(Value::as_i64)
+            } else {
+                Some(estimate)
+            };
+            (estimate, limit)
         }
         None => match inject_controlled_output_ceiling(
             if responses_chat.is_some() {
@@ -185,8 +193,11 @@ pub(super) fn plan_proxy_route(
             },
             &mut forwarded_json,
         )? {
-            Some(ceiling) => ceiling,
-            None => configured_output_reservation_bound(&route.config, &route.upstream_model)?,
+            Some(ceiling) => (ceiling, Some(ceiling)),
+            None => (
+                configured_output_reservation_bound(&route.config, &route.upstream_model)?,
+                None,
+            ),
         },
     };
     let upstream_stream =
@@ -251,6 +262,7 @@ pub(super) fn plan_proxy_route(
         route,
         forwarded_json,
         output_token_ceiling,
+        output_token_limit,
         upstream_stream,
         codex_downstream_stream,
         codex_store_disabled,
@@ -291,9 +303,6 @@ fn configured_output_reservation_bound(
     config: &Value,
     upstream_model: &str,
 ) -> Result<i64, AppError> {
-    // Pass-through envelopes cannot assume an output cap that was never sent
-    // to the supplier. Reserve a trusted per-model bound before dispatch;
-    // actual usage still must fit the reservation at settlement.
     if let Some(bounds) = config.get("reservation_token_bounds") {
         let bounds = bounds.as_object().ok_or_else(|| {
             AppError::Upstream("compatible upstream reservation metadata must be an object".into())
