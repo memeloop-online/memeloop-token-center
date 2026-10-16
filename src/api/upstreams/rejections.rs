@@ -8,7 +8,7 @@ const REJECTION_BODY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Inspect only a small, bounded error envelope. Provider text is never
 /// returned or logged, and unknown rejections retain the existing fallback.
-pub(super) async fn classify_auth_rejection(response: wreq::Response) -> &'static str {
+pub(super) async fn classify_auth_rejection(response: reqwest::Response) -> &'static str {
     if response.status() != StatusCode::FORBIDDEN
         || response
             .content_length()
@@ -81,7 +81,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(status).set_body_json(body))
                 .mount(&server)
                 .await;
-            let response = wreq::Client::new()
+            let response = reqwest::Client::new()
                 .get(format!("{}/models", server.uri()))
                 .send()
                 .await
@@ -104,7 +104,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(403).set_body_string(body))
                 .mount(&server)
                 .await;
-            let response = wreq::Client::new()
+            let response = reqwest::Client::new()
                 .get(format!("{}/models", server.uri()))
                 .send()
                 .await
