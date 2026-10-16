@@ -530,6 +530,66 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
     assert_eq!(failed["price_sync"]["status"], "skipped");
     assert_eq!(failed["disabled_models"], json!([]));
 
+    // A recognized service-group model restriction is distinct from a bad
+    // key. Both management paths must retain that distinction without copying
+    // the upstream message, and failed sync must keep the previous snapshot.
+    for (upstream_status, error, expected) in [
+        (
+            403,
+            json!({"type": "model_permission", "code": "model_not_activated"}),
+            "permission_denied",
+        ),
+        (
+            401,
+            json!({"type": "authentication_error", "code": "api_key_not_found"}),
+            "authentication_failed",
+        ),
+    ] {
+        server.reset().await;
+        let mut error = error;
+        error["message"] = json!("private-provider-message catalog-secret");
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(matches_header("authorization", "Bearer catalog-secret"))
+            .respond_with(
+                ResponseTemplate::new(upstream_status).set_body_json(json!({"error": error})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let (status, failed) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/models/sync?tenant_external_id=catalog-tenant",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{failed}");
+        assert_eq!(failed["status"], "stale");
+        assert_eq!(failed["error_code"], expected);
+        assert_eq!(failed["models"].as_array().unwrap().len(), 251);
+        let (status, health) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/health?tenant_external_id=catalog-tenant",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{health}");
+        assert_eq!(health["status"], "unhealthy");
+        assert_eq!(health["error_code"], expected);
+        assert_eq!(health["upstream_status"], upstream_status);
+        for result in [failed, health] {
+            let serialized = result.to_string();
+            assert!(!serialized.contains("private-provider-message"));
+            assert!(!serialized.contains("catalog-secret"));
+        }
+    }
+    server.reset().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
