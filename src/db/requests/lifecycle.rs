@@ -17,19 +17,30 @@ use tracing::Instrument;
 
 const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstream_model = $1 WHERE id = $2 AND reservation_id = $3 AND created_at = $4";
 
+#[cfg(test)]
+mod admission_lock_tests;
+
+fn output_validity_price_snapshot(
+    price: &ModelPrice,
+    output_token_limit: Option<i64>,
+) -> Result<String, AppError> {
+    if output_token_limit.is_some_and(|limit| !(0..=1_000_000_000).contains(&limit)) {
+        return Err(AppError::Internal);
+    }
+    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::Internal)?;
+    snapshot["output_token_limit"] = serde_json::json!(output_token_limit);
+    serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)
+}
+
 async fn persist_output_token_limit(
     transaction: &mut Transaction<'_, Any>,
     reservation_id: Uuid,
     price: &ModelPrice,
     output_token_limit: Option<i64>,
 ) -> Result<(), AppError> {
-    if output_token_limit.is_some_and(|limit| !(0..=1_000_000_000).contains(&limit)) {
-        return Err(AppError::Internal);
-    }
-    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::Internal)?;
-    snapshot["output_token_limit"] = serde_json::json!(output_token_limit);
+    let snapshot = output_validity_price_snapshot(price, output_token_limit)?;
     let updated = sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2 AND status = 'reserved'")
-        .bind(serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?)
+        .bind(snapshot)
         .bind(reservation_id.to_string())
         .execute(&mut **transaction)
         .await?;
@@ -554,6 +565,7 @@ impl Database {
         upstream_model: Option<&str>,
         output_token_limit: Option<i64>,
     ) -> Result<StartedProxyRequest, AppError> {
+        let price_snapshot_json = output_validity_price_snapshot(input.price, output_token_limit)?;
         // A stable reservation UUID supplies the authenticated encryption owner
         // before any transaction or global budget lock is acquired.
         let reservation_id = Uuid::now_v7();
@@ -612,27 +624,10 @@ impl Database {
             } else {
                 (self.begin_write_transaction().await?, unix_millis(), None)
             };
-        BudgetHold::set_phase(&mut hold, "key_account_reservation");
-        let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
-            backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
-        let reservation = super::settlement::reserve_usage_with_id_in_transaction(
-            &mut transaction,
-            input.key,
-            input.price,
-            input.input_token_ceiling,
-            input.output_token_ceiling,
-            now,
-            reservation_id,
-        )
-        .instrument(reservation_span)
-        .await?;
-        persist_output_token_limit(
-            &mut transaction,
-            reservation.id,
-            input.price,
-            output_token_limit,
-        )
-        .await?;
+        // Claim this request's private identity before locking the shared key
+        // budget. A slow/contended locator or request insert must not hold up
+        // unrelated reservations on the same key. These rows remain invisible
+        // until the financial reservation and request commit together below.
         BudgetHold::set_phase(&mut hold, "request_record");
         let started_request = NewRequest {
             request_id: input.request_id,
@@ -641,7 +636,7 @@ impl Database {
             protocol: input.protocol.to_owned(),
             model: input.model.to_owned(),
             request_object: input.request_object.to_owned(),
-            reservation_id: reservation.id,
+            reservation_id,
             upstream_account_id: input.upstream_account_id,
             model_route_id: input.model_route_id,
         };
@@ -656,7 +651,7 @@ impl Database {
             let updated = sqlx::query(ADMISSION_UPSTREAM_MODEL_UPDATE)
                 .bind(upstream_model)
                 .bind(input.request_id.to_string())
-                .bind(reservation.id.to_string())
+                .bind(reservation_id.to_string())
                 .bind(now)
                 .execute(&mut *transaction)
                 .await?;
@@ -665,6 +660,21 @@ impl Database {
                 return Err(AppError::Internal);
             }
         }
+        BudgetHold::set_phase(&mut hold, "key_account_reservation");
+        let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
+            backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
+        let reservation = super::settlement::reserve_usage_with_snapshot_in_transaction(
+            &mut transaction,
+            input.key,
+            input.price,
+            input.input_token_ceiling,
+            input.output_token_ceiling,
+            now,
+            reservation_id,
+            price_snapshot_json,
+        )
+        .instrument(reservation_span)
+        .await?;
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
