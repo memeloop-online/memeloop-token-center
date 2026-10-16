@@ -192,6 +192,23 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
+    const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
+    for (const role of ['gateway', 'control']) {
+      const original = services.find(service => service.metadata.labels['app.kubernetes.io/component'] === role);
+      const web = services.find(service => service.metadata.labels['app.kubernetes.io/component'] === `${role}-web`);
+      assert.equal(original.spec.publishNotReadyAddresses, undefined, `${role}: APIs retain readiness withdrawal`);
+      assert.equal(web.spec.publishNotReadyAddresses, true, `${role}: static shell survives withdrawal`);
+      assert.equal(web.spec.type, 'ClusterIP');
+      assert.deepEqual(web.spec.selector, original.spec.selector);
+      assert.deepEqual(web.spec.ports, original.spec.ports);
+    }
+    for (const variant of ['gateway', 'control']) {
+      const ingress = parseAllDocuments(output[variant]!).map(document => document.toJSON()).find(document => document?.kind === 'Ingress');
+      const paths = ingress.spec.rules[0].http.paths;
+      for (const path of paths) {
+        assert.equal(path.backend.service.name.endsWith('-web'), ['/operator', '/portal', '/ui-assets', '/healthz'].includes(path.path), `${variant}: ${path.path}`);
+      }
+    }
     count('default', /livenessProbe:\s+httpGet: \{ path: "?\/livez"?, port: http \}/g, 3);
     has('configmap', 'configMap:'); has('pvc', 'persistentVolumeClaim:');
     for (const needle of ['name: install-plugin-0', `image: "ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@${installer}"`, '- --registry-username-file', '- --registry-password-file', '- --cosign-public-key', 'medium: Memory', 'sizeLimit: "16Mi"', 'secretName: plugin-cosign-keys', 'secretName: plugin-registry-auth']) count('oci', needle, 3);

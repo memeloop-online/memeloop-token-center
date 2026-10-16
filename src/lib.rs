@@ -110,7 +110,7 @@ pub struct AppState {
 #[derive(Debug, thiserror::Error)]
 pub enum InitializationError {
     #[error("database initialization failed")]
-    Database,
+    Database(crate::error::AppError),
     #[error("archive initialization failed")]
     Archive,
     #[error("plugin initialization failed")]
@@ -121,6 +121,15 @@ pub enum InitializationError {
     ProxyMemoryBudget,
     #[error("invalid transport proxy groups")]
     TransportProxyGroups,
+}
+
+fn plugin_initialization_error(error: crate::error::AppError) -> InitializationError {
+    match error {
+        crate::error::AppError::DatabaseUnavailable(_) | crate::error::AppError::Overloaded => {
+            InitializationError::Database(error)
+        }
+        _ => InitializationError::Plugin,
+    }
 }
 
 impl AppState {
@@ -148,16 +157,16 @@ impl AppState {
                 config.database_max_connections,
             )
             .await
-            .map_err(|_| InitializationError::Database)?;
+            .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db
                 .migrate_with_credential_pepper(config.key_pepper.as_bytes())
                 .await
-                .map_err(|_| InitializationError::Database)?;
+                .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;
         }
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await
-            .map_err(|_| InitializationError::Database)?
+            .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
         let archive = ArchiveStore::from_config(&config)
             .await
@@ -179,7 +188,7 @@ impl AppState {
         plugins
             .validate_stored_configurations()
             .await
-            .map_err(|_| InitializationError::Plugin)?;
+            .map_err(plugin_initialization_error)?;
         let mut providers = ProviderCatalog::builtins();
         providers
             .extend(plugins.provider_types())
@@ -198,7 +207,7 @@ impl AppState {
                         &plugins,
                     )
                     .await
-                    .map_err(|_| InitializationError::Plugin)?
+                    .map_err(plugin_initialization_error)?
                     .with_installation_policy_file(
                         config
                             .plugin_install_policy_file
