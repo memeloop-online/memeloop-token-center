@@ -277,19 +277,9 @@ async fn postgres_proxy_group_116_accepts_empty_113_and_later_114_115() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let administrative = Database::connect(&url).await.unwrap();
-    let name = format!("mtc_proxy_schema_{}", uuid::Uuid::now_v7().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .execute(&administrative.pool)
-        .await
-        .unwrap();
-    let mut isolated = url::Url::parse(&url).unwrap();
-    isolated.set_path(&name);
-    let database = Database::connect(isolated.as_str()).await.unwrap();
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let database = Database::connect(fixture.url()).await.unwrap();
     upgrade_contract(&database).await;
     database.pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
-        .execute(&administrative.pool)
-        .await
-        .unwrap();
+    fixture.cleanup().await;
 }
