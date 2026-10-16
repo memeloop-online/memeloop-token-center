@@ -146,6 +146,15 @@ fn operator_bridge_requires_nonstreaming_json() {
 
 #[tokio::test]
 async fn control_inference_returns_tool_calls_and_settles_selected_billing_key() {
+    successful_inference(false).await;
+}
+
+#[tokio::test]
+async fn control_messages_returns_tool_use_and_settles_selected_billing_key() {
+    successful_inference(true).await;
+}
+
+async fn successful_inference(anthropic: bool) {
     use crate::{
         db::{CreateModelRouteInput, CreateUpstreamAccountInput},
         provider::UpstreamCredential,
@@ -155,15 +164,27 @@ async fn control_inference_returns_tool_calls_and_settles_selected_billing_key()
         matchers::{header as header_matcher, method, path},
     };
     let upstream = MockServer::start().await;
-    let completion = json!({
-        "id":"chatcmpl-operator-fixture", "object":"chat.completion", "created":1, "model":"fixture",
-        "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{
-            "id":"call-fixture", "type":"function", "function":{"name":"inspect","arguments":"{}"}
-        }]},"finish_reason":"tool_calls"}],
-        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
-    });
+    let completion = if anthropic {
+        json!({
+            "id":"msg_operator_fixture","type":"message","role":"assistant","model":"fixture",
+            "content":[{"type":"tool_use","id":"toolu_fixture","name":"inspect","input":{}}],
+            "stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}
+        })
+    } else {
+        json!({
+            "id":"chatcmpl-operator-fixture", "object":"chat.completion", "created":1, "model":"fixture",
+            "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{
+                "id":"call-fixture", "type":"function", "function":{"name":"inspect","arguments":"{}"}
+            }]},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+        })
+    };
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path(if anthropic {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        }))
         .and(header_matcher("authorization", "Bearer provider-fixture"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&completion))
         .expect(1)
@@ -198,7 +219,7 @@ async fn control_inference_returns_tool_calls_and_settles_selected_billing_key()
             public_model: "fixture".into(),
             upstream_account_id: account.id,
             upstream_model: "fixture".into(),
-            protocol: "openai".into(),
+            protocol: if anthropic { "anthropic" } else { "openai" }.into(),
             priority: 0,
         })
         .await
@@ -238,8 +259,16 @@ async fn control_inference_returns_tool_calls_and_settles_selected_billing_key()
         )
         .await
         .unwrap();
+    let mut request = inference(&service.token, key.key_id);
+    if anthropic {
+        *request.uri_mut() = "/internal/v1/inference/messages".parse().unwrap();
+        *request.body_mut() = Body::from(json!({"key_id":key.key_id,"request":{
+            "model":"fixture","messages":[{"role":"user","content":"hello"}],"max_tokens":64,
+            "tools":[{"name":"inspect","description":"Inspect fixture","input_schema":{"type":"object"}}],"stream":false
+        }}).to_string());
+    }
     let response = router_for_role(state.clone(), RuntimeRole::Control)
-        .oneshot(inference(&service.token, key.key_id))
+        .oneshot(request)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -248,7 +277,12 @@ async fn control_inference_returns_tool_calls_and_settles_selected_billing_key()
         .await
         .unwrap();
     let actual: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(actual["choices"], completion["choices"]);
+    if anthropic {
+        assert_eq!(actual["content"], completion["content"]);
+        assert_eq!(actual["stop_reason"], "tool_use");
+    } else {
+        assert_eq!(actual["choices"], completion["choices"]);
+    }
     assert_eq!(actual["usage"], completion["usage"]);
     let output = String::from_utf8_lossy(&bytes);
     for secret in [&key.key, &service.token] {
@@ -287,4 +321,28 @@ async fn control_inference_returns_tool_calls_and_settles_selected_billing_key()
     }
     assert!(!String::from_utf8_lossy(&forwarded[0].body).contains(&key.key));
     assert!(!String::from_utf8_lossy(&forwarded[0].body).contains(&service.token));
+}
+
+#[tokio::test]
+async fn messages_requires_the_same_key_write_permission() {
+    let (state, _directory) = crate::api::tests::test_state().await;
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "messages-readonly".into(),
+                scopes: vec!["keys:read".into()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut request = inference(&service.token, Uuid::now_v7());
+    *request.uri_mut() = "/internal/v1/inference/messages".parse().unwrap();
+    let response = router_for_role(state, RuntimeRole::Control)
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
