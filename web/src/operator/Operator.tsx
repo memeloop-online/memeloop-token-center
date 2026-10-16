@@ -271,7 +271,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     {scope.serviceFault && <div className="notice error" role="alert">{scope.serviceFault}<Button appearance="secondary" onClick={scope.retry} disabled={scope.authenticating}>{t('common.retry')}</Button></div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating && activeRoute !== 'system-settings'
+      {scope.authenticating && !scope.activeCredential && activeRoute !== 'system-settings'
         ? <LoadingState label={t('common.loading')} level="page" />
         : <Fragment key={pageScopeKey}><Suspense fallback={<LoadingState label={t('common.loading')} level="page" />}>{page}</Suspense></Fragment>}
     </section>

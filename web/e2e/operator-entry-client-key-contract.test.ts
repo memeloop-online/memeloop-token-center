@@ -42,29 +42,50 @@ test('only a server 401 against the client-key shape shows the portal guidance',
 });
 
 test('a rejected credential is never stored and never shown as signed in', () => {
-  assert.match(scope, /: \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \}/);
-  assert.match(scope, /dispatch\(\{ type: 'authentication-failed', message, preserve: false \}\)/);
+  assert.match(scope, /return \{ credential: '', validated: false, credentialInput: state\.credentialInput, tenant: '', tenants: \[\], status: \{ kind: 'failed', message: action\.message \} \};/);
+  assert.match(scope, /dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
 });
 
-test('a 403 permission denial shows the server message and only clears an unproven credential', () => {
+test('a 403 is a definitive denial, never an outage and never an active session', () => {
   assert.match(scope, /reason instanceof ApiError && reason\.status === 403/);
-  assert.match(scope, /const preserve = before\.validated && Boolean\(before\.credential\);\s*if \(!preserve\) clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-failed', message: messageOf\(reason, t\('common\.connectionFailed'\)\), preserve \}\)/);
-  assert.match(scope, /reason\.status === 403\) \{\s*dispatch\(\{ type: 'authentication-failed', message: messageOf\(reason, t\('common\.connectionFailed'\)\), preserve: true \}\)/);
+  // A validated identity is deactivated: validated flips false so pages and
+  // streams lose authorization, while the saved credential is kept.
+  assert.match(scope, /if \(action\.outcome === 'denied'\) return \{ \.\.\.state, validated: false, status: \{ kind: 'failed', message: action\.message \} \};/);
+  assert.match(scope, /reason\.status === 403\) \{\s*dispatch\(\{ type: 'authentication-failed', message: messageOf\(reason, t\('common\.connectionFailed'\)\), outcome: 'denied' \}\);\s*return;\s*\}/);
+  // An unproven candidate is dropped with its saved value, never promoted.
+  assert.match(scope, /if \(before\.validated\) \{\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'denied' \}\);\s*return;\s*\}\s*clearRememberedCredential\('operator'\);\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'reject' \}\)/);
+  assert.doesNotMatch(scope, /preserve:/);
+});
+
+test('a failed replacement candidate proves nothing about the validated session', () => {
+  assert.match(scope, /const replacement = before\.validated && Boolean\(before\.credential\) && candidate !== before\.credential;/);
+  assert.match(scope, /if \(replacement\) \{\s*dispatch\(\{ type: 'authentication-failed', message, outcome: 'session-kept' \}\);\s*return;\s*\}/);
+  assert.match(scope, /if \(action\.outcome === 'session-kept'\) return \{ \.\.\.state, status: \{ kind: 'failed', message: action\.message \} \};/);
+});
+
+test('tenant selection never masquerades as recovery; only a successful read recovers', () => {
+  const selectAt = scope.indexOf("case 'select-tenant':");
+  const clearAt = scope.indexOf("case 'clear':");
+  assert.ok(selectAt > -1 && clearAt > selectAt);
+  const selectCase = scope.slice(selectAt, clearAt);
+  assert.match(selectCase, /return \{ \.\.\.state, tenant: action\.tenant \};/);
+  assert.doesNotMatch(selectCase, /kind: 'ready'/);
+  assert.match(scope, /return \{ \.\.\.state, tenants: action\.tenants, tenant: action\.tenant, status: \{ kind: 'ready' \} \};/);
 });
 
 test('only a definitive 401 or 403, or an explicit user clear, removes the remembered credential', () => {
   const clearSites = [...scope.matchAll(/clearRememberedCredential\('operator'\)/g)].map((match) => match.index ?? 0);
   assert.equal(clearSites.length, 4, '401 and 403 rejections in authenticate and refresh, plus the explicit clear control');
   for (const at of clearSites) {
-    const context = scope.slice(Math.max(0, at - 320), at);
-    assert.ok(/reason\.status === 401|!preserve|function clearCredential/.test(context), 'every clearing site follows a definitive rejection or the explicit clear control');
+    const context = scope.slice(Math.max(0, at - 640), at);
+    assert.ok(/reason\.status === 401|reason\.status === 403|function clearCredential/.test(context), 'every clearing site follows a definitive rejection or the explicit clear control');
   }
 });
 
 test('a network, 502, 503 or database outage preserves the session, page and draft', () => {
   assert.match(scope, /\{ \.\.\.state, status: \{ kind: 'unavailable', message: action\.message, candidate: action\.candidate \} \}/);
   assert.match(scope, /dispatch\(\{ type: 'authentication-unavailable', message: outageMessage\(reason\), candidate \}\)/);
-  assert.match(scope, /state\.validated && \(state\.status\.kind === 'ready' \|\| state\.status\.kind === 'failed' \|\| state\.status\.kind === 'unavailable'\)/);
+  assert.match(scope, /state\.validated && \(\s*state\.status\.kind === 'ready'\s*\|\| state\.status\.kind === 'failed'\s*\|\| state\.status\.kind === 'unavailable'\s*\|\| \(state\.status\.kind === 'authenticating' && state\.status\.candidate === state\.credential\)\s*\) \? state\.credential : '';/);
   assert.match(scope, /t\('operator\.serviceUnavailable'\)/);
   assert.match(scope, /apiDiagnosticMessage\(reason, t\('common\.connectionFailed'\)/);
 });
@@ -83,6 +104,10 @@ test('retry re-attempts the preserved candidate without new side effects', () =>
   assert.match(scope, /if \(current\.status\.kind !== 'unavailable'\) return;/);
   assert.match(scope, /void authenticate\(current\.status\.candidate\)/);
   assert.match(operator, /scope\.serviceFault && <div className="notice error" role="alert">\{scope\.serviceFault\}<Button appearance="secondary" onClick=\{scope\.retry\} disabled=\{scope\.authenticating\}>/);
+  // Retrying the session's own credential keeps the mounted page and its
+  // drafts; only a scope without an active credential falls back to the
+  // loading page.
+  assert.match(operator, /\{scope\.authenticating && !scope\.activeCredential && activeRoute !== 'system-settings'/);
 });
 
 test('the access card reuses Fluent controls and drops scoped native buttons', () => {
