@@ -386,6 +386,27 @@ pub(crate) fn reservation_ceiling_amounts(
     Ok((reserved_micros, reserved_tokens))
 }
 
+fn usage_contract_amounts(
+    mode: EnforcementMode,
+    price: &ModelPrice,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+) -> Result<(i64, i64), AppError> {
+    if mode.enforces_prepaid_limits() {
+        return reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling);
+    }
+    // Unlimited credentials retain a private delivery/price contract, not a
+    // financial hold. Do not price hypothetical usage or apply prepaid budget
+    // arithmetic; only validate the token contract needed by finalization.
+    if input_token_ceiling < 0 || output_token_ceiling < 0 {
+        return Err(AppError::Internal);
+    }
+    let tokens = input_token_ceiling
+        .checked_add(output_token_ceiling)
+        .ok_or_else(|| AppError::BadRequest("token ceiling exceeds the supported range".into()))?;
+    Ok((0, tokens))
+}
+
 pub(crate) async fn reserve_usage_in_transaction(
     tx: &mut Transaction<'_, Any>,
     key: &AuthenticatedKey,
@@ -439,8 +460,12 @@ pub(super) async fn reserve_usage_with_snapshot_in_transaction(
     id: Uuid,
     price_snapshot_json: String,
 ) -> Result<UsageReservation, AppError> {
-    let (reserved_micros, reserved_tokens) =
-        reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
+    let (reserved_micros, reserved_tokens) = usage_contract_amounts(
+        key.policy.enforcement_mode,
+        price,
+        input_token_ceiling,
+        output_token_ceiling,
+    )?;
     reserve_usage_contract_with_id_in_transaction(
         tx,
         key,
@@ -476,13 +501,16 @@ pub(crate) async fn reserve_metered_usage_with_id_in_transaction(
             "metered request requires a positive unit ceiling and billing unit".into(),
         ));
     }
-    let reserved_micros =
+    let reserved_micros = if key.policy.enforcement_mode.enforces_prepaid_limits() {
         unit_ceiling
             .checked_mul(price.micros_per_unit)
             .ok_or(AppError::LimitExceeded {
                 reason: LimitReason::BalanceExhausted,
                 retry_after_seconds: None,
-            })?;
+            })?
+    } else {
+        0
+    };
     let reservation = reserve_usage_contract_with_id_in_transaction(
         tx,
         key,
@@ -777,13 +805,16 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     output_token_ceiling: i64,
     now: i64,
 ) -> Result<UsageReservation, AppError> {
+    // A policy edit must not turn an existing prepaid financial hold into an
+    // unlimited contract (or retroactively debit an unlimited request).
+    let mode = reservation.enforcement_mode;
     let (reserved_micros, reserved_tokens) =
-        reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
+        usage_contract_amounts(mode, price, input_token_ceiling, output_token_ceiling)?;
     // Settlement locks key -> account -> reservation. Never hold this
     // reservation while waiting for its key, or a concurrent settlement can
     // hold the key while waiting for us. Unchanged contracts and unlimited
     // reservations do not mutate the shared budget and need no key lock.
-    let budget_state = if key.policy.enforcement_mode.enforces_prepaid_limits()
+    let budget_state = if mode.enforces_prepaid_limits()
         && (reservation.reserved_micros != reserved_micros
             || reservation.reserved_tokens != reserved_tokens)
     {
@@ -794,7 +825,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     let current = sqlx::query(
         "UPDATE usage_reservations SET reserved_tokens = reserved_tokens
          WHERE id = $1 AND account_id = $2 AND key_id = $3 AND status = 'reserved'
-         RETURNING reserved_micros, reserved_tokens, rate_window_start",
+         RETURNING reserved_micros, reserved_tokens, rate_window_start, enforcement_mode",
     )
     .bind(reservation.id.to_string())
     .bind(reservation.account_id.to_string())
@@ -805,7 +836,10 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     let old_micros: i64 = current.try_get("reserved_micros")?;
     let old_tokens: i64 = current.try_get("reserved_tokens")?;
     let rate_window_start: i64 = current.try_get("rate_window_start")?;
-    if old_micros != reservation.reserved_micros
+    if current.try_get::<String, _>("enforcement_mode")? != mode.as_str()
+        || key.key_id != reservation.key_id
+        || key.account_id != reservation.account_id
+        || old_micros != reservation.reserved_micros
         || old_tokens != reservation.reserved_tokens
         || rate_window_start != reservation.rate_window_start
     {
@@ -816,7 +850,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     if old_micros == reserved_micros && old_tokens == reserved_tokens {
         return replace_reservation_price_in_transaction(tx, reservation, price).await;
     }
-    if !key.policy.enforcement_mode.enforces_prepaid_limits() {
+    if !mode.enforces_prepaid_limits() {
         let updated = sqlx::query(
             "UPDATE usage_reservations SET reserved_micros = $1, reserved_tokens = $2
              WHERE id = $3 AND account_id = $4 AND key_id = $5 AND status = 'reserved'
@@ -1145,7 +1179,7 @@ async fn settle_token_usage_with_explicit_charge(
         Some(_) => return Err(AppError::Internal),
         None => price_token_usage(reservation, usage)?,
     };
-    if lock_projection {
+    if lock_projection && reservation.enforcement_mode.enforces_prepaid_limits() {
         lock_request_stats_projection_writer_in_transaction(tx).await?;
     }
     if !reservation.enforcement_mode.enforces_prepaid_limits() {

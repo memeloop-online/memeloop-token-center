@@ -86,7 +86,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const count = (key: string, pattern: string | RegExp, expected: number): void => assert.equal(occurrences(output[key]!, pattern), expected, `${key} count for ${String(pattern)}`);
 
     assert.equal(output.terminalProjectionDisabled, output.default);
-    count('default', 'name: MTC_TERMINAL_PROJECTION_ENABLED', 0);
+    count('default', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "false"/, 1);
     count('terminalProjectionEnabled', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
     count('terminalProjectionAll', /name: MTC_TERMINAL_PROJECTION_ENABLED\n\s+value: "true"/, 1);
     const enabledProjectionDocuments = parseAllDocuments(output.terminalProjectionEnabled!).map(document => document.toJSON() as RuntimeDeployment);
@@ -95,7 +95,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const container = deployment.spec.template.spec.containers[0]!;
       const flag = container.env.filter(variable => variable.name === 'MTC_TERMINAL_PROJECTION_ENABLED');
       assert.deepEqual(flag, role === 'gateway' ? [{ name: 'MTC_TERMINAL_PROJECTION_ENABLED', value: 'true' }] : []);
-      container.env = container.env.filter(variable => variable.name !== 'MTC_TERMINAL_PROJECTION_ENABLED');
+      for (const variable of flag) variable.value = 'false';
     }
     assert.deepEqual(enabledProjectionDocuments, parseAllDocuments(output.default!).map(document => document.toJSON()));
     const allProjectionDeployment = parseAllDocuments(output.terminalProjectionAll!).map(document => document.toJSON() as RuntimeDeployment).find(document => document?.kind === 'Deployment')!;

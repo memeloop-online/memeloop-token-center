@@ -19,6 +19,8 @@ const ADMISSION_UPSTREAM_MODEL_UPDATE: &str = "UPDATE request_records SET upstre
 
 #[cfg(test)]
 mod admission_lock_tests;
+#[cfg(test)]
+mod unlimited_admission_tests;
 
 fn output_validity_price_snapshot(
     price: &ModelPrice,
@@ -660,21 +662,6 @@ impl Database {
                 return Err(AppError::Internal);
             }
         }
-        BudgetHold::set_phase(&mut hold, "key_account_reservation");
-        let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
-            backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
-        let reservation = super::settlement::reserve_usage_with_snapshot_in_transaction(
-            &mut transaction,
-            input.key,
-            input.price,
-            input.input_token_ceiling,
-            input.output_token_ceiling,
-            now,
-            reservation_id,
-            price_snapshot_json,
-        )
-        .instrument(reservation_span)
-        .await?;
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
             let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
@@ -725,6 +712,24 @@ impl Database {
         } else if prepared_request_batch.is_some() {
             return Err(AppError::Internal);
         }
+        // Finish private archive writes before taking any financial hold.
+        // Admission remains one atomic commit, but a slow archive batch cannot
+        // hold the shared key/account rows against another request.
+        BudgetHold::set_phase(&mut hold, "key_account_reservation");
+        let reservation_span = tracing::info_span!("archive_budget_reservation", request_id = %input.request_id,
+            backend_pid = ?hold.as_ref().and_then(BudgetHold::backend_pid));
+        let reservation = super::settlement::reserve_usage_with_snapshot_in_transaction(
+            &mut transaction,
+            input.key,
+            input.price,
+            input.input_token_ceiling,
+            input.output_token_ceiling,
+            now,
+            reservation_id,
+            price_snapshot_json,
+        )
+        .instrument(reservation_span)
+        .await?;
         // Acquire the globally serialized event cursor only after all archive
         // batches are inserted. The event and admission remain one commit,
         // without holding the cross-tenant cursor during compression/inserts.
