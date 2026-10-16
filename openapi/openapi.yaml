@@ -174,6 +174,110 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/api-schema:
+    get:
+      tags: [System]
+      operationId: discoverApiSchema
+      summary: Discover the complete OpenAPI contract
+      description: Authentication does not grant permission to invoke discovered operations.
+      security: [{ serviceBearer: [] }]
+      responses:
+        '200':
+          description: OpenAPI 3.1 JSON document; includes operations requiring additional scopes
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /internal/v1/inference/chat/completions:
+    post:
+      tags: [Client credentials]
+      operationId: operatorChatCompletion
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Requires an active key with a stored copyable credential. Only JSON
+        completions are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: OpenAI-compatible chat completion billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON completion request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/inference/messages:
+    post:
+      tags: [Client credentials]
+      operationId: operatorMessages
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Requires an active key with a stored copyable credential. Only JSON
+        messages are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: Anthropic Messages response billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON Messages request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /internal/v1/keys:
     get:
       tags: [Client credentials]

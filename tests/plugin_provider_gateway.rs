@@ -48,7 +48,7 @@ async fn plugin_provider_onboards_through_the_real_management_api() {
         directory.path().join("plugin-onboarding.db").display()
     );
     let mut config = Config::for_test(database_url);
-    config.plugin_dir = Some("examples/plugins".to_owned());
+    config.plugin_dir = Some(".plugin-examples/examples/plugins".to_owned());
     let state = AppState::initialize(config).await.unwrap();
     let response = api::router_for_role(state.clone(), RuntimeRole::Control)
         .oneshot(
@@ -236,7 +236,7 @@ async fn component_provider_fixture(
         directory.path().join(database_name).display()
     );
     let mut config = Config::for_test(database_url);
-    config.plugin_dir = Some("examples/plugins".to_owned());
+    config.plugin_dir = Some(".plugin-examples/examples/plugins".to_owned());
     let state = AppState::initialize(config).await.unwrap();
     let pepper = state.config.key_pepper.as_bytes();
     let issued = state

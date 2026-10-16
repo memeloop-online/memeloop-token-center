@@ -202,6 +202,8 @@ pub enum PluginOperatorUiSlot {
     PageBefore,
     #[serde(rename = "operator.page.after")]
     PageAfter,
+    #[serde(rename = "operator.model-route.action")]
+    ModelRouteAction,
 }
 
 /// Closed, core-owned visual presentation choices for declarative operator
@@ -2399,6 +2401,18 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 {
                     return Err(AppError::BadRequest(format!(
                         "plugin {} overview-card contribution cannot declare a route or category",
+                        manifest.id
+                    )));
+                }
+            }
+            PluginOperatorUiSlot::ModelRouteAction => {
+                if contribution.renderer != "component_v1"
+                    || contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || contribution.target_route.is_some()
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} model-route action requires a component without route or category",
                         manifest.id
                     )));
                 }

@@ -1,5 +1,10 @@
 # 插件开发
 
+插件示例源码和可安装样例统一维护在 [memeloop-token-center-example-plugins](https://github.com/memeloop-online/memeloop-token-center-example-plugins)。宿主 CI 将已审查的固定提交检出到 `.plugin-examples`；生产构建不携带这些示例。
+
+在 CI 之外运行宿主测试前，先将 `.github/actions/checkout-plugin-examples/action.yml` 中记录的同一提交检出到 `.plugin-examples`。示例源码已从宿主仓库移出。
+
+
 本文覆盖开发一个 MTC 插件的最小闭环：实现 WIT 导出 → 编写 `plugin.json` → OCI 打包与签名 → 提交到部署的发布流程。接口的权威定义是 [token-center.wit](https://github.com/memeloop-online/memeloop-token-center/blob/master/wit/token-center.wit)（当前包版本 `memeloop:token-center@0.2.0`）与[清单 Schema](https://github.com/memeloop-online/memeloop-token-center/blob/master/schemas/plugin-manifest.schema.json)。
 
 ## WIT ABI
@@ -163,5 +168,5 @@ cosign sign --key cosign.key "ghcr.io/example/token-center-plugins/example-polic
 
 ## 边界说明
 
-- 本文列出的扩展点是当前 ABI 的全部：流式请求钩子、任意 JavaScript UI、插件自创账户/路由等都不存在，请勿按「将来会有」设计。
+- 经过签名的[管理界面扩展](operator-ui.md)可以使用当前用户有权调用的 API。流式请求钩子不属于当前 ABI。
 - 组路由使用独立的 `group-routing-plugin` world，见[组路由](routing.md)。
