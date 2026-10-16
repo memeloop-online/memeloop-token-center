@@ -8,14 +8,14 @@ import { fileURLToPath } from 'node:url';
 const packages = {
   'model-guard': {
     id: 'mtc-model-guard',
-    crate: 'plugin-sources/model-guard',
+    crate: '.plugin-examples/plugin-sources/model-guard',
     wasm: 'mtc_model_guard.wasm',
     source: 'ghcr.io/memeloop-online/mtc-model-guard',
     hostTest: 'first_party_model_guard',
   },
   'preferred-account': {
     id: 'mtc-preferred-account',
-    crate: 'plugin-sources/preferred-account',
+    crate: '.plugin-examples/plugin-sources/preferred-account',
     wasm: 'mtc_preferred_account.wasm',
     source: 'ghcr.io/memeloop-online/mtc-preferred-account',
     hostTest: 'first_party_preferred_account',

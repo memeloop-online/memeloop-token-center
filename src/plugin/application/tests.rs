@@ -14,7 +14,7 @@ fn write_inventory(root: &std::path::Path, second: bool) {
     let package = root.join("example-policy-rewrite");
     std::fs::create_dir_all(&package).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../examples/plugins/policy-rewrite/plugin.json"
+        "../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.json"
     ))
     .unwrap();
     if second {
@@ -25,7 +25,9 @@ fn write_inventory(root: &std::path::Path, second: bool) {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    let mut source = include_str!("../../../examples/plugins/policy-rewrite/plugin.wat").to_owned();
+    let mut source =
+        include_str!("../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat")
+            .to_owned();
     if second {
         // Equal-length replacements preserve the fixture's canonical ABI offsets.
         source = source

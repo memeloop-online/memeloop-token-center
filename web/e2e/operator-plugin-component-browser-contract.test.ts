@@ -62,6 +62,10 @@ test('an installed runtime module renders without rebuilding MTC and failures st
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-component.html`);
     await page.getByTestId('trusted-plugin-workspace').getByText('ready', { exact: true }).waitFor();
     assert.deepEqual(dataCalls, [{ tenant: 'alpha', authorization: 'Bearer mts_component_fixture' }]);
+    await page.getByRole('button', { name: 'Refresh host view 0' }).click();
+    await page.getByRole('button', { name: 'Refresh host view 1' }).waitFor();
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    assert.equal(dataCalls.length, 1, 'unrelated host renders must not restart plugin API effects');
     await page.getByRole('button', { name: 'Open providers' }).click();
     await page.locator('.provider-directory').waitFor();
     await page.getByTestId('healthy-page-extension').waitFor();

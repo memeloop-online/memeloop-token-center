@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { CopyButton } from '../../CopyButton';
 import { formatCurrency, formatNumber, formatPercent } from '../../format';
@@ -1270,7 +1270,7 @@ function RouteFields({ token, tenant, draft, existingSelection, upstreams, provi
   </div>;
 }
 
-function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
+function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers, renderModelRouteActions }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[]; renderModelRouteActions?: (route: ModelRouteView) => ReactNode }) {
   const routePageSize = 100;
   const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
@@ -1474,7 +1474,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     finally { setBusy(''); }
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id} tabIndex={focusRouteId === route.id ? -1 : undefined} data-route-id={route.id} className={focusRouteId === route.id ? 'route-focus' : undefined}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id} tabIndex={focusRouteId === route.id ? -1 : undefined} data-route-id={route.id} className={focusRouteId === route.id ? 'route-focus' : undefined}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button>{renderModelRouteActions?.(route)}</div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
     </article>
     <CreateJourney title={editing ? t('routes.editTitle', { model: editing.public_model }) : t('routes.createTitle')} description={t('routes.description')} open={workspaceOpen} busy={Boolean(busy)} onOpenChange={(open) => { setWorkspaceOpen(open); if (!open) setEditing(undefined); }} onOpen={() => { setCredentialsRequested(true); setMessage(''); }}>
       {message && workspaceOpen && <div className="notice success" role="status">{message}</div>}
@@ -2242,7 +2242,7 @@ export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {
   </>;
 }
 
-export function RoutesPage({ token, tenant, writeTenant }: OperatorPageProps) {
+export function RoutesPage({ token, tenant, writeTenant, renderModelRouteActions }: OperatorPageProps & { renderModelRouteActions?: (route: ModelRouteView) => ReactNode }) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
@@ -2256,7 +2256,7 @@ export function RoutesPage({ token, tenant, writeTenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, upstreams }) =>
-    <RouteWorkspace token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} upstreams={upstreams} />
+    <RouteWorkspace token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} upstreams={upstreams} renderModelRouteActions={renderModelRouteActions} />
   }</ResourceBoundary>;
 }
 

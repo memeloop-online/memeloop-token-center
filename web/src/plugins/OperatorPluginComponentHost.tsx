@@ -3,6 +3,7 @@ import {
   Suspense,
   lazy,
   useMemo,
+  useRef,
   useState,
   type ComponentType,
   type ErrorInfo,
@@ -11,6 +12,7 @@ import {
 import * as ReactRuntime from 'react';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
+import { createOperatorApiBridge } from './operatorApiBridge.js';
 import type { PluginOperatorUiContribution, PluginServiceDataResponse } from '../types.js';
 import {
   OPERATOR_UI_PACKAGE_API_V1,
@@ -32,7 +34,8 @@ export interface OperatorPluginComponentHostProps {
   tenantExternalId: string;
   locale: string;
   compact?: boolean;
-  onNavigate: (route: string) => void;
+  context?: Record<string, unknown>;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
 }
 
 interface BoundaryProps {
@@ -132,6 +135,7 @@ function PluginComponent({
   locale,
   compact,
   onNavigate,
+  context,
   retry,
 }: OperatorPluginComponentHostProps & { compact: boolean; retry: number }) {
   const url = moduleUrl(pluginId, pluginVersion, contribution);
@@ -139,15 +143,24 @@ function PluginComponent({
     () => lazy(() => componentLoad(url, pluginId, pluginVersion, contribution.component_id!)),
     [contribution.component_id, pluginId, pluginVersion, retry, url],
   );
-  const hostApi = useMemo<OperatorUiHostApiV1>(() => ({
-    loadServiceData(endpointId: string, signal?: AbortSignal) {
-      if (!serviceEndpointIds.includes(endpointId)) {
-        return Promise.reject(new Error(`Unknown service-data endpoint: ${endpointId}`));
-      }
-      return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
-    },
-    navigate: onNavigate,
-  }), [credential, onNavigate, pluginId, serviceEndpointIds, tenantExternalId]);
+  // Parent renders must not replace the API object and restart plugin work.
+  // Navigation still uses the latest guard and route registry.
+  const navigationRef = useRef(onNavigate);
+  navigationRef.current = onNavigate;
+  const hostApi = useMemo<OperatorUiHostApiV1>(() => {
+    const requestApi = createOperatorApiBridge(credential, tenantExternalId);
+    return {
+      loadServiceData(endpointId: string, signal?: AbortSignal) {
+        if (!serviceEndpointIds.includes(endpointId)) {
+          return Promise.reject(new Error(`Unknown service-data endpoint: ${endpointId}`));
+        }
+        return api<PluginServiceDataResponse>(serviceDataPath(pluginId, endpointId, tenantExternalId), credential, { signal });
+      },
+      requestApi,
+      discoverApi: (signal?: AbortSignal) => requestApi<Record<string, unknown>>({ path: '/internal/v1/api-schema', signal }),
+      navigate: (route, context) => navigationRef.current(route, context),
+    };
+  }, [credential, pluginId, serviceEndpointIds, tenantExternalId]);
 
   return <Suspense fallback={<div className="empty" role="status">Loading plugin view…</div>}>
     <LazyComponent
@@ -158,6 +171,7 @@ function PluginComponent({
       locale={locale}
       compact={compact}
       api={hostApi}
+      context={context}
     />
   </Suspense>;
 }
