@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'release/**']
     tags: ['v*']
   pull_request:
 
@@ -945,7 +945,12 @@ jobs:
             exit 1
           fi
           mapfile -d '' assets < <(find "$RUNNER_TEMP/github-release-assets" -maxdepth 1 -type f ! -name RELEASE.md -print0 | sort -z)
+          release_options=()
+          if [[ "$VERSION_TAG" == *-* ]]; then
+            release_options+=(--prerelease --latest=false)
+          fi
           gh release create "$VERSION_TAG" "${assets[@]}" \
+            "${release_options[@]}" \
             --verify-tag \
             --title "MemeLoop Token Center $VERSION_TAG" \
             --notes-file "$RUNNER_TEMP/github-release-assets/RELEASE.md"
