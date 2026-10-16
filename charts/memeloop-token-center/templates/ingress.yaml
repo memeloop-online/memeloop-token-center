@@ -44,7 +44,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+                name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}{{ if has $path (list "/portal" "/operator" "/ui-assets" "/healthz") }}-web{{ end }}
                 port:
                   name: http
           {{- end }}
@@ -56,7 +56,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+                name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}{{ if has $path (list "/portal" "/operator" "/ui-assets" "/healthz") }}-web{{ end }}
                 port:
                   name: http
           {{- end }}

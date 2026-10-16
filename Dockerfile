@@ -54,6 +54,7 @@ COPY build.rs ./build.rs
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
+COPY openapi/openapi.json ./openapi/openapi.json
 COPY wit ./wit
 ARG MTC_BUILD_GIT_SHA_INPUT=unknown
 ARG MTC_BUILD_TIMESTAMP_INPUT=unknown

@@ -46,6 +46,7 @@ RUN mkdir -p src/bin tests \
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
+COPY openapi/openapi.json ./openapi/openapi.json
 COPY wit ./wit
 # Cargo validates explicitly declared test targets even when only the installer
 # binary is built. Keep the production image context small while satisfying the

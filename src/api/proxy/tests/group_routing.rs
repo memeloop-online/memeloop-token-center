@@ -538,7 +538,7 @@ async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
     let package = root.join("example-provider");
     fs::create_dir_all(&package).unwrap();
     let mut manifest: Value = serde_json::from_str(include_str!(
-        "../../../../examples/plugins/policy-rewrite/plugin.json"
+        "../../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.json"
     ))
     .unwrap();
     manifest["contributions"]["traffic_policy"] = json!(false);
@@ -558,7 +558,7 @@ async fn install_component_provider(fixture: &mut ResilientRouteFixture) {
     .unwrap();
     fs::write(
         package.join("plugin.wasm"),
-        include_bytes!("../../../../examples/plugins/policy-rewrite/plugin.wasm"),
+        include_bytes!("../../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.wasm"),
     )
     .unwrap();
     fixture.state.plugins = PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap();

@@ -87,6 +87,8 @@ pub enum AppError {
     NoAuthorizedUpstreamCandidate,
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("{0}")]
+    DatabaseUnavailable(DatabaseFailure),
     #[error("internal error")]
     Internal,
 }
@@ -117,6 +119,7 @@ impl AppError {
             Self::Overloaded => "overloaded",
             Self::NoAuthorizedUpstreamCandidate => "no_authorized_upstream_candidate",
             Self::Storage(_) => "storage",
+            Self::DatabaseUnavailable(failure) => failure.code(),
             Self::Internal => "internal",
         }
     }
@@ -183,6 +186,11 @@ impl IntoResponse for AppError {
                 "no_authorized_upstream_candidate",
                 self.to_string(),
             ),
+            Self::DatabaseUnavailable(failure) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                failure.code(),
+                failure.to_string(),
+            ),
             Self::Storage(_) | Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -239,6 +247,10 @@ impl From<sqlx::Error> for AppError {
             error_kind = sqlx_error_kind(&error),
             "database operation failed"
         );
+        if let Some(failure) = DatabaseFailure::from_sqlx(&error) {
+            failure.observe();
+            return Self::DatabaseUnavailable(failure);
+        }
         match error {
             // Pool exhaustion is a bounded, retryable capacity failure. Keeping
             // it distinct from corrupt data and programmer errors prevents a
@@ -435,5 +447,106 @@ mod tests {
             "configured upstream is unavailable: HTTP operation failed"
         );
         assert!(!rendered.contains("request-secret"));
+    }
+}
+
+/// Fixed, public dependency diagnostics. Never retain driver messages or URLs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DatabaseFailure {
+    #[error(
+        "Database storage is full. Database writes are unavailable; contact the service operator. Service credentials do not need to be re-entered."
+    )]
+    StorageFull,
+    #[error(
+        "The database cannot be reached. Data and authorization cannot be verified; try again after service recovery. Service credentials do not need to be re-entered."
+    )]
+    Unavailable,
+}
+
+static LAST_DATABASE_FAILURE: std::sync::Mutex<Option<(DatabaseFailure, u64)>> =
+    std::sync::Mutex::new(None);
+
+impl DatabaseFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::StorageFull => "database_storage_full",
+            Self::Unavailable => "database_unavailable",
+        }
+    }
+
+    pub(crate) fn from_sqlx(error: &sqlx::Error) -> Option<Self> {
+        match error {
+            sqlx::Error::Database(error) => Self::from_sqlstate(error.code().as_deref()?),
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolClosed => {
+                Some(Self::Unavailable)
+            }
+            _ => None,
+        }
+    }
+
+    fn from_sqlstate(code: &str) -> Option<Self> {
+        match code {
+            "53100" | "13" | "SQLITE_FULL" => Some(Self::StorageFull),
+            "57P01" | "57P02" | "57P03" => Some(Self::Unavailable),
+            code if code.starts_with("08") => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    fn observe(self) {
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut last) = LAST_DATABASE_FAILURE.lock() {
+            *last = Some((self, observed_at));
+        }
+    }
+
+    pub(crate) fn last_observed() -> Option<serde_json::Value> {
+        let last = LAST_DATABASE_FAILURE.lock().ok()?;
+        let (failure, observed_at) = (*last)?;
+        Some(json!({"code": failure.code(), "observed_at": observed_at}))
+    }
+}
+
+#[cfg(test)]
+mod database_failure_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[test]
+    fn disk_full_requires_explicit_driver_evidence_and_is_never_inferred_from_capacity() {
+        for code in ["53100", "13", "SQLITE_FULL"] {
+            assert_eq!(
+                DatabaseFailure::from_sqlstate(code),
+                Some(DatabaseFailure::StorageFull)
+            );
+        }
+        for code in ["53200", "53300", "57014", "55P03", "23505"] {
+            assert_eq!(DatabaseFailure::from_sqlstate(code), None, "{code}");
+        }
+        assert_eq!(DatabaseFailure::from_sqlx(&sqlx::Error::PoolTimedOut), None);
+        assert_eq!(
+            DatabaseFailure::from_sqlstate("08006"),
+            Some(DatabaseFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_failure_response_has_fixed_code_without_raw_driver_message() {
+        for failure in [DatabaseFailure::StorageFull, DatabaseFailure::Unavailable] {
+            let response = AppError::DatabaseUnavailable(failure).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), 8192).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], failure.code());
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("credentials do not need")
+            );
+        }
     }
 }

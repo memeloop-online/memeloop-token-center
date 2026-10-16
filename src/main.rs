@@ -268,9 +268,6 @@ async fn run() -> Result<(), &'static str> {
             println!("{output}");
         }
         Command::Serve { role } => {
-            let state = AppState::initialize(config.clone())
-                .await
-                .map_err(|_| "application_initialization_failed")?;
             let address: SocketAddr = config
                 .listen
                 .parse()
@@ -278,26 +275,51 @@ async fn run() -> Result<(), &'static str> {
             let listener = TcpListener::bind(address)
                 .await
                 .map_err(|_| "listen_bind_failed")?;
-            let (worker_shutdown, oauth_shutdown, worker_task) = if role.runs_worker() {
-                let (sender, receiver) = watch::channel(false);
-                let (oauth_sender, oauth_receiver) = watch::channel(false);
-                let task = tokio::spawn(worker::run_until_shutdown_with_oauth_stop(
-                    state.clone(),
-                    receiver,
-                    oauth_receiver,
-                ));
-                (Some(sender), Some(oauth_sender), Some(task))
-            } else {
-                (None, None, None)
-            };
-            info!(%address, ?role, "token center listening");
+            let (app, startup) = api::startup::router(role);
+            let (worker_shutdown, mut receiver) = watch::channel(false);
+            let (oauth_shutdown, oauth_receiver) = watch::channel(false);
+            // Keep dependency initialization off the HTTP lifecycle. A database
+            // outage retains the existing static shell and explicit 503 API
+            // errors, then recovers through the original router/auth chain.
+            let worker_task = tokio::spawn(async move {
+                loop {
+                    let initialized = tokio::select! {
+                        _ = receiver.changed() => return,
+                        result = AppState::initialize(config.clone()) => result,
+                    };
+                    match initialized {
+                        Ok(state) => {
+                            startup.install(api::router_for_role(state.clone(), role));
+                            if role.runs_worker() {
+                                worker::run_until_shutdown_with_oauth_stop(
+                                    state,
+                                    receiver,
+                                    oauth_receiver,
+                                )
+                                .await;
+                            } else {
+                                let _ = receiver.changed().await;
+                            }
+                            return;
+                        }
+                        Err(error) => {
+                            startup.failed(role, &error);
+                            tokio::select! {
+                                _ = receiver.changed() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                            }
+                        }
+                    }
+                }
+            });
+            info!(%address, ?role, "token center static shell listening; dependencies initialize separately");
             serve_with_worker_shutdown(
                 listener,
-                api::router_for_role(state, role),
+                app,
                 shutdown_signal(),
-                worker_task,
-                worker_shutdown,
-                oauth_shutdown,
+                Some(worker_task),
+                Some(worker_shutdown),
+                Some(oauth_shutdown),
             )
             .await?;
         }

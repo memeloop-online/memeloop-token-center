@@ -5,6 +5,7 @@ import { RouteErrorBoundary, type RouteErrorCopy } from './RouteErrorBoundary';
 import type { PluginNavigationSection } from '../operator/pluginContributions';
 import { NavigationGuardProvider, useGuardedNavigation, type NavigationGuard } from './NavigationGuard';
 import { PageLoadingRegion } from '../design-system';
+import { ServiceAvailabilityFooter } from './ServiceAvailabilityFooter';
 import { identityCopy } from '../operator/identityCopy';
 import { transportProxyGroupCopy } from '../operator/transportProxyGroupCopy';
 
@@ -286,6 +287,7 @@ function AppShellContent({ surface, route, onNavigate, children, pluginNavigatio
       <main className="app-main-content" id="app-main-content" tabIndex={-1} data-surface={surface} data-route={route}>
         <RouteErrorBoundary copy={routeErrorCopy} resetKey={`${surface}:${route}`}><PageLoadingRegion scopeKey={surface} label={t('common.loading')}>{children}</PageLoadingRegion></RouteErrorBoundary>
       </main>
+      <ServiceAvailabilityFooter />
     </div>
   </div>;
 }

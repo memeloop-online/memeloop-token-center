@@ -74,7 +74,7 @@ fn component_from_core_wat(source: &str) -> Vec<u8> {
 }
 
 fn core_wat_with_post_auth(body: &str) -> String {
-    let source = include_str!("../examples/plugins/policy-rewrite/plugin.wat");
+    let source = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat");
     let (_, after_start) = source
         .split_once(";; BEGIN POST-AUTH BODY")
         .expect("example start marker");
@@ -89,7 +89,7 @@ fn core_wat_with_post_auth(body: &str) -> String {
 }
 
 fn core_wat_with_body(marker: &str, body: &str) -> String {
-    let source = include_str!("../examples/plugins/policy-rewrite/plugin.wat");
+    let source = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat");
     let start = format!(";; BEGIN {marker} BODY");
     let end = format!(";; END {marker} BODY");
     let (prefix, after_start) = source.split_once(&start).expect("function start marker");
@@ -138,7 +138,7 @@ fn write_rewrite_package(root: &Path, id: &str) {
     .expect("write rewrite plugin manifest");
     fs::write(
         package.join("plugin.wasm"),
-        include_bytes!("../examples/plugins/policy-rewrite/plugin.wasm"),
+        include_bytes!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wasm"),
     )
     .expect("write rewrite plugin component");
 }
@@ -178,17 +178,20 @@ fn write_component_provider_package(root: &Path, id: &str, wat: &str, maximum: u
 fn checked_in_example_component_is_reproducible_from_auditable_wat() {
     assert_eq!(
         component_from_core_wat(include_str!(
-            "../examples/plugins/policy-rewrite/plugin.wat"
+            "../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat"
         )),
-        include_bytes!("../examples/plugins/policy-rewrite/plugin.wasm")
+        include_bytes!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wasm")
     );
 }
 
 #[tokio::test]
 async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = PluginRuntime::load(Some("examples/plugins"), database(directory.path()).await)
-        .expect("load checked-in example");
+    let runtime = PluginRuntime::load(
+        Some(".plugin-examples/examples/plugins"),
+        database(directory.path()).await,
+    )
+    .expect("load checked-in example");
 
     let manifests = runtime.manifests();
     assert_eq!(manifests.len(), 1);
@@ -766,8 +769,9 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");
     fs::create_dir(&plugins).unwrap();
-    let streaming_wat = include_str!("../examples/plugins/policy-rewrite/plugin.wat")
-        .replace("\\22streaming\\22:false}", "\\22streaming\\22:true }");
+    let streaming_wat =
+        include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat")
+            .replace("\\22streaming\\22:false}", "\\22streaming\\22:true }");
     write_component_provider_package(&plugins, "streaming", &streaming_wat, 1024);
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
         .expect("load streaming fixture");
@@ -813,7 +817,7 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     write_component_provider_package(
         &plugins,
         "oversize",
-        include_str!("../examples/plugins/policy-rewrite/plugin.wat"),
+        include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat"),
         8,
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)

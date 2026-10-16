@@ -34,7 +34,12 @@ pub fn router_for_role(mut state: AppState, role: RuntimeRole) -> Router {
             }
         }
     }
-    application = application.route("/ui-assets/{*path}", get(web_asset));
+    application = application
+        .route(
+            "/ui-assets/service-status",
+            get(super::startup::service_status),
+        )
+        .route("/ui-assets/{*path}", get(web_asset));
     if role.serves_control() {
         application = application.merge(control_router(state.clone()));
     }

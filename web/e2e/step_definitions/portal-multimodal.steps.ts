@@ -557,7 +557,6 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const credentialPanel = page.locator('.create-journey');
   await credentialPanel.locator('[data-workspace-toggle]').click();
   const credentialForm = credentialPanel.locator('form');
-  await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
   await credentialForm.locator('#root_alias').fill('Browser multimodal credential');
   await credentialPanel.getByRole('button', { name: '用量与预算', exact: true }).click();
   await credentialForm.locator('#root_currency').selectOption('USD');

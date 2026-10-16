@@ -269,3 +269,7 @@
   .settings-card-heading { flex-direction: column; }
   .settings-card-heading .status { align-self: flex-start; }
 }
+
+.app-service-availability { margin: 0 24px 20px; padding: 12px 16px; border-top: 1px solid currentColor; overflow-wrap: anywhere; }
+.app-service-availability p { margin: 0 0 8px; }
+@media (max-width: 600px) { .app-service-availability { margin-inline: 12px; } }

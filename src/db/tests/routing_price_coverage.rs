@@ -64,6 +64,8 @@ async fn postgres_price_coverage_is_read_only_and_detects_alias_only_failover() 
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&database_url).await;
+    let database_url = fixture.url().to_owned();
     let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
     let schema = format!("price_coverage_{}", Uuid::now_v7().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
@@ -221,4 +223,6 @@ async fn postgres_price_coverage_is_read_only_and_detects_alias_only_failover() 
         .execute(&admin)
         .await
         .unwrap();
+    admin.close().await;
+    fixture.cleanup().await;
 }

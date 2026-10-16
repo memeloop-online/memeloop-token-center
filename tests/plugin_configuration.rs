@@ -37,7 +37,7 @@ fn component_from_core_wat(source: &str) -> Vec<u8> {
 }
 
 fn configured_component(expected_configuration: &Value) -> Vec<u8> {
-    let source = include_str!("../examples/plugins/policy-rewrite/plugin.wat");
+    let source = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat");
     let (prefix, after_start) = source.split_once(";; BEGIN POST-AUTH BODY").unwrap();
     let (_, suffix) = after_start.split_once(";; END POST-AUTH BODY").unwrap();
     let encoded = serde_json::to_string(expected_configuration).unwrap();
