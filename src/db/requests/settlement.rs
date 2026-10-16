@@ -415,6 +415,30 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
     now: i64,
     id: Uuid,
 ) -> Result<UsageReservation, AppError> {
+    reserve_usage_with_snapshot_in_transaction(
+        tx,
+        key,
+        price,
+        input_token_ceiling,
+        output_token_ceiling,
+        now,
+        id,
+        serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reserve_usage_with_snapshot_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    key: &AuthenticatedKey,
+    price: &ModelPrice,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    now: i64,
+    id: Uuid,
+    price_snapshot_json: String,
+) -> Result<UsageReservation, AppError> {
     let (reserved_micros, reserved_tokens) =
         reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
     reserve_usage_contract_with_id_in_transaction(
@@ -428,7 +452,7 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
             reserved_units: 0,
             billing_unit: "",
             micros_per_unit: 0,
-            price_snapshot_json: serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+            price_snapshot_json,
             input_micros_per_million: price.input_micros_per_million,
             output_micros_per_million: price.output_micros_per_million,
             price_tiers: price.tiers.clone(),
@@ -755,6 +779,18 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
 ) -> Result<UsageReservation, AppError> {
     let (reserved_micros, reserved_tokens) =
         reservation_ceiling_amounts(price, input_token_ceiling, output_token_ceiling)?;
+    // Settlement locks key -> account -> reservation. Never hold this
+    // reservation while waiting for its key, or a concurrent settlement can
+    // hold the key while waiting for us. Unchanged contracts and unlimited
+    // reservations do not mutate the shared budget and need no key lock.
+    let budget_state = if key.policy.enforcement_mode.enforces_prepaid_limits()
+        && (reservation.reserved_micros != reserved_micros
+            || reservation.reserved_tokens != reserved_tokens)
+    {
+        Some(lock_key_budget_state(tx, key.key_id, now).await?)
+    } else {
+        None
+    };
     let current = sqlx::query(
         "UPDATE usage_reservations SET reserved_tokens = reserved_tokens
          WHERE id = $1 AND account_id = $2 AND key_id = $3 AND status = 'reserved'
@@ -811,8 +847,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
             retry_after_seconds: Some(retry_after_until(rate_window_start + 60_000, now)),
         });
     }
-    let (settled_lifetime_micros, active_reserved) =
-        lock_key_budget_state(tx, key.key_id, now).await?;
+    let (settled_lifetime_micros, active_reserved) = budget_state.ok_or(AppError::Internal)?;
     let adjusted_active_reserved = active_reserved
         .checked_sub(old_micros)
         .filter(|amount| *amount >= 0)
