@@ -293,6 +293,36 @@ async fn list_contract(database_url: String) {
         .find(|row| row["request_id"] == requests[1].to_string())
         .unwrap();
     assert!(row["egress"].is_null());
+
+    let now = memeloop_token_center::db::unix_millis();
+    sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, source_started_at, protocol, model, input_tokens, output_tokens, imported_at, source_session_id) VALUES ($1, 'egress-fixture', $2, $2, $3, $4, $5, 'openai', 'imported-id-collision', 0, 0, $5, 'fixture-session')")
+        .bind(keys[0].tenant_id.to_string())
+        .bind(requests[0].to_string())
+        .bind(keys[0].key_id.to_string())
+        .bind(keys[0].principal_id.to_string())
+        .bind(now + 1000)
+        .execute(&inspection)
+        .await
+        .unwrap();
+    let (status, rows) = response_json(&state, "/self/v1/requests", &credentials[0], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let matching: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["request_id"] == requests[0].to_string())
+        .collect();
+    assert_eq!(matching.len(), 2);
+    for row in matching {
+        if row["model"] == "imported-id-collision" {
+            assert!(row["egress"].is_null());
+        } else {
+            assert_eq!(
+                row["egress"]["selected"],
+                serde_json::to_value(&tied.selected).unwrap()
+            );
+        }
+    }
     inspection.close().await;
 }
 

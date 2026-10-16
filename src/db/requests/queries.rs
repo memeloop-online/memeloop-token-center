@@ -233,14 +233,17 @@ impl Database {
         }
         let rows = statement.fetch_all(&self.pool).await?;
         let mut native_ids = Vec::new();
-        for row in &rows {
+        let mut native_indices = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
             if row.try_get::<i64, _>("native_terminal")? == 1 {
                 native_ids.push(row.try_get::<String, _>("id")?);
+                native_indices.push(index);
             }
         }
         let mut views = request_views(rows)?;
         let mut observations = egress::request_list_egress(self, &native_ids).await?;
-        for view in &mut views {
+        for index in native_indices {
+            let view = &mut views[index];
             view.egress = observations.remove(&view.request_id);
         }
         Ok(views)
