@@ -7,7 +7,7 @@ import { rejected, repository, run } from './contract-helpers.ts';
 
 const revision = 'a'.repeat(40);
 const cargoManifest = readFileSync(join(repository, 'Cargo.toml'), 'utf8');
-const releaseVersion = /^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"$/mu.exec(cargoManifest)?.[1];
+const releaseVersion = /^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)"\s*$/mu.exec(cargoManifest)?.[1];
 if (releaseVersion === undefined) throw new Error('Cargo release version is missing');
 
 test('release version stays synchronized across product metadata', () => {
