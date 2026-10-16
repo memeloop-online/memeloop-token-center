@@ -56,15 +56,16 @@ export function credentialPolicySchema(schema: RJSFSchema): RJSFSchema {
   return inlineBudgetDefinitions(schema, schema);
 }
 
-// Routing is owned by the named comboboxes and injected into the request.
-// Remove only those root fields; leave policy and future plugin fields intact.
+// Routing and the principal are owned by dedicated controls and injected into
+// the request. Remove only those root fields; leave policy and future plugin
+// fields intact.
 export function credentialCreateSchema(schema: RJSFSchema): RJSFSchema {
-  const routingFields = new Set(['route_ids', 'route_group_ids']);
-  const properties = Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([name]) => !routingFields.has(name)));
+  const ownedFields = new Set(['route_ids', 'route_group_ids', 'principal_external_id']);
+  const properties = Object.fromEntries(Object.entries(schema.properties ?? {}).filter(([name]) => !ownedFields.has(name)));
   if (properties.policy && typeof properties.policy === 'object') properties.policy = inlineBudgetDefinitions(properties.policy, schema);
   return {
     ...schema,
     properties,
-    required: schema.required?.filter((name) => !routingFields.has(name)),
+    required: schema.required?.filter((name) => !ownedFields.has(name)),
   };
 }

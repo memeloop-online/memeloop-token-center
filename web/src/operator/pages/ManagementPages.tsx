@@ -57,6 +57,7 @@ import { providerFormWidgets } from '../ProviderFormWidgets';
 import { appHref } from '../../app/routes';
 import { useNavigationGuard } from '../../app/NavigationGuard';
 import { credentialFormTemplates } from '../CredentialFormTemplates';
+import { credentialCreatePrincipal } from '../credentialCreatePrincipal';
 import { CredentialRouteAuthorization } from '../CredentialRouteAuthorization';
 import { RouteListSource } from '../RouteListSource';
 import { credentialRouteOptions } from '../credentialRouteOptions';
@@ -1526,6 +1527,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [busy, setBusy] = useState('');
   const [newRouteIds, setNewRouteIds] = useState<string[]>([]);
   const [createCredentialDraft, setCreateCredentialDraft] = useState<Record<string, unknown>>();
+  const [createPrincipalOverride, setCreatePrincipalOverride] = useState('');
   const [policyDrafts, setPolicyDrafts] = useState<Record<string, KeyView['policy']>>({});
   const [newRouteGroupIds, setNewRouteGroupIds] = useState<string[]>([]);
   const [groupFilter, setGroupFilter] = useState('all');
@@ -1568,6 +1570,25 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const routeGroups = useGroups('route', token, writeTenant);
   const createFormSchema = useMemo(() => createSchema ? credentialCreateSchema(createSchema as RJSFSchema) : undefined, [createSchema]);
   const policyFormSchema = useMemo(() => policySchema ? credentialPolicySchema(policySchema as RJSFSchema) : undefined, [policySchema]);
+  const principalBindingId = useId();
+  // Principals of already loaded credentials in the write scope, so binding an
+  // additional credential to the same user or application reuses the exact
+  // existing identity instead of a retyped variant.
+  const existingPrincipals = useMemo(() => [...new Set(values
+    .filter(value => !writeTenant || value.tenant_external_id === writeTenant)
+    .map(value => value.principal_external_id)
+    .filter((principal): principal is string => Boolean(principal)))], [values, writeTenant]);
+  const principalQuery = createPrincipalOverride.trim().toLocaleLowerCase();
+  const principalField = <AdvancedFormSection title={t('credentials.principalBinding')} description={t('credentials.principalBindingHint')}>
+    <label htmlFor={principalBindingId}>{t('schema.Principal')}
+      <Combobox id={principalBindingId} freeform value={createPrincipalOverride} aria-label={t('schema.Principal')} placeholder={t('credentials.principalBindingPlaceholder')}
+        input={{ maxLength: 200, autoComplete: 'off' }}
+        onChange={event => setCreatePrincipalOverride(event.target.value)}
+        onOptionSelect={(_, data) => { if (data.optionValue === undefined) return; setCreatePrincipalOverride(data.optionValue); }}>
+        {existingPrincipals.filter(principal => !principalQuery || principal.toLocaleLowerCase().includes(principalQuery)).map(principal => <Option key={principal} value={principal} text={principal}>{principal}</Option>)}
+      </Combobox>
+    </label>
+  </AdvancedFormSection>;
   const ownsKeyRequest = (request: { identity: KeyListRequestIdentity; controller: AbortController }) => ownsKeyListRequest(keyRequest.current?.identity, request.identity)
     && scopeGeneration.current === request.identity.scopeGeneration
     && scopeRef.current.token === token && scopeRef.current.tenant === tenant;
@@ -1636,7 +1657,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     routingSaveLock.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setEditingCredential(undefined); setCredentialValue(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError('');
+    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError('');
     void loadRoutes(token, tenant, scopeGeneration.current);
     setCreationSource(tenant === 'default' ? 'manual_or_unknown' : 'all');
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
@@ -1885,7 +1906,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, principal_external_id: { 'ui:help': t('credentials.principalHelp') } }} formContext={{ authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, alias: { 'ui:help': t('credentials.aliasHelp') } }} formContext={{ principalField, authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;
@@ -1895,9 +1916,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         secretRequest.current?.abort();
         secretRequest.current = controller;
         try {
-          const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, creation_source: 'manual', route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
+          const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', operationToken, { ...secretResponseRequestPolicy, method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: operationWriteTenant, principal_external_id: credentialCreatePrincipal(formData?.alias, createPrincipalOverride), creation_source: 'manual', route_ids: newRouteIds, route_group_ids: newRouteGroupIds }), signal: controller.signal });
           if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
-          setCreateCredentialDraft(undefined); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, kind: 'issued', displayId: crypto.randomUUID() });
+          setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, kind: 'issued', displayId: crypto.randomUUID() });
           setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
