@@ -1355,6 +1355,8 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&database_url).await;
+    let database_url = fixture.url().to_owned();
     let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
     let schema = format!("online_projection_lock_{}", Uuid::now_v7().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
@@ -1672,6 +1674,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .await
         .unwrap();
     admin.close().await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]

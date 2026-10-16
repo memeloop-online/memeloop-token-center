@@ -2755,6 +2755,9 @@ mod tests {
             eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping failed cost backfill contract");
             return;
         };
+        let database_fixture =
+            crate::db::test_support::PostgresTestDatabase::create(&database_url).await;
+        let database_url = database_fixture.url().to_owned();
         sqlx::any::install_default_drivers();
         let admin = AnyPool::connect(&database_url).await.unwrap();
         let schema = format!("failed_cost_backfill_{}", Uuid::now_v7().simple());
@@ -2817,5 +2820,6 @@ mod tests {
             .unwrap();
         cost_only_concurrency::exercise_postgres_contribution_matrix(&database_url, &admin).await;
         admin.close().await;
+        database_fixture.cleanup().await;
     }
 }
