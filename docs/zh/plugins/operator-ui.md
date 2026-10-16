@@ -6,6 +6,6 @@
 
 [管理界面 SDK](https://github.com/memeloop-online/memeloop-token-center/tree/master/web/operator-ui-sdk) 提供同源 JSON 请求 `api.requestApi({ path, method, body, signal })`，以及需要登录的 OpenAPI 探索接口 `api.discoverApi(signal)`。请求使用当前页面的管理凭据，继续接受后端权限范围与资源授权检查。桥接层为接口声明的租户参数补充当前租户，不授予新权限。签名模块在管理页面的浏览器上下文中运行，因此只应安装可信发布者的插件。
 
-临时模型请求使用 `POST /internal/v1/inference/chat/completions`，正文为 `{ key_id, request }`。使用者需要选择当前管理身份有权使用的已有计费凭据（要求 `keys:write`），插件不会收到明文密钥。非流式对话请求继续应用该凭据的模型策略、路由、余额与计费规则。关闭页面不保证上游请求已经取消，也不保证不再产生费用。界面对话记录可以只保留在内存中，正常请求记录仍按部署的保留策略处理。
+临时模型请求使用 OpenAI chat 的 `POST /internal/v1/inference/chat/completions`，或 Anthropic Messages 的 `POST /internal/v1/inference/messages`，正文为 `{ key_id, request }`。使用者需要选择当前管理身份有权使用的已有计费凭据（要求 `keys:write`），插件不会收到明文密钥。非流式对话请求继续应用该凭据的模型策略、路由、余额与计费规则。关闭页面不保证上游请求已经取消，也不保证不再产生费用。界面对话记录可以只保留在内存中，正常请求记录仍按部署的保留策略处理。
 
 提供给模型的工具应限定在任务需要的操作内，避免将返回密钥的接口内容放入模型上下文，说明写入操作的影响，并响应取消。示例和文本模型游乐场维护在独立的[示例插件仓库](https://github.com/memeloop-online/memeloop-token-center-example-plugins)。
