@@ -93,7 +93,7 @@ impl Fixture {
             }
         })
         .await
-        .expect("contender must reach the actual request-record relation lock");
+        .expect("contender must reach the expected PostgreSQL blocking edge");
     }
 
     async fn amounts(&self) -> (i64, i64, i64, i64) {
@@ -277,5 +277,81 @@ async fn postgres_rejected_admission_rolls_back_private_request_and_all_budget_c
         .await
         .unwrap();
     assert_eq!(fixture.amounts().await, (999_970, 30, 0, 30));
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn postgres_resize_waits_for_key_without_blocking_once_only_settlement() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    let reservation = fixture
+        .database
+        .reserve_usage(&fixture.key, &fixture.price, 10, 20)
+        .await
+        .unwrap();
+    let mut settlement = fixture.database.begin_write_transaction().await.unwrap();
+    let settlement_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *settlement)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE key_budget_state SET updated_at = updated_at WHERE key_id = $1")
+        .bind(fixture.key.key_id.to_string())
+        .execute(&mut *settlement)
+        .await
+        .unwrap();
+
+    let contender = fixture.contender.clone();
+    let key = fixture.key.clone();
+    let price = fixture.price.clone();
+    let resizing = reservation.clone();
+    let pending = tokio::spawn(async move {
+        let mut transaction = contender.begin_write_transaction().await.unwrap();
+        let result = resize_usage_reservation_in_transaction(
+            &mut transaction,
+            &key,
+            &price,
+            &resizing,
+            10,
+            40,
+            unix_millis(),
+        )
+        .await;
+        transaction.rollback().await.unwrap();
+        result
+    });
+    fixture.wait_until_blocked_by(settlement_pid).await;
+
+    // Previously resize held the reservation before waiting for this key,
+    // completing a reservation -> key -> reservation deadlock.
+    let charged = tokio::time::timeout(
+        Duration::from_secs(5),
+        settle_token_usage_in_transaction(
+            &mut settlement,
+            &reservation,
+            &TokenUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                ..TokenUsage::default()
+            },
+            unix_millis(),
+        ),
+    )
+    .await
+    .expect("a resize waiting for the key must not own the reservation")
+    .unwrap();
+    assert_eq!(charged, 8);
+    settlement.commit().await.unwrap();
+    assert!(matches!(pending.await.unwrap(), Err(AppError::Conflict(_))));
+    assert_eq!(fixture.amounts().await, (999_992, 0, 8, 0));
+    assert_eq!(
+        fixture
+            .database
+            .settle_usage(&reservation, 3, 5)
+            .await
+            .unwrap(),
+        8
+    );
+    assert_eq!(fixture.amounts().await, (999_992, 0, 8, 0));
     fixture.close().await;
 }
