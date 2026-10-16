@@ -4317,17 +4317,23 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .mount(&upstream)
         .await;
 
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({
-            "model": fixture.model,
-            "input": "archive failures are non-fatal for text",
-            "stream": false
-        }),
-    )
-    .await;
+    // This test requires exact durable bodies for the later upload retry.
+    // Finish optional database capture before SQLite settlement can race its
+    // bounded writer; the unavailable object backend is still exercised below.
+    let response = fixture
+        .state
+        .db
+        .with_request_archive_capture_for_test(send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({
+                "model": fixture.model,
+                "input": "archive failures are non-fatal for text",
+                "stream": false
+            }),
+        ))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
