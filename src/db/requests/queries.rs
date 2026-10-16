@@ -1,5 +1,6 @@
 use super::super::effective_cost::effective_displayed_cost_micros;
 use super::super::*;
+mod egress;
 use crate::filter_ast::{
     TypedFilterAst, TypedFilterField, TypedFilterOperator, TypedFilterValue, filter_integer,
     filter_text, filter_uuid, search_contains,
@@ -172,8 +173,7 @@ impl Database {
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
         let query = build_request_list_query(RequestListScope::Key(key_id), &filter);
-        let rows = self.fetch_request_list(query).await?;
-        request_views(rows)
+        self.fetch_request_list(query).await
     }
 
     pub async fn list_all_requests(
@@ -198,8 +198,7 @@ impl Database {
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
         let query = build_request_list_query(RequestListScope::Tenant(tenant_external_id), &filter);
-        let rows = self.fetch_request_list(query).await?;
-        request_views(rows)
+        self.fetch_request_list(query).await
     }
 
     pub async fn list_global_requests(&self, limit: i64) -> Result<Vec<RequestView>, AppError> {
@@ -216,14 +215,13 @@ impl Database {
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
         let query = build_request_list_query(RequestListScope::Global, &filter);
-        let rows = self.fetch_request_list(query).await?;
-        request_views(rows)
+        self.fetch_request_list(query).await
     }
 
     async fn fetch_request_list(
         &self,
         query: PortableRequestListQuery,
-    ) -> Result<Vec<AnyRow>, AppError> {
+    ) -> Result<Vec<RequestView>, AppError> {
         // `$N` placeholders are understood by both native drivers behind sqlx::Any. The
         // statement itself only contains literals assembled below; every request value is bound.
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.statement));
@@ -233,7 +231,19 @@ impl Database {
                 RequestListBind::Text(value) => statement.bind(value),
             };
         }
-        Ok(statement.fetch_all(&self.pool).await?)
+        let rows = statement.fetch_all(&self.pool).await?;
+        let mut native_ids = Vec::new();
+        for row in &rows {
+            if row.try_get::<i64, _>("native_terminal")? == 1 {
+                native_ids.push(row.try_get::<String, _>("id")?);
+            }
+        }
+        let mut views = request_views(rows)?;
+        let mut observations = egress::request_list_egress(self, &native_ids).await?;
+        for view in &mut views {
+            view.egress = observations.remove(&view.request_id);
+        }
+        Ok(views)
     }
 
     pub async fn request_archive_refs(
@@ -1356,6 +1366,7 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
         },
     );
     Ok(RequestView {
+        egress: None,
         usage_basis: request_usage_basis_from_row(row)?,
         compaction: row
             .try_get::<Option<i64>, _>("compaction")?
@@ -1773,6 +1784,7 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
     });
     Ok(RequestArchiveRefs {
         view: RequestView {
+            egress: None,
             usage_basis: None,
             compaction: row
                 .try_get::<Option<i64>, _>("compaction")?
@@ -1898,6 +1910,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {
         view: RequestView {
+            egress: None,
             usage_basis: None,
             compaction: None,
             first_output_ms: None,

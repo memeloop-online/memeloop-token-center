@@ -1859,6 +1859,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             }
             Ok(ConversationRequestView {
                 request: RequestView {
+                    egress: None,
                     usage_basis,
                     compaction: row
                         .try_get::<Option<i64>, _>("compaction")?

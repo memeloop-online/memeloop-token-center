@@ -14,6 +14,23 @@ This is a read-only DTO handoff for the selected Kimi proxy-group UI owner. Do n
 
 ## Response DTOs
 
+Self-service `GET /self/v1/requests`, operator `GET /internal/v1/requests`, and
+`POST /internal/v1/requests/query` include nullable `egress: { selected,
+observed_at }`. `selected` uses the frozen `SelectedRequestEgress` below;
+`observed_at` is the persisted attempt observation time in Unix milliseconds.
+The server loads attempts for the authorized native request page in one batch,
+choosing `final_response` first, then descending `observed_at`, then descending
+`attempt_id` for deterministic ties. It does not consult current proxy groups or
+perform connectivity probes. No attempt, malformed selected snapshot, generation
+history, and imported archive history yield null. Other projections of the
+shared request DTO can also return null when egress was not loaded.
+
+Self-service retains key ownership; operator lists retain their existing
+`requests:read` and tenant restrictions. Historical host, port, and human labels
+are available within that request scope; URL userinfo, path, query, and fragment
+are excluded by snapshot capture. The full attempt/transport diagnostics remain
+operator-only. An observation is not evidence of current connectivity or delivery.
+
 UUIDs are strings; timestamps are Unix milliseconds; byte counters are nullable nonnegative integers. The API does not send BigInt strings.
 
 ```ts

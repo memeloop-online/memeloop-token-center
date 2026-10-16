@@ -1229,6 +1229,7 @@ impl Database {
                 }
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        egress: None,
                         usage_basis: super::requests::request_usage_basis_from_row(&row)?,
                         compaction: None,
                         first_output_ms: row.try_get("first_output_ms")?,
