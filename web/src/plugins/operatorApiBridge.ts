@@ -35,7 +35,16 @@ function bodyUsesTenant(document: SchemaObject, pathname: string, method: string
     const actual = pathname.split('/');
     return parts.length === actual.length && parts.every((part, index) => /^\{[^{}]+\}$/.test(part) || part === actual[index]);
   });
-  const match = candidates.find(([template]) => template === pathname) ?? candidates[0];
+  // Match concrete paths first, then the most specific template. Equal-rank
+  // templates are ambiguous: never let document insertion order choose scope.
+  const ranked = candidates.map((candidate) => ({
+    candidate,
+    literals: candidate[0].split('/').filter((part) => !/^\{[^{}]+\}$/.test(part)).length,
+  })).sort((left, right) => right.literals - left.literals);
+  if (ranked.length > 1 && ranked[0].literals === ranked[1].literals) {
+    throw new Error('API operation path is ambiguous in the host discovery schema');
+  }
+  const match = ranked[0]?.candidate;
   const operation = resolveSchema(document, resolveSchema(document, match?.[1])?.[method.toLowerCase()]);
   if (!operation) throw new Error('API operation is absent from the host discovery schema');
   const requestBody = resolveSchema(document, operation.requestBody);

@@ -111,3 +111,38 @@ test('aborted discovery does not poison subsequent writes', async () => {
     assert.equal(discoveries, 1);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test('tenant detection prefers specific paths and rejects equal-rank templates before dispatch', async () => {
+  const originalFetch = globalThis.fetch;
+  const sent: unknown[] = [];
+  const tenantWrite = { post: { requestBody: { content: { 'application/json': { schema: {
+    properties: { tenant_external_id: { type: 'string' } },
+  } } } } } };
+  globalThis.fetch = async (path, init) => {
+    if (String(path) === '/internal/v1/api-schema') return new Response(JSON.stringify({ paths: {
+      '/internal/v1/{resource}/{id}': tenantWrite,
+      '/internal/v1/keys/{id}': { post: {} },
+      '/internal/v1/keys/rotate': tenantWrite,
+      '/internal/v1/{resource}/rotate': tenantWrite,
+    } }));
+    sent.push(JSON.parse(String(init!.body)));
+    return new Response('{}');
+  };
+  try {
+    const request = createOperatorApiBridge('credential', 'selected');
+    await request({ path: '/internal/v1/keys/plain', method: 'POST', body: { value: 1 } });
+    await request({ path: '/internal/v1/keys/rotate', method: 'POST', body: { value: 2 } });
+    assert.deepEqual(sent, [{ value: 1 }, { value: 2, tenant_external_id: 'selected' }]);
+    // Both templates have the same literal count; neither is authoritative.
+    globalThis.fetch = async (path) => {
+      assert.equal(String(path), '/internal/v1/api-schema');
+      return new Response(JSON.stringify({ paths: {
+        '/internal/v1/keys/{id}': { post: {} },
+        '/internal/v1/{resource}/rotate': tenantWrite,
+      } }));
+    };
+    await assert.rejects(createOperatorApiBridge('credential', 'selected')({
+      path: '/internal/v1/keys/rotate', method: 'POST', body: {},
+    }), /path is ambiguous/);
+  } finally { globalThis.fetch = originalFetch; }
+});
