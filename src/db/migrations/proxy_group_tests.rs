@@ -280,6 +280,6 @@ async fn postgres_proxy_group_116_accepts_empty_113_and_later_114_115() {
     let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
     let database = Database::connect(fixture.url()).await.unwrap();
     upgrade_contract(&database).await;
-    database.pool.close().await;
+    database.close().await;
     fixture.cleanup().await;
 }
