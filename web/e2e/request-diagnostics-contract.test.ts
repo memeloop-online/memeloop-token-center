@@ -180,3 +180,32 @@ test('typed failure diagnostics explain stage and source without guessing from t
   assert.deepEqual(requestViewFromEvent({ ...partial, failure_diagnostic: null }, downstream)?.failure_diagnostic, downstream.failure_diagnostic);
   assert.equal(requestViewFromEvent({ ...event, failure_diagnostic: null })?.failure_diagnostic, null);
 });
+
+test('recorded pre-admission evidence explains non-forwarding without guessing the overload cause', () => {
+  const base: RequestView = { request_id: 'pre-admission-fixture', created_at: 1, completed_at: 2,
+    protocol: 'openai', model: 'fixture', status_code: 503, duration_ms: 1,
+    input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'service_overloaded' };
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const expected = locale === 'zh-CN'
+      ? '请求在网关准入前失败，尚未转发；具体原因未记录'
+      : 'The request failed before gateway admission and was not forwarded; the specific cause was not recorded';
+    for (const evidence of [
+      { terminal_cause_code: 'gateway_pre_admission' },
+      { failure_diagnostic: { stage: 'pre_admission', source: 'gateway', reason: 'gateway_pre_admission' } },
+    ]) {
+      const request = { ...base, ...evidence };
+      assert.equal(requestFailureCause(request, locale), expected);
+      assert.ok(requestStatusCopy(request, locale).hint.includes(expected));
+      assert.doesNotMatch(requestStatusCopy(request, locale).hint, /pool|database|连接池|数据库|重试|retry/i);
+    }
+    // Status and the public overload code alone establish neither phase nor cause.
+    assert.equal(requestFailureCause(base, locale), null);
+    for (const diagnostic of [
+      { stage: null, source: 'gateway', reason: 'gateway_pre_admission' },
+      { stage: 'pre_admission', source: 'upstream', reason: 'gateway_pre_admission' },
+      { stage: 'pre_admission', source: 'gateway', reason: 'private-canary' },
+    ]) assert.equal(requestFailureCause({ ...base, failure_diagnostic: diagnostic }, locale), null);
+    const specific = { ...base, terminal_cause_code: 'gateway_pre_admission', error_code: 'upstream_read_timeout' };
+    assert.equal(requestFailureCause(specific, locale), locale === 'zh-CN' ? '读取上游响应超时' : 'Reading the upstream response timed out');
+  }
+});

@@ -158,7 +158,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127)",
     )
     .execute(&database.pool)
     .await
@@ -215,7 +215,10 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126]);
+    assert_eq!(
+        tail,
+        vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+    );
     let policy: String = sqlx::query_scalar(
         "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
     )
@@ -251,7 +254,10 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126]);
+        assert_eq!(
+            tail,
+            vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+        );
     }
 }
 

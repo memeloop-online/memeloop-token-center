@@ -1,4 +1,4 @@
-mod conversations;
+pub(crate) mod conversations;
 mod early_terminal;
 mod lifecycle;
 mod metered_projection;

@@ -88,6 +88,7 @@ pub(super) async fn observe(
                     status_code: response.status().as_u16(),
                     error_code: error_code.to_owned(),
                 };
+                observe_failure(context.request_id, response.status().as_u16(), error_code);
                 if !state.early_requests.append(terminal).await {
                     response.headers_mut().insert(
                         "x-mtc-request-recording",
@@ -99,6 +100,24 @@ pub(super) async fn observe(
         })
         .await
 }
+
+fn observe_failure(request_id: uuid::Uuid, status: u16, error_code: &'static str) {
+    // Emit independently of the journal and its database replay. The public
+    // error code is observed evidence, not a SQL/transport root-cause label.
+    // This boundary has no captured upstream/member or more specific phase;
+    // leave them absent rather than inventing them from a 503 response.
+    tracing::warn!(
+        %request_id,
+        phase = "pre_admission",
+        terminal_cause_code = "gateway_pre_admission",
+        status,
+        error_code,
+        "gateway pre-admission failure observed"
+    );
+}
+
+#[cfg(test)]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {
