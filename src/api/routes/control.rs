@@ -7,6 +7,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(super::super::api_schema::discover),
         )
         .route(
+            "/internal/v1/inference/messages",
+            post(super::super::operator_inference::messages),
+        )
+        .route(
             "/internal/v1/inference/chat/completions",
             post(super::super::operator_inference::chat_completions),
         )

@@ -13640,6 +13640,87 @@
           }
         }
       }
+    },
+    "/internal/v1/inference/messages": {
+      "post": {
+        "tags": [
+          "Client credentials"
+        ],
+        "operationId": "operatorMessages",
+        "summary": "Run inference using an explicitly authorized billing credential",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key_id",
+                  "request"
+                ],
+                "properties": {
+                  "key_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                      "stream": {
+                        "type": "boolean",
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Anthropic Messages response billed to the selected key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON Messages request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ]
+      }
     }
   },
   "components": {

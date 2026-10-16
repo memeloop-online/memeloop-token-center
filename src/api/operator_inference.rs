@@ -16,6 +16,25 @@ pub(super) async fn chat_completions(
     Query(query): Query<ManagementTenantQuery>,
     Json(body): Json<InferenceRequest>,
 ) -> Result<Response, AppError> {
+    execute(state, headers, query, body, Protocol::OpenAiChat).await
+}
+
+pub(super) async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ManagementTenantQuery>,
+    Json(body): Json<InferenceRequest>,
+) -> Result<Response, AppError> {
+    execute(state, headers, query, body, Protocol::AnthropicMessages).await
+}
+
+async fn execute(
+    state: AppState,
+    headers: HeaderMap,
+    query: ManagementTenantQuery,
+    body: InferenceRequest,
+    protocol: Protocol,
+) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
     validate_request(&body.request)?;
@@ -51,16 +70,9 @@ pub(super) async fn chat_completions(
         "x-mtc-client-name",
         HeaderValue::from_static("operator-inference"),
     );
-    let mut response = proxy::proxy_with_identity(
-        state,
-        inference_headers,
-        bytes,
-        Protocol::OpenAiChat,
-        key,
-        None,
-        memory,
-    )
-    .await?;
+    let mut response =
+        proxy::proxy_with_identity(state, inference_headers, bytes, protocol, key, None, memory)
+            .await?;
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -70,7 +82,7 @@ pub(super) async fn chat_completions(
 fn validate_request(request: &Value) -> Result<(), AppError> {
     if !request.is_object() {
         return Err(AppError::BadRequest(
-            "request must be an OpenAI chat completion object".into(),
+            "request must be a text inference object".into(),
         ));
     }
     if request
