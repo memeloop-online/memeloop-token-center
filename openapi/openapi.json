@@ -23385,6 +23385,17 @@
           "session_context"
         ],
         "properties": {
+          "egress": {
+            "description": "Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestEgressObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "supplier_error": {
             "description": "Fixed recorded supplier reason from a bounded native inline error envelope. Null for unknown, legacy, imported and generation records; never inferred from HTTP status or fetched from object storage.",
             "oneOf": [
@@ -24410,6 +24421,24 @@
           }
         ]
       },
+      "RequestEgressObservation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "selected",
+          "observed_at"
+        ],
+        "properties": {
+          "selected": {
+            "$ref": "#/components/schemas/SelectedRequestEgress"
+          },
+          "observed_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Persisted attempt observation time in Unix milliseconds, not a connectivity check."
+          }
+        }
+      },
       "SelectedRequestEgress": {
         "type": "object",
         "required": [
@@ -24475,7 +24504,7 @@
               "string",
               "null"
             ],
-            "description": "Visible to authorized operators; URL authentication is excluded."
+            "description": "Visible within authorized request scope; URL authentication is excluded."
           },
           "port": {
             "type": [

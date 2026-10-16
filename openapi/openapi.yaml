@@ -9973,6 +9973,11 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        egress:
+          description: Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.
+          oneOf:
+            - $ref: '#/components/schemas/RequestEgressObservation'
+            - type: 'null'
         supplier_error:
           description: Fixed recorded supplier reason from a bounded native inline error envelope. Null for unknown, legacy, imported and generation records; never inferred from HTTP status or fetched from object storage.
           oneOf:
@@ -10296,6 +10301,13 @@ components:
               oneOf:
                 - $ref: '#/components/schemas/RequestProvenance'
                 - type: 'null'
+    RequestEgressObservation:
+      type: object
+      additionalProperties: false
+      required: [selected, observed_at]
+      properties:
+        selected: { $ref: '#/components/schemas/SelectedRequestEgress' }
+        observed_at: { type: integer, format: int64, description: 'Persisted attempt observation time in Unix milliseconds, not a connectivity check.' }
     SelectedRequestEgress:
       type: object
       required: [kind, group_id, group_version, group_name, member_id, member_name, scheme, host, port]
@@ -10307,7 +10319,7 @@ components:
         member_id: { type: [string, 'null'], format: uuid }
         member_name: { type: [string, 'null'] }
         scheme: { type: [string, 'null'] }
-        host: { type: [string, 'null'], description: 'Visible to authorized operators; URL authentication is excluded.' }
+        host: { type: [string, 'null'], description: 'Visible within authorized request scope; URL authentication is excluded.' }
         port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
     RequestEgressAttempt:
       type: object
