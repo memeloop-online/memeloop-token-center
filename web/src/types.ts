@@ -43,6 +43,13 @@ export interface RequestView {
   terminal_cause_code?: string | null;
   failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
+  /**
+   * Recorded network-exit snapshot for this request, captured from the egress
+   * attempt selected at send time. Absence means the history source did not
+   * capture or return an exit (older records, requests that ended before
+   * admission); it is never the current proxy configuration.
+   */
+  egress?: RequestEgressObservation | null;
   /** Durable request/response archive convergence state. */
   archive_state?: RequestArchiveState;
   session_context?: RequestSessionContext | null;
@@ -130,6 +137,13 @@ export interface SelectedRequestEgress {
   scheme: string | null;
   host: string | null;
   port: number | null;
+}
+
+/** Per-request recorded exit observation; list sources may omit it for records captured before egress observation existed. */
+export interface RequestEgressObservation {
+  selected: SelectedRequestEgress;
+  /** Server observation time of the recorded selection in Unix milliseconds; absent when the history source did not retain it. */
+  observed_at?: number | null;
 }
 
 export interface RequestEgressAttempt {

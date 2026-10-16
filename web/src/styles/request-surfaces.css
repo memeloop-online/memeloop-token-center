@@ -12,6 +12,9 @@
 .request-outcome small { font: inherit; opacity: .8; }
 .request-status-cause { display: none; }
 .request-diagnostics .request-status-cause { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+.request-egress-line { display: block; margin-top: 4px; color: var(--muted, #82979e); font-weight: 400; overflow-wrap: anywhere; }
+:root[data-theme='light'] .request-egress-line { color: var(--muted, #526d78); }
+.request-diagnostics .request-egress-line { display: none; }
 .request-outcome.ok { color: var(--mtc-data-primary, #72c7ba); background: color-mix(in srgb, var(--mtc-data-primary, #72c7ba) 10%, transparent); }
 .request-outcome.bad { color: var(--mtc-data-negative, #ed9caa); background: color-mix(in srgb, var(--mtc-data-negative, #ed9caa) 10%, transparent); }
 .request-outcome.pending { color: #f0d697; background: #3d3624; }

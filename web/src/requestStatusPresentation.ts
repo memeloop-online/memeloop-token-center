@@ -1,4 +1,6 @@
-import type { RequestView } from './types.js';
+import { egressAddress } from './operator/requestEgress.js';
+import { requestEgressCopy } from './operator/requestEgressCopy.js';
+import type { RequestEgressObservation, RequestView } from './types.js';
 
 export type RequestOutcome = 'running' | 'delivering' | 'completed' | 'cancelled' | 'interrupted' | 'failed' | 'unknown';
 
@@ -141,4 +143,87 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     cause: failureDetail,
     supplierDetail: requestSupplierDetail(request, locale),
     hint: ['failed', 'interrupted'].includes(outcome) ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
+}
+
+export type RequestEgressLineKind = 'proxy' | 'direct' | 'pre_admission' | 'unrecorded';
+
+export interface RequestEgressLine {
+  kind: RequestEgressLineKind;
+  text: string;
+  hover: string;
+}
+
+function egressObservedTime(observation: RequestEgressObservation, locale: 'zh-CN' | 'en'): string | null {
+  const at = observation.observed_at;
+  return typeof at === 'number' && Number.isFinite(at) ? new Date(at).toLocaleString(locale) : null;
+}
+
+/**
+ * The network exit recorded for this request: the attempt/selection snapshot
+ * when the list source carries one, never the current proxy configuration and
+ * never the upstream account. Pre-admission terminal records never selected an
+ * exit; missing snapshots stay explicitly unrecorded instead of being guessed.
+ */
+export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'): RequestEgressLine {
+  const zh = locale === 'zh-CN';
+  const copy = requestEgressCopy(locale);
+  if (request.terminal_cause_code === 'gateway_pre_admission') {
+    return {
+      kind: 'pre_admission',
+      text: zh ? '尚未选择网络出口' : 'No network exit selected',
+      hover: zh
+        ? '请求在选择网络出口前已由网关结束，没有实际使用的出口。'
+        : 'The gateway ended this request before a network exit was selected, so no exit was used.',
+    };
+  }
+  const observation = request.egress;
+  const selected = observation?.selected;
+  if (!observation || !selected || selected.kind === 'unknown') {
+    return {
+      kind: 'unrecorded',
+      text: zh ? `出口: ${copy.unknown}` : `Exit: ${copy.unknown.toLowerCase()}`,
+      hover: zh
+        ? '该请求的记录未包含网络出口快照；早期请求可能未采集，进行中的请求可能尚未随记录返回。'
+        : 'This record has no network-exit snapshot; older requests may predate capture, and in-flight requests may not have returned one yet.',
+    };
+  }
+  const recorded = `${zh ? '记录时间' : 'Recorded'}: ${egressObservedTime(observation, locale) ?? copy.unknown}`;
+  const connectivity = zh
+    ? '连通性: 未记录（历史使用不代表当前可通）'
+    : 'Connectivity: not recorded (past use does not confirm current reachability)';
+  if (selected.kind === 'direct') {
+    return {
+      kind: 'direct',
+      text: zh ? `出口: ${copy.direct}` : `Exit: ${copy.direct}`,
+      hover: [
+        zh
+          ? '该次请求记录为直连，未使用代理出口；网络出口是网络代理，与上游账号不同。'
+          : 'This request was recorded as a direct connection without a proxy exit; a network exit is a network proxy, separate from the upstream account.',
+        recorded,
+        connectivity,
+      ].join(' · '),
+    };
+  }
+  const address = egressAddress(selected, locale);
+  const member = selected.member_name?.trim();
+  const group = selected.group_name?.trim();
+  const name = member || group || '';
+  const summary = [name, address !== copy.unknown ? address : ''].filter(Boolean).join(' · ');
+  const groupDisplay = group || (selected.group_id ? copy.unnamedGroup : copy.ungrouped);
+  const version = typeof selected.group_version === 'number' && Number.isFinite(selected.group_version)
+    ? copy.version(selected.group_version) : '';
+  return {
+    kind: 'proxy',
+    text: zh ? `出口: ${summary || copy.proxy}` : `Exit: ${summary || copy.proxy}`,
+    hover: [
+      zh
+        ? '该次请求实际记录的网络出口（代理）；出口是网络代理，与上游账号不同。'
+        : 'The network exit (proxy) recorded for this request; an exit is a network proxy, separate from the upstream account.',
+      `${zh ? '代理组' : 'Proxy group'}: ${[groupDisplay, version].filter(Boolean).join(' · ')}`,
+      `${zh ? '出口' : 'Exit'}: ${member || copy.unnamedMember}`,
+      `${copy.address}: ${address}`,
+      recorded,
+      connectivity,
+    ].join(' · '),
+  };
 }
