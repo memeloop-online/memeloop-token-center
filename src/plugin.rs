@@ -478,6 +478,38 @@ pub struct TrafficDecision {
 }
 
 impl TrafficDecision {
+    /// Project the model the proxy would dispatch at this chain position. An
+    /// explicit model decision remains authoritative across later body rewrites.
+    /// Keep the JSON presented to the next guest consistent with its context,
+    /// without changing the original authentication identity or returned metadata.
+    fn project_context(
+        &self,
+        original: &types::RequestContext,
+        request: &mut Value,
+    ) -> types::RequestContext {
+        let model = self
+            .model
+            .as_deref()
+            .or_else(|| {
+                request
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| {
+                        !model.trim().is_empty() && model.len() <= MAX_TRAFFIC_MODEL_BYTES
+                    })
+            })
+            .unwrap_or(&original.model)
+            .to_owned();
+        // Preserve non-object rewrites so the proxy still rejects them instead
+        // of accidentally turning malformed guest output into a valid request.
+        if let Some(object) = request.as_object_mut() {
+            object.insert("model".to_owned(), Value::String(model.clone()));
+        }
+        let mut context = original.clone();
+        context.model = model;
+        context
+    }
+
     pub(crate) fn log_denial(&self) {
         debug_assert!(!self.allow);
         tracing::warn!(
@@ -1204,8 +1236,8 @@ impl PluginRuntime {
                 .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
             let bindings = Plugin::instantiate(&mut store, component, &linker)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
+            let mut plugin_context = decision.project_context(&context, &mut current);
             let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
-            let mut plugin_context = context.clone();
             let configuration = configurations
                 .get(&plugin.manifest.id)
                 .cloned()
