@@ -243,9 +243,21 @@ retain their sizes. No local build/test/install or production operation is part
 of validation. A2 permit transfer, finalization capacity admission and body
 spooling are still unimplemented; no forwarding concurrency is reduced.
 
-Controlled activation uses `MTC_TERMINAL_PROJECTION_ENABLED=true`; the default is
-false. The setting is propagated to the database and independent persistence
+Controlled activation uses `MTC_TERMINAL_PROJECTION_ENABLED=true`. The original
+staged default was false; the runtime default is now true so online financial
+transactions do not wait for statistical projection. Explicit false remains
+available for staged rollback and does not stop durable replay. The setting is
+propagated to the database and independent persistence
 pools, so real forwarding finalization, not only test helpers, uses the durable
-handoff when enabled. Keep production disabled pending mixed-worker PostgreSQL
-acceptance and test-instance validation. Disabling enqueue does not disable
+handoff when enabled. Release owners must retain the explicit false override on
+any deployment still awaiting mixed-worker PostgreSQL acceptance and real TEST
+normal, cancellation, fault and concurrent-request validation; changing this
+source default does not constitute that operational acceptance. Disabling enqueue does not disable
 replay of previously committed work.
+
+Unlimited admission retains the per-request immutable pricing/delivery record,
+with zero reserved money. It does not calculate a hypothetical monetary hold or
+touch shared key budgets, account balance, rate windows or concurrency counters.
+Actual observed usage still produces one priced ledger entry and a durable
+account projection receipt. Historical contracts retain their captured mode
+across policy edits and candidate switches.
