@@ -179,7 +179,7 @@ async fn postgres_unlimited_admission_and_terminal_ignore_shared_financial_and_s
         cancellation.status_code = 499;
         cancellation.usage_basis = Some(crate::model::RequestUsageBasis::NotObserved);
         cancellation.usage = TokenUsage::default();
-        cancellation.error_code = Some("client_disconnected".into());
+        cancellation.error_code = Some("client_disconnected");
         tokio::join!(
             fixture
                 .database
