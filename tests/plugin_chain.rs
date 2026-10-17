@@ -396,6 +396,12 @@ async fn traffic_input_exact_total_boundary_and_escaping_are_request_errors() {
         runtime.apply_traffic(ctx.clone(), &unicode),
         Err(AppError::PluginInputTooLarge)
     ));
+    let mut larger_context = ctx.clone();
+    larger_context.principal_id.push('界');
+    assert!(matches!(
+        runtime.apply_traffic(larger_context, &exact),
+        Err(AppError::PluginInputTooLarge)
+    ));
     let configs = std::collections::BTreeMap::from([("policy".into(), json!({"setting":"界"}))]);
     assert!(matches!(
         runtime.apply_traffic_with_config(ctx.clone(), &exact, &configs),
@@ -483,6 +489,18 @@ async fn no_traffic_hooks_do_not_impose_a_component_input_limit() {
     let runtime = PluginRuntime::load(None, database).unwrap();
     let request = json!({"model":"requested-model", "input":"x".repeat(TRAFFIC_INPUT_LIMIT + 1)});
     assert!(runtime.apply_traffic(context(), &request).unwrap().allow);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let revisions = revisions(runtime);
+        assert!(
+            revisions
+                .pin()
+                .unwrap()
+                .apply_traffic_with_config(context(), &request, &BTreeMap::new())
+                .unwrap()
+                .allow
+        );
+    }
 }
 
 #[tokio::test]
