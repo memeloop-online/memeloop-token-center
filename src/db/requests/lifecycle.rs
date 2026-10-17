@@ -1280,6 +1280,7 @@ impl Database {
             Some(&input),
             self.terminal_projection_enabled,
             false,
+            None,
         )
         .await
     }
@@ -1300,6 +1301,7 @@ impl Database {
             None,
             self.terminal_projection_enabled,
             false,
+            None,
         )
         .await
     }
@@ -1318,6 +1320,7 @@ impl Database {
             None,
             self.terminal_projection_enabled,
             false,
+            None,
         )
         .await
     }
@@ -1337,6 +1340,7 @@ impl Database {
             None,
             self.terminal_projection_enabled,
             false,
+            None,
         )
         .await
     }
@@ -1364,6 +1368,26 @@ impl Database {
             None,
             self.terminal_projection_enabled,
             true,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn finish_proxy_request_with_pending_receipt(
+        &self,
+        input: FinishProxyRequest<'_>,
+        upstream_attribution: ProxyRequestUpstreamAttribution,
+        receipt: &super::pending_settlement::Receipt<'_>,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        self.finish_proxy_request_inner(
+            input,
+            None,
+            None,
+            upstream_attribution,
+            None,
+            true,
+            false,
+            Some(receipt),
         )
         .await
     }
@@ -1378,6 +1402,7 @@ impl Database {
         metered: Option<&FinishMeteredSynchronousRequest<'_>>,
         defer_projection: bool,
         reap_orphan: bool,
+        pending_receipt: Option<&super::pending_settlement::Receipt<'_>>,
     ) -> Result<FinishProxyRequestResult, AppError> {
         if let Some(archive) = buffered_archive
             && (archive.identity().request_id != input.request_id
@@ -1457,6 +1482,15 @@ impl Database {
         .bind(&reservation_id)
         .execute(&mut *transaction)
         .await?;
+            if let Some(result) =
+                super::pending_settlement::guard(&mut transaction, &input, pending_receipt).await?
+            {
+                BudgetHold::commit_optional(transaction, hold).await?;
+                if let Some(reservation) = budget_reservation.as_ref() {
+                    reservation.release().await;
+                }
+                return Ok(result);
+            }
             if reap_orphan && claimed.rows_affected() == 1 {
                 let expires_at: Option<i64> = sqlx::query_scalar("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
                     .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)
@@ -1834,6 +1868,12 @@ impl Database {
             }
         };
 
+        if usage_invalid && pending_receipt.is_some() {
+            return Err(AppError::Conflict(
+                "pending settlement receipt contains invalid usage".into(),
+            ));
+        }
+
         if let Some(explicit_session_id) = input.routing_session_id {
             super::session_routing::upsert_session_routing_terminal_from_request_in_transaction(
                 &mut transaction,
@@ -1855,7 +1895,7 @@ impl Database {
         // bounded projector transaction later performs the semantic writes and
         // reclassifies the initially-unlinked request fact atomically.
         BudgetHold::set_phase(&mut hold, "conversation_projection");
-        if let Some(conversation) = input.conversation {
+        if let Some(conversation) = input.conversation.as_ref() {
             if conversation.key.tenant_id != input.tenant_id
                 || conversation.key.key_id != input.reservation.key_id
             {
@@ -2006,6 +2046,16 @@ impl Database {
                 "request terminal ownership changed".into(),
             ));
         }
+        if let Some(receipt) = pending_receipt {
+            super::pending_settlement::acknowledge(
+                &mut transaction,
+                receipt,
+                &input,
+                cost_micros,
+                now,
+            )
+            .await?;
+        }
         BudgetHold::commit_optional(transaction, hold).await?;
         if let Some(reservation) = budget_reservation.as_ref() {
             reservation.release().await;
@@ -2094,6 +2144,20 @@ impl Database {
 
     pub async fn record_request_finished(&self, request: FinishRequest) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
+        sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1")
+            .bind(request.request_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        if sqlx::query("SELECT 1 FROM pending_proxy_settlements WHERE request_id = $1")
+            .bind(request.request_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Conflict(
+                "pending settlement requires its authoritative receipt".into(),
+            ));
+        }
         let completed_at = unix_millis();
         record_request_finished_in_transaction(&mut tx, &request, completed_at, true).await?;
         tx.commit().await?;

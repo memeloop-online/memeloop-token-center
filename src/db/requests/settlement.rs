@@ -82,6 +82,24 @@ impl Database {
         usage: &TokenUsage,
     ) -> Result<i64, AppError> {
         let mut tx = self.begin_write_transaction().await?;
+        // Match claim/finalization lock order. A concurrent registration must
+        // not race a legacy split writer into silently settling with no receipt.
+        sqlx::query(
+            "UPDATE request_records SET completed_at = completed_at WHERE reservation_id = $1",
+        )
+        .bind(reservation.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if sqlx::query("SELECT 1 FROM pending_proxy_settlements WHERE reservation_id = $1")
+            .bind(reservation.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Conflict(
+                "pending settlement requires its authoritative receipt".into(),
+            ));
+        }
         let actual_micros =
             settle_token_usage_in_transaction(&mut tx, reservation, usage, unix_millis()).await?;
         tx.commit().await?;
@@ -100,7 +118,7 @@ impl Database {
         sqlx::query("UPDATE request_records SET submission_uncertain_at = $1, error_code = 'image_submission_uncertain' WHERE completed_at IS NULL AND submission_started_at IS NOT NULL AND submission_uncertain_at IS NULL AND id IN (SELECT q.id FROM request_records q WHERE q.created_at < $2 AND q.completed_at IS NULL AND q.submission_started_at IS NOT NULL AND q.submission_uncertain_at IS NULL AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.request_id = q.id AND s.key_id = q.key_id AND s.status = 'pending' AND s.lease_expires_at > $1) ORDER BY q.created_at, q.id LIMIT $3)")
             .bind(now).bind(cutoff).bind(limit.clamp(1, 1000)).execute(&self.pool).await?;
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND (q.proxy_owner_expires_at IS NULL OR q.proxy_owner_expires_at <= $2) AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
+            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.reserved_units, r.billing_unit, r.micros_per_unit, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND q.submission_started_at IS NULL AND (q.proxy_owner_expires_at IS NULL OR q.proxy_owner_expires_at <= $2) AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements p WHERE p.reservation_id = r.id AND p.state = 'pending') AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
         )
         .bind(cutoff)
         .bind(now)
