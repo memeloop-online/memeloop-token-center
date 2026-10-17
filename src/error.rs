@@ -50,7 +50,7 @@ pub enum AppError {
     Unauthorized,
     #[error("permission denied")]
     Forbidden,
-    #[error("请求过大，超过流量插件可处理的输入上限")]
+    #[error("request exceeds traffic plugin input limit")]
     PluginInputTooLarge,
     #[error("model has no price in the key currency")]
     UnpricedModel,

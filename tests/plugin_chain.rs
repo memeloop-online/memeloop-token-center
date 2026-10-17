@@ -516,7 +516,7 @@ async fn traffic_input_error_has_fixed_413_public_response() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("请求过大")
+            .contains("traffic plugin input limit")
     );
 }
 

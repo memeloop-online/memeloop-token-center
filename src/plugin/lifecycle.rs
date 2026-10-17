@@ -187,6 +187,7 @@ impl RuntimeSnapshot {
         configurations: &BTreeMap<String, serde_json::Value>,
         memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
+        let mut input_sizes = super::TrafficInputSizes::new(&self.runtime.plugins, configurations)?;
         let mut current = request.clone();
         let mut decision = TrafficDecision {
             allow: true,
@@ -203,16 +204,11 @@ impl RuntimeSnapshot {
             })
         {
             let id = &plugin.manifest.id;
-            let plugin_context = decision.project_context(&context, &mut current);
+            let (plugin_context, model_changed) = decision.project_context(&context, &mut current);
             // Input rejection belongs to this request. It must precede circuit
             // admission so an oversized body/config cannot open or probe a
             // shared plugin circuit, including for another tenant.
-            super::validate_traffic_inputs(
-                &self.runtime.plugins[index..],
-                &plugin_context,
-                &current,
-                configurations,
-            )?;
+            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
             let epoch = {
                 let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
                 let circuit = circuits.entry(id.clone()).or_default();
@@ -253,6 +249,7 @@ impl RuntimeSnapshot {
                     }
                     if let Some(request) = next.request_json {
                         current = request;
+                        input_sizes.invalidate_request();
                         decision.request_json = Some(current.clone());
                     }
                     if next.model.is_some() {

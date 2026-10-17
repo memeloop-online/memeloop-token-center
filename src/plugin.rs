@@ -492,7 +492,7 @@ impl TrafficDecision {
         &self,
         original: &types::RequestContext,
         request: &mut Value,
-    ) -> types::RequestContext {
+    ) -> (types::RequestContext, bool) {
         let model = self
             .model
             .as_deref()
@@ -508,12 +508,19 @@ impl TrafficDecision {
             .to_owned();
         // Preserve non-object rewrites so the proxy still rejects them instead
         // of accidentally turning malformed guest output into a valid request.
-        if let Some(object) = request.as_object_mut() {
-            object.insert("model".to_owned(), Value::String(model.clone()));
-        }
+        let changed = if let Some(object) = request.as_object_mut() {
+            if object.get("model").and_then(Value::as_str) == Some(model.as_str()) {
+                false
+            } else {
+                object.insert("model".to_owned(), Value::String(model.clone()));
+                true
+            }
+        } else {
+            false
+        };
         let mut context = original.clone();
         context.model = model;
-        context
+        (context, changed)
     }
 
     pub(crate) fn log_denial(&self) {
@@ -1194,6 +1201,7 @@ impl PluginRuntime {
         };
         let http = self.http.as_ref().ok_or(AppError::Internal)?;
         let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let mut input_sizes = TrafficInputSizes::new(&self.plugins, configurations)?;
         let mut current = request_json.clone();
         let mut decision = TrafficDecision {
             allow: true,
@@ -1203,15 +1211,9 @@ impl PluginRuntime {
             plugin.manifest.contributions.traffic_policy
                 || plugin.manifest.contributions.request_rewrite
         }) {
-            let mut plugin_context = decision.project_context(&context, &mut current);
-            // Check every remaining hook/configuration before executing any of
-            // them, and repeat after a preceding rewrite changes the input.
-            validate_traffic_inputs(
-                &self.plugins[index..],
-                &plugin_context,
-                &current,
-                configurations,
-            )?;
+            let (mut plugin_context, model_changed) =
+                decision.project_context(&context, &mut current);
+            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
             let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
             plugin_context.config_json =
                 serde_json::to_string(traffic_configuration(plugin, configurations))
@@ -1327,6 +1329,7 @@ impl PluginRuntime {
                 invalid_plugin_result(&plugin.manifest.id, "traffic policy request JSON")
             })? {
                 current = request;
+                input_sizes.invalidate_request();
                 decision.request_json = Some(current.clone());
             }
             if let Some(model) = result.model {
@@ -3127,41 +3130,76 @@ fn traffic_configuration<'a>(
         .unwrap_or(&EMPTY)
 }
 
-fn validate_traffic_inputs(
-    plugins: &[LoadedPlugin],
-    context: &types::RequestContext,
-    request: &Value,
-    configurations: &BTreeMap<String, Value>,
-) -> Result<(), AppError> {
-    let mut policies = plugins
-        .iter()
-        .filter(|plugin| {
-            plugin.manifest.contributions.traffic_policy
+// Cache configuration byte sizes once and suffix maxima in O(hooks). A body
+// is recounted only after a guest rewrite or model projection changes its JSON;
+// checking every remaining hook then requires constant work at each position.
+struct TrafficInputSizes {
+    remaining_configuration_bytes: Vec<usize>,
+    request_bytes: Option<usize>,
+}
+
+impl TrafficInputSizes {
+    fn new(
+        plugins: &[LoadedPlugin],
+        configurations: &BTreeMap<String, Value>,
+    ) -> Result<Self, AppError> {
+        let mut remaining_configuration_bytes = vec![0; plugins.len() + 1];
+        for (index, plugin) in plugins.iter().enumerate().rev() {
+            let own = if plugin.manifest.contributions.traffic_policy
                 || plugin.manifest.contributions.request_rewrite
+            {
+                traffic_json_bytes(
+                    traffic_configuration(plugin, configurations),
+                    MAX_TRAFFIC_INPUT_BYTES,
+                )?
+            } else {
+                0
+            };
+            remaining_configuration_bytes[index] =
+                own.max(remaining_configuration_bytes[index + 1]);
+        }
+        Ok(Self {
+            remaining_configuration_bytes,
+            request_bytes: None,
         })
-        .peekable();
-    if policies.peek().is_none() {
-        return Ok(());
     }
-    let body = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
-    let context_bytes = [
-        &context.tenant_id,
-        &context.principal_id,
-        &context.key_id,
-        &context.protocol,
-        &context.model,
-    ]
-    .into_iter()
-    .try_fold(body, |total, value| total.checked_add(value.len()))
-    .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
-    .ok_or(AppError::PluginInputTooLarge)?;
-    for plugin in policies {
-        traffic_json_bytes(
-            traffic_configuration(plugin, configurations),
-            MAX_TRAFFIC_INPUT_BYTES - context_bytes,
-        )?;
+
+    fn invalidate_request(&mut self) {
+        self.request_bytes = None;
     }
-    Ok(())
+
+    fn validate(
+        &mut self,
+        index: usize,
+        context: &types::RequestContext,
+        request: &Value,
+        model_changed: bool,
+    ) -> Result<(), AppError> {
+        if model_changed {
+            self.invalidate_request();
+        }
+        let body = match self.request_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let bytes = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
+                self.request_bytes = Some(bytes);
+                bytes
+            }
+        };
+        [
+            &context.tenant_id,
+            &context.principal_id,
+            &context.key_id,
+            &context.protocol,
+            &context.model,
+        ]
+        .into_iter()
+        .try_fold(body, |total, field| total.checked_add(field.len()))
+        .and_then(|total| total.checked_add(self.remaining_configuration_bytes[index]))
+        .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
+        .map(|_| ())
+        .ok_or(AppError::PluginInputTooLarge)
+    }
 }
 
 fn validate_traffic_request_json(value: &str) -> Result<Value, ()> {
