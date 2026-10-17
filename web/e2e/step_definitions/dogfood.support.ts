@@ -293,29 +293,23 @@ export async function addTypedFilterCondition(dialog: Locator, field: string): P
   const row = rows.nth(index);
   await row.getByLabel('字段').selectOption(field);
   // Selecting a field replaces the row's value control.  Confirm the React
-  // update before callers address a model catalog button rendered by it.
+  // update before callers address the model input rendered by it.
   await assertValue(row.getByLabel('字段'), field);
   return row;
 }
 
-/**
- * Open the model picker by its control contract rather than a localized label.
- * The visible label is product copy; `aria-haspopup=dialog` is the semantic
- * contract that makes this value editor a catalog picker rather than a free
- * text field. The non-modal dialog contains the listbox.
- */
+/** Open the editable model picker and return its input and catalog container. */
 export async function openCatalogModelPicker(row: Locator): Promise<Locator> {
   const picker = row.locator('.typed-filter-model-picker');
   await assertVisible(picker);
-  const trigger = picker.locator('button[aria-haspopup="dialog"]');
-  await trigger.click();
+  await picker.getByRole('combobox').click();
   const catalog = picker.getByRole('dialog', { name: '模型目录', exact: true });
   await assertVisible(catalog);
-  return catalog;
+  return picker;
 }
 
-export function catalogModelSearch(catalog: Locator): Locator {
-  return catalog.getByRole('combobox');
+export function catalogModelSearch(picker: Locator): Locator {
+  return picker.getByRole('combobox');
 }
 
 export async function applyUsageTypedFilter(
