@@ -74,6 +74,14 @@ impl ApplicationPlugins {
             )
             .await?;
         } else {
+            // A head receipt pins one exact active identity. A host inventory
+            // may approve alternatives, but uninstall must never select another
+            // approved version while removing an unrelated broken plugin.
+            if entry.grants.values().any(|versions| versions.len() != 1) {
+                return Err(AppError::Conflict(
+                    "retained plugins need one exact approved identity before uninstall".into(),
+                ));
+            }
             let root = path
                 .parent()
                 .ok_or(AppError::Forbidden)?

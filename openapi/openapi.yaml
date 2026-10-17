@@ -1410,9 +1410,9 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { description: The requested plugin is not present in the expected current plugin inventory. }
-        '409': { description: The current plugin revision changed, no published revision exists, or the idempotency key belongs to another request or actor. }
+        '409': { description: 'The current plugin revision changed, no published revision exists, or the idempotency key belongs to another request or actor.' }
         '422': { description: Request JSON contains unknown fields or has an invalid shape. }
-        '503': { description: Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request. }
+        '503': { description: 'Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request.' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugin-runtime/rollback:

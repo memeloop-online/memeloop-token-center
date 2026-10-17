@@ -37,6 +37,10 @@ async fn request(
 }
 
 async fn fixture() -> (tempfile::TempDir, Config, AppState) {
+    fixture_with_alternatives(false).await
+}
+
+async fn fixture_with_alternatives(alternatives: bool) -> (tempfile::TempDir, Config, AppState) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("approved");
     let inventory_file = directory.path().join("inventory.json");
@@ -67,7 +71,7 @@ async fn fixture() -> (tempfile::TempDir, Config, AppState) {
     let base = AppState::initialize(config.clone()).await.unwrap();
     let runtime = PluginRuntime::load(root.to_str(), base.db.clone()).unwrap();
     let identities = runtime.package_identities();
-    let grants = runtime
+    let mut grants: BTreeMap<String, Vec<PluginGrant>> = runtime
         .manifests()
         .into_iter()
         .map(|manifest| {
@@ -82,6 +86,18 @@ async fn fixture() -> (tempfile::TempDir, Config, AppState) {
             )
         })
         .collect();
+    if alternatives {
+        let mut manifest = runtime
+            .manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "retained-plugin")
+            .unwrap();
+        manifest.version = "1.0.1".into();
+        let mut alternative = grants["retained-plugin"][0].clone();
+        alternative.version = manifest.version.clone();
+        alternative.manifest_digest = lifecycle::manifest_digest(&manifest).unwrap();
+        grants.get_mut("retained-plugin").unwrap().push(alternative);
+    }
     let inventory = BTreeMap::from([(
         "approved".to_owned(),
         PreinstalledInventory { root, grants },
@@ -374,4 +390,34 @@ async fn concurrent_removals_never_rebase_onto_each_other() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn removal_cannot_silently_choose_another_approved_retained_version() {
+    let (directory, _config, state) = fixture_with_alternatives(true).await;
+    let path = directory
+        .path()
+        .join("approved/retained-plugin/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["version"] = json!("1.0.1");
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let status = request(
+        &state,
+        json!({"plugin_id":"removed-plugin", "expected_revision":1}),
+        Some("cannot-upgrade-retained"),
+        &state.config.service_token,
+    )
+    .await
+    .0;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let status = state
+        .application_plugins
+        .as_ref()
+        .unwrap()
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.current.unwrap().revision, 1);
+    assert_eq!(status.candidates.len(), 1);
 }
