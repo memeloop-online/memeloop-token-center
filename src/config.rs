@@ -22,6 +22,11 @@ pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
 pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
 pub const DEFAULT_ARCHIVE_SPOOL_COMPRESSION_ENABLED: bool = false;
+pub const DEFAULT_TERMINAL_PROJECTION_ENABLED: bool = true;
+
+const fn default_terminal_projection_enabled() -> bool {
+    DEFAULT_TERMINAL_PROJECTION_ENABLED
+}
 /// Runtime rollout starts in observation mode until every gateway understands
 /// transport-scoped connection cohorts. Tests keep the historical breaker
 /// semantics through `UpstreamHealthConfig::DEFAULT`; production config must
@@ -154,7 +159,7 @@ pub struct Config {
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
-    #[serde(default)]
+    #[serde(default = "default_terminal_projection_enabled")]
     pub terminal_projection_enabled: bool,
     /// Legacy deployment compatibility value; lifecycle admission uses bytes.
     pub proxy_lifecycle_concurrency: u32,
@@ -436,7 +441,10 @@ impl Config {
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
-            terminal_projection_enabled: env_bool("MTC_TERMINAL_PROJECTION_ENABLED", false),
+            terminal_projection_enabled: env_bool(
+                "MTC_TERMINAL_PROJECTION_ENABLED",
+                DEFAULT_TERMINAL_PROJECTION_ENABLED,
+            ),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
             proxy_memory_budget_bytes: env_u32(
@@ -779,6 +787,21 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_projection_default_and_explicit_rollback_survive_configuration_loading() {
+        let mut document =
+            serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_projection_enabled");
+        let defaulted: Config = serde_json::from_value(document.clone()).unwrap();
+        assert!(defaulted.terminal_projection_enabled);
+        document["terminal_projection_enabled"] = serde_json::json!(false);
+        let rollback: Config = serde_json::from_value(document).unwrap();
+        assert!(!rollback.terminal_projection_enabled);
+    }
 
     #[test]
     fn test_price_sources_require_explicit_mock_urls() {
