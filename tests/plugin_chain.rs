@@ -526,41 +526,42 @@ async fn rewritten_input_is_rechecked_before_the_next_hook_without_poisoning_cir
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");
     fs::create_dir(&plugins).unwrap();
-    let pointer = 65536;
-    let length = TRAFFIC_INPUT_LIMIT;
-    let prefix = stores(pointer, "{\"model\":\"requested-model\",\"input\":\"");
-    let suffix = stores(pointer + length - 2, "\"}");
-    let allow = decision_body(true, None, None);
-    let body = format!(
-        r#"
-        i32.const 256 memory.grow drop
-        i32.const {pointer} i32.const 120 i32.const {length} memory.fill
-        {prefix}
-        {suffix}
-        {allow}
-        drop
-        i32.const 300 i32.const 1 i32.store
-        i32.const 304 i32.const {pointer} i32.store
-        i32.const 308 i32.const {length} i32.store
-        i32.const 256
-    "#
+    // A small body rewrite crosses the total-input limit only because the next
+    // hook has a large configuration. No artificial bulk fill or raised fuel.
+    let rewritten = json!({"model":"requested-model", "input":"x".repeat(512)});
+    write_policy(
+        &plugins,
+        "a-rewriter",
+        &decision_body(true, None, Some(&rewritten)),
     );
-    write_policy(&plugins, "a-rewriter", &body);
-    write_policy(&plugins, "z-must-not-run", "unreachable");
+    write_policy_with_memory(&plugins, "z-next", &decision_body(true, None, None), true);
     let database = Database::connect(&format!(
         "sqlite://{}?mode=rwc",
         directory.path().join("rewrite.db").display()
     ))
     .await
     .unwrap();
-    let mut runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
-    // This synthetic rewriter bulk-fills16MiB to construct the boundary output.
-    // Isolate input admission from that fixture's separately tested fuel cost;
-    // production limits and all real policy-component tests stay unchanged.
-    runtime.set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
+    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
     let request = json!({"model":"requested-model"});
+    let ctx = context();
+    let common = [
+        &ctx.tenant_id,
+        &ctx.principal_id,
+        &ctx.key_id,
+        &ctx.protocol,
+        &ctx.model,
+    ]
+    .into_iter()
+    .map(|field| field.len())
+    .sum::<usize>()
+        + serde_json::to_vec(&request).unwrap().len();
+    let overhead = serde_json::to_vec(&json!({"setting":""})).unwrap().len();
+    let configurations = std::collections::BTreeMap::from([(
+        "z-next".into(),
+        json!({"setting":"x".repeat(TRAFFIC_INPUT_LIMIT - common - overhead - 64)}),
+    )]);
     assert!(matches!(
-        runtime.apply_traffic(context(), &request),
+        runtime.apply_traffic_with_config(ctx.clone(), &request, &configurations),
         Err(AppError::PluginInputTooLarge)
     ));
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -569,9 +570,73 @@ async fn rewritten_input_is_rechecked_before_the_next_hook_without_poisoning_cir
         let snapshot = revisions.pin().unwrap();
         for _ in 0..4 {
             assert!(matches!(
-                snapshot.apply_traffic_with_config(context(), &request, &BTreeMap::new()),
+                snapshot.apply_traffic_with_config(ctx.clone(), &request, &configurations),
                 Err(AppError::PluginInputTooLarge)
             ));
         }
+        let mut another = ctx;
+        another.tenant_id = "independent-tenant".into();
+        assert!(
+            snapshot
+                .apply_traffic_with_config(another, &request, &BTreeMap::new())
+                .unwrap()
+                .allow
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_projection_invalidates_the_cached_json_input_size() {
+    use memeloop_token_center::error::AppError;
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    let model = "m".repeat(200);
+    write_policy_with_memory(
+        &plugins,
+        "a-model",
+        &decision_body(true, Some(&model), None),
+        true,
+    );
+    write_policy_with_memory(&plugins, "z-next", &decision_body(true, None, None), true);
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("model.db").display()
+    ))
+    .await
+    .unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    let ctx = context();
+    let mut request = json!({"model":ctx.model, "input":""});
+    let common = [
+        &ctx.tenant_id,
+        &ctx.principal_id,
+        &ctx.key_id,
+        &ctx.protocol,
+        &ctx.model,
+    ]
+    .into_iter()
+    .map(|field| field.len())
+    .sum::<usize>()
+        + 2
+        + serde_json::to_vec(&request).unwrap().len();
+    // Changing only the context fits this slack. Changing both context and the
+    // canonical JSON crosses it, so a stale cached body size would miss it.
+    let slack = model.len() - ctx.model.len() + 32;
+    request["input"] = json!("x".repeat(TRAFFIC_INPUT_LIMIT - common - slack));
+    assert!(matches!(
+        runtime.apply_traffic(ctx.clone(), &request),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let revisions = revisions(runtime);
+        assert!(matches!(
+            revisions
+                .pin()
+                .unwrap()
+                .apply_traffic_with_config(ctx, &request, &BTreeMap::new()),
+            Err(AppError::PluginInputTooLarge)
+        ));
     }
 }
