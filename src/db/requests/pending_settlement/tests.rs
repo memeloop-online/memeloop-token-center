@@ -360,6 +360,36 @@ async fn receipt_authority_rejects_foreign_contract_and_invalid_or_unobserved_us
 }
 
 #[tokio::test]
+async fn same_price_candidate_change_fences_the_previous_receipt() {
+    let Some(f) = Fixture::postgres(EnforcementMode::Prepaid).await else {
+        return;
+    };
+    let old_claim = f.claim().await;
+    // The selected upstream model changes without changing the reservation
+    // identity, ceilings or price. It still needs a distinct receipt authority.
+    sqlx::query("UPDATE request_records SET upstream_model = 'next-candidate-model' WHERE id = $1")
+        .bind(f.owner.request_id.to_string())
+        .execute(&f.database.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.finish(&old_claim, Uuid::now_v7()).await,
+        Err(AppError::Conflict(_))
+    ));
+    let new_claim = f.claim().await;
+    assert_ne!(old_claim.fence, new_claim.fence);
+    assert_ne!(old_claim.contract_digest, new_claim.contract_digest);
+    assert!(matches!(
+        f.finish(&old_claim, Uuid::now_v7()).await,
+        Err(AppError::Conflict(_))
+    ));
+    f.assert_pending().await;
+    f.finish(&new_claim, Uuid::now_v7()).await.unwrap();
+    f.assert_applied_once(12).await;
+    f.close().await;
+}
+
+#[tokio::test]
 async fn explicit_non_execution_is_required_for_a_zero_usage_receipt() {
     let Some(f) = Fixture::postgres(EnforcementMode::Prepaid).await else {
         return;

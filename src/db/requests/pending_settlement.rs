@@ -3,6 +3,8 @@
 //! An absent journal ACK is unknown evidence, never permission to charge zero.
 use super::super::*;
 
+const RESERVATION_CONTRACT_SQL: &str = "SELECT r.account_id,r.enforcement_mode,r.reserved_micros,r.reserved_tokens,r.reserved_units,r.price_snapshot_json,q.upstream_account_id,q.model_route_id,q.upstream_model FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE r.id = $1 AND r.key_id = $2 AND q.id = $3 AND r.status = 'reserved'";
+
 #[cfg(test)]
 mod tests;
 
@@ -77,6 +79,9 @@ fn contract(
         "mode": reservation.try_get::<String, _>("enforcement_mode")?,
         "reserved_micros": reservation.try_get::<i64, _>("reserved_micros")?,
         "price_snapshot": reservation.try_get::<Option<String>, _>("price_snapshot_json")?,
+        "upstream_account_id": reservation.try_get::<Option<String>, _>("upstream_account_id")?,
+        "model_route_id": reservation.try_get::<Option<String>, _>("model_route_id")?,
+        "upstream_model": reservation.try_get::<Option<String>, _>("upstream_model")?,
         "input_ceiling": input_ceiling, "output_ceiling": output_ceiling, "tier": tier,
     }))
 }
@@ -112,9 +117,13 @@ impl Database {
         {
             return Err(conflict());
         }
-        let reservation = sqlx::query("SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, reserved_units, price_snapshot_json FROM usage_reservations WHERE id = $1 AND key_id = $2 AND status = 'reserved'")
-            .bind(owner.reservation_id.to_string()).bind(owner.key_id.to_string())
-            .fetch_optional(&mut *tx).await?.ok_or_else(conflict)?;
+        let reservation = sqlx::query(RESERVATION_CONTRACT_SQL)
+            .bind(owner.reservation_id.to_string())
+            .bind(owner.key_id.to_string())
+            .bind(owner.request_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(conflict)?;
         let account_id = parse_uuid(reservation.try_get("account_id")?)?;
         let contract = contract(
             owner,
@@ -313,9 +322,13 @@ pub(super) async fn guard(
             response_object: row.try_get("response_object")?,
         }));
     }
-    let reservation = sqlx::query("SELECT account_id,enforcement_mode,reserved_micros,reserved_tokens,reserved_units,price_snapshot_json FROM usage_reservations WHERE id = $1 AND key_id = $2 AND status = 'reserved'")
-        .bind(claim.reservation_id.to_string()).bind(claim.key_id.to_string())
-        .fetch_optional(&mut **tx).await?.ok_or_else(conflict)?;
+    let reservation = sqlx::query(RESERVATION_CONTRACT_SQL)
+        .bind(claim.reservation_id.to_string())
+        .bind(claim.key_id.to_string())
+        .bind(claim.request_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(conflict)?;
     let owner = ProxyRequestOwner {
         request_id: claim.request_id,
         tenant_id: claim.tenant_id,
