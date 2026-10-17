@@ -6,7 +6,7 @@ import { ModelPicker } from '../ModelPicker';
 import { useAnchoredPopover } from '../useAnchoredPopover';
 import { routeModelOptions } from './modelCatalog';
 import { filterModelPageSize, loadFilterModelRoutes } from './filterModelCatalog';
-import { filterConditionLabel, filterPresetPresentation } from './filterPresetPresentation';
+import { filterPresetPresentation } from './filterPresetPresentation';
 import { defaultUsageSelection, localDateTimeInput, usageAstFromSelection, usageSelectionFromAst, type UsageSelection } from './usageState';
 import type {
   FilterAssistantPlan, FilterAssistantSettings, FilterPresetState, RequestListCursor,
@@ -88,6 +88,16 @@ function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterO
   if (field.type === 'timestamp' || field.type === 'integer' || field.type === 'money_micros') return numericOperators;
   if (field.type === 'text' || field.type === 'model') return textOperators;
   return exactOperators;
+}
+
+function conditionLabel(condition: TypedFilterCondition, t: (key: string) => string) {
+  const value = typeof condition.value.value === 'number'
+    ? (condition.value.type === 'timestamp' ? new Date(condition.value.value).toLocaleString() : String(condition.value.value))
+    : condition.value.value;
+  const upper = condition.upper && typeof condition.upper.value === 'number'
+    ? (condition.upper.type === 'timestamp' ? new Date(condition.upper.value).toLocaleString() : String(condition.upper.value))
+    : condition.upper?.value;
+  return `${t(`filter.field.${condition.field}`)} ${t(`filter.operator.${condition.operator}`)} ${value}${upper === undefined ? '' : ` – ${upper}`}`;
 }
 
 /**
@@ -259,7 +269,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
 
   return <div className="typed-filter-builder" style={scope === 'usage' ? { minWidth: 0 } : undefined}>
     <div className="typed-filter-chips" style={scope === 'usage' ? { minWidth: 0 } : undefined} aria-label={t('filter.applied')}>
-      {ast.conditions.filter((condition) => scope !== 'usage' || condition.field !== 'created_at' || usageSelection?.preset !== '24h').map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{filterConditionLabel(condition, locale, t, upstreams)}</span>)}
+      {ast.conditions.filter((condition) => scope !== 'usage' || condition.field !== 'created_at' || usageSelection?.preset !== '24h').map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}
       {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
       {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>
@@ -298,7 +308,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
         const preview = filterPresetPresentation(recent, locale, t, upstreams);
         return <Button type="button" appearance="secondary" className="typed-filter-preset" key={`recent-${index}`} title={preview.detail} aria-label={preview.detail} onClick={() => loadPreset(recent)}><span className="typed-filter-preset-summary">{preview.summary}</span></Button>;
       })}</div><div className="typed-filter-save"><Input value={presetName} maxLength={80} onChange={(_, data) => setPresetName(data.value)} placeholder={t('filter.namePlaceholder')} /><Button type="button" appearance="secondary" disabled={busy || !presetName.trim()} onClick={() => void saveNamed()}>{t('filter.save')}</Button></div></section>
-      {scope === 'requests' && <section className="typed-filter-assistant"><h3>{t('filter.assistant')}</h3>{!tenant ? <div className="empty">{t('filter.assistantTenantRequired')}</div> : assistantSettings === undefined ? <LoadingState label={t('common.loading')} variant="compact" /> : assistantSettings === null ? <div className="empty">{t('filter.assistantNotConfigured')}</div> : <><label>{t('filter.assistantPrompt')}<Textarea value={assistantPrompt} maxLength={2000} onChange={(_, data) => setAssistantPrompt(data.value)} placeholder={t('filter.assistantPlaceholder')} /><small>{t('filter.assistantExecutionHint')}</small></label><Button type="button" appearance="secondary" disabled={busy || !assistantPrompt.trim()} onClick={() => void planWithAssistant()}>{t('filter.createPreview')}</Button>{assistantPlan && <div className="typed-filter-preview"><b>{t('filter.preview')}</b><div className="typed-filter-chips">{assistantPlan.ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{filterConditionLabel(condition, locale, t, upstreams)}</span>)}</div><Button type="button" onClick={() => { setDraft(assistantPlan.ast); setAssistantPlan(undefined); }}>{t('filter.usePreview')}</Button></div>}</>}</section>}
+      {scope === 'requests' && <section className="typed-filter-assistant"><h3>{t('filter.assistant')}</h3>{!tenant ? <div className="empty">{t('filter.assistantTenantRequired')}</div> : assistantSettings === undefined ? <LoadingState label={t('common.loading')} variant="compact" /> : assistantSettings === null ? <div className="empty">{t('filter.assistantNotConfigured')}</div> : <><label>{t('filter.assistantPrompt')}<Textarea value={assistantPrompt} maxLength={2000} onChange={(_, data) => setAssistantPrompt(data.value)} placeholder={t('filter.assistantPlaceholder')} /><small>{t('filter.assistantExecutionHint')}</small></label><Button type="button" appearance="secondary" disabled={busy || !assistantPrompt.trim()} onClick={() => void planWithAssistant()}>{t('filter.createPreview')}</Button>{assistantPlan && <div className="typed-filter-preview"><b>{t('filter.preview')}</b><div className="typed-filter-chips">{assistantPlan.ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}</div><Button type="button" onClick={() => { setDraft(assistantPlan.ast); setAssistantPlan(undefined); }}>{t('filter.usePreview')}</Button></div>}</>}</section>}
     </section>}
   </div>;
 }
