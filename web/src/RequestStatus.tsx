@@ -10,5 +10,5 @@ export function RequestStatus({ request }: { request: RequestView }) {
   const egress = requestEgressLine(request, locale);
   return <><DetailTooltip content={status.hint}><span className={`status request-outcome ${status.tone}`} data-outcome={status.outcome} tabIndex={0} aria-label={`${status.label}. ${status.hint}`}>
     {status.label}{request.status_code !== null && <small>{request.status_code}</small>}
-  </span></DetailTooltip>{status.cause && <small className="request-status-cause">{status.cause}</small>}<DetailTooltip content={egress.hover}><small className={`request-egress-line request-egress-${egress.kind}`} data-egress={egress.kind} tabIndex={0} aria-label={`${egress.text}. ${egress.hover}`}>{egress.text}</small></DetailTooltip></>;
+  </span></DetailTooltip>{status.cause && <small className="request-status-cause">{status.cause}</small>}{egress && <DetailTooltip content={egress.hover}><small className={`request-egress-line request-egress-${egress.kind}`} data-egress={egress.kind} tabIndex={0} aria-label={`${egress.text}. ${egress.hover}`}>{egress.text}</small></DetailTooltip>}</>;
 }

@@ -32,6 +32,17 @@ if (new URLSearchParams(location.search).has('egress')) first = {
   egress_attempts: egressAttempts,
 };
 const second = { ...base, compaction: null, request_id: 'request-b', model: 'model-b', status_code: 200, completed_at: 3000, duration_ms: 2000 };
+// Synthetic fixtures only: documentation ranges (RFC 5737), no real user data.
+const egressLineRows: RequestDetail[] = [
+  { ...base, request_id: 'request-c', model: 'model-c', status_code: 200, completed_at: 3000, duration_ms: 2000,
+    egress: { selected: { kind: 'proxy', group_id: 'group-c', group_version: 3, group_name: '示例出口组', member_id: 'member-c', member_name: 'edge-01', scheme: 'socks5h', host: '192.0.2.10', port: 1080 }, observed_at: 1760000000000 } },
+  { ...base, request_id: 'request-d', model: 'model-d', status_code: 200, completed_at: 3000, duration_ms: 2000,
+    egress: { selected: { kind: 'direct', group_id: null, group_version: null, group_name: null, member_id: null, member_name: null, scheme: null, host: null, port: null }, observed_at: 1760000000000 } },
+  { ...base, request_id: 'request-e', model: 'model-e', status_code: 200, completed_at: 3000, duration_ms: 2000,
+    egress: { selected: { kind: 'unknown', group_id: null, group_version: null, group_name: null, member_id: null, member_name: null, scheme: null, host: null, port: null } } },
+  { ...base, request_id: 'request-f', model: 'model-f', status_code: 502, completed_at: 3000, duration_ms: 2000, error_code: 'http_502', terminal_cause_code: 'gateway_pre_admission' },
+  { ...base, request_id: 'request-g', model: 'model-g', status_code: 200, completed_at: 3000, duration_ms: 2000, egress: null },
+];
 let hold = false;
 let release: (() => void) | undefined;
 let holdQuery = false;
@@ -51,7 +62,7 @@ window.fetch = async (input) => {
       holdQuery = false; window.requestLifecycleFixture.queryHeld = true;
       return new Promise<Response>((resolve) => { failQuery = () => { window.requestLifecycleFixture.queryHeld = false; resolve(new Response(JSON.stringify({ error: 'fixture query failure' }), { status: 503 })); }; });
     }
-    return json({ requests: [first, second], next_cursor: { before_created_at: 1000, before_id: second.request_id } });
+    return json({ requests: new URLSearchParams(location.search).has('egress-lines') ? [first, second, ...egressLineRows] : [first, second], next_cursor: { before_created_at: 1000, before_id: second.request_id } });
   }
   if (url.pathname.startsWith('/internal/v1/requests/')) {
     window.requestLifecycleFixture.detailCalls += 1;
