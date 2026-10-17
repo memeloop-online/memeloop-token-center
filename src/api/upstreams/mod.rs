@@ -16,6 +16,7 @@ mod oauth_device_worker_tests;
 mod oauth_kimi;
 mod proxy_settings;
 mod quota;
+mod rejections;
 
 fn restrict_transport_proxy_capability(
     service: &crate::model::AuthenticatedService,

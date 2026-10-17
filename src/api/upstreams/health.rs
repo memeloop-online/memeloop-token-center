@@ -238,11 +238,15 @@ pub(in crate::api) async fn probe_upstream_health(
     let checked_at = unix_millis();
     match response {
         Ok(response) => {
-            // Dropping the response without reading its body makes the probe
-            // bounded and prevents provider error text or secrets from being
-            // copied into logs or the management response.
             let upstream_status = response.status();
-            let error_code = health_probe_error(&account.driver, upstream_status);
+            let error_code = if matches!(
+                upstream_status,
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                Some(super::rejections::classify_auth_rejection(response).await)
+            } else {
+                health_probe_error(&account.driver, upstream_status)
+            };
             if error_code.is_none() {
                 // A request that began while the account was healthy can race
                 // with a routed generation failure. Re-read the same account

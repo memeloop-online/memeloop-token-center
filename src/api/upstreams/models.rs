@@ -887,7 +887,7 @@ async fn discover_models(
         return Err("redirect_rejected");
     }
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-        return Err("authentication_failed");
+        return Err(super::rejections::classify_auth_rejection(response).await);
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err("rate_limited");
