@@ -259,6 +259,7 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($6 = '' OR r.protocol = $6)
   AND $7 = 'pending'
   AND r.status_code IS NULL
+  AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = r.id AND operational.tenant_id = r.tenant_id AND operational.key_id = r.key_id AND operational.reservation_id = r.reservation_id)
   AND ($8 = '' OR r.error_code = $8)
   AND ($9 = '' OR r.upstream_account_id = $9)
   AND ($10 = '' OR r.model_route_id = $10)

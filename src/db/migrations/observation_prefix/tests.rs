@@ -52,11 +52,15 @@ async fn conversion_contract(url: &str) {
             .execute(&database.pool).await.unwrap();
         historical_requests.push((request, key.tenant_id, empty));
     }
+    sqlx::query("DROP TABLE proxy_operational_terminals")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     sqlx::query("DROP TABLE pending_proxy_settlements")
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (127, 128)")
+    sqlx::query("DELETE FROM schema_migrations WHERE version IN (127, 128, 129)")
         .execute(&database.pool)
         .await
         .unwrap();

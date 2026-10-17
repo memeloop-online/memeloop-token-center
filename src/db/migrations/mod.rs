@@ -673,6 +673,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "admitted proxy settlement recovery authority",
         sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
     },
+    Migration {
+        version: 129,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0129_proxy_operational_terminals.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1328,6 +1333,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 128,
         name: "admitted proxy settlement recovery authority",
         sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0129_proxy_operational_terminals.sql"),
     },
 ];
 

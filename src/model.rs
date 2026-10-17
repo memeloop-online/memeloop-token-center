@@ -605,6 +605,8 @@ pub struct EntitlementReconcileResult {
 
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    /// Independently acknowledged execution outcome; accounting may remain unknown.
+    pub operational_terminal: Option<RequestOperationalTerminalView>,
     pub egress: Option<RequestEgressObservation>,
     pub usage_basis: Option<RequestUsageBasis>,
     /// Only an explicitly persisted context-compaction marker is true.
@@ -614,9 +616,8 @@ pub struct RequestView {
     pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
     pub created_at: i64,
-    /// Time at which terminal accounting was committed. A missing value is a
-    /// request that is still pending (or an imported record without a native
-    /// terminal timestamp).
+    /// Time at which terminal accounting was committed. An execution may already
+    /// be terminal while this remains absent; see `operational_terminal`.
     pub completed_at: Option<i64>,
     /// Completion timestamp reported by an imported source. Native request
     /// records do not synthesize this field from their local completion time.
@@ -672,6 +673,21 @@ pub struct RequestView {
     pub session_context: Option<RequestSessionContext>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestOperationalTerminalView {
+    pub completed_at: i64,
+    pub stage: Option<String>,
+    pub financial_state: RequestFinancialState,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestFinancialState {
+    Pending,
+    Unknown,
+    Applied,
+}
+
 impl Serialize for RequestView {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -680,7 +696,8 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 32)?;
+        let mut state = serializer.serialize_struct("RequestView", 33)?;
+        state.serialize_field("operational_terminal", &self.operational_terminal)?;
         state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
@@ -717,10 +734,13 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
-        state.serialize_field(
-            "failure_diagnostic",
-            &failure_diagnostic(self.terminal_cause_code.as_deref()),
-        )?;
+        let diagnostic = failure_diagnostic(self.terminal_cause_code.as_deref());
+        let diagnostic = diagnostic.map(|value| serde_json::json!({
+            "stage": self.operational_terminal.as_ref().and_then(|terminal| terminal.stage.as_deref()).or(value.stage),
+            "source": value.source,
+            "reason": value.reason,
+        }));
+        state.serialize_field("failure_diagnostic", &diagnostic)?;
         state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
