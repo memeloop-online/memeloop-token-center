@@ -553,7 +553,11 @@ async fn rewritten_input_is_rechecked_before_the_next_hook_without_poisoning_cir
     ))
     .await
     .unwrap();
-    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    let mut runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    // This synthetic rewriter bulk-fills16MiB to construct the boundary output.
+    // Isolate input admission from that fixture's separately tested fuel cost;
+    // production limits and all real policy-component tests stay unchanged.
+    runtime.set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
     let request = json!({"model":"requested-model"});
     assert!(matches!(
         runtime.apply_traffic(context(), &request),
