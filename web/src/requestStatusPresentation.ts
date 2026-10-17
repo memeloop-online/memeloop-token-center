@@ -145,7 +145,7 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     hint: ['failed', 'interrupted'].includes(outcome) ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
 }
 
-export type RequestEgressLineKind = 'proxy' | 'direct' | 'pre_admission' | 'unrecorded';
+export type RequestEgressLineKind = 'proxy' | 'direct';
 
 export interface RequestEgressLine {
   kind: RequestEgressLineKind;
@@ -161,31 +161,21 @@ function egressObservedTime(observation: RequestEgressObservation, locale: 'zh-C
 /**
  * The network exit recorded for this request: the attempt/selection snapshot
  * when the list source carries one, never the current proxy configuration and
- * never the upstream account. Pre-admission terminal records never selected an
- * exit; missing snapshots stay explicitly unrecorded instead of being guessed.
+ * never the upstream account. Anything without a real recorded exit — a
+ * pre-admission terminal record, a missing or unknown snapshot, or a proxy
+ * snapshot with neither a name nor a usable address — returns null so the
+ * list omits the line instead of guessing or showing a placeholder.
  */
-export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'): RequestEgressLine {
+export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'): RequestEgressLine | null {
   const zh = locale === 'zh-CN';
   const copy = requestEgressCopy(locale);
   if (request.terminal_cause_code === 'gateway_pre_admission') {
-    return {
-      kind: 'pre_admission',
-      text: zh ? '尚未选择网络出口' : 'No network exit selected',
-      hover: zh
-        ? '请求在选择网络出口前已由网关结束，没有实际使用的出口。'
-        : 'The gateway ended this request before a network exit was selected, so no exit was used.',
-    };
+    return null;
   }
   const observation = request.egress;
   const selected = observation?.selected;
   if (!observation || !selected || selected.kind === 'unknown') {
-    return {
-      kind: 'unrecorded',
-      text: zh ? `出口: ${copy.unknown}` : `Exit: ${copy.unknown.toLowerCase()}`,
-      hover: zh
-        ? '该请求的记录未包含网络出口快照；早期请求可能未采集，进行中的请求可能尚未随记录返回。'
-        : 'This record has no network-exit snapshot; older requests may predate capture, and in-flight requests may not have returned one yet.',
-    };
+    return null;
   }
   const recorded = `${zh ? '记录时间' : 'Recorded'}: ${egressObservedTime(observation, locale) ?? copy.unknown}`;
   const connectivity = zh
@@ -194,7 +184,7 @@ export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'):
   if (selected.kind === 'direct') {
     return {
       kind: 'direct',
-      text: zh ? `出口: ${copy.direct}` : `Exit: ${copy.direct}`,
+      text: copy.direct,
       hover: [
         zh
           ? '该次请求记录为直连，未使用代理出口；网络出口是网络代理，与上游账号不同。'
@@ -209,12 +199,13 @@ export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'):
   const group = selected.group_name?.trim();
   const name = member || group || '';
   const summary = [name, address !== copy.unknown ? address : ''].filter(Boolean).join(' · ');
+  if (!summary) return null;
   const groupDisplay = group || (selected.group_id ? copy.unnamedGroup : copy.ungrouped);
   const version = typeof selected.group_version === 'number' && Number.isFinite(selected.group_version)
     ? copy.version(selected.group_version) : '';
   return {
     kind: 'proxy',
-    text: zh ? `出口: ${summary || copy.proxy}` : `Exit: ${summary || copy.proxy}`,
+    text: summary,
     hover: [
       zh
         ? '该次请求实际记录的网络出口（代理）；出口是网络代理，与上游账号不同。'

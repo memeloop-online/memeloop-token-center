@@ -102,3 +102,61 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
     }
   } finally { await browser.close(); await server.close(); }
 });
+
+test('request list exit lines render only real recorded exits with exact text and the preserved tooltip', { timeout: 90_000 }, async () => {
+  const server = await createIsolatedFixtureServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
+  await mkdir(artifactRoot, { recursive: true });
+  try {
+    for (const locale of ['zh-CN', 'en']) {
+      const zh = locale === 'zh-CN';
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+      await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
+      await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?egress-lines&quiet-background-help`);
+      const row = (model: string) => page.locator('tbody tr').filter({ has: page.getByText(model, { exact: true }) });
+      const proxyLine = row('model-c').locator('.request-egress-line');
+      await proxyLine.waitFor();
+      assert.equal(await proxyLine.innerText(), 'edge-01 · socks5h://192.0.2.10:1080');
+      assert.equal(await proxyLine.getAttribute('data-egress'), 'proxy');
+      const directLine = row('model-d').locator('.request-egress-line');
+      assert.equal(await directLine.innerText(), zh ? '直连' : 'Direct');
+      assert.equal(await directLine.getAttribute('data-egress'), 'direct');
+      // In-flight missing (model-a), completed missing (model-b), unknown kind
+      // (model-e), pre-admission (model-f) and explicit null (model-g) records
+      // have no real recorded exit, so the list renders no exit line at all.
+      for (const model of ['model-a', 'model-b', 'model-e', 'model-f', 'model-g']) {
+        assert.equal(await row(model).locator('.request-egress-line').count(), 0, `${model} has no recorded exit line`);
+      }
+      await page.screenshot({ path: `${artifactRoot}/egress-list-lines-${locale}-390.png`, fullPage: true });
+      await proxyLine.focus();
+      const proxyTooltip = page.locator('[role="tooltip"]:visible');
+      await proxyTooltip.waitFor();
+      const proxyTip = await proxyTooltip.innerText();
+      assert.match(proxyTip, zh ? /代理组: 示例出口组/ : /Proxy group: 示例出口组/);
+      assert.match(proxyTip, zh ? /组版本 3/ : /Group version 3/);
+      assert.match(proxyTip, /edge-01/);
+      assert.match(proxyTip, /socks5h:\/\/192\.0\.2\.10:1080/);
+      assert.match(proxyTip, zh ? /连通性: 未记录（历史使用不代表当前可通）/ : /Connectivity: not recorded \(past use does not confirm current reachability\)/);
+      assert.match(proxyTip, zh ? /与上游账号不同/ : /separate from the upstream account/);
+      await proxyLine.evaluate(element => (element as HTMLElement).blur());
+      await page.mouse.move(0, 0);
+      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+      await directLine.focus();
+      const directTooltip = page.locator('[role="tooltip"]:visible');
+      await directTooltip.waitFor();
+      assert.match(await directTooltip.innerText(), zh ? /未使用代理出口/ : /without a proxy exit/);
+      await directLine.evaluate(element => (element as HTMLElement).blur());
+      await page.mouse.move(0, 0);
+      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+      assert.deepEqual(errors, []);
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
