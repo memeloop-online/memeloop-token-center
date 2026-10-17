@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::db::routing::lock_routing_relation_writes;
+use crate::db::routing::{lock_routing_relation_writes, record_group_catalog_evidence};
 
 pub const MODEL_CATALOG_TTL_MILLIS: i64 = 24 * 60 * 60 * 1_000;
 
@@ -417,6 +417,8 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
 
+        record_group_catalog_evidence(&mut transaction, &tenant_id, account_id, now).await?;
+
         if driver == "openai-codex" {
             let mut config: Value =
                 serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
@@ -520,6 +522,7 @@ impl Database {
                 | "credential_invalid"
                 | "connection_failed"
                 | "authentication_failed"
+                | "permission_denied"
                 | "rate_limited"
                 | "upstream_unavailable"
                 | "redirect_rejected"

@@ -8,7 +8,8 @@ import '../../src/theme.css';
 
 function Fixture() {
   const [route, setRoute] = useState<NonNullable<OperatorProps['route']>>(pluginRouteKey('component-dashboard', 'workspace'));
-  return <Operator route={route} onRouteChange={setRoute} embedded showNavigation={false} />;
+  const [revision, setRevision] = useState(0);
+  return <><button type="button" onClick={() => setRevision(value => value + 1)}>Refresh host view {revision}</button><Operator route={route} onRouteChange={setRoute} embedded showNavigation={false} /></>;
 }
 
 localStorage.setItem('mtc.operator.service-credential.v1', 'mts_component_fixture');

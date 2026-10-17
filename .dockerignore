@@ -8,3 +8,5 @@ web/dist
 .env*
 compose.yaml
 
+
+.plugin-examples

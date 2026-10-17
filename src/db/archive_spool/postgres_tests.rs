@@ -451,6 +451,7 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     fixture.db.close().await;
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
@@ -817,6 +818,7 @@ impl PgFixture {
             .unwrap();
         let db = Database {
             pool: schema_pool(&url, &schema).await,
+            pool_role: "serve",
             backend: DatabaseBackend::PostgreSql,
             terminal_projection_enabled: false,
             gateway_persistence: isolated_gateway_persistence(&url, &schema),
@@ -1017,6 +1019,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.db.close().await;
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
@@ -1087,6 +1090,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.db.close().await;
     fixture.db = Database {
         pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
         terminal_projection_enabled: false,
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),

@@ -669,7 +669,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
     let legacy_observation_id = Uuid::now_v7();
     let legacy_request_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version) VALUES ($1, $2, $3, $4, '[]', $5, 2)",
+        "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version) VALUES ($1, $2, $3, $4, '{\"context_prefix_v1\":null,\"atom_count\":0}', $5, 2)",
     )
     .bind(legacy_observation_id.to_string())
     .bind(&parent_cluster)
@@ -1355,6 +1355,8 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&database_url).await;
+    let database_url = fixture.url().to_owned();
     let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
     let schema = format!("online_projection_lock_{}", Uuid::now_v7().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
@@ -1672,6 +1674,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
         .await
         .unwrap();
     admin.close().await;
+    fixture.cleanup().await;
 }
 
 #[tokio::test]

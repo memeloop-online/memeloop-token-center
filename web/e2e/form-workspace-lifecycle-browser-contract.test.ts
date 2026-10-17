@@ -96,7 +96,6 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
       await page.screenshot({ path: `${credentialArtifacts}/credential-list-${theme}-${width}.png`, fullPage: true });
     }
     await page.locator('[data-workspace-toggle]').click();
-    await page.locator('#root_principal_external_id').fill('fixture-principal');
     await page.locator('#root_alias').fill('研发自动化');
     await page.evaluate(() => {
       const original = window.fetch; let fail = true;

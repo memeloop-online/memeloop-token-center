@@ -4,6 +4,7 @@ import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { AppShell } from '../../src/app/AppShell';
 import { AuthorizationCodeConnection } from '../../src/operator/AuthorizationCodeConnection';
+import { TransportProxyGroups } from '../../src/operator/TransportProxyGroupManager';
 import { ProvidersPage } from '../../src/operator/pages/ManagementPages';
 import type { ProviderType, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
@@ -30,11 +31,12 @@ function Fixture() {
   const [tenant, setTenant] = useState('fixture-a');
   const [, setLocked] = useState(false);
   const [reads, setReads] = useState(0);
-  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><output data-testid="account-reads">{reads}</output><AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={selectedProvider} existing={account} onLock={setLocked} onChanged={async () => {
+  const connection = <AuthorizationCodeConnection key={tenant} token="fixture-token" tenant={tenant} provider={selectedProvider} existing={account} onLock={setLocked} onChanged={async () => {
     const response = await fetch('/internal/v1/upstreams');
     setReads(value => value + 1);
     if (!response.ok) throw new Error('fixture list read failed');
-  }} /></main>;
+  }} />;
+  return <main style={{ maxWidth: 720, margin: 'auto', padding: 16 }}><button onClick={() => setTenant('fixture-b')}>Switch scope</button><output data-testid="account-reads">{reads}</output>{new URLSearchParams(location.search).has('groups') ? <TransportProxyGroups token="fixture-token" tenant={tenant} accounts={[]} onChanged={async () => {}} onNavigate={() => {}}>{connection}</TransportProxyGroups> : connection}</main>;
 }
 function ScopedProvidersFixture() {
   const [tenant, setTenant] = useState('fixture-a');

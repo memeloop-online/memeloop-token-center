@@ -116,7 +116,9 @@ paths:
         cache, so probe bursts do not amplify dependency traffic. Database reachability
         and the complete migration registry determine the HTTP status. An archive failure
         is returned as HTTP 200 with `status: degraded` and `checks.archive: failed`;
-        archive-dependent image/video operations still fail closed.
+        archive-dependent image/video operations still fail closed. Before application
+        initialization completes, returns 503 with unknown dependency checks and a fixed
+        initialization error code; process liveness remains available.
       security: []
       responses:
         '200':
@@ -126,6 +128,32 @@ paths:
               schema: { $ref: '#/components/schemas/Readiness' }
         '503':
           description: PostgreSQL readiness failed, timed out, or its schema is missing a migration required by this binary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /ui-assets/service-status:
+    get:
+      tags: [System]
+      operationId: getWebsiteServiceStatus
+      summary: Read dependency status while the existing website shell remains available
+      description: |
+        Available through the existing static asset Ingress prefix, including before
+        AppState initialization. Uses the existing readiness cache after initialization.
+        Contains fixed public diagnostics only; does not authorize data access or forwarding.
+        last_database_error is the last failure observed in this process, with Unix seconds.
+        Read readiness does not establish that database writes have recovered.
+        Deploy the chart's static-only web Service/routing to retain this path when
+        Kubernetes withdraws the API Service's unready endpoints.
+      security: []
+      responses:
+        '200':
+          description: Database read health is ready; archive may be degraded. Historical failure evidence may remain.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Application initialization or database readiness is unavailable. Credentials remain unverified.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
@@ -174,6 +202,110 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/api-schema:
+    get:
+      tags: [System]
+      operationId: discoverApiSchema
+      summary: Discover the complete OpenAPI contract
+      description: Authentication does not grant permission to invoke discovered operations.
+      security: [{ serviceBearer: [] }]
+      responses:
+        '200':
+          description: OpenAPI 3.1 JSON document; includes operations requiring additional scopes
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /internal/v1/inference/chat/completions:
+    post:
+      tags: [Client credentials]
+      operationId: operatorChatCompletion
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Requires an active key with a stored copyable credential. Only JSON
+        completions are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: OpenAI-compatible chat completion billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON completion request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/inference/messages:
+    post:
+      tags: [Client credentials]
+      operationId: operatorMessages
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Requires an active key with a stored copyable credential. Only JSON
+        messages are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: Anthropic Messages response billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON Messages request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /internal/v1/keys:
     get:
       tags: [Client credentials]
@@ -7430,7 +7562,8 @@ components:
           additionalProperties: false
           required: [database, database_schema, archive]
           properties:
-            database: { type: string, enum: [ok, failed] }
+            application: { type: string, enum: [initializing, failed] }
+            database: { type: string, enum: [ok, failed, unknown] }
             database_schema:
               type: object
               additionalProperties: false
@@ -7440,7 +7573,23 @@ components:
                 required_version: { type: integer, format: int64, minimum: 0 }
                 latest_applied_version: { type: [integer, 'null'], format: int64, minimum: 0 }
                 missing_migration_count: { type: integer, minimum: 0 }
-            archive: { type: string, enum: [ok, failed] }
+            archive: { type: string, enum: [ok, failed, unknown] }
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [service_initializing, database_storage_full, database_unavailable, database_initialization_failed, application_initialization_failed, database_schema_outdated]
+            message: { type: string }
+        last_database_error:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [code, observed_at]
+          properties:
+            code: { type: string, enum: [database_storage_full, database_unavailable] }
+            observed_at: { type: integer, format: int64, minimum: 0, description: Unix seconds of the last failure observed in this process; not a current write-health assertion. }
     VersionInfo:
       type: object
       additionalProperties: false
@@ -9869,6 +10018,11 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        egress:
+          description: Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.
+          oneOf:
+            - $ref: '#/components/schemas/RequestEgressObservation'
+            - type: 'null'
         supplier_error:
           description: Fixed recorded supplier reason from a bounded native inline error envelope. Null for unknown, legacy, imported and generation records; never inferred from HTTP status or fetched from object storage.
           oneOf:
@@ -10192,6 +10346,13 @@ components:
               oneOf:
                 - $ref: '#/components/schemas/RequestProvenance'
                 - type: 'null'
+    RequestEgressObservation:
+      type: object
+      additionalProperties: false
+      required: [selected, observed_at]
+      properties:
+        selected: { $ref: '#/components/schemas/SelectedRequestEgress' }
+        observed_at: { type: integer, format: int64, description: 'Persisted attempt observation time in Unix milliseconds, not a connectivity check.' }
     SelectedRequestEgress:
       type: object
       required: [kind, group_id, group_version, group_name, member_id, member_name, scheme, host, port]
@@ -10203,7 +10364,7 @@ components:
         member_id: { type: [string, 'null'], format: uuid }
         member_name: { type: [string, 'null'] }
         scheme: { type: [string, 'null'] }
-        host: { type: [string, 'null'], description: 'Visible to authorized operators; URL authentication is excluded.' }
+        host: { type: [string, 'null'], description: 'Visible within authorized request scope; URL authentication is excluded.' }
         port: { type: [integer, 'null'], minimum: 1, maximum: 65535 }
     RequestEgressAttempt:
       type: object

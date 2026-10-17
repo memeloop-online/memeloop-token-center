@@ -404,7 +404,7 @@
             "required": ["id", "slot", "label", "icon", "renderer"],
             "properties": {
               "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
-              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after"] },
+              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after", "operator.model-route.action"] },
               "category": {
                 "type": "object",
                 "additionalProperties": false,
@@ -453,6 +453,13 @@
               {
                 "if": { "properties": { "slot": { "const": "operator.overview.card" } }, "required": ["slot"] },
                 "then": { "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] } }
+              },
+              {
+                "if": { "properties": { "slot": { "const": "operator.model-route.action" } }, "required": ["slot"] },
+                "then": {
+                  "properties": { "renderer": { "const": "component_v1" } },
+                  "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] }
+                }
               },
               {
                 "if": { "properties": { "slot": { "enum": ["operator.page.before", "operator.page.after"] } }, "required": ["slot"] },

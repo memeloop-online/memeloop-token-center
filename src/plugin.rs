@@ -202,6 +202,8 @@ pub enum PluginOperatorUiSlot {
     PageBefore,
     #[serde(rename = "operator.page.after")]
     PageAfter,
+    #[serde(rename = "operator.model-route.action")]
+    ModelRouteAction,
 }
 
 /// Closed, core-owned visual presentation choices for declarative operator
@@ -596,6 +598,16 @@ struct HostState {
     limits: StoreLimits,
     deadline: Instant,
     http_body_limit: usize,
+    http_diagnostic: PluginHttpDiagnostic,
+}
+
+#[derive(Default)]
+struct PluginHttpDiagnostic {
+    origin_slot: Option<usize>,
+    robots: bool,
+    status: Option<u16>,
+    stage: &'static str,
+    failure_code: Option<&'static str>,
 }
 
 fn read_identity_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AppError> {
@@ -673,6 +685,7 @@ impl PluginRuntime {
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
                 http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -1178,6 +1191,7 @@ impl PluginRuntime {
                     limits,
                     deadline: Instant::now() + self.execution_timeout,
                     http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                    http_diagnostic: PluginHttpDiagnostic::default(),
                 },
             );
             store.limiter(|state| &mut state.limits);
@@ -1336,6 +1350,7 @@ impl PluginRuntime {
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
                 http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -1596,6 +1611,7 @@ impl PluginRuntime {
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
                 http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -1927,6 +1943,10 @@ impl memeloop::token_center::host::Host for HostState {
         headers_json: String,
         body: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
+        self.http_diagnostic = PluginHttpDiagnostic {
+            stage: "request_validation",
+            ..PluginHttpDiagnostic::default()
+        };
         if body.len() > self.http_body_limit {
             return Err("plugin HTTP request exceeds its configured body limit".to_owned());
         }
@@ -1943,6 +1963,16 @@ impl memeloop::token_center::host::Host for HostState {
             );
         }
         let origin = url.origin().ascii_serialization();
+        self.http_diagnostic.origin_slot = self
+            .capabilities
+            .iter()
+            .filter_map(|capability| match capability {
+                PluginCapability::Http { allowed_origins } => Some(allowed_origins),
+                _ => None,
+            })
+            .flatten()
+            .position(|allowed| allowed == &origin);
+        self.http_diagnostic.robots = url.path() == "/robots.txt";
         let allowed = self.capabilities.iter().any(|capability| {
             let PluginCapability::Http { allowed_origins } = capability else {
                 return false;
@@ -1957,6 +1987,7 @@ impl memeloop::token_center::host::Host for HostState {
         // and TLS SNI from its original hostname; plugins cannot override it.
         let method = validate_plugin_http_method(&method)?;
         let headers = validate_plugin_http_headers(&headers_json)?;
+        self.http_diagnostic.stage = "destination_validation";
         // Plugin packages currently have no global-operator approval metadata
         // for private destinations. Until that exists, HTTP capability is
         // deliberately public-only and its DNS result is pinned per call.
@@ -1982,12 +2013,22 @@ impl memeloop::token_center::host::Host for HostState {
         }
         let runtime = self.runtime.clone();
         let http_body_limit = self.http_body_limit;
+        self.http_diagnostic.stage = "request_send";
+        let diagnostic = &mut self.http_diagnostic;
         let (status, response_headers, response_body) = runtime.block_on(async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|_| "plugin HTTP request failed".to_owned())?;
+            let response = request.send().await.map_err(|error| {
+                diagnostic.failure_code = Some(if error.is_timeout() {
+                    "timeout"
+                } else if error.is_connect() {
+                    "connect"
+                } else {
+                    "request"
+                });
+                "plugin HTTP request failed".to_owned()
+            })?;
             let status = response.status().as_u16();
+            diagnostic.status = Some(status);
+            diagnostic.stage = "response_read";
             let response_headers = response
                 .headers()
                 .iter()
@@ -2009,6 +2050,7 @@ impl memeloop::token_center::host::Host for HostState {
             }
             Ok::<_, String>((status, response_headers, response_body))
         })?;
+        self.http_diagnostic.stage = "response_received";
         serde_json::to_vec(&serde_json::json!({
             "status": status,
             "headers": response_headers,
@@ -2359,6 +2401,18 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 {
                     return Err(AppError::BadRequest(format!(
                         "plugin {} overview-card contribution cannot declare a route or category",
+                        manifest.id
+                    )));
+                }
+            }
+            PluginOperatorUiSlot::ModelRouteAction => {
+                if contribution.renderer != "component_v1"
+                    || contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || contribution.target_route.is_some()
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} model-route action requires a component without route or category",
                         manifest.id
                     )));
                 }
@@ -3774,6 +3828,7 @@ mod tests {
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
             http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_diagnostic: PluginHttpDiagnostic::default(),
         };
         let error = memeloop::token_center::host::Host::http_request(
             &mut state,
@@ -3784,6 +3839,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("forbidden header"), "{error}");
+        assert_eq!(state.http_diagnostic.origin_slot, Some(0));
+        assert_eq!(state.http_diagnostic.stage, "request_validation");
+        assert_eq!(state.http_diagnostic.status, None);
+        state.http_diagnostic.status = Some(599);
+        state.http_diagnostic.failure_code = Some("timeout");
+        state.http_diagnostic.robots = true;
+        let error = memeloop::token_center::host::Host::http_request(
+            &mut state,
+            "GET".to_owned(),
+            "https://private:credential@does-not-resolve.invalid/robots.txt".to_owned(),
+            "{}".to_owned(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("without credentials"));
+        assert_eq!(state.http_diagnostic.origin_slot, None);
+        assert_eq!(state.http_diagnostic.status, None);
+        assert_eq!(state.http_diagnostic.failure_code, None);
+        assert!(!state.http_diagnostic.robots);
+        assert_eq!(state.http_diagnostic.stage, "request_validation");
     }
 
     #[test]
@@ -3969,6 +4044,7 @@ mod tests {
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
             http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_diagnostic: PluginHttpDiagnostic::default(),
         };
         assert!(
             memeloop::token_center::host::Host::kv_get(&mut state, "secret".to_owned()).is_err()

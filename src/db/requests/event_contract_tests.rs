@@ -58,7 +58,7 @@ async fn assert_event_enrichment(database: &Database) {
         .bind(&request).bind(&tenant).bind(&key).bind(now).bind(now + 25)
         .bind(Uuid::now_v7().to_string()).bind(upstream.to_string()).bind(route.to_string()).bind("recorded-session")
         .execute(&database.pool).await.unwrap();
-    sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, session_name, task_kind, agent_id, metadata_source) VALUES ($1, 'recorded-session', $2, $3, '[]', $4, 1, 'recorded-name', 'task', 'agent', 'declared')")
+    sqlx::query("INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, atom_hashes_json, created_at, inference_version, session_name, task_kind, agent_id, metadata_source) VALUES ($1, 'recorded-session', $2, $3, '{\"context_prefix_v1\":null,\"atom_count\":0}', $4, 1, 'recorded-name', 'task', 'agent', 'declared')")
         .bind(Uuid::now_v7().to_string()).bind(&request).bind(&key).bind(now)
         .execute(&database.pool).await.unwrap();
     sqlx::query("UPDATE request_records SET first_output_ms = 5, generation_duration_ms = 15 WHERE id = $1 AND created_at = $2")

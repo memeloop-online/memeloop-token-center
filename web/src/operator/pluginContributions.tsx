@@ -41,6 +41,7 @@ export interface OperatorPluginRegistry {
   navigation: PluginNavigationSection[];
   pages: Map<PluginRouteKey, RegisteredPluginContribution>;
   overviewCards: RegisteredPluginContribution[];
+  modelRouteActions: RegisteredPluginContribution[];
   pageExtensions: Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>;
 }
 
@@ -88,6 +89,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
   const navigation = new Map<string, PluginNavigationSection>();
   const pages = new Map<PluginRouteKey, RegisteredPluginContribution>();
   const overviewCards: RegisteredPluginContribution[] = [];
+  const modelRouteActions: RegisteredPluginContribution[] = [];
   const pageExtensions = new Map<OperatorRouteKey, { before: RegisteredPluginContribution[]; after: RegisteredPluginContribution[] }>();
   const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
@@ -107,6 +109,11 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
         contribution,
         serviceEndpointIds: [...endpoints],
       };
+      if (contribution.slot === 'operator.model-route.action') {
+        if (contribution.renderer !== 'component_v1' || contribution.route || contribution.category || contribution.target_route) continue;
+        modelRouteActions.push({ ...registration, route: null });
+        continue;
+      }
       if (contribution.slot === 'operator.overview.card') {
         if (contribution.route || contribution.category || contribution.target_route) continue;
         overviewCards.push({ ...registration, route: null });
@@ -156,7 +163,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
       });
     }
   }
-  return { navigation: [...navigation.values()], pages, overviewCards, pageExtensions };
+  return { navigation: [...navigation.values()], pages, overviewCards, modelRouteActions, pageExtensions };
 }
 
 function serviceDataPath(pluginId: string, endpointId: string, tenant: string) {
@@ -293,8 +300,9 @@ interface PluginContributionRenderProps {
   token: string;
   tenant: string;
   locale: string;
-  onNavigate: (route: string) => void;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
   compact?: boolean;
+  context?: Record<string, unknown>;
 }
 
 function PluginContributionData(props: PluginContributionRenderProps) {
@@ -316,6 +324,7 @@ function ComponentPluginData({
   locale,
   compact = false,
   onNavigate,
+  context,
 }: PluginContributionRenderProps) {
   return <OperatorPluginComponentHost
     pluginId={registered.pluginId}
@@ -326,6 +335,7 @@ function ComponentPluginData({
     tenantExternalId={tenant}
     locale={locale}
     compact={compact}
+    context={context}
     onNavigate={onNavigate}
   />;
 }
@@ -392,16 +402,17 @@ function LegacyTypedPluginData({ registered, token: credential, tenant, compact 
   </>;
 }
 
-export function PluginContributionPage({ registered, token, tenant, locale, onNavigate }: {
+export function PluginContributionPage({ registered, token, tenant, locale, onNavigate, context }: {
   registered: RegisteredPluginContribution;
   token: string;
   tenant: string;
   locale: string;
-  onNavigate: (route: string) => void;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
+  context?: Record<string, unknown>;
 }) {
   if (registered.contribution.renderer === 'component_v1') {
     return <article className="plugin-contribution-page plugin-component-page" aria-label={registered.contribution.label}>
-      <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+      <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} context={context} />
     </article>;
   }
   return <article className="panel plugin-contribution-page">
@@ -415,7 +426,7 @@ export function PluginOverviewCards({ cards, token, tenant, locale, onNavigate }
   token: string;
   tenant: string;
   locale: string;
-  onNavigate: (route: string) => void;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
 }) {
   if (cards.length === 0) return null;
   return <section className="operator-overview-plugin-cards" aria-label="Plugin contributions">
@@ -431,7 +442,7 @@ export function PluginPageExtensions({ extensions, token, tenant, locale, onNavi
   token: string;
   tenant: string;
   locale: string;
-  onNavigate: (route: string) => void;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
 }) {
   if (extensions.length === 0) return null;
   return <section className="operator-page-plugin-extensions" aria-label="Plugin extensions">
@@ -444,4 +455,20 @@ export function PluginPageExtensions({ extensions, token, tenant, locale, onNavi
         <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
       </article>)}
   </section>;
+}
+
+/** Inline components receive only the selected model route and the normal host API. */
+export function PluginModelRouteActions({ actions, modelRoute, token, tenant, locale, onNavigate }: {
+  actions: RegisteredPluginContribution[];
+  modelRoute: import('../types.js').ModelRouteView;
+  token: string;
+  tenant: string;
+  locale: string;
+  onNavigate: (route: string, context?: Record<string, unknown>) => void;
+}) {
+  return <>{actions.map(registered => <PluginContributionData
+    key={`${registered.pluginId}:${registered.contribution.id}`}
+    registered={registered} token={token} tenant={tenant} locale={locale}
+    onNavigate={onNavigate} context={{ modelRoute }} compact
+  />)}</>;
 }

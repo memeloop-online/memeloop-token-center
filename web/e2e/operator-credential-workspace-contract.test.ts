@@ -404,8 +404,9 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       assert.equal(await create.getByRole('link', { name: /dedicated route|专用路由/ }).getAttribute('href'), '/operator?view=routes');
       assert.equal(await create.locator('.schema-array').count(), 0, 'routing IDs have one named control each');
       assert.equal(await create.getByText('Unsupported field schema', { exact: false }).count(), 0);
-      await create.locator('#root_principal_external_id').fill('fixture-principal');
       await create.locator('#root_alias').fill('Created client');
+      await create.getByRole('button', { name: english ? 'Bind an existing principal (optional)' : '绑定已有主体（可选）', exact: true }).click();
+      await create.getByRole('combobox', { name: english ? 'Principal' : '用户主体', exact: true }).fill('fixture-principal');
       await create.getByRole('button', { name: english ? 'Usage and budget' : '用量与预算', exact: true }).click();
       const createMode = create.getByRole('combobox', { name: modeLabel, exact: true });
       await create.locator('#root_policy_max_concurrency').focus();

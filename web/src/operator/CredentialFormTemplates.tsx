@@ -12,7 +12,7 @@ function CredentialObjectTemplate(props: ObjectFieldTemplateProps) {
   if (props.fieldPathId.path.length === 0 && (props.schema.properties?.policy || props.registry.formContext?.authorizationFields)) {
     const funding = props.properties.filter(field => ['currency', 'initial_balance'].includes(field.name) && !props.schema.required?.includes(field.name));
     return <div className="credential-form-journey">
-      <FormSection title={copy.identity}>{props.properties.filter(field => field.name !== 'policy' && !funding.includes(field)).map(field => field.content)}</FormSection>
+      <FormSection title={copy.identity}>{props.properties.filter(field => field.name !== 'policy' && !funding.includes(field)).map(field => field.content)}{props.registry.formContext?.principalField}</FormSection>
       {props.registry.formContext?.authorizationFields}
       {(props.schema.properties?.policy || funding.length > 0) && <AdvancedFormSection title={copy.policy} description={copy.policyHint} invalid={Boolean(props.errorSchema?.policy) || funding.some(field => Boolean(props.errorSchema?.[field.name]))}>
         {funding.map(field => field.content)}

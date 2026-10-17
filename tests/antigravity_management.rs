@@ -19,7 +19,7 @@ async fn operator_can_configure_bounded_quota_reads_through_the_loaded_plugin_sc
         "sqlite://{}?mode=rwc",
         directory.path().join("quota-policy.db").display()
     ));
-    config.plugin_dir = Some("plugins".into());
+    config.plugin_dir = Some(".plugin-examples/plugins".into());
     let state = AppState::initialize(config).await.unwrap();
     let supplier = MockServer::start().await;
     let original = json!({"base_url":supplier.uri(), "control_url":supplier.uri(), "network_scope":"public", "project_id":"fixture-project"});
@@ -86,7 +86,7 @@ async fn assert_no_tenant_rebind(driver: &str) {
         "sqlite://{}?mode=rwc",
         directory.path().join("native-management.db").display()
     ));
-    config.plugin_dir = Some("plugins".into());
+    config.plugin_dir = Some(".plugin-examples/plugins".into());
     let state = AppState::initialize(config).await.unwrap();
     let original = MockServer::start().await;
     let other = MockServer::start().await;

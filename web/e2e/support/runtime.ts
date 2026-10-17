@@ -287,9 +287,11 @@ class E2ERuntime {
       ]);
       if (exit) throw new Error(`browser e2e server exited before readiness (${exit.code ?? exit.signal})`);
       try {
-        const response = await fetch(new URL('/healthz', baseURL), { signal: AbortSignal.timeout(2_000) });
+        // Liveness can succeed while the static shell is serving initialization
+        // failures. Fixture writes must wait for database/application readiness.
+        const response = await fetch(new URL('/readyz', baseURL), { signal: AbortSignal.timeout(2_000) });
         if (response.ok) return;
-        lastReason = `health endpoint returned ${response.status}`;
+        lastReason = `readiness endpoint returned ${response.status}`;
       } catch (reason) {
         lastReason = reason instanceof Error ? reason.message : String(reason);
       }

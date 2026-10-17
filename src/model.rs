@@ -605,6 +605,7 @@ pub struct EntitlementReconcileResult {
 
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    pub egress: Option<RequestEgressObservation>,
     pub usage_basis: Option<RequestUsageBasis>,
     /// Only an explicitly persisted context-compaction marker is true.
     /// Absence (including legacy false/default observations) remains unknown.
@@ -679,7 +680,8 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 31)?;
+        let mut state = serializer.serialize_struct("RequestView", 32)?;
+        state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("request_id", &self.request_id)?;
@@ -725,6 +727,12 @@ impl Serialize for RequestView {
         state.serialize_field("session_context", &self.session_context)?;
         state.end()
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestEgressObservation {
+    pub selected: crate::db::egress::SelectedEgress,
+    pub observed_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]

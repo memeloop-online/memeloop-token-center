@@ -34,6 +34,41 @@ CREATE INDEX ledger_resource_route_switches_tenant_created_idx
 
 async fn upgrade_contract(database: &Database) {
     database.migrate().await.unwrap();
+    let tenant = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 0)")
+        .bind(&tenant)
+        .bind(&tenant)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let group = database
+        .create_group(
+            GroupKind::Provider,
+            CreateGroupInput {
+                tenant_external_id: tenant.clone(),
+                name: "pre-126".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let (route, _) = database
+        .create_routed_model_route(CreateRoutedModelRouteInput {
+            tenant_external_id: tenant.clone(),
+            public_model: "pre-126".into(),
+            upstream_model: "pre-126".into(),
+            protocol: "openai".into(),
+            priority: 0,
+            enabled: false,
+            upstream_account_ids: vec![],
+            included_provider_group_ids: vec![group.id],
+            excluded_provider_group_ids: vec![],
+            route_group_ids: vec![],
+            route_group_names: vec![],
+            granted_credential_ids: vec![],
+            custom_model_confirmed: false,
+        })
+        .await
+        .unwrap();
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&database.pool)
@@ -47,6 +82,25 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&120));
     assert!(versions.contains(&121));
     assert!(versions.contains(&125));
+    assert!(versions.contains(&126));
+    for statement in [
+        "DROP VIEW model_route_eligible_upstream_accounts",
+        "DROP TABLE model_route_group_catalog_evidence",
+        "ALTER TABLE model_route_included_provider_groups DROP COLUMN catalog_policy",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let (_, original_view) =
+        include_str!("../../../migrations/common/0046_route_catalog_policy.sql")
+            .split_once("CREATE VIEW ")
+            .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE VIEW {original_view}")))
+        .execute(&database.pool)
+        .await
+        .unwrap();
     for statement in [
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
@@ -104,7 +158,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127)",
     )
     .execute(&database.pool)
     .await
@@ -161,7 +215,22 @@ async fn upgrade_contract(database: &Database) {
     .fetch_all(&database.pool)
     .await
     .unwrap();
-    assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125]);
+    assert_eq!(
+        tail,
+        vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+    );
+    let policy: String = sqlx::query_scalar(
+        "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
+    )
+    .bind(route.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(policy, "required");
+    let routing = database.route_routing(route.id, &tenant).await.unwrap();
+    assert!(!routing.custom_model_confirmed);
+    assert_eq!(routing.included_provider_group_ids, vec![group.id]);
+    assert!(routing.candidate_upstream_account_ids.is_empty());
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_transport_proxy_selections")
         .fetch_one(&database.pool)
         .await
@@ -185,7 +254,10 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .filter(|migration| migration.version >= 117)
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(tail, vec![117, 118, 119, 120, 121, 122, 123, 124, 125]);
+        assert_eq!(
+            tail,
+            vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+        );
     }
 }
 
@@ -205,19 +277,9 @@ async fn postgres_proxy_group_116_accepts_empty_113_and_later_114_115() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let administrative = Database::connect(&url).await.unwrap();
-    let name = format!("mtc_proxy_schema_{}", uuid::Uuid::now_v7().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .execute(&administrative.pool)
-        .await
-        .unwrap();
-    let mut isolated = url::Url::parse(&url).unwrap();
-    isolated.set_path(&name);
-    let database = Database::connect(isolated.as_str()).await.unwrap();
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let database = Database::connect(fixture.url()).await.unwrap();
     upgrade_contract(&database).await;
-    database.pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
-        .execute(&administrative.pool)
-        .await
-        .unwrap();
+    database.close().await;
+    fixture.cleanup().await;
 }

@@ -91,6 +91,11 @@ fn readiness_contract(
 }
 
 pub(super) async fn readiness(State(state): State<AppState>) -> Response {
+    let (status, body) = readiness_snapshot(state).await;
+    (status, Json(body)).into_response()
+}
+
+pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
     let database = state.db.clone();
     let archive = state.archive.clone();
     let (database_ready, archive_ready) = state
@@ -142,8 +147,15 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
             (database_readiness, archive_ready)
         })
         .await;
-    let (status, body) = readiness_contract(database_ready, archive_ready);
-    (status, Json(body)).into_response()
+    let (status, mut body) = readiness_contract(database_ready, archive_ready);
+    if !database_ready.is_ready() {
+        let code = match database_ready {
+            crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",
+            _ => "database_unavailable",
+        };
+        body["error"] = json!({"code": code, "message": "Database readiness could not be verified. Data may be unavailable; service credentials do not need to be re-entered."});
+    }
+    (status, body)
 }
 
 pub(super) async fn prometheus_metrics(

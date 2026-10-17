@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
 
@@ -661,8 +662,6 @@ impl Database {
         let atom_hashes = snapshot
             .map(|snapshot| snapshot.atom_hashes.clone())
             .unwrap_or_else(|| bounded_atom_hashes(&atoms));
-        let atom_hashes_json =
-            serde_json::to_string(&atom_hashes).map_err(|_| AppError::Internal)?;
         let leaf = snapshot
             .map(|snapshot| snapshot.leaf.clone())
             .unwrap_or_else(|| nodes.last().map(|node| node.node_hash.clone()));
@@ -778,7 +777,7 @@ impl Database {
             Vec::new()
         } else {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
@@ -788,10 +787,40 @@ impl Database {
             .await?
         };
 
+        let fingerprint = prefix_storage::Fingerprint::from_hashes(&atom_hashes);
+        let graph = prefix_storage::load_candidate_paths(
+            transaction,
+            &tenant_id,
+            &candidates,
+            leaf.as_deref(),
+        )
+        .await?;
+        {
+            // A reference must never publish before its complete content-addressed
+            // path exists, including when an importer claims content_materialized.
+            let full = graph.hashes(leaf.as_deref(), None)?;
+            if full
+                .iter()
+                .take(MAX_CONVERSATION_FINGERPRINT_ATOMS)
+                .ne(atom_hashes.iter())
+                || (snapshot.is_none() && full.len() != atoms.len())
+            {
+                return Err(
+                    AppError::Conflict("conversation prefix content mismatch".into()).into(),
+                );
+            }
+        }
+        let atom_hashes_json =
+            serde_json::to_string(&fingerprint).map_err(|_| AppError::Internal)?;
         let has_semantic_atoms = !atom_hashes.is_empty();
         debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
         let current_node_hashes: HashSet<&str> =
             nodes.iter().map(|node| node.node_hash.as_str()).collect();
+        let current_ancestors = if snapshot.is_some() {
+            graph.ancestors(leaf.as_deref())?
+        } else {
+            HashSet::new()
+        };
         let mut selected: Option<ConversationSelection> = None;
         let mut candidate_selection: Option<ConversationSelection> = None;
         for row in candidates {
@@ -801,21 +830,15 @@ impl Database {
             let candidate_branch: Option<String> = row.try_get("branch_id")?;
             let candidate_client: Option<String> = row.try_get("client_name")?;
             let candidate_leaf: Option<String> = row.try_get("leaf_node_hash")?;
-            let previous_hashes_json: String = row.try_get("atom_hashes_json")?;
-            let previous_hashes: Vec<String> =
-                serde_json::from_str(&previous_hashes_json).unwrap_or_default();
+            let previous_hashes = prefix_storage::candidate_hashes(&row, &graph)?;
             let has_previous_semantic_atoms = !previous_hashes.is_empty();
-            let is_prefix = if let (Some(_), Some(leaf), Some(candidate)) =
-                (snapshot, leaf.as_deref(), candidate_leaf.as_deref())
-            {
-                let matched: i64 = sqlx::query_scalar("WITH RECURSIVE ancestors(node_hash, parent_hash, depth) AS (SELECT node_hash, parent_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 UNION ALL SELECT parent.node_hash, parent.parent_hash, parent.depth FROM context_nodes parent JOIN ancestors child ON parent.node_hash = child.parent_hash AND parent.depth < child.depth WHERE parent.tenant_id = $1) SELECT COUNT(*) FROM ancestors WHERE node_hash = $3")
-                    .bind(&tenant_id).bind(leaf).bind(candidate).fetch_one(&mut **transaction).await?;
-                matched != 0
-            } else {
-                candidate_leaf
-                    .as_deref()
-                    .is_some_and(|candidate| current_node_hashes.contains(candidate))
-            };
+            let is_prefix = candidate_leaf.as_deref().is_some_and(|candidate| {
+                if snapshot.is_some() {
+                    current_ancestors.contains(candidate)
+                } else {
+                    current_node_hashes.contains(candidate)
+                }
+            });
             let merkle_prefix =
                 leaf.is_some() && (leaf.as_deref() == candidate_leaf.as_deref() || is_prefix);
             let (relation, confidence) =
@@ -1267,7 +1290,7 @@ async fn fetch_structured_conversation_candidate(
 ) -> Result<Option<AnyRow>, AppError> {
     if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
         let by_turn = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
@@ -1276,7 +1299,7 @@ async fn fetch_structured_conversation_candidate(
         .fetch_optional(&mut **transaction)
         .await?;
         let by_response = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
@@ -1289,7 +1312,7 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(turn_id) = hints.turn_id.as_deref() {
         let candidate = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
@@ -1305,7 +1328,7 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(session_id) = hints.session_id.as_deref() {
         let causal = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
@@ -1322,7 +1345,7 @@ async fn fetch_structured_conversation_candidate(
         // A future row is valid only for explicit cluster membership; the caller
         // still suppresses any edge that would reverse causal ancestry.
         let future = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
@@ -1836,6 +1859,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             }
             Ok(ConversationRequestView {
                 request: RequestView {
+                    egress: None,
                     usage_basis,
                     compaction: row
                         .try_get::<Option<i64>, _>("compaction")?

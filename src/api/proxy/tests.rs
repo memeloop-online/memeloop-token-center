@@ -2493,7 +2493,7 @@ async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
     let mut config = Config::for_test(database_url);
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(directory.path().join("archive").display().to_string());
-    config.plugin_dir = Some("examples/plugins".to_owned());
+    config.plugin_dir = Some(".plugin-examples/examples/plugins".to_owned());
     let state = AppState::initialize(config).await.unwrap();
     let tenant = "secondary-component";
     let requested_model = "requested-model";
@@ -4317,17 +4317,23 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .mount(&upstream)
         .await;
 
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({
-            "model": fixture.model,
-            "input": "archive failures are non-fatal for text",
-            "stream": false
-        }),
-    )
-    .await;
+    // This test requires exact durable bodies for the later upload retry.
+    // Finish optional database capture before SQLite settlement can race its
+    // bounded writer; the unavailable object backend is still exercised below.
+    let response = fixture
+        .state
+        .db
+        .with_request_archive_capture_for_test(send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({
+                "model": fixture.model,
+                "input": "archive failures are non-fatal for text",
+                "stream": false
+            }),
+        ))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await

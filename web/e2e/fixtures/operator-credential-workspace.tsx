@@ -109,11 +109,11 @@ function json(value: unknown, status = 200) {
   });
 }
 
-function credential(alias: string, tenant: string, keyId: string) {
+function credential(alias: string, tenant: string, keyId: string, principal?: string) {
   return {
     key_id: keyId,
     tenant_external_id: tenant,
-    principal_external_id: `${tenant}-principal`,
+    principal_external_id: principal ?? `${tenant}-principal`,
     alias,
     status: 'active',
     currency: 'USD',
@@ -228,12 +228,18 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
       ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
     ]);
-    if (url.pathname === '/internal/v1/keys' && method === 'POST') return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
+    if (url.pathname === '/internal/v1/keys' && method === 'POST') {
+      if (parameters.has('duplicate-alias')) return json({ error: { message: 'fixture duplicate alias' } }, 409);
+      return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
+    }
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
     if (url.pathname === '/internal/v1/keys') return json([
       // Match the API's descending (created_at, key_id) keyset order.
       // These rows share a timestamp, and key-other sorts before key-form.
       ...(parameters.has('multiple-policies') ? [credential('Other workspace', 'tenant-a', 'key-other')] : []),
+      // A legacy identity whose external ID legitimately carries surrounding
+      // whitespace; picking it must bind the exact ID, never a trimmed rewrite.
+      ...(parameters.has('padded-principal') ? [credential('Padded owner client', 'tenant-a', 'key-padded', ' padded-owner ')] : []),
       credential(localStorage.getItem('mtc-locale')?.startsWith('zh') ? '研发工作区' : 'Research workspace', 'tenant-a', 'key-form'),
     ]);
     if (url.pathname === '/internal/v1/keys/key-form/rotate' && method === 'POST') return json({ key: 'mtc_fixture_rotated' });

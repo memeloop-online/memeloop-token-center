@@ -10,7 +10,7 @@
       "exposure": "public-operational",
       "authentication": "none",
       "in_openapi": true,
-      "exact_paths": ["/healthz", "/livez", "/readyz"]
+      "exact_paths": ["/healthz", "/livez", "/readyz", "/ui-assets/service-status"]
     },
     {
       "name": "shared-ui-assets",

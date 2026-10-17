@@ -703,7 +703,7 @@ impl Database {
         let granted_credential_ids = select_ids(&self.pool, "SELECT key_id AS id FROM routing_grants WHERE tenant_id = $1 AND model_route_id = $2 ORDER BY key_id", tenant_id, route_id).await?;
         let candidate_upstream_account_ids =
             candidate_upstream_ids(&self.pool, tenant_id, route_id).await?;
-        let custom_model_confirmed = sqlx::query("SELECT 1 FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' LIMIT 1")
+        let custom_model_confirmed = sqlx::query("SELECT 1 FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' UNION ALL SELECT 1 FROM model_route_included_provider_groups WHERE tenant_id = $1 AND model_route_id = $2 AND catalog_policy = 'explicit_custom' LIMIT 1")
             .bind(tenant_id).bind(route_id.to_string()).fetch_optional(&self.pool).await?.is_some();
         let grant_revision = route_grant_revision(&self.pool, tenant_id, route_id).await?;
         Ok(RouteRoutingView {
