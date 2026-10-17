@@ -273,11 +273,20 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
         // Field selection replaces only the value editor. Keeping the row
         // mounted preserves the freshly selected field while React swaps that
         // editor from a scalar input to the catalog picker.
+        // The catalog model picker labels its own editable input. Wrapping it
+        // in the value label would merge both texts into the input's
+        // accessible name, so the model cell uses a plain container that keeps
+        // the same layout styling without labeling the input a second time.
+        const valueCell = (side: 'value' | 'upper', caption: string) => {
+          const cellValue = side === 'value' ? condition.value : condition.upper;
+          if (cellValue?.type === 'model') return <div className="typed-filter-value" data-filter-field={condition.field}><span>{caption}</span>{renderValue(condition, index, side)}</div>;
+          return <label className="typed-filter-value" data-filter-field={condition.field}><span>{caption}</span>{renderValue(condition, index, side)}</label>;
+        };
         return <div className="typed-filter-row" key={index}>
           <label><span id={`${editorId}-field-${index}`}>{t('filter.field')}</span><Select aria-labelledby={`${editorId}-field-${index}`} value={condition.field} disabled={disabled} onChange={(_, data) => selectField(index, data.value as TypedFilterField)}>{visibleFields.map((option) => <option key={option.id} value={option.id}>{t(`filter.field.${option.id}`)}</option>)}</Select></label>
           <label><span id={`${editorId}-operator-${index}`}>{t('filter.operator')}</span><Select aria-labelledby={`${editorId}-operator-${index}`} value={condition.operator} disabled={disabled} onChange={(_, data) => { const operator = data.value as TypedFilterOperator; updateCondition(index, { operator, upper: operator === 'between' ? blankValue(field.type) : undefined }); }}>{operators.map((operator) => <option key={operator} value={operator}>{t(`filter.operator.${operator}`)}</option>)}</Select></label>
-          <label className="typed-filter-value" data-filter-field={condition.field}><span>{t('filter.value')}</span>{renderValue(condition, index, 'value')}</label>
-          {condition.operator === 'between' && <label className="typed-filter-value" data-filter-field={condition.field}><span>{t('filter.upper')}</span>{renderValue(condition, index, 'upper')}</label>}
+          {valueCell('value', t('filter.value'))}
+          {condition.operator === 'between' && valueCell('upper', t('filter.upper'))}
           <div className="typed-filter-row-actions"><Button type="button" appearance="secondary" disabled={disabled || index === 0} aria-label={t('common.moveUp')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index - 1], conditions[index]] = [conditions[index], conditions[index - 1]]; return { ...current, conditions }; })}>↑</Button><Button type="button" appearance="secondary" disabled={disabled || index + 1 === draft.conditions.length} aria-label={t('common.moveDown')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index], conditions[index + 1]] = [conditions[index + 1], conditions[index]]; return { ...current, conditions }; })}>↓</Button><Button type="button" appearance="secondary" disabled={disabled} aria-label={t('common.remove')} onClick={() => setDraft((current) => ({ ...current, conditions: current.conditions.filter((_, itemIndex) => itemIndex !== index) }))}>×</Button></div>
         </div>;
       })}</div>

@@ -195,6 +195,7 @@
 }
 
 .typed-filter-row label,
+.typed-filter-row .typed-filter-value,
 .typed-filter-assistant label {
   color: var(--picker-muted);
   display: grid;
@@ -258,7 +259,8 @@
 .typed-filter-preview > b { display: block; font-size: var(--fontSizeBase200, 12px); margin-bottom: 8px; }
 .typed-filter-preview button { margin-top: 9px; }
 
-.typed-filter-row > label { min-width: 0; }
+.typed-filter-row > label,
+.typed-filter-row > .typed-filter-value { min-width: 0; }
 .typed-filter-model-picker { min-width: 0; position: relative; }
 .typed-filter-model-picker > button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 .typed-filter-model-picker small { color: var(--picker-muted); display: block; margin-top: 4px; }
