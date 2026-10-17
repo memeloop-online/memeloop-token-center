@@ -522,6 +522,7 @@ impl Database {
                 | "credential_invalid"
                 | "connection_failed"
                 | "authentication_failed"
+                | "permission_denied"
                 | "rate_limited"
                 | "upstream_unavailable"
                 | "redirect_rejected"

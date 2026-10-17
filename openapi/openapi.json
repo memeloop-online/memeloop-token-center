@@ -135,7 +135,7 @@
         ],
         "operationId": "getReadiness",
         "summary": "Probe database readiness and archive degradation",
-        "description": "Available on every HTTP role for Kubernetes probes. PostgreSQL and archive\nchecks run concurrently with bounded deadlines and a five-second singleflight\ncache, so probe bursts do not amplify dependency traffic. Database reachability\nand the complete migration registry determine the HTTP status. An archive failure\nis returned as HTTP 200 with `status: degraded` and `checks.archive: failed`;\narchive-dependent image/video operations still fail closed.\n",
+        "description": "Available on every HTTP role for Kubernetes probes. PostgreSQL and archive\nchecks run concurrently with bounded deadlines and a five-second singleflight\ncache, so probe bursts do not amplify dependency traffic. Database reachability\nand the complete migration registry determine the HTTP status. An archive failure\nis returned as HTTP 200 with `status: degraded` and `checks.archive: failed`;\narchive-dependent image/video operations still fail closed. Before application\ninitialization completes, returns 503 with unknown dependency checks and a fixed\ninitialization error code; process liveness remains available.\n",
         "security": [],
         "responses": {
           "200": {
@@ -150,6 +150,39 @@
           },
           "503": {
             "description": "PostgreSQL readiness failed, timed out, or its schema is missing a migration required by this binary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ui-assets/service-status": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getWebsiteServiceStatus",
+        "summary": "Read dependency status while the existing website shell remains available",
+        "description": "Available through the existing static asset Ingress prefix, including before\nAppState initialization. Uses the existing readiness cache after initialization.\nContains fixed public diagnostics only; does not authorize data access or forwarding.\nlast_database_error is the last failure observed in this process, with Unix seconds.\nRead readiness does not establish that database writes have recovered.\nDeploy the chart's static-only web Service/routing to retain this path when\nKubernetes withdraws the API Service's unready endpoints.\n",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Database read health is ready; archive may be degraded. Historical failure evidence may remain.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Application initialization or database readiness is unavailable. Credentials remain unverified.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16267,11 +16300,19 @@
               "archive"
             ],
             "properties": {
+              "application": {
+                "type": "string",
+                "enum": [
+                  "initializing",
+                  "failed"
+                ]
+              },
               "database": {
                 "type": "string",
                 "enum": [
                   "ok",
-                  "failed"
+                  "failed",
+                  "unknown"
                 ]
               },
               "database_schema": {
@@ -16312,8 +16353,59 @@
                 "type": "string",
                 "enum": [
                   "ok",
-                  "failed"
+                  "failed",
+                  "unknown"
                 ]
+              }
+            }
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "service_initializing",
+                  "database_storage_full",
+                  "database_unavailable",
+                  "database_initialization_failed",
+                  "application_initialization_failed",
+                  "database_schema_outdated"
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "last_database_error": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "observed_at"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "database_storage_full",
+                  "database_unavailable"
+                ]
+              },
+              "observed_at": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0,
+                "description": "Unix seconds of the last failure observed in this process; not a current write-health assertion."
               }
             }
           }
