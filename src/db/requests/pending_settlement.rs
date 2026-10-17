@@ -71,6 +71,12 @@ fn contract(
     {
         return Err(conflict());
     }
+    // Legacy NULL prices are supported by the legacy finalizer's caller-price
+    // fallback, but cannot establish an authoritative immutable receipt claim.
+    let price_snapshot: String = reservation
+        .try_get::<Option<String>, _>("price_snapshot_json")?
+        .ok_or_else(conflict)?;
+    serde_json::from_str::<ModelPrice>(&price_snapshot).map_err(|_| conflict())?;
     Ok(serde_json::json!({
         "version": 1, "request_id": owner.request_id, "tenant_id": owner.tenant_id,
         "key_id": owner.key_id,
@@ -78,7 +84,7 @@ fn contract(
         "reservation_id": owner.reservation_id,
         "mode": reservation.try_get::<String, _>("enforcement_mode")?,
         "reserved_micros": reservation.try_get::<i64, _>("reserved_micros")?,
-        "price_snapshot": reservation.try_get::<Option<String>, _>("price_snapshot_json")?,
+        "price_snapshot": price_snapshot,
         "upstream_account_id": reservation.try_get::<Option<String>, _>("upstream_account_id")?,
         "model_route_id": reservation.try_get::<Option<String>, _>("model_route_id")?,
         "upstream_model": reservation.try_get::<Option<String>, _>("upstream_model")?,
@@ -210,6 +216,13 @@ impl Database {
         {
             return Err(conflict());
         }
+        if let Some(conversation) = input.conversation.as_ref()
+            && (conversation.key.tenant_id != claim.tenant_id
+                || conversation.key.key_id != claim.key_id
+                || conversation.key.account_id != claim.account_id)
+        {
+            return Err(conflict());
+        }
         match evidence {
             PendingProxySettlementEvidence::ProviderReported
                 if input.usage_basis != Some(crate::model::RequestUsageBasis::ProviderReported) =>
@@ -246,6 +259,13 @@ impl Database {
             "attribution": attribution,
             "conversation": input.conversation.as_ref().map(|c| serde_json::json!({
                 "key": c.key.key_id, "tenant": c.key.tenant_id, "principal": c.key.principal_id,
+                // Match every field persisted as key_snapshot_json by the
+                // conversation outbox, including on the applied replay path.
+                "key_snapshot": {
+                    "account_id": c.key.account_id, "alias": c.key.alias,
+                    "currency": c.key.currency, "credential_generation": c.key.credential_generation,
+                    "policy": c.key.policy,
+                },
                 "body": c.request_json, "hints": c.hints, "client": c.client_name, "response": c.upstream_response_id,
             })),
         });

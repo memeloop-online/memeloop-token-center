@@ -117,6 +117,23 @@ impl Fixture {
         }
     }
 
+    fn conversation_terminal<'a>(
+        &'a self,
+        key: &'a AuthenticatedKey,
+        body: &'a Value,
+        hints: &'a ConversationHints,
+    ) -> FinishProxyRequest<'a> {
+        let mut input = self.terminal();
+        input.conversation = Some(ProxyConversationInput {
+            key,
+            request_json: body,
+            hints,
+            client_name: Some("receipt-regression"),
+            upstream_response_id: Some("provider-response"),
+        });
+        input
+    }
+
     async fn finish(
         &self,
         claim: &PendingProxySettlementClaim,
@@ -355,6 +372,185 @@ async fn receipt_authority_rejects_foreign_contract_and_invalid_or_unobserved_us
     f.assert_pending().await;
     let ack = f.finish(&claim, Uuid::now_v7()).await.unwrap();
     assert_eq!(ack.cost_micros, 12);
+    f.assert_applied_once(12).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn applied_receipt_ack_requires_the_complete_persisted_conversation_key_snapshot() {
+    let Some(f) = Fixture::postgres(EnforcementMode::Prepaid).await else {
+        return;
+    };
+    let claim = f.claim().await;
+    let receipt = Uuid::now_v7();
+    let body = serde_json::json!({"messages":[{"role":"user","content":"receipt snapshot"}]});
+    let hints = ConversationHints::default();
+    let ack = f
+        .database
+        .finish_pending_proxy_settlement(
+            &claim,
+            receipt,
+            PendingProxySettlementEvidence::ProviderReported,
+            f.conversation_terminal(&f.key, &body, &hints),
+            ProxyRequestUpstreamAttribution::KeepSelected,
+        )
+        .await
+        .unwrap();
+    let stored: String = sqlx::query_scalar(
+        "SELECT key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(f.owner.request_id.to_string())
+    .fetch_one(&f.database.pool)
+    .await
+    .unwrap();
+    // All persisted snapshot components, plus all immutable identity fields.
+    for field in [
+        "account_id",
+        "alias",
+        "currency",
+        "credential_generation",
+        "policy",
+        "key_id",
+        "tenant_id",
+        "principal_id",
+    ] {
+        let mut changed = f.key.clone();
+        match field {
+            "account_id" => changed.account_id = Uuid::now_v7(),
+            "alias" => changed.alias.push_str("-changed"),
+            "currency" => changed.currency = "EUR".into(),
+            "credential_generation" => changed.credential_generation += 1,
+            "policy" => changed.policy.requests_per_minute += 1,
+            "key_id" => changed.key_id = Uuid::now_v7(),
+            "tenant_id" => changed.tenant_id = Uuid::now_v7(),
+            "principal_id" => changed.principal_id = Uuid::now_v7(),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                f.database
+                    .finish_pending_proxy_settlement(
+                        &claim,
+                        receipt,
+                        PendingProxySettlementEvidence::ProviderReported,
+                        f.conversation_terminal(&changed, &body, &hints),
+                        ProxyRequestUpstreamAttribution::KeepSelected,
+                    )
+                    .await,
+                Err(AppError::Conflict(_))
+            ),
+            "changed {field} must not receive deletion authority"
+        );
+    }
+    let replay = f
+        .database
+        .finish_pending_proxy_settlement(
+            &claim,
+            receipt,
+            PendingProxySettlementEvidence::ProviderReported,
+            f.conversation_terminal(&f.key, &body, &hints),
+            ProxyRequestUpstreamAttribution::KeepSelected,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, ack);
+    let after: String = sqlx::query_scalar(
+        "SELECT key_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(f.owner.request_id.to_string())
+    .fetch_one(&f.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(after, stored);
+    f.assert_applied_once(12).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn receipt_claim_requires_persisted_price_and_never_uses_caller_price_fallback() {
+    let Some(f) = Fixture::postgres(EnforcementMode::Prepaid).await else {
+        return;
+    };
+    let snapshot: String =
+        sqlx::query_scalar("SELECT price_snapshot_json FROM usage_reservations WHERE id = $1")
+            .bind(f.reservation.id.to_string())
+            .fetch_one(&f.database.pool)
+            .await
+            .unwrap();
+    for invalid in [None, Some("{}")] {
+        sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2")
+            .bind(invalid)
+            .bind(f.reservation.id.to_string())
+            .execute(&f.database.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.database
+                .claim_pending_proxy_settlement(&f.owner, 10, 20, None)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+    let claims: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_proxy_settlements WHERE request_id = $1")
+            .bind(f.owner.request_id.to_string())
+            .fetch_one(&f.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(claims, 0);
+    sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2")
+        .bind(&snapshot)
+        .bind(f.reservation.id.to_string())
+        .execute(&f.database.pool)
+        .await
+        .unwrap();
+    let claim = f.claim().await;
+    sqlx::query("UPDATE usage_reservations SET price_snapshot_json = NULL WHERE id = $1")
+        .bind(f.reservation.id.to_string())
+        .execute(&f.database.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.finish(&claim, Uuid::now_v7()).await,
+        Err(AppError::Conflict(_))
+    ));
+    f.assert_pending().await;
+    sqlx::query("UPDATE usage_reservations SET price_snapshot_json = $1 WHERE id = $2")
+        .bind(&snapshot)
+        .bind(f.reservation.id.to_string())
+        .execute(&f.database.pool)
+        .await
+        .unwrap();
+    let mut caller_price = f.reservation.clone();
+    caller_price.input_micros_per_million = 0;
+    caller_price.output_micros_per_million = 0;
+    caller_price.price_tiers = vec![ModelPriceTier {
+        service_tier: "default".into(),
+        input_micros_per_million: 0,
+        cached_input_micros_per_million: 0,
+        cache_write_micros_per_million: 0,
+        output_micros_per_million: 0,
+        source: "caller-mutation".into(),
+    }];
+    let mut input = f.terminal();
+    input.reservation = &caller_price;
+    let receipt = Uuid::now_v7();
+    let ack = f
+        .database
+        .finish_pending_proxy_settlement(
+            &claim,
+            receipt,
+            PendingProxySettlementEvidence::ProviderReported,
+            input,
+            ProxyRequestUpstreamAttribution::KeepSelected,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ack.cost_micros, 12,
+        "persisted rates win over supplied rates/tiers"
+    );
+    assert_eq!(f.finish(&claim, receipt).await.unwrap(), ack);
     f.assert_applied_once(12).await;
     f.close().await;
 }
