@@ -92,10 +92,19 @@ fn observer_body(model: &str, request: &Value, allow: bool) -> String {
 }
 
 fn write_policy(root: &Path, id: &str, body: &str) {
+    write_policy_with_memory(root, id, body, false);
+}
+
+fn write_policy_with_memory(root: &Path, id: &str, body: &str, large_memory: bool) {
     let source = include_str!("../.plugin-examples/examples/plugins/policy-rewrite/plugin.wat");
     let (prefix, tail) = source.split_once(";; BEGIN POST-AUTH BODY").unwrap();
     let (_, suffix) = tail.split_once(";; END POST-AUTH BODY").unwrap();
     let source = format!("{prefix}{body}{suffix}");
+    let source = if large_memory {
+        source.replace("(memory $memory 1)", "(memory $memory 512)")
+    } else {
+        source
+    };
     let mut module = wat::parse_str(source).unwrap();
     let mut resolve = Resolve::default();
     let (package, _) = resolve.push_path("wit/token-center.wit").unwrap();
@@ -313,4 +322,234 @@ async fn downstream_policy_observes_effective_model_and_canonical_body_in_both_e
         true,
     )
     .await;
+}
+
+const TRAFFIC_INPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn revisions(runtime: PluginRuntime) -> memeloop_token_center::plugin::lifecycle::RuntimeRevisions {
+    use memeloop_token_center::plugin::lifecycle::{
+        PluginGrant, RuntimeRevisions, manifest_digest,
+    };
+    let identities = runtime.package_identities();
+    let grants = runtime
+        .manifests()
+        .into_iter()
+        .map(|manifest| {
+            let grant = PluginGrant {
+                version: manifest.version.clone(),
+                capabilities: manifest.capabilities.clone(),
+                manifest_digest: manifest_digest(&manifest).unwrap(),
+                identity: identities[&manifest.id].clone(),
+            };
+            (manifest.id, vec![grant])
+        })
+        .collect();
+    RuntimeRevisions::new(runtime, grants).unwrap()
+}
+
+#[tokio::test]
+async fn traffic_input_exact_total_boundary_and_escaping_are_request_errors() {
+    use memeloop_token_center::error::AppError;
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_policy_with_memory(&plugins, "policy", &decision_body(true, None, None), true);
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("input.db").display()
+    ))
+    .await
+    .unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    let ctx = context();
+    let fields = [
+        &ctx.tenant_id,
+        &ctx.principal_id,
+        &ctx.key_id,
+        &ctx.protocol,
+        &ctx.model,
+    ];
+    let common = fields.iter().map(|field| field.len()).sum::<usize>() + 2; // actual configuration {}
+    let mut exact = json!({"model":ctx.model, "input":""});
+    let overhead = common + serde_json::to_vec(&exact).unwrap().len();
+    exact["input"] = json!("x".repeat(TRAFFIC_INPUT_LIMIT - overhead));
+    let mut below = exact.clone();
+    below["input"] = json!("x".repeat(TRAFFIC_INPUT_LIMIT - overhead - 1));
+    assert!(runtime.apply_traffic(ctx.clone(), &below).unwrap().allow);
+    assert!(runtime.apply_traffic(ctx.clone(), &exact).unwrap().allow);
+    let mut above = exact.clone();
+    above["input"] = json!(format!("{}x", above["input"].as_str().unwrap()));
+    assert!(matches!(
+        runtime.apply_traffic(ctx.clone(), &above),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    let escaped = json!({"model":ctx.model, "input":"\0".repeat(TRAFFIC_INPUT_LIMIT / 6 + 1)});
+    assert!(escaped["input"].as_str().unwrap().len() < TRAFFIC_INPUT_LIMIT);
+    assert!(matches!(
+        runtime.apply_traffic(ctx.clone(), &escaped),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    // UTF-8 bytes (not char count) and a larger actual configuration both count.
+    let unicode = json!({"model":ctx.model, "input":"界".repeat(TRAFFIC_INPUT_LIMIT / 3 + 1)});
+    assert!(matches!(
+        runtime.apply_traffic(ctx.clone(), &unicode),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    let configs = std::collections::BTreeMap::from([("policy".into(), json!({"setting":"界"}))]);
+    assert!(matches!(
+        runtime.apply_traffic_with_config(ctx.clone(), &exact, &configs),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let revisions = revisions(runtime);
+        let snapshot = revisions.pin().unwrap();
+        // Repeated rejections must not be swallowed as403 or count toward the
+        // shared circuit; another tenant must still execute its policy.
+        for _ in 0..4 {
+            assert!(matches!(
+                snapshot.apply_traffic_with_config(ctx.clone(), &above, &BTreeMap::new()),
+                Err(AppError::PluginInputTooLarge)
+            ));
+        }
+        let mut other = ctx.clone();
+        other.tenant_id = "tenant-2".into();
+        assert!(
+            snapshot
+                .apply_traffic_with_config(
+                    other,
+                    &json!({"model":"requested-model","input":"small"}),
+                    &BTreeMap::new()
+                )
+                .unwrap()
+                .allow
+        );
+        assert!(
+            snapshot
+                .apply_traffic_with_config(ctx, &exact, &BTreeMap::new())
+                .unwrap()
+                .allow
+        );
+    }
+}
+
+#[tokio::test]
+async fn all_hook_configs_are_checked_before_any_guest_executes() {
+    use memeloop_token_center::error::AppError;
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_policy(&plugins, "a-first-would-trap", "unreachable");
+    write_policy(&plugins, "z-second", &decision_body(true, None, None));
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("configs.db").display()
+    ))
+    .await
+    .unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    let configs = std::collections::BTreeMap::from([(
+        "z-second".into(),
+        json!({"setting":"x".repeat(TRAFFIC_INPUT_LIMIT)}),
+    )]);
+    let request = json!({"model":"requested-model"});
+    assert!(matches!(
+        runtime.apply_traffic_with_config(context(), &request, &configs),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let revisions = revisions(runtime);
+        assert!(matches!(
+            revisions
+                .pin()
+                .unwrap()
+                .apply_traffic_with_config(context(), &request, &configs),
+            Err(AppError::PluginInputTooLarge)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn no_traffic_hooks_do_not_impose_a_component_input_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("empty.db").display()
+    ))
+    .await
+    .unwrap();
+    let runtime = PluginRuntime::load(None, database).unwrap();
+    let request = json!({"model":"requested-model", "input":"x".repeat(TRAFFIC_INPUT_LIMIT + 1)});
+    assert!(runtime.apply_traffic(context(), &request).unwrap().allow);
+}
+
+#[tokio::test]
+async fn traffic_input_error_has_fixed_413_public_response() {
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use memeloop_token_center::error::AppError;
+    let response = AppError::PluginInputTooLarge.into_response();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "plugin_input_too_large");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("请求过大")
+    );
+}
+
+#[tokio::test]
+async fn rewritten_input_is_rechecked_before_the_next_hook_without_poisoning_circuits() {
+    use memeloop_token_center::error::AppError;
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    let pointer = 65536;
+    let length = TRAFFIC_INPUT_LIMIT;
+    let prefix = stores(pointer, "{\"model\":\"requested-model\",\"input\":\"");
+    let suffix = stores(pointer + length - 2, "\"}");
+    let allow = decision_body(true, None, None);
+    let body = format!(
+        r#"
+        i32.const 256 memory.grow drop
+        i32.const {pointer} i32.const 120 i32.const {length} memory.fill
+        {prefix}
+        {suffix}
+        {allow}
+        drop
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+    "#
+    );
+    write_policy(&plugins, "a-rewriter", &body);
+    write_policy(&plugins, "z-must-not-run", "unreachable");
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("rewrite.db").display()
+    ))
+    .await
+    .unwrap();
+    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+    let request = json!({"model":"requested-model"});
+    assert!(matches!(
+        runtime.apply_traffic(context(), &request),
+        Err(AppError::PluginInputTooLarge)
+    ));
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let revisions = revisions(runtime);
+        let snapshot = revisions.pin().unwrap();
+        for _ in 0..4 {
+            assert!(matches!(
+                snapshot.apply_traffic_with_config(context(), &request, &BTreeMap::new()),
+                Err(AppError::PluginInputTooLarge)
+            ));
+        }
+    }
 }

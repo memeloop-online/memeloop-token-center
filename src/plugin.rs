@@ -54,6 +54,12 @@ const MAX_TRAFFIC_REASON_BYTES: usize = 256;
 const MAX_TRAFFIC_MODEL_BYTES: usize = 200;
 const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 16 * 1024 * 1024;
+// Total UTF-8 strings lowered for one post-auth call, including serialized JSON
+// and the six context fields. Reserve the other half of the unchanged 32 MiB
+// guest ceiling for allocator/runtime data and bounded return values. A guest
+// may still exhaust its own budget; this is an input contract, not a guarantee
+// about arbitrary guest allocations. Requests without traffic hooks are exempt.
+const MAX_TRAFFIC_INPUT_BYTES: usize = PLUGIN_MEMORY_BYTES / 2;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
 const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -1193,10 +1199,23 @@ impl PluginRuntime {
             allow: true,
             ..TrafficDecision::default()
         };
-        for plugin in self.plugins.iter().filter(|plugin| {
+        for (index, plugin) in self.plugins.iter().enumerate().filter(|(_, plugin)| {
             plugin.manifest.contributions.traffic_policy
                 || plugin.manifest.contributions.request_rewrite
         }) {
+            let mut plugin_context = decision.project_context(&context, &mut current);
+            // Check every remaining hook/configuration before executing any of
+            // them, and repeat after a preceding rewrite changes the input.
+            validate_traffic_inputs(
+                &self.plugins[index..],
+                &plugin_context,
+                &current,
+                configurations,
+            )?;
+            let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
+            plugin_context.config_json =
+                serde_json::to_string(traffic_configuration(plugin, configurations))
+                    .map_err(|_| AppError::Internal)?;
             let component = plugin.component.as_ref().ok_or_else(|| {
                 AppError::Storage(format!(
                     "plugin {} contributes a traffic policy without a component",
@@ -1236,22 +1255,6 @@ impl PluginRuntime {
                 .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
             let bindings = Plugin::instantiate(&mut store, component, &linker)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
-            let mut plugin_context = decision.project_context(&context, &mut current);
-            let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
-            let configuration = configurations
-                .get(&plugin.manifest.id)
-                .cloned()
-                .or_else(|| {
-                    plugin
-                        .manifest
-                        .contributions
-                        .configuration
-                        .as_ref()
-                        .map(|contribution| contribution.default.clone())
-                })
-                .unwrap_or_else(empty_json_object);
-            plugin_context.config_json =
-                serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
             let result = bindings
                 .memeloop_token_center_traffic_policy()
                 .call_post_auth(&mut store, &plugin_context, &request)
@@ -3077,6 +3080,86 @@ fn validate_plugin_text(value: &str, maximum: usize, allow_empty: bool) -> Resul
         || value.chars().any(char::is_control)
     {
         return Err(());
+    }
+    Ok(())
+}
+
+// Count serde's actual output (including JSON escaping) without allocating a
+// second unbounded String. Stop as soon as the remaining ABI budget is exceeded.
+fn traffic_json_bytes(value: &Value, limit: usize) -> Result<usize, AppError> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let remaining = self.limit.saturating_sub(self.bytes);
+            if bytes.len() > remaining {
+                return Err(std::io::Error::other("traffic input limit"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value).map_err(|_| AppError::PluginInputTooLarge)?;
+    Ok(counter.bytes)
+}
+
+fn traffic_configuration<'a>(
+    plugin: &'a LoadedPlugin,
+    configurations: &'a BTreeMap<String, Value>,
+) -> &'a Value {
+    static EMPTY: std::sync::LazyLock<Value> = std::sync::LazyLock::new(empty_json_object);
+    configurations
+        .get(&plugin.manifest.id)
+        .or_else(|| {
+            plugin
+                .manifest
+                .contributions
+                .configuration
+                .as_ref()
+                .map(|configuration| &configuration.default)
+        })
+        .unwrap_or(&EMPTY)
+}
+
+fn validate_traffic_inputs(
+    plugins: &[LoadedPlugin],
+    context: &types::RequestContext,
+    request: &Value,
+    configurations: &BTreeMap<String, Value>,
+) -> Result<(), AppError> {
+    let mut policies = plugins
+        .iter()
+        .filter(|plugin| {
+            plugin.manifest.contributions.traffic_policy
+                || plugin.manifest.contributions.request_rewrite
+        })
+        .peekable();
+    if policies.peek().is_none() {
+        return Ok(());
+    }
+    let body = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
+    let context_bytes = [
+        &context.tenant_id,
+        &context.principal_id,
+        &context.key_id,
+        &context.protocol,
+        &context.model,
+    ]
+    .into_iter()
+    .try_fold(body, |total, value| total.checked_add(value.len()))
+    .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
+    .ok_or(AppError::PluginInputTooLarge)?;
+    for plugin in policies {
+        traffic_json_bytes(
+            traffic_configuration(plugin, configurations),
+            MAX_TRAFFIC_INPUT_BYTES - context_bytes,
+        )?;
     }
     Ok(())
 }
