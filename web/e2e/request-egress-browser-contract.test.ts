@@ -121,6 +121,23 @@ test('request list exit lines render only real recorded exits with exact text an
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?egress-lines&quiet-background-help`);
       const row = (model: string) => page.locator('tbody tr').filter({ has: page.getByText(model, { exact: true }) });
+      const tooltipForExit = async (model: string) => {
+        const anchor = row(model).locator('.request-outcome');
+        const trigger = row(model).locator('.request-egress-line');
+        await page.mouse.move(-1, -1);
+        await anchor.focus();
+        assert.equal(await anchor.evaluate(element => document.activeElement === element), true, `${model}: keyboard traversal starts at the status`);
+        await page.keyboard.press('Escape');
+        await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+        await page.keyboard.press('Tab');
+        assert.equal(await trigger.evaluate(element => document.activeElement === element), true, `${model}: Tab focuses the exact exit trigger`);
+        await page.waitForFunction(element => (element?.getAttribute('aria-describedby') ?? '').split(/\s+/).some(id => document.getElementById(id)?.getAttribute('role') === 'tooltip'), await trigger.elementHandle());
+        const tooltipId = await trigger.evaluate(element => (element.getAttribute('aria-describedby') ?? '').split(/\s+/).find(id => document.getElementById(id)?.getAttribute('role') === 'tooltip'));
+        assert.ok(tooltipId, `${model}: exit trigger describes its own tooltip`);
+        const tooltip = page.locator(`[role="tooltip"][id=${JSON.stringify(tooltipId)}]`);
+        await tooltip.waitFor({ state: 'visible' });
+        return tooltip;
+      };
       const proxyLine = row('model-c').locator('.request-egress-line');
       await proxyLine.waitFor();
       assert.equal(await proxyLine.innerText(), 'edge-01 · socks5h://192.0.2.10:1080');
@@ -128,16 +145,11 @@ test('request list exit lines render only real recorded exits with exact text an
       const directLine = row('model-d').locator('.request-egress-line');
       assert.equal(await directLine.innerText(), zh ? '直连' : 'Direct');
       assert.equal(await directLine.getAttribute('data-egress'), 'direct');
-      // In-flight missing (model-a), completed missing (model-b), unknown kind
-      // (model-e), pre-admission (model-f) and explicit null (model-g) records
-      // have no real recorded exit, so the list renders no exit line at all.
       for (const model of ['model-a', 'model-b', 'model-e', 'model-f', 'model-g']) {
         assert.equal(await row(model).locator('.request-egress-line').count(), 0, `${model} has no recorded exit line`);
       }
       await page.screenshot({ path: `${artifactRoot}/egress-list-lines-${locale}-390.png`, fullPage: true });
-      await proxyLine.focus();
-      const proxyTooltip = page.locator('[role="tooltip"]:visible');
-      await proxyTooltip.waitFor();
+      const proxyTooltip = await tooltipForExit('model-c');
       const proxyTip = await proxyTooltip.innerText();
       assert.match(proxyTip, zh ? /代理组: 示例出口组/ : /Proxy group: 示例出口组/);
       assert.match(proxyTip, zh ? /组版本 3/ : /Group version 3/);
@@ -145,16 +157,12 @@ test('request list exit lines render only real recorded exits with exact text an
       assert.match(proxyTip, /socks5h:\/\/192\.0\.2\.10:1080/);
       assert.match(proxyTip, zh ? /连通性: 未记录（历史使用不代表当前可通）/ : /Connectivity: not recorded \(past use does not confirm current reachability\)/);
       assert.match(proxyTip, zh ? /与上游账号不同/ : /separate from the upstream account/);
-      await proxyLine.evaluate(element => (element as HTMLElement).blur());
-      await page.mouse.move(0, 0);
-      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
-      await directLine.focus();
-      const directTooltip = page.locator('[role="tooltip"]:visible');
-      await directTooltip.waitFor();
+      await page.keyboard.press('Escape');
+      await proxyTooltip.waitFor({ state: 'hidden' });
+      const directTooltip = await tooltipForExit('model-d');
       assert.match(await directTooltip.innerText(), zh ? /未使用代理出口/ : /without a proxy exit/);
-      await directLine.evaluate(element => (element as HTMLElement).blur());
-      await page.mouse.move(0, 0);
-      await page.locator('[role="tooltip"]:visible').waitFor({ state: 'hidden' });
+      await page.keyboard.press('Escape');
+      await directTooltip.waitFor({ state: 'hidden' });
       assert.deepEqual(errors, []);
       await page.close();
     }
