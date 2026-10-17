@@ -141,7 +141,8 @@ fn delivery_error_class(error: &AppError) -> &'static str {
         AppError::Overloaded => "overloaded",
         AppError::NoAuthorizedUpstreamCandidate => "no_authorized_upstream_candidate",
         AppError::Unauthorized | AppError::Forbidden => "authorization",
-        AppError::UnpricedModel
+        AppError::PluginInputTooLarge
+        | AppError::UnpricedModel
         | AppError::QuotaExceeded
         | AppError::RateLimited
         | AppError::LimitExceeded { .. }

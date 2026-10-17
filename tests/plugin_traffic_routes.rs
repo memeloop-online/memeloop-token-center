@@ -1620,3 +1620,56 @@ async fn call(state: &AppState, key: &str, path: &str, body: Value) -> (StatusCo
     };
     (status, body)
 }
+
+#[tokio::test]
+async fn component_input_limit_returns_413_after_authentication_and_route_authorization() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let (_directory, state, issued) =
+        policy_state("unreachable", "input-limit", vec!["requested-model".into()]).await;
+    create_account_and_routes(
+        &state,
+        "policy-input-limit",
+        &issued,
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": upstream.uri(), "network_scope":"public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "unused-upstream",
+            protocols: &["generation"],
+            granted_public_models: &["requested-model"],
+        },
+    )
+    .await;
+    let mut request = json!({"model":"requested-model", "prompt":""});
+    let length = 16 * 1024 * 1024 - 1;
+    let overhead = serde_json::to_vec(&request).unwrap().len();
+    request["prompt"] = json!("x".repeat(length - overhead));
+    // The image endpoint accepts this raw body, but its JSON plus authenticated
+    // context exceeds the component ABI limit. No guest/upstream may execute.
+    assert_eq!(serde_json::to_vec(&request).unwrap().len(), length);
+    let (status, body) = call(
+        &state,
+        &issued.key,
+        "/v1/images/generations",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["code"], "plugin_input_too_large");
+    let (status, _) = call(
+        &state,
+        "invalid-test-key",
+        "/v1/images/generations",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    request["model"] = json!("ungranted");
+    let (status, _) = call(&state, &issued.key, "/v1/images/generations", request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
