@@ -265,7 +265,7 @@ async fn postgres_unlimited_admission_and_terminal_ignore_shared_financial_and_s
         );
     }
     let totals: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'), (SELECT SUM(cost_micros) FROM request_stats_facts), (SELECT COUNT(*) FROM request_events WHERE event_kind = 'finished'), (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1)"
+        "SELECT (SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'), (SELECT CAST(SUM(cost_micros) AS BIGINT) FROM request_stats_facts), (SELECT COUNT(*) FROM request_events WHERE event_kind = 'finished'), (SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1)"
     ).bind(fixture.key.account_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
     assert_eq!(totals, (2, 8, 2, 8));
     fixture.cleanup().await;
@@ -468,7 +468,7 @@ async fn postgres_terminal_outbox_failure_rolls_back_unlimited_and_prepaid_finan
             1
         );
         let ledger: (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), -SUM(amount_micros) FROM ledger_entries WHERE kind = 'usage'",
+            "SELECT COUNT(*), CAST(-SUM(amount_micros) AS BIGINT) FROM ledger_entries WHERE kind = 'usage'",
         )
         .fetch_one(&fixture.database.pool)
         .await
