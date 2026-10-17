@@ -102,6 +102,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE pending_proxy_settlements",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
@@ -158,7 +159,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128)",
     )
     .execute(&database.pool)
     .await
@@ -217,7 +218,7 @@ async fn upgrade_contract(database: &Database) {
     .unwrap();
     assert_eq!(
         tail,
-        vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+        vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128]
     );
     let policy: String = sqlx::query_scalar(
         "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
@@ -256,7 +257,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .collect();
         assert_eq!(
             tail,
-            vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+            vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128]
         );
     }
 }

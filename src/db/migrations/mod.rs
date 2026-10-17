@@ -668,6 +668,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
+    Migration {
+        version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1318,6 +1323,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 127,
         name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
+    },
+    Migration {
+        version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
     },
 ];
 
