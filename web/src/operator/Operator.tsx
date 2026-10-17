@@ -215,6 +215,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   const accessSettings = <OperatorAccessSettings
     credentialInput={scope.credentialInput}
     credential={scope.credential}
+    validated={scope.validated}
     authenticating={scope.authenticating}
     onCredentialInput={scope.setCredentialInput}
     onConnect={(credential) => { void scope.authenticate(credential); }}

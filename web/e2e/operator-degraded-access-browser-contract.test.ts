@@ -177,8 +177,19 @@ test('a baseline 403 deauthorizes the console while a scoped API 403 stays local
     assert.equal(await page.locator('.tenant-manager').count(), 0, 'a denied identity no longer authorizes management pages');
     assert.equal(await page.locator('.tenant-picker select').count(), 0, 'scope controls hide once authorization is gone');
     assert.equal(await savedCredential(page), credentialA, 'a denial keeps the saved credential for inspection or explicit clear');
+    assert.equal(await page.locator('.settings-access-card .status.ok').count(), 0, 'a retained credential must not show Connected after baseline authorization is denied');
+    assert.equal(await page.getByText('Connected', { exact: true }).count(), 0, 'the denied access card must not claim a connected session');
+    await page.getByRole('button', { name: 'Clear credential', exact: true }).waitFor();
     assert.equal((await fixtureCalls(page)).filter((call) => call === 'GET /internal/v1/tenants [alpha]').length, 2, 'the denial answers once without an outage retry loop');
     assert.equal((await fixtureCalls(page)).filter((call) => call.startsWith('GET /internal/v1/tenant-management')).length, 2, 'no management read runs after deauthorization');
+
+    await setMode(page, 'ok');
+    await page.getByLabel('Service credential', { exact: true }).fill(credentialA);
+    await page.getByRole('button', { name: 'Replace credential', exact: true }).click();
+    await denial.waitFor({ state: 'detached' });
+    await page.goto(fixtureUrl(port, 'system-settings'));
+    await page.locator('.settings-access-card .status.ok').getByText('Connected', { exact: true }).waitFor();
+    assert.equal(await savedCredential(page), credentialA, 'successful authorization keeps the same saved credential');
 
     await openTenantManager(page, port);
     await setMode(page, 'management-denied');

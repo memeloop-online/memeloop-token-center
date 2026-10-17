@@ -8,6 +8,7 @@ import './pages/systemSettings.css';
 export interface OperatorAccessSettingsProps {
   credentialInput: string;
   credential: string;
+  validated: boolean;
   authenticating?: boolean;
   onCredentialInput: (value: string) => void;
   onConnect: (value: string) => void;
@@ -15,7 +16,7 @@ export interface OperatorAccessSettingsProps {
 }
 
 /** Small authentication surface kept outside the tenant settings bundle. */
-export function OperatorAccessSettings({ credentialInput, credential, authenticating = false, onCredentialInput, onConnect, onClear }: OperatorAccessSettingsProps) {
+export function OperatorAccessSettings({ credentialInput, credential, validated, authenticating = false, onCredentialInput, onConnect, onClear }: OperatorAccessSettingsProps) {
   const { t } = useI18n();
   return <article className="panel settings-card settings-access-card">
     <div className="settings-card-heading">
@@ -23,7 +24,7 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
         <h3>{t('settings.accessTitle')}</h3>
         <p className="muted">{t('settings.accessDescription')}</p>
       </div>
-      {credential && <span className="status ok">{t('common.savedCredentialInUse')}</span>}
+      {credential && validated && <span className="status ok">{t('common.savedCredentialInUse')}</span>}
     </div>
     <form className="system-settings-access operator-credential" aria-busy={authenticating} onSubmit={(event) => {
       event.preventDefault();
