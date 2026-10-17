@@ -735,11 +735,17 @@ impl Serialize for RequestView {
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
         let diagnostic = failure_diagnostic(self.terminal_cause_code.as_deref());
-        let diagnostic = diagnostic.map(|value| serde_json::json!({
-            "stage": self.operational_terminal.as_ref().and_then(|terminal| terminal.stage.as_deref()).or(value.stage),
-            "source": value.source,
-            "reason": value.reason,
-        }));
+        let diagnostic = diagnostic.map(|value| {
+            let stage = match self.operational_terminal.as_ref() {
+                Some(terminal) => terminal.stage.as_deref(),
+                None => value.stage,
+            };
+            serde_json::json!({
+                "stage": stage,
+                "source": value.source,
+                "reason": value.reason,
+            })
+        });
         state.serialize_field("failure_diagnostic", &diagnostic)?;
         state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
@@ -1806,11 +1812,156 @@ pub fn priced_tokens(tokens: i64, micros_per_million: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::priced_tokens;
+    use super::*;
 
     #[test]
     fn token_price_saturates_instead_of_wrapping() {
         assert_eq!(priced_tokens(i64::MAX, i64::MAX), i64::MAX);
         assert_eq!(priced_tokens(-1, i64::MAX), 0);
+    }
+
+    fn diagnostic_request(
+        cause: &str,
+        operational_terminal: Option<RequestOperationalTerminalView>,
+    ) -> RequestView {
+        let cancelled = cause == "client_disconnected";
+        RequestView {
+            operational_terminal,
+            egress: None,
+            usage_basis: None,
+            compaction: None,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: Uuid::nil(),
+            created_at: 1,
+            completed_at: None,
+            source_completed_at: None,
+            lifecycle_state: if cancelled {
+                RequestLifecycleState::Cancelled
+            } else {
+                RequestLifecycleState::Failed
+            },
+            protocol: "openai".into(),
+            model: "diagnostic-regression".into(),
+            upstream_model: None,
+            upstream_account_id: None,
+            route_id: None,
+            status_code: Some(if cancelled { 499 } else { 502 }),
+            duration_ms: Some(1),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            cost: "0".into(),
+            currency: None,
+            usage: RequestUsageView {
+                tokens: None,
+                generation: None,
+            },
+            billing: RequestBillingView {
+                billable: true,
+                cost: None,
+                currency: None,
+            },
+            error_code: Some(
+                if cancelled {
+                    "client_cancelled"
+                } else {
+                    "upstream_http_error"
+                }
+                .into(),
+            ),
+            terminal_cause_code: Some(cause.into()),
+            supplier_error: None,
+            archive_state: RequestArchiveState::Gap,
+            credential_identity: None,
+            session_context: None,
+        }
+    }
+
+    #[test]
+    fn request_serialization_preserves_unknown_operational_stage_for_recorded_causes() {
+        for (cause, source) in [
+            ("client_disconnected", "downstream_connection"),
+            ("upstream_http_status", "upstream_http_response"),
+        ] {
+            let request = diagnostic_request(
+                cause,
+                Some(RequestOperationalTerminalView {
+                    completed_at: 2,
+                    stage: None,
+                    financial_state: RequestFinancialState::Unknown,
+                }),
+            );
+            let encoded = serde_json::to_value(request).unwrap();
+            assert!(encoded["operational_terminal"].is_object());
+            assert!(encoded["operational_terminal"]["stage"].is_null());
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": null, "source": source, "reason": cause,
+                })
+            );
+            assert_eq!(
+                encoded["operational_terminal"]["financial_state"],
+                "unknown"
+            );
+            assert!(encoded["completed_at"].is_null());
+            assert!(encoded["input_tokens"].is_null());
+            assert!(encoded["cost"].is_null());
+        }
+    }
+
+    #[test]
+    fn request_serialization_preserves_explicit_operational_stage_over_cause_defaults() {
+        for (cause, source) in [
+            ("client_disconnected", "downstream_connection"),
+            ("upstream_http_status", "upstream_http_response"),
+        ] {
+            let request = diagnostic_request(
+                cause,
+                Some(RequestOperationalTerminalView {
+                    completed_at: 2,
+                    stage: Some("upstream_response_body".into()),
+                    financial_state: RequestFinancialState::Pending,
+                }),
+            );
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                encoded["operational_terminal"]["stage"],
+                "upstream_response_body"
+            );
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": "upstream_response_body", "source": source, "reason": cause,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn request_serialization_retains_legacy_cause_stage_without_operational_record() {
+        for (cause, source, stage) in [
+            (
+                "client_disconnected",
+                "downstream_connection",
+                "response_delivery",
+            ),
+            (
+                "upstream_http_status",
+                "upstream_http_response",
+                "upstream_response_headers",
+            ),
+        ] {
+            let encoded = serde_json::to_value(diagnostic_request(cause, None)).unwrap();
+            assert!(encoded["operational_terminal"].is_null());
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": stage, "source": source, "reason": cause,
+                })
+            );
+        }
     }
 }
