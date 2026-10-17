@@ -504,6 +504,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(super::super::plugins::publish_application_plugin),
         )
         .route(
+            "/internal/v1/plugin-runtime/uninstall",
+            post(super::super::plugins::uninstall_application_plugin),
+        )
+        .route(
             "/internal/v1/plugin-runtime/rollback",
             post(super::super::plugins::rollback_application_plugin),
         );
