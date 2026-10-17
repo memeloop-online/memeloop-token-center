@@ -25,6 +25,7 @@ pub use descriptor_export::{ExportPluginDescriptor, PluginDescriptorExport};
 #[cfg(feature = "plugin-distribution")]
 pub mod descriptor_import;
 mod empty;
+pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
 pub mod prepare;
