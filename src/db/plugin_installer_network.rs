@@ -4,10 +4,53 @@ use super::transport_proxy_management::{OAuthGroupReference, OAuthGroupSnapshot}
 use super::*;
 use std::net::SocketAddr;
 
-#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum InstallerNetworkInput {
     #[default]
+    Default,
+    Direct,
+    Group {
+        tenant_external_id: String,
+        group_id: Uuid,
+        group_version: i64,
+        member_id: Uuid,
+    },
+    Custom {
+        url: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+}
+
+// Serde accepts extra fields on internally tagged unit variants even with
+// deny_unknown_fields. Check those variants before using the derived decoder.
+impl<'de> Deserialize<'de> for InstallerNetworkInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if let Some(object) = value.as_object()
+            && matches!(
+                object.get("mode").and_then(Value::as_str),
+                Some("default" | "direct")
+            )
+            && object.len() != 1
+        {
+            return Err(serde::de::Error::custom(
+                "unexpected installation network fields",
+            ));
+        }
+        InstallerNetworkInputDef::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(
+    remote = "InstallerNetworkInput",
+    tag = "mode",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum InstallerNetworkInputDef {
     Default,
     Direct,
     Group {

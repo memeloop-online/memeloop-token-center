@@ -24,6 +24,12 @@ fn installer_network_schema_and_redaction() {
         .is_err()
     );
     assert!(serde_json::from_value::<InstallerNetworkInput>(serde_json::json!({"mode":"custom","url":"http://example.org","password_file":"/secret"})).is_err());
+    assert!(
+        serde_json::from_value::<InstallerNetworkInput>(
+            serde_json::json!({"mode":"default","password":"unexpected"})
+        )
+        .is_err()
+    );
     assert_ne!(
         selection_digest(&input, KEY).unwrap(),
         selection_digest(&input, b"another-key").unwrap()

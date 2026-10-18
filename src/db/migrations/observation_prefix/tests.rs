@@ -56,7 +56,17 @@ async fn conversion_contract(url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version IN (127, 128)")
+    for table in [
+        "application_plugin_release_resolutions",
+        "plugin_installer_network_snapshots",
+        "plugin_installer_network_preferences",
+    ] {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version >= 127")
         .execute(&database.pool)
         .await
         .unwrap();

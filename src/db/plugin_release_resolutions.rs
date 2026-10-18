@@ -215,7 +215,12 @@ mod tests {
 
     #[tokio::test]
     async fn release_publication_cannot_rebase_to_a_different_expected_revision() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("publication.db").display()
+        );
+        let db = Database::connect(&url).await.unwrap();
         db.migrate().await.unwrap();
         let source = release('a');
         let resolution = db
