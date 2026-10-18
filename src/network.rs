@@ -712,6 +712,29 @@ pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> 
     Ok(url)
 }
 
+/// An already-resolved installer proxy passed to OCI/cosign transports must
+/// use the frozen IP directly, so those transports cannot resolve it again.
+pub(crate) fn validate_frozen_installer_proxy(value: &str) -> Result<(), AppError> {
+    let url = checked_installer_proxy_url(value)?;
+    let address = match url.host() {
+        Some(Host::Ipv4(address)) => IpAddr::V4(address),
+        Some(Host::Ipv6(address)) => IpAddr::V6(address),
+        _ => {
+            return Err(AppError::BadRequest(
+                "installation proxy must use its frozen IP address".into(),
+            ));
+        }
+    };
+    validate_addresses(
+        &[SocketAddr::new(
+            address,
+            url.port_or_known_default().unwrap_or(1080),
+        )],
+        OutboundScope::Private,
+        false,
+    )
+}
+
 fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
@@ -1484,6 +1507,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(addresses.len(), 1);
+            validate_frozen_installer_proxy(value).unwrap();
         }
         for value in [
             "http://127.0.0.1:3128",
@@ -1505,7 +1529,9 @@ mod tests {
                     .is_err(),
                 "accepted {value}"
             );
+            assert!(validate_frozen_installer_proxy(value).is_err());
         }
+        assert!(validate_frozen_installer_proxy("https://proxy.example.org:443").is_err());
         assert!(
             validate_installer_proxy_endpoint("socks5h://8.8.8.8:1080", true)
                 .await

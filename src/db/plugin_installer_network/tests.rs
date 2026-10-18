@@ -149,6 +149,62 @@ async fn contract(database: &Database) {
         false
     );
     group_contract(database).await;
+    deployment_default_contract(database).await;
+}
+
+async fn deployment_default_contract(database: &Database) {
+    let actor = format!("service:{}", Uuid::now_v7());
+    let operation = format!("default-{}", Uuid::now_v7());
+    let fallback = InstallerNetworkInput::Custom {
+        url: "http://10.20.30.40:3128".into(),
+        username: Some("deployment-user".into()),
+        password: Some("deployment-secret".into()),
+    };
+    let frozen = database
+        .freeze_installer_network_with_default(
+            &operation,
+            &actor,
+            Some(InstallerNetworkInput::Default),
+            Some(fallback),
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen.proxy_url.as_deref(), Some("http://10.20.30.40:3128"));
+    assert_eq!(frozen.password.as_deref(), Some("deployment-secret"));
+    assert!(matches!(
+        database
+            .installer_network_preference(&actor, KEY)
+            .await
+            .unwrap(),
+        InstallerNetworkInput::Default
+    ));
+    let retry = database
+        .freeze_installer_network_with_default(
+            &operation,
+            &actor,
+            None,
+            Some(InstallerNetworkInput::Direct),
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.password, frozen.password);
+    let direct = database
+        .freeze_installer_network_with_default(
+            &format!("direct-{}", Uuid::now_v7()),
+            &actor,
+            Some(InstallerNetworkInput::Direct),
+            Some(InstallerNetworkInput::Custom {
+                url: "http://10.20.30.40:3128".into(),
+                username: None,
+                password: None,
+            }),
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(direct.proxy_url.is_none());
 }
 
 async fn group_contract(database: &Database) {
@@ -286,7 +342,7 @@ async fn sqlite_installer_network_encrypted_remember_and_frozen_retry() {
             .fetch_one(&database.pool)
             .await
             .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
 }
 
 #[tokio::test]

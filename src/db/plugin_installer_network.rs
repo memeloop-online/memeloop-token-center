@@ -243,6 +243,18 @@ impl Database {
         input: Option<InstallerNetworkInput>,
         key: &[u8],
     ) -> Result<FrozenInstallerNetwork, AppError> {
+        self.freeze_installer_network_with_default(operation_key, actor, input, None, key)
+            .await
+    }
+
+    pub(crate) async fn freeze_installer_network_with_default(
+        &self,
+        operation_key: &str,
+        actor: &str,
+        input: Option<InstallerNetworkInput>,
+        deployment_default: Option<InstallerNetworkInput>,
+        key: &[u8],
+    ) -> Result<FrozenInstallerNetwork, AppError> {
         if operation_key.is_empty() || operation_key.len() > 256 {
             return Err(AppError::BadRequest(
                 "invalid installation operation key".into(),
@@ -276,7 +288,16 @@ impl Database {
             }
             None => self.installer_network_preference(actor, key).await?,
         };
-        let snapshot = self.resolve_installer_network(&input, key).await?;
+        // Keep the remembered selection as Default; deployment credentials are
+        // only stored in the encrypted operation snapshot, never preferences.
+        let effective = if matches!(input, InstallerNetworkInput::Default) {
+            deployment_default
+                .as_ref()
+                .unwrap_or(&InstallerNetworkInput::Direct)
+        } else {
+            &input
+        };
+        let snapshot = self.resolve_installer_network(effective, key).await?;
         let frozen = self
             .insert_installer_network_snapshot(
                 operation_key,
