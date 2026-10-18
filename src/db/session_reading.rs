@@ -155,7 +155,7 @@ impl Database {
         atom: &str,
         offset: i64,
     ) -> Result<(String, i64), AppError> {
-        if offset < 0 || offset > i64::MAX - CONTEXT_CONTENT_CHARS - 1 {
+        if !(0..=i64::MAX - CONTEXT_CONTENT_CHARS - 1).contains(&offset) {
             return Err(AppError::BadRequest(
                 "invalid context content offset".into(),
             ));
@@ -191,7 +191,7 @@ impl Database {
         atom: &str,
         offset: i64,
     ) -> Result<(String, i64), AppError> {
-        if offset < 0 || offset > i64::MAX - CONTEXT_CONTENT_CHARS - 1 {
+        if !(0..=i64::MAX - CONTEXT_CONTENT_CHARS - 1).contains(&offset) {
             return Err(AppError::BadRequest("invalid context text offset".into()));
         }
         let extraction = match self.backend {

@@ -5406,6 +5406,102 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/context:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionContext
+      summary: Read one bounded page of retained semantic conversation history
+      description: Returns at most 32 prefix nodes. Tool bodies are excluded. Signed continuations bind tenant, stable key, session, request and immutable prefix leaf. Canonical semantic content is not a byte-exact archive.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - $ref: '#/components/parameters/ContextCursor'
+        - $ref: '#/components/parameters/ContextDetails'
+      responses:
+        '200':
+          description: Chronologically ordered page with an optional earlier-page continuation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/context/content:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionContextContent
+      summary: Read one signed content or text-only character range
+      description: Requires a content or text cursor issued by the context page. At most 16384 Unicode scalar values are returned; subsequent reads recheck caller authorization. Text cursors exclude embedded tool and media content.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - name: cursor
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+      responses:
+        '200':
+          description: Bounded content with scalar offsets and an optional continuation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextContent' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained content is incomplete or inconsistent. }
+
+  /internal/v1/sessions/{session_id}/title:
+    parameters:
+      - $ref: '#/components/parameters/ContextSessionId'
+      - $ref: '#/components/parameters/TenantFilter'
+      - $ref: '#/components/parameters/ContextKeyId'
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTitle
+      summary: Read the generated title and generation state
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      responses:
+        '200':
+          description: Current title and background job status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionGeneratedTitle' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Operator traffic]
+      operationId: generateOperatorSessionTitle
+      summary: Queue title generation with the configured system assistant
+      description: Requires requests:read and filter_assistant:execute. Uses the configured model route and billing credential. Repeated requests while queued or running coalesce. Existing titles remain visible until a replacement commits. Closing the page does not cancel the background operation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: filter_assistant:execute
+      x-additional-required-scopes: [requests:read]
+      responses:
+        '200':
+          description: Accepted or already queued title job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionGeneratedTitle' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/requests/{request_id}/assets/{asset_id}:
     get:
       tags: [Operator traffic]
@@ -6263,6 +6359,52 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /self/v1/sessions/{session_id}/requests/{request_id}/context:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionContext
+      summary: Read one bounded page of the authenticated credential's retained history
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/ContextCursor'
+        - $ref: '#/components/parameters/ContextDetails'
+      responses:
+        '200':
+          description: Owned semantic context page, without tool bodies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /self/v1/sessions/{session_id}/requests/{request_id}/context/content:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionContextContent
+      summary: Read one signed content range from an owned context node
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - name: cursor
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+      responses:
+        '200':
+          description: Owned content or text-only chunk with Unicode scalar offsets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextContent' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained content is incomplete or inconsistent. }
+
   /v1/models:
     get:
       tags: [OpenAI compatible, Anthropic compatible]
@@ -6696,6 +6838,25 @@ components:
         enum: [reused]
 
   parameters:
+    ContextSessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ContextKeyId:
+      name: key_id
+      in: query
+      required: true
+      schema: { type: string, format: uuid }
+    ContextCursor:
+      name: cursor
+      in: query
+      schema: { type: string, minLength: 1, maxLength: 4096 }
+    ContextDetails:
+      name: details
+      in: query
+      description: Include full inline assistant message text rather than its final paragraph. Tool bodies remain excluded.
+      schema: { type: boolean, default: false }
     TenantFilter:
       name: tenant_external_id
       in: query
@@ -7249,6 +7410,52 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    SessionContextItem:
+      type: object
+      required: [node_id, depth, role, kind, phase, text, text_complete, source_chars, content_cursor, text_cursor]
+      properties:
+        node_id: { type: string, pattern: '^[a-f0-9]{64}$' }
+        depth: { type: integer, format: int64, minimum: 1 }
+        role: { type: string }
+        kind: { type: string }
+        phase: { type: string, nullable: true }
+        text: { type: string, nullable: true }
+        text_complete: { type: boolean }
+        source_chars: { type: integer, format: int64, minimum: 0, nullable: true }
+        content_cursor: { type: string, minLength: 1, maxLength: 4096 }
+        text_cursor: { type: string, minLength: 1, maxLength: 4096, nullable: true }
+    SessionContextPage:
+      type: object
+      required: [contract_version, representation, request_id, session_id, items, next_cursor]
+      properties:
+        contract_version: { type: string, enum: [session_context_v1] }
+        representation: { type: string, enum: [semantic_context] }
+        request_id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        items:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/SessionContextItem' }
+        next_cursor: { type: string, maxLength: 4096, nullable: true }
+    SessionContextContent:
+      type: object
+      required: [contract_version, representation, node_id, offset_chars, total_chars, content, next_cursor]
+      properties:
+        contract_version: { type: string, enum: [session_context_content_v1] }
+        representation: { type: string, enum: [semantic_context, message_text] }
+        node_id: { type: string, pattern: '^[a-f0-9]{64}$' }
+        offset_chars: { type: integer, format: int64, minimum: 0 }
+        total_chars: { type: integer, format: int64, minimum: 0 }
+        content: { type: string, maxLength: 16384 }
+        next_cursor: { type: string, maxLength: 4096, nullable: true }
+    SessionGeneratedTitle:
+      type: object
+      required: [title, state, error_code, updated_at]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 80, nullable: true }
+        state: { type: string, enum: [unavailable, pending, running, ready, failed, waiting_config] }
+        error_code: { type: string, nullable: true }
+        updated_at: { type: integer, format: int64, nullable: true }
     PluginInstallerNetworkInput: {"oneOf":[{"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"type":"string","enum":["default","direct"]}}},{"type":"object","additionalProperties":false,"required":["mode","url"],"properties":{"mode":{"type":"string","enum":["custom"]},"url":{"type":"string","maxLength":2048},"username":{"type":"string","maxLength":255},"password":{"type":"string","maxLength":255,"writeOnly":true}}},{"type":"object","additionalProperties":false,"required":["mode","tenant_external_id","group_id","group_version","member_id"],"properties":{"mode":{"type":"string","enum":["group"]},"tenant_external_id":{"type":"string"},"group_id":{"type":"string","format":"uuid"},"group_version":{"type":"integer"},"member_id":{"type":"string","format":"uuid"}}}]}
     TransportProxyGroupList: {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/TransportProxyGroup"}}}}
     TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}

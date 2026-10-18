@@ -8,7 +8,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number; archiveRangeReads: number } }
+declare global { interface Window { sessionReplayReads: Record<string, number>; sessionReplayAborts: number; archiveRangeReads: number; contextReads: number; contextContentReads: number } }
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'session-replay');

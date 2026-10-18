@@ -143,3 +143,16 @@ isolated worktree `/tmp/mtc-session-review.uHCVTq`, branch
 The first PR revision conflicted with newer master migrations 128–130; the
 review branch merges master and assigns the title migration version 131.
 This supersedes the earlier migration number in the original worktree.
+
+CI run `39158604560` is live for `796ea30f`. Migration smoke, dependency
+security, repository security and docs passed. Initial failures:
+
+- Web typecheck: missing browser-test Window declarations for context counters;
+  fixed locally in review worktree.
+- Packaging: Helm schemaVersion still 130; adjusted to 131 in review worktree.
+- API contract: new context/title routes need canonical OpenAPI entries and
+  regenerated runtime discovery. This remains pending.
+- Rust and memory compilation were still running at the last check.
+
+The final-response projection has not been implemented. Do not infer that the
+PR or partial green checks establish completion of the reading requirements.

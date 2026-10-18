@@ -11,197 +11,6 @@ pub(crate) struct SessionTitleView {
     pub updated_at: Option<i64>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conversation::ConversationHints;
-    use crate::db::requests::conversations::prefix_storage::tests::{key, observe};
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn crashed_workers_cannot_dispatch_unbounded_attempts() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = Database::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("crashed-titles.db").display()
-        ))
-        .await
-        .unwrap();
-        db.migrate().await.unwrap();
-        let tenant = Uuid::now_v7();
-        let key = Uuid::now_v7();
-        let session = Uuid::now_v7();
-        db.request_session_title(tenant, key, session)
-            .await
-            .unwrap();
-        for attempt in 1..=3 {
-            let task = db
-                .claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(task.attempts, attempt);
-            sqlx::query("UPDATE session_generated_titles SET lease_until = 0")
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        }
-        assert!(
-            db.claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let title = db.session_title(tenant, key, session).await.unwrap();
-        assert_eq!(title.state, "failed");
-        assert_eq!(title.error_code.as_deref(), Some("generation_interrupted"));
-    }
-
-    #[tokio::test]
-    async fn title_queue_coalesces_clicks_and_fences_stale_completions() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = Database::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("titles.db").display()
-        ))
-        .await
-        .unwrap();
-        db.migrate().await.unwrap();
-        let key = key(&db, "titles").await;
-        let session = observe(
-            &db,
-            &key,
-            &json!({"input":[{"role":"user","content":"Repair session history loading"}]}),
-            &ConversationHints::default(),
-            Uuid::now_v7(),
-            1,
-            true,
-        )
-        .await;
-        let tenant = key.tenant_id;
-        assert_eq!(
-            db.session_title(tenant, key.key_id, session)
-                .await
-                .unwrap()
-                .state,
-            "pending"
-        );
-        db.request_session_title(tenant, key.key_id, session)
-            .await
-            .unwrap();
-        let first = db
-            .claim_session_title(Uuid::now_v7())
-            .await
-            .unwrap()
-            .unwrap();
-        db.request_session_title(tenant, key.key_id, session)
-            .await
-            .unwrap();
-        assert!(
-            db.claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            db.session_title_sample(&first, false)
-                .await
-                .unwrap()
-                .contains("Repair session")
-        );
-        assert!(
-            db.session_title_tenant("other", key.key_id, session)
-                .await
-                .is_err()
-        );
-
-        // Simulate a worker losing its lease; only its successor may commit.
-        sqlx::query("UPDATE session_generated_titles SET lease_until = 0")
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        let second = db
-            .claim_session_title(Uuid::now_v7())
-            .await
-            .unwrap()
-            .unwrap();
-        db.finish_session_title(&first, Some("Stale"), None)
-            .await
-            .unwrap();
-        assert!(
-            db.session_title(tenant, key.key_id, session)
-                .await
-                .unwrap()
-                .title
-                .is_none()
-        );
-        db.finish_session_title(&second, Some("Session history"), None)
-            .await
-            .unwrap();
-        let ready = db.session_title(tenant, key.key_id, session).await.unwrap();
-        assert_eq!(ready.title.as_deref(), Some("Session history"));
-        assert_eq!(ready.state, "ready");
-        let pending = db
-            .request_session_title(tenant, key.key_id, session)
-            .await
-            .unwrap();
-        assert_eq!(pending.title.as_deref(), Some("Session history"));
-        let third = db
-            .claim_session_title(Uuid::now_v7())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(third.revision > first.revision);
-        db.finish_session_title(&third, None, Some("assistant_not_configured"))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.session_title(tenant, key.key_id, session)
-                .await
-                .unwrap()
-                .state,
-            "waiting_config"
-        );
-        assert!(
-            db.claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        db.request_session_title(tenant, key.key_id, session)
-            .await
-            .unwrap();
-        for attempt in 1..=3 {
-            let task = db
-                .claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(task.attempts, attempt);
-            db.finish_session_title(&task, None, Some("generation_failed"))
-                .await
-                .unwrap();
-            sqlx::query("UPDATE session_generated_titles SET next_attempt_at = 0")
-                .execute(&db.pool)
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            db.session_title(tenant, key.key_id, session)
-                .await
-                .unwrap()
-                .state,
-            "failed"
-        );
-        assert!(
-            db.claim_session_title(Uuid::now_v7())
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-}
-
 pub(crate) struct SessionTitleTask {
     pub tenant_id: Uuid,
     pub key_id: Uuid,
@@ -444,5 +253,196 @@ impl Database {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::ConversationHints;
+    use crate::db::requests::conversations::prefix_storage::tests::{key, observe};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn crashed_workers_cannot_dispatch_unbounded_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("crashed-titles.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let tenant = Uuid::now_v7();
+        let key = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        db.request_session_title(tenant, key, session)
+            .await
+            .unwrap();
+        for attempt in 1..=3 {
+            let task = db
+                .claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.attempts, attempt);
+            sqlx::query("UPDATE session_generated_titles SET lease_until = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        assert!(
+            db.claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let title = db.session_title(tenant, key, session).await.unwrap();
+        assert_eq!(title.state, "failed");
+        assert_eq!(title.error_code.as_deref(), Some("generation_interrupted"));
+    }
+
+    #[tokio::test]
+    async fn title_queue_coalesces_clicks_and_fences_stale_completions() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("titles.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = key(&db, "titles").await;
+        let session = observe(
+            &db,
+            &key,
+            &json!({"input":[{"role":"user","content":"Repair session history loading"}]}),
+            &ConversationHints::default(),
+            Uuid::now_v7(),
+            1,
+            true,
+        )
+        .await;
+        let tenant = key.tenant_id;
+        assert_eq!(
+            db.session_title(tenant, key.key_id, session)
+                .await
+                .unwrap()
+                .state,
+            "pending"
+        );
+        db.request_session_title(tenant, key.key_id, session)
+            .await
+            .unwrap();
+        let first = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
+        db.request_session_title(tenant, key.key_id, session)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.session_title_sample(&first, false)
+                .await
+                .unwrap()
+                .contains("Repair session")
+        );
+        assert!(
+            db.session_title_tenant("other", key.key_id, session)
+                .await
+                .is_err()
+        );
+
+        // Simulate a worker losing its lease; only its successor may commit.
+        sqlx::query("UPDATE session_generated_titles SET lease_until = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let second = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
+        db.finish_session_title(&first, Some("Stale"), None)
+            .await
+            .unwrap();
+        assert!(
+            db.session_title(tenant, key.key_id, session)
+                .await
+                .unwrap()
+                .title
+                .is_none()
+        );
+        db.finish_session_title(&second, Some("Session history"), None)
+            .await
+            .unwrap();
+        let ready = db.session_title(tenant, key.key_id, session).await.unwrap();
+        assert_eq!(ready.title.as_deref(), Some("Session history"));
+        assert_eq!(ready.state, "ready");
+        let pending = db
+            .request_session_title(tenant, key.key_id, session)
+            .await
+            .unwrap();
+        assert_eq!(pending.title.as_deref(), Some("Session history"));
+        let third = db
+            .claim_session_title(Uuid::now_v7())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.revision > first.revision);
+        db.finish_session_title(&third, None, Some("assistant_not_configured"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.session_title(tenant, key.key_id, session)
+                .await
+                .unwrap()
+                .state,
+            "waiting_config"
+        );
+        assert!(
+            db.claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.request_session_title(tenant, key.key_id, session)
+            .await
+            .unwrap();
+        for attempt in 1..=3 {
+            let task = db
+                .claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.attempts, attempt);
+            db.finish_session_title(&task, None, Some("generation_failed"))
+                .await
+                .unwrap();
+            sqlx::query("UPDATE session_generated_titles SET next_attempt_at = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            db.session_title(tenant, key.key_id, session)
+                .await
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert!(
+            db.claim_session_title(Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
