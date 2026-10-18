@@ -698,6 +698,7 @@ pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> 
     }
     let url = Url::parse(value).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || (url.scheme() == "https" && matches!(url.host(), Some(Host::Domain(_))))
         || url.host_str().is_none()
         || url.port() == Some(0)
         || !url.username().is_empty()

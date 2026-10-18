@@ -68,6 +68,14 @@ fn changed_selection() -> AppError {
 }
 
 impl Database {
+    pub(crate) async fn installer_network_snapshot_exists(
+        &self,
+        operation: &str,
+        actor: &str,
+    ) -> Result<bool, AppError> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT operation_key FROM plugin_installer_network_snapshots WHERE operation_key=$1 AND actor=$2")
+            .bind(operation).bind(actor).fetch_optional(&self.pool).await?.is_some())
+    }
     pub(crate) async fn installer_network_preference(
         &self,
         actor: &str,
@@ -105,26 +113,38 @@ impl Database {
             crate::network::checked_installer_proxy_url(url)?;
             if username
                 .as_ref()
-                .is_some_and(|value| value.len() > 1024 || value.chars().any(char::is_control))
+                .is_some_and(|value| value.len() > 255 || value.chars().any(char::is_control))
                 || password
                     .as_ref()
-                    .is_some_and(|value| value.len() > 4096 || value.chars().any(char::is_control))
+                    .is_some_and(|value| value.len() > 255 || value.chars().any(char::is_control))
             {
                 return Err(AppError::BadRequest(
                     "installation proxy credentials are invalid".into(),
                 ));
             }
-            if password.is_none() {
-                if let InstallerNetworkInput::Custom {
+            if password.is_none()
+                && let InstallerNetworkInput::Custom {
                     url: old_url,
                     username: old_username,
                     password: old_password,
                 } = self.installer_network_preference(actor, key).await?
-                {
-                    if *url == old_url && *username == old_username {
-                        *password = old_password;
-                    }
-                }
+                && *url == old_url
+                && *username == old_username
+            {
+                *password = old_password;
+            }
+            // Clearing the password explicitly disables authentication.
+            if password.as_deref() == Some("") {
+                *password = None;
+                *username = None;
+            }
+            if username.as_deref() == Some("") {
+                *username = None;
+            }
+            if username.is_some() != password.is_some() {
+                return Err(AppError::BadRequest(
+                    "proxy username and password must be supplied together".into(),
+                ));
             }
         }
         Ok(input)
@@ -236,6 +256,7 @@ impl Database {
 
     /// The operation key is the opaque actor-bound installation idempotency
     /// hash, never a URL or credential. Omitted input replays the frozen choice.
+    #[cfg(test)]
     pub(crate) async fn freeze_installer_network(
         &self,
         operation_key: &str,

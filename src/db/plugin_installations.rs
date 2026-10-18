@@ -25,7 +25,10 @@ impl Database {
                 "installation idempotency key was used for another operation".into(),
             ));
         }
-        let record = installation_record(row)?;
+        let mut record = installation_record(row)?;
+        record.base_revision = self
+            .plugin_release_base_revision(&record.inventory_id)
+            .await?;
         if matches!(
             record.status.as_str(),
             "review" | "registered" | "installing"
@@ -232,7 +235,7 @@ impl Database {
         actor: &str,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered')")
+        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered') AND NOT EXISTS (SELECT 1 FROM application_plugin_release_resolutions r WHERE r.install_key_hash=application_plugin_installations.idempotency_hash AND r.base_revision <> COALESCE((SELECT revision FROM application_plugin_head WHERE scope='global'),0))")
             .bind(unix_millis()).bind(id).bind(digest).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(AppError::Conflict("installation review changed".into()));

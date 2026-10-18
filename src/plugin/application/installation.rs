@@ -407,19 +407,22 @@ impl ApplicationPlugins {
         let resolution = self
             .installation_release_policy(&key_hash, actor, &mut policy)
             .await?;
-        if let Some(resolution) = &resolution {
-            if input.packages != vec![resolution.release.descriptor.reference.clone()] {
-                return Err(AppError::Forbidden);
-            }
+        if let Some(resolution) = &resolution
+            && input.packages != vec![resolution.release.descriptor.reference.clone()]
+        {
+            return Err(AppError::Forbidden);
         }
-        if let Some(network_key) = &self.installer_network_key {
+        if let Some(network_key) = &self.installer_network_key
+            && self
+                .db
+                .installer_network_snapshot_exists(&key_hash, actor)
+                .await?
+        {
             let frozen = self
                 .db
                 .load_installer_network(&key_hash, actor, network_key)
                 .await?;
-            // Freeze credentials into private temporary files consumed by the
-            // isolated installer; only filenames enter argv. The directory is
-            // retained until the owned subprocess has completed or been killed.
+            // Credentials stay in RAM and use the installer's anonymous stdin.
             policy.network_snapshot_key = Some(key_hash.clone());
             apply_frozen_installer_network(&frozen, &mut policy)?;
         }
@@ -705,7 +708,11 @@ impl ApplicationPlugins {
         let resolution = self
             .installation_release_policy(&record.idempotency_hash, &record.actor, &mut policy)
             .await?;
-        if self.installer_network_key.is_some() {
+        if self
+            .db
+            .installer_network_snapshot_exists(&record.idempotency_hash, &record.actor)
+            .await?
+        {
             policy.network_snapshot_key = Some(record.idempotency_hash.clone());
         }
         // Recheck source policy on approval; installing before a trust-policy
@@ -721,10 +728,10 @@ impl ApplicationPlugins {
             .plugin_root
             .join(inventory_attempt_storage_id(&record.attempt_id)?);
         let runtime = self.review_runtime(root.clone()).await?;
-        if let Some(resolution) = &resolution {
-            if let Some(retained) = &resolution.retained {
-                super::retained_installation::verify_retained_grants(retained, &runtime)?;
-            }
+        if let Some(resolution) = &resolution
+            && let Some(retained) = &resolution.retained
+        {
+            super::retained_installation::verify_retained_grants(retained, &runtime)?;
         }
         let trust = trust_digest(&policy).await?;
         if review_digest(&runtime, &trust)? != digest {

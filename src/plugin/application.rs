@@ -442,12 +442,11 @@ impl ApplicationPlugins {
             .db
             .plugin_release_base_revision(&input.inventory_id)
             .await?
+            && input.expected_revision != base
         {
-            if input.expected_revision != base {
-                return Err(AppError::Conflict(
-                    "release installation was prepared against another runtime revision".into(),
-                ));
-            }
+            return Err(AppError::Conflict(
+                "release installation was prepared against another runtime revision".into(),
+            ));
         }
         let reason = if input.expected_revision == 0 {
             "initial"

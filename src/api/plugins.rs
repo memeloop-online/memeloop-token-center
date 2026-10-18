@@ -311,18 +311,24 @@ pub(super) async fn retry_application_plugin_installation(
         .map(|id| format!("service:{id}"))
         .unwrap_or_else(|| "bootstrap".into());
     let record = state.db.plugin_installation(&id).await?;
-    let frozen = state
+    if state
         .db
-        .load_installer_network(
-            &record.idempotency_hash,
-            &record.actor,
-            state.config.key_pepper.as_bytes(),
+        .installer_network_snapshot_exists(&record.idempotency_hash, &record.actor)
+        .await?
+    {
+        let frozen = state
+            .db
+            .load_installer_network(
+                &record.idempotency_hash,
+                &record.actor,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?;
+        super::plugin_installer_network::authorize_installer_network_snapshot(
+            &state, &headers, &frozen,
         )
         .await?;
-    super::plugin_installer_network::authorize_installer_network_snapshot(
-        &state, &headers, &frozen,
-    )
-    .await?;
+    }
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(authority.retry_installation(&id, &actor).await?),
