@@ -58,9 +58,7 @@ use buffered_upstream::{read_bounded_upstream, upstream_error_health_terminal};
 use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
-use lifecycle::{
-    finish_proxy_request_with_archive_fallback, finish_unavailable, run_bounded_proxy_lifecycle,
-};
+use lifecycle::{finish_unavailable, run_bounded_proxy_lifecycle};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
     CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
@@ -776,6 +774,7 @@ fn requested_service_tier(
 
 async fn execute_component_primary(
     mut request: BufferedRequest<'_>,
+    cancellation: &mut lifecycle::CancellationGuard,
     key: &AuthenticatedKey,
     price: &crate::model::ModelPrice,
     mut primary: PlannedProxyRoute,
@@ -908,6 +907,7 @@ async fn execute_component_primary(
         return finish_proxy_failure(&request, "provider_candidate_invalid").await;
     };
     active_route.release_request_buffers();
+    cancellation.prepare_dispatch(&request).await?;
     execute_component_provider(
         request,
         &active_route.route.driver,
@@ -993,13 +993,7 @@ async fn proxy_with_identity_and_conversation_spool(
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
     let mut cancellation = lifecycle::CancellationGuard::default();
-    let owner_loss = cancellation.owner_loss();
-    let result = tokio::select! {
-        biased;
-        _ = crate::proxy_lifecycle::wait_for_owner_loss(Some(owner_loss.clone())) => {
-            return Err(AppError::Internal);
-        }
-        result = Box::pin(proxy_with_cancellation_guard(
+    let result = Box::pin(proxy_with_cancellation_guard(
         state,
         headers,
         body,
@@ -1009,11 +1003,9 @@ async fn proxy_with_identity_and_conversation_spool(
         memory,
         conversation_spool,
         &mut cancellation,
-        )) => result,
-    };
-    if !*owner_loss.borrow() {
-        cancellation.disarm();
-    }
+    ))
+    .await;
+    cancellation.disarm();
     result
 }
 
@@ -1280,6 +1272,7 @@ async fn proxy_with_cancellation_guard(
     super::early_request::mark_admitted();
     cancellation.arm(
         state.db.clone(),
+        state.pending_terminals.clone(),
         diagnostic_context,
         key.tenant_id,
         started_request.reservation.clone(),
@@ -1411,6 +1404,7 @@ async fn proxy_with_cancellation_guard(
         drop(request_json);
         return execute_component_primary(
             buffered_request,
+            cancellation,
             &key,
             &price,
             primary,
@@ -1538,7 +1532,13 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let (result, rate_limit) = match attempt_budget
+        if let Err(error) = cancellation.prepare_dispatch(&buffered_request).await {
+            attempt.finish(error.diagnostic_category(), None, None);
+            let response = error.into_response();
+            cancellation.record_dispatch_failure(&response);
+            return Ok(response);
+        }
+        let result = attempt_budget
             .send(
                 send_proxy_route(
                     &state,
@@ -1552,8 +1552,11 @@ async fn proxy_with_cancellation_guard(
                 ),
                 active_route.wait_for_compaction,
             )
-            .await
-        {
+            .await;
+        if result.is_ok() {
+            cancellation.response_headers_received();
+        }
+        let (result, rate_limit) = match result {
             Ok(mut result)
                 if active_route.is_codex()
                     && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
@@ -2314,6 +2317,7 @@ struct ProxyConversation {
     projection_admission: std::sync::Mutex<ConversationProjectionAdmission>,
 }
 
+#[derive(Clone)]
 enum ConversationBody {
     InMemory(Bytes),
     Spool(std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>),
@@ -2366,6 +2370,20 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn take_for_terminal(&self) -> Option<Self> {
+        let admission = std::mem::replace(
+            &mut *self.projection_admission.lock().ok()?,
+            ConversationProjectionAdmission::Rejected,
+        );
+        Some(Self {
+            key: self.key.clone(),
+            request_body: self.request_body.clone(),
+            hints: self.hints.clone(),
+            client_name: self.client_name.clone(),
+            projection_admission: std::sync::Mutex::new(admission),
+        })
+    }
+
     fn is_source_backed(&self) -> bool {
         matches!(&self.request_body, ConversationBody::Spool(_))
     }
@@ -2456,6 +2474,33 @@ impl<'a> ProxyConversationProjection<'a> {
             hints: &self.conversation.hints,
             client_name: self.conversation.client_name.as_deref(),
             upstream_response_id,
+        }
+    }
+}
+
+async fn prepare_terminal_conversation(
+    conversation: Option<ProxyConversation>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    response_id: Option<String>,
+    request_id: Uuid,
+    deadline: tokio::time::Instant,
+) -> Option<crate::proxy_lifecycle::pending_terminal::PreparedConversation> {
+    let conversation = conversation?;
+    match conversation.project(&memory, deadline).await {
+        Ok(projection) => {
+            let conversation = crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+                projection.input(response_id.as_deref()),
+            );
+            Some(
+                crate::proxy_lifecycle::pending_terminal::PreparedConversation {
+                    conversation,
+                    retained: Box::new(projection._memory),
+                },
+            )
+        }
+        Err(error) => {
+            ProxyConversation::log_projection_error(request_id, &error);
+            None
         }
     }
 }
@@ -3033,7 +3078,7 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
     policy: BufferedFinishPolicy,
 ) -> Result<Response, AppError> {
     let deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
-    let finalization = Box::pin(finish_buffered_request_before_deadline(
+    finish_buffered_request_before_deadline(
         request,
         status,
         body,
@@ -3042,24 +3087,8 @@ async fn finish_buffered_request_with_upstream_attribution_and_response_object(
         error_code,
         policy,
         deadline,
-    ));
-    match run_bounded_proxy_lifecycle(deadline, finalization).await {
-        Ok(result) => result,
-        Err(_) => {
-            let _ = tokio::time::timeout(
-                MAX_PROXY_FINALIZATION_LIFETIME,
-                request.state.db.expire_proxy_lifecycle_deadline(
-                    request.request_id,
-                    request.tenant_id,
-                    &request.reservation,
-                    proxy_diagnostics::Context::for_request(request.request_id)
-                        .elapsed_millis_at(Instant::now()),
-                ),
-            )
-            .await;
-            Err(AppError::Internal)
-        }
-    }
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3118,20 +3147,10 @@ async fn finish_buffered_request_before_deadline(
         .conversation
         .as_ref()
         .and_then(|conversation| conversation.hints.session_id.clone());
-    let conversation = if let Some(conversation) = request.conversation.as_ref() {
-        match conversation
-            .project(&request.memory, projection_deadline)
-            .await
-        {
-            Ok(projection) => Some(projection),
-            Err(error) => {
-                ProxyConversation::log_projection_error(request_id, &error);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let conversation = request
+        .conversation
+        .as_ref()
+        .and_then(ProxyConversation::take_for_terminal);
     let terminal = FinishProxyRequest {
         terminal_cause,
         first_output_ms: None,
@@ -3151,18 +3170,27 @@ async fn finish_buffered_request_before_deadline(
         response_object: &stored_response,
         routing_session_id: routing_session_id.as_deref(),
         routing_terminal_observed_at: None,
-        conversation: conversation
-            .as_ref()
-            .map(|projection| projection.input(response_id.as_deref())),
+        conversation: None,
     };
-    let terminal_phase = proxy_diagnostics::Phase::new(
-        proxy_diagnostics::Context::for_request(request_id),
-        "buffered_billing_settlement",
+    let snapshot = crate::proxy_lifecycle::pending_terminal::Snapshot::capture(
+        terminal,
+        upstream_attribution,
+        response_id.clone(),
+        false,
+        "buffered_response_ready",
     );
-    let result =
-        finish_proxy_request_with_retry(&request.state.db, terminal, None, upstream_attribution)
-            .await;
-    if archive_response && result.is_ok() {
+    request.state.pending_terminals.submit_with_preparation(
+        snapshot,
+        (body.clone(), request.memory.clone(), _response_buffer),
+        prepare_terminal_conversation(
+            conversation,
+            request.memory.clone(),
+            response_id,
+            request_id,
+            projection_deadline,
+        ),
+    );
+    if archive_response {
         persistence::capture(
             request.state,
             crate::db::ArchiveSpoolIdentity {
@@ -3174,29 +3202,11 @@ async fn finish_buffered_request_before_deadline(
             body.clone(),
         );
     }
-    terminal_phase.finish(
-        if result.is_ok() {
-            "completed"
-        } else {
-            "failed"
-        },
-        Some(status.as_u16()),
-        Some(body.len()),
-    );
-    if result.is_err() {
-        tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
-    }
-    let result = result?;
-    if matches!(result, FinishProxyRequestResult::Finished { .. })
-        && let Some(identity) = request.session_preference
-    {
+    if let Some(identity) = request.session_preference {
         request
             .state
             .session_preferences
             .invalidate(request.state, identity);
-    }
-    if matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }) {
-        tracing::debug!(%request_id, stage = "terminal_replay", "proxy request already finalized");
     }
     Response::builder()
         .status(status)

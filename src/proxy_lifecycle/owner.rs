@@ -4,7 +4,6 @@ use tokio::sync::watch;
 
 pub(super) struct RequestOwnerLease {
     task: tokio::task::JoinHandle<()>,
-    lost: watch::Receiver<bool>,
 }
 
 impl RequestOwnerLease {
@@ -23,7 +22,6 @@ impl RequestOwnerLease {
             lost.send_replace(true);
             return Err(AppError::Internal);
         }
-        let receiver = lost.subscribe();
         let task = tokio::spawn(async move {
             renew_owner_until_lost(started, lost, || async {
                 if database.renew_proxy_request_owner(&identity).await? {
@@ -36,14 +34,7 @@ impl RequestOwnerLease {
             })
             .await;
         });
-        Ok(Self {
-            task,
-            lost: receiver,
-        })
-    }
-
-    pub(super) fn loss(&self) -> watch::Receiver<bool> {
-        self.lost.clone()
+        Ok(Self { task })
     }
 }
 
@@ -88,21 +79,6 @@ async fn renew_owner_until_lost<F, Renewal>(
     lost.send_replace(true);
 }
 
-pub(crate) async fn wait_for_owner_loss(receiver: Option<watch::Receiver<bool>>) {
-    let Some(mut receiver) = receiver else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    loop {
-        if *receiver.borrow_and_update() {
-            return;
-        }
-        if receiver.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,7 +111,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn terminal_cleanup_timeout_drops_the_owner_and_stops_renewal() {
-        let (lost, receiver) = watch::channel(false);
+        let (lost, _receiver) = watch::channel(false);
         let renewals = Arc::new(AtomicUsize::new(0));
         let observed = renewals.clone();
         let task = tokio::spawn(renew_owner_until_lost(
@@ -148,10 +124,7 @@ mod tests {
         ));
         let counter = Arc::new(ProxyLifecycleCounter::default());
         let mut permit = counter.start();
-        permit.owner = Some(RequestOwnerLease {
-            task,
-            lost: receiver,
-        });
+        permit.owner = Some(RequestOwnerLease { task });
         assert!(
             tokio::time::timeout(MAX_PROXY_FINALIZATION_LIFETIME, async move {
                 let _permit = permit;

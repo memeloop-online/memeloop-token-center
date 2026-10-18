@@ -119,7 +119,7 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
     .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let rows = sqlx::query(
-        "SELECT q.status_code, r.status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id",
+        "SELECT COALESCE(q.status_code, o.status_code) AS status_code, q.completed_at, q.status_code AS financial_status, r.status, r.actual_micros, p.state AS pending_state, p.unknown_reason, o.error_code AS operational_error, o.completed_at AS operational_completed, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id LEFT JOIN pending_proxy_settlements p ON p.request_id = q.id LEFT JOIN proxy_operational_terminals o ON o.request_id = q.id",
     )
     .fetch_all(&pool)
     .await
@@ -130,9 +130,29 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         let status = row.get::<i64, _>("status_code");
         assert!(status == 200 || status == 499, "terminal status {status}");
         cancelled += usize::from(status == 499);
-        assert_eq!(row.get::<String, _>("status"), "settled");
-        assert_eq!(row.get::<i64, _>("ledger_count"), 1);
-        assert_eq!(row.get::<i64, _>("event_count"), 1);
+        if status == 499 {
+            assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+            assert_eq!(row.get::<Option<i64>, _>("financial_status"), None);
+            assert_eq!(row.get::<String, _>("status"), "reserved");
+            assert_eq!(row.get::<Option<i64>, _>("actual_micros"), None);
+            assert_eq!(row.get::<String, _>("pending_state"), "pending");
+            assert_eq!(
+                row.get::<String, _>("unknown_reason"),
+                "authoritative_usage_unavailable"
+            );
+            assert_eq!(
+                row.get::<String, _>("operational_error"),
+                "client_cancelled"
+            );
+            assert!(row.get::<Option<i64>, _>("operational_completed").is_some());
+            assert_eq!(row.get::<i64, _>("ledger_count"), 0);
+            assert_eq!(row.get::<i64, _>("event_count"), 0);
+        } else {
+            assert!(row.get::<Option<i64>, _>("completed_at").is_some());
+            assert_eq!(row.get::<String, _>("status"), "settled");
+            assert_eq!(row.get::<i64, _>("ledger_count"), 1);
+            assert_eq!(row.get::<i64, _>("event_count"), 1);
+        }
     }
     assert_eq!(cancelled, 1);
     assert_eq!(fixture.state.proxy_lifecycles.active(), 0);

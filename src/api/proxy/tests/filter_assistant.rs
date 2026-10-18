@@ -185,6 +185,7 @@ async fn assistant_invokes_selected_route_and_bills_explicit_key_then_rejects_di
         serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
     assert_eq!(plan["model_route_id"], fixture.route_id.to_string());
     assert_eq!(plan["ast"], suggestion);
+    wait_for_request_settlement(&fixture, 1).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let recorded = sqlx::query("SELECT q.model_route_id, q.cost_micros, q.status_code, q.reservation_id, r.status AS reservation_status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.key_id = $1")
         .bind(fixture.key_id.to_string())

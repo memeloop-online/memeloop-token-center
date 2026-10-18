@@ -26,9 +26,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) delivered_billable: bool,
     pub(super) sse_summary: Option<ResponsesSseSummary>,
     pub(super) usage_capture: Vec<u8>,
-    pub(super) response_archive_attempt: Option<crate::proxy_lifecycle::ProxyArchiveAttempt>,
     pub(super) stored_response: String,
-    pub(super) gap_response: String,
     pub(super) routing_terminal_observed_at: Option<i64>,
     pub(super) routing_terminal_pre_published: bool,
 }
@@ -185,9 +183,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         delivered_billable,
         sse_summary,
         usage_capture,
-        response_archive_attempt,
         stored_response,
-        gap_response,
         routing_terminal_observed_at,
         routing_terminal_pre_published,
     } = input;
@@ -223,13 +219,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         })
         .and_then(|summary| summary.usage.clone());
     let mut usage = if error_code.is_some() {
-        if delivered_billable {
-            if let Some(usage) = terminal_usage {
-                usage_basis = crate::model::RequestUsageBasis::ProviderReported;
-                usage
-            } else {
-                TokenUsage::default()
-            }
+        if let Some(usage) = terminal_usage {
+            usage_basis = crate::model::RequestUsageBasis::ProviderReported;
+            usage
         } else {
             TokenUsage::default()
         }
@@ -321,17 +313,6 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let routing_session_id = conversation
         .as_ref()
         .and_then(|conversation| conversation.hints.session_id.clone());
-    let conversation = if let Some(conversation) = conversation.as_ref() {
-        match conversation.project(&memory, lifecycle_deadline).await {
-            Ok(projection) => Some(projection),
-            Err(error) => {
-                ProxyConversation::log_projection_error(request_id, &error);
-                None
-            }
-        }
-    } else {
-        None
-    };
     let (duration_ms, first_output_ms, generation_duration_ms) = output_timing
         .finish_with_duration(
             error_code.is_none()
@@ -342,8 +323,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             diagnostic_context,
             Instant::now(),
         );
-    let terminal_result = finish_proxy_request_with_archive_fallback(
-        &state.db,
+    let snapshot = crate::proxy_lifecycle::pending_terminal::Snapshot::capture(
         FinishProxyRequest {
             terminal_cause: if transport_error == Some("downstream_disconnected") {
                 Some(crate::model::RequestTerminalCause::ClientDisconnected)
@@ -370,37 +350,42 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
                 routing_session_id.as_deref()
             },
             routing_terminal_observed_at,
-            conversation: conversation
-                .as_ref()
-                .map(|projection| projection.input(response_id.as_deref())),
+            conversation: None,
         },
-        response_archive_attempt.as_ref(),
-        &gap_response,
-    )
-    .await;
-    let terminal_result_failed = terminal_result.is_err();
-    if terminal_result_failed {
-        // The commit can be durable even when its acknowledgement is lost.
-        // Preserve this request-scoped archive until its database owner is
-        // known; deleting it here could leave a committed row dangling.
-        tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
-    }
-    let attempt_terminal = match streaming_upstream_evidence(
-        terminal_result_failed,
-        transport_error,
-        sse_summary.as_ref(),
-        error_code,
-    ) {
-        StreamingUpstreamEvidence::Succeeded => UpstreamAttemptTerminal::Succeeded,
-        StreamingUpstreamEvidence::Inconclusive => UpstreamAttemptTerminal::Inconclusive,
-        StreamingUpstreamEvidence::InvalidResponse => UpstreamAttemptTerminal::invalid_response(),
-    };
+        ProxyRequestUpstreamAttribution::KeepSelected,
+        response_id.clone(),
+        delivered_billable,
+        if matches!(
+            transport_error,
+            Some("downstream_disconnected" | "downstream_backpressure")
+        ) {
+            "response_delivery"
+        } else {
+            "upstream_response_body"
+        },
+    );
+    state.pending_terminals.submit_with_preparation(
+        snapshot,
+        memory.clone(),
+        prepare_terminal_conversation(
+            conversation,
+            memory,
+            response_id,
+            request_id,
+            lifecycle_deadline,
+        ),
+    );
+    let attempt_terminal =
+        match streaming_upstream_evidence(false, transport_error, sse_summary.as_ref(), error_code)
+        {
+            StreamingUpstreamEvidence::Succeeded => UpstreamAttemptTerminal::Succeeded,
+            StreamingUpstreamEvidence::Inconclusive => UpstreamAttemptTerminal::Inconclusive,
+            StreamingUpstreamEvidence::InvalidResponse => {
+                UpstreamAttemptTerminal::invalid_response()
+            }
+        };
     upstream_attempt.complete(attempt_terminal).await;
-    codex_retry.complete(if terminal_result_failed {
-        CodexRetryTerminal::Failed
-    } else {
-        retry_terminal
-    });
+    codex_retry.complete(retry_terminal);
 }
 
 #[cfg(test)]

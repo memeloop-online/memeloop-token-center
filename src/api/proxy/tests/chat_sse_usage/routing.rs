@@ -32,21 +32,7 @@ async fn non_opt_in_chat_routes_transparently_forward_n() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("\"content\":\"ok\""));
     upstream.verify().await;
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 200, None).await;
 }
 
 #[tokio::test]

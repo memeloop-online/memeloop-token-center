@@ -340,7 +340,8 @@ async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
     assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
     assert!(!rendered.contains("private-secret"));
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_stream_read_error"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -445,7 +446,12 @@ async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(rendered.matches("event: response.failed").count(), 1);
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_response_terminal_conflict"),
+    )
+    .await;
     let rows = fixture
         .state
         .db
@@ -563,7 +569,8 @@ async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY).await;
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
     wait_for_account_failure_count(&fixture, 2).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let failure_kind: String = sqlx::query_scalar(

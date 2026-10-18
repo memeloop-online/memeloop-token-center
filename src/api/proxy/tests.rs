@@ -20,6 +20,7 @@ use crate::{
         CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
     },
     model::KeyPolicy,
+    proxy_lifecycle::response_archive_requires_cleanup,
 };
 
 mod anthropic_bridge;
@@ -53,6 +54,7 @@ mod lifecycle_duration;
 mod memory_admission;
 mod memory_metrics;
 mod passthrough_reservation;
+mod pending_delivery;
 mod persistence_isolation;
 mod phase_diagnostics;
 mod postgres_attempt_deadline;
@@ -1621,7 +1623,11 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
     pool.close().await;
-    assert_response_archives_omit(&fixture, "transient upstream detail must stay private").await;
+    sse_delivery::assert_unknown_response_archives_omit(
+        &fixture,
+        "transient upstream detail must stay private",
+    )
+    .await;
     upstream.verify().await;
 }
 
@@ -1699,7 +1705,11 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
             !String::from_utf8_lossy(&body).contains("must not trigger account replay"),
             "{label}"
         );
-        wait_for_request_settlement(&fixture, 1).await;
+        if should_failover {
+            wait_for_request_settlement(&fixture, 1).await;
+        } else {
+            cancellation::assert_single_unknown_receipt(&fixture, 502, Some("http_502")).await;
+        }
         let rows = fixture
             .state
             .db
@@ -1748,14 +1758,21 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
         .unwrap();
         assert_eq!(actual_failure, failure_kind, "{label}");
         pool.close().await;
-        assert_exactly_once_side_effects_for(
-            &fixture,
-            rows[0].request_id,
-            None,
-            expected_account,
-            expected_route,
-        )
-        .await;
+        if should_failover {
+            assert_exactly_once_side_effects_for(
+                &fixture,
+                rows[0].request_id,
+                None,
+                expected_account,
+                expected_route,
+            )
+            .await;
+        } else {
+            assert_eq!(rows[0].upstream_account_id, Some(expected_account));
+            assert_eq!(rows[0].route_id, Some(expected_route));
+            assert!(rows[0].usage.tokens.is_none());
+            assert_eq!(rows[0].billing.cost, None);
+        }
         let rendered_metrics = fixture
             .state
             .metrics
@@ -1839,7 +1856,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("upstream rejected the request"));
     assert!(!body.contains("private ordinary rejection"));
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
         .db
@@ -1848,8 +1865,8 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(400));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    assert_response_archives_omit(&fixture, "private ordinary rejection").await;
+    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
+        .await;
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
@@ -1904,7 +1921,12 @@ async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_incomplete_response"),
+    )
+    .await;
     let rows = fixture
         .state
         .db
@@ -1916,7 +1938,7 @@ async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
         rows[0].error_code.as_deref(),
         Some("upstream_incomplete_response")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_eq!(rows[0].billing.cost, None);
     let rendered_metrics = fixture
         .state
         .metrics
@@ -1993,7 +2015,13 @@ async fn codex_retry_buffered_completion_requires_a_single_matching_response_id(
         )
         .await;
         assert_eq!(response.status().is_success(), success, "{label}");
-        wait_for_request_settlement(&fixture, 1).await;
+        if success {
+            wait_for_request_settlement(&fixture, 1).await;
+        } else {
+            let receipt = cancellation::single_unknown_receipt(&fixture).await;
+            assert_eq!(receipt["status_code"], 502);
+            assert!(receipt["error_code"].as_str().is_some());
+        }
         let rows = fixture
             .state
             .db
@@ -2001,12 +2029,13 @@ async fn codex_retry_buffered_completion_requires_a_single_matching_response_id(
             .await
             .unwrap();
         assert_eq!(rows[0].status_code, Some(if success { 200 } else { 502 }));
-        assert_exactly_once_side_effects(
-            &fixture,
-            rows[0].request_id,
-            success.then_some("resp-buffered"),
-        )
-        .await;
+        if success {
+            assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-buffered"))
+                .await;
+        } else {
+            assert!(rows[0].usage.tokens.is_none());
+            assert_eq!(rows[0].billing.cost, None);
+        }
         let rendered_metrics = fixture
             .state
             .metrics
@@ -2077,7 +2106,7 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     assert!(body.contains("upstream rejected the request"));
     assert!(!body.contains("private transient rejection"));
     assert!(!body.contains("private ordinary rejection"));
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
         .db
@@ -2087,9 +2116,10 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(400));
     assert_eq!(rows[0].error_code.as_deref(), Some("http_400"));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    assert_response_archives_omit(&fixture, "private transient rejection").await;
-    assert_response_archives_omit(&fixture, "private ordinary rejection").await;
+    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private transient rejection")
+        .await;
+    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
+        .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health
@@ -2153,7 +2183,8 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("upstream request failed"));
     accepted.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_transport_request"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -2166,8 +2197,7 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         rows[0].error_code.as_deref(),
         Some("upstream_transport_request")
     );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_eq!(rows[0].billing.cost, None);
     let refs = fixture
         .state
         .db
@@ -2253,9 +2283,10 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
             .unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("upstream rejected the request"), "{label}");
+        cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
         if let Some(sensitive) = sensitive {
             assert!(!body.contains(sensitive), "{label}");
-            assert_response_archives_omit(&fixture, sensitive).await;
+            sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
         }
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
@@ -2370,7 +2401,7 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
         .unwrap();
         assert_eq!(health_rows, 0, "{label}");
         pool.close().await;
-        assert_response_archives_omit(&fixture, sensitive).await;
+        sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
         upstream.verify().await;
     }
 }
@@ -2797,8 +2828,23 @@ async fn gated_completed_sse_upstream_endpoint(
         stream.write_all(prefix.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
         terminal_rx.await.unwrap();
-        stream.write_all(terminal.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
+        let result: std::io::Result<()> = async {
+            stream.write_all(terminal.as_bytes()).await?;
+            stream.shutdown().await
+        }
+        .await;
+        if let Err(error) = result {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                ),
+                "unexpected upstream IO failure: {error}"
+            );
+        }
     });
     (endpoint, terminal_tx, accepted)
 }
@@ -2812,7 +2858,7 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
                 .list_requests(fixture.key_id, 10)
                 .await
                 .unwrap();
-            if rows.len() == expected && rows.iter().all(|row| row.status_code.is_some()) {
+            if rows.len() == expected && rows.iter().all(|row| row.completed_at.is_some()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -4626,7 +4672,8 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
 
     accepted.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_stream_read_error"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -4640,8 +4687,7 @@ async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
         rows[0].error_code.as_deref(),
         Some("upstream_stream_read_error")
     );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_eq!(rows[0].billing.cost, None);
 }
 
 #[tokio::test]
@@ -4670,7 +4716,9 @@ async fn codex_streaming_natural_failure_then_truncation_emits_one_error_termina
     assert!(!rendered.contains("provider-secret"));
 
     accepted.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
+    assert!(receipt["error_code"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -4701,7 +4749,9 @@ async fn codex_streaming_completed_then_truncation_replaces_held_success_with_er
     assert_eq!(rendered.matches("upstream request failed").count(), 1);
 
     accepted.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
+    assert!(receipt["error_code"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -5143,7 +5193,12 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     for secret in ["provider-secret", "secret-token"] {
         assert!(!rendered.contains(secret));
     }
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_failed_response"),
+    )
+    .await;
     let rows = fixture
         .state
         .db
@@ -5151,17 +5206,12 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
     assert_eq!(
         rows[0].error_code.as_deref(),
         Some("upstream_failed_response")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health
@@ -5176,20 +5226,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         "a valid provider failure is request-scoped evidence, not shared-account health evidence"
     );
     pool.close().await;
-    drain_completed_response_archive(&fixture).await;
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    let archived = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().unwrap())
-        .await
-        .unwrap();
-    let archived = String::from_utf8(archived.to_vec()).unwrap();
+    let archived = sse_delivery::pending_response_archive(&fixture, &receipt).await;
     assert_eq!(archived, rendered);
     for secret in ["provider-secret", "secret-token"] {
         assert!(!archived.contains(secret));
@@ -5246,7 +5283,8 @@ async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actua
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("billable output"));
     assert!(!rendered.contains("provider-secret"));
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -5254,13 +5292,8 @@ async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actua
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
 }
 
 #[tokio::test]
@@ -5353,7 +5386,7 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
 }
 
 #[tokio::test]
-async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
+async fn downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream() {
     let fixture = codex_route_fixture("downstream-disconnect-stalled-upstream").await;
     let prefix = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-cancelled\"}}\n\n",
@@ -5391,10 +5424,7 @@ async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
     .unwrap();
     drop(body);
 
-    // Do not release the upstream terminal gate until after durable
-    // settlement. This is the regression boundary: cancellation itself must
-    // wake the producer rather than waiting for another provider byte.
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     let rows = fixture
         .state
         .db
@@ -5403,13 +5433,8 @@ async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
         .unwrap();
     assert_eq!(rows[0].status_code, Some(499));
     assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
 
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -5439,7 +5464,7 @@ async fn downstream_disconnect_settles_without_waiting_for_stalled_upstream() {
 }
 
 #[tokio::test]
-async fn completed_provider_usage_is_not_charged_when_no_billable_frame_was_delivered() {
+async fn unobserved_provider_usage_is_unknown_when_cancelled_before_terminal_release() {
     let fixture = codex_route_fixture("completed-usage-no-delivery").await;
     let completed = completed_response_with_usage(3, 7);
     let terminal = format!(
@@ -5457,10 +5482,10 @@ async fn completed_provider_usage_is_not_charged_when_no_billable_frame_was_deli
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     drop(response);
+    cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     terminal_tx.send(()).unwrap();
     upstream.await.unwrap();
 
-    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
@@ -5469,13 +5494,8 @@ async fn completed_provider_usage_is_not_charged_when_no_billable_frame_was_deli
         .unwrap();
     assert_eq!(rows[0].status_code, Some(499));
     assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
 }
 
 fn completed_response_with_usage(input_tokens: i64, output_tokens: i64) -> Value {
@@ -5624,7 +5644,8 @@ async fn buffered_response_usage_rejects_usage_above_total_reservation() {
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
     let response = send_response_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -5636,11 +5657,11 @@ async fn buffered_response_usage_rejects_usage_above_total_reservation() {
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_usage")
     );
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert!(rows[0].usage.tokens.is_none());
 }
 
 #[tokio::test]
-async fn buffered_failed_response_is_redacted_and_settled_as_502() {
+async fn buffered_failed_response_is_redacted_and_records_502_with_unknown_finance() {
     let upstream = MockServer::start().await;
     let mut failed = completed_response_with_usage(309, 7);
     failed["status"] = json!("failed");
@@ -5667,7 +5688,8 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
     assert!(rendered.contains("upstream request failed"));
     assert!(!rendered.contains("provider-secret"));
     assert!(!rendered.contains("secret-token"));
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -5679,7 +5701,7 @@ async fn buffered_failed_response_is_redacted_and_settled_as_502() {
         rows[0].error_code.as_deref(),
         Some("upstream_failed_response")
     );
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert!(rows[0].usage.tokens.is_none());
 }
 
 #[tokio::test]
@@ -5842,7 +5864,7 @@ async fn buffered_chat_usage_diagnostics_preserve_failure_accounting_and_error_p
             body.as_ref(),
             br#"{"error":{"message":"upstream request failed","type":"upstream_error"}}"#
         );
-        wait_for_request_settlement(&fixture, 1).await;
+        cancellation::assert_single_unknown_receipt(&fixture, 502, Some(expected_error)).await;
         let rows = fixture
             .state
             .db
@@ -5852,22 +5874,9 @@ async fn buffered_chat_usage_diagnostics_preserve_failure_accounting_and_error_p
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request_id, request_id);
         assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
-        assert_eq!(
-            rows[0].usage_basis,
-            Some(crate::model::RequestUsageBasis::NotObserved)
-        );
-        assert_eq!(
-            (
-                rows[0].input_tokens,
-                rows[0].output_tokens,
-                rows[0].cached_input_tokens,
-                rows[0].cache_write_tokens
-            ),
-            (0, 0, 0, 0)
-        );
-        assert_eq!(rows[0].cost, "0");
-        assert_exactly_once_side_effects(&fixture, request_id, None).await;
-        assert_response_archives_omit(&fixture, "private").await;
+        assert!(rows[0].usage.tokens.is_none());
+        assert_eq!(rows[0].billing.cost, None);
+        sse_delivery::assert_unknown_response_archives_omit(&fixture, "private").await;
         upstream.verify().await;
     }
 }
@@ -5935,7 +5944,12 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             assert!(rendered.contains("upstream request failed"));
             assert!(!rendered.contains("provider-secret"));
         }
-        wait_for_request_settlement(&fixture, 1).await;
+        if expected_status == 200 {
+            wait_for_request_settlement(&fixture, 1).await;
+        } else {
+            cancellation::assert_single_unknown_receipt(&fixture, expected_status, expected_error)
+                .await;
+        }
         let rows = fixture
             .state
             .db
@@ -5953,12 +5967,8 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             )
             .await;
         } else {
-            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-            assert_eq!(
-                rows[0].usage_basis,
-                Some(crate::model::RequestUsageBasis::NotObserved)
-            );
-            assert_eq!(rows[0].cost, "0");
+            assert!(rows[0].usage.tokens.is_none());
+            assert_eq!(rows[0].billing.cost, None);
         }
     }
 }

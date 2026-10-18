@@ -196,6 +196,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .await
                 .unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
+            wait_for_request_settlement(&fixture, 1).await;
             let records = fixture
                 .state
                 .db

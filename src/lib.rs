@@ -98,6 +98,7 @@ pub struct AppState {
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
     pub(crate) early_requests: Arc<early_request::Journal>,
+    pub(crate) pending_terminals: Arc<proxy_lifecycle::pending_terminal::Journal>,
     /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
@@ -176,6 +177,16 @@ impl AppState {
         let early_requests = early_request::Journal::new(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("early-terminals")
+                .join(
+                    blake3::hash(config.database_url.as_bytes())
+                        .to_hex()
+                        .as_str(),
+                ),
+            db.independent_persistence_pool(),
+        );
+        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::new(
+            std::path::Path::new(&config.responses_request_spool_path)
+                .join("pending-terminals-v1")
                 .join(
                     blake3::hash(config.database_url.as_bytes())
                         .to_hex()
@@ -262,6 +273,7 @@ impl AppState {
             )),
             responses_request_spool,
             early_requests,
+            pending_terminals,
             // Cloned request/router states share the same bounded synchronous
             // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.

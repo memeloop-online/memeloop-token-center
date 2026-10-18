@@ -309,7 +309,7 @@ async fn ordinary_openai_wire_omits_unsolicited_limits_and_settles_above_4096_on
 }
 
 #[tokio::test]
-async fn ordinary_missing_metadata_cancellation_before_headers_releases_its_hold() {
+async fn ordinary_missing_metadata_cancellation_before_headers_preserves_unknown_hold() {
     for stream in [false, true] {
         let upstream = MockServer::start().await;
         let fixture = response_usage_fixture_with_uri_contract_and_driver(
@@ -354,8 +354,15 @@ async fn ordinary_missing_metadata_cancellation_before_headers_releases_its_hold
                 .get("output_token_limit"),
             Some(&Value::Null)
         );
+        let held_account: (i64, i64) = sqlx::query_as(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+        )
+        .bind(fixture.credit_account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         drop(request);
-        wait_for_request_settlement(&fixture, 1).await;
+        cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
         let rows = fixture
             .state
             .db
@@ -364,12 +371,12 @@ async fn ordinary_missing_metadata_cancellation_before_headers_releases_its_hold
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status_code, Some(499));
-        assert_eq!(rows[0].error_code.as_deref(), Some("request_cancelled"));
-        assert_eq!(rows[0].output_tokens, 0);
-        assert_eq!(rows[0].cost, "0");
+        assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+        assert!(rows[0].usage.tokens.is_none());
+        assert_eq!(rows[0].billing.cost, None);
         let terminal: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id), (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') FROM request_records q WHERE q.id = $1")
             .bind(rows[0].request_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(terminal, (1, 1));
+        assert_eq!(terminal, (0, 0));
         let account: (i64, i64) = sqlx::query_as(
             "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
         )
@@ -377,7 +384,9 @@ async fn ordinary_missing_metadata_cancellation_before_headers_releases_its_hold
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(account, (1_000_000, 0));
+        assert_eq!(account, held_account);
+        assert_eq!(account.0, 1_000_000);
+        assert!(account.1 > 0);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
         pool.close().await;
     }
@@ -418,7 +427,16 @@ async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constr
             let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
-            wait_for_request_settlement(&fixture, 1).await;
+            if reported == 17 {
+                wait_for_request_settlement(&fixture, 1).await;
+            } else {
+                cancellation::assert_single_unknown_receipt(
+                    &fixture,
+                    502,
+                    Some("upstream_invalid_usage"),
+                )
+                .await;
+            }
             let rows = fixture
                 .state
                 .db
@@ -426,7 +444,12 @@ async fn ordinary_openai_preserves_each_explicit_wire_limit_and_financial_constr
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].output_tokens, if reported == 17 { 17 } else { 0 });
+            if reported == 17 {
+                assert_eq!(rows[0].output_tokens, 17);
+            } else {
+                assert!(rows[0].usage.tokens.is_none());
+                assert_eq!(rows[0].billing.cost, None);
+            }
             assert_eq!(
                 rows[0].error_code.as_deref(),
                 if reported == 17 {
@@ -596,7 +619,8 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
     let _body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -608,7 +632,7 @@ async fn passthrough_explicit_limit_remains_a_settlement_constraint() {
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_usage")
     );
-    assert_eq!(rows[0].output_tokens, 0);
+    assert!(rows[0].usage.tokens.is_none());
     upstream.verify().await;
 }
 
