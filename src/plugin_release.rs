@@ -12,6 +12,8 @@ use crate::{error::AppError, plugin::CosignKeylessIdentity};
 const MAX_RELEASE_BYTES: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 4;
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
+static RELEASE_FETCH_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +151,9 @@ pub async fn resolve_github_release(
     proxy: Option<ReleaseProxy<'_>>,
 ) -> Result<ResolvedPluginRelease, AppError> {
     let original = validate_github_release_url(value)?;
+    let _permit = RELEASE_FETCH_PERMITS
+        .try_acquire()
+        .map_err(|_| AppError::Overloaded)?;
     download_release(original, |url| request_release(url, proxy.as_ref())).await
 }
 
