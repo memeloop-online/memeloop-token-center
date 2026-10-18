@@ -149,61 +149,79 @@ pub async fn resolve_github_release(
     proxy: Option<ReleaseProxy<'_>>,
 ) -> Result<ResolvedPluginRelease, AppError> {
     let original = validate_github_release_url(value)?;
+    download_release(original, |url| request_release(url, proxy.as_ref())).await
+}
+
+async fn request_release(
+    current: Url,
+    proxy: Option<&ReleaseProxy<'_>>,
+) -> Result<reqwest::Response, AppError> {
+    let host = current.host_str().ok_or_else(invalid_release)?;
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|_| invalid_release())?
+        .take(33)
+        .collect();
+    if addresses.is_empty()
+        || addresses.len() > 32
+        || addresses
+            .iter()
+            .any(|address| !crate::network::is_public_ip(address.ip()))
+    {
+        return Err(invalid_release());
+    }
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(RELEASE_TIMEOUT);
+    if let Some(proxy) = proxy {
+        crate::network::checked_installer_proxy_url(proxy.url).map_err(|_| invalid_release())?;
+        let mut endpoint = Url::parse(proxy.url).map_err(|_| invalid_release())?;
+        let address = proxy.addresses.first().ok_or_else(invalid_release)?;
+        endpoint
+            .set_ip_host(address.ip())
+            .map_err(|_| invalid_release())?;
+        let mut configured =
+            reqwest::Proxy::all(endpoint.as_str()).map_err(|_| invalid_release())?;
+        match (proxy.username, proxy.password) {
+            (Some(username), Some(password)) => {
+                configured = configured.basic_auth(username, password)
+            }
+            (None, None) => (),
+            _ => return Err(invalid_release()),
+        }
+        builder = builder.proxy(configured);
+    } else {
+        // Pin the address checked above; TLS still authenticates host.
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    let client = builder.build().map_err(|_| invalid_release())?;
+    let response = client
+        .get(current)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/octet-stream, application/json",
+        )
+        .header(reqwest::header::USER_AGENT, "memeloop-plugin-installer")
+        .send()
+        .await
+        .map_err(|_| invalid_release())?;
+    Ok(response)
+}
+
+async fn download_release<F, Fut>(
+    original: Url,
+    mut request: F,
+) -> Result<ResolvedPluginRelease, AppError>
+where
+    F: FnMut(Url) -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, AppError>>,
+{
     tokio::time::timeout(RELEASE_TIMEOUT, async {
         let mut current = original.clone();
         for hop in 0..=MAX_REDIRECTS {
-            let host = current.host_str().ok_or_else(invalid_release)?;
-            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))
-                .await
-                .map_err(|_| invalid_release())?
-                .take(33)
-                .collect();
-            if addresses.is_empty()
-                || addresses.len() > 32
-                || addresses
-                    .iter()
-                    .any(|address| !crate::network::is_public_ip(address.ip()))
-            {
-                return Err(invalid_release());
-            }
-            let mut builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(RELEASE_TIMEOUT);
-            if let Some(proxy) = &proxy {
-                crate::network::checked_installer_proxy_url(proxy.url)
-                    .map_err(|_| invalid_release())?;
-                let mut endpoint = Url::parse(proxy.url).map_err(|_| invalid_release())?;
-                let address = proxy.addresses.first().ok_or_else(invalid_release)?;
-                endpoint
-                    .set_ip_host(address.ip())
-                    .map_err(|_| invalid_release())?;
-                let mut configured =
-                    reqwest::Proxy::all(endpoint.as_str()).map_err(|_| invalid_release())?;
-                match (proxy.username, proxy.password) {
-                    (Some(username), Some(password)) => {
-                        configured = configured.basic_auth(username, password)
-                    }
-                    (None, None) => (),
-                    _ => return Err(invalid_release()),
-                }
-                builder = builder.proxy(configured);
-            } else {
-                // Pin the address checked above; TLS still authenticates host.
-                builder = builder.resolve_to_addrs(host, &addresses);
-            }
-            let client = builder.build().map_err(|_| invalid_release())?;
-            let mut response = client
-                .get(current.clone())
-                .header(
-                    reqwest::header::ACCEPT,
-                    "application/octet-stream, application/json",
-                )
-                .header(reqwest::header::USER_AGENT, "memeloop-plugin-installer")
-                .send()
-                .await
-                .map_err(|_| invalid_release())?;
+            let mut response = request(current.clone()).await?;
             if response.status().is_redirection() {
                 if hop == MAX_REDIRECTS {
                     return Err(invalid_release());
@@ -245,6 +263,110 @@ pub async fn resolve_github_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn github_release_http_fixture_follows_only_approved_redirects_and_bounds_body() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let original = validate_github_release_url(
+            "https://github.com/owner/repo/releases/download/v1/release.json",
+        )
+        .unwrap();
+        let descriptor = serde_json::json!({"format_version":1,
+            "reference":format!("ghcr.io/owner/repo@sha256:{}","a".repeat(64)),
+            "signer":{"issuer":"https://token.actions.githubusercontent.com",
+                "identity":"https://github.com/owner/repo/.github/workflows/publish.yml@refs/tags/v1"}});
+        Mock::given(method("GET"))
+            .and(path(original.path()))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                "https://release-assets.githubusercontent.com/asset",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/asset"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&descriptor))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Only the transport is replaced. URL/redirect policy, response status,
+        // bounded body consumption and descriptor parsing are production code.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let result = download_release(original.clone(), |url| {
+            let target = format!("{}{}", server.uri(), url.path());
+            let client = client.clone();
+            async move {
+                client
+                    .get(target)
+                    .send()
+                    .await
+                    .map_err(|_| invalid_release())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.descriptor.reference, descriptor["reference"]);
+        assert_eq!(result.release_url, original.as_str());
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "https://169.254.169.254/latest/meta-data/"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            download_release(original.clone(), |_| {
+                let target = server.uri();
+                let client = client.clone();
+                async move {
+                    client
+                        .get(target)
+                        .send()
+                        .await
+                        .map_err(|_| invalid_release())
+                }
+            })
+            .await
+            .is_err()
+        );
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_RELEASE_BYTES + 1]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            download_release(original, |_| {
+                let target = server.uri();
+                let client = client.clone();
+                async move {
+                    client
+                        .get(target)
+                        .send()
+                        .await
+                        .map_err(|_| invalid_release())
+                }
+            })
+            .await
+            .is_err()
+        );
+        server.verify().await;
+    }
 
     #[test]
     fn release_assets_are_exact_https_github_paths() {
