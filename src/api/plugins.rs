@@ -150,20 +150,52 @@ pub(super) async fn install_application_plugin(
         "actor":actor,"key":runtime_operation_key(&headers)?
     }))?;
     if let Some(input) = body.network.as_ref() {
-        super::plugin_installer_network::authorize_installer_network_input(&state, &headers, input).await?;
+        super::plugin_installer_network::authorize_installer_network_input(&state, &headers, input)
+            .await?;
     }
     let frozen = match (&body.release_resolution_id, &body.release_descriptor_sha256) {
         (Some(id), Some(digest)) => {
             if body.network.is_some() {
-                return Err(AppError::BadRequest("release installation uses the network frozen during resolution".into()));
+                return Err(AppError::BadRequest(
+                    "release installation uses the network frozen during resolution".into(),
+                ));
             }
-            let resolution = state.db.plugin_release_resolution_for_confirmation(id, digest, &actor).await?;
-            state.db.freeze_installer_network_from(&operation_key, &actor, &resolution.operation_key, state.config.key_pepper.as_bytes()).await?
+            let resolution = state
+                .db
+                .plugin_release_resolution_for_confirmation(id, digest, &actor)
+                .await?;
+            state
+                .db
+                .freeze_installer_network_from(
+                    &operation_key,
+                    &actor,
+                    &resolution.operation_key,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?
         }
-        (None, None) => state.db.freeze_installer_network(&operation_key, &actor, body.network.take(), state.config.key_pepper.as_bytes()).await?,
-        _ => return Err(AppError::BadRequest("release confirmation requires its exact descriptor digest".into())),
+        (None, None) => {
+            state
+                .db
+                .freeze_installer_network_with_default(
+                    &operation_key,
+                    &actor,
+                    body.network.take(),
+                    authority.deployment_installer_network().await?,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "release confirmation requires its exact descriptor digest".into(),
+            ));
+        }
     };
-    super::plugin_installer_network::authorize_installer_network_snapshot(&state, &headers, &frozen).await?;
+    super::plugin_installer_network::authorize_installer_network_snapshot(
+        &state, &headers, &frozen,
+    )
+    .await?;
     let record = authority
         .install(body, runtime_operation_key(&headers)?, &actor)
         .await?;
@@ -185,28 +217,65 @@ pub(super) async fn resolve_application_plugin_release(
     Json(body): Json<ResolvePluginReleaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let authority = application_authority(&state, &headers).await?;
-    if !authority.installation_enabled() { return Err(AppError::NotFound); }
+    if !authority.installation_enabled() {
+        return Err(AppError::NotFound);
+    }
     crate::plugin_release::validate_github_release_url(&body.url)?;
     let service = require_service(&headers, &state, "plugins:write").await?;
-    let actor = service.service_id.map(|id| format!("service:{id}"))
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
         .unwrap_or_else(|| "bootstrap".into());
     let operation_key = plugin_configuration_schema_digest(&serde_json::json!({
         "actor":actor,"release_resolution_key":runtime_operation_key(&headers)?
     }))?;
     if let Some(input) = body.network.as_ref() {
-        super::plugin_installer_network::authorize_installer_network_input(&state, &headers, input).await?;
+        super::plugin_installer_network::authorize_installer_network_input(&state, &headers, input)
+            .await?;
     }
-    let frozen = state.db.freeze_installer_network(&operation_key, &actor, body.network, state.config.key_pepper.as_bytes()).await?;
-    super::plugin_installer_network::authorize_installer_network_snapshot(&state, &headers, &frozen).await?;
-    if let Some(replay) = state.db.replay_plugin_release_resolution(&operation_key, &actor, &body.url).await? {
+    let frozen = state
+        .db
+        .freeze_installer_network_with_default(
+            &operation_key,
+            &actor,
+            body.network,
+            authority.deployment_installer_network().await?,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    super::plugin_installer_network::authorize_installer_network_snapshot(
+        &state, &headers, &frozen,
+    )
+    .await?;
+    if let Some(replay) = state
+        .db
+        .replay_plugin_release_resolution(&operation_key, &actor, &body.url)
+        .await?
+    {
         return Ok(Json(replay));
     }
-    let proxy = frozen.proxy_url.as_deref().map(|url| crate::plugin_release::ReleaseProxy {
-        url, username: frozen.username.as_deref(), password: frozen.password.as_deref(),
-        host: frozen.proxy_host.as_deref(), addresses: &frozen.proxy_addresses,
-    });
+    let proxy = frozen
+        .proxy_url
+        .as_deref()
+        .map(|url| crate::plugin_release::ReleaseProxy {
+            url,
+            username: frozen.username.as_deref(),
+            password: frozen.password.as_deref(),
+            host: frozen.proxy_host.as_deref(),
+            addresses: &frozen.proxy_addresses,
+        });
     let release = crate::plugin_release::resolve_github_release(&body.url, proxy).await?;
-    let resolution = state.db.save_plugin_release_resolution(&operation_key, &actor, &release).await?;
+    let (base_revision, retained) = authority.installation_base_snapshot().await?;
+    let resolution = state
+        .db
+        .save_plugin_release_resolution(
+            &operation_key,
+            &actor,
+            &release,
+            base_revision,
+            retained.as_ref(),
+        )
+        .await?;
     Ok(Json(resolution))
 }
 
@@ -241,6 +310,19 @@ pub(super) async fn retry_application_plugin_installation(
         .service_id
         .map(|id| format!("service:{id}"))
         .unwrap_or_else(|| "bootstrap".into());
+    let record = state.db.plugin_installation(&id).await?;
+    let frozen = state
+        .db
+        .load_installer_network(
+            &record.idempotency_hash,
+            &record.actor,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    super::plugin_installer_network::authorize_installer_network_snapshot(
+        &state, &headers, &frozen,
+    )
+    .await?;
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(authority.retry_installation(&id, &actor).await?),

@@ -23,7 +23,6 @@ pub mod native_cli;
 pub mod network;
 pub mod oauth;
 pub mod plugin;
-pub mod plugin_release;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
 #[cfg(any(
@@ -31,6 +30,7 @@ pub mod plugin_distribution;
     feature = "plugin-distribution"
 ))]
 mod plugin_publication;
+pub mod plugin_release;
 #[cfg(any(
     feature = "experimental-plugin-revisions",
     feature = "plugin-distribution"

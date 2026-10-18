@@ -173,7 +173,7 @@ pub async fn resolve_github_release(
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(RELEASE_TIMEOUT);
             if let Some(proxy) = &proxy {
-                crate::network::validate_install_egress_proxy(proxy.url)
+                crate::network::checked_installer_proxy_url(proxy.url)
                     .map_err(|_| invalid_release())?;
                 let mut configured =
                     reqwest::Proxy::all(proxy.url).map_err(|_| invalid_release())?;
@@ -186,7 +186,9 @@ pub async fn resolve_github_release(
                 }
                 builder = builder.proxy(configured);
                 if let Some(host) = proxy.host {
-                    if proxy.addresses.is_empty() { return Err(invalid_release()); }
+                    if proxy.addresses.is_empty() {
+                        return Err(invalid_release());
+                    }
                     builder = builder.resolve_to_addrs(host, proxy.addresses);
                 }
             } else {

@@ -131,16 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credentials = credentials(&arguments)?;
     let egress_proxy_credentials = if arguments.egress_proxy_credentials_stdin {
         Some(InstallProxyCredentials::from_stdin()?)
-    } else { match (
-        &arguments.egress_proxy_username_file,
-        &arguments.egress_proxy_password_file,
-    ) {
-        (Some(username), Some(password)) => {
-            Some(InstallProxyCredentials::from_files(username, password)?)
+    } else {
+        match (
+            &arguments.egress_proxy_username_file,
+            &arguments.egress_proxy_password_file,
+        ) {
+            (Some(username), Some(password)) => {
+                Some(InstallProxyCredentials::from_files(username, password)?)
+            }
+            (None, None) => None,
+            _ => return Err("proxy credential file pair required".into()),
         }
-        (None, None) => None,
-        _ => return Err("proxy credential file pair required".into()),
-    }};
+    };
     let plugin_root = match &arguments.publication_attempt_id {
         Some(attempt_id) => {
             let attempt = uuid::Uuid::parse_str(attempt_id)?;
