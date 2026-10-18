@@ -268,7 +268,7 @@
    sits on the same baseline. */
 .typed-filter-row .shared-model-picker > label { margin-bottom: 5px; }
 .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { box-sizing: border-box; height: 32px; min-height: 32px; padding: 5px 10px; }
-.typed-filter-dialog > .panel-title { align-items: flex-start; flex-direction: row; gap: 12px; }
+.typed-filter-dialog > .panel-title { align-items: flex-start; flex-direction: row; flex-wrap: nowrap; gap: 12px; }
 .typed-filter-dialog > .panel-title > div { min-width: 0; }
 .typed-filter-dialog > .panel-title > button { flex-shrink: 0; min-width: 54px; }
 /* Full-width row hint sits below the controls so help text never shifts the
@@ -389,7 +389,8 @@
   .typed-filter-value { grid-column: span 2; }
   .typed-filter-row-actions { grid-column: span 2; justify-content: start; }
   .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
-  .typed-filter-row .fui-Select { min-height: 44px; }
+  .typed-filter-row .fui-Select,
+  .typed-filter-row .fui-Select > select { min-height: 44px; }
 }
 
 .provider-list .panel-title,
