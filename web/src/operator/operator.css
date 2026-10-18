@@ -388,7 +388,6 @@
   .typed-filter-row:has(.typed-filter-value + .typed-filter-value) { grid-template-columns: 1fr 1fr; }
   .typed-filter-value { grid-column: span 2; }
   .typed-filter-row-actions { grid-column: span 2; justify-content: start; }
-  .typed-filter-row-actions > button { min-height: 44px; min-width: 44px; width: 44px; }
   .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
   .typed-filter-row .fui-Select { min-height: 44px; }
 }
