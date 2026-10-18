@@ -133,8 +133,9 @@ async fn contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(remembered.view()["has_password"], true);
-    if let InstallerNetworkInput::Custom { url, .. } = &mut omitted {
+    if let InstallerNetworkInput::Custom { url, username, .. } = &mut omitted {
         *url = "https://1.1.1.1:443".into();
+        *username = None;
     }
     database
         .put_installer_network_preference(&actor, omitted, KEY)

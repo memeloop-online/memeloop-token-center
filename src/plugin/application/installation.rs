@@ -2218,6 +2218,83 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
     }
 
     #[tokio::test]
+    async fn browser_installer_network_and_release_errors_are_private_and_redacted() {
+        let (_directory, state, _, _) = fixture().await;
+        let token = state.config.service_token.clone();
+        for (path, body) in [
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://credential-user:credential-secret@127.0.0.1:3128"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"https://proxy.example.com","username":"credential-user","password":"credential-secret"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://8.8.8.8:3128","username":"credential-user"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/release-resolutions",
+                json!({"url":"https://127.0.0.1/plugin.json","network":{"mode":"custom","url":"http://8.8.8.8:3128","password":"credential-secret"}}),
+            ),
+        ] {
+            let method = if path.ends_with("installer-network") {
+                "PUT"
+            } else {
+                "POST"
+            };
+            let response = crate::api::router_for_role(state.clone(), RuntimeRole::Control)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", "browser-invalid")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let rendered = std::str::from_utf8(&bytes).unwrap();
+            assert!(!rendered.contains("credential-secret"));
+            assert!(!rendered.contains("credential-user"));
+            assert!(!rendered.contains("proxy.example.com"));
+        }
+        let (status, view) = call(
+            &state,
+            "PUT",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({"mode":"direct"}),
+            "direct",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
+        let (status, view) = call(
+            &state,
+            "GET",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({}),
+            "remembered",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
+    }
+
+    #[tokio::test]
     async fn review_approval_publish_rollback_and_audit_are_real_control_operations() {
         let (_directory, state, record, digest) = fixture().await;
         let token = &state.config.service_token;

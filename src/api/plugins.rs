@@ -339,6 +339,9 @@ fn runtime_operation_key(headers: &HeaderMap) -> Result<&str, AppError> {
     headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 200 && !value.chars().any(char::is_control)
+        })
         .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))
 }
 
