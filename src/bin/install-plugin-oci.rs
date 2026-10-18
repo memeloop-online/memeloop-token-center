@@ -16,6 +16,9 @@ const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 struct Arguments {
     #[arg(long)]
     egress_proxy: Option<String>,
+    /// Internal bounded anonymous-pipe credentials, never argv or disk.
+    #[arg(long, requires = "egress_proxy", conflicts_with_all = ["egress_proxy_username_file", "egress_proxy_password_file"])]
+    egress_proxy_credentials_stdin: bool,
     #[arg(long, requires_all = ["egress_proxy", "egress_proxy_password_file"])]
     egress_proxy_username_file: Option<PathBuf>,
     #[arg(long, requires_all = ["egress_proxy", "egress_proxy_username_file"])]
@@ -126,7 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let arguments = Arguments::parse();
     let credentials = credentials(&arguments)?;
-    let egress_proxy_credentials = match (
+    let egress_proxy_credentials = if arguments.egress_proxy_credentials_stdin {
+        Some(InstallProxyCredentials::from_stdin()?)
+    } else { match (
         &arguments.egress_proxy_username_file,
         &arguments.egress_proxy_password_file,
     ) {
@@ -135,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         (None, None) => None,
         _ => return Err("proxy credential file pair required".into()),
-    };
+    }};
     let plugin_root = match &arguments.publication_attempt_id {
         Some(attempt_id) => {
             let attempt = uuid::Uuid::parse_str(attempt_id)?;

@@ -128,6 +128,7 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
                     packages: vec![],
                     release_resolution_id: None,
                     release_descriptor_sha256: None,
+                    network: None,
                 },
                 "ordinary-empty-install",
                 "bootstrap",

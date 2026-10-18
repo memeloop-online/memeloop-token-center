@@ -1,6 +1,14 @@
 use super::*;
 use crate::db::plugin_installer_network::{FrozenInstallerNetwork, InstallerNetworkInput};
 
+pub(super) async fn installer_network_response(mut response: Response) -> Response {
+    if matches!(response.status(), StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST) {
+        response = AppError::BadRequest("invalid plugin installation request".into()).into_response();
+    }
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct InstallerGroupsQuery {

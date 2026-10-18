@@ -22,6 +22,10 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallPolicy {
+    #[serde(skip)]
+    network_snapshot_key: Option<String>,
+    #[serde(skip)]
+    ephemeral_proxy_credentials: Option<(String, String)>,
     #[serde(default)]
     egress_proxy: Option<String>,
     #[serde(default)]
@@ -59,6 +63,8 @@ pub struct InstallPluginRequest {
     pub release_resolution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_descriptor_sha256: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub(crate) network: Option<crate::db::plugin_installer_network::InstallerNetworkInput>,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +224,7 @@ impl ApplicationPlugins {
                     packages: record.packages,
                     release_resolution_id: None,
                     release_descriptor_sha256: None,
+                    network: None,
                 },
                 "retry",
                 &record.actor,
@@ -304,6 +311,14 @@ impl ApplicationPlugins {
             if input.packages != vec![resolution.release.descriptor.reference.clone()] {
                 return Err(AppError::Forbidden);
             }
+        }
+        if let Some(network_key) = &self.installer_network_key {
+            let frozen = self.db.load_installer_network(&key_hash, actor, network_key).await?;
+            // Freeze credentials into private temporary files consumed by the
+            // isolated installer; only filenames enter argv. The directory is
+            // retained until the owned subprocess has completed or been killed.
+            policy.network_snapshot_key = Some(key_hash.clone());
+            apply_frozen_installer_network(&frozen, &mut policy)?;
         }
         self.reclaim_unreferenced_installation_attempts().await?;
         if self
@@ -430,7 +445,7 @@ impl ApplicationPlugins {
                     .arg(&policy.plugin_root)
                     .arg("--publication-attempt-id")
                     .arg(attempt_id)
-                    .stdin(Stdio::null())
+                    .stdin(if policy.ephemeral_proxy_credentials.is_some() { Stdio::piped() } else { Stdio::null() })
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
@@ -446,6 +461,14 @@ impl ApplicationPlugins {
                     tracing::warn!(stage = "installer_spawn", "plugin installation failed");
                     AppError::Internal
                 })?;
+                if let Some((username, password)) = &policy.ephemeral_proxy_credentials {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stdin = child.stdin.take().ok_or(AppError::Internal)?;
+                    let payload = serde_json::to_vec(&json!({"username":username,"password":password}))
+                        .map_err(|_| AppError::Internal)?;
+                    stdin.write_all(&payload).await.map_err(|_| AppError::Internal)?;
+                    stdin.shutdown().await.map_err(|_| AppError::Internal)?;
+                }
                 let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
                 let capture = async {
                     use tokio::io::AsyncReadExt;
@@ -548,6 +571,9 @@ impl ApplicationPlugins {
         }
         let mut policy = self.install_policy().await?;
         self.installation_release_policy(&record.idempotency_hash, &record.actor, &mut policy).await?;
+        if self.installer_network_key.is_some() {
+            policy.network_snapshot_key = Some(record.idempotency_hash.clone());
+        }
         // Recheck source policy on approval; installing before a trust-policy
         // change does not grandfather an artifact into execution authority.
         if record.packages.iter().any(|reference| {
@@ -815,9 +841,12 @@ impl InstallPolicy {
             return Err(AppError::Forbidden);
         }
         if let Some(proxy) = &self.egress_proxy {
-            crate::network::validate_install_egress_proxy(proxy)
+            crate::network::validate_frozen_installer_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
             command.arg("--egress-proxy").arg(proxy);
+        }
+        if self.ephemeral_proxy_credentials.is_some() {
+            command.arg("--egress-proxy-credentials-stdin");
         }
         if let (Some(username), Some(password)) = (
             &self.egress_proxy_username_file,
@@ -1318,10 +1347,12 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
         keys.push(bytes);
     }
     let mut trust = json!({"sources":policy.allowed_sources,"keys":keys});
-    if let Some(proxy) = &policy.egress_proxy {
+    if let Some(snapshot) = &policy.network_snapshot_key {
+        trust["network_snapshot_key"] = json!(snapshot);
+    } else if let Some(proxy) = &policy.egress_proxy {
         trust["egress_proxy"] = json!(proxy);
     }
-    if let (Some(username), Some(password)) = (
+    if policy.network_snapshot_key.is_none() && let (Some(username), Some(password)) = (
         &policy.egress_proxy_username_file,
         &policy.egress_proxy_password_file,
     ) {
@@ -1338,6 +1369,31 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
             serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::Internal)?;
     }
     super::super::plugin_configuration_schema_digest(&trust)
+}
+
+fn apply_frozen_installer_network(
+    frozen: &crate::db::plugin_installer_network::FrozenInstallerNetwork,
+    policy: &mut InstallPolicy,
+) -> Result<(), AppError> {
+    policy.egress_proxy = frozen.proxy_url.clone();
+    policy.egress_proxy_username_file = None;
+    policy.egress_proxy_password_file = None;
+    if let Some(proxy) = &mut policy.egress_proxy {
+        let mut url = url::Url::parse(proxy).map_err(|_| AppError::Forbidden)?;
+        let address = frozen.proxy_addresses.first().ok_or(AppError::Forbidden)?;
+        // Both OCI and external Cosign consume the same frozen literal proxy.
+        if url.scheme() == "https" && frozen.proxy_host.is_some() {
+            return Err(AppError::BadRequest("HTTPS installation proxies require an IP address endpoint".into()));
+        }
+        url.set_ip_host(address.ip()).map_err(|_| AppError::Forbidden)?;
+        *proxy = url.to_string();
+    }
+    policy.ephemeral_proxy_credentials = match (&frozen.username, &frozen.password) {
+        (Some(username), Some(password)) => Some((username.clone(), password.clone())),
+        (None, None) => None,
+        _ => return Err(AppError::BadRequest("proxy username and password must be supplied together".into())),
+    };
+    Ok(())
 }
 
 pub(super) async fn append_inventory_file(
@@ -1675,6 +1731,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
             packages,
             release_resolution_id: None,
             release_descriptor_sha256: None,
+            network: None,
         };
         let (record, run) = state
             .db

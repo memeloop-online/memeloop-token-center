@@ -11,6 +11,13 @@ pub struct PluginReleaseResolution {
 }
 
 impl Database {
+    pub(crate) async fn plugin_release_resolution_for_confirmation(
+        &self, id: &str, digest: &str, actor: &str,
+    ) -> Result<PluginReleaseResolution, AppError> {
+        let row = sqlx::query("SELECT * FROM application_plugin_release_resolutions WHERE id=$1 AND descriptor_sha256=$2 AND actor=$3")
+            .bind(id).bind(digest).bind(actor).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
+        resolution(row)
+    }
     pub(crate) async fn replay_plugin_release_resolution(
         &self, operation_key: &str, actor: &str, url: &str,
     ) -> Result<Option<PluginReleaseResolution>, AppError> {

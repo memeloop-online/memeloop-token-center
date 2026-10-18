@@ -61,6 +61,8 @@ mod new_api_transport;
 mod operator_inference;
 pub(crate) mod plugin_execution;
 mod plugins;
+#[cfg(feature = "experimental-plugin-revisions")]
+mod plugin_installer_network;
 pub(crate) mod proxy;
 pub(crate) use proxy::{MediaAttemptBudget, wait_media_recovery};
 pub(crate) use proxy::{
