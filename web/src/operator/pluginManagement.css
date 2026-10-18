@@ -119,3 +119,10 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+.plugin-manifest-details {
+  max-height: 24rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

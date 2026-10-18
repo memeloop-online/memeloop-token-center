@@ -26,7 +26,14 @@ interface ReleaseResolution {
 type NetworkView = { mode: 'default' | 'direct' } | { mode: 'custom'; url: string; username?: string | null; has_password?: boolean } | { mode: 'group'; tenant_external_id: string; group_id: string; group_version: number; member_id: string };
 interface ProxyGroup { id: string; name: string; version: number; members: { id: string; label: string; scheme: string; host: string; port: number }[] }
 
-export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: { token: string; tenant: string; canManage: boolean; onPublished: () => Promise<void> }) {
+interface PluginRuntimeManagerProps { token: string; tenant: string; canManage: boolean; onPublished: () => Promise<void> }
+
+export function PluginRuntimeManager(props: PluginRuntimeManagerProps) {
+  // Credentials own all drafts, confirmations and pending operation identities.
+  return <PluginRuntimeManagerSession key={props.token} {...props} />;
+}
+
+function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: PluginRuntimeManagerProps) {
   const { locale } = useI18n();
   const text = locale.startsWith('zh') ? copy.zh : copy.en;
   const [status, setStatus] = useState<RuntimeStatus>();
@@ -141,6 +148,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
     mutationLock.current = true; setBusy(true); setError(''); setMessage(''); setResolution(undefined); setTrusted(false);
     try {
       if (networkDirty) await persistNetwork();
+      if (!alive.current) return;
       const value = await api<ReleaseResolution>('/internal/v1/plugin-runtime/release-resolutions', token, {
         method: 'POST', headers: { 'Idempotency-Key': resolveKey.current }, body: JSON.stringify({ url: releaseUrl.trim() }),
       });
@@ -153,9 +161,18 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
     if (revision === undefined || busy || !canManage || !await confirm(text.uninstallConfirm(pluginId))) return;
     await mutate('/internal/v1/plugin-runtime/uninstall', { plugin_id: pluginId, expected_revision: revision }, true);
   }
+  function publicationRevision(candidate: Candidate): number | undefined {
+    if (!history || historyError || !status || statusError) return undefined;
+    const job = history.installations.find((item) => item.inventory_id === candidate.inventory_id);
+    // URL installations must keep the revision frozen when their release was read.
+    // An absent record/field is not permission to rebase a generated plugin set.
+    if ((job && job.base_revision === undefined) || (!job && candidate.inventory_id.startsWith('install-'))) return undefined;
+    return job?.base_revision ?? status.current?.revision ?? 0;
+  }
   async function activate(candidate: Candidate) {
-    if (busy || !canManage || !await confirm(text.activateConfirm(candidate.inventory_id))) return;
-    await mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: history?.installations.find((job) => job.inventory_id === candidate.inventory_id)?.base_revision ?? status?.current?.revision ?? 0 }, true);
+    const revision = publicationRevision(candidate);
+    if (revision === undefined || busy || !canManage || !await confirm(text.activateConfirm(candidate.inventory_id))) return;
+    await mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: revision }, true);
   }
   async function rollback(revision: Revision) {
     if (busy || !canManage || !await confirm(text.rollbackConfirm(revision.revision))) return;
@@ -177,6 +194,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
         setResolution(undefined); setTrusted(false); setInstallOpen(false); setActivityOpen(true); resolveKey.current = crypto.randomUUID();
       }
       const refreshed = await load();
+      if (!alive.current) return;
       const catalog = activates ? await Promise.allSettled([onPublished()]) : [];
       if (alive.current) setMessage(refreshed && catalog.every((result) => result.status === 'fulfilled') ? text.done : text.refreshPending);
     } catch (reason) {
@@ -293,8 +311,9 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
             <div className="plugin-runtime-list">{status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
               <div className="plugin-runtime-resource-heading"><b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span></div>
               <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ') || text.noActive}</p>
+              {publicationRevision(candidate) === undefined && candidate.inventory_id !== status.current?.inventory_id && <p className="notice">{text.missingBase}</p>}
               <div className="plugin-runtime-actions"><Button appearance="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</Button>
-              <Button appearance="primary" disabled={busy || !canManage || Boolean(statusError) || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button></div>
+              <Button appearance="primary" disabled={busy || !canManage || publicationRevision(candidate) === undefined || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button></div>
             </div>)}</div>
           </>}
         </div></Disclosure>
@@ -307,7 +326,21 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
               <div className="plugin-runtime-resource-heading"><b>{job.inventory_id}</b><span className="pill">{text.statusLabel(job.status)}</span></div><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
               {job.failure_category && <p role="alert">{job.failure_category}</p>}
               {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
-              {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}
+              {reviews[job.id]?.review && <div className="plugin-runtime-section">
+                {reviews[job.id].review.plugins.map((plugin) => <section key={plugin.id}>
+                  <h4>{plugin.id} · {plugin.version}</h4>
+                  <ul>{plugin.capabilities.map((capability, index) => <li key={index}>{capability.kind === 'http' ? `${text.httpAccess}: ${capability.allowed_origins.join(', ')}` : capability.kind === 'log' ? text.logAccess : capability.kind === 'kv' ? text.storageAccess : text.quotaAccess}</li>)}
+                    {plugin.contributions.traffic_policy && <li>{text.trafficPolicy}</li>}
+                    {plugin.contributions.request_rewrite && <li>{text.requestRewrite}</li>}
+                    {plugin.contributions.configuration && <li>{text.configurationAccess}</li>}
+                    {(plugin.contributions.providers ?? []).map((provider) => <li key={provider.id}>{text.providerAccess}: {provider.display_name || provider.id}</li>)}
+                    {(plugin.contributions.operator_ui ?? []).map((contribution) => <li key={contribution.id}>{text.interfaceAccess}: {contribution.label || contribution.id}</li>)}
+                    {(plugin.contributions.service_data ?? []).map((endpoint) => <li key={endpoint.id}>{text.dataAccess}: {endpoint.url || endpoint.id} · {endpoint.required_scope}</li>)}
+                  </ul>
+                  {plugin.capabilities.length === 0 && Object.keys(plugin.contributions).length === 0 && <p>{text.noPermissions}</p>}
+                </section>)}
+                <Disclosure title={text.technicalDetails}><pre className="plugin-manifest-details">{JSON.stringify(reviews[job.id].review, null, 2)}</pre></Disclosure>
+              </div>}
               {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><Checkbox label={text.approve} disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(_, data) => setApprovals((old) => ({ ...old, [job.id]: data.checked === true }))} /><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
               {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
             </section>)}</div></section>

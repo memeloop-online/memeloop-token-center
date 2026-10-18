@@ -32,6 +32,8 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     const candidates = [{ inventory_id: 'baseline', staged: true, plugins: { 'retained-plugin': ['1.0.0'] } as Record<string, string[]> }];
     let job: { id: string; inventory_id: string; actor: string; status: string; packages: string[]; completed_packages: number; review_digest: string; review: unknown; failure_category: null; created_at: number; updated_at: number; base_revision: number } | undefined;
     let uninstallConflict = true;
+    let savedNetwork: { mode: string; url?: string; username?: string | null; has_password?: boolean } = { mode: 'default' };
+    const networkWrites: Record<string, unknown>[] = [];
     const writes: { path: string; body: any; key?: string }[] = [];
     await page.route('**/internal/v1/plugin-runtime**', async route => {
       const request = route.request();
@@ -45,12 +47,18 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
           }
           await route.fulfill({ json: { runtime_enabled: true, installation_enabled: true, revisions, installations: job ? [{ ...job, review: null }] : [], audit: [] } });
         }
-        else if (path.endsWith('/installer-network')) await route.fulfill({ json: { mode: 'default' } });
+        else if (path.endsWith('/installer-network')) await route.fulfill({ json: savedNetwork });
         else if (path.endsWith('/installations/job')) await route.fulfill({ json: job });
         else await route.fulfill({ json: { current, candidates } });
         return;
       }
       const body = request.postDataJSON();
+      if (path.endsWith('/installer-network')) {
+        networkWrites.push(body);
+        savedNetwork = { mode: body.mode, url: body.url, username: body.username, has_password: body.password !== '' };
+        await route.fulfill({ json: savedNetwork });
+        return;
+      }
       writes.push({ path, body, key: request.headers()['idempotency-key'] });
       if (path.endsWith('/release-resolutions')) {
         assert.deepEqual(body, { url: 'https://github.com/example/new/releases/download/v1/plugin.json' });
@@ -97,6 +105,25 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     releaseInitialHistory();
     await page.getByText('broken current catalog', { exact: false }).waitFor();
     await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
+    await page.getByRole('button', { name: 'Download network', exact: true }).click();
+    await page.getByLabel('Download network', { exact: true }).selectOption('custom');
+    await page.getByLabel('Proxy URL', { exact: true }).fill('http://192.0.2.10:8080');
+    await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+    await page.getByRole('button', { name: 'Save network', exact: true }).click();
+    await page.getByText('Download network saved.', { exact: true }).waitFor();
+    assert.equal(await page.getByLabel('Password', { exact: true }).inputValue(), '');
+    await page.reload();
+    await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
+    await page.getByRole('button', { name: 'Download network', exact: true }).click();
+    assert.equal(await page.getByLabel('Proxy URL', { exact: true }).inputValue(), 'http://192.0.2.10:8080');
+    assert.equal(await page.getByLabel('Password', { exact: true }).inputValue(), '');
+    await page.getByText('Leave blank to keep the saved password for this URL and username.', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Save network', exact: true }).click();
+    await page.getByText('Download network saved.', { exact: true }).waitFor();
+    assert.deepEqual(networkWrites, [
+      { mode: 'custom', url: 'http://192.0.2.10:8080', username: null, password: 'fixture-only' },
+      { mode: 'custom', url: 'http://192.0.2.10:8080', username: null },
+    ]);
     await page.getByLabel('GitHub Release JSON URL').fill('https://github.com/example/new/releases/download/v1/plugin.json');
     await page.getByRole('button', { name: 'Read release', exact: true }).click();
     await page.getByText('https://token.actions.githubusercontent.com', { exact: true }).waitFor();
