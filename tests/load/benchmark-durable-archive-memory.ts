@@ -4,7 +4,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type ClientRequest, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -19,8 +19,62 @@ import { apiRequest, MIB, processMemory, seed } from "./benchmark-memory.ts";
 const LIMIT_MIB = 448;
 const CHUNK = 64 * 1024;
 export const NATIVE_MMAP_THRESHOLD_BYTES = 64 * 1024;
-type Result = { status: number; bytes: number; sha256: string; retryAfter?: string; transportClosed?: boolean };
+type Result = { status: number; bytes: number; sha256: string; requestId?: string; retryAfter?: string; transportClosed?: boolean };
 type Plan = { prefix: Buffer; fillBytes: number; suffix: Buffer; bytes: number; path?: string };
+type PendingReceipt = {
+  request_id: string; receipt_id: string; usage_basis: string; status_code: number; error_code: string;
+  response_object: string; claim: Record<string, unknown>; operational_terminal: Record<string, unknown>;
+  reservation: { id: string; reserved_micros: number };
+};
+const SAFE_UPSTREAM_ERROR = '{"error":{"message":"upstream request failed","type":"upstream_error"}}';
+
+export function archiveDrainReady(row: Record<string, unknown>, retainedRequestCipherBytes?: number): boolean {
+  const expected = retainedRequestCipherBytes === undefined ? 0 : 1;
+  const cipherBytes = retainedRequestCipherBytes ?? 0;
+  assert(Number.isSafeInteger(cipherBytes) && cipherBytes >= 0, "retained archive bytes must be valid");
+  return row.pending_requests === expected && row.unsettled_reservations === expected
+    && row.cipher_bytes === cipherBytes && row.request_cipher_bytes === cipherBytes;
+}
+
+export function assertUnknownFinancialEvidence(row: Record<string, unknown>, receipt: PendingReceipt): number {
+  for (const field of ["financial_completed", "financial_status", "actual_micros", "receipt_id", "receipt_digest", "cost_micros"]) {
+    assert(row[field] === null, `unknown must not fabricate financial completion: ${field}`);
+  }
+  assert(row.reservation_status === "reserved" && row.state === "pending", "unknown must retain its original financial hold");
+  assert(row.unknown_reason === "authoritative_usage_unavailable", "unknown responsibility must be annotated");
+  for (const field of ["ledger_count", "event_count", "fact_count", "observation_count"]) {
+    assert(row[field] === 0, `unknown must have no financial side effects: ${field}`);
+  }
+  assert(row.operational_status === 502 && row.operational_error === "upstream_invalid_response", "real upstream failure must remain visible");
+  assert(row.operational_stage === "buffered_response_ready", "failure must retain its actual stage");
+  assert(typeof row.operational_completed === "number" && row.operational_completed > 0, "operational completion must be recorded");
+  assert(receipt.request_id === row.request_id && receipt.receipt_id === row.operational_receipt_id, "journal must match the operational receipt");
+  assert(receipt.usage_basis === "not_observed", "unknown must not fabricate provider usage");
+  for (const field of ["request_id", "tenant_id", "key_id", "account_id", "reservation_id", "owner_token", "fence", "contract_digest"]) {
+    assert(typeof row[field] === "string" && row[field] !== "" && receipt.claim[field] === row[field], `journal must retain exact claim authority: ${field}`);
+  }
+  assert(receipt.reservation.id === row.reservation_id && receipt.reservation.reserved_micros === row.reserved_micros, "journal must retain the original reservation");
+  assert(receipt.status_code === row.operational_status && receipt.error_code === row.operational_error, "journal must retain the real client failure");
+  const operational = receipt.operational_terminal;
+  for (const [field, column] of Object.entries({ status_code: "operational_status", error_code: "operational_error", completed_at: "operational_completed", stage: "operational_stage", response_object: "operational_response_object" })) {
+    assert(operational[field] === row[column], `operational ACK must match owned receipt: ${field}`);
+  }
+  assert(receipt.response_object === `inline-json:${SAFE_UPSTREAM_ERROR}` && operational.response_object === receipt.response_object, "failed response archive must contain only the safe local error");
+  assert(row.spool_state === "pending" && row.spool_plain_bytes === 512 && row.chunk_plain_bytes === 512, "unknown request archive must remain durable, not be discarded");
+  assert(typeof row.spool_cipher_bytes === "number" && Number.isSafeInteger(row.spool_cipher_bytes) && row.spool_cipher_bytes > 0, "retained request archive must have exact positive accounting");
+  return row.spool_cipher_bytes;
+}
+
+function pendingReceipt(directory: string, receiptId: string): PendingReceipt | undefined {
+  try {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      try { return JSON.parse(readFileSync(join(directory, entry.name, `${receiptId}.json`), "utf8")); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  return undefined;
+}
 
 export function nativeAllocatorEnvironment(): NodeJS.ProcessEnv {
   return { GLIBC_TUNABLES: `glibc.malloc.mmap_threshold=${NATIVE_MMAP_THRESHOLD_BYTES}` };
@@ -211,7 +265,7 @@ function send(base: string, key: string, plan: Plan, options: {
       let bytes = 0;
       response.on("data", (chunk: Buffer) => { bytes += chunk.length; hash.update(chunk); });
       response.once("error", reject);
-      response.once("end", () => done({ status: response.statusCode ?? 0, bytes, sha256: hash.digest("hex"), retryAfter: String(response.headers["retry-after"] ?? "") }));
+      response.once("end", () => done({ status: response.statusCode ?? 0, bytes, sha256: hash.digest("hex"), requestId: String(response.headers["x-mtc-request-id"] ?? ""), retryAfter: String(response.headers["retry-after"] ?? "") }));
     });
     req.setTimeout(45_000, () => req.destroy(new Error("proxy request timed out")));
     req.once("error", (error) => { stopped = true; uploaded.release(); reject(error); });
@@ -366,15 +420,50 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
     report.idle_native_allocator_bytes = nativeAllocatorEvidence(idleMetrics.body.toString("utf8"));
 
-    const drain = async (): Promise<Record<string, unknown>> => {
+    const drain = async (unknownRequestId?: string): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
       reader.exec("PRAGMA busy_timeout = 1000");
       try {
         return await deadline((async () => {
           while (true) {
+            let retainedRequestCipherBytes: number | undefined;
+            let unknownEvidence: Record<string, unknown> | undefined;
+            if (unknownRequestId !== undefined) {
+              const unknown = reader.prepare(`
+                SELECT p.*, q.completed_at AS financial_completed, q.status_code AS financial_status,
+                  r.status AS reservation_status, r.actual_micros, r.reserved_micros,
+                  o.status_code AS operational_status, o.error_code AS operational_error,
+                  o.completed_at AS operational_completed, o.stage AS operational_stage,
+                  o.receipt_id AS operational_receipt_id, o.response_object AS operational_response_object,
+                  s.state AS spool_state, s.byte_count AS spool_plain_bytes, s.cipher_bytes AS spool_cipher_bytes,
+                  (SELECT SUM(byte_count) FROM request_archive_spool_chunks WHERE request_id = q.id) AS chunk_plain_bytes,
+                  (SELECT COUNT(*) FROM ledger_entries WHERE source = q.reservation_id) AS ledger_count,
+                  (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
+                  (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = q.id) AS fact_count,
+                  (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count
+                FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id
+                JOIN pending_proxy_settlements p ON p.request_id = q.id AND p.reservation_id = r.id
+                LEFT JOIN proxy_operational_terminals o ON o.request_id = p.request_id AND o.fence = p.fence AND o.contract_digest = p.contract_digest
+                LEFT JOIN request_archive_spools s ON s.request_id = p.request_id AND s.reservation_id = p.reservation_id
+                WHERE q.id = ?`).get(unknownRequestId);
+              const receipt = typeof unknown?.operational_receipt_id === "string"
+                ? pendingReceipt(join(requestSpool, "pending-terminals-v1"), unknown.operational_receipt_id) : undefined;
+              if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing") {
+                await delay(100); continue;
+              }
+              retainedRequestCipherBytes = assertUnknownFinancialEvidence(unknown, receipt);
+              unknownEvidence = {
+                request_id: unknownRequestId, receipt_id: receipt.receipt_id, fence: unknown.fence,
+                financial_state: "unknown", status_code: unknown.operational_status,
+                error_code: unknown.operational_error, stage: unknown.operational_stage,
+                completed_at: unknown.operational_completed, reservation_status: unknown.reservation_status,
+                reserved_micros: unknown.reserved_micros, retained_request_cipher_bytes: retainedRequestCipherBytes,
+                durable_journal: true, financial_ack: false, financial_side_effects: 0,
+              };
+            }
             const row = reader.prepare("SELECT cipher_bytes, request_cipher_bytes, (SELECT COUNT(*) FROM request_records WHERE completed_at IS NULL) AS pending_requests, (SELECT COUNT(*) FROM usage_reservations WHERE status = 'reserved') AS unsettled_reservations FROM response_archive_spool_budget WHERE singleton = 1").get();
             assert(row, "archive budget row missing");
-            if (Object.values(row).every((value) => Number(value) === 0)) {
+            if (archiveDrainReady(row, retainedRequestCipherBytes)) {
               const metrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
               assert(metrics.status === 200, "permit metrics must be available");
               const metricsText = metrics.body.toString("utf8");
@@ -382,7 +471,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
               if (Object.values(gauges).every((value) => value === 0)) {
                 const currentBudget = reader.prepare("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").get();
                 assert(currentBudget, "archive budget row missing after capture drain");
-                if (Object.values(currentBudget).some((value) => Number(value) !== 0)) { await delay(100); continue; }
+                if (!archiveDrainReady({ ...row, ...currentBudget }, retainedRequestCipherBytes)) { await delay(100); continue; }
                 const successfulGaps = reader.prepare("SELECT COALESCE(SUM(CASE WHEN request_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS request_gaps, COALESCE(SUM(CASE WHEN response_object IS NULL OR response_object LIKE 'gap:%' THEN 1 ELSE 0 END), 0) AS response_gaps FROM request_records WHERE status_code = 200").get();
                 const persistence = deferredPersistenceEvidence(metricsText);
                 const requestPersistence = requestPersistenceEvidence(metricsText);
@@ -390,7 +479,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 const responseGaps = Number(successfulGaps?.response_gaps);
                 assertArchiveGapEvidence(requestGaps, responseGaps, requestPersistence, persistence);
                 const processMemoryEvidence = processMemory(service!.pid!);
-                return { ...row, permits: gauges, persistence, request_persistence: requestPersistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: requestGaps + responseGaps, successful_request_archive_gaps: requestGaps, successful_response_archive_gaps: responseGaps };
+                return { ...row, unknown_financial_responsibility: unknownEvidence, permits: gauges, persistence, request_persistence: requestPersistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: requestGaps + responseGaps, successful_request_archive_gaps: requestGaps, successful_response_archive_gaps: responseGaps };
               }
             }
             await delay(100);
@@ -398,7 +487,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
         })(), 30_000, "archive drain");
       } finally { reader.close(); }
     };
-    const phase = async (name: string, operation: () => Promise<unknown>): Promise<void> => {
+    const phase = async (name: string, operation: () => Promise<unknown>, expectUnknown = false): Promise<void> => {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
       const operationStarted = performance.now();
@@ -414,7 +503,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
       }
       assert(entry.peak_rss_mib <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
       const drainStarted = performance.now();
-      entry.drain = await drain();
+      const unknownRequestId = expectUnknown ? (entry.result as Result).requestId : undefined;
+      if (expectUnknown) assert(unknownRequestId, "failed client response must identify its unknown financial responsibility");
+      entry.drain = await drain(unknownRequestId);
       entry.drain_duration_ms = performance.now() - drainStarted;
     };
 
@@ -484,9 +575,10 @@ export async function run(binary: string, output: string): Promise<boolean> {
         upstream_calls: upstreamCalls - before,
       };
       assert(result.status === 502 && upstreamCalls - before === 1, "malformed upstream framing must fail once without replaying upstream");
+      assert(result.bytes === Buffer.byteLength(SAFE_UPSTREAM_ERROR) && result.sha256 === createHash("sha256").update(SAFE_UPSTREAM_ERROR).digest("hex"), "malformed upstream response must expose only the exact safe local error");
       underdeclaredResponse = false;
       return result;
-    });
+    }, true);
     const peak = Math.max(...report.samples.map((s: any) => Math.max(s.rss_mib, s.high_water_mib)));
     report.peak_rss_or_kernel_high_water_mib = peak;
     assert(peak <= LIMIT_MIB, "kernel VmHWM exceeded 448 MiB service allowance");
