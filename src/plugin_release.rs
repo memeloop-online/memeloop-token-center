@@ -34,7 +34,6 @@ pub struct ReleaseProxy<'a> {
     pub url: &'a str,
     pub username: Option<&'a str>,
     pub password: Option<&'a str>,
-    pub host: Option<&'a str>,
     pub addresses: &'a [SocketAddr],
 }
 
@@ -175,8 +174,13 @@ pub async fn resolve_github_release(
             if let Some(proxy) = &proxy {
                 crate::network::checked_installer_proxy_url(proxy.url)
                     .map_err(|_| invalid_release())?;
+                let mut endpoint = Url::parse(proxy.url).map_err(|_| invalid_release())?;
+                let address = proxy.addresses.first().ok_or_else(invalid_release)?;
+                endpoint
+                    .set_ip_host(address.ip())
+                    .map_err(|_| invalid_release())?;
                 let mut configured =
-                    reqwest::Proxy::all(proxy.url).map_err(|_| invalid_release())?;
+                    reqwest::Proxy::all(endpoint.as_str()).map_err(|_| invalid_release())?;
                 match (proxy.username, proxy.password) {
                     (Some(username), Some(password)) => {
                         configured = configured.basic_auth(username, password)
@@ -185,12 +189,6 @@ pub async fn resolve_github_release(
                     _ => return Err(invalid_release()),
                 }
                 builder = builder.proxy(configured);
-                if let Some(host) = proxy.host {
-                    if proxy.addresses.is_empty() {
-                        return Err(invalid_release());
-                    }
-                    builder = builder.resolve_to_addrs(host, proxy.addresses);
-                }
             } else {
                 // Pin the address checked above; TLS still authenticates host.
                 builder = builder.resolve_to_addrs(host, &addresses);

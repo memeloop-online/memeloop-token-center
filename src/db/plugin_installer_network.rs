@@ -249,6 +249,18 @@ impl Database {
             snapshot.group.is_some(),
         )
         .await?;
+        if snapshot.username.is_some() != snapshot.password.is_some()
+            || [&snapshot.username, &snapshot.password]
+                .into_iter()
+                .flatten()
+                .any(|value| {
+                    value.is_empty() || value.len() > 255 || value.chars().any(char::is_control)
+                })
+        {
+            return Err(AppError::BadRequest(
+                "installation proxy credentials are invalid".into(),
+            ));
+        }
         snapshot.proxy_host = host;
         snapshot.proxy_addresses = addresses;
         Ok(snapshot)

@@ -717,15 +717,17 @@ pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> 
 /// use the frozen IP directly, so those transports cannot resolve it again.
 pub(crate) fn validate_frozen_installer_proxy(value: &str) -> Result<(), AppError> {
     let url = checked_installer_proxy_url(value)?;
-    let address = match url.host() {
-        Some(Host::Ipv4(address)) => IpAddr::V4(address),
-        Some(Host::Ipv6(address)) => IpAddr::V6(address),
-        _ => {
-            return Err(AppError::BadRequest(
-                "installation proxy must use its frozen IP address".into(),
-            ));
-        }
-    };
+    // url treats SOCKS as a non-special scheme, whose literal IPv4 host can
+    // be represented as Host::Domain. Parse the spelling as an IP explicitly.
+    let address: IpAddr = url
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| {
+            AppError::BadRequest("installation proxy must use its frozen IP address".into())
+        })?;
     validate_addresses(
         &[SocketAddr::new(
             address,

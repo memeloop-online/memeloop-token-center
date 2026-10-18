@@ -261,7 +261,6 @@ pub(super) async fn resolve_application_plugin_release(
             url,
             username: frozen.username.as_deref(),
             password: frozen.password.as_deref(),
-            host: frozen.proxy_host.as_deref(),
             addresses: &frozen.proxy_addresses,
         });
     let release = crate::plugin_release::resolve_github_release(&body.url, proxy).await?;

@@ -347,15 +347,15 @@ impl ApplicationPlugins {
             &input.release_descriptor_sha256,
         ) {
             (Some(id), Some(digest)) => {
-                let resolution = self
-                    .db
-                    .confirm_plugin_release_resolution(id, digest, actor, &key_hash)
-                    .await?;
                 if !input.packages.is_empty() {
                     return Err(AppError::BadRequest(
                         "release installation cannot include extra packages".into(),
                     ));
                 }
+                let resolution = self
+                    .db
+                    .confirm_plugin_release_resolution(id, digest, actor, &key_hash)
+                    .await?;
                 input.packages = vec![resolution.release.descriptor.reference];
             }
             (None, None) => (),

@@ -120,3 +120,167 @@ fn resolution(row: AnyRow) -> Result<PluginReleaseResolution, AppError> {
         release: serde_json::from_str(&json).map_err(|_| AppError::Internal)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(reference_digest: char) -> ResolvedPluginRelease {
+        serde_json::from_value(serde_json::json!({
+            "release_url":"https://github.com/example/plugin/releases/download/v1/release.json",
+            "descriptor_sha256":format!("sha256:{}", reference_digest.to_string().repeat(64)),
+            "source":"ghcr.io/example/plugin",
+            "descriptor":{"format_version":1,
+                "reference":format!("ghcr.io/example/plugin@sha256:{}", reference_digest.to_string().repeat(64)),
+                "signer":{"issuer":"https://token.actions.githubusercontent.com",
+                    "identity":"https://github.com/example/plugin/.github/workflows/publish.yml@refs/tags/v1"}}
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn release_confirmation_freezes_bytes_actor_and_single_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("release.db").display()
+        );
+        let db = Database::connect(&url).await.unwrap();
+        db.migrate().await.unwrap();
+        let original = release('a');
+        let first = db
+            .save_plugin_release_resolution("resolve-key", "operator-a", &original, 0, None)
+            .await
+            .unwrap();
+        let concurrent = db
+            .save_plugin_release_resolution("resolve-key", "operator-a", &release('b'), 9, None)
+            .await
+            .unwrap();
+        assert_eq!(first.id, concurrent.id);
+        assert_eq!(
+            concurrent.release.descriptor_sha256,
+            original.descriptor_sha256
+        );
+        assert_eq!(concurrent.base_revision, 0);
+        assert!(
+            db.confirm_plugin_release_resolution(
+                &first.id,
+                &original.descriptor_sha256,
+                "operator-b",
+                "install-key"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            db.confirm_plugin_release_resolution(
+                &first.id,
+                &release('b').descriptor_sha256,
+                "operator-a",
+                "install-key"
+            )
+            .await
+            .is_err()
+        );
+        db.confirm_plugin_release_resolution(
+            &first.id,
+            &original.descriptor_sha256,
+            "operator-a",
+            "install-key",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.confirm_plugin_release_resolution(
+                &first.id,
+                &original.descriptor_sha256,
+                "operator-a",
+                "other-install"
+            )
+            .await
+            .is_err()
+        );
+        drop(db);
+        let db = Database::connect(&url).await.unwrap();
+        let restored = db
+            .installation_plugin_release_resolution("install-key", "operator-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.id, first.id);
+        let response = serde_json::to_value(&restored).unwrap();
+        assert!(response.get("retained").is_none());
+        assert!(response.get("operation_key").is_none());
+        assert_eq!(response["base_revision"], 0);
+    }
+
+    #[tokio::test]
+    async fn release_publication_cannot_rebase_to_a_different_expected_revision() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.migrate().await.unwrap();
+        let source = release('a');
+        let resolution = db
+            .save_plugin_release_resolution("resolve", "operator", &source, 0, None)
+            .await
+            .unwrap();
+        db.confirm_plugin_release_resolution(
+            &resolution.id,
+            &source.descriptor_sha256,
+            "operator",
+            "install",
+        )
+        .await
+        .unwrap();
+        let (record, _) = db
+            .begin_plugin_installation(
+                "fresh",
+                &serde_json::json!([source.descriptor.reference]),
+                "request",
+                "install",
+                "operator",
+                unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        db.finish_plugin_installation(
+            &record.id,
+            &record.attempt_id,
+            Some(("review", &serde_json::json!({"plugins":[]}))),
+        )
+        .await
+        .unwrap();
+        db.stage_application_plugin_candidate("fresh", "identity", "contract")
+            .await
+            .unwrap();
+        db.register_plugin_installation(&record.id, "review", "operator")
+            .await
+            .unwrap();
+        let replay = db
+            .replay_plugin_installation("install", "request", "operator")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.base_revision, Some(0));
+        assert!(matches!(
+            db.publish_application_plugin(
+                "fresh",
+                1,
+                "reload",
+                "bad-rebase",
+                "bad-hash",
+                "operator"
+            )
+            .await,
+            Err(AppError::Conflict(_))
+        ));
+        db.publish_application_plugin("fresh", 0, "initial", "initial", "initial-hash", "operator")
+            .await
+            .unwrap();
+        // Even a direct database caller cannot approve a snapshot after its
+        // base head has changed. Publication is separately guarded in its tx.
+        assert!(matches!(
+            db.register_plugin_installation(&record.id, "review", "operator")
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+}
