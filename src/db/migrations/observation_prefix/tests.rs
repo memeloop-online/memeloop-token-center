@@ -56,12 +56,12 @@ async fn conversion_contract(url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
-    for table in [
-        "application_plugin_release_resolutions",
-        "plugin_installer_network_snapshots",
-        "plugin_installer_network_preferences",
+    for statement in [
+        "DROP TABLE application_plugin_release_resolutions",
+        "DROP TABLE plugin_installer_network_snapshots",
+        "DROP TABLE plugin_installer_network_preferences",
     ] {
-        sqlx::query(&format!("DROP TABLE {table}"))
+        sqlx::query(statement)
             .execute(&database.pool)
             .await
             .unwrap();
