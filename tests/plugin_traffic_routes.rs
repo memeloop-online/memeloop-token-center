@@ -164,10 +164,14 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
 }
 
 fn write_policy_package(root: &Path, body: &str, capabilities: Value) {
+    write_named_policy_package(root, "gateway-policy", body, capabilities);
+}
+
+fn write_named_policy_package(root: &Path, id: &str, body: &str, capabilities: Value) {
     fs::write(
         root.join("plugin.json"),
         serde_json::to_vec(&json!({
-            "id": "gateway-policy",
+            "id": id,
             "version": "1.0.0",
             "wit_version": "0.2.0",
             "wasm": "plugin.wasm",
@@ -232,6 +236,16 @@ async fn policy_state_with_capabilities(
 const DENY_BODY: &str = r#"
     i32.const 256 i32.const 0 i32.store
     i32.const 260 i32.const 0 i32.store
+    i32.const 264 i32.const 0 i32.store
+    i32.const 276 i32.const 0 i32.store
+    i32.const 288 i32.const 0 i32.store
+    i32.const 300 i32.const 0 i32.store
+    i32.const 256
+"#;
+
+const ALLOW_BODY: &str = r#"
+    i32.const 256 i32.const 0 i32.store
+    i32.const 260 i32.const 1 i32.store
     i32.const 264 i32.const 0 i32.store
     i32.const 276 i32.const 0 i32.store
     i32.const 288 i32.const 0 i32.store
@@ -1412,6 +1426,92 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
     )
     .await;
     assert_eq!(response.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn model_projection_through_a_second_policy_preserves_both_route_authorization_checks() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("must-not-dispatch"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    for (label, granted) in [
+        ("chain-original-only", "requested-model"),
+        ("chain-effective-only", "example-rewritten"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        for (id, body) in [
+            ("a-rewriter", REWRITE_MODEL_BODY.to_owned()),
+            (
+                "z-observer",
+                format!(
+                    r#"
+                    local.get 9 i32.const 17 i32.ne if unreachable end
+                    {allow}
+                    "#,
+                    allow = ALLOW_BODY
+                ),
+            ),
+        ] {
+            let package = directory.path().join(id);
+            fs::create_dir(&package).unwrap();
+            write_named_policy_package(&package, id, &body, json!([]));
+        }
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("chain-authorization.db").display()
+        ));
+        config.plugin_dir = Some(directory.path().display().to_string());
+        let state = AppState::initialize(config).await.unwrap();
+        let tenant = format!("policy-{label}");
+        let issued = state
+            .db
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: tenant.clone(),
+                    principal_external_id: "chain-user".into(),
+                    alias: label.into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy {
+                        allowed_models: vec!["requested-model".into(), "example-rewritten".into()],
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        create_account_and_routes(
+            &state,
+            &tenant,
+            &issued,
+            RouteFixture {
+                driver: "http-json",
+                config: json!({"base_url": upstream.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                upstream_model: "must-not-dispatch",
+                protocols: &["openai"],
+                granted_public_models: &[granted],
+            },
+        )
+        .await;
+        let response = call(
+            &state,
+            &issued.key,
+            "/v1/chat/completions",
+            json!({"model": "requested-model", "messages": [{"role": "user", "content": "synthetic"}]}),
+        ).await;
+        assert_eq!(
+            response.0,
+            StatusCode::FORBIDDEN,
+            "{label}: {:?}",
+            response.1
+        );
+    }
+    upstream.verify().await;
 }
 
 struct RouteFixture<'a> {

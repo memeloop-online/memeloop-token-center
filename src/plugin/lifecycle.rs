@@ -209,8 +209,9 @@ impl RuntimeSnapshot {
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
             runtime.plugins = Arc::new(vec![plugin.clone()]);
+            let plugin_context = decision.project_context(&context, &mut current);
             let result = runtime.apply_traffic_with_config_and_memory(
-                context.clone(),
+                plugin_context,
                 &current,
                 configurations,
                 memory,
