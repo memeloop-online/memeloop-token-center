@@ -4,6 +4,7 @@ import { Tooltip } from '@fluentui/react-components';
 import { I18nProvider } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system';
 import { RequestsPage } from '../../src/operator/pages/RequestsPage';
+import { coalesceRequestEvent, RequestRefreshBatch } from '../../src/operator/traffic/requestRefresh';
 import type { RequestDetail, RequestEvent, TypedFilterAst } from '../../src/types';
 import { egressAttempts } from '../support/request-egress-fixtures';
 import '../../src/styles.css';
@@ -12,7 +13,7 @@ import '../../src/styles/metrics.css';
 import '../../src/styles/request-table.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
 const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
@@ -107,6 +108,28 @@ function Fixture() {
       if (!first.operational_terminal) throw new Error('Operational fixture required');
       first = { ...first, cost, completed_at: 4000, input_tokens: 20, output_tokens: 10, usage_basis: 'provider_reported',
         operational_terminal: { ...first.operational_terminal, financial_state: 'applied' } };
+      if (kind === 'archive_bound') {
+        const scheduled: { flush?: () => void } = {};
+        const batch = new RequestRefreshBatch(5000, {
+          schedule: callback => { scheduled.flush = callback; return 1; },
+          cancel: () => { scheduled.flush = undefined; },
+        }, (published, overflow) => {
+          if (overflow) throw new Error('Low-volume fixture must not overflow');
+          setEvents(previous => {
+            const merged = new Map(previous);
+            for (const [requestId, event] of published) merged.set(requestId, coalesceRequestEvent(previous.get(requestId), event));
+            return merged;
+          });
+          setRevision(value => value + 1);
+        });
+        batch.enqueue({ ...base, status_code: 200, completed_at: 4000, cost: '999',
+          event_id: `financial-${revision}`, event_at: 4000, event_kind: 'finished', key_id: 'key' });
+        batch.enqueue({ ...base, event_id: `archive-${revision}`, event_at: 4001,
+          event_kind: 'archive_bound', archive_state: 'bound', key_id: 'key' });
+        scheduled.flush?.();
+        batch.dispose();
+        return;
+      }
       setEvents(new Map([[first.request_id, { ...base, status_code: 200, completed_at: 4000, cost: '999',
         event_id: `financial-${revision}`, event_at: 4000, event_kind: kind, key_id: 'key' } as RequestEvent]]));
       setRevision(value => value + 1);
@@ -126,6 +149,6 @@ function Fixture() {
   useLayoutEffect(() => {
     window.requestLifecycleFixture.scopeCommits.push({ scope: tenant, drawers: document.querySelectorAll('.drawer').length });
   }, [tenant]);
-  return <div data-request-fixture-scope={tenant} data-request-fixture-revision={revision}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} requestRefresh={operationalMode ? { intervalMs: 5000, paused: false, onIntervalChange: () => {} } : undefined} /><Tooltip content="Background scope help" visible={backgroundHelpVisible} relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible={backgroundHelpVisible} relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
+  return <div data-request-fixture-scope={tenant} data-request-fixture-revision={revision} data-request-fixture-event-kind={events.get(base.request_id)?.event_kind} data-request-fixture-completed-at={events.get(base.request_id)?.completed_at}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} requestRefresh={operationalMode ? { intervalMs: 5000, paused: false, onIntervalChange: () => {} } : undefined} /><Tooltip content="Background scope help" visible={backgroundHelpVisible} relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible={backgroundHelpVisible} relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

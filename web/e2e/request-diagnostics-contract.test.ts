@@ -57,7 +57,7 @@ test('request table exposes copyable durable IDs and its recorded token billing 
   assert.match(components, /requestTokenBreakdown/);
   assert.match(components, /const cachedInputTokens = request\.cached_input_tokens;/);
   assert.match(components, /const cacheWriteTokens = request\.cache_write_tokens;/);
-  assert.match(components, /if \(cachedInputTokens === undefined \|\| cacheWriteTokens === undefined\) return undefined;/);
+  assert.match(components, /if \(typeof request\.input_tokens !== 'number' \|\| typeof request\.output_tokens !== 'number'\s*\|\| typeof cachedInputTokens !== 'number' \|\| typeof cacheWriteTokens !== 'number'\) return undefined;/);
   assert.doesNotMatch(components, /cached_input_tokens \?\? 0/);
   assert.doesNotMatch(components, /cache_write_tokens \?\? 0/);
 });

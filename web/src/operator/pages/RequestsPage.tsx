@@ -316,8 +316,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     }
     for (const request of requestsRef.current) {
       const event = liveEventsRef.current.get(request.request_id);
+      const completedAt = event?.completed_at;
+      const retainedTerminal = typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at;
       if (!request.operational_terminal || request.operational_terminal.financial_state === 'applied'
-        || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected')
+        || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected' && !retainedTerminal)
         || reconciledOperationalEvents.current.get(request.request_id) === event.event_id) continue;
       void api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal })
         .then(next => {

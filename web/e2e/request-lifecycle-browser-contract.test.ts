@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 
 test('low-volume terminal events reconcile operational money without opening details or overflowing', { timeout: 45_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -26,7 +26,7 @@ test('low-volume terminal events reconcile operational money without opening det
       });
       await page.addInitScript(locale => localStorage.setItem('mtc-locale', locale), locale);
       for (const amount of ['0', '2.50']) {
-        for (const kind of ['finished', 'projected'] as const) {
+        for (const kind of ['finished', 'projected', 'archive_bound'] as const) {
           await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=499`);
           const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
           await row.locator('[data-outcome="cancelled"]').waitFor();
@@ -35,6 +35,9 @@ test('low-volume terminal events reconcile operational money without opening det
           const queries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
           assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
           await page.evaluate(({ amount, kind }) => window.requestLifecycleFixture.settle(amount, kind), { amount, kind });
+          if (kind === 'archive_bound') {
+            await page.locator('[data-request-fixture-event-kind="archive_bound"][data-request-fixture-completed-at="4000"]').waitFor();
+          }
           await page.waitForFunction(() => {
             const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes('model-a'));
             return row?.querySelector('.request-cost-cell .request-value-info')?.getAttribute('aria-label') === null;
