@@ -221,6 +221,36 @@ impl Database {
         request_hash: &str,
         actor: &str,
     ) -> Result<ApplicationRevision, AppError> {
+        self.publish_application_plugin_action(
+            inventory_id,
+            expected_revision,
+            reason,
+            idempotency_key,
+            request_hash,
+            actor,
+            if reason == "rollback" {
+                "rollback"
+            } else {
+                "publish"
+            },
+            None,
+        )
+        .await
+    }
+
+    // Keep operation claim, head CAS and its precise audit event in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_application_plugin_action(
+        &self,
+        inventory_id: &str,
+        expected_revision: i64,
+        reason: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        actor: &str,
+        action: &str,
+        audit_event_key: Option<&str>,
+    ) -> Result<ApplicationRevision, AppError> {
         let next = expected_revision
             .checked_add(1)
             .filter(|n| *n > 0)
@@ -274,8 +304,8 @@ impl Database {
         sqlx::query("UPDATE application_plugin_operations SET result_revision = $1 WHERE idempotency_key = $2")
             .bind(next).bind(idempotency_key).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO application_plugin_audit (id,event_key,actor,action,inventory_id,revision,outcome,created_at) VALUES ($1,$2,$3,$4,$5,$6,'published',$7) ON CONFLICT(event_key) DO NOTHING")
-            .bind(Uuid::now_v7().to_string()).bind(format!("revision:{next}")).bind(actor)
-            .bind(if reason=="rollback" {"rollback"}else{"publish"}).bind(inventory_id).bind(next).bind(unix_millis())
+            .bind(Uuid::now_v7().to_string()).bind(audit_event_key.map(str::to_owned).unwrap_or_else(|| format!("revision:{next}"))).bind(actor)
+            .bind(action).bind(inventory_id).bind(next).bind(unix_millis())
             .execute(&mut *tx).await?;
         tx.commit().await?;
         self.application_plugin_revision(next).await

@@ -411,6 +411,25 @@ pub(in crate::api) async fn publish_application_plugin(
 }
 
 #[cfg(feature = "experimental-plugin-revisions")]
+pub(in crate::api) async fn uninstall_application_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::plugin::application::uninstall::UninstallApplicationPlugin>,
+) -> Result<impl IntoResponse, AppError> {
+    let authority = application_authority(&state, &headers).await?;
+    let service = require_service(&headers, &state, "plugins:write").await?;
+    let actor = service
+        .service_id
+        .map(|id| format!("service:{id}"))
+        .unwrap_or_else(|| "bootstrap".into());
+    Ok(Json(
+        authority
+            .uninstall(body, runtime_operation_key(&headers)?, &actor)
+            .await?,
+    ))
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
 pub(in crate::api) async fn rollback_application_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,

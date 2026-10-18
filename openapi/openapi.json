@@ -2726,6 +2726,89 @@
         }
       }
     },
+    "/internal/v1/plugin-runtime/uninstall": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "uninstallApplicationPlugin",
+        "summary": "Uninstall one active plugin using revision CAS (experimental)",
+        "description": "Global operators only. Requires host-only MTC_PLUGIN_INVENTORY_FILE. Derives an immutable subset of the approved current inventory and publishes expected_revision plus one. Retained approvals, configuration, package cache and historical revisions are preserved. Removing the last plugin publishes a durable empty inventory, even if the removed package is unavailable. Only plugin_id and expected_revision are accepted. Exact idempotency replay is actor-bound and returns the original receipt; stale revisions and reused keys with different requests conflict without automatic rebasing.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "x-experimental-feature": "experimental-plugin-revisions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "plugin_id",
+                  "expected_revision"
+                ],
+                "properties": {
+                  "plugin_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9-]{1,64}$"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 1,
+                    "maximum": 9223372036854775806
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Original uninstall publication receipt, including exact replay.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPluginRevision"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "The requested plugin is not present in the expected current plugin inventory."
+          },
+          "409": {
+            "description": "The current plugin revision changed, no published revision exists, or the idempotency key belongs to another request or actor."
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "description": "Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request."
+          }
+        }
+      }
+    },
     "/internal/v1/plugin-runtime/rollback": {
       "post": {
         "tags": [
