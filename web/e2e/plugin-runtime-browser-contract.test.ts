@@ -106,7 +106,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     await page.getByText('broken current catalog', { exact: false }).waitFor();
     await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
     await page.getByRole('button', { name: 'Download network', exact: true }).click();
-    await page.getByLabel('Download network', { exact: true }).selectOption('custom');
+    await page.getByLabel('Download network').selectOption('custom');
     await page.getByLabel('Proxy URL', { exact: true }).fill('http://192.0.2.10:8080');
     await page.getByLabel('Password', { exact: true }).fill('fixture-only');
     await page.getByRole('button', { name: 'Save network', exact: true }).click();
