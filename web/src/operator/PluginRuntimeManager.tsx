@@ -52,6 +52,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
   const [clearPassword, setClearPassword] = useState(false);
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [groupsError, setGroupsError] = useState('');
+  const [groupsLoading, setGroupsLoading] = useState(false);
   const resolveKey = useRef(crypto.randomUUID());
   const mutationLock = useRef(false);
   const networkEdited = useRef(false);
@@ -67,20 +68,23 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
     const request = ++generation.current;
     setStatusError(''); setHistoryError('');
     const current = () => alive.current && request === generation.current;
+    let statusLoaded = false;
+    let historyLoaded = false;
     const statusRead = api<RuntimeStatus>('/internal/v1/plugin-runtime', token).then((nextStatus) => {
       if (!current()) return;
-      setStatus(nextStatus); setUnavailable(false);
+      statusLoaded = true; setStatus(nextStatus); setUnavailable(false);
     }).catch((reason) => {
       if (!current()) return;
       if (reason instanceof ApiError && [403, 404].includes(reason.status)) setUnavailable(true);
       else setStatusError(reason instanceof Error ? reason.message : 'Request failed');
     });
     const historyRead = api<History>('/internal/v1/plugin-runtime/history', token).then((nextHistory) => {
-      if (current()) setHistory(nextHistory);
+      if (current()) { historyLoaded = true; setHistory(nextHistory); }
     }).catch((reason) => {
       if (current()) setHistoryError(reason instanceof Error ? reason.message : 'Request failed');
     });
     await Promise.allSettled([statusRead, historyRead]);
+    return current() && statusLoaded && historyLoaded;
   }, [token]);
   useEffect(() => { void load(); }, [load]);
   const installing = history?.installations.some((job) => job.status === 'installing') ?? false;
@@ -100,12 +104,12 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
     return () => { current = false; };
   }, [token, canManage, text.networkFailed]);
   useEffect(() => {
-    setGroups([]); setGroupsError('');
+    setGroups([]); setGroupsError(''); setGroupsLoading(false);
     if (!canManage || !tenant || network.mode !== 'group') return;
-    let current = true;
+    let current = true; setGroupsLoading(true);
     void api<{ items: ProxyGroup[] }>(`/internal/v1/plugin-runtime/installer-network/groups?tenant_external_id=${encodeURIComponent(tenant)}`, token).then((value) => {
       if (current) setGroups(value.items);
-    }).catch(() => { if (current) setGroupsError(text.groupsFailed); });
+    }).catch(() => { if (current) setGroupsError(text.groupsFailed); }).finally(() => { if (current) setGroupsLoading(false); });
     return () => { current = false; };
   }, [token, tenant, canManage, network.mode, text.groupsFailed]);
 
@@ -120,7 +124,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
 
   async function persistNetwork() {
     const input = network.mode === 'custom'
-      ? { mode: network.mode, url: network.url.trim(), username: network.username?.trim() || null, ...(clearPassword ? { password: '' } : password ? { password } : {}) }
+      ? { mode: network.mode, url: network.url.trim(), username: network.username || null, ...(clearPassword ? { password: '' } : password ? { password } : {}) }
       : network;
     const saved = await api<NetworkView>('/internal/v1/plugin-runtime/installer-network', token, { method: 'PUT', body: JSON.stringify(input) });
     if (alive.current) { setNetwork(saved); setNetworkDirty(false); setNetworkReady(true); setNetworkError(''); setPassword(''); setClearPassword(false); }
@@ -168,12 +172,13 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
     try {
       await api(path, token, { method: 'POST', body: encoded, headers: { 'Idempotency-Key': key } });
       if (!alive.current) return;
-      setMessage(text.done); setApprovals({});
+      setApprovals({});
       if (path === '/internal/v1/plugin-runtime/installations') {
         setResolution(undefined); setTrusted(false); setInstallOpen(false); setActivityOpen(true); resolveKey.current = crypto.randomUUID();
       }
-      await load();
-      if (activates) await Promise.allSettled([onPublished()]);
+      const refreshed = await load();
+      const catalog = activates ? await Promise.allSettled([onPublished()]) : [];
+      if (alive.current) setMessage(refreshed && catalog.every((result) => result.status === 'fulfilled') ? text.done : text.refreshPending);
     } catch (reason) {
       if (alive.current) {
         const stale = reason instanceof ApiError && [404, 409].includes(reason.status);
@@ -234,6 +239,8 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
       {history && (!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <CreateJourney title={text.add} description={text.addHint} open={installOpen} onOpenChange={setInstallOpen} busy={busy}>
         <form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void resolveRelease(); }}>
           <label>{text.releaseUrl}<input type="url" required value={releaseUrl} disabled={busy} placeholder="https://github.com/owner/repo/releases/download/v1/plugin.json" onChange={(event) => { setReleaseUrl(event.target.value); setResolution(undefined); setTrusted(false); resolveKey.current = crypto.randomUUID(); }} /></label>
+          <p className="muted">{text.network}: {network.mode === 'default' ? text.defaultNetwork : network.mode === 'direct' ? text.direct : network.mode === 'group' ? text.group : text.custom}</p>
+          {!networkValid && <p className="notice">{text.chooseNetwork}</p>}
           <Disclosure title={text.network}>
             <div className="plugin-runtime-install-form">
               <p className="muted">{text.networkHint}</p>
@@ -246,7 +253,8 @@ export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: 
               {network.mode === 'group' && <>
                 {!tenant && <p className="notice">{text.needTenant}</p>}
                 {groupsError && <p className="notice error" role="alert">{groupsError}</p>}
-                {tenant && !groupsError && groups.length === 0 && <p className="muted">{text.noGroups}</p>}
+                {groupsLoading && <p role="status">{text.loading}</p>}
+                {tenant && !groupsLoading && !groupsError && groups.length === 0 && <p className="muted">{text.noGroups}</p>}
                 <label>{text.groupLabel}<select disabled={busy || !tenant} value={selectedGroup?.id ?? ''} onChange={(event) => {
                   const group = groups.find((item) => item.id === event.target.value);
                   editNetwork({ mode: 'group', tenant_external_id: tenant, group_id: group?.id ?? '', group_version: group?.version ?? 0, member_id: group?.members[0]?.id ?? '' });
