@@ -787,10 +787,13 @@ impl Database {
                 .bind(&query)
                 .bind(&before_key_id);
         }
-        session_summaries_from_rows(
+        let mut sessions = session_summaries_from_rows(
             session_query.fetch_all(&self.pool).await?,
             Some(limit as usize),
-        )
+        )?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn session_summaries(
@@ -1077,7 +1080,11 @@ impl Database {
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
         session_query = session_query.bind(&filter.state).bind(&model).bind(&query);
-        session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)
+        let mut sessions =
+            session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn unlinked_session_detail(

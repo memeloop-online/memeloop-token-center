@@ -81,7 +81,13 @@ mod routing;
 pub use routing::egress;
 mod rows;
 mod session_analytics;
+mod session_reading;
+pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 mod session_projection;
+mod session_titles;
+pub(crate) use session_titles::{
+    SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
+};
 mod tenants;
 mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;

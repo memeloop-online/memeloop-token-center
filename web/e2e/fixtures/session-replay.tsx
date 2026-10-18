@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { SessionReplayPanel } from '../../src/sessionReplayViews';
+import { SessionDetailSurface } from '../../src/SessionViews';
+import type { SessionContextLoader } from '../../src/sessionContextReader';
 import { ArchiveChangedError, ArchiveUnavailableError, type ArchiveRangeLoader } from '../../src/archiveRange';
 import { MtcFluentProvider } from '../../src/design-system';
 import type { ConversationRequest, LogicalSessionDetail, RequestDetail } from '../../src/types';
@@ -69,6 +71,32 @@ const archives = new Map<string, RequestDetail>([
 ]);
 
 const liveFixture = new URLSearchParams(location.search).has('live');
+const contextFixture = new URLSearchParams(location.search).has('context');
+declare global { interface Window { contextReads: number; contextContentReads: number } }
+window.contextReads = 0;
+window.contextContentReads = 0;
+const contextLoader: SessionContextLoader = {
+  async page(requestId) {
+    window.contextReads += 1;
+    return {
+      contract_version: 'session_context_v1', representation: 'semantic_context',
+      request_id: requestId, session_id: sessionId, next_cursor: null,
+      items: [
+        { node_id: '1'.repeat(64), depth: 1, role: 'user', kind: 'message', phase: null, text: longUserTurn, text_complete: true, source_chars: 4000, content_cursor: 'user' },
+        { node_id: '2'.repeat(64), depth: 2, role: 'assistant', kind: 'message', phase: 'commentary', text: null, text_complete: false, source_chars: 50, content_cursor: 'commentary' },
+        { node_id: '3'.repeat(64), depth: 3, role: 'user', kind: 'function_call', phase: null, text: null, text_complete: false, source_chars: null, content_cursor: 'tool' },
+        { node_id: '4'.repeat(64), depth: 4, role: 'assistant', kind: 'message', phase: 'final', text: 'Retained final answer', text_complete: true, source_chars: 100, content_cursor: 'final' },
+      ],
+    };
+  },
+  async content(_requestId, cursor) {
+    window.contextContentReads += 1;
+    const content = cursor === 'tool' ? '{"arguments":"deferred-tool-secret"}' : '{"content":"expanded message"}';
+    return { contract_version: 'session_context_content_v1', representation: 'semantic_context',
+      node_id: (cursor === 'tool' ? '3' : cursor === 'commentary' ? '2' : cursor === 'final' ? '4' : '1').repeat(64),
+      offset_chars: 0, total_chars: content.length, content, next_cursor: null };
+  },
+};
 const fullFixture = new URLSearchParams(location.search).has('full');
 const fullInvalid = new URLSearchParams(location.search).has('invalid');
 const fullInvalidPayload = new URLSearchParams(location.search).has('invalid-payload');
@@ -150,7 +178,8 @@ function Fixture() {
       <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r3' ? { ...request, archive_state: 'bound' } : request) }))}>Finish late archive</button>
     </>}
     {liveFixture && <button onClick={() => setCurrent(value => ({ ...value, requests: value.requests.map(request => request.request_id === 'replay-r1' ? { ...request, archive_state: 'gap' } : request) }))}>Invalidate complete archive</button>}
-    {fullFixture ? <MtcFluentProvider>
+    {contextFixture ? <MtcFluentProvider><SessionDetailSurface detail={current} loading={false} onLoadOlder={() => {}} onSelect={() => {}}
+      contextLoader={contextLoader} loadReplayArchive={loadArchive} /></MtcFluentProvider> : fullFixture ? <MtcFluentProvider>
       <button onClick={() => { fullVersion = '"fixture-v2"'; }}>Change archive version</button>
       <button onClick={() => setScope(value => `${value}-next`)}>Change full scope</button>
       <SessionReplayPanel detail={current} scopeKey={scope} loadArchiveDetail={loadArchive} loadArchiveRange={loadFullArchive} />

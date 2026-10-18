@@ -35,6 +35,29 @@
 .mtc-fluent-root .session-replay-status span { border: 0; border-radius: 0; font-family: inherit; letter-spacing: normal; }
 .mtc-fluent-root .session-replay-entry { border-radius: var(--borderRadiusMedium); }
 
+.session-context-content { min-width: 0; }
+.session-context-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .65fr); gap: 16px; }
+.session-context-columns > * { min-width: 0; }
+.session-context-columns article { margin-block: 10px; }
+@media (max-width: 760px) {
+  .session-context-columns { grid-template-columns: minmax(0, 1fr); }
+  .session-context-columns > aside { grid-row: 1; }
+}
+.session-context-content pre,
+.session-context-message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+.session-context-content pre {
+  padding: 12px;
+  border-radius: var(--borderRadiusMedium);
+  color: var(--colorNeutralForeground1);
+  background: var(--colorNeutralBackground2);
+}
+.session-title-action { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.session-title-action p { flex-basis: 100%; margin: 0; }
+
 .session-replay-heading,
 .session-replay-heading > div,
 .session-replay-status,
@@ -67,18 +90,20 @@
 .session-replay-layout {
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(170px, 240px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 38%);
+  grid-template-areas: "responses users";
   gap: 14px;
   align-items: start;
 }
 
 .session-replay-turns {
+  grid-area: users;
   position: sticky;
   top: 18px;
   display: grid;
   gap: 8px;
   min-width: 0;
-  max-height: min(70vh, 680px);
+  max-height: 80vh;
   overflow: auto;
   padding: 10px;
   border: 1px solid var(--replay-border);
@@ -102,9 +127,10 @@
 .session-replay-turns button:hover,
 .session-replay-turns button[aria-pressed='true'] { border-color: var(--replay-accent); background: color-mix(in srgb, var(--replay-entry), var(--replay-accent) 13%); }
 .session-replay-turns button span { flex: 0 0 auto; color: var(--replay-accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-.session-replay-turns button b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.session-replay-turns button b { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; font-weight: normal; line-height: 1.65; }
 .session-replay-turns p { margin: 0; color: var(--replay-muted); font-size: 12px; }
 
+.session-replay-layout > .session-replay-feed { grid-area: responses; }
 .session-replay-feed > li { min-width: 0; scroll-margin-block: 24px; }
 .session-replay-feed > li.selected .session-replay-entry { border-color: var(--replay-accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--replay-accent), transparent 60%); }
 .session-replay-entry {
@@ -177,11 +203,11 @@
 }
 
 @media (min-width: 1440px) {
-  .session-replay-layout { grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); }
+  .session-replay-layout { grid-template-columns: minmax(0, 1fr) minmax(300px, 38%); }
 }
 
 @media (max-width: 768px) {
-  .session-replay-layout { grid-template-columns: minmax(150px, 190px) minmax(0, 1fr); }
+  .session-replay-layout { grid-template-columns: minmax(0, 1fr) minmax(200px, 42%); }
   .session-replay-turns { top: 10px; }
 }
 
@@ -189,15 +215,31 @@
   .session-replay { padding: 12px; }
   .session-replay-heading { display: grid; }
   .session-replay-status { justify-content: flex-start; }
-  .session-replay-layout { grid-template-columns: minmax(0, 1fr); }
-  .session-replay-turns { position: static; max-height: 160px; }
-  .session-replay-turns ol { grid-auto-flow: column; grid-auto-columns: minmax(180px, 72%); overflow-x: auto; }
+  .session-replay-layout { grid-template-columns: minmax(0, 1fr); grid-template-areas: "users" "responses"; }
+  .session-replay-turns { position: static; max-height: none; overflow: visible; }
 }
 
 @media (max-width: 320px) {
   .session-replay { gap: 10px; padding: 10px; }
   .session-replay-heading h3 { font-size: 14px; }
-  .session-replay-turns ol { grid-auto-columns: minmax(150px, 86%); }
   .session-replay-entry { padding: 10px; }
   .session-replay-body { padding: 8px; font-size: 14px; }
 }
+
+/* Match the theme selector's specificity so light mode also uses Fluent. */
+:root .mtc-fluent-root .session-replay {
+  --replay-surface: var(--colorNeutralBackground1);
+  --replay-surface-deep: var(--colorNeutralBackground2);
+  --replay-entry: var(--colorNeutralBackground1);
+  --replay-code: var(--colorNeutralBackground2);
+  --replay-border: var(--colorNeutralStroke2);
+  --replay-border-subtle: var(--colorNeutralStroke2);
+  --replay-text: var(--colorNeutralForeground1);
+  --replay-muted: var(--colorNeutralForeground2);
+  --replay-accent: var(--colorBrandForeground1);
+  --replay-warning: var(--colorNeutralForeground2);
+  background: var(--colorNeutralBackground1);
+  border-radius: var(--borderRadiusMedium);
+}
+.mtc-fluent-root .session-replay-entry header,
+.mtc-fluent-root .session-replay-turn-heading { font-family: inherit; letter-spacing: normal; }

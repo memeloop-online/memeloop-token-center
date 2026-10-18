@@ -76,6 +76,9 @@ mod router;
 mod routes;
 mod routing;
 mod self_service;
+mod session_reading;
+mod session_titles;
+pub(crate) use session_titles::process_one as process_session_title;
 mod sessions;
 mod sse;
 pub mod startup;
@@ -132,6 +135,8 @@ pub use router::{router, router_for_role};
 use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
+use session_reading::*;
+use session_titles::{generate_session_title, get_session_title};
 use sessions::*;
 use tenants::{
     archive_tenant, create_tenant, delete_tenant, list_tenant_management, rename_tenant,

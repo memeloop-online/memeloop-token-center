@@ -15,6 +15,38 @@ const artifactRoot = join(webRoot, 'e2e-artifacts', 'session-replay');
 const screenshotWidths = [320, 768, 1440] as const;
 const screenshotLocales = ['zh-CN', 'en'] as const;
 
+test('prefix reader never fetches archives or tool bodies before their disclosure is opened', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?context=1`);
+    await page.getByText('Retained final answer', { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
+    assert.equal(await page.evaluate(() => window.contextReads), 1);
+    assert.equal(await page.evaluate(() => window.contextContentReads), 0);
+    await page.locator('summary').filter({ hasText: /^Full conversation and execution details$/ }).click();
+    await page.locator('summary').filter({ hasText: /Tool calls and results/ }).click();
+    await page.locator('summary').filter({ hasText: 'function_call · 3' }).click();
+    assert.equal(await page.evaluate(() => window.contextContentReads), 0);
+    await page.locator('summary').filter({ hasText: /^Call arguments$/ }).click();
+    await page.getByText(/deferred-tool-secret/).waitFor();
+    assert.equal(await page.evaluate(() => window.contextContentReads), 1);
+    assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
+    await page.locator('summary').filter({ hasText: /^Original request and response archives$/ }).click();
+    await page.waitForFunction(() => Object.keys(window.sessionReplayReads).length > 0);
+  } finally { await browser.close(); await server.close(); }
+});
+
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();
   if (existsSync(defaultExecutable)) return defaultExecutable;
@@ -30,6 +62,16 @@ async function localChromiumExecutable() {
 
 async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+async function expandReplay(page: import('playwright').Page) {
+  // Expand the new hierarchy without opening large archive byte readers.
+  for (let depth = 0; depth < 4; depth += 1) {
+    const buttons = page.locator('.session-replay button[aria-expanded="false"]').filter({
+      hasText: /Full conversation and execution details|完整对话与执行详情|Tool calls and results|工具调用与结果|Tool call ·|Tool result ·|工具调用 ·|工具结果 ·/,
+    });
+    for (const button of await buttons.all()) await button.click();
+  }
 }
 
 test('large archive content is explicit, paged to its real end, and cleared on version or scope changes', { timeout: 45_000 }, async () => {
@@ -50,7 +92,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     const open = page.getByRole('button', { name: 'Read full Response content', exact: true });
     await open.waitFor();
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
-    assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—', '—'], 'snapshot-only data cannot claim zero user or agent activity');
+    assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—'], 'snapshot-only data cannot claim zero user activity');
     assert.equal(await page.getByText('This history has not loaded yet. Try again later.', { exact: true }).count(), 0, 'a readable large archive is not labelled unavailable');
     await open.click();
     const reader = page.locator('.archive-content-reader:not(.collapsed)');
@@ -59,7 +101,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     await nextPaint(page);
     assert.equal(await page.evaluate(() => window.archiveRangeReads), firstReads, 'reading stops at the displayed item page');
     assert.equal(await reader.locator('.session-replay-entry.message').count(), 30);
-    assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—', '—'], 'partial reading does not invent a complete archive count');
+    assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—'], 'partial reading does not invent a complete archive count');
     await mkdir(artifactRoot, { recursive: true });
     for (const theme of ['light', 'dark']) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
@@ -138,6 +180,8 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
   try {
     const page = await browser.newPage();
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?live=1`);
+    await page.locator('.session-replay-turns button').first().waitFor();
+    await expandReplay(page);
     await page.locator('.session-replay-entry.message.user').waitFor();
     assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 0, 'fast content appears before the deliberately slow tool archive');
     for (let index = 4; index < 7; index += 1) {
@@ -149,25 +193,31 @@ test('slow replay reads survive live metadata refresh, publish incrementally and
     await page.getByRole('button', { name: 'Switch replay scope', exact: true }).click();
     assert.equal(await page.locator('.session-replay-entry.message').count(), 0, 'the previous scope is hidden immediately, before the new read completes');
     await page.getByRole('button', { name: 'Resume scope reads', exact: true }).click();
+    await page.locator('.session-replay-turns button').first().waitFor();
+    await expandReplay(page);
     await page.locator('.session-replay-entry.message.user').waitFor();
     await page.getByRole('button', { name: 'Release slow archive', exact: true }).click();
+    await page.locator('.session-replay[data-replay-loading="false"]').waitFor();
+    await expandReplay(page);
     await page.locator('.session-replay-entry.tool-result').waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'metadata-only refreshes never restart completed or in-flight reads');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r2']), 2);
     assert.ok(await page.evaluate(() => window.sessionReplayAborts) > 0, 'scope transition cancels obsolete reads');
     const originalTurn = page.locator('.session-replay-turns button').filter({ hasText: 'Find the forecast for Oslo' });
     await originalTurn.click();
-    const originalEntry = page.locator('.session-replay-feed > li').filter({ has: page.locator('.session-replay-entry.message.user') });
+    const originalEntry = page.locator('.session-replay-layout > .session-replay-feed > li').filter({ has: page.locator('.session-replay-entry.message.user') });
     await originalEntry.evaluate(element => element.setAttribute('data-retained-test', 'true'));
     await page.getByRole('button', { name: 'Append earlier archive', exact: true }).click();
     await page.waitForFunction(() => window.sessionReplayReads['earlier-late'] === 1);
     assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'new unrelated requests retain the selected user turn');
     await page.getByRole('button', { name: 'Release earlier archive', exact: true }).click();
+    await page.locator('.session-replay-turns').getByText('Earlier restored user turn', { exact: true }).waitFor();
+    await expandReplay(page);
     await page.locator('.session-replay-feed').getByText('Earlier restored user turn', { exact: true }).waitFor();
     assert.equal(await originalTurn.getAttribute('aria-pressed'), 'true', 'earlier archives do not move the selected identity to another message');
     assert.equal(await page.locator('.session-replay-feed > li[data-retained-test="true"].selected').count(), 1, 'late insertion preserves the original message DOM and reading state');
     await page.getByRole('button', { name: 'Finish late archive', exact: true }).click();
-    await page.locator('.session-replay-feed').getByText('Late archive arrived', { exact: true }).waitFor();
+    await page.locator('.session-replay-feed').getByText('Late archive arrived', { exact: true }).first().waitFor();
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r1']), 2, 'complete archives are reused inside the same bounded scope');
     assert.equal(await page.evaluate(() => window.sessionReplayReads['replay-r3']), 3, 'late availability refreshes an incomplete archive');
     await page.getByRole('button', { name: 'Invalidate complete archive', exact: true }).click();
@@ -192,6 +242,17 @@ test('SessionReplayPanel renders archived content, keeps missing data explicit, 
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html`);
+    await page.locator('.session-replay[data-replay-loading="false"]').waitFor();
+    assert.equal(await page.locator('.session-replay-entry.tool-call').count(), 0, 'tool bodies are not mounted by default');
+    assert.equal(await page.locator('.session-replay-entry.tool-result').count(), 0, 'tool results are not mounted by default');
+    const userText = page.locator('.session-replay-turns button b').first();
+    assert.equal(await userText.evaluate(element => getComputedStyle(element).whiteSpace), 'pre-wrap', 'the full user message wraps without ellipsis');
+    const sides = await page.evaluate(() => ({
+      users: document.querySelector('.session-replay-turns')!.getBoundingClientRect().left,
+      responses: document.querySelector('.session-replay-feed')!.getBoundingClientRect().left,
+    }));
+    assert.ok(sides.users > sides.responses, 'user messages appear on the right');
+    await expandReplay(page);
     await page.locator('[data-fixture-ready="session-replay"] .session-replay-entry.tool-result').waitFor();
     assert.equal(await page.locator('.session-replay-entry.message.user').count(), 1, 'the fixture must render the archive user message');
     assert.equal(await page.locator('.session-replay-entry.message.assistant').count(), 2, 'the fixture must render both archive agent messages');
@@ -208,7 +269,7 @@ test('SessionReplayPanel renders archived content, keeps missing data explicit, 
     for (const locale of screenshotLocales) {
       await page.evaluate((value) => localStorage.setItem('mtc-locale', value), locale);
       await page.reload();
-      await page.locator('[data-fixture-ready="session-replay"] .session-replay-entry.tool-result').waitFor();
+      await page.locator('.session-replay[data-replay-loading="false"]').waitFor();
       for (const theme of ['dark', 'light'] as const) {
         await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
         for (const width of screenshotWidths) {

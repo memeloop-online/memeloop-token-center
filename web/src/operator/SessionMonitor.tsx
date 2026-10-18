@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { createSessionContextLoader } from '../sessionContextReader.js';
 import { api, apiRead } from '../api.js';
 import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange.js';
 import { useI18n } from '../i18n.js';
 import { Button, Checkbox } from '../design-system';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
+import { SessionTitleAction } from './SessionTitleAction.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
 import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
@@ -82,6 +84,8 @@ function requestArchivePath(tenant: string, requestId: string, side?: 'request' 
 }
 
 function messageOf(reason: unknown, fallback: string) {
+  // Browser-generated timeout strings are not product copy.
+  if (reason instanceof Error && (reason.name === 'TimeoutError' || reason.name === 'AbortError')) return fallback;
   return reason instanceof Error ? reason.message : fallback;
 }
 
@@ -108,6 +112,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);
   const [generatedAt, setGeneratedAt] = useState(0);
   const [error, setError] = useState('');
+  const [errorTarget, setErrorTarget] = useState<'list' | 'detail'>('list');
   const [errorScope, setErrorScope] = useState('');
   const [draft, setDraft] = useState<SessionFilters>(emptySessionFilters);
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
@@ -151,6 +156,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const scopeGeneration = useRef(0);
   const filtersRef = useRef(filters);
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
+  const contextLoader = useMemo(() => selected ? createSessionContextLoader(selected.session_id, token, (requestId, content) => {
+    const params = new URLSearchParams({ key_id: selected.key_id });
+    if (tenant) params.set('tenant_external_id', tenant);
+    return `/internal/v1/sessions/${encodeURIComponent(selected.session_id)}/requests/${encodeURIComponent(requestId)}/context${content ? '/content' : ''}?${params}`;
+  }) : undefined, [selected?.session_id, selected?.key_id, token, tenant]);
   const detailRef = useRef<LogicalSessionDetail | undefined>(detail);
   filtersRef.current = filters;
   selectedRef.current = selected;
@@ -222,6 +232,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (!request.isCurrent() || sequence !== listSequence.current) return false;
       setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorTarget('list');
       setErrorScope(requestScope);
       // A failed live refresh is not an empty result set. Keep the current
       // scoped page (including older pages) and report the refresh failure.
@@ -257,6 +268,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (!request.isCurrent() || sequence !== listSequence.current) return undefined;
       setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorTarget('list');
       setErrorScope(requestScope);
       return undefined;
     } finally {
@@ -285,6 +297,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
     } finally {
@@ -325,6 +338,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
       return false;
@@ -362,6 +376,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch (reason) {
       if (request.isCurrent()) {
         setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorTarget('detail');
         setErrorScope(requestScope);
       }
     } finally {
@@ -655,7 +670,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const visibleDetail = detailScope === scopeKey ? detail : undefined;
   const visibleError = errorScope === scopeKey ? error : '';
   return <>
-    {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
+    {visibleError && <div className="notice error" role="alert">{visibleError} <Button appearance="secondary" disabled={loading || detailLoading} onClick={() => errorTarget === 'detail' && selected ? void selectSession(selected) : void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</Button></div>}
     <RequestRefreshControl
       intervalMs={refreshInterval}
       onIntervalChange={refreshCadence?.onIntervalChange ?? setLocalRefreshInterval}
@@ -684,7 +699,15 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader}
+          titleAction={selected && !visibleDetail.unlinked ? <SessionTitleAction key={`${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`}
+            token={token} tenant={tenant} keyId={selected.key_id} sessionId={visibleDetail.session_id}
+            onTitle={(title) => {
+              const target = selected;
+              setSelected((current) => current?.key_id === target.key_id && current.session_id === target.session_id ? { ...current, session_name: title } : current);
+              setSessions((current) => current.map((session) => session.key_id === target.key_id && session.session_id === target.session_id ? { ...session, session_name: title } : session));
+            }} /> : undefined}
+          onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
       </div>
     </div>
   </>;

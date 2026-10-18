@@ -333,6 +333,15 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     periodic!(
+        "session_titles",
+        Duration::from_secs(5),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = api::process_session_title(state).await {
+                tracing::error!(%error, "worker failed to claim or update a session title");
+            }
+        }
+    );
+    periodic!(
         "oauth_device_login",
         Duration::from_secs(1),
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
