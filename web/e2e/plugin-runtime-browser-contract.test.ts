@@ -135,7 +135,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     await approve.waitFor();
     assert.equal(await approve.isDisabled(), true);
     await page.getByRole('button', { name: 'Review manifest and requested capabilities' }).click();
-    await page.getByText('https://api.example.com', { exact: false }).waitFor();
+    await page.getByRole('listitem').filter({ hasText: 'https://api.example.com' }).waitFor();
     await page.getByRole('checkbox', { name: 'Approve permissions' }).check();
     await approve.click();
     await page.getByText('Ready to activate', { exact: true }).waitFor();

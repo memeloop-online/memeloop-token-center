@@ -22,7 +22,7 @@ export const pluginManagementCopy = {
     title: '插件管理', global: '管理所有租户使用的插件。',
     unavailable: '请启用运行时管理，并使用具有全局插件管理员权限的凭据。',
     loading: '正在读取运行时…', refresh: '刷新运行时', disabled: '暂时无法安装，请联系管理员启用安装功能。',
-    scope: '安装新版本会保留正在使用的插件。激活前请审阅权限。',
+    scope: '安装插件会保留正在使用的插件。激活前请审阅权限。',
     inventory: '新插件集 ID', packages: '固定摘要的 OCI 引用（每行一个）', install: '安装并审阅',
     tasks: '安装任务', review: '审阅清单与请求能力', approve: '批准权限',
     warning: '批准后，此插件集可使用这里列出的全部权限和功能。',

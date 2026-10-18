@@ -156,6 +156,20 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
     } catch { if (alive.current) setError(text.readFailed); }
     finally { mutationLock.current = false; if (alive.current) setBusy(false); }
   }
+  async function installOci() {
+    if (mutationLock.current || !canManage || !networkValid || (!networkReady && !networkDirty)) return;
+    mutationLock.current = true; setBusy(true); setError('');
+    try {
+      if (networkDirty) await persistNetwork();
+    } catch {
+      if (alive.current) { setNetworkError(text.saveFailed); setBusy(false); }
+      mutationLock.current = false;
+      return;
+    }
+    mutationLock.current = false;
+    if (!alive.current) return;
+    await mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) });
+  }
   async function uninstall(pluginId: string) {
     const revision = status?.current?.revision;
     if (revision === undefined || busy || !canManage || !await confirm(text.uninstallConfirm(pluginId))) return;
@@ -298,10 +312,10 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
           <Checkbox label={text.trust} checked={trusted} disabled={busy} onChange={(_, data) => setTrusted(data.checked === true)} />
           <Button appearance="primary" disabled={busy || !trusted} onClick={() => void mutate('/internal/v1/plugin-runtime/installations', { release_resolution_id: resolution.id, release_descriptor_sha256: resolution.descriptor_sha256, packages: [] })}>{text.install}</Button>
         </section>}
-        <Disclosure title={text.advanced}><p className="muted">{text.advancedHint}</p><form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
+        <Disclosure title={text.advanced}><p className="muted">{text.advancedHint}</p><form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void installOci(); }}>
           <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
           <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
-          <Button disabled={busy} type="submit">{busy ? text.pending : text.install}</Button>
+          <Button disabled={busy || !networkValid || (!networkReady && !networkDirty)} type="submit">{busy ? text.pending : text.install}</Button>
         </form></Disclosure>
       </CreateJourney>)}
       <div className="plugin-runtime-disclosures">
@@ -342,6 +356,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
                 <Disclosure title={text.technicalDetails}><pre className="plugin-manifest-details">{JSON.stringify(reviews[job.id].review, null, 2)}</pre></Disclosure>
               </div>}
               {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><Checkbox label={text.approve} disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(_, data) => setApprovals((old) => ({ ...old, [job.id]: data.checked === true }))} /><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
+              {canManage && job.status === 'registered' && status?.candidates.filter((candidate) => candidate.inventory_id === job.inventory_id).map((candidate) => <Button key={candidate.inventory_id} appearance="primary" disabled={busy || publicationRevision(candidate) === undefined || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button>)}
               {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
             </section>)}</div></section>
             <section><h3>{text.history}</h3>
