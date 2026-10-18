@@ -21,7 +21,7 @@ pub struct PluginReleaseDescriptor {
     pub signer: CosignKeylessIdentity,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ResolvedPluginRelease {
     pub release_url: String,
     pub descriptor_sha256: String,
@@ -34,6 +34,8 @@ pub struct ReleaseProxy<'a> {
     pub url: &'a str,
     pub username: Option<&'a str>,
     pub password: Option<&'a str>,
+    pub host: Option<&'a str>,
+    pub addresses: &'a [SocketAddr],
 }
 
 fn invalid_release() -> AppError {
@@ -183,6 +185,10 @@ pub async fn resolve_github_release(
                     _ => return Err(invalid_release()),
                 }
                 builder = builder.proxy(configured);
+                if let Some(host) = proxy.host {
+                    if proxy.addresses.is_empty() { return Err(invalid_release()); }
+                    builder = builder.resolve_to_addrs(host, proxy.addresses);
+                }
             } else {
                 // Pin the address checked above; TLS still authenticates host.
                 builder = builder.resolve_to_addrs(host, &addresses);

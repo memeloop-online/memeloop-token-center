@@ -68,6 +68,8 @@ mod oauth_sessions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
+#[cfg(feature = "experimental-plugin-revisions")]
+pub(crate) mod plugin_release_resolutions;
 mod plugin_kv;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_revisions;

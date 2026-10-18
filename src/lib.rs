@@ -215,7 +215,8 @@ impl AppState {
                             .as_deref()
                             .map(std::path::PathBuf::from),
                     )
-                    .map_err(|_| InitializationError::Plugin)?,
+                    .map_err(|_| InitializationError::Plugin)?
+                    .with_installer_network_key(config.key_pepper.as_bytes()),
                 ))
             }
             None => None,

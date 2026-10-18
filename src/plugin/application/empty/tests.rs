@@ -125,7 +125,9 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
             .install(
                 installation::InstallPluginRequest {
                     inventory_id: "not-empty-api".into(),
-                    packages: vec![]
+                    packages: vec![],
+                    release_resolution_id: None,
+                    release_descriptor_sha256: None,
                 },
                 "ordinary-empty-install",
                 "bootstrap",

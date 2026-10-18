@@ -96,6 +96,7 @@ pub struct ApplicationPlugins {
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
     installation_policy_file: Option<PathBuf>,
+    installer_network_key: Option<Vec<u8>>,
     inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
     #[cfg(test)]
     inventory_reads: std::sync::atomic::AtomicUsize,
@@ -230,6 +231,7 @@ impl ApplicationPlugins {
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
             installation_policy_file: None,
+            installer_network_key: None,
             inventory_stamp: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             inventory_reads: std::sync::atomic::AtomicUsize::new(0),

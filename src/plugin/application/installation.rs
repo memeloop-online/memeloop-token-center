@@ -51,8 +51,14 @@ struct CredentialFiles {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallPluginRequest {
+    #[serde(default)]
     pub inventory_id: String,
+    #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_resolution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_descriptor_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +109,31 @@ pub struct PluginAuditEntry {
 }
 
 impl ApplicationPlugins {
+    pub fn with_installer_network_key(mut self, key: &[u8]) -> Self {
+        self.installer_network_key = Some(key.to_vec());
+        self
+    }
+
+    async fn installation_release_policy(
+        &self,
+        key_hash: &str,
+        actor: &str,
+        policy: &mut InstallPolicy,
+    ) -> Result<Option<crate::db::plugin_release_resolutions::PluginReleaseResolution>, AppError> {
+        let resolution = self.db.installation_plugin_release_resolution(key_hash, actor).await?;
+        if let Some(resolution) = &resolution {
+            let release = &resolution.release;
+            // Operator confirmation authorizes exactly this source, immutable
+            // artifact and signer for this installation. Never mutate host policy.
+            policy.allowed_sources = BTreeSet::from([release.source.clone()]);
+            policy.cosign_public_keys.clear();
+            policy.cosign_keyless = Some(release.descriptor.signer.clone());
+            policy.source_keyless.clear();
+            policy.source_credentials.clear();
+        }
+        Ok(resolution)
+    }
+
     pub fn with_installation_policy_file(
         mut self,
         path: Option<PathBuf>,
@@ -144,7 +175,6 @@ impl ApplicationPlugins {
         }
         if !policy.egress_credentials_valid()
             || !policy.plugin_root.is_absolute()
-            || policy.allowed_sources.is_empty()
             || !policy.signer_policy_valid()
             || policy.cosign_public_keys.len() > 8
             || policy
@@ -186,6 +216,8 @@ impl ApplicationPlugins {
                 InstallPluginRequest {
                     inventory_id: record.inventory_id.clone(),
                     packages: record.packages,
+                    release_resolution_id: None,
+                    release_descriptor_sha256: None,
                 },
                 "retry",
                 &record.actor,
@@ -207,13 +239,34 @@ impl ApplicationPlugins {
 
     async fn install_internal(
         self: &Arc<Self>,
-        input: InstallPluginRequest,
+        mut input: InstallPluginRequest,
         key: &str,
         actor: &str,
         existing_hash: Option<&str>,
     ) -> Result<InstallationRecord, AppError> {
-        validate_inventory_id(&input.inventory_id)?;
         validate_operation(0, key)?;
+        let key_hash = match existing_hash {
+            Some(hash) => hash.to_owned(),
+            None => super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?,
+        };
+        match (&input.release_resolution_id, &input.release_descriptor_sha256) {
+            (Some(id), Some(digest)) => {
+                let resolution = self.db.confirm_plugin_release_resolution(id, digest, actor, &key_hash).await?;
+                if !input.packages.is_empty() {
+                    return Err(AppError::BadRequest("release installation cannot include extra packages".into()));
+                }
+                input.packages = vec![resolution.release.descriptor.reference];
+            }
+            (None, None) => (),
+            _ => return Err(AppError::BadRequest("release resolution and digest confirmation are required together".into())),
+        }
+        // Retry reconstructs the same request from the frozen installation.
+        input.release_resolution_id = None;
+        input.release_descriptor_sha256 = None;
+        if input.inventory_id.is_empty() {
+            input.inventory_id = format!("install-{}", &key_hash[..54]);
+        }
+        validate_inventory_id(&input.inventory_id)?;
         if input.packages.is_empty() || input.packages.len() > 16 {
             return Err(AppError::BadRequest(
                 "install one to sixteen packages per complete inventory".into(),
@@ -238,12 +291,6 @@ impl ApplicationPlugins {
             }
         }
         let hash = super::super::plugin_configuration_schema_digest(&json!(&input))?;
-        let key_hash = match existing_hash {
-            Some(hash) => hash.to_owned(),
-            None => {
-                super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?
-            }
-        };
         if let Some(replay) = self
             .db
             .replay_plugin_installation(&key_hash, &hash, actor)
@@ -251,7 +298,13 @@ impl ApplicationPlugins {
         {
             return Ok(replay);
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        let resolution = self.installation_release_policy(&key_hash, actor, &mut policy).await?;
+        if let Some(resolution) = &resolution {
+            if input.packages != vec![resolution.release.descriptor.reference.clone()] {
+                return Err(AppError::Forbidden);
+            }
+        }
         self.reclaim_unreferenced_installation_attempts().await?;
         if self
             .inventory
@@ -493,7 +546,8 @@ impl ApplicationPlugins {
         if record.status == "registered" {
             return Ok(());
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        self.installation_release_policy(&record.idempotency_hash, &record.actor, &mut policy).await?;
         // Recheck source policy on approval; installing before a trust-policy
         // change does not grandfather an artifact into execution authority.
         if record.packages.iter().any(|reference| {
@@ -775,6 +829,10 @@ impl InstallPolicy {
         Ok(())
     }
     fn signer_policy_valid(&self) -> bool {
+        if self.allowed_sources.is_empty() {
+            return self.cosign_public_keys.is_empty() && self.cosign_keyless.is_none()
+                && self.source_keyless.is_empty();
+        }
         if self.source_keyless.is_empty() {
             return self.cosign_public_keys.is_empty() != self.cosign_keyless.is_none()
                 && self
@@ -1615,6 +1673,8 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         let input = InstallPluginRequest {
             inventory_id: "worker-signers".into(),
             packages,
+            release_resolution_id: None,
+            release_descriptor_sha256: None,
         };
         let (record, run) = state
             .db

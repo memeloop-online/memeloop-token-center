@@ -475,6 +475,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(super::super::plugins::export_application_plugin_descriptor),
         )
         .route(
+            "/internal/v1/plugin-runtime/release-resolutions",
+            post(super::super::plugins::resolve_application_plugin_release),
+        )
+        .route(
             "/internal/v1/plugin-runtime/installations",
             post(super::super::plugins::install_application_plugin),
         )
