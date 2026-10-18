@@ -213,7 +213,7 @@
 }
 
 .typed-filter-row-actions { justify-content: end; }
-.typed-filter-row-actions > button { font-size: 13px; min-width: 32px; padding: 0; width: 32px; }
+.typed-filter-row-actions button:not([class*="fui-"]) { font-size: 13px; min-width: 30px; padding: 6px; }
 .typed-filter-footer { display: flex; gap: 8px; justify-content: space-between; }
 .typed-filter-footer-actions { display: flex; gap: 8px; }
 .typed-filter-presets,
@@ -267,7 +267,7 @@
    spacing of the sibling field/operator cells so every control in the row
    sits on the same baseline. */
 .typed-filter-row .shared-model-picker > label { margin-bottom: 5px; }
-.typed-filter-row .shared-model-picker > input { box-sizing: border-box; height: 32px; min-height: 32px; padding: 5px 10px; }
+.typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { box-sizing: border-box; height: 32px; min-height: 32px; padding: 5px 10px; }
 .typed-filter-dialog > .panel-title { align-items: flex-start; flex-direction: row; gap: 12px; }
 .typed-filter-dialog > .panel-title > div { min-width: 0; }
 .typed-filter-dialog > .panel-title > button { flex-shrink: 0; min-width: 54px; }
@@ -389,7 +389,7 @@
   .typed-filter-value { grid-column: span 2; }
   .typed-filter-row-actions { grid-column: span 2; justify-content: start; }
   .typed-filter-row-actions > button { min-height: 44px; min-width: 44px; width: 44px; }
-  .typed-filter-row .shared-model-picker > input { height: 44px; min-height: 44px; }
+  .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
   .typed-filter-row .fui-Select { min-height: 44px; }
 }
 
