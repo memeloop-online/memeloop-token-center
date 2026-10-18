@@ -1,54 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
-import { Checkbox, Disclosure } from '../design-system';
+import { Button, Checkbox, Disclosure } from '../design-system';
 import { useI18n } from '../i18n';
 import type { PluginManifest } from '../types';
+import { useConfirmDialog } from '../useConfirmDialog';
+import { CreateJourney } from './CreateJourney';
+import { pluginManagementCopy as copy } from './pluginManagementCopy';
 
 interface Revision { revision: number; inventory_id: string; reason: string; created_at?: number }
 interface Candidate { inventory_id: string; staged: boolean; plugins: Record<string, string[]> }
 interface RuntimeStatus { current: Revision | null; candidates: Candidate[] }
 interface Installation {
-  id: string; inventory_id: string; actor: string; status: string; packages: string[];
+  id: string; inventory_id: string; actor: string; status: string; packages: string[]; base_revision?: number | null;
   review_digest: string | null; review: { plugins: PluginManifest[] } | null;
   failure_category: string | null; created_at: number; updated_at: number; completed_packages: number;
 }
 interface Audit { id: string; actor: string; action: string; inventory_id: string | null; revision: number | null; outcome: string; created_at: number }
 interface History { runtime_enabled?: boolean; installation_enabled: boolean; installations: Installation[]; revisions: Revision[]; audit: Audit[] }
 
-const copy = {
-  en: {
-    title: 'Plugin installation and versions', global: 'Global administrator operations',
-    unavailable: 'Runtime management must be enabled and this credential needs global plugin administrator permission.',
-    loading: 'Loading runtime…', refresh: 'Refresh runtime', disabled: 'Installation is disabled. Configure host signing trust and shared inventory storage to enable it.',
-    scope: 'Each inventory is a complete plugin set. Keep required policies and providers. Installation alone does not activate code.',
-    inventory: 'New inventory ID', packages: 'Digest-pinned OCI references (one per line)', install: 'Install for review',
-    tasks: 'Installation tasks', review: 'Review manifest and requested capabilities', approve: 'Approve this exact inventory',
-    warning: 'Approval grants every displayed capability and contract. Review endpoints, schemas and provider contributions before confirming.',
-    retry: 'Retry installation', candidates: 'Available inventories', stage: 'Validate inventory', publish: 'Publish inventory',
-    current: 'Current revision', baseline: 'Startup baseline (no published revision)', history: 'Version history', rollback: 'Roll back to this version',
-    audit: 'Operation audit', older: 'Load older versions', olderAudit: 'Load older audit records', empty: 'No records yet.', done: 'Operation completed.',
-    failed: 'Operation failed. Refresh to view the latest result before retrying.', confirm: 'Confirm global activation',
-    inventoryFlow: 'Inventory and installation', activity: 'Tasks and version records',
-    pending: 'Working…', staged: 'Validated', unstaged: 'Not yet validated',
-  },
-  zh: {
-    title: '插件安装与版本管理', global: '全局管理员操作',
-    unavailable: '请启用运行时管理，并使用具有全局插件管理员权限的凭据。',
-    loading: '正在读取运行时…', refresh: '刷新运行时', disabled: '安装功能未启用。请配置主机签名信任策略和共享库存存储。',
-    scope: '每个库存必须包含完整插件集，请保留需要的策略和供应商。安装本身不会激活代码。',
-    inventory: '新库存 ID', packages: '固定摘要的 OCI 引用（每行一个）', install: '安装并待审阅',
-    tasks: '安装任务', review: '审阅清单与请求能力', approve: '批准此精确库存',
-    warning: '批准会授予所列全部能力与契约。请确认端点、配置结构和供应商贡献后再批准。',
-    retry: '重试安装', candidates: '可用库存', stage: '校验库存', publish: '发布库存',
-    current: '当前版本', baseline: '启动基线（尚未发布版本）', history: '版本历史', rollback: '回退到此版本',
-    audit: '操作审计', older: '读取更早版本', olderAudit: '读取更早审计记录', empty: '暂无记录。', done: '操作已完成。',
-    failed: '操作失败，请刷新查看最新结果后重试。', confirm: '确认全局激活',
-    inventoryFlow: '库存与安装', activity: '任务与版本记录',
-    pending: '处理中…', staged: '已校验', unstaged: '尚未校验',
-  },
-};
 
-export function PluginRuntimeManager({ token, canManage, onPublished }: { token: string; canManage: boolean; onPublished: () => Promise<void> }) {
+interface ReleaseResolution {
+  id: string; base_revision: number; release_url: string; descriptor_sha256: string; source: string;
+  descriptor: { reference: string; signer: { issuer: string; identity: string } };
+}
+type NetworkView = { mode: 'default' | 'direct' } | { mode: 'custom'; url: string; username?: string | null; has_password?: boolean } | { mode: 'group'; tenant_external_id: string; group_id: string; group_version: number; member_id: string };
+interface ProxyGroup { id: string; name: string; version: number; members: { id: string; label: string; scheme: string; host: string; port: number }[] }
+
+export function PluginRuntimeManager({ token, canManage, onPublished, tenant }: { token: string; tenant: string; canManage: boolean; onPublished: () => Promise<void> }) {
   const { locale } = useI18n();
   const text = locale.startsWith('zh') ? copy.zh : copy.en;
   const [status, setStatus] = useState<RuntimeStatus>();
@@ -61,7 +39,23 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
   const [busy, setBusy] = useState(false);
   const [inventory, setInventory] = useState('');
   const [packages, setPackages] = useState('');
-  const [confirmation, setConfirmation] = useState(false);
+  const [installOpen, setInstallOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [releaseUrl, setReleaseUrl] = useState('');
+  const [resolution, setResolution] = useState<ReleaseResolution>();
+  const [trusted, setTrusted] = useState(false);
+  const [network, setNetwork] = useState<NetworkView>({ mode: 'default' });
+  const [networkReady, setNetworkReady] = useState(false);
+  const [networkDirty, setNetworkDirty] = useState(false);
+  const [networkError, setNetworkError] = useState('');
+  const [password, setPassword] = useState('');
+  const [clearPassword, setClearPassword] = useState(false);
+  const [groups, setGroups] = useState<ProxyGroup[]>([]);
+  const [groupsError, setGroupsError] = useState('');
+  const resolveKey = useRef(crypto.randomUUID());
+  const mutationLock = useRef(false);
+  const networkEdited = useRef(false);
+  const { confirm, confirmationDialog } = useConfirmDialog([token, canManage, status?.current?.revision]);
   const [approvals, setApprovals] = useState<Record<string, boolean>>({});
   const [reviews, setReviews] = useState<Record<string, Installation>>({});
   const generation = useRef(0);
@@ -96,9 +90,77 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
     return () => window.clearInterval(timer);
   }, [installing, load]);
 
+  useEffect(() => {
+    if (!canManage) return;
+    let current = true;
+    setNetworkReady(false);
+    void api<NetworkView>('/internal/v1/plugin-runtime/installer-network', token).then((value) => {
+      if (current) { if (!networkEdited.current) setNetwork(value); setNetworkReady(true); setNetworkError(''); }
+    }).catch(() => { if (current) setNetworkError(text.networkFailed); });
+    return () => { current = false; };
+  }, [token, canManage, text.networkFailed]);
+  useEffect(() => {
+    setGroups([]); setGroupsError('');
+    if (!canManage || !tenant || network.mode !== 'group') return;
+    let current = true;
+    void api<{ items: ProxyGroup[] }>(`/internal/v1/plugin-runtime/installer-network/groups?tenant_external_id=${encodeURIComponent(tenant)}`, token).then((value) => {
+      if (current) setGroups(value.items);
+    }).catch(() => { if (current) setGroupsError(text.groupsFailed); });
+    return () => { current = false; };
+  }, [token, tenant, canManage, network.mode, text.groupsFailed]);
+
+  function editNetwork(value: NetworkView) {
+    networkEdited.current = true;
+    setNetwork(value); setNetworkDirty(true); setResolution(undefined); setTrusted(false);
+    resolveKey.current = crypto.randomUUID();
+  }
+  const selectedGroup = network.mode === 'group' && network.tenant_external_id === tenant ? groups.find((group) => group.id === network.group_id) : undefined;
+  const networkValid = network.mode === 'custom' ? Boolean(network.url.trim())
+    : network.mode !== 'group' || Boolean(selectedGroup && selectedGroup.version === network.group_version && selectedGroup.members.some((member) => member.id === network.member_id));
+
+  async function persistNetwork() {
+    const input = network.mode === 'custom'
+      ? { mode: network.mode, url: network.url.trim(), username: network.username?.trim() || null, ...(clearPassword ? { password: '' } : password ? { password } : {}) }
+      : network;
+    const saved = await api<NetworkView>('/internal/v1/plugin-runtime/installer-network', token, { method: 'PUT', body: JSON.stringify(input) });
+    if (alive.current) { setNetwork(saved); setNetworkDirty(false); setNetworkReady(true); setNetworkError(''); setPassword(''); setClearPassword(false); }
+  }
+  async function saveNetwork() {
+    if (mutationLock.current || !canManage || !networkValid) return;
+    mutationLock.current = true; setBusy(true); setMessage(''); setNetworkError('');
+    try { await persistNetwork(); if (alive.current) setMessage(text.networkSaved); }
+    catch { if (alive.current) setNetworkError(text.saveFailed); }
+    finally { mutationLock.current = false; if (alive.current) setBusy(false); }
+  }
+  async function resolveRelease() {
+    if (mutationLock.current || !canManage || !networkValid || (!networkReady && !networkDirty)) return;
+    mutationLock.current = true; setBusy(true); setError(''); setMessage(''); setResolution(undefined); setTrusted(false);
+    try {
+      if (networkDirty) await persistNetwork();
+      const value = await api<ReleaseResolution>('/internal/v1/plugin-runtime/release-resolutions', token, {
+        method: 'POST', headers: { 'Idempotency-Key': resolveKey.current }, body: JSON.stringify({ url: releaseUrl.trim() }),
+      });
+      if (alive.current) setResolution(value);
+    } catch { if (alive.current) setError(text.readFailed); }
+    finally { mutationLock.current = false; if (alive.current) setBusy(false); }
+  }
+  async function uninstall(pluginId: string) {
+    const revision = status?.current?.revision;
+    if (revision === undefined || busy || !canManage || !await confirm(text.uninstallConfirm(pluginId))) return;
+    await mutate('/internal/v1/plugin-runtime/uninstall', { plugin_id: pluginId, expected_revision: revision }, true);
+  }
+  async function activate(candidate: Candidate) {
+    if (busy || !canManage || !await confirm(text.activateConfirm(candidate.inventory_id))) return;
+    await mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: history?.installations.find((job) => job.inventory_id === candidate.inventory_id)?.base_revision ?? status?.current?.revision ?? 0 }, true);
+  }
+  async function rollback(revision: Revision) {
+    if (busy || !canManage || !await confirm(text.rollbackConfirm(revision.revision))) return;
+    await mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status?.current?.revision }, true);
+  }
+
   async function mutate(path: string, body: unknown, activates = false) {
-    if (busy || !canManage) return;
-    setBusy(true); setError(''); setMessage('');
+    if (mutationLock.current || !canManage) return;
+    mutationLock.current = true; setBusy(true); setError(''); setMessage('');
     const encoded = JSON.stringify(body);
     const identity = `${path}\0${encoded}`;
     const key = keys.current.get(identity) ?? crypto.randomUUID();
@@ -106,12 +168,19 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
     try {
       await api(path, token, { method: 'POST', body: encoded, headers: { 'Idempotency-Key': key } });
       if (!alive.current) return;
-      setMessage(text.done); setConfirmation(false); setApprovals({});
+      setMessage(text.done); setApprovals({});
+      if (path === '/internal/v1/plugin-runtime/installations') {
+        setResolution(undefined); setTrusted(false); setInstallOpen(false); setActivityOpen(true); resolveKey.current = crypto.randomUUID();
+      }
       await load();
-      if (activates) await onPublished();
+      if (activates) await Promise.allSettled([onPublished()]);
     } catch (reason) {
-      if (alive.current) { setError(`${text.failed} ${reason instanceof Error ? reason.message : ''}`); await load(); }
-    } finally { if (alive.current) setBusy(false); }
+      if (alive.current) {
+        const stale = reason instanceof ApiError && [404, 409].includes(reason.status);
+        if (stale) { keys.current.delete(identity); setResolution(undefined); setTrusted(false); resolveKey.current = crypto.randomUUID(); }
+        setError(stale ? text.changed : `${text.failed} ${reason instanceof Error ? reason.message : ''}`); await load();
+      }
+    } finally { mutationLock.current = false; if (alive.current) setBusy(false); }
   }
 
   async function older() {
@@ -143,43 +212,91 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
     } catch (reason) { if (alive.current) setError(reason instanceof Error ? reason.message : text.failed); }
   }
 
+  const activeSet = status?.current ? status.candidates.find((candidate) => candidate.inventory_id === status.current?.inventory_id) : undefined;
+  const activePlugins = Object.entries(activeSet?.plugins ?? {});
   return <article className="panel" aria-label={text.title}>
-    <div className="panel-title"><div><h2>{text.title}</h2><p className="muted">{text.global}</p></div><button type="button" className="secondary" disabled={busy} onClick={() => void load()}>{text.refresh}</button></div>
+    {confirmationDialog}
+    <div className="panel-title"><div><h2>{text.title}</h2><p className="muted">{text.global}</p></div><Button appearance="secondary" disabled={busy} onClick={() => void load()}>{text.refresh}</Button></div>
     {error && <p className="notice error" role="alert">{error}</p>}
     {message && <p className="notice" role="status">{message}</p>}
     {unavailable ? <p className="muted">{text.unavailable}</p> : <>
       {statusError && <p className="notice error" role="alert">{statusError}</p>}
       {!status && !statusError && <p role="status">{text.loading}</p>}
-      {status && <>
-        <p>{text.current}: {history?.runtime_enabled === false ? text.unavailable : status.current ? `${status.current.revision} · ${status.current.inventory_id}` : text.baseline}</p>
-        <p className="muted">{text.scope}</p>
-      </>}
+      {status && <section aria-label={text.active}>
+        <h3>{text.active}</h3>
+        <p className="muted">{text.current}: {status.current ? status.current.revision : text.baseline}</p>
+        {!activeSet ? <p className="notice">{!status.current && status.candidates.length === 0 ? text.noActive : text.missingActive}</p> : activePlugins.length === 0 ? <p className="empty">{text.noActive}</p> : <div className="plugin-runtime-list">{activePlugins.map(([id, versions]) => <div className="managed-resource" key={id}>
+          <div className="managed-resource-header"><div><b>{id}</b><span>{versions.join(', ')}</span></div><Button appearance="secondary" disabled={busy || !canManage || Boolean(statusError)} onClick={() => void uninstall(id)}>{text.uninstall}</Button></div>
+        </div>)}</div>}
+      </section>}
       {historyError && <p className="notice error" role="alert">{historyError}</p>}
+      {!history && !historyError && <p role="status">{text.loading}</p>}
+      {history && (!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <CreateJourney title={text.add} description={text.addHint} open={installOpen} onOpenChange={setInstallOpen} busy={busy}>
+        <form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void resolveRelease(); }}>
+          <label>{text.releaseUrl}<input type="url" required value={releaseUrl} disabled={busy} placeholder="https://github.com/owner/repo/releases/download/v1/plugin.json" onChange={(event) => { setReleaseUrl(event.target.value); setResolution(undefined); setTrusted(false); resolveKey.current = crypto.randomUUID(); }} /></label>
+          <Disclosure title={text.network}>
+            <div className="plugin-runtime-install-form">
+              <p className="muted">{text.networkHint}</p>
+              {networkError && <p className="notice error" role="alert">{networkError}</p>}
+              <label>{text.network}<select value={network.mode} disabled={busy} onChange={(event) => {
+                setPassword(''); setClearPassword(false);
+                const mode = event.target.value;
+                editNetwork(mode === 'custom' ? { mode, url: '', username: '' } : mode === 'group' ? { mode, tenant_external_id: tenant, group_id: '', group_version: 0, member_id: '' } : { mode: mode === 'direct' ? 'direct' : 'default' });
+              }}><option value="default">{text.defaultNetwork}</option><option value="direct">{text.direct}</option><option value="group">{text.group}</option><option value="custom">{text.custom}</option></select></label>
+              {network.mode === 'group' && <>
+                {!tenant && <p className="notice">{text.needTenant}</p>}
+                {groupsError && <p className="notice error" role="alert">{groupsError}</p>}
+                {tenant && !groupsError && groups.length === 0 && <p className="muted">{text.noGroups}</p>}
+                <label>{text.groupLabel}<select disabled={busy || !tenant} value={selectedGroup?.id ?? ''} onChange={(event) => {
+                  const group = groups.find((item) => item.id === event.target.value);
+                  editNetwork({ mode: 'group', tenant_external_id: tenant, group_id: group?.id ?? '', group_version: group?.version ?? 0, member_id: group?.members[0]?.id ?? '' });
+                }}><option value="">{text.select}</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>
+                <label>{text.member}<select disabled={busy || !selectedGroup} value={selectedGroup ? network.member_id : ''} onChange={(event) => editNetwork({ ...network, member_id: event.target.value })}><option value="">{text.select}</option>{selectedGroup?.members.map((member) => <option key={member.id} value={member.id}>{member.label || `${member.scheme}://${member.host}:${member.port}`}</option>)}</select></label>
+              </>}
+              {network.mode === 'custom' && <>
+                <label>{text.proxyUrl}<input type="url" disabled={busy} value={network.url} placeholder="http://proxy.example:8080" onChange={(event) => editNetwork({ ...network, url: event.target.value, has_password: false })} /></label><p className="muted">{text.proxyHint}</p>
+                <label>{text.username}<input autoComplete="off" disabled={busy} value={network.username ?? ''} onChange={(event) => editNetwork({ ...network, username: event.target.value, has_password: false })} /></label>
+                <label>{text.password}<input type="password" autoComplete="new-password" disabled={busy || clearPassword} value={password} onChange={(event) => { setPassword(event.target.value); editNetwork(network); }} /></label>
+                {network.has_password && <p className="muted">{text.passwordKept}</p>}
+                <Checkbox label={text.clearPassword} disabled={busy} checked={clearPassword} onChange={(_, data) => { setClearPassword(data.checked === true); setPassword(''); editNetwork(network); }} />
+              </>}
+              <Button type="button" appearance="secondary" disabled={busy || !networkValid} onClick={() => void saveNetwork()}>{text.saveNetwork}</Button>
+            </div>
+          </Disclosure>
+          <Button appearance="primary" type="submit" disabled={busy || !networkValid || (!networkReady && !networkDirty)}>{busy ? text.pending : text.resolve}</Button>
+          {networkError && <p className="notice error" role="alert">{networkError}</p>}
+        </form>
+        {resolution && <section className="plugin-runtime-section" aria-label={text.review}>
+          <dl className="plugin-release-details"><dt>{text.source}</dt><dd>{resolution.source}</dd><dt>{text.releaseUrl}</dt><dd>{resolution.release_url}</dd><dt>{text.reference}</dt><dd>{resolution.descriptor.reference}</dd><dt>{text.issuer}</dt><dd>{resolution.descriptor.signer.issuer}</dd><dt>{text.identity}</dt><dd>{resolution.descriptor.signer.identity}</dd><dt>{text.digest}</dt><dd>{resolution.descriptor_sha256}</dd></dl>
+          <p className="muted">{text.trustHint}</p><p>{text.scope}</p>
+          <Checkbox label={text.trust} checked={trusted} disabled={busy} onChange={(_, data) => setTrusted(data.checked === true)} />
+          <Button appearance="primary" disabled={busy || !trusted} onClick={() => void mutate('/internal/v1/plugin-runtime/installations', { release_resolution_id: resolution.id, release_descriptor_sha256: resolution.descriptor_sha256, packages: [] })}>{text.install}</Button>
+        </section>}
+        <Disclosure title={text.advanced}><p className="muted">{text.advancedHint}</p><form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
+          <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
+          <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
+          <Button disabled={busy} type="submit">{busy ? text.pending : text.install}</Button>
+        </form></Disclosure>
+      </CreateJourney>)}
       <div className="plugin-runtime-disclosures">
-        <Disclosure title={text.inventoryFlow} defaultOpen><div className="plugin-runtime-section">
+        <Disclosure title={text.inventoryFlow}><div className="plugin-runtime-section">
           {status && <><h3>{text.candidates}</h3>
-            {canManage && <Checkbox label={text.confirm} checked={confirmation} onChange={(_, data) => setConfirmation(data.checked === true)} />}
+            {status.candidates.length === 0 && <p className="empty">{text.empty}</p>}
             <div className="plugin-runtime-list">{status.candidates.map((candidate) => <div className="managed-resource" key={candidate.inventory_id}>
               <div className="plugin-runtime-resource-heading"><b>{candidate.inventory_id}</b><span className="pill">{candidate.staged ? text.staged : text.unstaged}</span></div>
-              <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ')}</p>
-              <div className="plugin-runtime-actions"><button type="button" className="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</button>
-              <button type="button" disabled={busy || !canManage || !confirmation || candidate.inventory_id === status.current?.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/publish', { inventory_id: candidate.inventory_id, expected_revision: status.current?.revision ?? 0 }, true)}>{text.publish}</button></div>
+              <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ') || text.noActive}</p>
+              <div className="plugin-runtime-actions"><Button appearance="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</Button>
+              <Button appearance="primary" disabled={busy || !canManage || Boolean(statusError) || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button></div>
             </div>)}</div>
           </>}
-          {!history && !historyError && <p role="status">{text.history}: {text.loading}</p>}
-          {history && (!history.installation_enabled ? <p className="notice">{text.disabled}</p> : canManage && <form className="plugin-runtime-install-form" onSubmit={(event) => { event.preventDefault(); void mutate('/internal/v1/plugin-runtime/installations', { inventory_id: inventory.trim(), packages: packages.split('\n').map((line) => line.trim()).filter(Boolean) }); }}>
-            <label>{text.inventory}<input required pattern="[A-Za-z0-9_-]{1,64}" value={inventory} onChange={(event) => setInventory(event.target.value)} disabled={busy} /></label>
-            <label>{text.packages}<textarea required rows={3} value={packages} onChange={(event) => setPackages(event.target.value)} disabled={busy} placeholder="ghcr.io/example/plugin@sha256:…" /></label>
-            <button disabled={busy} type="submit">{busy ? text.pending : text.install}</button>
-          </form>)}
         </div></Disclosure>
-        <Disclosure title={text.activity}><div className="plugin-runtime-section">
+        <Disclosure title={text.activity} open={activityOpen} onOpenChange={setActivityOpen}><div className="plugin-runtime-section">
           {!history && !historyError && <p role="status">{text.history}: {text.loading}</p>}
           {history && <>
             <section><h3>{text.tasks}</h3>
             {history.installations.length === 0 && <p className="muted">{text.empty}</p>}
             <div className="plugin-runtime-list">{history.installations.map((job) => <section className="managed-resource" key={job.id}>
-              <div className="plugin-runtime-resource-heading"><b>{job.inventory_id}</b><span className="pill">{job.status}</span></div><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
+              <div className="plugin-runtime-resource-heading"><b>{job.inventory_id}</b><span className="pill">{text.statusLabel(job.status)}</span></div><p className="muted">{job.completed_packages ?? 0}/{job.packages.length} · {new Date(job.updated_at).toLocaleString(locale)} · {job.actor}</p>
               {job.failure_category && <p role="alert">{job.failure_category}</p>}
               {job.review_digest && <button type="button" className="secondary" onClick={() => void review(job)}>{text.review}</button>}
               {reviews[job.id]?.review && <details open><summary>{text.review}</summary><pre style={{ maxHeight: '24rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(reviews[job.id].review, null, 2)}</pre></details>}
@@ -190,7 +307,7 @@ export function PluginRuntimeManager({ token, canManage, onPublished }: { token:
             {history.revisions.length === 0 && <p className="muted">{text.empty}</p>}
             <div className="plugin-runtime-list">{history.revisions.map((revision) => <div className="managed-resource" key={revision.revision}>
               <b>{revision.revision} · {revision.inventory_id}</b> <span>{revision.reason}</span>
-              <button type="button" className="secondary" disabled={busy || !canManage || !confirmation || !status?.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void mutate('/internal/v1/plugin-runtime/rollback', { target_revision: revision.revision, expected_revision: status?.current?.revision }, true)}>{text.rollback}</button>
+              <button type="button" className="secondary" disabled={busy || !canManage || Boolean(statusError) || !status?.current || revision.revision >= status.current.revision || revision.inventory_id === status.current.inventory_id} onClick={() => void rollback(revision)}>{text.rollback}</button>
             </div>)}</div>
             {history.revisions.length > 0 && <button type="button" className="secondary" disabled={busy} onClick={() => void older()}>{text.older}</button>}</section>
             <section><h3>{text.audit}</h3>

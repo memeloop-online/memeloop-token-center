@@ -94,3 +94,28 @@
     width: 100%;
   }
 }
+
+.plugin-release-details {
+  margin: 0;
+  display: grid;
+  gap: var(--spacingVerticalS);
+}
+
+.plugin-release-details dt {
+  color: var(--colorNeutralForeground2);
+}
+
+.plugin-release-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.plugin-runtime-list .managed-resource-header {
+  gap: var(--spacingHorizontalM);
+  flex-wrap: wrap;
+}
+
+.plugin-runtime-list .managed-resource-header > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
