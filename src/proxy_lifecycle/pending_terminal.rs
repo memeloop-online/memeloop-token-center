@@ -769,26 +769,25 @@ impl Journal {
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            match pending.entry(snapshot.receipt_id) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    tracing::info!(request_id = %snapshot.request_id, %receipt_id, financial_state = "pending_durable", "pending terminal receipt recovered");
-                    entry.insert(Pending {
-                        snapshot: Arc::new(snapshot),
-                        activity: None,
-                        retained: None,
-                        running: false,
-                        durable: true,
-                        applied: false,
-                        reconcile: false,
-                        operational_running: false,
-                        operational_acknowledged: false,
-                        unknown_annotated: false,
-                        operational_reconcile: false,
-                        preparation: None,
-                        projection_retained: None,
-                    });
-                }
-                _ => {}
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                pending.entry(snapshot.receipt_id)
+            {
+                tracing::info!(request_id = %snapshot.request_id, %receipt_id, financial_state = "pending_durable", "pending terminal receipt recovered");
+                entry.insert(Pending {
+                    snapshot: Arc::new(snapshot),
+                    activity: None,
+                    retained: None,
+                    running: false,
+                    durable: true,
+                    applied: false,
+                    reconcile: false,
+                    operational_running: false,
+                    operational_acknowledged: false,
+                    unknown_annotated: false,
+                    operational_reconcile: false,
+                    preparation: None,
+                    projection_retained: None,
+                });
             }
         }
     }
