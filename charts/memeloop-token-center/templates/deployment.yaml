@@ -49,9 +49,15 @@ kind: Deployment
 metadata:
   name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   annotations:
+    {{- if $.Values.plugins.runtimeInventory.enabled }}
+    # Writers initialize an empty shared PVC before read-only worker startup.
+    # Gateway follows the worker so producers retain their drain dependency.
+    argocd.argoproj.io/sync-wave: {{ if $runtimeWriter }}"0"{{ else if eq $role "worker" }}"1"{{ else }}"2"{{ end }}
+    {{- else }}
     # Worker joins ServiceAccount/PVC creation in wave 0. Argo waits for it
     # before applying split-role producers, including on a fresh installation.
     argocd.argoproj.io/sync-wave: {{ ternary "1" "0" (or (eq $role "gateway") (eq $role "control")) | quote }}
+    {{- end }}
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
@@ -184,9 +190,9 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
-            {{- if and $.Values.config.terminalProjectionEnabled (or (eq $role "gateway") (eq $role "all")) }}
+            {{- if or (eq $role "gateway") (eq $role "all") }}
             - name: MTC_TERMINAL_PROJECTION_ENABLED
-              value: "true"
+              value: {{ $.Values.config.terminalProjectionEnabled | default false | quote }}
             {{- end }}
             {{- include "memeloop-token-center.runtimeInventory.env" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
             - name: MTC_GATEWAY_POD_NAME

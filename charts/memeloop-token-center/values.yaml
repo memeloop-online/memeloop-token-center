@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 127
+  schemaVersion: 130
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -221,6 +221,8 @@ plugins:
   # The existing PVC must support concurrent multi-node mounts (normally RWX)
   # and coherent POSIX locks, hard links, rename and fsync.
   runtimeInventory:
+    # Deployment provisioning is explicit: no durable claim/trust means no
+    # browser installation, never an automatic emptyDir/ConfigMap fallback.
     enabled: false
     existingClaim: ""
     persistence:
@@ -228,7 +230,11 @@ plugins:
       storageClass: ""
       size: 1Gi
     installationEnabled: false
-    # Host-owned policy.json; paths refer to the mounts documented in the guide.
+    # Host-owned policy.json must place plugin_root on durable storage: the
+    # shared runtime PVC or an independently persistent package mount.
+    # /tmp is transient extraction space and must never be the package root.
+    # Installation approvals/configurations/revision head also require a
+    # persistent external database via config.databaseUrlSecret.
     policyConfigMap: ""
     # Explicit keyless mode omits the public-key Secret; policy.json must then
     # contain an exact reviewed GitHub Actions issuer and workflow identity.

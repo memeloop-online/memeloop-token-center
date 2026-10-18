@@ -501,7 +501,7 @@
         ],
         "operationId": "createClientCredential",
         "summary": "Provision a stable client identity and its first credential",
-        "description": "Creates or reuses the tenant and principal, creates a credit account and stable\n`key_id`, then returns the one-time `mtc_…` secret. When `Idempotency-Key` is\nsupplied, an identical request may replay the same response for 24 hours; use\nof the same key with a different normalized request is rejected. The\n`memeloop-cloud-principal:` namespace is reserved for the Cloud integration\nand cannot be claimed through this generic endpoint.\n",
+        "description": "Creates or reuses the tenant and principal, creates a credit account and stable\n`key_id`, then returns the one-time `mtc_\u2026` secret. When `Idempotency-Key` is\nsupplied, an identical request may replay the same response for 24 hours; use\nof the same key with a different normalized request is rejected. The\n`memeloop-cloud-principal:` namespace is reserved for the Cloud integration\nand cannot be claimed through this generic endpoint.\n",
         "security": [
           {
             "serviceBearer": []
@@ -2231,7 +2231,7 @@
         ],
         "operationId": "installPluginInventory",
         "summary": "Install new signed OCI packages into an inactive inventory for review",
-        "description": "Requires host installation policy. The host owns storage roots, allowed repositories, Cosign trust keys and registry credential files. Only digest-pinned references and a fresh inventory ID are accepted. A durable task survives HTTP disconnect; exact retries reuse the task. Successful download does not register grants or publish a revision.",
+        "description": "A normal browser install supplies release_resolution_id and release_descriptor_sha256 as explicit confirmation of the displayed source, immutable reference and exact signing identity. Its inventory ID is generated server side. The frozen resolution authorizes only this installation; host source policy is not changed. Current exact approved plugins are retained without downloading or reapproving them. The base runtime revision is checked before review, approval and publication; conflicts require a new resolution. Existing digest-pinned OCI packages and inventory_id remain the advanced interface. Full Cosign verification and a subsequent explicit capability review are required. Network credentials travel to the installer only through bounded anonymous stdin, never argv, environment or temporary files.",
         "security": [
           {
             "serviceBearer": []
@@ -2258,10 +2258,6 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "inventory_id",
-                  "packages"
-                ],
                 "properties": {
                   "inventory_id": {
                     "type": "string",
@@ -2269,7 +2265,7 @@
                   },
                   "packages": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 16,
                     "uniqueItems": true,
                     "items": {
@@ -2277,6 +2273,17 @@
                       "maxLength": 2048,
                       "pattern": "^[^@]+@sha256:[0-9A-Fa-f]{64}$"
                     }
+                  },
+                  "release_resolution_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "release_descriptor_sha256": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "network": {
+                    "$ref": "#/components/schemas/PluginInstallerNetworkInput"
                   }
                 }
               }
@@ -2715,6 +2722,89 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/internal/v1/plugin-runtime/uninstall": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "uninstallApplicationPlugin",
+        "summary": "Uninstall one active plugin using revision CAS (experimental)",
+        "description": "Global operators only. Requires host-only MTC_PLUGIN_INVENTORY_FILE. Derives an immutable subset of the approved current inventory and publishes expected_revision plus one. Retained approvals, configuration, package cache and historical revisions are preserved. Removing the last plugin publishes a durable empty inventory, even if the removed package is unavailable. Only plugin_id and expected_revision are accepted. Exact idempotency replay is actor-bound and returns the original receipt; stale revisions and reused keys with different requests conflict without automatic rebasing.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "x-experimental-feature": "experimental-plugin-revisions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "plugin_id",
+                  "expected_revision"
+                ],
+                "properties": {
+                  "plugin_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9-]{1,64}$"
+                  },
+                  "expected_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 1,
+                    "maximum": 9223372036854775806
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Original uninstall publication receipt, including exact replay.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationPluginRevision"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "The requested plugin is not present in the expected current plugin inventory."
+          },
+          "409": {
+            "description": "The current plugin revision changed, no published revision exists, or the idempotency key belongs to another request or actor."
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "description": "Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request."
           }
         }
       }
@@ -13754,6 +13844,195 @@
           }
         ]
       }
+    },
+    "/internal/v1/plugin-runtime/release-resolutions": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "resolvePluginRelease",
+        "summary": "Resolve a GitHub release asset for explicit source and signer confirmation",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Private response; credentials are never returned."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "maxLength": 2048
+                  },
+                  "network": {
+                    "$ref": "#/components/schemas/PluginInstallerNetworkInput"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          }
+        ],
+        "description": "Downloads a bounded HTTPS GitHub release JSON asset through the frozen installation network. Returns id, base_revision, release_url, descriptor_sha256, source and descriptor with reference and signer. Discovery does not authorize the signer: the operator must explicitly confirm it in the installation request. The descriptor and current approved plugin inventory are persisted; install and retry never refetch the URL. No private roots, proxy credentials or retained grants are returned."
+      }
+    },
+    "/internal/v1/plugin-runtime/installer-network": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getPluginInstallerNetwork",
+        "summary": "Read remembered installer network without proxy password",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Private response; credentials are never returned."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "putPluginInstallerNetwork",
+        "summary": "Remember the installation network",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Private response; credentials are never returned."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginInstallerNetworkInput"
+              }
+            }
+          }
+        },
+        "description": "Credentials are encrypted at rest. default freezes the deployment network; direct bypasses it. Custom HTTP or SOCKS proxy DNS is frozen to approved addresses. HTTPS proxy hostnames are rejected for the external installer; HTTPS IP endpoints are supported. An omitted password preserves the remembered password only for the same URL and username; empty clears it."
+      }
+    },
+    "/internal/v1/plugin-runtime/installer-network/groups": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "listPluginInstallerNetworkGroups",
+        "summary": "List installation proxy groups for one tenant",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "plugins:write",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Private response; credentials are never returned."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant_external_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Also requires providers:read for the tenant. Returns the existing safe transport group list with versions and member IDs; never returns proxy credentials."
+      }
     }
   },
   "components": {
@@ -13761,13 +14040,13 @@
       "serviceBearer": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "mts_…",
+        "bearerFormat": "mts_\u2026",
         "description": "Bootstrap service token or a stored service credential with the required scope and tenant boundary."
       },
       "clientBearer": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "mtc_… or imported opaque credential",
+        "bearerFormat": "mtc_\u2026 or imported opaque credential",
         "description": "The active normal credential generation for one stable client identity."
       },
       "memeloopCloudHmac": {
@@ -15599,6 +15878,11 @@
           "updated_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "base_revision": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Frozen current revision for additive URL installations; publication must use it as expected_revision."
           }
         }
       },
@@ -27728,6 +28012,88 @@
             "maxLength": 32000
           }
         }
+      },
+      "PluginInstallerNetworkInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "direct"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode",
+              "url"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "custom"
+                ]
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048
+              },
+              "username": {
+                "type": "string",
+                "maxLength": 255
+              },
+              "password": {
+                "type": "string",
+                "maxLength": 255,
+                "writeOnly": true
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode",
+              "tenant_external_id",
+              "group_id",
+              "group_version",
+              "member_id"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "group"
+                ]
+              },
+              "tenant_external_id": {
+                "type": "string"
+              },
+              "group_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "group_version": {
+                "type": "integer"
+              },
+              "member_id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            }
+          }
+        ]
       }
     }
   }

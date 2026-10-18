@@ -22,7 +22,7 @@ import { IdentityPage } from './pages/IdentityPage';
 import { identityCopy } from './identityCopy';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy';
 import { currentProxyGroupNavigationContext, type ProxyGroupNavigationContext } from '../app/proxyGroupNavigation';
-import { LoadingState, PageLoadingRegion } from '../design-system';
+import { Button, LoadingState, PageLoadingRegion } from '../design-system';
 import {
   PluginContributionPage,
   PluginModelRouteActions,
@@ -215,6 +215,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   const accessSettings = <OperatorAccessSettings
     credentialInput={scope.credentialInput}
     credential={scope.credential}
+    validated={scope.validated}
     authenticating={scope.authenticating}
     onCredentialInput={scope.setCredentialInput}
     onConnect={(credential) => { void scope.authenticate(credential); }}
@@ -278,8 +279,9 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : t(item.label)}</button>;
     })}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
+    {scope.serviceFault && <div className="notice error" role="alert">{scope.serviceFault}<Button appearance="secondary" onClick={scope.retry} disabled={scope.authenticating}>{t('common.retry')}</Button></div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating && activeRoute !== 'system-settings'
+      {scope.authenticating && !scope.activeCredential && activeRoute !== 'system-settings'
         ? <LoadingState label={t('common.loading')} level="page" />
         : <Fragment key={pageScopeKey}><Suspense fallback={<LoadingState label={t('common.loading')} level="page" />}>{page}</Suspense></Fragment>}
     </section>

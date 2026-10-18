@@ -65,7 +65,7 @@ certificate credentials and context. No Windows configuration was modified.
   atoms are not a claim of byte-for-byte original archive fidelity. Tests were
   added for >1,024 messages, repeated messages, resets, Unicode chunks,
   ownership boundaries and retired credentials; they still require CI.
-- Added migration 128 and a credential-scoped title queue. It stores one title
+- Added migration 131 and a credential-scoped title queue. It stores one title
   plus job state, no copied conversation. Initial unnamed observations enqueue
   idempotently; explicit regeneration preserves the prior title. Leases fence
   stale completions, three attempts bound execution retries (including worker
@@ -131,3 +131,15 @@ The following requested work is **not complete**:
   resets, compactions, missing archives and branch boundaries.
 - CI validation and deployment. These local changes have not changed the
   production application.
+
+## CI handoff
+
+Draft PR: https://github.com/memeloop-online/memeloop-token-center/pull/657
+
+The task-only changes were committed using a separate Git index, excluding
+unrelated dirty proxy-lifecycle edits. Review/CI work now continues in the
+isolated worktree `/tmp/mtc-session-review.uHCVTq`, branch
+`fix/session-reading-20261018`. The original workspace remains untouched.
+The first PR revision conflicted with newer master migrations 128–130; the
+review branch merges master and assigns the title migration version 131.
+This supersedes the earlier migration number in the original worktree.

@@ -670,8 +670,23 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
         name: "bounded generated session titles",
-        sql: include_str!("../../../migrations/common/0128_session_generated_titles.sql"),
+        sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
     },
 ];
 
@@ -1326,8 +1341,23 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
         name: "bounded generated session titles",
-        sql: include_str!("../../../migrations/common/0128_session_generated_titles.sql"),
+        sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
     },
 ];
 

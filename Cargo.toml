@@ -33,6 +33,7 @@ h2-attempt-binding = ["wreq-proto/h2-attempt-observer"]
 plugin-distribution = ["dep:oci-client"]
 
 [dependencies]
+percent-encoding = "2"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 # Only the delay iterator is used; the quota deadline owns Tokio sleeping.
@@ -92,7 +93,6 @@ pprof = { version = "0.15.0", default-features = false, features = ["prost-codec
 [dev-dependencies]
 wreq-proto = { version = "=0.2.6", default-features = false, features = ["h2-attempt-observer"] }
 cucumber = { version = "0.23.0", features = ["macros"] }
-percent-encoding = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
