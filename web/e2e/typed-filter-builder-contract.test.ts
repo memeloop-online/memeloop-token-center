@@ -9,15 +9,10 @@ const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import
 
 test('professional request filters are schema-backed, previewed, and bound to public model routes', () => {
   assert.match(builder, /role="dialog"/);
-  assert.match(builder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\?\$\{params\}`/);
-  assert.match(builder, /loadFilterModelRoutes/);
-  assert.match(builder, /params\.set\('before_created_at'/);
-  assert.match(builder, /params\.set\('before_id'/);
-  assert.match(builder, /editable disabled=\{disabled\}/);
-  assert.match(builder, /disabled: false/);
+  assert.doesNotMatch(builder, /loadFilterModelRoutes|routeModelOptions|api<ModelRouteView/);
+  assert.match(builder, /groupBy="none"/);
   assert.match(builder, /filterPresetPresentation/);
   assert.doesNotMatch(builder, /\{t\('filter\.recent'\)\} \{index \+ 1\}/);
-  assert.match(builder, /routeModelOptions\(routes, upstreams, groups/);
   assert.match(catalog, /valueKind === 'route' \? route\.id : route\.public_model/);
   assert.match(catalog, /route\.protocol/);
   assert.match(builder, /popover="auto"/);

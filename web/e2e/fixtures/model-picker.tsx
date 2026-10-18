@@ -79,6 +79,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const values: Record<string, unknown> = {
     '/internal/v1/upstreams': accounts,
     '/internal/v1/model-routes': routes,
+    '/internal/v1/filter-model-names': [...new Set(routes.map((route) => route.public_model))],
     '/internal/v1/model-picker-options': projection,
     '/internal/v1/provider-groups': groups,
     '/internal/v1/filter-presets': { named: [], recent: [] },

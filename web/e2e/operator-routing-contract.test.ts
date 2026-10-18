@@ -59,13 +59,8 @@ test('mutation scopes remain explicit and shared local filters retain their pref
 
 test('request filters use current scoped routing metadata without upstream model enumeration', () => {
   assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
-  assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\?\$\{params\}`/);
-  assert.match(typedFilterBuilder, /loadFilterModelRoutes/);
-  assert.match(typedFilterBuilder, /limit: String\(filterModelPageSize\)/);
-  assert.match(typedFilterBuilder, /params\.set\('tenant_external_id', tenant\)/);
-  assert.match(typedFilterBuilder, /params\.set\('before_created_at', String\(cursor\.created_at\)\)/);
-  assert.match(typedFilterBuilder, /params\.set\('before_id', cursor\.id\)/);
-  assert.match(typedFilterBuilder, /routeModelOptions\(routes, upstreams, groups/);
+  assert.doesNotMatch(typedFilterBuilder, /loadFilterModelRoutes|routeModelOptions|api<ModelRouteView/);
+  assert.match(typedFilterBuilder, /groupBy="none"/);
   assert.match(typedFilterBuilder, /<ModelPicker/);
   assert.doesNotMatch(typedFilterBuilder, /\/internal\/v1\/upstream-models/);
   assert.match(typedFilterBuilder, /upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => <option value=\{account\.id\}/);

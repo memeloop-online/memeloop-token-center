@@ -171,6 +171,41 @@ fn route_create_idempotency_key(
     Ok(Some(RouteCreateIdempotencyKey::from_hmac_sha256(hash)))
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct FilterModelNamesQuery {
+    tenant_external_id: Option<String>,
+    #[serde(default)]
+    search: String,
+    #[serde(default = "default_filter_model_names_limit")]
+    limit: i64,
+}
+
+fn default_filter_model_names_limit() -> i64 {
+    50
+}
+
+pub(super) async fn list_filter_model_names(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FilterModelNamesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    if query.search.len() > crate::filter_ast::MAX_TYPED_FILTER_TEXT_BYTES
+        || query.search.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest(
+            "model name search is too long or contains control characters".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .db
+            .list_filter_model_names(tenant.as_deref(), &query.search, query.limit)
+            .await?,
+    ))
+}
+
 pub(super) async fn list_model_routes(
     State(state): State<AppState>,
     headers: HeaderMap,

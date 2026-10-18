@@ -335,6 +335,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(disconnect_upstream_oauth),
         )
         .route(
+            "/internal/v1/filter-model-names",
+            get(list_filter_model_names),
+        )
+        .route(
             "/internal/v1/model-routes",
             get(list_model_routes).post(create_model_route),
         )
