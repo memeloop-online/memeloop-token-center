@@ -30,7 +30,7 @@ export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog
   const manager = access.state.scopeKey !== token ? null : access.state.kind === 'failed'
     ? <p className="notice error" role="alert">{access.state.message}</p>
     : access.state.kind === 'ready' && access.state.value.can_view_runtime
-      ? <PluginRuntimeManager key={token} token={token} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
+      ? <PluginRuntimeManager key={token} token={token} tenant={tenant} canManage={access.state.value.can_manage_runtime} onPublished={reloadCatalog} /> : null;
   const content = !token || (catalog.scopeKey === token && catalog.kind === 'idle' && catalog.disabled)
     ? null
     : catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading'

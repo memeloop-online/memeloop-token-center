@@ -4,6 +4,7 @@ import { Button, Disclosure } from '../design-system';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import type { PluginConfiguration, PluginManifest } from '../types';
+import { pluginManagementCopy } from './pluginManagementCopy';
 import { queryForTenant } from './scope/operatorShared';
 
 const PluginConfigurationForm = lazy(() => import('./PluginConfigurationForm').then((module) => ({ default: module.PluginConfigurationForm })));
@@ -80,8 +81,9 @@ function PluginConfigurationEditor({ token, tenant, writeTenant, plugin }: { tok
 /** `tenant` scopes reads; plugin configuration writes use `writeTenant`. */
 export function Plugins({ token, tenant, writeTenant = tenant, values, onRefresh, refreshError }: { token: string; tenant: string; writeTenant?: string; values: PluginManifest[]; onRefresh?: () => Promise<void>; refreshError?: string }) {
   const { locale, t } = useI18n();
+  const text = locale.startsWith('zh') ? pluginManagementCopy.zh : pluginManagementCopy.en;
   return <article className="panel">
-    <div className="panel-title"><div><h2>{t('plugins.title')}</h2><p className="muted">{t('plugins.configurationDescription')}</p></div>{onRefresh && <Button appearance="secondary" onClick={() => void onRefresh()}>{t('plugins.refreshCatalog')}</Button>}</div>
+    <div className="panel-title"><div><h2>{text.configuration}</h2><p className="muted">{text.configurationHint}</p></div>{onRefresh && <Button appearance="secondary" onClick={() => void onRefresh()}>{t('plugins.refreshCatalog')}</Button>}</div>
     {refreshError && <div className="notice error" role="alert">{refreshError}</div>}
     <div className="account-list">
       {values.length === 0 && <div className="empty">{t('plugins.empty')}</div>}
