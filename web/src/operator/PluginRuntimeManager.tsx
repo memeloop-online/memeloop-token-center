@@ -249,7 +249,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
     } catch (reason) { if (alive.current) setError(reason instanceof Error ? reason.message : text.failed); }
   }
 
-  const activeSet = status?.current ? status.candidates.find((candidate) => candidate.inventory_id === status.current?.inventory_id) : undefined;
+  const activeSet = status?.current ? status.candidates.find((candidate) => candidate.inventory_id === status?.current?.inventory_id) : undefined;
   const activePlugins = Object.entries(activeSet?.plugins ?? {});
   return <article className="panel" aria-label={text.title}>
     {confirmationDialog}
@@ -327,7 +327,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
               <p>{Object.entries(candidate.plugins).map(([id, versions]) => `${id}: ${versions.join(', ')}`).join(' · ') || text.noActive}</p>
               {publicationRevision(candidate) === undefined && candidate.inventory_id !== status.current?.inventory_id && <p className="notice">{text.missingBase}</p>}
               <div className="plugin-runtime-actions"><Button appearance="secondary" disabled={busy || !canManage} onClick={() => void mutate('/internal/v1/plugin-runtime/candidates', { inventory_id: candidate.inventory_id })}>{text.stage}</Button>
-              <Button appearance="primary" disabled={busy || !canManage || publicationRevision(candidate) === undefined || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button></div>
+              <Button appearance="primary" disabled={busy || !canManage || publicationRevision(candidate) === undefined || candidate.inventory_id === status?.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button></div>
             </div>)}</div>
           </>}
         </div></Disclosure>
@@ -356,7 +356,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
                 <Disclosure title={text.technicalDetails}><pre className="plugin-manifest-details">{JSON.stringify(reviews[job.id].review, null, 2)}</pre></Disclosure>
               </div>}
               {canManage && job.status === 'review' && job.review_digest && <><p>{text.warning}</p><Checkbox label={text.approve} disabled={!reviews[job.id]?.review || reviews[job.id].review_digest !== job.review_digest} checked={approvals[job.id] === true} onChange={(_, data) => setApprovals((old) => ({ ...old, [job.id]: data.checked === true }))} /><button type="button" disabled={busy || !approvals[job.id] || reviews[job.id]?.review_digest !== job.review_digest} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/approve`, { review_digest: reviews[job.id].review_digest })}>{text.approve}</button></>}
-              {canManage && job.status === 'registered' && status?.candidates.filter((candidate) => candidate.inventory_id === job.inventory_id).map((candidate) => <Button key={candidate.inventory_id} appearance="primary" disabled={busy || publicationRevision(candidate) === undefined || candidate.inventory_id === status.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button>)}
+              {canManage && job.status === 'registered' && status?.candidates.filter((candidate) => candidate.inventory_id === job.inventory_id).map((candidate) => <Button key={candidate.inventory_id} appearance="primary" disabled={busy || publicationRevision(candidate) === undefined || candidate.inventory_id === status?.current?.inventory_id} onClick={() => void activate(candidate)}>{text.publish}</Button>)}
               {canManage && ['failed', 'interrupted'].includes(job.status) && <button type="button" disabled={busy} onClick={() => void mutate(`/internal/v1/plugin-runtime/installations/${encodeURIComponent(job.id)}/retry`, {})}>{text.retry}</button>}
             </section>)}</div></section>
             <section><h3>{text.history}</h3>
