@@ -22,6 +22,10 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallPolicy {
+    #[serde(skip)]
+    network_snapshot_key: Option<String>,
+    #[serde(skip)]
+    ephemeral_proxy_credentials: Option<(String, String)>,
     #[serde(default)]
     egress_proxy: Option<String>,
     #[serde(default)]
@@ -51,8 +55,16 @@ struct CredentialFiles {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallPluginRequest {
+    #[serde(default)]
     pub inventory_id: String,
+    #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_resolution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_descriptor_sha256: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub(crate) network: Option<crate::db::plugin_installer_network::InstallerNetworkInput>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +77,7 @@ pub struct ApproveInstallationRequest {
 pub struct InstallationRecord {
     pub id: String,
     pub inventory_id: String,
+    pub base_revision: Option<i64>,
     pub actor: String,
     #[serde(skip)]
     pub(crate) attempt_id: String,
@@ -103,6 +116,114 @@ pub struct PluginAuditEntry {
 }
 
 impl ApplicationPlugins {
+    pub(crate) async fn installation_base_snapshot(
+        &self,
+    ) -> Result<(i64, Option<PreinstalledInventory>), AppError> {
+        self.refresh_inventory().await?;
+        let Some(head) = self.db.optional_application_plugin_head().await? else {
+            return Ok((0, None));
+        };
+        let entry = self
+            .inventory
+            .read()
+            .await
+            .get(&head.inventory_id)
+            .cloned()
+            .ok_or(AppError::Forbidden)?;
+        if entry.grants.values().any(|versions| versions.len() != 1) {
+            return Err(AppError::Conflict(
+                "retained plugins require one exact approved identity".into(),
+            ));
+        }
+        Ok((head.revision, Some(entry)))
+    }
+
+    async fn verify_installation_base(
+        &self,
+        resolution: &crate::db::plugin_release_resolutions::PluginReleaseResolution,
+    ) -> Result<(), AppError> {
+        let revision = self
+            .db
+            .optional_application_plugin_head()
+            .await?
+            .map(|head| head.revision)
+            .unwrap_or(0);
+        if revision != resolution.base_revision {
+            return Err(AppError::Conflict(
+                "plugin runtime revision changed; resolve the release again".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) async fn deployment_installer_network(
+        &self,
+    ) -> Result<Option<crate::db::plugin_installer_network::InstallerNetworkInput>, AppError> {
+        let policy = self.install_policy().await?;
+        let Some(url) = policy.egress_proxy else {
+            return Ok(None);
+        };
+        async fn secret(path: Option<PathBuf>) -> Result<Option<String>, AppError> {
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            let mut bytes = Vec::new();
+            file.take(258)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            if bytes.len() > 257 {
+                return Err(AppError::Forbidden);
+            }
+            let value = std::str::from_utf8(&bytes)
+                .map_err(|_| AppError::Forbidden)?
+                .trim_end_matches(['\r', '\n']);
+            if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+                return Err(AppError::Forbidden);
+            }
+            Ok(Some(value.to_owned()))
+        }
+        Ok(Some(
+            crate::db::plugin_installer_network::InstallerNetworkInput::Custom {
+                url,
+                username: secret(policy.egress_proxy_username_file).await?,
+                password: secret(policy.egress_proxy_password_file).await?,
+            },
+        ))
+    }
+
+    pub fn with_installer_network_key(mut self, key: &[u8]) -> Self {
+        self.installer_network_key = Some(key.to_vec());
+        self
+    }
+
+    async fn installation_release_policy(
+        &self,
+        key_hash: &str,
+        actor: &str,
+        policy: &mut InstallPolicy,
+    ) -> Result<Option<crate::db::plugin_release_resolutions::PluginReleaseResolution>, AppError>
+    {
+        let resolution = self
+            .db
+            .installation_plugin_release_resolution(key_hash, actor)
+            .await?;
+        if let Some(resolution) = &resolution {
+            self.verify_installation_base(resolution).await?;
+            let release = &resolution.release;
+            // Operator confirmation authorizes exactly this source, immutable
+            // artifact and signer for this installation. Never mutate host policy.
+            policy.allowed_sources = BTreeSet::from([release.source.clone()]);
+            policy.cosign_public_keys.clear();
+            policy.cosign_keyless = Some(release.descriptor.signer.clone());
+            policy.source_keyless.clear();
+            policy.source_credentials.clear();
+        }
+        Ok(resolution)
+    }
+
     pub fn with_installation_policy_file(
         mut self,
         path: Option<PathBuf>,
@@ -144,7 +265,6 @@ impl ApplicationPlugins {
         }
         if !policy.egress_credentials_valid()
             || !policy.plugin_root.is_absolute()
-            || policy.allowed_sources.is_empty()
             || !policy.signer_policy_valid()
             || policy.cosign_public_keys.len() > 8
             || policy
@@ -186,6 +306,9 @@ impl ApplicationPlugins {
                 InstallPluginRequest {
                     inventory_id: record.inventory_id.clone(),
                     packages: record.packages,
+                    release_resolution_id: None,
+                    release_descriptor_sha256: None,
+                    network: None,
                 },
                 "retry",
                 &record.actor,
@@ -207,13 +330,48 @@ impl ApplicationPlugins {
 
     async fn install_internal(
         self: &Arc<Self>,
-        input: InstallPluginRequest,
+        mut input: InstallPluginRequest,
         key: &str,
         actor: &str,
         existing_hash: Option<&str>,
     ) -> Result<InstallationRecord, AppError> {
-        validate_inventory_id(&input.inventory_id)?;
         validate_operation(0, key)?;
+        let key_hash = match existing_hash {
+            Some(hash) => hash.to_owned(),
+            None => {
+                super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?
+            }
+        };
+        match (
+            &input.release_resolution_id,
+            &input.release_descriptor_sha256,
+        ) {
+            (Some(id), Some(digest)) => {
+                if !input.packages.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "release installation cannot include extra packages".into(),
+                    ));
+                }
+                let resolution = self
+                    .db
+                    .confirm_plugin_release_resolution(id, digest, actor, &key_hash)
+                    .await?;
+                input.packages = vec![resolution.release.descriptor.reference];
+            }
+            (None, None) => (),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "release resolution and digest confirmation are required together".into(),
+                ));
+            }
+        }
+        // Retry reconstructs the same request from the frozen installation.
+        input.release_resolution_id = None;
+        input.release_descriptor_sha256 = None;
+        if input.inventory_id.is_empty() {
+            input.inventory_id = format!("install-{}", &key_hash[..54]);
+        }
+        validate_inventory_id(&input.inventory_id)?;
         if input.packages.is_empty() || input.packages.len() > 16 {
             return Err(AppError::BadRequest(
                 "install one to sixteen packages per complete inventory".into(),
@@ -238,12 +396,6 @@ impl ApplicationPlugins {
             }
         }
         let hash = super::super::plugin_configuration_schema_digest(&json!(&input))?;
-        let key_hash = match existing_hash {
-            Some(hash) => hash.to_owned(),
-            None => {
-                super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?
-            }
-        };
         if let Some(replay) = self
             .db
             .replay_plugin_installation(&key_hash, &hash, actor)
@@ -251,7 +403,29 @@ impl ApplicationPlugins {
         {
             return Ok(replay);
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        let resolution = self
+            .installation_release_policy(&key_hash, actor, &mut policy)
+            .await?;
+        if let Some(resolution) = &resolution
+            && input.packages != vec![resolution.release.descriptor.reference.clone()]
+        {
+            return Err(AppError::Forbidden);
+        }
+        if let Some(network_key) = &self.installer_network_key
+            && self
+                .db
+                .installer_network_snapshot_exists(&key_hash, actor)
+                .await?
+        {
+            let frozen = self
+                .db
+                .load_installer_network(&key_hash, actor, network_key)
+                .await?;
+            // Credentials stay in RAM and use the installer's anonymous stdin.
+            policy.network_snapshot_key = Some(key_hash.clone());
+            apply_frozen_installer_network(&frozen, &mut policy)?;
+        }
         self.reclaim_unreferenced_installation_attempts().await?;
         if self
             .inventory
@@ -332,6 +506,11 @@ impl ApplicationPlugins {
         let inventory_root = policy
             .plugin_root
             .join(inventory_attempt_storage_id(attempt_id)?);
+        let record = self.db.plugin_installation(operation_id).await?;
+        let resolution = self
+            .db
+            .installation_plugin_release_resolution(&record.idempotency_hash, &record.actor)
+            .await?;
         let (trust, mut checkpoints) = bounded_install_phase(STORAGE_DEADLINE, async {
             let trust = trust_digest(policy).await?;
             tokio::fs::create_dir_all(&policy.plugin_root)
@@ -362,6 +541,16 @@ impl ApplicationPlugins {
             Ok((trust, checkpoints))
         })
         .await?;
+        if let Some(resolution) = &resolution {
+            self.verify_installation_base(resolution).await?;
+            if let Some(retained) = &resolution.retained {
+                super::retained_installation::retain_approved_installations(
+                    retained,
+                    &inventory_root,
+                )
+                .await?;
+            }
+        }
         for reference in &input.packages {
             bounded_install_phase(PACKAGE_DEADLINE, async {
                 if let Some(checkpoint) = checkpoints.get(reference)
@@ -377,7 +566,11 @@ impl ApplicationPlugins {
                     .arg(&policy.plugin_root)
                     .arg("--publication-attempt-id")
                     .arg(attempt_id)
-                    .stdin(Stdio::null())
+                    .stdin(if policy.ephemeral_proxy_credentials.is_some() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
@@ -393,6 +586,18 @@ impl ApplicationPlugins {
                     tracing::warn!(stage = "installer_spawn", "plugin installation failed");
                     AppError::Internal
                 })?;
+                if let Some((username, password)) = &policy.ephemeral_proxy_credentials {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stdin = child.stdin.take().ok_or(AppError::Internal)?;
+                    let payload =
+                        serde_json::to_vec(&json!({"username":username,"password":password}))
+                            .map_err(|_| AppError::Internal)?;
+                    stdin
+                        .write_all(&payload)
+                        .await
+                        .map_err(|_| AppError::Internal)?;
+                    stdin.shutdown().await.map_err(|_| AppError::Internal)?;
+                }
                 let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
                 let capture = async {
                     use tokio::io::AsyncReadExt;
@@ -432,6 +637,12 @@ impl ApplicationPlugins {
         }
         bounded_install_phase(STORAGE_DEADLINE, async {
             let runtime = self.review_runtime(inventory_root).await?;
+            if let Some(resolution) = &resolution {
+                if let Some(retained) = &resolution.retained {
+                    super::retained_installation::verify_retained_grants(retained, &runtime)?;
+                }
+                self.verify_installation_base(resolution).await?;
+            }
             let digest = review_digest(&runtime, &trust)?;
             let review = json!({"plugins":runtime.manifests()});
             if serde_json::to_vec(&review)
@@ -493,7 +704,17 @@ impl ApplicationPlugins {
         if record.status == "registered" {
             return Ok(());
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        let resolution = self
+            .installation_release_policy(&record.idempotency_hash, &record.actor, &mut policy)
+            .await?;
+        if self
+            .db
+            .installer_network_snapshot_exists(&record.idempotency_hash, &record.actor)
+            .await?
+        {
+            policy.network_snapshot_key = Some(record.idempotency_hash.clone());
+        }
         // Recheck source policy on approval; installing before a trust-policy
         // change does not grandfather an artifact into execution authority.
         if record.packages.iter().any(|reference| {
@@ -507,6 +728,11 @@ impl ApplicationPlugins {
             .plugin_root
             .join(inventory_attempt_storage_id(&record.attempt_id)?);
         let runtime = self.review_runtime(root.clone()).await?;
+        if let Some(resolution) = &resolution
+            && let Some(retained) = &resolution.retained
+        {
+            super::retained_installation::verify_retained_grants(retained, &runtime)?;
+        }
         let trust = trust_digest(&policy).await?;
         if review_digest(&runtime, &trust)? != digest {
             return Err(AppError::Conflict(
@@ -523,7 +749,7 @@ impl ApplicationPlugins {
         }
         runtime.validate_stored_configurations().await?;
         let identities = runtime.package_identities();
-        let grants = runtime
+        let mut grants = runtime
             .manifests()
             .into_iter()
             .map(|manifest| {
@@ -542,6 +768,15 @@ impl ApplicationPlugins {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, AppError>>()?;
+        if let Some(resolution) = &resolution {
+            if let Some(retained) = &resolution.retained {
+                // Preserve previous exact approvals without expanding them.
+                for (id, versions) in &retained.grants {
+                    grants.insert(id.clone(), versions.clone());
+                }
+            }
+            self.verify_installation_base(resolution).await?;
+        }
         let entry = PreinstalledInventory { root, grants };
         let path = self.inventory_file.clone().ok_or(AppError::Forbidden)?;
         append_inventory_file(&path, &record.inventory_id, &entry).await?;
@@ -761,9 +996,12 @@ impl InstallPolicy {
             return Err(AppError::Forbidden);
         }
         if let Some(proxy) = &self.egress_proxy {
-            crate::network::validate_install_egress_proxy(proxy)
+            crate::network::validate_frozen_installer_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
             command.arg("--egress-proxy").arg(proxy);
+        }
+        if self.ephemeral_proxy_credentials.is_some() {
+            command.arg("--egress-proxy-credentials-stdin");
         }
         if let (Some(username), Some(password)) = (
             &self.egress_proxy_username_file,
@@ -775,6 +1013,11 @@ impl InstallPolicy {
         Ok(())
     }
     fn signer_policy_valid(&self) -> bool {
+        if self.allowed_sources.is_empty() {
+            return self.cosign_public_keys.is_empty()
+                && self.cosign_keyless.is_none()
+                && self.source_keyless.is_empty();
+        }
         if self.source_keyless.is_empty() {
             return self.cosign_public_keys.is_empty() != self.cosign_keyless.is_none()
                 && self
@@ -1260,13 +1503,17 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
         keys.push(bytes);
     }
     let mut trust = json!({"sources":policy.allowed_sources,"keys":keys});
-    if let Some(proxy) = &policy.egress_proxy {
+    if let Some(snapshot) = &policy.network_snapshot_key {
+        trust["network_snapshot_key"] = json!(snapshot);
+    } else if let Some(proxy) = &policy.egress_proxy {
         trust["egress_proxy"] = json!(proxy);
     }
-    if let (Some(username), Some(password)) = (
-        &policy.egress_proxy_username_file,
-        &policy.egress_proxy_password_file,
-    ) {
+    if policy.network_snapshot_key.is_none()
+        && let (Some(username), Some(password)) = (
+            &policy.egress_proxy_username_file,
+            &policy.egress_proxy_password_file,
+        )
+    {
         trust["egress_proxy_username_file"] = json!(username);
         trust["egress_proxy_password_file"] = json!(password);
     }
@@ -1280,6 +1527,38 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
             serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::Internal)?;
     }
     super::super::plugin_configuration_schema_digest(&trust)
+}
+
+fn apply_frozen_installer_network(
+    frozen: &crate::db::plugin_installer_network::FrozenInstallerNetwork,
+    policy: &mut InstallPolicy,
+) -> Result<(), AppError> {
+    policy.egress_proxy = frozen.proxy_url.clone();
+    policy.egress_proxy_username_file = None;
+    policy.egress_proxy_password_file = None;
+    if let Some(proxy) = &mut policy.egress_proxy {
+        let mut url = url::Url::parse(proxy).map_err(|_| AppError::Forbidden)?;
+        let address = frozen.proxy_addresses.first().ok_or(AppError::Forbidden)?;
+        // Both OCI and external Cosign consume the same frozen literal proxy.
+        if url.scheme() == "https" && frozen.proxy_host.is_some() {
+            return Err(AppError::BadRequest(
+                "HTTPS installation proxies require an IP address endpoint".into(),
+            ));
+        }
+        url.set_ip_host(address.ip())
+            .map_err(|_| AppError::Forbidden)?;
+        *proxy = url.to_string();
+    }
+    policy.ephemeral_proxy_credentials = match (&frozen.username, &frozen.password) {
+        (Some(username), Some(password)) => Some((username.clone(), password.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::BadRequest(
+                "proxy username and password must be supplied together".into(),
+            ));
+        }
+    };
+    Ok(())
 }
 
 pub(super) async fn append_inventory_file(
@@ -1615,6 +1894,9 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         let input = InstallPluginRequest {
             inventory_id: "worker-signers".into(),
             packages,
+            release_resolution_id: None,
+            release_descriptor_sha256: None,
+            network: None,
         };
         let (record, run) = state
             .db
@@ -1933,6 +2215,83 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
                 serde_json::from_slice(&bytes).unwrap()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn browser_installer_network_and_release_errors_are_private_and_redacted() {
+        let (_directory, state, _, _) = fixture().await;
+        let token = state.config.service_token.clone();
+        for (path, body) in [
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://credential-user:credential-secret@127.0.0.1:3128"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"https://proxy.example.com","username":"credential-user","password":"credential-secret"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://8.8.8.8:3128","username":"credential-user"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/release-resolutions",
+                json!({"url":"https://127.0.0.1/plugin.json","network":{"mode":"custom","url":"http://8.8.8.8:3128","password":"credential-secret"}}),
+            ),
+        ] {
+            let method = if path.ends_with("installer-network") {
+                "PUT"
+            } else {
+                "POST"
+            };
+            let response = crate::api::router_for_role(state.clone(), RuntimeRole::Control)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", "browser-invalid")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let rendered = std::str::from_utf8(&bytes).unwrap();
+            assert!(!rendered.contains("credential-secret"));
+            assert!(!rendered.contains("credential-user"));
+            assert!(!rendered.contains("proxy.example.com"));
+        }
+        let (status, view) = call(
+            &state,
+            "PUT",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({"mode":"direct"}),
+            "direct",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
+        let (status, view) = call(
+            &state,
+            "GET",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({}),
+            "remembered",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
     }
 
     #[tokio::test]
