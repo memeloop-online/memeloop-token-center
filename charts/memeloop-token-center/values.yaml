@@ -230,8 +230,8 @@ plugins:
       storageClass: ""
       size: 1Gi
     installationEnabled: false
-    # Host-owned policy.json must place plugin_root beneath the same persistent
-    # /var/lib/memeloop-token-center/plugin-runtime mount as inventory.json.
+    # Host-owned policy.json must place plugin_root on durable storage: the
+    # shared runtime PVC or an independently persistent package mount.
     # /tmp is transient extraction space and must never be the package root.
     # Installation approvals/configurations/revision head also require a
     # persistent external database via config.databaseUrlSecret.
