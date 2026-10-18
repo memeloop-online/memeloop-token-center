@@ -154,5 +154,12 @@ security, repository security and docs passed. Initial failures:
   regenerated runtime discovery. This remains pending.
 - Rust and memory compilation were still running at the last check.
 
+That run subsequently finished: memory compilation/acceptance passed; Rust
+stopped on three Clippy diagnostics (two manual range checks and test-module
+ordering), now corrected. OpenAPI paths, schemas and generated discovery were
+added; contract assertions now cover bounded ranges, text representation and
+the title endpoint's additional execution authority. CI runs on the updated
+branch; no test-suite success or deployment is implied by compilation alone.
+
 The final-response projection has not been implemented. Do not infer that the
 PR or partial green checks establish completion of the reading requirements.

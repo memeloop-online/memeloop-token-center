@@ -15701,21 +15701,27 @@
             "type": "string"
           },
           "phase": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "text": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "text_complete": {
             "type": "boolean"
           },
           "source_chars": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "minimum": 0,
-            "nullable": true
+            "minimum": 0
           },
           "content_cursor": {
             "type": "string",
@@ -15723,10 +15729,12 @@
             "maxLength": 4096
           },
           "text_cursor": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "minLength": 1,
-            "maxLength": 4096,
-            "nullable": true
+            "maxLength": 4096
           }
         }
       },
@@ -15769,9 +15777,11 @@
             }
           },
           "next_cursor": {
-            "type": "string",
-            "maxLength": 4096,
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
           }
         }
       },
@@ -15819,9 +15829,11 @@
             "maxLength": 16384
           },
           "next_cursor": {
-            "type": "string",
-            "maxLength": 4096,
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
           }
         }
       },
@@ -15835,10 +15847,12 @@
         ],
         "properties": {
           "title": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "minLength": 1,
-            "maxLength": 80,
-            "nullable": true
+            "maxLength": 80
           },
           "state": {
             "type": "string",
@@ -15852,13 +15866,17 @@
             ]
           },
           "error_code": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },
