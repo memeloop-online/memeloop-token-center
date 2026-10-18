@@ -138,7 +138,7 @@ Draft PR: https://github.com/memeloop-online/memeloop-token-center/pull/657
 
 The task-only changes were committed using a separate Git index, excluding
 unrelated dirty proxy-lifecycle edits. Review/CI work now continues in the
-isolated worktree `/tmp/mtc-session-review.uHCVTq`, branch
+isolated worktree `/home/user/workspace/mtc-session-review`, branch
 `fix/session-reading-20261018`. The original workspace remains untouched.
 The first PR revision conflicted with newer master migrations 128–130; the
 review branch merges master and assigns the title migration version 131.
@@ -163,3 +163,26 @@ branch; no test-suite success or deployment is implied by compilation alone.
 
 The final-response projection has not been implemented. Do not infer that the
 PR or partial green checks establish completion of the reading requirements.
+
+## Latest integration evidence
+
+- The temporary filesystem filled during a new parser-file write. The review
+  worktree was copied to persistent storage and Git's worktree pointer repaired;
+  task work now continues at `/home/user/workspace/mtc-session-review`. The
+  incomplete parser file was repaired before committing. The old `/tmp` copy
+  is not the active worktree.
+- CI `39166590869` completed. API contracts, migration smoke and security passed.
+  Rust passed compilation/Clippy and reached tests: failures were the historical
+  migration fixture's fixed version list and missing title-table downgrade.
+  These are updated for migration 131.
+- Browser failures were traced to fixture routing counting new context/title
+  reads as detail refreshes, and disclosure-test nth locators shifting as
+  opened items left the selector. Fixtures/selectors are corrected without
+  weakening refresh or lazy-read assertions.
+- Helm values.schema.json also pins the database schema version; updated it
+  to 131 alongside values.yaml.
+- Added a final-answer parser and protocol tests for buffered Responses, Chat,
+  Anthropic, plus corresponding SSE forms. It preserves explicit final text,
+  otherwise takes the last paragraph, ignores tool fields, and rejects missing
+  terminal/incomplete responses. It is test-only until the background
+  projection/cache is connected; the selected-response feature remains pending.

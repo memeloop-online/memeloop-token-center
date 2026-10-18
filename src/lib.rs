@@ -43,6 +43,8 @@ mod request_event_stream;
 mod response_archive_spool;
 pub mod schema;
 pub mod server;
+#[cfg(test)]
+mod session_response;
 pub mod supplier_error;
 mod upstream_quota;
 pub mod worker;

@@ -70,7 +70,9 @@ async function expandReplay(page: import('playwright').Page) {
     const buttons = page.locator('.session-replay button[aria-expanded="false"]').filter({
       hasText: /Full conversation and execution details|完整对话与执行详情|Tool calls and results|工具调用与结果|Tool call ·|Tool result ·|工具调用 ·|工具结果 ·/,
     });
-    for (const button of await buttons.all()) await button.click();
+    // Re-query the first closed disclosure after each click: nth locators from
+    // all() shift when the aria-expanded=false filter loses the opened item.
+    for (let count = await buttons.count(); count > 0; count -= 1) await buttons.first().click();
   }
 }
 
