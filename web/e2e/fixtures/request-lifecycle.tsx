@@ -12,7 +12,7 @@ import '../../src/styles/metrics.css';
 import '../../src/styles/request-table.css';
 import '../../src/operator/operator.css';
 
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
 const base: RequestDetail = { request_id: 'request-a', created_at: 1000, completed_at: null, model: 'model-a', protocol: 'openai', status_code: null, duration_ms: null, input_tokens: 0, output_tokens: 0, cost: '0', error_code: null, request_body: null, response_body: null, archive_complete: false };
 const backgroundHelpVisible = !new URLSearchParams(location.search).has('quiet-background-help');
 const supplierFailure = new URLSearchParams(location.search).has('supplier-error')
@@ -26,7 +26,16 @@ const diagnosticFailure = diagnosticParam === 'downstream'
   ? { ...base, status_code: 499, completed_at: 3000, duration_ms: 2000, error_code: 'http_499',
     failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } }
   : undefined;
-let first = supplierFailure ?? diagnosticFailure ?? base;
+const operationalMode = new URLSearchParams(location.search).get('operational');
+const operational: RequestDetail | undefined = operationalMode ? {
+  ...base, currency: 'USD', status_code: operationalMode === '499' ? 499 : operationalMode === '502' ? 502 : 200,
+  completed_at: operationalMode === 'zero' ? 4000 : null, duration_ms: 2000,
+  cost: operationalMode === 'zero' ? '0' : null,
+  error_code: operationalMode === '499' ? 'http_499' : operationalMode === '502' ? 'http_502' : null,
+  terminal_cause_code: operationalMode === '499' ? 'client_disconnected' : operationalMode === '502' ? 'upstream_transport_connection_reset' : null,
+  operational_terminal: { completed_at: 3000, stage: null, financial_state: operationalMode === 'zero' ? 'applied' : operationalMode === '200' ? 'unknown' : 'pending' },
+} : undefined;
+let first = operational ?? supplierFailure ?? diagnosticFailure ?? base;
 if (new URLSearchParams(location.search).has('egress')) first = {
   ...base, status_code: 502, completed_at: 3000, duration_ms: 2000, error_code: 'upstream_http2_reset',
   egress_attempts: egressAttempts,
@@ -58,6 +67,7 @@ window.fetch = async (input) => {
     return json([]);
   }
   if (url.pathname === '/internal/v1/requests/query') {
+    window.requestLifecycleFixture.queryCalls += 1;
     if (holdQuery) {
       holdQuery = false; window.requestLifecycleFixture.queryHeld = true;
       return new Promise<Response>((resolve) => { failQuery = () => { window.requestLifecycleFixture.queryHeld = false; resolve(new Response(JSON.stringify({ error: 'fixture query failure' }), { status: 503 })); }; });
@@ -84,20 +94,38 @@ function Fixture() {
   const [drilldown, setDrilldown] = useState<{ ast: TypedFilterAst; revision: number }>();
   window.requestLifecycleFixture = {
     held: window.requestLifecycleFixture?.held ?? false, detailCalls: window.requestLifecycleFixture?.detailCalls ?? 0,
+    queryCalls: window.requestLifecycleFixture?.queryCalls ?? 0,
     scopeCommits: window.requestLifecycleFixture?.scopeCommits ?? [],
     queryHeld: window.requestLifecycleFixture?.queryHeld ?? false,
     filter: () => { holdQuery = true; setDrilldown({ ast: { logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'different-model' } }] }, revision: 1 }); },
     failQuery: () => { failQuery?.(); },
-    hold: () => { hold = true; }, release: () => { release?.(); }, switchScope: () => setTenant('tenant-b'),
+    hold: () => { hold = true; }, release: () => { release?.(); }, switchScope: () => {
+      if (operational) { first = operational; setEvents(new Map()); }
+      setTenant('tenant-b');
+    },
+    settle: (cost, kind) => {
+      if (!first.operational_terminal) throw new Error('Operational fixture required');
+      first = { ...first, cost, completed_at: 4000, input_tokens: 20, output_tokens: 10, usage_basis: 'provider_reported',
+        operational_terminal: { ...first.operational_terminal, financial_state: 'applied' } };
+      setEvents(new Map([[first.request_id, { ...base, status_code: 200, completed_at: 4000, cost: '999',
+        event_id: `financial-${revision}`, event_at: 4000, event_kind: kind, key_id: 'key' } as RequestEvent]]));
+      setRevision(value => value + 1);
+    },
+    replay: () => {
+      setEvents(new Map([[first.request_id, { ...base, status_code: 200, completed_at: 2000, cost: '999',
+        event_id: 'old-financial', event_at: 2000, event_kind: 'finished', key_id: 'key' } as RequestEvent]]));
+      setRevision(value => value + 1);
+    },
     finish: () => {
-      first = supplierFailure ?? { ...base, compaction: true, status_code: 200, completed_at: 3000, duration_ms: 2000, input_tokens: 20, output_tokens: 10, archive_complete: true };
-      setEvents(new Map([[first.request_id, { ...first, event_id: `terminal-${revision}`, event_at: 3000, event_kind: 'finished', key_id: 'key' } as RequestEvent]]));
+      const finished = supplierFailure ?? { ...base, compaction: true, status_code: 200, completed_at: 3000, duration_ms: 2000, input_tokens: 20, output_tokens: 10, archive_complete: true };
+      first = operational ?? finished;
+      setEvents(new Map([[first.request_id, { ...finished, event_id: `terminal-${revision}`, event_at: 3000, event_kind: 'finished', key_id: 'key' } as RequestEvent]]));
       setRevision((value) => value + 1);
     },
   };
   useLayoutEffect(() => {
     window.requestLifecycleFixture.scopeCommits.push({ scope: tenant, drawers: document.querySelectorAll('.drawer').length });
   }, [tenant]);
-  return <div data-request-fixture-scope={tenant}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} /><Tooltip content="Background scope help" visible={backgroundHelpVisible} relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible={backgroundHelpVisible} relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
+  return <div data-request-fixture-scope={tenant} data-request-fixture-revision={revision}><RequestsPage token="fixture-token" tenant={tenant} liveEvents={events} streamRevision={revision} streamState="live" streamError="" onOpenSessions={() => {}} onOpenSession={() => {}} requestDrilldown={drilldown} requestRefresh={operationalMode ? { intervalMs: 5000, paused: false, onIntervalChange: () => {} } : undefined} /><Tooltip content="Background scope help" visible={backgroundHelpVisible} relationship="description"><button id="background-help">Background helper</button></Tooltip>{revision > 0 && <Tooltip content="Live-added background help" visible={backgroundHelpVisible} relationship="description"><button>Live-added helper</button></Tooltip>}</div>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

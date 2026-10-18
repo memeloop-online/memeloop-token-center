@@ -4,7 +4,7 @@ import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestIn
 import { mergeLiveRequestEvents, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent } from '../src/types.js';
 import type { RequestView } from '../src/types.js';
-import { requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
+import { requestCompletedAt, requestErrorCopy, requestFailureCause, requestOutcome, requestStatusCopy } from '../src/requestStatusPresentation.js';
 
 const request: RequestView = {
   usage_basis: 'provider_reported',
@@ -12,6 +12,39 @@ const request: RequestView = {
   duration_ms: 2000, input_tokens: 160, cached_input_tokens: 40, cache_write_tokens: 20,
   output_tokens: 32, cost: '0', error_code: null,
 };
+
+test('operational completion and financial confirmation are independent in both languages', () => {
+  for (const financial_state of ['pending', 'unknown', 'applied'] as const) {
+    const terminal: RequestView = { ...request, completed_at: null, cost: null,
+      operational_terminal: { completed_at: 3000, stage: null, financial_state } };
+    assert.equal(requestOutcome(terminal), 'completed');
+    assert.equal(requestCompletedAt(terminal), 3000);
+    assert.equal(requestIsPending(terminal), false);
+    assert.equal(requestDisplayedCost(terminal), '');
+    for (const locale of ['zh-CN', 'en'] as const) {
+      assert.equal(requestStatusCopy(terminal, locale).label, locale === 'en' ? 'Completed' : '已完成');
+      assert.equal(requestCostCopy(terminal, locale).unknown, true);
+      assert.match(requestCostCopy(terminal, locale).hint, locale === 'en' ? /does not mean zero cost/ : /不代表费用为零/);
+    }
+    for (const cost of ['0', '8.25']) {
+      assert.equal(requestDisplayedCost({ ...terminal, cost }), financial_state === 'applied' ? cost : '');
+      assert.equal(requestCostCopy({ ...terminal, cost }, 'en').unknown, financial_state !== 'applied');
+    }
+    const cancelled = { ...terminal, status_code: 499, error_code: 'http_499', terminal_cause_code: 'client_disconnected' };
+    assert.equal(requestOutcome(cancelled), 'cancelled');
+    assert.equal(requestStatusCopy(cancelled, 'en').hint, 'Recorded cause: The client disconnected');
+    assert.equal(requestStatusCopy(cancelled, 'zh-CN').hint, '已记录原因: 客户端断开了连接');
+    const failed = { ...terminal, status_code: 502, error_code: 'http_502', terminal_cause_code: 'upstream_transport_connection_reset' };
+    assert.equal(requestOutcome(failed), 'failed');
+    assert.equal(requestStatusCopy(failed, 'en').hint, 'Recorded cause: The upstream connection was reset');
+    assert.equal(requestStatusCopy(failed, 'zh-CN').hint, '已记录原因: 上游连接被重置');
+    const nullUsage: RequestView = JSON.parse(JSON.stringify({ ...terminal, input_tokens: null, output_tokens: null }));
+    assert.equal(requestUsageIsActual(nullUsage), false);
+    assert.equal(nonCachedRequestInput(nullUsage), null);
+  }
+  assert.equal(requestDisplayedCost({ ...request, status_code: 502, cost: null }), '');
+  assert.equal(requestDisplayedCost({ ...request, status_code: 502, cost: '0' }), '0');
+});
 
 test('502 tooltip and detail share recorded cause, and missing evidence stays explicitly unknown', () => {
   const reset = { ...request, status_code: 502, error_code: 'upstream_transport_connection_reset' };
@@ -99,7 +132,7 @@ test('generation TPS requires observed output interval and does not relabel tota
   assert.equal(generationRequestOutputTps({ ...timed, generation_duration_ms: 1 }), 32000, 'no arbitrary high-rate threshold masks an otherwise recorded gateway interval');
 });
 
-test('failed requests use policy zero unless provider-reported usage supports the settlement', () => {
+test('failure and usage provenance do not replace a recorded settlement amount', () => {
   const failures = [
     { status_code: 499, error_code: null },
     { status_code: 502, error_code: null },
@@ -111,14 +144,13 @@ test('failed requests use policy zero unless provider-reported usage supports th
       const failed = { ...request, ...failure, usage_basis, cost: '35' };
       assert.equal(requestUsageIsActual(failed), false);
       assert.equal(requestCostCopy(failed, 'en').unknown, false);
-      assert.equal(requestCostCopy(failed, 'en').label, 'Cost set to 0');
-      assert.equal(requestDisplayedCost(failed), '0');
+      assert.equal(requestDisplayedCost(failed), '35');
       assert.equal(failed.cost, '35', 'presentation policy leaves the stored ledger amount unchanged');
     }
   }
   const successfulUnobserved = { ...request, usage_basis: 'not_observed' as const, cost: '35' };
   assert.equal(requestDisplayedCost(successfulUnobserved), '35');
-  assert.equal(requestDisplayedCost({ ...successfulUnobserved, status_code: null, error_code: 'delivery_started' }), '35');
+  assert.equal(requestDisplayedCost({ ...successfulUnobserved, status_code: null, error_code: 'delivery_started' }), '');
   assert.equal(requestCostCopy({ ...successfulUnobserved, status_code: null }, 'en').label, 'Awaiting settlement');
   const reported = { ...request, status_code: 499, cost: '0.2' };
   assert.equal(requestUsageIsActual(reported), true);
@@ -156,12 +188,11 @@ test('average output TPS uses recorded total seconds, distinguishes valid zero f
   assert.equal(averageRequestOutputTps({ ...request, output_tokens: -1 }), null);
 });
 
-test('failed cost copy states the zero policy while success remains unchanged', () => {
+test('settlement copy does not infer zero from failure or unknown usage', () => {
   const failed = requestCostCopy({ ...request, status_code: 502, usage_basis: 'contract_ceiling', cost: '35' }, 'en');
   assert.equal(failed.unknown, false);
-  assert.equal(failed.label, 'Cost set to 0');
-  assert.match(failed.hint, /cost is 0/);
-  assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, true);
+  assert.doesNotMatch(failed.hint, /cost is 0/);
+  assert.equal(requestCostCopy({ ...request, status_code: 200, usage_basis: 'not_observed', cost: '35' }, 'en').unknown, false);
 });
 
 test('credential identity remains meaningful without inventing an alias for explicitly unbound history', () => {

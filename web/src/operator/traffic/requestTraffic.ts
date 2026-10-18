@@ -74,13 +74,10 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
         cachedTokens += cachedInput;
       }
     }
-    // Local settlement amounts follow the shared displayed-cost policy: failed
-    // requests retain cost only when usage is provider-reported. The policy
-    // amount is only parsed when a currency is recorded, and totals stay grouped
-    // per currency.
     const currency = typeof request.currency === 'string' && request.currency.trim() ? request.currency : undefined;
-    if (currency) {
-      const cost = Number(requestDisplayedCost(request));
+    const displayedCost = requestDisplayedCost(request);
+    if (currency && displayedCost !== '') {
+      const cost = Number(displayedCost);
       if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
     }
     const outcome = requestOutcome(request);
@@ -246,6 +243,13 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   const createdAt = event.created_at ?? previous?.created_at
     ?? (event.event_kind === 'started' ? event.event_at : undefined);
   if (createdAt === undefined) return previous;
+  if (previous?.operational_terminal) {
+    return {
+      ...previous,
+      archive_state: mergeArchiveState(previous.archive_state, event),
+      session_context: mergeSessionContext(previous.session_context, event),
+    };
+  }
   // Replayed starts must not regress an authoritative terminal history row.
   if (event.event_kind === 'started' && previous?.status_code != null) return previous;
   const request: RequestView = {
@@ -270,6 +274,7 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
+  if (event.operational_terminal !== undefined) request.operational_terminal = event.operational_terminal;
   const supplierError = event.supplier_error ?? previous?.supplier_error;
   if (supplierError !== undefined || event.supplier_error === null) request.supplier_error = supplierError ?? null;
   const failureDiagnostic = event.failure_diagnostic ?? previous?.failure_diagnostic;
