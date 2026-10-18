@@ -280,7 +280,7 @@ async fn management_boundary_unknown_plugin_stale_revision_and_idempotency_confl
         )
         .await
         .0,
-        StatusCode::UNPROCESSABLE_ENTITY
+        StatusCode::BAD_REQUEST
     );
     assert_eq!(
         request(&state, body, Some("remove"), token).await.0,

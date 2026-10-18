@@ -2796,9 +2796,6 @@
           "500": {
             "$ref": "#/components/responses/InternalError"
           },
-          "422": {
-            "description": "Request JSON contains unknown fields or has an invalid shape."
-          },
           "503": {
             "description": "Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request."
           }
