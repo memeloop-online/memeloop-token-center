@@ -187,16 +187,28 @@ impl RuntimeSnapshot {
         configurations: &BTreeMap<String, serde_json::Value>,
         memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
+        let mut input_sizes = super::TrafficInputSizes::new(&self.runtime.plugins, configurations)?;
         let mut current = request.clone();
         let mut decision = TrafficDecision {
             allow: true,
             ..Default::default()
         };
-        for plugin in self.runtime.plugins.iter().filter(|plugin| {
-            plugin.manifest.contributions.traffic_policy
-                || plugin.manifest.contributions.request_rewrite
-        }) {
+        for (index, plugin) in self
+            .runtime
+            .plugins
+            .iter()
+            .enumerate()
+            .filter(|(_, plugin)| {
+                plugin.manifest.contributions.traffic_policy
+                    || plugin.manifest.contributions.request_rewrite
+            })
+        {
             let id = &plugin.manifest.id;
+            let (plugin_context, model_changed) = decision.project_context(&context, &mut current);
+            // Input rejection belongs to this request. It must precede circuit
+            // admission so an oversized body/config cannot open or probe a
+            // shared plugin circuit, including for another tenant.
+            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
             let epoch = {
                 let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
                 let circuit = circuits.entry(id.clone()).or_default();
@@ -209,7 +221,6 @@ impl RuntimeSnapshot {
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
             runtime.plugins = Arc::new(vec![plugin.clone()]);
-            let plugin_context = decision.project_context(&context, &mut current);
             let result = runtime.apply_traffic_with_config_and_memory(
                 plugin_context,
                 &current,
@@ -218,6 +229,15 @@ impl RuntimeSnapshot {
             );
             let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
             let circuit = circuits.entry(id.clone()).or_default();
+            if matches!(result, Err(AppError::PluginInputTooLarge)) {
+                // Defensive propagation if the executor discovers an input
+                // rejection after admission. Release a half-open probe without
+                // counting a guest failure or resetting previous failures.
+                if Arc::ptr_eq(&epoch.epoch, &circuit.epoch) {
+                    circuit.probe_active = false;
+                }
+                return Err(AppError::PluginInputTooLarge);
+            }
             circuit.complete(&epoch, result.is_err(), Instant::now());
             match result {
                 Err(_) => {
@@ -229,6 +249,7 @@ impl RuntimeSnapshot {
                     }
                     if let Some(request) = next.request_json {
                         current = request;
+                        input_sizes.invalidate_request();
                         decision.request_json = Some(current.clone());
                     }
                     if next.model.is_some() {
