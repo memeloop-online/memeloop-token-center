@@ -664,6 +664,54 @@ pub(crate) fn validate_install_egress_proxy(value: &str) -> Result<(), AppError>
     Ok(())
 }
 
+/// Explicit global-operator installer proxies may be public or private. Resolve
+/// once and persist the addresses with the operation; consumers must pin these
+/// addresses, including on retry. Proxy failure must never cause direct retry.
+pub(crate) async fn validate_installer_proxy_endpoint(
+    value: &str,
+    approved_group: bool,
+) -> Result<(Option<String>, Vec<SocketAddr>), AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    let url = checked_installer_proxy_url(value)?;
+    if approved_group {
+        crate::provider::validate_codex_proxy_url(value).map_err(|_| invalid())?;
+    }
+    let (host, addresses, _) = validated_endpoint(&url, OutboundScope::Private, false).await?;
+    if approved_group
+        && addresses
+            .iter()
+            .any(|address| !is_safe_private_upstream_ip(address.ip()))
+    {
+        return Err(invalid());
+    }
+    Ok((host, addresses))
+}
+
+pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    if value.len() > 2048
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_some_and(is_loopback_name)
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
 fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
@@ -1421,6 +1469,57 @@ mod tests {
         assert!(
             validate_transport_security("http", &private, OutboundScope::Private, false).is_ok(),
             "explicit private ComfyUI endpoints may use cleartext on the private network"
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_proxy_public_private_and_forbidden_endpoint_contract() {
+        for value in [
+            "http://8.8.8.8:3128",
+            "https://1.1.1.1:443",
+            "socks5://8.8.4.4:1080",
+            "socks5h://10.20.30.40:1080",
+        ] {
+            let (_, addresses) = validate_installer_proxy_endpoint(value, false)
+                .await
+                .unwrap();
+            assert_eq!(addresses.len(), 1);
+        }
+        for value in [
+            "http://127.0.0.1:3128",
+            "http://169.254.169.254:3128",
+            "http://100.100.100.200:3128",
+            "http://[::1]:3128",
+            "http://[fe80::1]:3128",
+            "http://user:secret@8.8.8.8:3128",
+            "http://8.8.8.8:3128/path",
+            "http://8.8.8.8:3128?x=y",
+            "http://8.8.8.8:3128#fragment",
+            "file:///tmp/proxy",
+            "http://localhost:3128",
+            "http://8.8.8.8:0",
+        ] {
+            assert!(
+                validate_installer_proxy_endpoint(value, false)
+                    .await
+                    .is_err(),
+                "accepted {value}"
+            );
+        }
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://8.8.8.8:1080", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("http://10.20.30.40:3128", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://10.20.30.40:1080", true)
+                .await
+                .is_ok()
         );
     }
 
