@@ -49,6 +49,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       runtime: render('runtime', runtimeFlags),
       runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
       runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
+      runtimeAll: render('runtime-all', [...runtimeFlags, '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       dev: render('dev', ['--values', join(chart, 'values-dev.yaml')]),
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
@@ -116,6 +117,21 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     has('runtimeCreated', 'helm.sh/resource-policy: keep');
     has('runtimeCreated', 'storage: "1Gi"');
     has('runtimeCreated', 'storageClassName: "reviewed-rwx"');
+    for (const key of ['runtime', 'runtimeReaders', 'runtimeCreated', 'runtimeAll', 'retainedWorker']) {
+      const runtimeDeployments = parseAllDocuments(output[key]!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
+      const writer = runtimeDeployments.find(deployment => ['control', 'all'].includes(deployment.spec.template.metadata.labels['app.kubernetes.io/component']!))!;
+      const writerWave = Number(writer.metadata.annotations['argocd.argoproj.io/sync-wave']);
+      const writerClaim = writer.spec.template.spec.volumes.find(volume => volume.name === 'plugin-runtime-inventory')!.persistentVolumeClaim!.claimName;
+      for (const deployment of runtimeDeployments) {
+        const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+        const claim = deployment.spec.template.spec.volumes.find(volume => volume.name === 'plugin-runtime-inventory')!;
+        assert.equal(claim.persistentVolumeClaim?.claimName, writerClaim, `${key}/${role}: image or role changes must retain the shared PVC`);
+        assert.equal(claim.emptyDir, undefined, `${key}/${role}: runtime state must never fall back to Pod storage`);
+        if (role === 'gateway' || role === 'worker') {
+          assert.ok(writerWave < Number(deployment.metadata.annotations['argocd.argoproj.io/sync-wave']), `${key}/${role}: empty-PVC initialization must precede read-only startup`);
+        }
+      }
+    }
     for (const deployment of parseAllDocuments(output.runtime!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const writer = role === 'control';
