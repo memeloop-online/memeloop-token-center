@@ -421,7 +421,8 @@ pub struct PluginInstallProvenance {
     pub signature_policy: String,
 }
 
-/// Host-owned exact GitHub Actions signing identity, never request input.
+/// Exact GitHub Actions signing identity. Installation callers must obtain
+/// host policy or explicit operator confirmation before treating it as trust.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CosignKeylessIdentity {
@@ -434,7 +435,7 @@ impl CosignKeylessIdentity {
         self.issuer == "https://token.actions.githubusercontent.com"
             && self.identity.starts_with("https://github.com/")
             && self.identity.contains("/.github/workflows/")
-            && self.identity.contains("@refs/heads/")
+            && (self.identity.contains("@refs/heads/") || self.identity.contains("@refs/tags/"))
             && self.identity.len() <= 512
             && !self
                 .identity

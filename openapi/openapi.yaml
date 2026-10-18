@@ -1159,44 +1159,13 @@ paths:
         '500': { $ref: '#/components/responses/InternalError' }
         '503': { description: Export validation capacity or the database is unavailable; no publication occurs. }
 
-  /internal/v1/plugin-runtime/installations:
-    post:
-      tags: [System]
-      operationId: installPluginInventory
-      summary: Install new signed OCI packages into an inactive inventory for review
-      description: Requires host installation policy. The host owns storage roots, allowed repositories, Cosign trust keys and registry credential files. Only digest-pinned references and a fresh inventory ID are accepted. A durable task survives HTTP disconnect; exact retries reuse the task. Successful download does not register grants or publish a revision.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: plugins:write
-      x-global-operator-only: true
-      parameters:
-        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [inventory_id, packages]
-              properties:
-                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
-                packages:
-                  type: array
-                  minItems: 1
-                  maxItems: 16
-                  uniqueItems: true
-                  items: { type: string, maxLength: 2048, pattern: '^[^@]+@sha256:[0-9A-Fa-f]{64}$' }
-      responses:
-        '202':
-          description: Durable installation task or exact replay.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/PluginInstallation' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+  "/internal/v1/plugin-runtime/release-resolutions": {"post":{"tags":["System"],"operationId":"resolvePluginRelease","summary":"Resolve a GitHub release asset for explicit source and signer confirmation","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}},"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["url"],"properties":{"url":{"type":"string","format":"uri","maxLength":2048},"network":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}}}},"parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":200}}],"description":"Downloads a bounded HTTPS GitHub release JSON asset through the frozen installation network. Returns id, base_revision, release_url, descriptor_sha256, source and descriptor with reference and signer. Discovery does not authorize the signer: the operator must explicitly confirm it in the installation request. The descriptor and current approved plugin inventory are persisted; install and retry never refetch the URL. No private roots, proxy credentials or retained grants are returned."}}
+
+  "/internal/v1/plugin-runtime/installer-network": {"get":{"tags":["System"],"operationId":"getPluginInstallerNetwork","summary":"Read remembered installer network without proxy password","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}}},"put":{"tags":["System"],"operationId":"putPluginInstallerNetwork","summary":"Remember the installation network","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}},"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}},"description":"Credentials are encrypted at rest. default freezes the deployment network; direct bypasses it. Custom HTTP or SOCKS proxy DNS is frozen to approved addresses. HTTPS proxy hostnames are rejected for the external installer; HTTPS IP endpoints are supported. An omitted password preserves the remembered password only for the same URL and username; empty clears it."}}
+
+  "/internal/v1/plugin-runtime/installer-network/groups": {"get":{"tags":["System"],"operationId":"listPluginInstallerNetworkGroups","summary":"List installation proxy groups for one tenant","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}},"parameters":[{"name":"tenant_external_id","in":"query","required":true,"schema":{"type":"string"}}],"description":"Also requires providers:read for the tenant. Returns the existing safe transport group list with versions and member IDs; never returns proxy credentials."}}
+
+  /internal/v1/plugin-runtime/installations: {"post":{"tags":["System"],"operationId":"installPluginInventory","summary":"Install new signed OCI packages into an inactive inventory for review","description":"A normal browser install supplies release_resolution_id and release_descriptor_sha256 as explicit confirmation of the displayed source, immutable reference and exact signing identity. Its inventory ID is generated server side. The frozen resolution authorizes only this installation; host source policy is not changed. Current exact approved plugins are retained without downloading or reapproving them. The base runtime revision is checked before review, approval and publication; conflicts require a new resolution. Existing digest-pinned OCI packages and inventory_id remain the advanced interface. Full Cosign verification and a subsequent explicit capability review are required. Network credentials travel to the installer only through bounded anonymous stdin, never argv, environment or temporary files.","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":200}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"inventory_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"packages":{"type":"array","minItems":0,"maxItems":16,"uniqueItems":true,"items":{"type":"string","maxLength":2048,"pattern":"^[^@]+@sha256:[0-9A-Fa-f]{64}$"}},"release_resolution_id":{"type":"string","format":"uuid"},"release_descriptor_sha256":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"network":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}}}},"responses":{"202":{"description":"Durable installation task or exact replay.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PluginInstallation"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"$ref":"#/components/responses/Conflict"}}}}
 
   /internal/v1/plugin-runtime/installations/{id}:
     parameters:
@@ -7316,6 +7285,7 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    PluginInstallerNetworkInput: {"oneOf":[{"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"type":"string","enum":["default","direct"]}}},{"type":"object","additionalProperties":false,"required":["mode","url"],"properties":{"mode":{"type":"string","enum":["custom"]},"url":{"type":"string","maxLength":2048},"username":{"type":"string","maxLength":255},"password":{"type":"string","maxLength":255,"writeOnly":true}}},{"type":"object","additionalProperties":false,"required":["mode","tenant_external_id","group_id","group_version","member_id"],"properties":{"mode":{"type":"string","enum":["group"]},"tenant_external_id":{"type":"string"},"group_id":{"type":"string","format":"uuid"},"group_version":{"type":"integer"},"member_id":{"type":"string","format":"uuid"}}}]}
     TransportProxyGroupList: {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/TransportProxyGroup"}}}}
     TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}
     CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
@@ -7381,6 +7351,7 @@ components:
       additionalProperties: false
       required: [id, inventory_id, actor, status, packages, completed_packages, review_digest, review, failure_category, created_at, updated_at]
       properties:
+        base_revision: {"type":"integer","nullable":true,"description":"Frozen current revision for additive URL installations; publication must use it as expected_revision."}
         id: { type: string, format: uuid }
         inventory_id: { type: string }
         actor: { type: string, description: Service identity or bootstrap marker; never a credential. }

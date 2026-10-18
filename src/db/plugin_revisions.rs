@@ -256,6 +256,15 @@ impl Database {
             .filter(|n| *n > 0)
             .ok_or(AppError::Internal)?;
         let mut tx = self.pool.begin().await?;
+        if reason != "rollback" {
+            let frozen_base: Option<i64> = sqlx::query_scalar("SELECT r.base_revision FROM application_plugin_release_resolutions r JOIN application_plugin_installations i ON i.idempotency_hash=r.install_key_hash WHERE i.inventory_id=$1")
+                .bind(inventory_id).fetch_optional(&mut *tx).await?;
+            if frozen_base.is_some_and(|base| base != expected_revision) {
+                return Err(AppError::Conflict(
+                    "release installation base revision changed".into(),
+                ));
+            }
+        }
         let claimed = sqlx::query("INSERT INTO application_plugin_operations (idempotency_key, request_hash, created_at) VALUES ($1, $2, $3) ON CONFLICT(idempotency_key) DO NOTHING")
             .bind(idempotency_key).bind(request_hash).bind(unix_millis()).execute(&mut *tx).await?;
         if claimed.rows_affected() == 0 {

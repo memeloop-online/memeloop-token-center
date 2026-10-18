@@ -29,6 +29,7 @@ pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
 pub mod prepare;
+mod retained_installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
 const PIN_DEADLINE: Duration = Duration::from_secs(45);
@@ -97,6 +98,7 @@ pub struct ApplicationPlugins {
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
     installation_policy_file: Option<PathBuf>,
+    installer_network_key: Option<Vec<u8>>,
     inventory_stamp: tokio::sync::Mutex<Option<InventoryStamp>>,
     #[cfg(test)]
     inventory_reads: std::sync::atomic::AtomicUsize,
@@ -231,6 +233,7 @@ impl ApplicationPlugins {
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
             installation_policy_file: None,
+            installer_network_key: None,
             inventory_stamp: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             inventory_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -436,6 +439,16 @@ impl ApplicationPlugins {
         actor: &str,
     ) -> Result<ApplicationRevision, AppError> {
         validate_operation(input.expected_revision, key)?;
+        if let Some(base) = self
+            .db
+            .plugin_release_base_revision(&input.inventory_id)
+            .await?
+            && input.expected_revision != base
+        {
+            return Err(AppError::Conflict(
+                "release installation was prepared against another runtime revision".into(),
+            ));
+        }
         let reason = if input.expected_revision == 0 {
             "initial"
         } else {
