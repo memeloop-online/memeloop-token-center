@@ -475,6 +475,8 @@ mod tests {
         );
         assert!(!format!("{error:?}").contains(SECRET));
         for failure in [
+            PluginReleaseDownloadFailure::Request,
+            PluginReleaseDownloadFailure::RemoteHttp,
             PluginReleaseDownloadFailure::Dns,
             PluginReleaseDownloadFailure::Connection,
             PluginReleaseDownloadFailure::Body,
