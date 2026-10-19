@@ -307,3 +307,9 @@ PR or partial green checks establish completion of the reading requirements.
 - CI `39292284611` for `e3e85b0e` remains live; API, migration smoke, packaging,
   security and release-input assembly passed. Rust and web were still running
   at the latest check. Keep this run for evidence before pushing the sweep.
+
+- The same run's web job has now completed successfully, including the new
+  multi-request/reset-history browser contract. Rust formatting and Clippy
+  passed; the all-targets test step is still running. Added light/dark
+  320/768/1440px screenshots and overflow/right-column assertions for the
+  actual default prefix-history view to the next browser revision.

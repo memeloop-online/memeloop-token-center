@@ -72,6 +72,23 @@ test('conversation history pages request replies across resets without opening a
     assert.equal(await page.locator('.session-context-turn').count(), 4);
     assert.equal(await page.evaluate(() => window.contextContentReads), 0);
     assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
+    await mkdir(artifactRoot, { recursive: true });
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
+      for (const width of screenshotWidths) {
+        await page.setViewportSize({ width, height: 900 });
+        await nextPaint(page);
+        const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+        assert.ok(overflow <= 1, `history overflows at ${width}px in ${theme}`);
+        if (width === 1440) {
+          const columns = page.locator('.session-context-columns').first();
+          const assistant = await columns.locator(':scope > section').boundingBox();
+          const user = await columns.locator(':scope > aside').boundingBox();
+          assert.ok(assistant && user && assistant.x + assistant.width <= user.x, 'user messages stay on the right');
+        }
+        await page.screenshot({ path: join(artifactRoot, `prefix-history-${theme}-${width}.png`), fullPage: true });
+      }
+    }
     await page.getByRole('button', { name: 'Earlier turns', exact: true }).click();
     await page.getByText('Current request final answer · replay-r1', { exact: true }).waitFor();
     await page.getByText('User message before reset', { exact: true }).waitFor();
