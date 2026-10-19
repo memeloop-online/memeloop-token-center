@@ -50,11 +50,11 @@ test('confirmed empty tenant scope allows global plugin management and first ten
     await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
     assert.equal(await page.getByRole('heading', { name: 'Plugin settings', exact: true }).count(), 0);
     await page.getByRole('button', { name: 'Download network', exact: true }).click();
-    await page.getByLabel('Download network', { exact: true }).selectOption('group');
+    await page.getByRole('combobox', { name: /^Download network/ }).selectOption('group');
     await page.getByText('Select a tenant to use its proxy groups.', { exact: true }).waitFor();
-    assert.equal(await page.getByLabel('Proxy group', { exact: true }).isDisabled(), true);
+    assert.equal(await page.getByRole('combobox', { name: /^Proxy group/ }).isDisabled(), true);
     assert.equal(calls.some(call => call.includes('/groups') || call.includes('/configuration') || call.includes('/data/')), false);
-    await page.getByLabel('Download network', { exact: true }).selectOption('custom');
+    await page.getByRole('combobox', { name: /^Download network/ }).selectOption('custom');
     await page.getByLabel('Proxy URL', { exact: true }).fill('http://proxy.example:8080');
     await page.getByRole('button', { name: 'Save network', exact: true }).click();
     await page.getByText('Download network saved.', { exact: true }).waitFor();
@@ -114,11 +114,11 @@ for (const view of ['plugins', 'tenants', 'providers', 'service-credentials', 's
       await page.goto(`http://127.0.0.1:${address.port}/operator?view=${view}`);
       await discoveryStarted;
       await page.locator('[id^="operator-panel-"]').waitFor();
-      assert.deepEqual(calls, ['/internal/v1/tenants']);
+      assert.deepEqual([...new Set(calls)], ['/internal/v1/tenants'], 'StrictMode may repeat discovery, but must never read page resources');
       assert.equal(await page.getByText('No tenants are available to this credential.', { exact: true }).count(), 0, 'loading is not an empty scope');
       release();
       await page.getByRole('alert').filter({ hasText: 'temporarily unavailable' }).waitFor();
-      assert.deepEqual(calls, ['/internal/v1/tenants']);
+      assert.deepEqual([...new Set(calls)], ['/internal/v1/tenants'], 'StrictMode may repeat discovery, but must never read page resources');
       assert.equal(await page.getByText('No tenants are available to this credential.', { exact: true }).count(), 0, 'failed discovery is not an empty scope');
       unavailable = false;
       await page.getByRole('alert').getByRole('button', { name: 'Retry', exact: true }).click();
