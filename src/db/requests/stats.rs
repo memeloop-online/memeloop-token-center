@@ -4,6 +4,62 @@ use super::super::*;
 
 pub(crate) const MAX_STATS_RANGE_MILLIS: i64 = 93 * 86_400_000;
 
+const OPERATIONAL_ACTIVITY_DELTA: &str = r#"
+SELECT r.created_at,
+       r.model,
+       r.protocol,
+       CASE WHEN op.status_code BETWEEN 200 AND 399 AND COALESCE(op.error_code, '') = ''
+            THEN 'success' ELSE 'failure' END AS status_class,
+       COALESCE(op.error_code, '') AS error_code,
+       CASE WHEN r.completed_at IS NULL OR r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
+       CASE WHEN r.completed_at IS NULL OR r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
+       r.currency,
+       CASE WHEN r.completed_at IS NULL THEN CAST(NULL AS BIGINT) ELSE r.cost_micros END AS cost_micros,
+       CAST(1 AS BIGINT) AS requests
+FROM operational_candidates candidate
+JOIN proxy_operational_terminals op ON op.request_id = candidate.request_id
+JOIN request_records r ON r.id = op.request_id AND r.created_at = op.request_created_at
+     AND r.tenant_id = op.tenant_id AND r.key_id = op.key_id AND r.reservation_id = op.reservation_id
+LEFT JOIN key_records k ON k.id = op.key_id AND k.tenant_id = op.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+JOIN tenants t ON t.id = op.tenant_id
+WHERE ($1 = '' OR t.external_id = $1)
+  AND ($2 = '' OR op.key_id = $2)
+  AND op.request_created_at >= $3 AND op.request_created_at <= $4
+  AND r.created_at >= $3 AND r.created_at <= $4
+  AND ($5 = '' OR r.model = $5)
+  AND ($6 = '' OR r.protocol = $6)
+  AND ($7 = ''
+       OR ($7 = 'success' AND op.status_code BETWEEN 200 AND 399 AND COALESCE(op.error_code, '') = '')
+       OR ($7 = 'error' AND (op.status_code NOT BETWEEN 200 AND 399 OR COALESCE(op.error_code, '') <> '')))
+  AND ($8 = '' OR op.error_code = $8)
+  AND ($9 = '' OR op.upstream_account_id = $9)
+  AND ($10 = '' OR op.model_route_id = $10)
+  AND ($11 < 0 OR op.duration_ms >= $11)
+  AND ($12 < 0 OR op.duration_ms <= $12)
+  AND ($13 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros >= $13))
+  AND ($14 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros <= $14))
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
+  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = op.request_id)
+"#;
+
+const OPERATIONAL_CANDIDATES: &str = r#"
+SELECT request_id FROM pending_proxy_settlements WHERE state = 'pending'
+  AND ($1 = '' OR tenant_id = (SELECT id FROM tenants WHERE external_id = $1))
+  AND ($2 = '' OR key_id = $2)
+UNION
+SELECT request_id FROM terminal_projection_outbox WHERE projected_at IS NULL
+  AND ($1 = '' OR tenant_id = (SELECT id FROM tenants WHERE external_id = $1))
+  AND ($2 = '' OR key_id = $2)
+"#;
+
 pub(crate) const FILTERED_ACTIVITY_SOURCE_ROLLUPS: &str = r#"
 SELECT a.day_bucket * 86400000 AS created_at,
        a.model,
@@ -336,6 +392,7 @@ struct StatsProjectionAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     costs: BTreeMap<String, i64>,
+    unknown_cost: bool,
     cache_usage: crate::model::CacheStats,
 }
 
@@ -382,8 +439,12 @@ impl StatsProjectionAccumulator {
         if currency.is_empty() {
             return Err(AppError::Internal);
         }
-        let cost = self.costs.entry(currency).or_default();
-        *cost = cost.saturating_add(row.try_get("cost_micros")?);
+        if let Some(micros) = row.try_get::<Option<i64>, _>("cost_micros")? {
+            let cost = self.costs.entry(currency).or_default();
+            *cost = cost.saturating_add(micros);
+        } else {
+            self.unknown_cost = true;
+        }
         Ok(())
     }
 
@@ -399,7 +460,7 @@ impl StatsProjectionAccumulator {
             failed_requests: self.failed_requests,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            total_cost,
+            total_cost: if self.unknown_cost { None } else { total_cost },
             costs,
         }
     }
@@ -411,7 +472,7 @@ impl StatsProjectionAccumulator {
             requests: self.total_requests,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            cost,
+            cost: if self.unknown_cost { None } else { cost },
             costs,
         }
     }
@@ -499,18 +560,23 @@ impl Database {
         let principal = search_prefix(filter.principal.as_deref());
         // Ordinary terminal statistics use compact daily rollups for complete UTC days and
         // exact facts for the two possible boundary days. Per-request duration/cost filters
-        // use compact facts for the whole bounded interval. Only transient pending requests
-        // need the raw request/job tables.
+        // use compact facts for the whole bounded interval. Unprojected operational terminals
+        // add only indexed transient candidates and point reads of their request metadata.
         let use_facts = filter.min_duration_ms.is_some()
             || filter.max_duration_ms.is_some()
             || filter.min_cost_micros.is_some()
             || filter.max_cost_micros.is_some();
-        let activity_source = if filter.status.as_deref() == Some("pending") {
+        let base_activity_source = if filter.status.as_deref() == Some("pending") {
             FILTERED_ACTIVITY_SOURCE_PENDING
         } else if use_facts {
             FILTERED_ACTIVITY_SOURCE_FACTS
         } else {
             FILTERED_ACTIVITY_SOURCE_ROLLUPS
+        };
+        let activity_source = if filter.status.as_deref() == Some("pending") {
+            base_activity_source.to_owned()
+        } else {
+            format!("{base_activity_source}\nUNION ALL\n{OPERATIONAL_ACTIVITY_DELTA}")
         };
         const DAY_MILLIS: i64 = 86_400_000;
         let full_day_from = from_created_at
@@ -552,7 +618,8 @@ impl Database {
         let stats_sql = match self.backend {
             DatabaseBackend::PostgreSql => format!(
                 r#"
-WITH filtered_activity AS MATERIALIZED ({activity_source}),
+WITH operational_candidates AS MATERIALIZED ({OPERATIONAL_CANDIDATES}),
+filtered_activity AS MATERIALIZED ({activity_source}),
 enriched AS (
     SELECT model,
            created_at / 86400000 AS day_bucket,
@@ -596,7 +663,7 @@ grouped AS (
            CAST(COALESCE(SUM(cache_reported_read_tokens), 0) AS BIGINT) AS cache_reported_read_tokens,
            CAST(COALESCE(SUM(cache_reported_requests), 0) AS BIGINT) AS cache_reported_requests,
            currency,
-           CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros
+           CAST(CASE WHEN COUNT(*) = COUNT(cost_micros) THEN COALESCE(SUM(cost_micros), 0) ELSE NULL END AS BIGINT) AS cost_micros
       FROM enriched
      GROUP BY GROUPING SETS (
          (currency), (model, currency), (day_bucket, currency), (error_bucket, currency)
@@ -631,7 +698,8 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
             ),
             DatabaseBackend::Sqlite => format!(
                 r#"
-WITH filtered_activity AS MATERIALIZED ({activity_source}),
+WITH operational_candidates AS MATERIALIZED ({OPERATIONAL_CANDIDATES}),
+filtered_activity AS MATERIALIZED ({activity_source}),
 grouped AS (
     SELECT 'summary' AS bucket_kind,
            '' AS name,
@@ -648,25 +716,25 @@ grouped AS (
            CAST(COALESCE(SUM(cache_reported_read_tokens), 0) AS BIGINT) AS cache_reported_read_tokens,
            CAST(COALESCE(SUM(cache_reported_requests), 0) AS BIGINT) AS cache_reported_requests,
            currency,
-           CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros
+           CAST(CASE WHEN COUNT(*) = COUNT(cost_micros) THEN COALESCE(SUM(cost_micros), 0) ELSE NULL END AS BIGINT) AS cost_micros
       FROM filtered_activity GROUP BY currency
     UNION ALL
     SELECT 'model', model, -1, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, CASE WHEN COUNT(*) = COUNT(cost_micros) THEN SUM(cost_micros) ELSE NULL END
       FROM filtered_activity GROUP BY model, currency
     UNION ALL
     SELECT 'day', '', created_at / 86400000, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, CASE WHEN COUNT(*) = COUNT(cost_micros) THEN SUM(cost_micros) ELSE NULL END
       FROM filtered_activity GROUP BY created_at / 86400000, currency
     UNION ALL
     SELECT 'error', error_code, -1, SUM(requests),
            SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END),
            SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END),
-           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, SUM(cost_micros)
+           SUM(input_tokens), SUM(output_tokens), SUM(cache_known_read_tokens), SUM(cache_known_input_tokens), SUM(cache_eligible_requests), SUM(cache_unknown_requests), SUM(cache_reported_read_tokens), SUM(cache_reported_requests), currency, CASE WHEN COUNT(*) = COUNT(cost_micros) THEN SUM(cost_micros) ELSE NULL END
       FROM filtered_activity WHERE error_code <> '' GROUP BY error_code, currency
 ),
 with_bucket_totals AS (
@@ -697,7 +765,7 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
             ),
         };
         // SQL safety boundary: both outer templates are literals and `activity_source` is chosen
-        // exclusively from the three module constants above. All request filters remain binds;
+        // exclusively from the module constants above. All request filters remain binds;
         // no caller-provided text is interpolated into this generated statement.
         let rows = bind_activity_filter!(sqlx::query(sqlx::AssertSqlSafe(stats_sql)))
             .fetch_all(&self.pool)
@@ -836,4 +904,118 @@ pub(crate) fn validate_numeric_range(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod operational_plan_tests {
+    use super::*;
+    use crate::db::test_support::PostgresTestDatabase;
+
+    async fn assert_overlay_access_paths(database: &Database) {
+        let mut transaction = database.pool.begin().await.unwrap();
+        let prefix = match database.backend {
+            DatabaseBackend::PostgreSql => {
+                sqlx::query("SET LOCAL enable_seqscan = off")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                "EXPLAIN"
+            }
+            DatabaseBackend::Sqlite => "EXPLAIN QUERY PLAN",
+        };
+        let statement = format!(
+            "{prefix} WITH operational_candidates AS MATERIALIZED ({OPERATIONAL_CANDIDATES}) {OPERATIONAL_ACTIVITY_DELTA}"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind("")
+            .bind("")
+            .bind(0_i64)
+            .bind(unix_millis())
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind("")
+            .bind(-1_i64)
+            .bind(-1_i64)
+            .bind(-1_i64)
+            .bind(-1_i64)
+            .bind("")
+            .bind("")
+            .fetch_all(&mut *transaction)
+            .await
+            .unwrap();
+        let details = rows
+            .iter()
+            .map(|row| match database.backend {
+                DatabaseBackend::PostgreSql => row.get::<String, _>(0),
+                DatabaseBackend::Sqlite => row.get::<String, _>("detail"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            details.contains("pending_proxy_settlements_recovery_idx"),
+            "{details}"
+        );
+        assert!(
+            details.contains("terminal_projection_pending_idx"),
+            "{details}"
+        );
+        match database.backend {
+            DatabaseBackend::PostgreSql => {
+                for table in [
+                    "request_records",
+                    "proxy_operational_terminals",
+                    "request_stats_facts",
+                ] {
+                    assert!(
+                        !details.contains(&format!("Seq Scan on {table}")),
+                        "{details}"
+                    );
+                }
+            }
+            DatabaseBackend::Sqlite => {
+                for alias in ["r", "op", "fact"] {
+                    assert!(
+                        !details.lines().any(|line| line == format!("SCAN {alias}")
+                            || line.starts_with(&format!("SCAN {alias} "))),
+                        "{details}"
+                    );
+                }
+            }
+        }
+        transaction.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_operational_statistics_overlay_uses_transient_indexes_and_point_joins() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("operational-plan.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        assert_overlay_access_paths(&database).await;
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_operational_statistics_overlay_has_index_access_paths() {
+        let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "PostgreSQL required in CI"
+            );
+            return;
+        };
+        let isolated = PostgresTestDatabase::create(&url).await;
+        let database = Database::connect(isolated.url()).await.unwrap();
+        database.migrate().await.unwrap();
+        assert_overlay_access_paths(&database).await;
+        database.close().await;
+        isolated.cleanup().await;
+    }
 }

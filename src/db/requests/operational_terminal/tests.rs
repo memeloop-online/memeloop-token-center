@@ -4,7 +4,8 @@ use crate::model::{RequestFinancialState, RequestLifecycleState, RequestUsageBas
 use rust_decimal::Decimal;
 
 struct Fixture {
-    isolated: PostgresTestDatabase,
+    isolated: Option<PostgresTestDatabase>,
+    directory: Option<tempfile::TempDir>,
     database: Database,
     key: AuthenticatedKey,
     claim: PendingProxySettlementClaim,
@@ -22,12 +23,33 @@ impl Fixture {
         };
         let isolated = PostgresTestDatabase::create(&url).await;
         let database = Database::connect_with_max(isolated.url(), 6).await.unwrap();
+        Some(Self::create(database, Some(isolated), "operational-test").await)
+    }
+
+    async fn sqlite() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("operational.db").display()
+        ))
+        .await
+        .unwrap();
+        let mut fixture = Self::create(database, None, "operational-test").await;
+        fixture.directory = Some(directory);
+        fixture
+    }
+
+    async fn create(
+        database: Database,
+        isolated: Option<PostgresTestDatabase>,
+        tenant: &str,
+    ) -> Self {
         database.migrate().await.unwrap();
         let pepper = b"operational receipt regression";
         let issued = database
             .create_key(
                 CreateKeyInput {
-                    tenant_external_id: "operational-test".into(),
+                    tenant_external_id: tenant.into(),
                     principal_external_id: "member".into(),
                     alias: "operational-test".into(),
                     currency: "USD".into(),
@@ -78,13 +100,14 @@ impl Fixture {
             .claim_pending_proxy_settlement(&owner, 10, 20, None)
             .await
             .unwrap();
-        Some(Self {
+        Self {
             isolated,
+            directory: None,
             database,
             key,
             claim,
             reservation,
-        })
+        }
     }
 
     fn operational(&self, status: i64) -> PendingProxyOperationalTerminal {
@@ -279,8 +302,444 @@ impl Fixture {
 
     async fn close(self) {
         self.database.close().await;
-        self.isolated.cleanup().await;
+        if let Some(isolated) = self.isolated {
+            isolated.cleanup().await;
+        }
+        drop(self.directory);
     }
+}
+
+#[tokio::test]
+async fn sqlite_operational_statistics_preserve_unknown_finance_and_filters() {
+    for status in [200, 429, 499, 502] {
+        operational_statistics_contract(Fixture::sqlite().await, status).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_operational_statistics_preserve_unknown_finance_and_filters() {
+    for status in [200, 429, 499, 502] {
+        let Some(fixture) = Fixture::postgres().await else {
+            return;
+        };
+        operational_statistics_contract(fixture, status).await;
+    }
+}
+
+async fn operational_statistics_contract(fixture: Fixture, status: i64) {
+    let mut terminal = fixture.operational(status);
+    if status == 200 {
+        terminal.error_code = None;
+        terminal.terminal_cause = None;
+    }
+    let upstream = Uuid::now_v7();
+    let route = Uuid::now_v7();
+    let receipt = Uuid::now_v7();
+    fixture
+        .database
+        .record_pending_proxy_operational_terminal(
+            &fixture.claim,
+            receipt,
+            &terminal,
+            ProxyRequestUpstreamAttribution::LastDispatched(Some((upstream, route))),
+        )
+        .await
+        .unwrap();
+    fixture
+        .database
+        .mark_pending_proxy_settlement_unknown(&fixture.claim)
+        .await
+        .unwrap();
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(created_at),
+        ..StatsFilter::default()
+    };
+    let stats = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(stats.summary.total_requests, 1);
+    assert_eq!(stats.summary.successful_requests, i64::from(status == 200));
+    assert_eq!(stats.summary.failed_requests, i64::from(status != 200));
+    assert_eq!(stats.summary.total_cost, None);
+    assert!(stats.summary.costs.is_empty());
+    assert_eq!(stats.summary.input_tokens, 0);
+    assert_eq!(stats.summary.output_tokens, 0);
+    assert_eq!(stats.summary.cache_usage.unknown_requests, 1);
+    assert_eq!(stats.by_model.len(), 1);
+    assert_eq!(stats.by_day.len(), 1);
+    for bucket in stats
+        .by_model
+        .iter()
+        .chain(&stats.by_day)
+        .chain(&stats.errors)
+    {
+        assert_eq!(bucket.requests, 1);
+        assert_eq!(bucket.cost, None);
+        assert!(bucket.costs.is_empty());
+    }
+    assert_eq!(stats.errors.len(), usize::from(status != 200));
+    fixture.assert_unsettled().await;
+    let day_start = created_at / 86_400_000 * 86_400_000;
+    let complete_day = StatsFilter {
+        from_created_at: Some(day_start),
+        to_created_at: Some(day_start + 86_400_000 - 1),
+        ..filter.clone()
+    };
+    let complete_day_stats = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, complete_day)
+        .await
+        .unwrap();
+    assert_eq!(complete_day_stats.summary.total_requests, 1);
+    assert_eq!(complete_day_stats.summary.total_cost, None);
+
+    let other_key = Fixture::create(fixture.database.clone(), None, "operational-test").await;
+    other_key
+        .record(Uuid::now_v7(), &other_key.operational(status))
+        .await
+        .unwrap();
+    let foreign = Fixture::create(fixture.database.clone(), None, "foreign-tenant").await;
+    foreign
+        .record(Uuid::now_v7(), &foreign.operational(status))
+        .await
+        .unwrap();
+    let scope_filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(unix_millis()),
+        ..StatsFilter::default()
+    };
+    assert_eq!(
+        fixture
+            .database
+            .global_operator_stats_filtered(scope_filter.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        3
+    );
+    assert_eq!(
+        fixture
+            .database
+            .operator_stats_filtered("operational-test", scope_filter.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        2
+    );
+    assert_eq!(
+        fixture
+            .database
+            .operator_stats_filtered("foreign-tenant", scope_filter)
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        1
+    );
+
+    let matching = StatsFilter {
+        key_id: Some(fixture.key.key_id),
+        model: Some("operational-model".into()),
+        protocol: Some("openai".into()),
+        status: Some(if status == 200 { "success" } else { "error" }.into()),
+        error_code: terminal.error_code.clone(),
+        upstream_account_id: Some(upstream),
+        route_id: Some(route),
+        min_duration_ms: Some(10),
+        max_duration_ms: Some(10),
+        key_alias: Some("OPERATIONAL".into()),
+        principal: Some("MEM".into()),
+        ..filter.clone()
+    };
+    assert_eq!(
+        fixture
+            .database
+            .operator_stats_filtered("operational-test", matching.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        1
+    );
+    assert_eq!(
+        fixture
+            .database
+            .global_operator_stats_filtered(matching.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        1
+    );
+    assert_eq!(
+        fixture
+            .database
+            .operator_stats_filtered("foreign-tenant", matching.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        0
+    );
+    let mut forged = matching.clone();
+    forged.key_id = Some(Uuid::now_v7());
+    assert_eq!(
+        fixture
+            .database
+            .stats_filtered(fixture.key.key_id, forged.clone())
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        1
+    );
+    assert_eq!(
+        fixture
+            .database
+            .global_operator_stats_filtered(forged)
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        0
+    );
+    let mut excluded = Vec::new();
+    let mut changed = matching.clone();
+    changed.model = Some("foreign-model".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.protocol = Some("anthropic".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.status = Some(if status == 200 { "error" } else { "success" }.into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.status = Some("pending".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.error_code = Some("foreign-error".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.upstream_account_id = Some(Uuid::now_v7());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.route_id = Some(Uuid::now_v7());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.min_duration_ms = Some(11);
+    changed.max_duration_ms = None;
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.min_duration_ms = None;
+    changed.max_duration_ms = Some(9);
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.min_cost_micros = Some(0);
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.max_cost_micros = Some(1000);
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.key_alias = Some("foreign".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.principal = Some("foreign".into());
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.from_created_at = Some(created_at + 1);
+    changed.to_created_at = Some(created_at + 1);
+    excluded.push(changed);
+    let mut changed = matching.clone();
+    changed.from_created_at = Some(created_at - 1);
+    changed.to_created_at = Some(created_at - 1);
+    excluded.push(changed);
+    for excluded_filter in excluded {
+        assert_eq!(
+            fixture
+                .database
+                .global_operator_stats_filtered(excluded_filter.clone())
+                .await
+                .unwrap()
+                .summary
+                .total_requests,
+            0,
+            "{excluded_filter:?}"
+        );
+    }
+
+    let mut financial = fixture.financial();
+    financial.status_code = terminal.status_code;
+    financial.error_code = terminal.error_code.as_deref();
+    financial.terminal_cause = if status == 200 {
+        None
+    } else {
+        Some(crate::model::RequestTerminalCause::StreamReadError)
+    };
+    let ack = fixture
+        .database
+        .finish_pending_proxy_settlement(
+            &fixture.claim,
+            receipt,
+            PendingProxySettlementEvidence::ProviderReported,
+            financial,
+            ProxyRequestUpstreamAttribution::LastDispatched(Some((upstream, route))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ack.cost_micros, 12);
+    let awaiting_projection = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, matching.clone())
+        .await
+        .unwrap();
+    assert_eq!(awaiting_projection.summary.total_requests, 1);
+    assert_eq!(
+        awaiting_projection.summary.total_cost.as_deref(),
+        Some("0.000012")
+    );
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        fixture
+            .database
+            .claim_terminal_projection_tasks(owner, 10)
+            .await
+            .unwrap(),
+        vec![fixture.claim.request_id]
+    );
+    assert!(
+        fixture
+            .database
+            .project_claimed_terminal_projection_task(owner, fixture.claim.request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .database
+            .project_claimed_terminal_projection_task(owner, fixture.claim.request_id)
+            .await
+            .unwrap()
+    );
+    for window in [
+        filter.clone(),
+        StatsFilter {
+            from_created_at: Some(day_start),
+            to_created_at: Some(day_start + 86_400_000 - 1),
+            ..filter
+        },
+    ] {
+        for use_facts in [false, true] {
+            let selected = StatsFilter {
+                min_duration_ms: use_facts.then_some(0),
+                ..window.clone()
+            };
+            let stats = fixture
+                .database
+                .stats_filtered(fixture.key.key_id, selected)
+                .await
+                .unwrap();
+            assert_eq!(stats.summary.total_requests, 1);
+            assert_eq!(stats.summary.failed_requests, i64::from(status != 200));
+            assert_eq!(stats.summary.successful_requests, i64::from(status == 200));
+            assert_eq!(stats.summary.total_cost.as_deref(), Some("0.000012"));
+            assert_eq!(stats.summary.input_tokens, 5);
+            assert_eq!(stats.summary.output_tokens, 7);
+        }
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_mixed_operational_statistics_do_not_report_partial_cost_as_total() {
+    mixed_operational_cost_contract(Fixture::sqlite().await).await;
+}
+
+#[tokio::test]
+async fn postgres_mixed_operational_statistics_do_not_report_partial_cost_as_total() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    mixed_operational_cost_contract(fixture).await;
+}
+
+async fn mixed_operational_cost_contract(fixture: Fixture) {
+    let terminal = fixture.operational(429);
+    fixture.record(Uuid::now_v7(), &terminal).await.unwrap();
+    for _request in 0..50 {
+        sqlx::query("INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, currency, cost_micros) SELECT $1, tenant_id, key_id, created_at, model, protocol, 'success', '', '', '', 10, 5, 7, currency, 12 FROM request_records WHERE id = $2")
+            .bind(Uuid::now_v7().to_string()).bind(fixture.claim.request_id.to_string()).execute(&fixture.database.pool).await.unwrap();
+    }
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(created_at),
+        ..StatsFilter::default()
+    };
+    let stats = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        [
+            stats.summary.total_requests,
+            stats.summary.successful_requests,
+            stats.summary.failed_requests
+        ],
+        [51, 50, 1]
+    );
+    assert_eq!(stats.summary.total_cost, None);
+    assert!(stats.summary.costs.is_empty());
+    for bucket in stats.by_model.iter().chain(&stats.by_day) {
+        assert_eq!(bucket.requests, 51);
+        assert_eq!(bucket.cost, None);
+        assert!(bucket.costs.is_empty());
+    }
+    let known_only = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                min_cost_micros: Some(0),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(known_only.summary.total_requests, 50);
+    assert_eq!(known_only.summary.total_cost.as_deref(), Some("0.0006"));
+    sqlx::query("UPDATE request_stats_facts SET currency = 'EUR' WHERE key_id = $1")
+        .bind(fixture.key.key_id.to_string())
+        .execute(&fixture.database.pool)
+        .await
+        .unwrap();
+    let multiple_currencies = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter)
+        .await
+        .unwrap();
+    assert_eq!(multiple_currencies.summary.total_requests, 51);
+    assert_eq!(multiple_currencies.summary.total_cost, None);
+    assert_eq!(multiple_currencies.summary.costs.len(), 1);
+    assert_eq!(multiple_currencies.summary.costs[0].currency, "EUR");
+    assert_eq!(multiple_currencies.summary.costs[0].cost, "0.0006");
+    fixture.close().await;
 }
 
 #[tokio::test]
