@@ -240,3 +240,19 @@ PR or partial green checks establish completion of the reading requirements.
   1,997 library tests passed, four historical migration-fixture tests failed
   due to missing 131/132 rollback handling and a second version-list assertion.
   These fixture omissions are corrected locally for the next CI run.
+
+## Restart continuation (2026-10-19)
+
+- Recovered the existing worktree, PR 657 and active goal. Commit `52e7fb71`
+  is pushed and mergeable; no duplicate branch or conversation was created.
+- Kubernetes access via `100.64.0.9:6443` remains working. Production still
+  reports schema 130; this task's reading/title changes are not deployed.
+- CI `39270026449` passed API contracts, migration smoke, packaging and memory
+  acceptance. Rust reached 2,006 passing library tests; the remaining failure
+  exposed inner joins to deleted credentials in the realtime summary path.
+  That path now uses the same retained-cluster ownership and retired alias as
+  the list query. Browser Cucumber's detail counter was including context
+  polling; it now counts only the actual session-detail route.
+- Full-session reading, HTTP authorization coverage, bounded historical receipt
+  compaction and deployment verification remain open. These CI corrections do
+  not establish completion.
