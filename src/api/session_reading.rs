@@ -28,6 +28,8 @@ pub(super) struct ContextQuery {
     cursor: Option<String>,
     #[serde(default)]
     details: bool,
+    #[serde(default)]
+    response_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,6 +45,10 @@ enum Position {
     },
     Text {
         node: String,
+        atom: String,
+        offset: i64,
+    },
+    ResponseText {
         atom: String,
         offset: i64,
     },
@@ -62,6 +68,17 @@ pub(super) struct ContextPage {
     representation: &'static str,
     items: Vec<ContextItem>,
     next_cursor: Option<String>,
+    response: ResponseSummary,
+}
+
+#[derive(Serialize)]
+struct ResponseSummary {
+    state: String,
+    text: Option<String>,
+    text_cursor: Option<String>,
+    node_id: Option<String>,
+    total_chars: i64,
+    error_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -230,8 +247,30 @@ async fn context_page(
     };
     let page = state
         .db
-        .session_context_page(&scope, head.as_deref())
+        .session_context_page(
+            &scope,
+            if query.response_only {
+                None
+            } else {
+                head.as_deref()
+            },
+        )
         .await?;
+    let summary = state.db.session_response_summary(&scope).await?;
+    let text_cursor = summary
+        .atom
+        .as_ref()
+        .map(|atom| {
+            encode_cursor(
+                &scope,
+                Position::ResponseText {
+                    atom: atom.clone(),
+                    offset: 0,
+                },
+                pepper,
+            )
+        })
+        .transpose()?;
     let items = page
         .nodes
         .into_iter()
@@ -243,6 +282,14 @@ async fn context_page(
         session_id: scope.session_id,
         representation: "semantic_context",
         items,
+        response: ResponseSummary {
+            state: summary.state,
+            text: summary.text,
+            text_cursor,
+            node_id: summary.atom,
+            total_chars: summary.total_chars,
+            error_code: summary.error_code,
+        },
         next_cursor: page
             .next_head
             .map(|head| encode_cursor(&scope, Position::Page { head }, pepper))
@@ -261,12 +308,18 @@ async fn context_content(
         &scope,
         pepper,
     )?;
-    let (node, atom, offset, text_only) = match position {
-        Position::Content { node, atom, offset } => (node, atom, offset, false),
-        Position::Text { node, atom, offset } => (node, atom, offset, true),
+    let (node, atom, offset, text_only, response_text) = match position {
+        Position::Content { node, atom, offset } => (node, atom, offset, false, false),
+        Position::Text { node, atom, offset } => (node, atom, offset, true, false),
+        Position::ResponseText { atom, offset } => (atom.clone(), atom, offset, true, true),
         _ => return Err(invalid_cursor()),
     };
-    let (content, total_chars) = if text_only {
+    let (content, total_chars) = if response_text {
+        state
+            .db
+            .session_response_text(&scope, &atom, offset)
+            .await?
+    } else if text_only {
         state
             .db
             .session_context_text(&scope, &node, &atom, offset)
@@ -302,7 +355,9 @@ async fn context_content(
         next_cursor: if next < total_chars {
             Some(encode_cursor(
                 &scope,
-                if text_only {
+                if response_text {
+                    Position::ResponseText { atom, offset: next }
+                } else if text_only {
                     Position::Text {
                         node,
                         atom,

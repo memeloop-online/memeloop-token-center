@@ -90,7 +90,9 @@ pub use routing::egress;
 mod rows;
 mod session_analytics;
 mod session_reading;
+mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
+pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
 mod session_titles;
 pub(crate) use session_titles::{

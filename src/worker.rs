@@ -342,6 +342,15 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     periodic!(
+        "session_response_reading",
+        Duration::from_secs(1),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = crate::session_response_worker::process_one(state).await {
+                tracing::error!(%error, "worker failed to update session response reading projection");
+            }
+        }
+    );
+    periodic!(
         "oauth_device_login",
         Duration::from_secs(1),
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {

@@ -104,3 +104,23 @@ test('a content continuation cannot change from text-only to raw tool-capable JS
     ...first, representation: 'semantic_context', offset_chars: 2, content: '文🎉', next_cursor: null,
   }));
 });
+
+test('response status polling is scoped and skips context pages and archive content', async () => {
+  const original = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    return new Response(JSON.stringify({ ...page(1, 1), items: [], response: {
+      state: 'ready', text: 'Final', node_id: node(9), text_cursor: 'text', total_chars: 5, error_code: null,
+    } }));
+  };
+  try {
+    const loader = createSessionContextLoader('s', 'test', () => '/context?key_id=owned');
+    const response = await loader.response!('r', new AbortController().signal);
+    assert.equal(response.text, 'Final');
+    assert.equal(requests.length, 1);
+    assert.match(requests[0], /key_id=owned&response_only=true/);
+    const malformed = { ...page(1, 1), response: { ...response, total_chars: 1 } };
+    assert.throws(() => validateContextPage(malformed, 's', 'r'));
+  } finally { globalThis.fetch = original; }
+});

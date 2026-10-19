@@ -270,10 +270,9 @@ pub(crate) fn extract(mut reader: impl BufRead) -> Result<Option<String>, &'stat
                         stop_reason: Some(reason),
                         ..
                     } = value.delta
+                        && !matches!(reason.as_str(), "end_turn" | "tool_use" | "stop_sequence")
                     {
-                        if !matches!(reason.as_str(), "end_turn" | "tool_use" | "stop_sequence") {
-                            return Err("response_incomplete");
-                        }
+                        return Err("response_incomplete");
                     }
                 }
                 "message_stop" => terminal = true,
@@ -283,13 +282,13 @@ pub(crate) fn extract(mut reader: impl BufRead) -> Result<Option<String>, &'stat
                             if let Some(text) = choice.delta.content {
                                 delta_text.push_str(&text);
                             }
-                            if let Some(reason) = choice.finish_reason {
-                                if !matches!(
+                            if let Some(reason) = choice.finish_reason
+                                && !matches!(
                                     reason.as_str(),
                                     "stop" | "tool_calls" | "function_call"
-                                ) {
-                                    return Err("response_incomplete");
-                                }
+                                )
+                            {
+                                return Err("response_incomplete");
                             }
                         }
                     }

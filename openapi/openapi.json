@@ -11524,6 +11524,9 @@
           },
           {
             "$ref": "#/components/parameters/ContextDetails"
+          },
+          {
+            "$ref": "#/components/parameters/ContextResponseOnly"
           }
         ],
         "responses": {
@@ -13517,6 +13520,9 @@
           },
           {
             "$ref": "#/components/parameters/ContextDetails"
+          },
+          {
+            "$ref": "#/components/parameters/ContextResponseOnly"
           }
         ],
         "responses": {
@@ -14420,6 +14426,15 @@
       }
     },
     "parameters": {
+      "ContextResponseOnly": {
+        "name": "response_only",
+        "in": "query",
+        "description": "Read only final-response preparation status and text; skip prefix nodes. An idempotent background reading job may be queued, but no archive is fetched on this HTTP path.",
+        "schema": {
+          "type": "boolean",
+          "default": false
+        }
+      },
       "ContextSessionId": {
         "name": "session_id",
         "in": "path",
@@ -15746,9 +15761,13 @@
           "request_id",
           "session_id",
           "items",
-          "next_cursor"
+          "next_cursor",
+          "response"
         ],
         "properties": {
+          "response": {
+            "$ref": "#/components/schemas/SessionResponseSummary"
+          },
           "contract_version": {
             "type": "string",
             "enum": [
@@ -15782,6 +15801,60 @@
               "null"
             ],
             "maxLength": 4096
+          }
+        }
+      },
+      "SessionResponseSummary": {
+        "type": "object",
+        "required": [
+          "state",
+          "text",
+          "text_cursor",
+          "node_id",
+          "total_chars",
+          "error_code"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "ready",
+              "unavailable"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 16384
+          },
+          "text_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "total_chars": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

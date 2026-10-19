@@ -186,3 +186,30 @@ PR or partial green checks establish completion of the reading requirements.
   otherwise takes the last paragraph, ignores tool fields, and rejects missing
   terminal/incomplete responses. It is test-only until the background
   projection/cache is connected; the selected-response feature remains pending.
+
+## Final-response reading integration (2026-10-19)
+
+- The parser is now connected to a separate serial background worker and
+  migration 132's request-scoped reading queue. Context HTTP reads enqueue
+  idempotently and return status without opening archived objects.
+- The worker uses a bounded disk-backed archive download (128 MiB, 60 seconds),
+  then extracts final text; oversized events/archives and incomplete streams
+  return an explicit unavailable state rather than a fabricated answer.
+  These limits are remaining compatibility constraints, not proof that every
+  retained archive is readable through the default projection.
+- Final text is stored once per tenant as a content-addressed semantic atom.
+  Queue rows retain only its hash and bounded status metadata, no tool body
+  or full response envelope. Expired completions are transactionally fenced.
+- The API adds response-only polling and signed final-text continuations.
+  The UI displays the selected request's own final reply when prepared;
+  long replies use the existing scalar-offset chunk reader.
+- Added cache deduplication, Unicode chunking, cross-scope denial, stale lease
+  and retry tests, plus a browser assertion that current-response polling
+  never opens the original archive in the browser.
+- Previous CI (`39173706994`) passed browser-backed contracts but failed one
+  Cucumber scenario because the view exposed duplicate older-request actions.
+  Removed the redundant action. Rust stopped on two collapsible-if Clippy
+  diagnostics in the parser; both were corrected.
+- This integration has not yet been compiled/tested by CI or deployed.
+  Session-wide chronology/branch coverage, title-search and lifecycle cleanup,
+  production storage auditing and final verification remain incomplete.

@@ -29,11 +29,13 @@ test('prefix reader never fetches archives or tool bodies before their disclosur
   try {
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?context=1`);
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?context=1&response=1`);
     await page.getByText('Retained final answer', { exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
     assert.equal(await page.evaluate(() => window.contextReads), 1);
     assert.equal(await page.evaluate(() => window.contextContentReads), 0);
+    await page.getByText('Current request final answer', { exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {}, 'final response polling must not open the raw archive');
     await page.locator('summary').filter({ hasText: /^Full conversation and execution details$/ }).click();
     await page.locator('summary').filter({ hasText: /Tool calls and results/ }).click();
     await page.locator('summary').filter({ hasText: 'function_call · 3' }).click();

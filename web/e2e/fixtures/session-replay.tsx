@@ -72,6 +72,7 @@ const archives = new Map<string, RequestDetail>([
 
 const liveFixture = new URLSearchParams(location.search).has('live');
 const contextFixture = new URLSearchParams(location.search).has('context');
+const responseFixture = new URLSearchParams(location.search).has('response');
 declare global { interface Window { contextReads: number; contextContentReads: number } }
 window.contextReads = 0;
 window.contextContentReads = 0;
@@ -81,6 +82,7 @@ const contextLoader: SessionContextLoader = {
     return {
       contract_version: 'session_context_v1', representation: 'semantic_context',
       request_id: requestId, session_id: sessionId, next_cursor: null,
+      ...(responseFixture ? { response: { state: 'pending' as const, text: null, node_id: null, text_cursor: null, total_chars: 0, error_code: null } } : {}),
       items: [
         { node_id: '1'.repeat(64), depth: 1, role: 'user', kind: 'message', phase: null, text: longUserTurn, text_complete: true, source_chars: 4000, content_cursor: 'user' },
         { node_id: '2'.repeat(64), depth: 2, role: 'assistant', kind: 'message', phase: 'commentary', text: null, text_complete: false, source_chars: 50, content_cursor: 'commentary' },
@@ -88,6 +90,10 @@ const contextLoader: SessionContextLoader = {
         { node_id: '4'.repeat(64), depth: 4, role: 'assistant', kind: 'message', phase: 'final', text: 'Retained final answer', text_complete: true, source_chars: 100, content_cursor: 'final' },
       ],
     };
+  },
+  async response() {
+    const text = 'Current request final answer';
+    return { state: 'ready', text, text_cursor: 'response-text', node_id: '5'.repeat(64), total_chars: text.length, error_code: null };
   },
   async content(_requestId, cursor) {
     window.contextContentReads += 1;

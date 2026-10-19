@@ -688,6 +688,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded generated session titles",
         sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
     },
+    Migration {
+        version: 132,
+        name: "deferred session final response reading",
+        sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1358,6 +1363,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 131,
         name: "bounded generated session titles",
         sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
+    },
+    Migration {
+        version: 132,
+        name: "deferred session final response reading",
+        sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
     },
 ];
 

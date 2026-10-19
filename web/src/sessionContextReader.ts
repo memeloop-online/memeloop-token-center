@@ -20,6 +20,16 @@ export interface SessionContextPage {
   session_id: string;
   items: SessionContextItem[];
   next_cursor: string | null;
+  response?: SessionResponseSummary;
+}
+
+export interface SessionResponseSummary {
+  state: 'pending' | 'running' | 'ready' | 'unavailable';
+  text: string | null;
+  text_cursor: string | null;
+  node_id: string | null;
+  total_chars: number;
+  error_code: string | null;
 }
 
 export interface SessionContextChunk {
@@ -35,6 +45,7 @@ export interface SessionContextChunk {
 export interface SessionContextLoader {
   page: (requestId: string, cursor: string | undefined, details: boolean, signal: AbortSignal) => Promise<SessionContextPage>;
   content: (requestId: string, cursor: string, signal: AbortSignal) => Promise<SessionContextChunk>;
+  response?: (requestId: string, signal: AbortSignal) => Promise<SessionResponseSummary>;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -66,6 +77,17 @@ export function validateContextPage(value: unknown, sessionId: string, requestId
     previousDepth = item.depth;
   }
   if (value.items.length === 0 && value.next_cursor !== null) throw invalid();
+  if (value.response !== undefined) {
+    const response = value.response;
+    if (!record(response) || !['pending', 'running', 'ready', 'unavailable'].includes(String(response.state))
+      || !(response.text === null || typeof response.text === 'string')
+      || !cursor(response.text_cursor) || !(response.node_id === null || hash(response.node_id))
+      || !integer(response.total_chars) || !(response.error_code === null || typeof response.error_code === 'string')) throw invalid();
+    if (typeof response.text === 'string'
+      && (Array.from(response.text).length > 16384 || Array.from(response.text).length > response.total_chars
+        || response.state !== 'ready' || !response.node_id || !response.text_cursor)) throw invalid();
+    if (response.total_chars > 0 && response.text === null) throw invalid();
+  }
   return value as unknown as SessionContextPage;
 }
 
@@ -110,6 +132,14 @@ export function createSessionContextLoader(sessionId: string, credential: string
     return `${base}${separator}${new URLSearchParams(values)}`;
   };
   return {
+    async response(requestId, signal) {
+      const page = validateContextPage(await apiRead<unknown>(
+        queryPath(path(requestId, false), { response_only: 'true' }), credential,
+        { signal, totalTimeoutMilliseconds: 15_000 },
+      ), sessionId, requestId);
+      if (!page.response) throw invalid();
+      return page.response;
+    },
     async page(requestId, continuation, details, signal) {
       const response = await apiRead<unknown>(queryPath(path(requestId, false), {
         ...(continuation ? { cursor: continuation } : {}), details: String(details),

@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { Button, Select } from './design-system';
 import { useI18n } from './i18n.js';
 import { SessionContextDisclosure, SessionUserText } from './SessionContextContent.js';
-import { prependContextPage, type SessionContextLoader, type SessionContextPage } from './sessionContextReader.js';
+import { prependContextPage, type SessionContextLoader, type SessionContextPage, type SessionResponseSummary } from './sessionContextReader.js';
 import type { LogicalSessionDetail } from './types.js';
 
 const loaderIdentities = new WeakMap<SessionContextLoader, number>();
@@ -27,6 +27,7 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
   const [retry, setRetry] = useState(0);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  const [response, setResponse] = useState<SessionResponseSummary>();
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -43,6 +44,26 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
     return () => controller.abort();
     // `page` is the predecessor of this cursor, never a reason to refetch it.
   }, [loader, requestId, cursor, retry]);
+  useEffect(() => {
+    const initial = page?.response;
+    if (!initial) return;
+    setResponse(initial);
+    if (!loader.response || !['pending', 'running'].includes(initial.state)) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const next = await loader.response!(requestId, controller.signal);
+        if (controller.signal.aborted) return;
+        setResponse(next);
+        if (['pending', 'running'].includes(next.state)) timer = setTimeout(() => { void poll(); }, 3000);
+      } catch {
+        if (!controller.signal.aborted) timer = setTimeout(() => { void poll(); }, 10_000);
+      }
+    };
+    timer = setTimeout(() => { void poll(); }, 1500);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [page?.response, loader, requestId]);
   const items = page?.items ?? [];
   const users = items.filter((item) => item.role === 'user' && ['message', 'agent_message'].includes(item.kind));
   const tools = items.filter((item) => !['message', 'agent_message'].includes(item.kind) || item.role === 'tool');
@@ -65,7 +86,16 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
     <div className="session-context-columns">
       <section aria-label={t('sessionReplay.agentOutput')}>
         {answers.map((item) => <article className="session-replay-entry" key={item.node_id}><div className="session-context-message">{item.text}</div></article>)}
-        {!loading && answers.length === 0 && <p className="mtc-secondary-text">{t('sessionReplay.noFinalResponse')}</p>}
+        {response?.state === 'ready' && response.text !== null && <article className="session-replay-entry">
+          {response.total_chars > Array.from(response.text).length && response.text_cursor && response.node_id
+            ? <SessionUserText item={{ node_id: response.node_id, depth: 1, role: 'assistant', kind: 'message', phase: 'final',
+              text: null, text_complete: false, source_chars: response.total_chars,
+              content_cursor: response.text_cursor, text_cursor: response.text_cursor }} requestId={requestId} loader={loader} />
+            : <div className="session-context-message">{response.text}</div>}
+        </article>}
+        {response && ['pending', 'running'].includes(response.state) && <p role="status">{t('sessionReplay.responsePreparing')}</p>}
+        {response?.state === 'unavailable' && <p role="status">{t('sessionReplay.responseUnavailable')}</p>}
+        {!loading && answers.length === 0 && (!response || response.state === 'ready' && response.text === null) && <p className="mtc-secondary-text">{t('sessionReplay.noFinalResponse')}</p>}
       </section>
       <aside aria-label={t('sessionReplay.userInput')}>
         {users.map((item) => <article className="session-replay-entry" key={item.node_id}>
@@ -91,8 +121,8 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
 }
 
 /** Each observation retains its own path, including the paths before compaction. */
-export function SessionContextPanel({ detail, loader, onLoadEarlier, loadingEarlier }: {
-  detail: LogicalSessionDetail; loader: SessionContextLoader; onLoadEarlier: () => void; loadingEarlier: boolean;
+export function SessionContextPanel({ detail, loader }: {
+  detail: LogicalSessionDetail; loader: SessionContextLoader;
 }) {
   const { locale, t } = useI18n();
   const requests = [...detail.requests].sort((a, b) => b.created_at - a.created_at || b.request_id.localeCompare(a.request_id));
@@ -109,6 +139,5 @@ export function SessionContextPanel({ detail, loader, onLoadEarlier, loadingEarl
     </header>
     <p className="mtc-secondary-text">{t('sessionReplay.contextScope')}</p>
     {selected && <RequestContext key={`${loaderIdentity(loader)}:${selected.request_id}`} requestId={selected.request_id} loader={loader} />}
-    {detail.has_more && <Button appearance="secondary" disabled={loadingEarlier} onClick={onLoadEarlier}>{t('sessions.loadEarlier')}</Button>}
   </section>;
 }
