@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{error::AppError, plugin::CosignKeylessIdentity};
+use crate::{
+    error::{AppError, PluginReleaseDownloadFailure},
+    plugin::CosignKeylessIdentity,
+};
 
 const MAX_RELEASE_BYTES: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 4;
@@ -164,11 +167,13 @@ async fn request_release(
     let host = current.host_str().ok_or_else(invalid_release)?;
     let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))
         .await
-        .map_err(|_| invalid_release())?
+        .map_err(|_| download_failure(PluginReleaseDownloadFailure::Dns))?
         .take(33)
         .collect();
-    if addresses.is_empty()
-        || addresses.len() > 32
+    if addresses.is_empty() {
+        return Err(download_failure(PluginReleaseDownloadFailure::Dns));
+    }
+    if addresses.len() > 32
         || addresses
             .iter()
             .any(|address| !crate::network::is_public_ip(address.ip()))
@@ -201,7 +206,9 @@ async fn request_release(
         // Pin the address checked above; TLS still authenticates host.
         builder = builder.resolve_to_addrs(host, &addresses);
     }
-    let client = builder.build().map_err(|_| invalid_release())?;
+    let client = builder
+        .build()
+        .map_err(|_| download_failure(PluginReleaseDownloadFailure::Client))?;
     let response = client
         .get(current)
         .header(
@@ -211,7 +218,7 @@ async fn request_release(
         .header(reqwest::header::USER_AGENT, "memeloop-plugin-installer")
         .send()
         .await
-        .map_err(|_| invalid_release())?;
+        .map_err(request_failure)?;
     Ok(response)
 }
 
@@ -243,15 +250,27 @@ where
                 current = next;
                 continue;
             }
-            if !response.status().is_success()
-                || response
-                    .content_length()
-                    .is_some_and(|size| size > MAX_RELEASE_BYTES as u64)
+            if !response.status().is_success() {
+                tracing::warn!(
+                    status = response.status().as_u16(),
+                    "GitHub plugin release server returned an unsuccessful status"
+                );
+                return Err(download_failure(PluginReleaseDownloadFailure::RemoteHttp));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_RELEASE_BYTES as u64)
             {
                 return Err(invalid_release());
             }
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| invalid_release())? {
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                download_failure(if error.is_timeout() {
+                    PluginReleaseDownloadFailure::Timeout
+                } else {
+                    PluginReleaseDownloadFailure::Body
+                })
+            })? {
                 if bytes.len() + chunk.len() > MAX_RELEASE_BYTES {
                     return Err(invalid_release());
                 }
@@ -262,7 +281,25 @@ where
         Err(invalid_release())
     })
     .await
-    .map_err(|_| invalid_release())?
+    .map_err(|_| download_failure(PluginReleaseDownloadFailure::Timeout))?
+}
+
+fn download_failure(failure: PluginReleaseDownloadFailure) -> AppError {
+    tracing::warn!(
+        stage = failure.code(),
+        "GitHub plugin release download failed"
+    );
+    AppError::PluginReleaseDownload(failure)
+}
+
+fn request_failure(error: reqwest::Error) -> AppError {
+    download_failure(if error.is_timeout() {
+        PluginReleaseDownloadFailure::Timeout
+    } else if error.is_connect() {
+        PluginReleaseDownloadFailure::Connection
+    } else {
+        PluginReleaseDownloadFailure::Request
+    })
 }
 
 #[cfg(test)]
@@ -373,6 +410,140 @@ mod tests {
         server.verify().await;
     }
 
+    #[tokio::test]
+    async fn valid_release_transport_and_remote_http_failures_are_safe_dependency_errors() {
+        use axum::{body::to_bytes, response::IntoResponse};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let original = validate_github_release_url(
+            "https://github.com/owner/repo/releases/download/v1/release.json",
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        const SECRET: &str = "signed-redirect-token-and-proxy-password";
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(SECRET))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = download_release(original.clone(), |_| {
+            let client = client.clone();
+            let target = format!("{}?signature={SECRET}", server.uri());
+            async move { client.get(target).send().await.map_err(request_failure) }
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.diagnostic_category(), "plugin_release_http_failed");
+        assert!(!format!("{error:?}").contains(SECRET));
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(SECRET));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "plugin_release_http_failed");
+
+        // Exercise the real reqwest error mapper with a secret-bearing URL.
+        let error = client
+            .get(format!("http://[::1?signature={SECRET}"))
+            .send()
+            .await
+            .unwrap_err();
+        let error = request_failure(error);
+        assert_eq!(error.diagnostic_category(), "plugin_release_request_failed");
+        assert!(!format!("{error:?}").contains(SECRET));
+        // A refused connection for an otherwise accepted release URL stays a
+        // dependency failure; the request URL can never enter the public error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = download_release(original.clone(), |_| {
+            let client = client.clone();
+            async move {
+                client
+                    .get(format!("http://{address}/?signature={SECRET}"))
+                    .send()
+                    .await
+                    .map_err(request_failure)
+            }
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.diagnostic_category(),
+            "plugin_release_connection_failed"
+        );
+        assert!(!format!("{error:?}").contains(SECRET));
+        for failure in [
+            PluginReleaseDownloadFailure::Request,
+            PluginReleaseDownloadFailure::RemoteHttp,
+            PluginReleaseDownloadFailure::Dns,
+            PluginReleaseDownloadFailure::Connection,
+            PluginReleaseDownloadFailure::Body,
+            PluginReleaseDownloadFailure::Timeout,
+            PluginReleaseDownloadFailure::Client,
+        ] {
+            let error = download_release(original.clone(), |_| {
+                std::future::ready(Err(download_failure(failure)))
+            })
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.diagnostic_category(), failure.code());
+            let response = error.into_response();
+            assert_eq!(
+                response.status(),
+                if failure == PluginReleaseDownloadFailure::Timeout {
+                    axum::http::StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    axum::http::StatusCode::BAD_GATEWAY
+                }
+            );
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], failure.code());
+        }
+    }
+
+    #[tokio::test]
+    async fn release_body_transport_error_does_not_retain_remote_secrets() {
+        let original = validate_github_release_url(
+            "https://github.com/owner/repo/releases/download/v1/release.json",
+        )
+        .unwrap();
+        let error = download_release(original, |_| async {
+            let stream = futures_util::stream::once(async {
+                Err::<bytes::Bytes, _>(std::io::Error::other("remote-secret-body"))
+            });
+            Ok(reqwest::Response::from(axum::http::Response::new(
+                reqwest::Body::wrap_stream(stream),
+            )))
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.diagnostic_category(), "plugin_release_body_failed");
+        assert!(!format!("{error:?}").contains("remote-secret-body"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_total_deadline_is_a_gateway_timeout() {
+        use axum::response::IntoResponse;
+        let original = validate_github_release_url(
+            "https://github.com/owner/repo/releases/download/v1/release.json",
+        )
+        .unwrap();
+        let error = download_release(original, |_| std::future::pending())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.diagnostic_category(), "plugin_release_timeout");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
     #[test]
     fn release_assets_are_exact_https_github_paths() {
         for url in [
@@ -391,7 +562,13 @@ mod tests {
             "https://github.com/owner/repo/releases/download/v1/%2Frelease.json",
             "https://127.0.0.1/owner/repo/releases/download/v1/release.json",
         ] {
-            assert!(validate_github_release_url(url).is_err(), "{url}");
+            assert!(
+                matches!(
+                    validate_github_release_url(url),
+                    Err(AppError::BadRequest(_))
+                ),
+                "{url}"
+            );
         }
     }
 
