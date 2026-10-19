@@ -13,6 +13,12 @@ Helm `config.responsesRequestSpoolBytes` value has been removed. Remove that val
 from chart overrides before upgrading; the chart rejects unknown config keys.
 Existing environment injections have no effect. Neither declared lengths nor
 retained source files can reject another upload against a synthetic byte cap.
+Persisted `Config` JSON containing `responses_request_spool_bytes` still
+deserializes through the existing unknown-field behavior. Rewriting that config
+removes the retired key; no runtime compatibility field or startup rejection is
+introduced. Helm override files require an explicit migration deleting
+`config.responsesRequestSpoolBytes` before chart validation, rather than keeping
+an exposed setting that no longer controls admission.
 
 `memeloop_token_center_request_spool_bytes{measure="used"}` counts bytes
 successfully written to live spool files, including partial captures. It does
@@ -43,6 +49,7 @@ Its bounded background capture can retain an archive gap on failure; this change
 does not modify archive behavior or mandatory usage-reservation safety.
 
 CI regressions cover declared and unknown-length uploads stalled for 120 seconds,
+zero body polls and zero promised-byte telemetry while file opens are paused,
 six retained 12 MiB spools exceeding the former 64 MiB aggregate default, new
 admissions while those sources remain live, no ingress replay, actual-byte and
 file cleanup, per-request size rejection, and ENOSPC/EDQUOT classification.

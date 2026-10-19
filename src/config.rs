@@ -768,6 +768,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_spool_budget_deserializes_and_is_removed_on_configuration_rewrite() {
+        let mut document =
+            serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();
+        document["responses_request_spool_bytes"] = serde_json::json!(1);
+        let loaded: Config = serde_json::from_value(document).unwrap();
+        assert!(loaded.validate_proxy_memory_budget().is_ok());
+        let rewritten = serde_json::to_value(loaded).unwrap();
+        assert!(rewritten.get("responses_request_spool_bytes").is_none());
+    }
+
+    #[test]
     fn terminal_projection_default_and_explicit_rollback_survive_configuration_loading() {
         let mut document =
             serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();

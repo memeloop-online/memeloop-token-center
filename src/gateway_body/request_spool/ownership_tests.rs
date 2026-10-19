@@ -301,7 +301,11 @@ async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_in
 
     for declared in [true, false] {
         let directory = tempfile::tempdir().unwrap();
-        let spool = RequestSpoolAdmission::new(directory.path().to_owned());
+        let opening_pause = Arc::new(BlockingPause::default());
+        let opening_resume = ResumeOnDrop(opening_pause.clone());
+        let mut spool = RequestSpoolAdmission::new(directory.path().to_owned());
+        Arc::get_mut(&mut spool.usage).unwrap().blocking_open = Some(opening_pause);
+        let polls = Arc::new(AtomicUsize::new(0));
         let budget = Arc::new(ProxyMemoryBudget::new(32 * 1024 * 1024));
         let (started, mut starts) = tokio::sync::mpsc::channel(UPLOADS);
         let (resume, waiting) = tokio::sync::watch::channel(false);
@@ -309,14 +313,17 @@ async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_in
         for index in 0..UPLOADS {
             let started = started.clone();
             let waiting = waiting.clone();
+            let polls = polls.clone();
             let body =
                 Body::from_stream(stream::unfold((0, waiting), move |(piece, mut waiting)| {
                     let started = started.clone();
+                    let polls = polls.clone();
                     async move {
                         if piece == UPLOAD_BYTES / REQUEST_SPOOL_CHUNK_BYTES {
                             return None;
                         }
                         if piece == 0 {
+                            polls.fetch_add(1, Ordering::AcqRel);
                             started.send(()).await.unwrap();
                             waiting.wait_for(|ready| *ready).await.unwrap();
                             tokio::time::sleep(Duration::from_secs(120)).await;
@@ -347,10 +354,19 @@ async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_in
                 .unwrap()
             }));
         }
+        while spool.snapshot().active_files < UPLOADS {
+            assert!(
+                !captures.iter().any(tokio::task::JoinHandle::is_finished),
+                "all uploads must reach file creation before their first body poll"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::Acquire), 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        drop(opening_resume);
         for _ in 0..UPLOADS {
             starts.recv().await.unwrap();
         }
-        assert!(UPLOADS * UPLOAD_BYTES > FORMER_AGGREGATE_LIMIT);
         assert_eq!(spool.snapshot().used_bytes, 0);
         assert_eq!(spool.snapshot().active_files, UPLOADS);
         let small = admit(ROUTES[0], Body::from("{}"), Some(2), &budget, &spool)
@@ -371,6 +387,7 @@ async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_in
             drop(admitted);
         }
         assert_eq!(spool.snapshot().used_bytes, UPLOADS * UPLOAD_BYTES);
+        assert!(spool.snapshot().used_bytes > FORMER_AGGREGATE_LIMIT);
         assert_eq!(spool.snapshot().active_files, UPLOADS);
         assert_eq!(spool.read_count_for_test(), 0);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
