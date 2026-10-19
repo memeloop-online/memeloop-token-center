@@ -34,13 +34,29 @@ test('request filters find older astra routes, accept historical names, and prev
       const preview = await presets.last().getAttribute('title');
       assert.equal(await presets.last().getAttribute('aria-label'), preview);
       assert.equal(await page.locator('.typed-filter-dialog').evaluate((element) => element.scrollWidth > element.clientWidth), false);
-      const model = page.getByRole('combobox', { name: locale === 'en' ? 'Enter or choose a model' : '输入或选择模型', exact: true });
+      const model = page.locator('.typed-filter-model-picker input[role=combobox]');
+      await model.fill('slow');
+      await page.waitForFunction(() => JSON.parse(document.body.dataset.catalogRequests ?? '[]').includes('slow'));
       await model.fill('astra');
       const option = page.getByRole('option').filter({ has: page.getByText('gpt-6-astra', { exact: true }) });
       await option.waitFor();
+      await page.waitForTimeout(750);
+      assert.equal(await model.inputValue(), 'astra', 'late search must not overwrite the current input');
+      assert.equal(await page.locator('.shared-model-popover').getByRole('option', { name: 'slow-historical-model', exact: true }).count(), 0);
       assert.equal(await option.isEnabled(), true, 'historical model selection must not require a usable account');
-      await option.click();
+      assert.equal(await option.count(), 1, 'one name represents all accounts');
+      assert.equal(await page.locator('.shared-model-popover').getByRole('group').count(), 0);
+      await model.press('ArrowDown');
+      await model.press('Enter');
       assert.equal(await model.inputValue(), 'gpt-6-astra');
+      await page.setViewportSize({ width: 1280, height: 900 });
+      const controls = await page.locator('.typed-filter-row').first().locator('select, .shared-model-picker > input').evaluateAll((elements) => elements.map((element) => { const rect = element.getBoundingClientRect(); return { top: rect.top, height: rect.height }; }));
+      assert.equal(controls.length, 3);
+      assert.ok(Math.max(...controls.map((c) => c.top)) - Math.min(...controls.map((c) => c.top)) <= 2, 'field, operator and model input share the same baseline');
+      for (const width of [320, 375]) {
+        await page.setViewportSize({ width, height: 900 });
+        assert.equal(await page.locator('.typed-filter-dialog').evaluate((element) => element.scrollWidth > element.clientWidth), false);
+      }
       const apply = page.getByRole('button', { name: locale === 'en' ? 'Apply filters' : '应用筛选', exact: true });
       await apply.click();
       await page.locator('.typed-filter-dialog').waitFor({ state: 'detached' });

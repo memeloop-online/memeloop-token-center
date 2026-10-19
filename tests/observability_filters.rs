@@ -1134,3 +1134,118 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn model_name_equality_spans_accounts_and_routes_with_optional_account_restriction() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("model-name-filter.db").display()
+    )))
+    .await
+    .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "model-name-tenant".into(),
+                principal_external_id: "member".into(),
+                alias: "filter".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = state
+        .db
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let account_a = Uuid::now_v7();
+    let account_b = Uuid::now_v7();
+    let mut expected = Vec::new();
+    for account in [account_a, account_b] {
+        expected.push(
+            record(
+                &state,
+                &key,
+                RecordedRequest {
+                    model: "gpt-6-astra",
+                    route_id: Uuid::now_v7(),
+                    upstream_id: account,
+                    duration_ms: 20,
+                    cost_micros: 0,
+                    status_code: 200,
+                    error_code: None,
+                },
+            )
+            .await,
+        );
+    }
+    record(
+        &state,
+        &key,
+        RecordedRequest {
+            model: "gpt-6-astra-other",
+            route_id: Uuid::now_v7(),
+            upstream_id: account_a,
+            duration_ms: 20,
+            cost_micros: 0,
+            status_code: 200,
+            error_code: None,
+        },
+    )
+    .await;
+    let mut ast = TypedFilterAst {
+        logical_operator: TypedFilterLogicalOperator::And,
+        conditions: vec![TypedFilterCondition {
+            field: TypedFilterField::Model,
+            operator: TypedFilterOperator::Equals,
+            value: TypedFilterValue::Model("gpt-6-astra".into()),
+            upper: None,
+        }],
+    };
+    let all = state
+        .db
+        .list_all_requests_filtered(
+            "model-name-tenant",
+            memeloop_token_center::db::RequestListFilter {
+                limit: 100,
+                typed_ast: Some(ast.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(
+        expected
+            .iter()
+            .all(|id| all.iter().any(|r| r.request_id == *id))
+    );
+    ast.conditions.push(TypedFilterCondition {
+        field: TypedFilterField::UpstreamAccountId,
+        operator: TypedFilterOperator::Equals,
+        value: TypedFilterValue::Uuid(account_b),
+        upper: None,
+    });
+    let scoped = state
+        .db
+        .list_all_requests_filtered(
+            "model-name-tenant",
+            memeloop_token_center::db::RequestListFilter {
+                limit: 100,
+                typed_ast: Some(ast),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].upstream_account_id, Some(account_b));
+}

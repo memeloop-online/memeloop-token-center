@@ -263,25 +263,22 @@
 .typed-filter-row > .typed-filter-value { min-width: 0; }
 .typed-filter-model-picker { min-width: 0; position: relative; }
 .typed-filter-model-picker > button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
-.typed-filter-model-picker small { color: var(--picker-muted); display: block; margin-top: 4px; }
-
-.typed-filter-catalog {
-  background: #0d1c20;
-  border: 1px solid #3d6971;
-  box-shadow: 0 10px 22px rgb(0 0 0 / 40%);
-  left: 0;
-  min-width: 280px;
-  padding: 8px;
-  position: absolute;
-  top: calc(100% + 4px);
-  z-index: 2;
+/* The picker's own label is the model cell's only label; match the caption
+   spacing of the sibling field/operator cells so every control in the row
+   sits on the same baseline. */
+.typed-filter-row .shared-model-picker > label { margin-bottom: 5px; }
+.typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { box-sizing: border-box; height: 32px; min-height: 32px; padding: 5px 10px; }
+.typed-filter-dialog > .panel-title { align-items: flex-start; flex-direction: row; flex-wrap: nowrap; gap: 12px; }
+.typed-filter-dialog > .panel-title > div { min-width: 0; }
+.typed-filter-dialog > .panel-title > button { flex-shrink: 0; min-width: 54px; }
+/* Full-width row hint sits below the controls so help text never shifts the
+   field/operator/value baseline or inflates the row height between columns. */
+.typed-filter-row-hint {
+  color: var(--picker-muted);
+  font-size: var(--fontSizeBase200, 12px);
+  grid-column: 1 / -1;
+  line-height: 1.4;
 }
-
-.typed-filter-catalog > input { width: 100%; }
-.typed-filter-catalog [role="listbox"] { display: grid; margin-top: 6px; max-height: 200px; overflow-y: auto; }
-.typed-filter-catalog [role="option"] { background: transparent; border: 0; border-radius: 0; color: #d7e7e9; margin: 0; padding: 7px; text-align: left; }
-.typed-filter-catalog [role="option"]:hover { background: #173139; }
-.typed-filter-catalog [role="option"] small { color: #91aab0; display: block; }
 .error-text { color: #ff9f9f; }
 
 .traffic-filters label {
@@ -391,6 +388,9 @@
   .typed-filter-row:has(.typed-filter-value + .typed-filter-value) { grid-template-columns: 1fr 1fr; }
   .typed-filter-value { grid-column: span 2; }
   .typed-filter-row-actions { grid-column: span 2; justify-content: start; }
+  .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
+  .typed-filter-row .fui-Select,
+  .typed-filter-row .fui-Select > select { min-height: 44px; }
 }
 
 .provider-list .panel-title,
