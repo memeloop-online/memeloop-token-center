@@ -272,3 +272,9 @@ PR or partial green checks establish completion of the reading requirements.
   32-node page still uses explicit continuation, and historical metadata is
   loaded through the existing older-request action. Full production coverage
   is not yet verified.
+
+- Added a title-worker integration test using the real proxy/accounting path
+  with a mock upstream. It checks initial automatic enqueue, coalesced manual
+  generation, configured route and separate billing credential, bounded
+  Unicode first/latest excerpts, persisted title and exactly one model call.
+  This test is pending GitHub Actions validation.
