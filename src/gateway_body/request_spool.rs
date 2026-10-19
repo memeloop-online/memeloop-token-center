@@ -20,16 +20,16 @@ mod ownership_tests;
 #[derive(Clone)]
 pub(crate) struct RequestSpoolAdmission {
     directory: Arc<PathBuf>,
-    budget: Arc<RequestSpoolBudget>,
+    usage: Arc<RequestSpoolUsage>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
 }
 
 impl RequestSpoolAdmission {
-    pub(crate) fn new(directory: PathBuf, limit_bytes: usize) -> Self {
+    pub(crate) fn new(directory: PathBuf) -> Self {
         Self {
             directory: Arc::new(directory),
-            budget: Arc::new(RequestSpoolBudget::new(limit_bytes)),
+            usage: Arc::new(RequestSpoolUsage::default()),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -69,27 +69,23 @@ impl RequestSpoolAdmission {
                     .ok_or(RequestSpoolCaptureError::MemoryExhausted)
             })
             .transpose()?;
-        let lease = Arc::new(Mutex::new(RequestSpoolLease::new(self.budget.clone())));
-        if let Some(length) = declared_content_length {
-            if length > maximum {
-                return Err(RequestSpoolCaptureError::TooLarge);
-            }
-            lease
-                .lock()
-                .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-                .try_grow(length)
-                .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
+        let lease = Arc::new(Mutex::new(RequestSpoolLease::new(self.usage.clone())));
+        if declared_content_length.is_some_and(|length| length > maximum) {
+            return Err(RequestSpoolCaptureError::TooLarge);
         }
         prepare_directory(self.directory.as_ref()).await?;
         let directory = self.directory.clone();
         let opening_metadata = metadata.clone();
         let opening_lease = lease.clone();
         #[cfg(test)]
-        let blocking_open = self.budget.blocking_open.clone();
+        let blocking_open = self.usage.blocking_open.clone();
         let opening = tokio::task::spawn_blocking(move || {
             let _opening_metadata = opening_metadata;
-            let _opening_lease = opening_lease;
             let owner = tempfile::tempfile_in(directory.as_ref())?;
+            opening_lease
+                .lock()
+                .map_err(|_| io::Error::other("request spool ownership unavailable"))?
+                .opened();
             let writer = owner.try_clone()?;
             #[cfg(test)]
             if let Some(pause) = blocking_open {
@@ -98,7 +94,7 @@ impl RequestSpoolAdmission {
             Ok::<_, io::Error>((owner, writer))
         });
         #[cfg(test)]
-        if let Some(pause) = &self.budget.blocking_open {
+        if let Some(pause) = &self.usage.blocking_open {
             pause.record(&opening);
         }
         let (owner, writer) = opening
@@ -135,35 +131,38 @@ impl RequestSpoolAdmission {
                 if next > maximum {
                     return Err(RequestSpoolCaptureError::TooLarge);
                 }
-                {
-                    let mut lease = capture
-                        .lease
-                        .lock()
-                        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-                    let reserved = lease.bytes();
-                    lease
-                        .try_grow(next.saturating_sub(reserved))
-                        .ok_or(RequestSpoolCaptureError::CapacityExhausted)?;
-                }
                 let mut writer = capture.writer.try_clone().map_err(spool_io_error)?;
                 let write_metadata = metadata.clone();
                 let write_frame = frame_memory.clone();
                 let write_lease = capture.lease.clone();
                 let write_bytes = piece.to_vec();
                 #[cfg(test)]
-                let blocking_write = self.budget.blocking_write.clone();
+                let blocking_write = self.usage.blocking_write.clone();
                 let writing = tokio::task::spawn_blocking(move || {
                     let _write_metadata = write_metadata;
                     let _write_frame = write_frame;
-                    let _write_lease = write_lease;
                     #[cfg(test)]
                     if let Some(pause) = blocking_write {
                         pause.block();
                     }
-                    std::io::Write::write_all(&mut writer, &write_bytes)
+                    let mut remaining = write_bytes.as_slice();
+                    while !remaining.is_empty() {
+                        let written = match std::io::Write::write(&mut writer, remaining) {
+                            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                            Ok(written) => written,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(error),
+                        };
+                        write_lease
+                            .lock()
+                            .map_err(|_| io::Error::other("request spool ownership unavailable"))?
+                            .record_written(written);
+                        remaining = &remaining[written..];
+                    }
+                    Ok(())
                 });
                 #[cfg(test)]
-                if let Some(pause) = &self.budget.blocking_write {
+                if let Some(pause) = &self.usage.blocking_write {
                     pause.record(&writing);
                 }
                 writing
@@ -174,11 +173,6 @@ impl RequestSpoolAdmission {
                 capture.length = next;
             }
         }
-        capture
-            .lease
-            .lock()
-            .map_err(|_| RequestSpoolCaptureError::Unavailable)?
-            .shrink_to(capture.length);
         let owner = capture
             .owner
             .take()
@@ -196,7 +190,7 @@ impl RequestSpoolAdmission {
     }
 
     pub(crate) fn snapshot(&self) -> RequestSpoolSnapshot {
-        self.budget.snapshot()
+        self.usage.snapshot()
     }
 
     #[cfg(test)]
@@ -208,107 +202,62 @@ impl RequestSpoolAdmission {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RequestSpoolSnapshot {
     pub(crate) used_bytes: usize,
-    pub(crate) limit_bytes: usize,
     pub(crate) active_files: usize,
-    pub(crate) capacity_rejections: u64,
 }
 
-struct RequestSpoolBudget {
+#[derive(Default)]
+struct RequestSpoolUsage {
     used_bytes: AtomicUsize,
-    limit_bytes: usize,
     active_files: AtomicUsize,
-    capacity_rejections: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     blocking_open: Option<Arc<ownership_tests::BlockingPause>>,
     #[cfg(test)]
     blocking_write: Option<Arc<ownership_tests::BlockingPause>>,
 }
 
-impl RequestSpoolBudget {
-    fn new(limit_bytes: usize) -> Self {
-        Self {
-            used_bytes: AtomicUsize::new(0),
-            limit_bytes,
-            active_files: AtomicUsize::new(0),
-            capacity_rejections: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            blocking_open: None,
-            #[cfg(test)]
-            blocking_write: None,
-        }
-    }
-
-    fn try_grow(&self, bytes: usize) -> bool {
-        if bytes == 0 {
-            return true;
-        }
-        let result = self
-            .used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|total| *total <= self.limit_bytes)
-            });
-        if result.is_err() {
-            self.capacity_rejections.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        true
-    }
-
-    fn release(&self, bytes: usize) {
-        let _ = self
-            .used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            });
-    }
-
+impl RequestSpoolUsage {
     fn snapshot(&self) -> RequestSpoolSnapshot {
         RequestSpoolSnapshot {
             used_bytes: self.used_bytes.load(Ordering::Acquire),
-            limit_bytes: self.limit_bytes,
             active_files: self.active_files.load(Ordering::Acquire),
-            capacity_rejections: self.capacity_rejections.load(Ordering::Relaxed),
         }
     }
 }
 
 struct RequestSpoolLease {
-    budget: Arc<RequestSpoolBudget>,
+    usage: Arc<RequestSpoolUsage>,
     bytes: usize,
+    opened: bool,
 }
 
 impl RequestSpoolLease {
-    fn new(budget: Arc<RequestSpoolBudget>) -> Self {
-        budget.active_files.fetch_add(1, Ordering::AcqRel);
-        Self { budget, bytes: 0 }
-    }
-
-    fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    fn try_grow(&mut self, bytes: usize) -> Option<()> {
-        if self.budget.try_grow(bytes) {
-            self.bytes = self.bytes.saturating_add(bytes);
-            Some(())
-        } else {
-            None
+    fn new(usage: Arc<RequestSpoolUsage>) -> Self {
+        Self {
+            usage,
+            bytes: 0,
+            opened: false,
         }
     }
 
-    fn shrink_to(&mut self, bytes: usize) {
-        let refund = self.bytes.saturating_sub(bytes);
-        self.budget.release(refund);
-        self.bytes = self.bytes.saturating_sub(refund);
+    fn opened(&mut self) {
+        self.usage.active_files.fetch_add(1, Ordering::AcqRel);
+        self.opened = true;
+    }
+
+    fn record_written(&mut self, bytes: usize) {
+        self.usage.used_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.bytes += bytes;
     }
 }
 
 impl Drop for RequestSpoolLease {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
-        self.budget.active_files.fetch_sub(1, Ordering::AcqRel);
+        self.usage
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.opened {
+            self.usage.active_files.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -392,13 +341,21 @@ fn spool_io_error(error: io::Error) -> RequestSpoolCaptureError {
         os_error = error.raw_os_error(),
         "local request spool I/O unavailable"
     );
-    RequestSpoolCaptureError::Unavailable
+    match error.raw_os_error() {
+        Some(code)
+            if code == rustix::io::Errno::NOSPC.raw_os_error()
+                || code == rustix::io::Errno::DQUOT.raw_os_error() =>
+        {
+            RequestSpoolCaptureError::StorageFull
+        }
+        _ => RequestSpoolCaptureError::Unavailable,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestSpoolCaptureError {
     TooLarge,
-    CapacityExhausted,
+    StorageFull,
     MemoryExhausted,
     BodyReadRejected,
     Unavailable,
@@ -424,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn capture_round_trips_and_drop_unlinks_the_file() {
         let directory = tempfile::tempdir().unwrap();
-        let admission = RequestSpoolAdmission::new(directory.path().to_owned(), 256 * 1024);
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
         let body = Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES * 2 + 17]);
         let digest = *blake3::hash(&body).as_bytes();
         let spool = admission
@@ -443,9 +400,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_body_exhausts_disk_budget_before_polling() {
+    async fn oversized_declared_body_is_rejected_before_polling_or_file_creation() {
         let directory = tempfile::tempdir().unwrap();
-        let admission = RequestSpoolAdmission::new(directory.path().to_owned(), 64 * 1024);
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
         let polls = Arc::new(AtomicUsize::new(0));
         let observed = polls.clone();
         let body = Body::from_stream(stream::poll_fn(move |_| {
@@ -453,19 +410,35 @@ mod tests {
             std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"x"))))
         }));
         assert!(matches!(
-            admission.capture(body, 128 * 1024, Some(128 * 1024)).await,
-            Err(RequestSpoolCaptureError::CapacityExhausted)
+            admission.capture(body, 64 * 1024, Some(128 * 1024)).await,
+            Err(RequestSpoolCaptureError::TooLarge)
         ));
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert_eq!(file_count(directory.path()), 0);
         assert_eq!(admission.snapshot().used_bytes, 0);
-        assert_eq!(admission.snapshot().capacity_rejections, 1);
+        assert_eq!(admission.snapshot().active_files, 0);
+    }
+
+    #[test]
+    fn filesystem_full_and_quota_errors_are_distinct_from_unavailable() {
+        for errno in [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT] {
+            assert_eq!(
+                spool_io_error(io::Error::from_raw_os_error(errno.raw_os_error())),
+                RequestSpoolCaptureError::StorageFull
+            );
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+            assert_eq!(
+                spool_io_error(io::Error::from(kind)),
+                RequestSpoolCaptureError::Unavailable
+            );
+        }
     }
 
     #[tokio::test]
     async fn cancelling_chunked_capture_releases_bytes_and_unlinks() {
         let directory = tempfile::tempdir().unwrap();
-        let admission = RequestSpoolAdmission::new(directory.path().to_owned(), 256 * 1024);
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
         let active = admission.clone();
         let (second_chunk_polled, second_chunk_poll) = tokio::sync::oneshot::channel();
         let body = Body::from_stream(
@@ -494,7 +467,7 @@ mod tests {
     async fn anonymous_spool_leaves_no_restart_orphan() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("request-spool");
-        let admission = RequestSpoolAdmission::new(path.clone(), 256 * 1024);
+        let admission = RequestSpoolAdmission::new(path.clone());
         let spool = admission
             .capture(Body::from("sensitive"), 1024, None)
             .await
@@ -502,7 +475,7 @@ mod tests {
         assert_eq!(file_count(&path), 0, "active spool must be anonymous");
         drop(spool);
         drop(admission);
-        let restarted = RequestSpoolAdmission::new(path.clone(), 256 * 1024);
+        let restarted = RequestSpoolAdmission::new(path.clone());
         assert_eq!(restarted.snapshot().used_bytes, 0);
         assert_eq!(file_count(&path), 0);
     }
@@ -515,7 +488,7 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         let link = parent.path().join("request-spool");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let admission = RequestSpoolAdmission::new(link, 1024);
+        let admission = RequestSpoolAdmission::new(link);
         assert!(matches!(
             admission.capture(Body::from("secret"), 1024, None).await,
             Err(RequestSpoolCaptureError::Unavailable)

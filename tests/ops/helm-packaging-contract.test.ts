@@ -160,7 +160,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 1Gi/);
     assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 256Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
-    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_BYTES\n\s+value: "134217728"/, 3);
+    assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
     count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 3);
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     for (const deployment of deployments) {
@@ -278,7 +278,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
-      ['config.responsesRequestSpoolBytes=4194303'], ['config.responsesRequestSpoolBytes=2147483649'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
+      ['config.responsesRequestSpoolBytes=134217728'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -305,16 +305,16 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
     }
     for (const values of [
-      ['config.responsesRequestSpoolBytes=33554431'],
-      ['requestSpool.sizeLimit=127Mi'],
       ['requestSpool.mountPath=/var/lib/../request-spool'],
       ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-spool-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `request spool cross-field gate accepted ${values.join(',')}`);
-      assert.match(result.stderr, /responsesRequestSpoolBytes must cover|requestSpool.sizeLimit must cover|requestSpool.mountPath must be|ephemeral-storage must cover/);
+      assert.match(result.stderr, /requestSpool.mountPath must be|ephemeral-storage must cover/);
     }
+    const smallerSpool = spawnSync(helm, ['template', 'smaller-spool', chart, '--set', 'requestSpool.sizeLimit=64Mi'], { cwd: repository, encoding: 'utf8', shell: false });
+    assert.equal(smallerSpool.status, 0, smallerSpool.stderr);
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {
       const result = spawnSync(helm, ['template', 'invalid-body-memory-budget', chart,
