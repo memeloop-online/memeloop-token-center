@@ -150,7 +150,6 @@ impl AppState {
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
         let responses_request_spool = gateway_body::request_spool::RequestSpoolAdmission::new(
             config.responses_request_spool_path.clone().into(),
-            config.responses_request_spool_bytes as usize,
         );
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(

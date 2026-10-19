@@ -191,8 +191,6 @@ pub(super) async fn prometheus_metrics(
             .load(std::sync::atomic::Ordering::Acquire),
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
-        responses_request_spool_limit_bytes: request_spool.limit_bytes,
-        responses_request_spool_capacity_rejections: request_spool.capacity_rejections,
         proxy_lifecycles: state.proxy_lifecycles.active(),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             .saturating_sub(state.proxy_archive_stream_permits.available_permits()),

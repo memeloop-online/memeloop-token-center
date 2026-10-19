@@ -119,7 +119,7 @@ async fn admit(
 
 async fn metadata_charge(path: &str, declared: Option<usize>) -> usize {
     let directory = tempfile::tempdir().unwrap();
-    let spool = RequestSpoolAdmission::new(directory.path().to_owned(), BUDGET_BYTES as usize);
+    let spool = RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
     let body = Body::from(vec![b'x'; declared.unwrap_or(0)]);
     let admitted = admit(path, body, declared, &budget, &spool).await.unwrap();
@@ -138,7 +138,7 @@ async fn responses_metadata_one_unit_short_rejects_before_directory_or_body_poll
         let metadata = metadata_charge(path, Some(1)).await;
         let directory = tempfile::tempdir().unwrap();
         let spool_path = directory.path().join("not-opened");
-        let spool = RequestSpoolAdmission::new(spool_path.clone(), BUDGET_BYTES as usize);
+        let spool = RequestSpoolAdmission::new(spool_path.clone());
         let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
         let held = budget.reservation();
         let held_bytes = BUDGET_BYTES as usize - metadata + REQUEST_SPOOL_CHUNK_BYTES;
@@ -174,11 +174,8 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                     let directory = tempfile::tempdir().unwrap();
                     let pause = Arc::new(BlockingPause::default());
                     let resume = ResumeOnDrop(pause.clone());
-                    let mut spool = RequestSpoolAdmission::new(
-                        directory.path().to_owned(),
-                        BUDGET_BYTES as usize,
-                    );
-                    Arc::get_mut(&mut spool.budget).unwrap().blocking_write = Some(pause.clone());
+                    let mut spool = RequestSpoolAdmission::new(directory.path().to_owned());
+                    Arc::get_mut(&mut spool.usage).unwrap().blocking_write = Some(pause.clone());
                     let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
                     let held = budget.reservation();
                     let held_bytes = BUDGET_BYTES as usize - metadata - frame_allowance;
@@ -211,7 +208,7 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                         pause.wait_started().await;
                         assert!(!pause.is_finished());
                         assert_eq!(budget.snapshot().0, BUDGET_BYTES as usize);
-                        assert_eq!(spool.snapshot().used_bytes, frame_bytes);
+                        assert_eq!(spool.snapshot().used_bytes, 0);
                         drop(resume);
                         let admitted = capture.await.unwrap().unwrap();
                         assert_eq!(budget.snapshot().0, held_bytes + metadata);
@@ -229,7 +226,7 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
 }
 
 #[tokio::test]
-async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes() {
+async fn cancelled_blocking_open_and_write_keep_memory_and_file_until_task_finishes() {
     for path in ROUTES {
         for frame_bytes in TRANSPORT_SIZED_FRAMES {
             let metadata = metadata_charge(path, Some(frame_bytes)).await;
@@ -237,12 +234,11 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 let directory = tempfile::tempdir().unwrap();
                 let pause = Arc::new(BlockingPause::default());
                 let resume = ResumeOnDrop(pause.clone());
-                let mut spool =
-                    RequestSpoolAdmission::new(directory.path().to_owned(), BUDGET_BYTES as usize);
+                let mut spool = RequestSpoolAdmission::new(directory.path().to_owned());
                 if pause_open {
-                    Arc::get_mut(&mut spool.budget).unwrap().blocking_open = Some(pause.clone());
+                    Arc::get_mut(&mut spool.usage).unwrap().blocking_open = Some(pause.clone());
                 } else {
-                    Arc::get_mut(&mut spool.budget).unwrap().blocking_write = Some(pause.clone());
+                    Arc::get_mut(&mut spool.usage).unwrap().blocking_write = Some(pause.clone());
                 }
                 let budget = Arc::new(ProxyMemoryBudget::new(BUDGET_BYTES));
                 let held = budget.reservation();
@@ -267,13 +263,13 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 pause.wait_started().await;
                 assert_eq!(polls.load(Ordering::Acquire), usize::from(!pause_open));
                 assert_eq!(budget.snapshot().0, BUDGET_BYTES as usize);
-                assert_eq!(spool.snapshot().used_bytes, frame_bytes);
+                assert_eq!(spool.snapshot().used_bytes, 0);
                 assert_eq!(spool.snapshot().active_files, 1);
                 capture.abort();
                 assert!(capture.await.unwrap_err().is_cancelled());
                 assert!(!pause.is_finished());
                 assert_eq!(budget.snapshot().0, BUDGET_BYTES as usize);
-                assert_eq!(spool.snapshot().used_bytes, frame_bytes);
+                assert_eq!(spool.snapshot().used_bytes, 0);
                 assert_eq!(spool.snapshot().active_files, 1);
                 assert!(!held.try_grow(1, 1));
                 drop(resume);
@@ -283,8 +279,8 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 assert_eq!(spool.snapshot().active_files, 0);
                 drop(held);
                 assert_eq!(budget.snapshot().0, 0);
-                Arc::get_mut(&mut spool.budget).unwrap().blocking_open = None;
-                Arc::get_mut(&mut spool.budget).unwrap().blocking_write = None;
+                Arc::get_mut(&mut spool.usage).unwrap().blocking_open = None;
+                Arc::get_mut(&mut spool.usage).unwrap().blocking_write = None;
                 let recovered = admit(path, Body::from("x"), Some(1), &budget, &spool)
                     .await
                     .unwrap();
@@ -294,5 +290,115 @@ async fn cancelled_blocking_open_and_write_keep_both_budgets_until_task_finishes
                 assert_eq!(spool.snapshot().active_files, 0);
             }
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_independent() {
+    const UPLOAD_BYTES: usize = 12 * 1024 * 1024;
+    const UPLOADS: usize = 6;
+    const FORMER_AGGREGATE_LIMIT: usize = 64 * 1024 * 1024;
+
+    for declared in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let opening_pause = Arc::new(BlockingPause::default());
+        let opening_resume = ResumeOnDrop(opening_pause.clone());
+        let mut spool = RequestSpoolAdmission::new(directory.path().to_owned());
+        Arc::get_mut(&mut spool.usage).unwrap().blocking_open = Some(opening_pause);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(ProxyMemoryBudget::new(32 * 1024 * 1024));
+        let (started, mut starts) = tokio::sync::mpsc::channel(UPLOADS);
+        let (resume, waiting) = tokio::sync::watch::channel(false);
+        let mut captures = Vec::new();
+        for index in 0..UPLOADS {
+            let started = started.clone();
+            let waiting = waiting.clone();
+            let polls = polls.clone();
+            let body =
+                Body::from_stream(stream::unfold((0, waiting), move |(piece, mut waiting)| {
+                    let started = started.clone();
+                    let polls = polls.clone();
+                    async move {
+                        if piece == UPLOAD_BYTES / REQUEST_SPOOL_CHUNK_BYTES {
+                            return None;
+                        }
+                        if piece == 0 {
+                            polls.fetch_add(1, Ordering::AcqRel);
+                            started.send(()).await.unwrap();
+                            waiting.wait_for(|ready| *ready).await.unwrap();
+                            tokio::time::sleep(Duration::from_secs(120)).await;
+                        }
+                        Some((
+                            Ok::<_, Infallible>(Bytes::from(vec![b'x'; REQUEST_SPOOL_CHUNK_BYTES])),
+                            (piece + 1, waiting),
+                        ))
+                    }
+                }));
+            let mut request = Request::post(ROUTES[index % ROUTES.len()]);
+            if declared {
+                request = request.header(header::CONTENT_LENGTH, UPLOAD_BYTES);
+            }
+            let active_spool = spool.clone();
+            let active_budget = budget.clone();
+            captures.push(tokio::spawn(async move {
+                admit_gateway_request_body_with_memory(
+                    request.body(body).unwrap(),
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                    16 * 1024 * 1024,
+                    crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
+                    Some(&active_budget),
+                    &active_spool,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+        while spool.snapshot().active_files < UPLOADS {
+            assert!(
+                !captures.iter().any(tokio::task::JoinHandle::is_finished),
+                "all uploads must reach file creation before their first body poll"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::Acquire), 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        drop(opening_resume);
+        for _ in 0..UPLOADS {
+            starts.recv().await.unwrap();
+        }
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert_eq!(spool.snapshot().active_files, UPLOADS);
+        let small = admit(ROUTES[0], Body::from("{}"), Some(2), &budget, &spool)
+            .await
+            .unwrap();
+        drop(small);
+        resume.send(true).unwrap();
+        let mut retained = Vec::new();
+        for capture in captures {
+            let admitted = capture.await.unwrap();
+            let owner = admitted
+                .extensions()
+                .get::<Arc<super::RequestSpool>>()
+                .unwrap()
+                .clone();
+            assert_eq!(owner.len(), UPLOAD_BYTES);
+            retained.push(owner);
+            drop(admitted);
+        }
+        assert_eq!(spool.snapshot().used_bytes, UPLOADS * UPLOAD_BYTES);
+        assert!(spool.snapshot().used_bytes > FORMER_AGGREGATE_LIMIT);
+        assert_eq!(spool.snapshot().active_files, UPLOADS);
+        assert_eq!(spool.read_count_for_test(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let small = admit(ROUTES[1], Body::from("{}"), None, &budget, &spool)
+            .await
+            .unwrap();
+        drop(small);
+        assert_eq!(spool.snapshot().used_bytes, UPLOADS * UPLOAD_BYTES);
+        drop(retained);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(budget.snapshot().0, 0);
     }
 }

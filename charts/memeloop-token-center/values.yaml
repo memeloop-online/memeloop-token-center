@@ -132,12 +132,8 @@ config:
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` may exceed the normal 4 MiB gateway request. Four dedicated
-  # concurrent reads and the separate process disk-byte budget bound admission.
+  # `/v1/responses` uses disk-backed spools with bounded RAM and a per-request ceiling.
   responsesBodyMaxBytes: 33554432
-  # Per-process bytes admitted to request spool files. Capacity saturation is
-  # a retryable 503 and remains distinct from the 413 request-size boundary.
-  responsesRequestSpoolBytes: 134217728
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.
   audioBodyMaxBytes: 26214400

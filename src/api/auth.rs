@@ -82,7 +82,7 @@ pub(super) async fn authenticate_control_before_body(
                 return Err(AppError::Overloaded);
             }
             Err(
-                crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
+                crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull
                 | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
             ) => return Err(AppError::Overloaded),
             Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
@@ -276,16 +276,16 @@ fn gateway_body_admission_rejection(
                 .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
         }
-        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted => {
+        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull => {
             tracing::warn!(
                 request_id = %request_id,
                 route_class = "responses",
-                reason = "request_spool_capacity_exhausted",
-                "gateway request spool admission rejected"
+                reason = "request_spool_storage_full",
+                "gateway request spool storage full"
             );
             gateway_request_spool_rejection(
-                "request_spool_capacity_exhausted",
-                "request spool capacity is temporarily exhausted",
+                "request_spool_storage_full",
+                "request spool storage is full or its filesystem quota is exhausted",
             )
         }
         crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable => {
@@ -413,7 +413,7 @@ pub(super) async fn admit_cloud_webhook_before_body(
             return Err(AppError::Overloaded);
         }
         Err(
-            crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
+            crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull
             | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
         ) => return Err(AppError::Overloaded),
         Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
@@ -506,10 +506,10 @@ mod response_body_guard_tests {
     }
 
     #[tokio::test]
-    async fn request_spool_capacity_exhaustion_is_retryable_and_explainable() {
+    async fn request_spool_storage_full_is_retryable_and_explainable() {
         let response = gateway_request_spool_rejection(
-            "request_spool_capacity_exhausted",
-            "request spool capacity is temporarily exhausted",
+            "request_spool_storage_full",
+            "request spool storage is full or its filesystem quota is exhausted",
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -520,8 +520,8 @@ mod response_body_guard_tests {
             .await
             .expect("error body");
         let body = std::str::from_utf8(&body).expect("UTF-8 error");
-        assert!(body.contains("request_spool_capacity_exhausted"));
-        assert!(body.contains("temporarily exhausted"));
+        assert!(body.contains("request_spool_storage_full"));
+        assert!(body.contains("filesystem quota is exhausted"));
     }
 
     #[test]
