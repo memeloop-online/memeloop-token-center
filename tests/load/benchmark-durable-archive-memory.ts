@@ -426,6 +426,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
       try {
         return await deadline((async () => {
           while (true) {
+            const drainEvidence: Record<string, unknown> = { request_id: unknownRequestId, waiting_for: "financial_and_archive_state" };
+            report.last_archive_drain = drainEvidence;
             let retainedRequestCipherBytes: number | undefined;
             let unknownEvidence: Record<string, unknown> | undefined;
             if (unknownRequestId !== undefined) {
@@ -448,6 +450,12 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 WHERE q.id = ?`).get(unknownRequestId);
               const receipt = typeof unknown?.operational_receipt_id === "string"
                 ? pendingReceipt(join(requestSpool, "pending-terminals-v1"), unknown.operational_receipt_id) : undefined;
+              drainEvidence.unknown = unknown ? Object.fromEntries([
+                "state", "unknown_reason", "financial_completed", "reservation_status",
+                "operational_status", "operational_error", "operational_completed", "operational_receipt_id",
+                "spool_state", "spool_plain_bytes", "spool_cipher_bytes", "chunk_plain_bytes",
+              ].map((field) => [field, unknown[field]])) : null;
+              drainEvidence.durable_receipt_found = receipt !== undefined;
               if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing") {
                 await delay(100); continue;
               }
@@ -463,11 +471,14 @@ export async function run(binary: string, output: string): Promise<boolean> {
             }
             const row = reader.prepare("SELECT cipher_bytes, request_cipher_bytes, (SELECT COUNT(*) FROM request_records WHERE completed_at IS NULL) AS pending_requests, (SELECT COUNT(*) FROM usage_reservations WHERE status = 'reserved') AS unsettled_reservations FROM response_archive_spool_budget WHERE singleton = 1").get();
             assert(row, "archive budget row missing");
+            drainEvidence.budget = row;
             if (archiveDrainReady(row, retainedRequestCipherBytes)) {
+              drainEvidence.waiting_for = "memory_and_worker_permits";
               const metrics = await apiRequest(base, "GET", "/metrics", token, undefined, 2000);
               assert(metrics.status === 200, "permit metrics must be available");
               const metricsText = metrics.body.toString("utf8");
               const gauges = permitEvidence(metricsText);
+              drainEvidence.permits = gauges;
               if (Object.values(gauges).every((value) => value === 0)) {
                 const currentBudget = reader.prepare("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1").get();
                 assert(currentBudget, "archive budget row missing after capture drain");

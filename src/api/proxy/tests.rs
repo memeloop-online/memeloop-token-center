@@ -2946,6 +2946,55 @@ async fn assert_exactly_once_side_effects_for(
     expected_account_id: Uuid,
     expected_route_id: Uuid,
 ) {
+    let projection_owner = Uuid::now_v7();
+    for pending_id in fixture
+        .state
+        .db
+        .claim_terminal_projection_tasks(projection_owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(projection_owner, pending_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(projection_owner, pending_id)
+                .await
+                .unwrap()
+        );
+    }
+    for task in fixture
+        .state
+        .db
+        .claim_conversation_projection_tasks(projection_owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_conversation_projection_task(projection_owner, task.request_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .state
+                .db
+                .project_claimed_conversation_projection_task(projection_owner, task.request_id)
+                .await
+                .unwrap()
+        );
+    }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row = sqlx::query(
         "SELECT q.upstream_account_id, q.model_route_id, r.status AS reservation_status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservation_count, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = $2) AS response_observation_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",

@@ -1,6 +1,73 @@
 use super::*;
 
 #[tokio::test]
+async fn durable_unknown_receipt_releases_projection_memory_without_discarding_evidence() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("{", "application/json"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("pending-unknown-memory", &upstream, 256).await;
+    let held = fixture.state.pending_terminals.hold_writer_for_test().await;
+    let response = send_response_usage_request(
+        &fixture,
+        &json!({
+            "model": fixture.model, "input": "PRIVATE_OWNED_UNKNOWN_INPUT",
+            "stream": false, "max_output_tokens": 16
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&delivered).contains("PRIVATE_OWNED_UNKNOWN_INPUT"));
+    assert!(
+        fixture.state.proxy_memory_budget.snapshot().0 > 0,
+        "unacknowledged journal must retain its accounted payload"
+    );
+    drop(held);
+    let receipt = cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_invalid_response"),
+    )
+    .await;
+    assert_eq!(
+        receipt["conversation"]["request_json"]["input"],
+        "PRIVATE_OWNED_UNKNOWN_INPUT"
+    );
+    let path = fixture
+        .state
+        .pending_terminals
+        .directory_for_test()
+        .join(format!("{}.json", receipt["receipt_id"].as_str().unwrap()));
+    let durable = tokio::fs::read(&path).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (lifecycle, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+            if lifecycle == 0 && retained == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable unknown must release its raw projection and memory permits");
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), durable);
+    cancellation::assert_unknown_request(
+        &fixture,
+        Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap(),
+        0,
+    )
+    .await;
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn second_candidate_claim_failure_records_original_responsibility_without_waiting_for_ack() {
     let fixture = codex_route_fixture("pending-second-candidate-claim-failure").await;
     let standby = add_codex_standby_route(

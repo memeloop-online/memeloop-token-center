@@ -450,6 +450,19 @@ impl Journal {
                 tracing::error!(%request_id, financial_state = "unknown", "pending terminal worker interrupted; evidence retained for supervised retry");
             }
         }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for entry in pending
+            .values_mut()
+            .filter(|entry| entry.durable && entry.reconcile && !entry.running)
+        {
+            if let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
+                snapshot.conversation = None;
+                entry.projection_retained = None;
+            }
+        }
     }
 
     pub(crate) fn submit_with_preparation(
