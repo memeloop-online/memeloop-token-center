@@ -133,17 +133,17 @@ export function createSessionContextLoader(sessionId: string, credential: string
   };
   return {
     async response(requestId, signal) {
-      const page = validateContextPage(await apiRead<unknown>(
+      const page = validateContextPage(await bounded(signal, () => apiRead<unknown>(
         queryPath(path(requestId, false), { response_only: 'true' }), credential,
         { signal, totalTimeoutMilliseconds: 15_000 },
-      ), sessionId, requestId);
+      )), sessionId, requestId);
       if (!page.response) throw invalid();
       return page.response;
     },
     async page(requestId, continuation, details, signal) {
-      const response = await apiRead<unknown>(queryPath(path(requestId, false), {
+      const response = await bounded(signal, () => apiRead<unknown>(queryPath(path(requestId, false), {
         ...(continuation ? { cursor: continuation } : {}), details: String(details),
-      }), credential, { signal, totalTimeoutMilliseconds: 15_000 });
+      }), credential, { signal, totalTimeoutMilliseconds: 15_000 }));
       return validateContextPage(response, sessionId, requestId);
     },
     async content(requestId, continuation, signal) {

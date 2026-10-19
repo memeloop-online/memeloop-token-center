@@ -256,3 +256,19 @@ PR or partial green checks establish completion of the reading requirements.
 - Full-session reading, HTTP authorization coverage, bounded historical receipt
   compaction and deployment verification remain open. These CI corrections do
   not establish completion.
+
+- Added router-level HTTP coverage for owned context/content reads, denied
+  cross-key/cross-tenant reads, forged continuations, tenant-limited service
+  access and the title operation's combined read/execution authority.
+- Default reading now presents a four-request chronological window with each
+  request's own final response. Earlier/newer windows replace mounted readers;
+  individual timestamp inspection remains an explicit option. Shared user
+  prefix nodes appear once per window; distinct nodes with identical text and
+  reset paths remain separate. Context-page, final-status and content reads
+  now share the same four-read concurrency limit.
+- Added browser coverage for request-window pagination, pre-reset history,
+  shared-prefix deduplication, intentional repeated text and no eager archive
+  or tool reads; these new checks have not yet run in CI. Context before each
+  32-node page still uses explicit continuation, and historical metadata is
+  loaded through the existing older-request action. Full production coverage
+  is not yet verified.

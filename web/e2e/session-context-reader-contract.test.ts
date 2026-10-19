@@ -124,3 +124,46 @@ test('response status polling is scoped and skips context pages and archive cont
     assert.throws(() => validateContextPage(malformed, 's', 'r'));
   } finally { globalThis.fetch = original; }
 });
+
+test('context pages, response polling and content share one four-read concurrency bound', async () => {
+  const original = globalThis.fetch;
+  const releases: Array<() => void> = [];
+  let active = 0;
+  let maximum = 0;
+  globalThis.fetch = async (input) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise<void>((resolve) => releases.push(resolve));
+    active -= 1;
+    const value = String(input).includes('/content')
+      ? { contract_version: 'session_context_content_v1', representation: 'message_text',
+        node_id: node(1), offset_chars: 0, total_chars: 1, content: '文', next_cursor: null }
+      : { ...page(1, 1), response: { state: 'pending', text: null, node_id: null,
+        text_cursor: null, total_chars: 0, error_code: null } };
+    return new Response(JSON.stringify(value));
+  };
+  try {
+    const loader = createSessionContextLoader('s', 'test', (_request, content) => content ? '/content' : '/context');
+    const signal = new AbortController().signal;
+    const reads = [
+      loader.page('r', undefined, false, signal),
+      loader.response!('r', signal),
+      loader.content('r', 'cursor', signal),
+      loader.page('r', undefined, false, signal),
+      loader.response!('r', signal),
+      loader.content('r', 'cursor', signal),
+    ];
+    // Yield through fetch/API promises, without a wall-clock sleep.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(releases.length, 4);
+    while (releases.length) {
+      releases.shift()!();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await Promise.all(reads);
+    assert.equal(maximum, 4);
+  } finally {
+    for (const release of releases) release();
+    globalThis.fetch = original;
+  }
+});

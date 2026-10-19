@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Button, Select } from './design-system';
 import { useI18n } from './i18n.js';
 import { SessionContextDisclosure, SessionUserText } from './SessionContextContent.js';
-import { prependContextPage, type SessionContextLoader, type SessionContextPage, type SessionResponseSummary } from './sessionContextReader.js';
+import { prependContextPage, type SessionContextItem, type SessionContextLoader, type SessionContextPage, type SessionResponseSummary } from './sessionContextReader.js';
 import type { LogicalSessionDetail } from './types.js';
 
 const loaderIdentities = new WeakMap<SessionContextLoader, number>();
@@ -20,7 +20,10 @@ export function DeferredSessionDetails({ label, children }: { label: string; chi
   </details>;
 }
 
-function RequestContext({ requestId, loader }: { requestId: string; loader: SessionContextLoader }) {
+function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswers = true }: {
+  requestId: string; loader: SessionContextLoader; hiddenUsers?: Set<string>;
+  onItems?: (requestId: string, items: SessionContextItem[]) => void; contextAnswers?: boolean;
+}) {
   const { t } = useI18n();
   const [page, setPage] = useState<SessionContextPage>();
   const [cursor, setCursor] = useState<string>();
@@ -28,6 +31,9 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [response, setResponse] = useState<SessionResponseSummary>();
+  useEffect(() => {
+    if (page) onItems?.(requestId, page.items);
+  }, [page, requestId, onItems]);
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -65,7 +71,7 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
     return () => { controller.abort(); clearTimeout(timer); };
   }, [page?.response, loader, requestId]);
   const items = page?.items ?? [];
-  const users = items.filter((item) => item.role === 'user' && ['message', 'agent_message'].includes(item.kind));
+  const users = items.filter((item) => item.role === 'user' && ['message', 'agent_message'].includes(item.kind) && !hiddenUsers?.has(item.node_id));
   const tools = items.filter((item) => !['message', 'agent_message'].includes(item.kind) || item.role === 'tool');
   // One visible answer per retained user turn. Explicit final markers take
   // precedence over unmarked candidates; commentary is never promoted.
@@ -85,7 +91,7 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
     {page?.next_cursor && !failed && <Button appearance="secondary" disabled={loading} onClick={() => setCursor(page.next_cursor!)}>{t('sessionReplay.contextEarlier')}</Button>}
     <div className="session-context-columns">
       <section aria-label={t('sessionReplay.agentOutput')}>
-        {answers.map((item) => <article className="session-replay-entry" key={item.node_id}><div className="session-context-message">{item.text}</div></article>)}
+        {contextAnswers && answers.map((item) => <article className="session-replay-entry" key={item.node_id}><div className="session-context-message">{item.text}</div></article>)}
         {response?.state === 'ready' && response.text !== null && <article className="session-replay-entry">
           {response.total_chars > Array.from(response.text).length && response.text_cursor && response.node_id
             ? <SessionUserText item={{ node_id: response.node_id, depth: 1, role: 'assistant', kind: 'message', phase: 'final',
@@ -95,7 +101,7 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
         </article>}
         {response && ['pending', 'running'].includes(response.state) && <p role="status">{t('sessionReplay.responsePreparing')}</p>}
         {response?.state === 'unavailable' && <p role="status">{t('sessionReplay.responseUnavailable')}</p>}
-        {!loading && answers.length === 0 && (!response || response.state === 'ready' && response.text === null) && <p className="mtc-secondary-text">{t('sessionReplay.noFinalResponse')}</p>}
+        {!loading && (!contextAnswers || answers.length === 0) && (!response || response.state === 'ready' && response.text === null) && <p className="mtc-secondary-text">{t('sessionReplay.noFinalResponse')}</p>}
       </section>
       <aside aria-label={t('sessionReplay.userInput')}>
         {users.map((item) => <article className="session-replay-entry" key={item.node_id}>
@@ -120,6 +126,30 @@ function RequestContext({ requestId, loader }: { requestId: string; loader: Sess
   </div>;
 }
 
+const REQUEST_WINDOW = 4;
+
+/** Keep only one bounded request window mounted. Prefix node identity includes
+ * ancestry, so repeated text and reset branches are not text-deduplicated. */
+function ContextWindow({ requests, loader }: {
+  requests: LogicalSessionDetail['requests']; loader: SessionContextLoader;
+}) {
+  const { locale } = useI18n();
+  const [pages, setPages] = useState<Record<string, SessionContextItem[]>>({});
+  const onItems = useCallback((requestId: string, items: SessionContextItem[]) => {
+    setPages((previous) => previous[requestId] === items ? previous : { ...previous, [requestId]: items });
+  }, []);
+  const seen = new Set<string>();
+  return <>{[...requests].reverse().map((request, index) => {
+    const hiddenUsers = new Set(seen);
+    for (const item of pages[request.request_id] ?? []) seen.add(item.node_id);
+    return <section key={request.request_id} className="session-context-turn" data-request-id={request.request_id}>
+      <h4><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></h4>
+      <RequestContext requestId={request.request_id} loader={loader} hiddenUsers={hiddenUsers}
+        onItems={onItems} contextAnswers={index === 0} />
+    </section>;
+  })}</>;
+}
+
 /** Each observation retains its own path, including the paths before compaction. */
 export function SessionContextPanel({ detail, loader }: {
   detail: LogicalSessionDetail; loader: SessionContextLoader;
@@ -127,17 +157,30 @@ export function SessionContextPanel({ detail, loader }: {
   const { locale, t } = useI18n();
   const requests = [...detail.requests].sort((a, b) => b.created_at - a.created_at || b.request_id.localeCompare(a.request_id));
   const [selection, setSelection] = useState<string>();
-  const selected = requests.find((request) => request.request_id === selection) ?? requests[0];
+  const [anchor, setAnchor] = useState<string>();
+  const selected = requests.find((request) => request.request_id === selection);
+  const start = Math.max(0, requests.findIndex((request) => request.request_id === anchor));
+  const window = requests.slice(start, start + REQUEST_WINDOW);
   return <section className="session-replay" aria-label={t('sessionReplay.title')}>
     <header className="session-replay-heading"><h3>{t('sessionReplay.content')}</h3>
       <Select aria-label={t('sessionReplay.contextObservation')} value={selected?.request_id ?? ''}
-        onChange={(event) => setSelection(event.target.value)}>
+        onChange={(event) => setSelection(event.target.value || undefined)}>
+        <option value="">{t('sessionReplay.conversationHistory')}</option>
         {requests.map((request) => <option key={request.request_id} value={request.request_id}>
           {new Date(request.created_at).toLocaleString(locale)} · {request.request_id.slice(-8)}
         </option>)}
       </Select>
     </header>
     <p className="mtc-secondary-text">{t('sessionReplay.contextScope')}</p>
-    {selected && <RequestContext key={`${loaderIdentity(loader)}:${selected.request_id}`} requestId={selected.request_id} loader={loader} />}
+    {selected ? <RequestContext key={`${loaderIdentity(loader)}:${selected.request_id}`} requestId={selected.request_id} loader={loader} />
+      : <>
+        <div className="session-replay-heading">
+          <Button appearance="secondary" disabled={start + REQUEST_WINDOW >= requests.length}
+            onClick={() => setAnchor(requests[start + REQUEST_WINDOW]?.request_id)}>{t('sessionReplay.earlierTurns')}</Button>
+          <Button appearance="secondary" disabled={start === 0}
+            onClick={() => setAnchor(requests[Math.max(0, start - REQUEST_WINDOW)]?.request_id)}>{t('sessionReplay.newerTurns')}</Button>
+        </div>
+        <ContextWindow key={`${loaderIdentity(loader)}:${window.map((request) => request.request_id).join(':')}`} requests={window} loader={loader} />
+      </>}
   </section>;
 }

@@ -478,7 +478,190 @@ fn last_paragraph(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+        response::Response,
+    };
     use serde_json::json;
+    use tower::ServiceExt;
+
+    async fn http(state: &AppState, method: &str, path: &str, token: &str) -> Response {
+        crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::All)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn client(state: &AppState, tenant: &str) -> crate::model::IssuedKey {
+        state
+            .db
+            .create_key(
+                crate::db::CreateKeyInput {
+                    tenant_external_id: tenant.into(),
+                    principal_external_id: "reading-member".into(),
+                    alias: "reading test".into(),
+                    currency: "USD".into(),
+                    policy: crate::model::KeyPolicy::default(),
+                    initial_balance: rust_decimal::Decimal::TEN,
+                    idempotency_key: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_context_and_title_routes_enforce_identity_and_execution_authority() {
+        let (state, _directory) = crate::api::tests::test_state().await;
+        let owner = client(&state, "reading-http").await;
+        let other = client(&state, "reading-http").await;
+        let foreign = client(&state, "reading-foreign").await;
+        let key = state
+            .db
+            .authenticate_key(&owner.key, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        let request = Uuid::now_v7();
+        let mut transaction = state.db.begin_write_transaction().await.unwrap();
+        let session = state
+            .db
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                crate::db::ConversationObservationInput {
+                    key: &key,
+                    request_id: request,
+                    request_json: &json!({"input":[
+                        {"role":"user","content":"完整问题"},
+                        {"type":"function_call","name":"test_tool","arguments":"private tool arguments"}
+                    ]}),
+                    hints: &crate::conversation::ConversationHints::default(),
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: crate::db::unix_millis(),
+                    attach_request_record: false,
+                    content_materialized: false,
+                },
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let self_path = format!("/self/v1/sessions/{session}/requests/{request}/context");
+        let response = http(&state, "GET", &self_path, &owner.key).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 128 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(page["items"][0]["text"], "完整问题");
+        assert!(page["items"][1]["text"].is_null());
+        assert!(!page.to_string().contains("private tool arguments"));
+        let cursor = page["items"][1]["content_cursor"].as_str().unwrap();
+        let content_path = format!("{self_path}/content?cursor={cursor}");
+        assert_eq!(
+            http(&state, "GET", &content_path, &owner.key)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for token in [&other.key, &foreign.key] {
+            for path in [&self_path, &content_path] {
+                assert_eq!(
+                    http(&state, "GET", path, token).await.status(),
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+        assert_eq!(
+            http(&state, "GET", &self_path, "invalid-token")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            http(&state, "GET", &format!("{content_path}x"), &owner.key)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let reader = state
+            .db
+            .create_service_token(
+                crate::db::CreateServiceTokenInput {
+                    name: "reading-only".into(),
+                    scopes: vec!["requests:read".into()],
+                    tenant_external_id: Some("reading-http".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let executor = state
+            .db
+            .create_service_token(
+                crate::db::CreateServiceTokenInput {
+                    name: "execution-only".into(),
+                    scopes: vec!["filter_assistant:execute".into()],
+                    tenant_external_id: Some("reading-http".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let internal_path = format!("/internal/v1/sessions/{session}/requests/{request}/context");
+        let scope = format!("tenant_external_id=reading-http&key_id={}", owner.key_id);
+        let title_path = format!("/internal/v1/sessions/{session}/title?{scope}");
+        for path in [format!("{internal_path}?{scope}"), title_path.clone()] {
+            assert_eq!(
+                http(&state, "GET", &path, &reader.token).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                http(&state, "GET", &path, &executor.token).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Generating a title spends the configured billing credential. Neither
+        // reading authority alone nor execution authority alone is sufficient.
+        for token in [&reader.token, &executor.token] {
+            assert_eq!(
+                http(&state, "POST", &title_path, token).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            http(
+                &state,
+                "GET",
+                &format!(
+                    "{internal_path}?tenant_external_id=reading-foreign&key_id={}",
+                    owner.key_id
+                ),
+                &reader.token
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            http(
+                &state,
+                "GET",
+                &format!("{internal_path}/content?{scope}&cursor={cursor}"),
+                &reader.token
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
 
     fn scope() -> SessionContextScope {
         SessionContextScope {

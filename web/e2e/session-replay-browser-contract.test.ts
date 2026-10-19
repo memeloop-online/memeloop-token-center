@@ -49,6 +49,45 @@ test('prefix reader never fetches archives or tool bodies before their disclosur
   } finally { await browser.close(); await server.close(); }
 });
 
+test('conversation history pages request replies across resets without opening archives', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return test.skip('Chromium required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?context=1&response=1&history=1`);
+    for (let index = 2; index <= 5; index += 1) {
+      await page.getByText(`Current request final answer · replay-r${index}`, { exact: true }).waitFor();
+    }
+    assert.equal(await page.evaluate(() => window.contextReads), 4);
+    assert.equal(await page.locator('.session-context-columns aside .session-replay-entry').count(), 2, 'shared prefix users appear once, but repeated text at a new node remains visible');
+    assert.equal(await page.locator('.session-context-turn').count(), 4);
+    assert.equal(await page.evaluate(() => window.contextContentReads), 0);
+    assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
+    await page.getByRole('button', { name: 'Earlier turns', exact: true }).click();
+    await page.getByText('Current request final answer · replay-r1', { exact: true }).waitFor();
+    await page.getByText('User message before reset', { exact: true }).waitFor();
+    assert.equal(await page.locator('.session-context-turn').count(), 1, 'previous window is unmounted');
+    assert.equal(await page.evaluate(() => window.contextReads), 5);
+    assert.equal(await page.getByRole('button', { name: 'Earlier turns', exact: true }).isDisabled(), true);
+    assert.equal(await page.evaluate(() => window.contextContentReads), 0);
+    assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
+    await page.getByRole('button', { name: 'Newer turns', exact: true }).click();
+    await page.getByText('Current request final answer · replay-r5', { exact: true }).waitFor();
+    await page.getByRole('combobox', { name: 'History timestamp', exact: true }).selectOption('replay-r1');
+    await page.getByText('User message before reset', { exact: true }).waitFor();
+    assert.equal(await page.locator('.session-context-turn').count(), 0, 'individual context inspection is an explicit mode');
+  } finally { await browser.close(); await server.close(); }
+});
+
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();
   if (existsSync(defaultExecutable)) return defaultExecutable;
