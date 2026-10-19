@@ -102,7 +102,10 @@ impl Database {
             return Ok(());
         }
         let atom = if let Some(answer) = answer {
-            let encoded = serde_json::to_string(answer).map_err(|_| AppError::Internal)?;
+            let encoded = serde_json::to_string(&serde_json::json!({
+                "role": "assistant", "type": "response_summary", "content": answer
+            }))
+            .map_err(|_| AppError::Internal)?;
             let digest = blake3::hash(encoded.as_bytes()).to_hex().to_string();
             sqlx::query("INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $2, 'assistant', 'response_summary', $3, $4) ON CONFLICT(tenant_id, content_hash) DO NOTHING")
                 .bind(task.tenant_id.to_string()).bind(&digest).bind(encoded).bind(now).execute(&mut *tx).await?;
@@ -131,8 +134,8 @@ impl Database {
             return Err(AppError::NotFound);
         }
         let text = match self.backend {
-            DatabaseBackend::PostgreSql => "a.content_json::jsonb #>> '{}'",
-            DatabaseBackend::Sqlite => "json_extract(a.content_json, '$')",
+            DatabaseBackend::PostgreSql => "a.content_json::jsonb ->> 'content'",
+            DatabaseBackend::Sqlite => "json_extract(a.content_json, '$.content')",
         };
         let sql = format!(
             "SELECT SUBSTR({text}, $5, 16384) AS text, CAST(LENGTH({text}) AS BIGINT) AS total FROM session_response_summaries r JOIN semantic_atoms a ON a.tenant_id = r.tenant_id AND a.content_hash = r.atom_hash WHERE r.tenant_id = $1 AND r.key_id = $2 AND r.request_id = $3 AND r.atom_hash = $4 AND r.state = 'ready' AND r.session_id = $6"

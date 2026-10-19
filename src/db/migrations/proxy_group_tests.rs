@@ -224,7 +224,7 @@ async fn upgrade_contract(database: &Database) {
     assert_eq!(
         tail,
         vec![
-            117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130
+            117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132
         ]
     );
     let policy: String = sqlx::query_scalar(

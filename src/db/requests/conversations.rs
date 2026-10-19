@@ -162,8 +162,11 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() == 0 {
-        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1")
+        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, projected_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
+        let completed = existing
+            .try_get::<Option<i64>, _>("projected_at")?
+            .is_some();
         if existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
             || existing.try_get::<String, _>("key_id")? != key.key_id.to_string()
             || existing.try_get::<String, _>("principal_id")? != key.principal_id.to_string()
@@ -182,12 +185,22 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
                 .try_get::<Option<String>, _>("key_snapshot_json")?
                 .as_deref()
                 != Some(key_snapshot.as_str())
-            || existing.try_get::<Option<String>, _>("semantic_snapshot_json")? != semantic_snapshot
+            || !semantic_payload::snapshot_matches(
+                existing
+                    .try_get::<Option<String>, _>("semantic_snapshot_json")?
+                    .as_deref(),
+                semantic_snapshot.as_deref(),
+                completed,
+            )
             || (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some()
         {
             return Err(AppError::Conflict(
                 "conversation projection evidence does not match its owner".into(),
             ));
+        }
+        if completed {
+            // A matching replay must not resurrect a consumed body payload.
+            return Ok(());
         }
     }
     if let Some((body, digest)) = payload {
@@ -545,12 +558,14 @@ impl Database {
             )
             .await?;
         }
+        let receipt = task.try_get::<Option<String>, _>("semantic_snapshot_json")?.as_deref().map(semantic_payload::completed_receipt);
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
         .bind(now)
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
+        .bind(receipt)
         .execute(&mut *transaction)
         .await?;
         if acknowledged.rows_affected() != 1 {
@@ -1639,6 +1654,14 @@ async fn merge_conversation_clusters_in_transaction(
     if target_cluster.rows_affected() != 1 {
         return Err(AppError::Internal);
     }
+    merge_session_reading_in_transaction(
+        transaction,
+        tenant_id,
+        key_id,
+        &source_cluster_id,
+        &target_cluster_id,
+    )
+    .await?;
     sqlx::query("DELETE FROM conversation_key_clusters WHERE key_id = $1 AND cluster_id = $2")
         .bind(key_id)
         .bind(&source_cluster_id)

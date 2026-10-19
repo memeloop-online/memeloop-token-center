@@ -213,3 +213,30 @@ PR or partial green checks establish completion of the reading requirements.
 - This integration has not yet been compiled/tested by CI or deployed.
   Session-wide chronology/branch coverage, title-search and lifecycle cleanup,
   production storage auditing and final verification remain incomplete.
+
+## Storage/search follow-up
+
+- Read-only production catalog snapshot: semantic_atoms ~1.18M estimated rows /
+  4,232 MB including indexes/TOAST; context_nodes ~4.72M / 2,767 MB;
+  observations ~506K / 1,289 MB; conversation outbox ~51K / 776 MB.
+  These are planner estimates and allocated sizes, not live-content counts.
+- A bounded sample of 64 completed outbox jobs retained an average 14,229 bytes
+  of semantic snapshot and maximum 33,608 bytes, despite request_json being
+  only two bytes. Code inspection also found that an identical enqueue replay
+  could recreate its already-consumed transient payload after completion.
+- New successful acknowledgments compact the snapshot to a versioned digest
+  receipt (<128 bytes), preserving evidence-match rejection and compatibility
+  with legacy completed snapshots. Matching completed replays return without
+  persisting the transient payload again. Pending jobs retain full recovery
+  evidence. Added receipt/replay tests. No existing production rows were
+  rewritten; bounded historical compaction remains to be designed/verified.
+- Generated titles now participate in both list and realtime-summary search.
+  Added coverage for searching generated titles after credential retirement.
+- Credential-scoped session merges now move response-summary ownership and
+  preserve a ready title while invalidating stale title leases; merged source
+  title rows are removed in the same transaction. Tenant deletion dependency
+  checks now protect retained prefix/history and reading records.
+- CI `39186625086`: browser contracts and full Cucumber suite passed. Rust:
+  1,997 library tests passed, four historical migration-fixture tests failed
+  due to missing 131/132 rollback handling and a second version-list assertion.
+  These fixture omissions are corrected locally for the next CI run.

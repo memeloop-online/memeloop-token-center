@@ -90,6 +90,8 @@ pub use routing::egress;
 mod rows;
 mod session_analytics;
 mod session_reading;
+mod session_reading_lifecycle;
+pub(crate) use session_reading_lifecycle::merge_session_reading_in_transaction;
 mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;

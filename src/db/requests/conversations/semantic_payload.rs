@@ -1,5 +1,31 @@
 use super::*;
 
+/// Completed work needs an idempotency receipt, not another 1,024-hash copy
+/// of the already materialized prefix. Pending snapshots remain unchanged.
+pub(super) fn completed_receipt(snapshot: &str) -> String {
+    serde_json::json!({
+        "completed_snapshot_digest_v1": blake3::hash(snapshot.as_bytes()).to_hex().to_string()
+    })
+    .to_string()
+}
+
+pub(super) fn snapshot_matches(
+    existing: Option<&str>,
+    expected: Option<&str>,
+    completed: bool,
+) -> bool {
+    if existing == expected {
+        return true;
+    }
+    if !completed {
+        return false;
+    }
+    match (existing, expected) {
+        (Some(existing), Some(expected)) => existing == completed_receipt(expected),
+        _ => false,
+    }
+}
+
 const MAX_SEMANTIC_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 fn digest(
@@ -153,4 +179,82 @@ pub(super) async fn verify_in_transaction(
         expected,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipts_are_small_and_accept_only_matching_completed_snapshots() {
+        let snapshot =
+            serde_json::json!({"leaf":"node","atom_hashes":vec!["a".repeat(64);1024]}).to_string();
+        let receipt = completed_receipt(&snapshot);
+        assert!(receipt.len() < 128);
+        assert!(snapshot_matches(Some(&receipt), Some(&snapshot), true));
+        assert!(!snapshot_matches(Some(&receipt), Some(&snapshot), false));
+        assert!(!snapshot_matches(Some(&receipt), Some("changed"), true));
+        assert!(
+            snapshot_matches(Some(&snapshot), Some(&snapshot), true),
+            "legacy completed rows remain replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_enqueue_replay_never_recreates_consumed_payload() {
+        use super::super::prefix_storage::tests::key;
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("receipt.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let key = key(&db, "receipt").await;
+        let request = Uuid::now_v7();
+        let body = serde_json::json!({"input":[{"role":"user","content":"retained question"}]});
+        let hints = ConversationHints::default();
+        let enqueue = |request_json| ConversationProjectionEnqueueInput {
+            request_id: request,
+            key: &key,
+            request_json,
+            hints: &hints,
+            client_name: Some("Codex"),
+            upstream_response_id: None,
+            observed_at: 1,
+            content_materialized: false,
+        };
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let snapshot: String = sqlx::query_scalar("SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request.to_string()).fetch_one(&db.pool).await.unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 2, semantic_payload_snapshot_json = $1 WHERE request_id = $2")
+            .bind(completed_receipt(&snapshot)).bind(request.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
+            .bind(request.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let changed = serde_json::json!({"input":"different evidence"});
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        assert!(
+            enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&changed))
+                .await
+                .is_err()
+        );
+    }
 }
