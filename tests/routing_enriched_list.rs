@@ -256,3 +256,140 @@ async fn model_route_list_batches_enrichment_and_keeps_tenants_isolated() {
     assert!(listed.get("credential_group_ids").is_none());
     assert!(!listed.to_string().contains(&account_b.id.to_string()));
 }
+
+#[tokio::test]
+async fn filter_model_names_are_distinct_bounded_literal_and_tenant_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("filter-names.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let mut accounts = Vec::new();
+    for (tenant, name) in [
+        ("names-a", "first"),
+        ("names-a", "second"),
+        ("names-b", "foreign"),
+    ] {
+        accounts.push(state.db.create_upstream_account(CreateUpstreamAccountInput {
+            tenant_external_id: tenant.into(), name: name.into(), driver: "http-json".into(),
+            config: json!({"base_url":"http://127.0.0.1:18101", "network_scope":"private"}),
+            credential: UpstreamCredential::None, oauth_session_id: None,
+            oauth_driver: None, oauth_refresh_url: None,
+        }, pepper).await.unwrap());
+    }
+    for (account, name) in [
+        (&accounts[0], "gpt-6-astra"),
+        (&accounts[1], "gpt-6-astra"),
+        (&accounts[0], "gpt-6-astra_100%"),
+        (&accounts[0], "gpt-6-astraX100Z"),
+        (&accounts[2], "foreign-only"),
+    ] {
+        state
+            .db
+            .create_model_route(memeloop_token_center::db::CreateModelRouteInput {
+                tenant_external_id: if account.id == accounts[2].id {
+                    "names-b"
+                } else {
+                    "names-a"
+                }
+                .into(),
+                public_model: name.into(),
+                upstream_account_id: account.id,
+                upstream_model: "native".into(),
+                protocol: "openai".into(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+    }
+    // Suggestions remain usable when accounts/routes cannot serve new traffic.
+    let inspection = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "UPDATE model_routes SET enabled = 0, archived_at = 1 WHERE public_model = 'gpt-6-astra'",
+    )
+    .execute(&inspection)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE upstream_accounts SET status = 'disabled'")
+        .execute(&inspection)
+        .await
+        .unwrap();
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "names-reader".into(),
+                scopes: vec!["routes:read".into()],
+                tenant_external_id: Some("names-a".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let (status, names) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names?search=ASTRA&limit=100",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{names}");
+    assert_eq!(
+        names,
+        json!(["gpt-6-astra", "gpt-6-astraX100Z", "gpt-6-astra_100%"])
+    );
+    let (status, names) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names?search=_100%25",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{names}");
+    assert_eq!(names, json!(["gpt-6-astra_100%"]));
+    let (_, names) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names?limit=1",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(names.as_array().unwrap().len(), 1);
+    let (status, _) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names?tenant_external_id=names-b",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names?search=%0A",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let path = format!("/internal/v1/filter-model-names?search={}", "a".repeat(201));
+    let (status, _) = request_json(&state, "GET", &path, &service.token, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/filter-model-names",
+        "invalid-token",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

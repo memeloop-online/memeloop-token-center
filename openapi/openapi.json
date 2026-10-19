@@ -2334,6 +2334,15 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "502": {
+            "description": "Release download dependency failure. Fixed error codes: plugin_release_dns_failed, plugin_release_connection_failed, plugin_release_request_failed, plugin_release_body_failed, plugin_release_http_failed, plugin_release_client_failed. URLs, credentials and remote bodies are never returned."
+          },
+          "503": {
+            "description": "Release download capacity is exhausted (service_overloaded)."
+          },
+          "504": {
+            "description": "Release download deadline exceeded (plugin_release_timeout)."
           }
         },
         "requestBody": {
@@ -7827,6 +7836,72 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/internal/v1/filter-model-names": {
+      "get": {
+        "tags": [
+          "Routes and pricing"
+        ],
+        "operationId": "listFilterModelNames",
+        "summary": "Suggest distinct public model names across accounts and channels",
+        "description": "Name-only historical filter suggestions, including disabled and archived routes. Literal case-insensitive substring search over route configuration; no account availability checks or request-history scan. Response is bounded; narrow the search for more names. Model filter equality remains exact and independent of route and account identity.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "routes:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "default": ""
+            },
+            "description": "Literal substring, not a SQL wildcard. At most 200 UTF-8 bytes and no control characters."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Clamped to 1–100."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Distinct model names ordered by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }

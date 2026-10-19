@@ -229,10 +229,10 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await applyUsageTypedFilter(page, 'model', async (row) => {
-    const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+    const modelNamesResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/filter-model-names'
       && response.request().method() === 'GET');
     const catalog = await openCatalogModelPicker(row);
-    assert.equal((await routeCatalogResponse).status(), 200);
+    assert.equal((await modelNamesResponse).status(), 200);
     await catalogModelSearch(catalog).fill(model);
     await catalog.getByRole('option').filter({ hasText: model }).first().click();
   }, 'model', model);
