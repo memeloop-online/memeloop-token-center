@@ -13874,6 +13874,15 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "502": {
+            "description": "Release download dependency failure. Fixed error codes: plugin_release_dns_failed, plugin_release_connection_failed, plugin_release_request_failed, plugin_release_body_failed, plugin_release_http_failed, plugin_release_client_failed. URLs, credentials and remote bodies are never returned."
+          },
+          "503": {
+            "description": "Release download capacity is exhausted (service_overloaded)."
+          },
+          "504": {
+            "description": "Release download deadline exceeded (plugin_release_timeout)."
           }
         },
         "requestBody": {

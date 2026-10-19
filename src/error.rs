@@ -77,6 +77,8 @@ pub enum AppError {
     CompactionProducerUnavailable,
     #[error("secret schema analysis exceeds the supported complexity limit")]
     SchemaSecretAnalysisTooComplex,
+    #[error("{0}")]
+    PluginReleaseDownload(PluginReleaseDownloadFailure),
     #[error("configured upstream is unavailable: {0}")]
     Upstream(String),
     #[error(
@@ -117,6 +119,7 @@ impl AppError {
             Self::BadRequest(_) => "invalid_request",
             Self::CompactionProducerUnavailable => "compaction_producer_unavailable",
             Self::SchemaSecretAnalysisTooComplex => "schema_secret_analysis_too_complex",
+            Self::PluginReleaseDownload(failure) => failure.code(),
             Self::Upstream(_) => "upstream",
             Self::OAuthRefresh(_) => "oauth_refresh",
             Self::Overloaded => "overloaded",
@@ -173,6 +176,15 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_REQUEST,
                 "schema_secret_analysis_too_complex",
                 self.to_string(),
+            ),
+            Self::PluginReleaseDownload(failure) => (
+                if *failure == PluginReleaseDownloadFailure::Timeout {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                failure.code(),
+                failure.to_string(),
             ),
             Self::Upstream(_) => (
                 StatusCode::BAD_GATEWAY,
@@ -555,6 +567,39 @@ mod database_failure_tests {
                     .unwrap()
                     .contains("credentials do not need")
             );
+        }
+    }
+}
+
+/// Fixed release-fetch stages; never retain transport errors, URLs or credentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PluginReleaseDownloadFailure {
+    #[error("GitHub plugin release DNS resolution failed")]
+    Dns,
+    #[error("GitHub plugin release connection failed")]
+    Connection,
+    #[error("GitHub plugin release request failed")]
+    Request,
+    #[error("GitHub plugin release response body transfer failed")]
+    Body,
+    #[error("GitHub plugin release download timed out")]
+    Timeout,
+    #[error("GitHub plugin release server returned an unsuccessful HTTP status")]
+    RemoteHttp,
+    #[error("GitHub plugin release HTTP client setup failed")]
+    Client,
+}
+
+impl PluginReleaseDownloadFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Dns => "plugin_release_dns_failed",
+            Self::Connection => "plugin_release_connection_failed",
+            Self::Request => "plugin_release_request_failed",
+            Self::Body => "plugin_release_body_failed",
+            Self::Timeout => "plugin_release_timeout",
+            Self::RemoteHttp => "plugin_release_http_failed",
+            Self::Client => "plugin_release_client_failed",
         }
     }
 }
