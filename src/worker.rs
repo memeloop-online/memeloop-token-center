@@ -24,6 +24,39 @@ const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const CODEX_MODEL_CATALOG_RETRY_MILLIS: i64 = 60 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
+async fn compact_conversation_receipts(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = None;
+    let mut next_pass = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            _ = ticker.tick() => {
+                if *shutdown.borrow() { break; }
+                if tokio::time::Instant::now() < next_pass { continue; }
+                match state.db.compact_completed_conversation_receipts(cursor.as_deref()).await {
+                    Ok((next, compacted)) => {
+                        cursor = next;
+                        if compacted > 0 {
+                            tracing::info!(compacted, "worker compacted completed conversation receipts");
+                        }
+                        if cursor.is_none() {
+                            next_pass = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "worker failed to compact completed conversation receipts");
+                        next_pass = tokio::time::Instant::now() + Duration::from_secs(60);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn refresh_expiring_oauth(
     state: &AppState,
     account_id: Uuid,
@@ -163,6 +196,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
     roles.spawn(async move {
         crate::response_archive_spool::run(spool_state, spool_shutdown).await;
         "response_spool"
+    });
+    let receipt_state = state.clone();
+    let receipt_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        compact_conversation_receipts(receipt_state, receipt_shutdown).await;
+        "conversation_receipts"
     });
 
     // No spawn-per-tick: generation remains single-flight and OAuth remains serial.

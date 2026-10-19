@@ -278,3 +278,32 @@ PR or partial green checks establish completion of the reading requirements.
   generation, configured route and separate billing credential, bounded
   Unicode first/latest excerpts, persisted title and exactly one model call.
   This test is pending GitHub Actions validation.
+
+## Bounded historical receipt compaction
+
+- Added a serial background sweep using primary-key keyset pagination over
+  32 outbox rows per five-second tick, with a 128 KiB per-snapshot return cap.
+  Completed rows are compacted only if their exact tenant/key/request and leaf
+  match a retained observation. Compare-and-swap prevents stale or concurrent
+  sweeps from replacing changed evidence. Pending, malformed, oversized and
+  missing/mismatched-history records remain untouched.
+- Successfully compacted rows also discard any consumed transient payload
+  recreated by an older completed-replay implementation. Small snapshots are
+  retained when a digest receipt would be larger. This does not delete prefix
+  nodes, semantic atoms, observations or original request/response archives.
+- Sweeps restart daily to revisit jobs that were pending behind the cursor;
+  failures retain the cursor and back off for one minute. SQLite and isolated
+  PostgreSQL contract tests cover the batch boundary, retained evidence,
+  pending payload preservation, missing/mismatched paths and idempotent repeats.
+  Automated execution is pending the next GitHub Actions revision.
+- Production read-only EXPLAIN of the candidate query: primary-key Index Scan,
+  32 rows, 264.682 ms execution, 0.779 ms planning. No production compaction has
+  run. Allocated PostgreSQL file sizes need not shrink when rows are updated;
+  reclaimable space is normally reused after vacuum.
+- Receipt format compatibility requires the new enqueue implementation for
+  replaying compacted completed jobs. Rollout must upgrade gateway/control
+  writers before starting the new worker, and rollback must retain receipt
+  support. Existing full snapshots remain accepted by the new implementation.
+- CI `39292284611` for `e3e85b0e` remains live; API, migration smoke, packaging,
+  security and release-input assembly passed. Rust and web were still running
+  at the latest check. Keep this run for evidence before pushing the sweep.
