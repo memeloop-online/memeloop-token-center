@@ -67,11 +67,13 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
   const [approvals, setApprovals] = useState<Record<string, boolean>>({});
   const [reviews, setReviews] = useState<Record<string, Installation>>({});
   const generation = useRef(0);
+  const activeLoads = useRef(0);
   const alive = useRef(true);
   const keys = useRef(new Map<string, string>());
 
   useEffect(() => { alive.current = true; return () => { alive.current = false; generation.current++; }; }, []);
   const load = useCallback(async () => {
+    activeLoads.current++;
     const request = ++generation.current;
     setStatusError(''); setHistoryError('');
     const current = () => alive.current && request === generation.current;
@@ -91,13 +93,16 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
       if (current()) setHistoryError(reason instanceof Error ? reason.message : 'Request failed');
     });
     await Promise.allSettled([statusRead, historyRead]);
+    activeLoads.current--;
     return current() && statusLoaded && historyLoaded;
   }, [token]);
   useEffect(() => { void load(); }, [load]);
   const installing = history?.installations.some((job) => job.status === 'installing') ?? false;
   useEffect(() => {
     if (!installing) return;
-    const timer = window.setInterval(() => { void load(); }, 3000);
+    // Background ticks must not supersede a slow read or a manual refresh.
+    // Explicit refreshes still advance generation to reject older results.
+    const timer = window.setInterval(() => { if (activeLoads.current === 0) void load(); }, 3000);
     return () => window.clearInterval(timer);
   }, [installing, load]);
 
