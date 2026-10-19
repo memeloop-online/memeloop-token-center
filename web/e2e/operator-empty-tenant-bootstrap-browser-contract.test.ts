@@ -24,7 +24,7 @@ test('confirmed empty tenant scope allows global plugin management and first ten
       localStorage.setItem('mtc.operator.service-credential.v1', 'bootstrap-test');
     });
     const calls: string[] = [];
-    const tenants: { external_id: string }[] = [];
+    const tenants: { external_id: string; status: string }[] = [];
     await page.route('**/internal/v1/**', async (route) => {
       const url = new URL(route.request().url());
       const method = route.request().method();
@@ -32,7 +32,7 @@ test('confirmed empty tenant scope allows global plugin management and first ten
       if (url.pathname === '/internal/v1/tenants') return route.fulfill({ json: tenants });
       if (url.pathname === '/internal/v1/tenant-management') {
         if (method === 'POST') {
-          const tenant = { external_id: route.request().postDataJSON().external_id };
+          const tenant = { external_id: route.request().postDataJSON().external_id, status: 'active' };
           tenants.push(tenant);
           return route.fulfill({ json: tenant });
         }
@@ -98,16 +98,21 @@ for (const view of ['plugins', 'tenants', 'providers', 'service-credentials', 's
         localStorage.setItem('mtc.operator.service-credential.v1', 'bootstrap-test');
       });
       const calls: string[] = [];
+      let unavailable = true;
       await page.route('**/internal/v1/**', async route => {
         const path = new URL(route.request().url()).pathname;
         calls.push(path);
         if (path === '/internal/v1/tenants') {
           await gate;
-          return route.fulfill({ status: 503, json: { error: 'Discovery unavailable' } });
+          return unavailable
+            ? route.fulfill({ status: 503, json: { error: 'Discovery unavailable' } })
+            : route.fulfill({ json: [] });
         }
         return route.fulfill({ json: [] });
       });
+      const discoveryStarted = page.waitForRequest(request => new URL(request.url()).pathname === '/internal/v1/tenants');
       await page.goto(`http://127.0.0.1:${address.port}/operator?view=${view}`);
+      await discoveryStarted;
       await page.locator('[id^="operator-panel-"]').waitFor();
       assert.deepEqual(calls, ['/internal/v1/tenants']);
       assert.equal(await page.getByText('No tenants are available to this credential.', { exact: true }).count(), 0, 'loading is not an empty scope');
@@ -115,6 +120,13 @@ for (const view of ['plugins', 'tenants', 'providers', 'service-credentials', 's
       await page.getByRole('alert').filter({ hasText: 'temporarily unavailable' }).waitFor();
       assert.deepEqual(calls, ['/internal/v1/tenants']);
       assert.equal(await page.getByText('No tenants are available to this credential.', { exact: true }).count(), 0, 'failed discovery is not an empty scope');
+      unavailable = false;
+      await page.getByRole('alert').getByRole('button', { name: 'Retry', exact: true }).click();
+      await page.locator('.console-context').getByText('No tenants are available to this credential.', { exact: true }).waitFor();
+      if (view === 'tenants') await page.getByLabel('Tenant ID', { exact: true }).waitFor();
+      if (view === 'plugins') await page.getByText('Create a tenant to configure plugins.', { exact: true }).waitFor();
+      const allowed = new Set(['/internal/v1/tenants', '/internal/v1/plugins', ...(view === 'tenants' ? ['/internal/v1/tenant-management'] : view === 'plugins' ? ['/internal/v1/plugins/runtime-access'] : [])]);
+      assert.deepEqual(calls.filter(path => !allowed.has(path)), [], 'confirmed empty discovery must not enable tenant-scoped resources');
     } finally {
       release();
       await browser.close();
