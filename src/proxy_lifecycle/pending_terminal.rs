@@ -1025,35 +1025,35 @@ impl Journal {
                                         && ack.fence == claim.fence
                                         && !ack.receipt_digest.is_empty()
                                     {
-                                        Ok(FinishProxyRequestResult::Finished {
+                                        Ok(Some(FinishProxyRequestResult::Finished {
                                             cost_micros: ack.cost_micros,
                                             usage_invalid: false,
-                                        })
+                                        }))
                                     } else {
                                         Err(crate::error::AppError::Internal)
                                     }
                                 })
                         } else {
-                            match database.mark_pending_proxy_settlement_unknown(claim).await {
-                                Ok(()) => {
-                                    reconcile = true;
-                                    tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement");
-                                    Err(crate::error::AppError::Conflict(
-                                        "authoritative terminal evidence unavailable".into(),
-                                    ))
-                                }
-                                Err(error) => Err(error),
-                            }
+                            database
+                                .mark_pending_proxy_settlement_unknown(claim)
+                                .await
+                                .map(|()| None)
                         }
                     } else {
-                        finish_proxy_request_with_retry(&database, input, None, attribution).await
+                        finish_proxy_request_with_retry(&database, input, None, attribution)
+                            .await
+                            .map(Some)
                     }
                 }
                 Err(error) => Err(error),
             };
             match result {
-                Ok(FinishProxyRequestResult::Finished { .. }) => applied = true,
-                Ok(FinishProxyRequestResult::AlreadyFinished { .. }) => {
+                Ok(Some(FinishProxyRequestResult::Finished { .. })) => applied = true,
+                Ok(None) => {
+                    reconcile = true;
+                    tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement");
+                }
+                Ok(Some(FinishProxyRequestResult::AlreadyFinished { .. })) => {
                     reconcile = true;
                     tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "terminal already finished without receipt acknowledgement; durable evidence retained for arbitration");
                 }
