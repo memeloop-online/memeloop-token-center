@@ -222,11 +222,15 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     onClear={scope.clearCredential}
   />;
 
+  const emptyTenantScope = Boolean(scope.activeCredential && scope.validated
+    && scope.status.kind === 'ready' && !scope.tenant && scope.tenants.length === 0);
+  const globalBootstrapPage = activeRoute === 'plugins' || activeRoute === 'tenants';
   let page: ReactNode = null;
   // Pages mount only after authentication and tenant discovery have produced
-  // an exact scope. This prevents a transient empty tenant from turning a
+  // an exact scope. Only global bootstrap pages accept a confirmed empty list.
+  // This prevents a transient empty tenant from turning a
   // tenant-scoped resource request into an accidental all-tenant read.
-  if (scope.activeCredential && scope.validated && scope.tenant) {
+  if (scope.activeCredential && scope.validated && (scope.tenant || (emptyTenantScope && globalBootstrapPage))) {
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
@@ -250,7 +254,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
         case 'system-settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
       const extensions = pluginRegistry.pageExtensions.get(activeRoute);
-      if (page && extensions) {
+      if (page && extensions && scope.tenant) {
         page = <>
           <PluginPageExtensions extensions={extensions.before} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
           {page}
@@ -269,7 +273,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   } else if (!scope.authenticating || activeRoute === 'system-settings') page = accessSettings;
 
   const content = <>
-    {scope.activeCredential && scope.tenants.length === 0 && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div></div>}
+    {emptyTenantScope && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div>{activeRoute !== 'tenants' && <Button appearance="secondary" onClick={() => void navigate('tenants')}>{t('tenants.create')}</Button>}</div>}
     {scope.activeCredential && (scope.tenants.length > 1 || activeRoute === 'credentials') && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => {
       const tenant = event.target.value;
       void guardedNavigation(() => { setProxyContext({}); scope.setTenant(tenant); });

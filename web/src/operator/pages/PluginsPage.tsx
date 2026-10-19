@@ -37,7 +37,9 @@ export function PluginsPage({ token, tenant, writeTenant, catalog, reloadCatalog
       ? <LoadingState label={t('common.loading')} level="page" />
       : catalog.kind === 'failed'
         ? <div className="notice error" role="alert">{catalog.message}<button type="button" onClick={() => void reloadCatalog()}>{t('common.retry')}</button></div>
-        : <Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} />;
+        : !tenant
+          ? <p className="notice">{t('operator.noTenants')}</p>
+          : <Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} onRefresh={reloadCatalog} refreshError={catalog.refreshError} />;
   const refreshing = catalog.scopeKey === token && catalog.kind === 'ready' && catalog.refreshing === true;
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0plugins`} label={t('common.loading')} busy={refreshing}><div className="plugin-management-flow" aria-busy={refreshing}>{manager}{content}</div></PageLoadingRegion>;
 }
