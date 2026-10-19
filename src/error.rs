@@ -50,6 +50,8 @@ pub enum AppError {
     Unauthorized,
     #[error("permission denied")]
     Forbidden,
+    #[error("request exceeds traffic plugin input limit")]
+    PluginInputTooLarge,
     #[error("model has no price in the key currency")]
     UnpricedModel,
     #[error("available balance or configured budget is insufficient")]
@@ -104,6 +106,7 @@ impl AppError {
         match self {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
+            Self::PluginInputTooLarge => "plugin_input_too_large",
             Self::UnpricedModel => "unpriced_model",
             Self::QuotaExceeded => "quota_exceeded",
             Self::RateLimited => "rate_limited",
@@ -130,6 +133,11 @@ impl IntoResponse for AppError {
         let (status, code, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", self.to_string()),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden", self.to_string()),
+            Self::PluginInputTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "plugin_input_too_large",
+                self.to_string(),
+            ),
             Self::UnpricedModel => (
                 StatusCode::FAILED_DEPENDENCY,
                 "unpriced_model",

@@ -57,9 +57,10 @@ test('plugin catalog is usable without unrelated route code or unopened configur
       if (url.pathname === '/internal/v1/plugin-runtime') {
         return route.fulfill({ json: {
           current: { revision: 2, inventory_id: 'current-1', reason: 'publish', created_at: 1 },
-          candidates: [{ inventory_id: 'candidate-2', staged: true, plugins: { first: ['1.0.0'] } }],
+          candidates: [{ inventory_id: 'current-1', staged: true, plugins: { first: ['1.0.0'] } }, { inventory_id: 'candidate-2', staged: true, plugins: { first: ['1.0.0'] } }],
         } });
       }
+      if (url.pathname === '/internal/v1/plugin-runtime/installer-network') return route.fulfill({ json: { mode: 'default' } });
       if (url.pathname === '/internal/v1/plugin-runtime/history') {
         return route.fulfill({ json: {
           runtime_enabled: true, installation_enabled: true, installations: [],
@@ -83,6 +84,9 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     await page.goto(`http://127.0.0.1:${address.port}/operator?view=plugins`);
     const plugin = page.locator('.account-list > .managed-resource').filter({ has: page.getByText('first', { exact: true }) });
     await plugin.waitFor();
+    await page.getByRole('region', { name: 'Active plugins', exact: true }).getByText('first', { exact: true }).waitFor();
+    assert.equal(await page.getByText('candidate-2', { exact: true }).isHidden(), true, 'inactive plugin sets are initially collapsed');
+    await page.getByRole('button', { name: 'Plugin sets', exact: true }).press('Enter');
     await page.getByText('candidate-2', { exact: true }).waitFor();
     assert.deepEqual(unrelatedRequests, [], 'the selected plugin route must not wait for unrelated management page modules');
     assert.equal(catalogReads, 1, 'shell registration and plugin management share one catalog read');
@@ -100,10 +104,12 @@ test('plugin catalog is usable without unrelated route code or unopened configur
     assert.ok(headingTypography.every(({ family, baseFamily, weight }) => family === baseFamily && weight >= 600),
       'plugin management headings use the same base sans typography as other Operator management workspaces');
 
-    const activation = page.getByRole('checkbox', { name: 'Confirm global activation' });
+    const activation = page.getByRole('button', { name: 'Activate plugin set', exact: true }).last();
     await activation.focus();
-    await page.keyboard.press('Space');
-    assert.equal(await activation.isChecked(), true, 'the labelled activation control remains keyboard operable');
+    await page.keyboard.press('Enter');
+    await page.getByRole('dialog').getByText('Activate plugin set candidate-2 for all tenants? It will replace the active set.', { exact: true }).waitFor();
+    await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).press('Enter');
+    assert.equal(await page.getByRole('dialog').count(), 0, 'keyboard cancellation leaves the plugin set unchanged');
     const compactRecords = page.getByRole('button', { name: 'Tasks and version records' });
     await compactRecords.focus();
     await page.keyboard.press('Enter');

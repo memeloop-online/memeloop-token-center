@@ -30,6 +30,7 @@ pub mod plugin_distribution;
     feature = "plugin-distribution"
 ))]
 mod plugin_publication;
+pub mod plugin_release;
 #[cfg(any(
     feature = "experimental-plugin-revisions",
     feature = "plugin-distribution"
@@ -225,7 +226,8 @@ impl AppState {
                             .as_deref()
                             .map(std::path::PathBuf::from),
                     )
-                    .map_err(|_| InitializationError::Plugin)?,
+                    .map_err(|_| InitializationError::Plugin)?
+                    .with_installer_network_key(config.key_pepper.as_bytes()),
                 ))
             }
             None => None,

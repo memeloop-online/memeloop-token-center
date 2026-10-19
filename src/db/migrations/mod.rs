@@ -675,8 +675,18 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
         name: "proxy operational completion independent of financial settlement",
-        sql: include_str!("../../../migrations/common/0129_proxy_operational_terminals.sql"),
+        sql: include_str!("../../../migrations/common/0131_proxy_operational_terminals.sql"),
     },
 ];
 
@@ -1336,8 +1346,18 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
         name: "proxy operational completion independent of financial settlement",
-        sql: include_str!("../../../migrations/common/0129_proxy_operational_terminals.sql"),
+        sql: include_str!("../../../migrations/common/0131_proxy_operational_terminals.sql"),
     },
 ];
 

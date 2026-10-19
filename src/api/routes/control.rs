@@ -335,6 +335,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(disconnect_upstream_oauth),
         )
         .route(
+            "/internal/v1/filter-model-names",
+            get(list_filter_model_names),
+        )
+        .route(
             "/internal/v1/model-routes",
             get(list_model_routes).post(create_model_route),
         )
@@ -475,8 +479,36 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(super::super::plugins::export_application_plugin_descriptor),
         )
         .route(
+            "/internal/v1/plugin-runtime/release-resolutions",
+            post(super::super::plugins::resolve_application_plugin_release).layer(
+                middleware::map_response(
+                    super::super::plugin_installer_network::installer_network_response,
+                ),
+            ),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installer-network",
+            get(super::super::plugin_installer_network::get_installer_network)
+                .put(super::super::plugin_installer_network::put_installer_network)
+                .layer(middleware::map_response(
+                    super::super::plugin_installer_network::installer_network_response,
+                )),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/installer-network/groups",
+            get(super::super::plugin_installer_network::installer_network_groups).layer(
+                middleware::map_response(
+                    super::super::plugin_installer_network::installer_network_response,
+                ),
+            ),
+        )
+        .route(
             "/internal/v1/plugin-runtime/installations",
-            post(super::super::plugins::install_application_plugin),
+            post(super::super::plugins::install_application_plugin).layer(
+                middleware::map_response(
+                    super::super::plugin_installer_network::installer_network_response,
+                ),
+            ),
         )
         .route(
             "/internal/v1/plugin-runtime/installations/{id}",
@@ -502,6 +534,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/plugin-runtime/publish",
             post(super::super::plugins::publish_application_plugin),
+        )
+        .route(
+            "/internal/v1/plugin-runtime/uninstall",
+            post(super::super::plugins::uninstall_application_plugin),
         )
         .route(
             "/internal/v1/plugin-runtime/rollback",

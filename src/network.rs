@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -665,6 +664,80 @@ pub(crate) fn validate_install_egress_proxy(value: &str) -> Result<(), AppError>
     Ok(())
 }
 
+/// Explicit global-operator installer proxies may be public or private. Resolve
+/// once and persist the addresses with the operation; consumers must pin these
+/// addresses, including on retry. Proxy failure must never cause direct retry.
+pub(crate) async fn validate_installer_proxy_endpoint(
+    value: &str,
+    approved_group: bool,
+) -> Result<(Option<String>, Vec<SocketAddr>), AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    let url = checked_installer_proxy_url(value)?;
+    if approved_group {
+        crate::provider::validate_codex_proxy_url(value).map_err(|_| invalid())?;
+    }
+    let (host, addresses, _) = validated_endpoint(&url, OutboundScope::Private, false).await?;
+    if approved_group
+        && addresses
+            .iter()
+            .any(|address| !is_safe_private_upstream_ip(address.ip()))
+    {
+        return Err(invalid());
+    }
+    Ok((host, addresses))
+}
+
+pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    if value.len() > 2048
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || (url.scheme() == "https" && matches!(url.host(), Some(Host::Domain(_))))
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_some_and(is_loopback_name)
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+/// An already-resolved installer proxy passed to OCI/cosign transports must
+/// use the frozen IP directly, so those transports cannot resolve it again.
+pub(crate) fn validate_frozen_installer_proxy(value: &str) -> Result<(), AppError> {
+    let url = checked_installer_proxy_url(value)?;
+    // url treats SOCKS as a non-special scheme, whose literal IPv4 host can
+    // be represented as Host::Domain. Parse the spelling as an IP explicitly.
+    let address: IpAddr = url
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| {
+            AppError::BadRequest("installation proxy must use its frozen IP address".into())
+        })?;
+    validate_addresses(
+        &[SocketAddr::new(
+            address,
+            url.port_or_known_default().unwrap_or(1080),
+        )],
+        OutboundScope::Private,
+        false,
+    )
+}
+
 fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
@@ -723,7 +796,6 @@ pub(crate) fn upstream_api_url(base_url: &str, api_path: &str) -> String {
 const DNS_TIMEOUT_MESSAGE: &str = "outbound DNS lookup timed out";
 const DNS_RESOLUTION_MESSAGE: &str = "outbound host could not be resolved";
 const DNS_EMPTY_MESSAGE: &str = "outbound host returned no addresses";
-const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Only fixed labels may cross the outbound-preparation log boundary. In
 /// particular, never forward AppError's free-text payload or Display output:
@@ -743,17 +815,16 @@ pub(crate) fn preparation_failure_category(error: &AppError) -> &'static str {
 }
 
 async fn resolve_once(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
-    resolve_with_timeout(tokio::net::lookup_host((host, port))).await
+    resolve_lookup(tokio::net::lookup_host((host, port))).await
 }
 
-async fn resolve_with_timeout<F, I>(lookup: F) -> Result<Vec<SocketAddr>, AppError>
+async fn resolve_lookup<F, I>(lookup: F) -> Result<Vec<SocketAddr>, AppError>
 where
     F: std::future::Future<Output = std::io::Result<I>>,
     I: Iterator<Item = SocketAddr>,
 {
-    let resolved = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup)
+    let resolved = lookup
         .await
-        .map_err(|_| AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()))?
         .map_err(|_| AppError::BadRequest(DNS_RESOLUTION_MESSAGE.into()))?;
     let addresses = resolved
         .collect::<BTreeSet<_>>()
@@ -895,31 +966,57 @@ mod tests {
     }
 
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
     use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
 
     #[tokio::test(start_paused = true)]
-    async fn pending_dns_lookup_expires_at_existing_three_second_budget() {
+    async fn dns_lookup_can_complete_after_three_seconds() {
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let started = tokio::time::Instant::now();
-        let error = resolve_with_timeout(std::future::pending::<
-            std::io::Result<std::vec::IntoIter<SocketAddr>>,
-        >())
+        let addresses = resolve_lookup(async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(vec![public].into_iter())
+        })
         .await
-        .unwrap_err();
-        assert_eq!(started.elapsed(), Duration::from_secs(3));
-        assert_eq!(preparation_failure_category(&error), "dns_timeout");
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+        assert_eq!(addresses, vec![public]);
+        assert!(validate_addresses(&addresses, OutboundScope::Public, false).is_ok());
+        assert!(
+            validate_transport_security("https", &addresses, OutboundScope::Public, false).is_ok()
+        );
+        assert!(
+            validate_transport_security("http", &addresses, OutboundScope::Public, false).is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_dns_resolution_drops_the_owned_lookup_future() {
+        let (answers, lookup) =
+            oneshot::channel::<std::io::Result<std::vec::IntoIter<SocketAddr>>>();
+        let mut resolution = Box::pin(resolve_lookup(async move { lookup.await.unwrap() }));
+        assert!(futures_util::poll!(resolution.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(futures_util::poll!(resolution.as_mut()).is_pending());
+        assert!(!answers.is_closed());
+        drop(resolution);
+        assert!(answers.is_closed());
     }
 
     #[tokio::test(start_paused = true)]
     async fn dns_success_deduplicates_answers_without_weakening_validation() {
         let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let private: SocketAddr = "10.0.0.1:443".parse().unwrap();
-        let addresses = resolve_with_timeout(std::future::ready(Ok(
-            vec![public, private, public].into_iter()
-        )))
+        let addresses = resolve_lookup(async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(vec![public, private, public].into_iter())
+        })
         .await
         .unwrap();
         assert_eq!(addresses, vec![public, private]);
@@ -929,20 +1026,55 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dns_errors_and_empty_answers_are_safely_classified() {
-        let error = resolve_with_timeout(std::future::ready(Err::<
-            std::vec::IntoIter<SocketAddr>,
-            _,
-        >(std::io::Error::other(
-            "https://user:secret@example.test/?token=secret",
-        ))))
+        let error = resolve_lookup(std::future::ready(
+            Err::<std::vec::IntoIter<SocketAddr>, _>(std::io::Error::other(
+                "https://user:secret@example.test/?token=secret",
+            )),
+        ))
         .await
         .unwrap_err();
         assert_eq!(preparation_failure_category(&error), "dns_resolution");
         assert!(!error.to_string().contains("secret"));
-        let empty = resolve_with_timeout(std::future::ready(Ok(Vec::new().into_iter())))
+        let empty = resolve_lookup(std::future::ready(Ok(Vec::new().into_iter())))
             .await
             .unwrap_err();
         assert_eq!(preparation_failure_category(&empty), "dns_resolution");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolver_timeout_errors_do_not_expose_resolver_details() {
+        let error = resolve_lookup(std::future::ready(
+            Err::<std::vec::IntoIter<SocketAddr>, _>(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "https://user:secret@example.test/?token=secret",
+            )),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(preparation_failure_category(&error), "dns_resolution");
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_dns_answers_still_reject_forbidden_addresses() {
+        for forbidden in [
+            "127.0.0.1:443",
+            "169.254.169.254:443",
+            "100.100.100.200:443",
+            "[::ffff:169.254.169.254]:443",
+            "[64:ff9b::a9fe:a9fe]:443",
+        ] {
+            let address: SocketAddr = forbidden.parse().unwrap();
+            let addresses = resolve_lookup(async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Ok(vec![address].into_iter())
+            })
+            .await
+            .unwrap();
+            for scope in [OutboundScope::Public, OutboundScope::Private] {
+                assert!(validate_addresses(&addresses, scope, false).is_err());
+            }
+        }
     }
 
     #[test]
@@ -953,6 +1085,10 @@ mod tests {
             (AppError::Upstream(secret.into()), "preparation_failed"),
             (AppError::Storage(secret.into()), "preparation_failed"),
             (AppError::Internal, "client_build"),
+            (
+                AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()),
+                "dns_timeout",
+            ),
             (
                 AppError::BadRequest(format!("{DNS_TIMEOUT_MESSAGE}: {secret}")),
                 "destination_rejected",
@@ -1359,6 +1495,60 @@ mod tests {
         assert!(
             validate_transport_security("http", &private, OutboundScope::Private, false).is_ok(),
             "explicit private ComfyUI endpoints may use cleartext on the private network"
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_proxy_public_private_and_forbidden_endpoint_contract() {
+        for value in [
+            "http://8.8.8.8:3128",
+            "https://1.1.1.1:443",
+            "socks5://8.8.4.4:1080",
+            "socks5h://10.20.30.40:1080",
+        ] {
+            let (_, addresses) = validate_installer_proxy_endpoint(value, false)
+                .await
+                .unwrap();
+            assert_eq!(addresses.len(), 1);
+            validate_frozen_installer_proxy(value).unwrap();
+        }
+        for value in [
+            "http://127.0.0.1:3128",
+            "http://169.254.169.254:3128",
+            "http://100.100.100.200:3128",
+            "http://[::1]:3128",
+            "http://[fe80::1]:3128",
+            "http://user:secret@8.8.8.8:3128",
+            "http://8.8.8.8:3128/path",
+            "http://8.8.8.8:3128?x=y",
+            "http://8.8.8.8:3128#fragment",
+            "file:///tmp/proxy",
+            "http://localhost:3128",
+            "http://8.8.8.8:0",
+        ] {
+            assert!(
+                validate_installer_proxy_endpoint(value, false)
+                    .await
+                    .is_err(),
+                "accepted {value}"
+            );
+            assert!(validate_frozen_installer_proxy(value).is_err());
+        }
+        assert!(validate_frozen_installer_proxy("https://proxy.example.org:443").is_err());
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://8.8.8.8:1080", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("http://10.20.30.40:3128", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://10.20.30.40:1080", true)
+                .await
+                .is_ok()
         );
     }
 

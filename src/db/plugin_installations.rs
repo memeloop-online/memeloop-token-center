@@ -25,7 +25,10 @@ impl Database {
                 "installation idempotency key was used for another operation".into(),
             ));
         }
-        let record = installation_record(row)?;
+        let mut record = installation_record(row)?;
+        record.base_revision = self
+            .plugin_release_base_revision(&record.inventory_id)
+            .await?;
         if matches!(
             record.status.as_str(),
             "review" | "registered" | "installing"
@@ -44,12 +47,22 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::NotFound)?;
-        installation_record(row)
+        let mut record = installation_record(row)?;
+        record.base_revision = self
+            .plugin_release_base_revision(&record.inventory_id)
+            .await?;
+        Ok(record)
     }
 
     pub(crate) async fn plugin_installations(&self) -> Result<Vec<InstallationRecord>, AppError> {
-        sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,checkpoints_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
-            .fetch_all(&self.pool).await?.into_iter().map(installation_record).collect()
+        let mut records = sqlx::query("SELECT id,idempotency_hash,request_hash,inventory_id,packages_json,actor,attempt_id,status,review_digest,NULL AS review_json,checkpoints_json,failure_category,lease_until,created_at,updated_at FROM application_plugin_installations ORDER BY created_at DESC, id DESC LIMIT 100")
+            .fetch_all(&self.pool).await?.into_iter().map(installation_record).collect::<Result<Vec<_>,_>>()?;
+        for record in &mut records {
+            record.base_revision = self
+                .plugin_release_base_revision(&record.inventory_id)
+                .await?;
+        }
+        Ok(records)
     }
 
     pub(crate) async fn begin_plugin_installation(
@@ -222,7 +235,7 @@ impl Database {
         actor: &str,
     ) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered')")
+        let changed = sqlx::query("UPDATE application_plugin_installations SET status='registered', updated_at=$1 WHERE id=$2 AND review_digest=$3 AND status IN ('review','registered') AND NOT EXISTS (SELECT 1 FROM application_plugin_release_resolutions r WHERE r.install_key_hash=application_plugin_installations.idempotency_hash AND r.base_revision <> COALESCE((SELECT revision FROM application_plugin_head WHERE scope='global'),0))")
             .bind(unix_millis()).bind(id).bind(digest).execute(&mut *tx).await?.rows_affected();
         if changed != 1 {
             return Err(AppError::Conflict("installation review changed".into()));
@@ -313,6 +326,7 @@ fn installation_record(row: AnyRow) -> Result<InstallationRecord, AppError> {
         checkpoints,
         id: row.try_get("id")?,
         inventory_id: row.try_get("inventory_id")?,
+        base_revision: None,
         actor: row.try_get("actor")?,
         attempt_id: row.try_get("attempt_id")?,
         idempotency_hash: row.try_get("idempotency_hash")?,

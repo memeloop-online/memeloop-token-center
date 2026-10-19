@@ -884,10 +884,10 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const builder = requestPanel.locator('.typed-filter-builder');
   const dialog = await openTypedFilterDialog(builder);
   const modelCondition = await addTypedFilterCondition(dialog, 'model');
-  const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+  const modelNamesResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/filter-model-names'
     && response.request().method() === 'GET');
   const catalog = await openCatalogModelPicker(modelCondition);
-  assert.equal((await routeCatalogResponse).status(), 200);
+  assert.equal((await modelNamesResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).first().click();
   await completeOperatorRequestQuery(page, tenant, () => dialog.getByRole('button', { name: '应用筛选', exact: true }).click());

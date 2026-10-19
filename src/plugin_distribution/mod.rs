@@ -645,7 +645,7 @@ pub async fn install_plugin_oci(
     options: &InstallPluginOptions,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
     if let Some(proxy) = &options.egress_proxy {
-        crate::network::validate_install_egress_proxy(proxy)
+        crate::network::validate_frozen_installer_proxy(proxy)
             .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
     }
     let runner = SystemCosignRunner {
@@ -706,7 +706,7 @@ async fn install_plugin_oci_with_verifier(
 ) -> Result<InstalledPlugin, PluginDistributionError> {
     let client_config = registry_client_config(options, allow_plain_http)?;
     if let Some(proxy) = &options.egress_proxy {
-        crate::network::validate_install_egress_proxy(proxy)
+        crate::network::validate_frozen_installer_proxy(proxy)
             .map_err(|_| PluginDistributionError::InvalidEgressProxy)?;
     }
     let supplied_reference: Reference = options
