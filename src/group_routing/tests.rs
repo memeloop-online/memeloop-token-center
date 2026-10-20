@@ -1,4 +1,108 @@
 use super::*;
+use tracing::instrument::WithSubscriber;
+
+#[derive(Clone, Default)]
+struct SnapshotLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SnapshotLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SnapshotLogWriter {
+    fn events(&self) -> Vec<serde_json::Value> {
+        let bytes = self.0.lock().unwrap();
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn empty_and_oversized_snapshots_do_not_wait_for_database_preflight() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("group-input-bounds.db").display()
+    )))
+    .await
+    .unwrap();
+    let held = state.db.hold_group_snapshot_pool_for_tests().await;
+    tokio::time::pause();
+    for count in [0, 1025] {
+        let mut candidates = vec![
+            AuthorizedUpstreamCandidate {
+                route_id: Uuid::from_u128(1),
+                account_id: Uuid::from_u128(2),
+                driver: "http-json".into(),
+                transport_revision: 1,
+                credential_generation: 1,
+            };
+            count
+        ];
+        let before = candidates.clone();
+        let started = tokio::time::Instant::now();
+        prepare(
+            &mut state,
+            Uuid::now_v7(),
+            Uuid::nil(),
+            Uuid::now_v7(),
+            started + Duration::from_secs(1),
+            &mut candidates,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert_eq!(candidates, before);
+        assert!(state.group_routing.is_none());
+    }
+    drop(held);
+}
+
+#[test]
+fn snapshot_phases_correlate_duration_without_policy_or_error_data() {
+    let writer = SnapshotLogWriter::default();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(move || sink.clone())
+        .finish();
+    let request_id = Uuid::now_v7();
+    tracing::subscriber::with_default(subscriber, || {
+        let mut phase = SnapshotPhase::new(request_id, "group_routing_candidate_snapshot");
+        phase.started = std::time::Instant::now() - Duration::from_secs(2);
+        phase.finish("returned");
+        SnapshotPhase::new(request_id, "group_routing_transient_snapshot").finish("error");
+        drop(SnapshotPhase::new(
+            request_id,
+            "group_routing_quota_snapshot",
+        ));
+    });
+    let events = writer.events();
+    assert_eq!(events.len(), 6);
+    for event in &events {
+        let fields = event["fields"].as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields["request_id"], request_id.to_string());
+        assert!(fields["duration_ms"].is_u64());
+        for field in fields.keys() {
+            assert!(["request_id", "stage", "duration_ms", "outcome"].contains(&field.as_str()));
+        }
+    }
+    assert_eq!(events[0]["fields"]["outcome"], "started");
+    assert!(events[1]["fields"]["duration_ms"].as_u64().unwrap() >= 2000);
+    assert_eq!(events[1]["fields"]["outcome"], "returned");
+    assert_eq!(events[3]["fields"]["outcome"], "error");
+    assert_eq!(events[5]["fields"]["outcome"], "not_completed");
+}
 
 #[tokio::test]
 async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline() {
@@ -21,6 +125,14 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
         })
         .collect::<Vec<_>>();
     let before = candidates.clone();
+    let writer = SnapshotLogWriter::default();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(move || sink.clone())
+        .finish();
+    let request_id = Uuid::now_v7();
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(25);
@@ -32,10 +144,11 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
         &mut state,
         tenant,
         Uuid::nil(),
-        Uuid::now_v7(),
+        request_id,
         deadline,
         &mut candidates,
     )
+    .with_subscriber(subscriber)
     .await
     .unwrap();
     // Tokio's timer wheel rounds a deadline up to the next millisecond tick,
@@ -45,6 +158,15 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
     assert!(completed <= deadline + Duration::from_millis(1));
     assert_eq!(candidates, before);
     assert!(state.group_routing.is_none());
+    let events: Vec<_> = writer
+        .events()
+        .into_iter()
+        .filter(|event| event["fields"]["stage"] == "group_routing_candidate_snapshot")
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["fields"]["outcome"], "started");
+    assert_eq!(events[1]["fields"]["request_id"], request_id.to_string());
+    assert_eq!(events[1]["fields"]["outcome"], "not_completed");
     drop(held);
 }
 

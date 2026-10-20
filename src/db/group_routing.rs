@@ -32,15 +32,6 @@ impl Database {
         }
         held
     }
-    pub(crate) async fn has_group_routing_strategies(
-        &self,
-        tenant_id: Uuid,
-    ) -> Result<bool, AppError> {
-        let row = sqlx::query("SELECT id FROM provider_groups WHERE tenant_id = $1 AND routing_strategy IS NOT NULL UNION ALL SELECT id FROM route_groups WHERE tenant_id = $1 AND routing_strategy IS NOT NULL LIMIT 1")
-            .bind(tenant_id.to_string()).fetch_optional(&self.pool).await?;
-        Ok(row.is_some())
-    }
-
     #[cfg(test)]
     pub(crate) async fn candidate_group_strategy(
         &self,
