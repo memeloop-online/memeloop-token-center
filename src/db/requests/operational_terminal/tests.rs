@@ -661,6 +661,135 @@ async fn operational_statistics_contract(fixture: Fixture, status: i64) {
 }
 
 #[tokio::test]
+async fn sqlite_operational_cached_usage_is_unchanged_by_financial_fact_projection() {
+    for denominator in [Some(8), None] {
+        operational_cached_usage_projection_contract(Fixture::sqlite().await, denominator).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_operational_cached_usage_is_unchanged_by_financial_fact_projection() {
+    for denominator in [Some(8), None] {
+        let Some(fixture) = Fixture::postgres().await else {
+            return;
+        };
+        operational_cached_usage_projection_contract(fixture, denominator).await;
+    }
+}
+
+async fn operational_cached_usage_projection_contract(fixture: Fixture, denominator: Option<i64>) {
+    let mut terminal = fixture.operational(200);
+    terminal.error_code = None;
+    terminal.terminal_cause = None;
+    let receipt = Uuid::now_v7();
+    fixture.record(receipt, &terminal).await.unwrap();
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(created_at),
+        ..StatsFilter::default()
+    };
+    let unknown = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(unknown.summary.total_cost, None);
+    assert_eq!(unknown.summary.cache_usage.unknown_requests, 1);
+    assert_eq!(unknown.summary.cache_usage.reported_requests, 0);
+    let mut financial = fixture.financial();
+    financial.usage.cached_input_tokens = 3;
+    financial.usage.cache_coverage = Some(crate::model::CacheUsageCoverage {
+        read_tokens: 3,
+        inclusive_input_tokens: denominator,
+    });
+    fixture
+        .database
+        .finish_pending_proxy_settlement(
+            &fixture.claim,
+            receipt,
+            PendingProxySettlementEvidence::ProviderReported,
+            financial,
+            ProxyRequestUpstreamAttribution::KeepSelected,
+        )
+        .await
+        .unwrap();
+    let before = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    let cache = &before.summary.cache_usage;
+    assert_eq!(
+        cache.known_read_tokens,
+        if denominator.is_some() { 3 } else { 0 }
+    );
+    assert_eq!(cache.known_input_tokens, denominator.unwrap_or(0));
+    assert_eq!(cache.eligible_requests, i64::from(denominator.is_some()));
+    assert_eq!(cache.unknown_requests, i64::from(denominator.is_none()));
+    assert_eq!(cache.reported_read_tokens, 3);
+    assert_eq!(cache.reported_requests, 1);
+    assert_eq!(cache.hit_rate, denominator.map(|input| 3.0 / input as f64));
+    assert_eq!(before.summary.total_requests, 1);
+    assert!(before.summary.total_cost.is_some());
+    let fact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    assert_eq!(fact_count, 0);
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        fixture
+            .database
+            .claim_terminal_projection_tasks(owner, 10)
+            .await
+            .unwrap(),
+        vec![fixture.claim.request_id]
+    );
+    assert!(
+        fixture
+            .database
+            .project_claimed_terminal_projection_task(owner, fixture.claim.request_id)
+            .await
+            .unwrap()
+    );
+    let after = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    let day_start = created_at / 86_400_000 * 86_400_000;
+    let daily = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                from_created_at: Some(day_start),
+                to_created_at: Some(day_start + 86_400_000 - 1),
+                ..StatsFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&daily).unwrap()
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn sqlite_mixed_operational_statistics_do_not_report_partial_cost_as_total() {
     mixed_operational_cost_contract(Fixture::sqlite().await).await;
 }

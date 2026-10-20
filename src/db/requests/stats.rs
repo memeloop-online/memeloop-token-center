@@ -13,17 +13,16 @@ SELECT r.created_at,
        COALESCE(op.error_code, '') AS error_code,
        CASE WHEN r.completed_at IS NULL OR r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
        CASE WHEN r.completed_at IS NULL OR r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
-       CAST(0 AS BIGINT) AS cache_known_read_tokens,
-       CAST(0 AS BIGINT) AS cache_known_input_tokens,
-       CAST(0 AS BIGINT) AS cache_eligible_requests,
-       CAST(1 AS BIGINT) AS cache_unknown_requests,
-       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
-       CAST(0 AS BIGINT) AS cache_reported_requests,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN r.cache_known_read_tokens ELSE 0 END AS cache_known_read_tokens,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN r.cache_known_input_tokens ELSE 0 END AS cache_known_input_tokens,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_eligible_requests,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END AS cache_unknown_requests,
+       CASE WHEN r.completed_at IS NOT NULL THEN COALESCE(r.cache_known_read_tokens, 0) ELSE 0 END AS cache_reported_read_tokens,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_reported_requests,
        r.currency,
        CASE WHEN r.completed_at IS NULL THEN CAST(NULL AS BIGINT) ELSE r.cost_micros END AS cost_micros,
        CAST(1 AS BIGINT) AS requests
-FROM operational_candidates candidate
-JOIN proxy_operational_terminals op ON op.request_id = candidate.request_id
+FROM operational_candidates op
 JOIN request_records r ON r.id = op.request_id AND r.created_at = op.request_created_at
      AND r.tenant_id = op.tenant_id AND r.key_id = op.key_id AND r.reservation_id = op.reservation_id
 LEFT JOIN key_records k ON k.id = op.key_id AND k.tenant_id = op.tenant_id
@@ -47,17 +46,29 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($14 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros <= $14))
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
-  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = op.request_id)
+  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = op.request_id LIMIT 1 OFFSET 0)
+  AND (EXISTS (
+       SELECT 1 FROM pending_proxy_settlements pending
+       WHERE pending.request_id = op.request_id AND pending.state = 'pending'
+         AND pending.tenant_id = op.tenant_id AND pending.key_id = op.key_id
+         AND pending.reservation_id = op.reservation_id
+       LIMIT 1 OFFSET 0
+  ) OR EXISTS (
+       SELECT 1 FROM terminal_projection_outbox outbox
+       WHERE outbox.request_id = op.request_id AND outbox.projected_at IS NULL
+         AND outbox.tenant_id = op.tenant_id AND outbox.key_id = op.key_id
+         AND outbox.reservation_id = op.reservation_id
+       LIMIT 1 OFFSET 0
+  ))
 "#;
 
 const OPERATIONAL_CANDIDATES: &str = r#"
-SELECT request_id FROM pending_proxy_settlements WHERE state = 'pending'
-  AND ($1 = '' OR tenant_id = (SELECT id FROM tenants WHERE external_id = $1))
+SELECT request_id, request_created_at, tenant_id, key_id, reservation_id,
+       status_code, error_code, upstream_account_id, model_route_id, duration_ms
+FROM proxy_operational_terminals
+WHERE ($1 = '' OR tenant_id = (SELECT id FROM tenants WHERE external_id = $1))
   AND ($2 = '' OR key_id = $2)
-UNION
-SELECT request_id FROM terminal_projection_outbox WHERE projected_at IS NULL
-  AND ($1 = '' OR tenant_id = (SELECT id FROM tenants WHERE external_id = $1))
-  AND ($2 = '' OR key_id = $2)
+  AND request_created_at >= $3 AND request_created_at <= $4
 "#;
 
 pub(crate) const FILTERED_ACTIVITY_SOURCE_ROLLUPS: &str = r#"
@@ -560,8 +571,8 @@ impl Database {
         let principal = search_prefix(filter.principal.as_deref());
         // Ordinary terminal statistics use compact daily rollups for complete UTC days and
         // exact facts for the two possible boundary days. Per-request duration/cost filters
-        // use compact facts for the whole bounded interval. Unprojected operational terminals
-        // add only indexed transient candidates and point reads of their request metadata.
+        // use compact facts for the whole bounded interval. Date-bounded operational terminals
+        // add point reads of their pending/projection state and request metadata.
         let use_facts = filter.min_duration_ms.is_some()
             || filter.max_duration_ms.is_some()
             || filter.min_cost_micros.is_some()
@@ -911,85 +922,212 @@ mod operational_plan_tests {
     use super::*;
     use crate::db::test_support::PostgresTestDatabase;
 
-    async fn assert_overlay_access_paths(database: &Database) {
-        let mut transaction = database.pool.begin().await.unwrap();
-        let prefix = match database.backend {
-            DatabaseBackend::PostgreSql => {
-                sqlx::query("SET LOCAL enable_seqscan = off")
-                    .execute(&mut *transaction)
-                    .await
-                    .unwrap();
-                "EXPLAIN"
-            }
-            DatabaseBackend::Sqlite => "EXPLAIN QUERY PLAN",
-        };
-        let statement = format!(
-            "{prefix} WITH operational_candidates AS MATERIALIZED ({OPERATIONAL_CANDIDATES}) {OPERATIONAL_ACTIVITY_DELTA}"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind("")
-            .bind("")
-            .bind(0_i64)
-            .bind(unix_millis())
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind(-1_i64)
-            .bind(-1_i64)
-            .bind(-1_i64)
-            .bind(-1_i64)
-            .bind("")
-            .bind("")
-            .fetch_all(&mut *transaction)
+    async fn seed_overlay_history(database: &Database) -> (String, String, i64) {
+        let pepper = b"operational statistics plan fixture";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "operational-plan".into(),
+                    principal_external_id: "member".into(),
+                    alias: "operational-plan".into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: rust_decimal::Decimal::ONE,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
             .await
             .unwrap();
-        let details = rows
-            .iter()
-            .map(|row| match database.backend {
-                DatabaseBackend::PostgreSql => row.get::<String, _>(0),
-                DatabaseBackend::Sqlite => row.get::<String, _>("detail"),
+        let key = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = database
+            .upsert_model_price(
+                "plan-model",
+                "USD",
+                rust_decimal::Decimal::ONE,
+                rust_decimal::Decimal::ONE,
+            )
+            .await
+            .unwrap();
+        let request_id = Uuid::now_v7();
+        let reservation = database
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 20,
+                protocol: "openai",
+                model: "plan-model",
+                request_object: "gap://plan/request",
+                upstream_account_id: None,
+                model_route_id: None,
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            details.contains("pending_proxy_settlements_recovery_idx"),
-            "{details}"
-        );
-        assert!(
-            details.contains("terminal_projection_pending_idx"),
-            "{details}"
-        );
-        match database.backend {
-            DatabaseBackend::PostgreSql => {
-                for table in [
-                    "request_records",
-                    "proxy_operational_terminals",
-                    "request_stats_facts",
-                ] {
-                    assert!(
-                        !details.contains(&format!("Seq Scan on {table}")),
-                        "{details}"
-                    );
-                }
+            .await
+            .unwrap();
+        let created_at: i64 =
+            sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+                .bind(request_id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO proxy_operational_terminals (request_id,request_created_at,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,receipt_id,operational_digest,status_code,error_code,completed_at,duration_ms,response_object,recorded_at) VALUES ($1,$2,$3,$4,$5,$6,'owner','fence','contract','receipt','operational',429,'http_429',$2,10,'gap://plan/response',$2)")
+            .bind(request_id.to_string()).bind(created_at).bind(key.tenant_id.to_string())
+            .bind(key.key_id.to_string()).bind(key.account_id.to_string()).bind(reservation.id.to_string())
+            .execute(&database.pool).await.unwrap();
+        sqlx::query("WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < 8192) INSERT INTO proxy_operational_terminals (request_id,request_created_at,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,receipt_id,operational_digest,status_code,error_code,completed_at,duration_ms,response_object,recorded_at) SELECT 'history-' || CAST(value AS TEXT), request_created_at - 31536000000, tenant_id,key_id,account_id,'history-' || CAST(value AS TEXT),owner_token,fence,contract_digest,receipt_id,operational_digest,status_code,error_code,completed_at - 31536000000,duration_ms,response_object,recorded_at - 31536000000 FROM proxy_operational_terminals CROSS JOIN numbers WHERE request_id = $1")
+            .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO pending_proxy_settlements (request_id,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,contract_json,state,unknown_reason,created_at,updated_at) SELECT request_id,tenant_id,key_id,account_id,reservation_id,owner_token,fence,contract_digest,'{}','pending','authoritative_usage_unavailable',request_created_at,recorded_at FROM proxy_operational_terminals")
+            .execute(&database.pool).await.unwrap();
+        sqlx::query("INSERT INTO terminal_projection_outbox (request_id,reservation_id,tenant_id,key_id,account_id,created_at,completed_at,model,protocol,status_code,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,generation_units,billing_unit,service_tier,currency,cost_micros,usage_basis,session_id,response_object) SELECT request_id,reservation_id,tenant_id,key_id,account_id,request_created_at,completed_at,'plan-model','openai',status_code,error_code,'','',duration_ms,0,0,0,0,0,'token','default','USD',0,'not_observed','',response_object FROM proxy_operational_terminals")
+            .execute(&database.pool).await.unwrap();
+        sqlx::query("ANALYZE")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        (request_id.to_string(), key.key_id.to_string(), created_at)
+    }
+
+    fn inspect_postgres_plan(node: &serde_json::Value, operational_rows: &mut u64) {
+        let relation = node["Relation Name"].as_str().unwrap_or_default();
+        let loops = node["Actual Loops"].as_u64().unwrap_or(0);
+        if loops > 0
+            && matches!(
+                relation,
+                "proxy_operational_terminals"
+                    | "pending_proxy_settlements"
+                    | "terminal_projection_outbox"
+            )
+        {
+            let rows = node["Actual Rows"].as_u64().unwrap();
+            let removed = node["Rows Removed by Filter"].as_u64().unwrap_or(0)
+                + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
+            assert!(
+                (rows + removed) * loops <= 1,
+                "history visited outside the one-row date window: {node}"
+            );
+            assert_ne!(node["Node Type"].as_str(), Some("Seq Scan"), "{node}");
+            if relation == "proxy_operational_terminals" {
+                *operational_rows += rows * loops;
             }
-            DatabaseBackend::Sqlite => {
-                for alias in ["r", "op", "fact"] {
+        }
+        if let Some(children) = node["Plans"].as_array() {
+            for child in children {
+                inspect_postgres_plan(child, operational_rows);
+            }
+        }
+    }
+
+    async fn assert_overlay_access_paths(database: &Database, postgres: Option<&sqlx::PgPool>) {
+        let (request_id, key_id, created_at) = seed_overlay_history(database).await;
+        for pending in [true, false] {
+            if !pending {
+                sqlx::query("DELETE FROM pending_proxy_settlements WHERE request_id = $1")
+                    .bind(&request_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+            }
+            for (tenant, key) in [
+                ("", ""),
+                ("operational-plan", ""),
+                ("", key_id.as_str()),
+                ("operational-plan", key_id.as_str()),
+            ] {
+                macro_rules! bind_window {
+                    ($query:expr) => {
+                        $query
+                            .bind(tenant)
+                            .bind(key)
+                            .bind(created_at)
+                            .bind(created_at)
+                            .bind("")
+                            .bind("")
+                            .bind("")
+                            .bind("")
+                            .bind("")
+                            .bind("")
+                            .bind(-1_i64)
+                            .bind(-1_i64)
+                            .bind(-1_i64)
+                            .bind(-1_i64)
+                            .bind("")
+                            .bind("")
+                    };
+                }
+                let statement = format!(
+                    "WITH operational_candidates AS MATERIALIZED ({OPERATIONAL_CANDIDATES}) {OPERATIONAL_ACTIVITY_DELTA}"
+                );
+                let rows = bind_window!(sqlx::query(sqlx::AssertSqlSafe(statement.clone())))
+                    .fetch_all(&database.pool)
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get::<i64, _>("requests"), 1);
+                assert_eq!(rows[0].get::<Option<i64>, _>("cost_micros"), None);
+                if let Some(pool) = postgres {
+                    let plan_sql =
+                        format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF) {statement}");
+                    let row = bind_window!(sqlx::query(sqlx::AssertSqlSafe(plan_sql)))
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    let raw = row.try_get_unchecked::<String, _>(0).unwrap();
+                    let plan: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    let mut operational_rows = 0;
+                    inspect_postgres_plan(&plan[0]["Plan"], &mut operational_rows);
+                    assert_eq!(operational_rows, 1, "{plan}");
                     assert!(
-                        !details.lines().any(|line| line == format!("SCAN {alias}")
-                            || line.starts_with(&format!("SCAN {alias} "))),
+                        raw.contains("proxy_operational_terminals_time_idx")
+                            || raw.contains("proxy_operational_terminals_key_time_idx"),
+                        "{plan}"
+                    );
+                } else {
+                    let plan_sql = format!("EXPLAIN QUERY PLAN {statement}");
+                    let rows = bind_window!(sqlx::query(sqlx::AssertSqlSafe(plan_sql)))
+                        .fetch_all(&database.pool)
+                        .await
+                        .unwrap();
+                    let details = rows
+                        .iter()
+                        .map(|row| row.get::<String, _>("detail"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        details.contains("proxy_operational_terminals_time_idx")
+                            || details.contains("proxy_operational_terminals_key_time_idx"),
                         "{details}"
                     );
+                    assert!(
+                        details.contains("request_created_at>?")
+                            && details.contains("request_created_at<?"),
+                        "{details}"
+                    );
+                    for alias in ["pending", "outbox"] {
+                        assert!(
+                            details
+                                .lines()
+                                .any(|line| line.starts_with(&format!("SEARCH {alias} "))
+                                    && (line.contains("request_id=?")
+                                        || line.contains("reservation_id=?"))),
+                            "{details}"
+                        );
+                        assert!(
+                            !details.lines().any(|line| line == format!("SCAN {alias}")
+                                || line.starts_with(&format!("SCAN {alias} "))),
+                            "{details}"
+                        );
+                    }
                 }
             }
         }
-        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]
-    async fn sqlite_operational_statistics_overlay_uses_transient_indexes_and_point_joins() {
+    async fn sqlite_operational_statistics_overlay_bounds_retained_history_before_state_checks() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
@@ -998,12 +1136,12 @@ mod operational_plan_tests {
         .await
         .unwrap();
         database.migrate().await.unwrap();
-        assert_overlay_access_paths(&database).await;
+        assert_overlay_access_paths(&database, None).await;
         database.close().await;
     }
 
     #[tokio::test]
-    async fn postgres_operational_statistics_overlay_has_index_access_paths() {
+    async fn postgres_operational_statistics_overlay_bounds_retained_history_before_state_checks() {
         let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -1014,7 +1152,9 @@ mod operational_plan_tests {
         let isolated = PostgresTestDatabase::create(&url).await;
         let database = Database::connect(isolated.url()).await.unwrap();
         database.migrate().await.unwrap();
-        assert_overlay_access_paths(&database).await;
+        let pool = sqlx::PgPool::connect(isolated.url()).await.unwrap();
+        assert_overlay_access_paths(&database, Some(&pool)).await;
+        pool.close().await;
         database.close().await;
         isolated.cleanup().await;
     }
