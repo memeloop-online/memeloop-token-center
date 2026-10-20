@@ -2,9 +2,26 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   projectSessionReplay,
+  finalReplayResponse,
   SESSION_REPLAY_MAX_ITEMS,
 } from '../src/sessionReplayProjection.js';
 import type { RequestDetail } from '../src/types.js';
+
+test('response summaries prefer explicit final markers and omit progress-only responses', () => {
+  const replay = projectSessionReplay('session-a', [detail('final', 1, { input: 'hello' }, {
+    output: [
+      { type: 'message', role: 'assistant', phase: 'commentary', content: 'Checking' },
+      { type: 'message', role: 'assistant', phase: 'final_answer', content: 'First paragraph\n\nFinal paragraph' },
+    ],
+  })]);
+  assert.equal(finalReplayResponse(replay.items)?.text, 'First paragraph\n\nFinal paragraph');
+  assert.equal(finalReplayResponse(replay.items.filter(item => item.kind === 'message' && item.phase === 'commentary')), undefined);
+  const unmarked = projectSessionReplay('session-a', [detail('plain', 2, { input: 'hello' }, {
+    choices: [{ message: { role: 'assistant', content: 'Intermediate explanation\n\nConclusion' } }],
+  })]);
+  assert.equal(finalReplayResponse(unmarked.items)?.text, 'Conclusion');
+  assert.equal(unmarked.items.filter(item => item.kind === 'message').at(-1)?.text, 'Intermediate explanation\n\nConclusion', 'summary does not destroy the retained full response');
+});
 
 function detail(requestId: string, createdAt: number, requestBody: unknown, responseBody: unknown, overrides: Partial<RequestDetail> = {}): RequestDetail {
   return {

@@ -514,7 +514,7 @@ async fn store_filter_preset_state(
         .await
 }
 
-async fn load_filter_assistant_settings(
+pub(super) async fn load_filter_assistant_settings(
     state: &AppState,
     tenant: &str,
 ) -> Result<Option<FilterAssistantSettings>, AppError> {
@@ -533,7 +533,7 @@ async fn load_filter_assistant_settings(
         .map_err(|_| AppError::Internal)
 }
 
-async fn assistant_execution_context(
+pub(super) async fn assistant_execution_context(
     state: &AppState,
     tenant: &str,
     route_id: Uuid,

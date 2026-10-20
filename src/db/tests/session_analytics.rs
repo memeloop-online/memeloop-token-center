@@ -126,6 +126,67 @@ async fn sqlite_operator_sessions_keep_a_stable_retired_credential_identity() {
     assert_eq!(sessions[0].key_alias, "__retired_credential__");
     assert!(!sessions[0].key_alias.contains("API2"));
 
+    database
+        .request_session_title(key.tenant_id, key.key_id, cluster_id)
+        .await
+        .unwrap();
+    let title_job = database
+        .claim_session_title(Uuid::now_v7())
+        .await
+        .unwrap()
+        .unwrap();
+    database
+        .finish_session_title(&title_job, Some("Session reading diagnosis"), None)
+        .await
+        .unwrap();
+    let title_filter = LogicalSessionListFilter {
+        limit: 10,
+        state: "all".into(),
+        query: Some("session reading".into()),
+        ..Default::default()
+    };
+    let named = database
+        .operator_recent_sessions("retired-session-tenant", title_filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        named.len(),
+        1,
+        "generated titles participate in filtered session lists"
+    );
+    assert_eq!(
+        named[0].session_name.as_deref(),
+        Some("Session reading diagnosis")
+    );
+    let named_batch = database
+        .operator_session_summaries(
+            "retired-session-tenant",
+            &[(key.key_id, cluster_id.to_string())],
+            title_filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        named_batch.len(),
+        1,
+        "realtime summary filtering uses the same generated-title search"
+    );
+    assert!(
+        database
+            .operator_recent_sessions(
+                "retired-session-tenant",
+                LogicalSessionListFilter {
+                    limit: 10,
+                    state: "all".into(),
+                    query: Some("unrelated title".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let detail = database
         .operator_logical_session_detail(
             "retired-session-tenant",

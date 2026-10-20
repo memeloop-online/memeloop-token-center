@@ -127,7 +127,7 @@ When('管理员打开实时会话聚合', async function (this: DogfoodWorld) {
     const url = new URL(request.url());
     if (url.pathname === '/internal/v1/sessions') observation.sessionListRequests.push(url.toString());
     else if (url.pathname === '/internal/v1/sessions/summaries') observation.sessionSummaryRequests.push(url.toString());
-    else if (url.pathname.startsWith('/internal/v1/sessions/')) observation.detailRequests.push(url.toString());
+    else if (/^\/internal\/v1\/sessions\/[^/]+$/.test(url.pathname)) observation.detailRequests.push(url.toString());
   });
   await openAppRoute(page, 'operator', 'sessions');
   await visible(page.getByRole('heading', { name: '最近会话与未关联请求', exact: true }));
