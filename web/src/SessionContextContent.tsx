@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button } from './design-system';
+import { Button, Disclosure } from './design-system';
 import { useI18n } from './i18n.js';
 import {
   appendContextChunk, contextMessageText, type ContextContentState,
@@ -66,10 +66,9 @@ export function SessionContextDisclosure({ item, requestId, loader, label, textO
   item: SessionContextItem; requestId: string; loader: SessionContextLoader; label: string; textOnly?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  return <details onToggle={(event) => setOpen(event.currentTarget.open)}>
-    <summary>{label}</summary>
+  return <Disclosure title={label} open={open} onOpenChange={setOpen}>
     {open && <SessionContextContent key={`${requestId}:${item.node_id}`} item={item} requestId={requestId} loader={loader} textOnly={textOnly} />}
-  </details>;
+  </Disclosure>;
 }
 
 /** User text is visible in full by default; each sequential request is bounded.

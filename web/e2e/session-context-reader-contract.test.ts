@@ -87,6 +87,8 @@ test('constructing and paging a loader does not fetch content or follow continua
 test('content disclosure mounts its reader only on expansion and offers bounded continuation', async () => {
   const source = await readFile(new URL('../src/SessionContextContent.tsx', import.meta.url), 'utf8');
   assert.match(source, /open && <SessionContextContent/);
+  assert.match(source, /<Disclosure title=\{label\} open=\{open\} onOpenChange=\{setOpen\}/);
+  assert.doesNotMatch(source, /<details|<summary/);
   assert.match(source, /loader\.content\(requestId, requested, controller\.signal\)/);
   assert.match(source, /setRequested\(state\.nextCursor!\)/);
   assert.match(source, /controller\.abort\(\)/);

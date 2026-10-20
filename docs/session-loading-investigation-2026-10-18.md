@@ -313,3 +313,25 @@ PR or partial green checks establish completion of the reading requirements.
   passed; the all-targets test step is still running. Added light/dark
   320/768/1440px screenshots and overflow/right-column assertions for the
   actual default prefix-history view to the next browser revision.
+
+## Release preparation (2026-10-20)
+
+- CI `39299768529` for `70103489` completed successfully, including historical
+  receipt compaction contracts and responsive history screenshots. Prior run
+  `39292284611` also passed all gates: 2,009 library tests, with the real HTTP
+  authorization and configured title billing integration tests confirmed in
+  its logs.
+- Inspected the new desktop light and mobile dark screenshots from
+  `/home/user/workspace/session-ui-evidence.O6dFZB/session-replay/`.
+  Full user text and left/right desktop placement are visible. The review
+  identified remaining native details/summary controls alongside the shared
+  Fluent disclosures. Replaced both context disclosure wrappers with controlled
+  shared Disclosure components while preserving conditional child mounting;
+  updated browser and lazy-loading contracts. This final UI revision needs CI.
+- Production inspection: canonical application is healthy but OutOfSync;
+  control is annotated release `63022be`, gateway/worker `469c6dd`. Both release
+  commits are ancestors of this branch. The separate image canary is Suspended,
+  not an active rollout. Do not broadly sync the application or replace its
+  independently pinned data/ingress sources when deploying these changes.
+- PR 657's description now records implemented features, verification and
+  remaining publication/production acceptance steps. No deployment yet.

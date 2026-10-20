@@ -36,15 +36,15 @@ test('prefix reader never fetches archives or tool bodies before their disclosur
     assert.equal(await page.evaluate(() => window.contextContentReads), 0);
     await page.getByText('Current request final answer', { exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {}, 'final response polling must not open the raw archive');
-    await page.locator('summary').filter({ hasText: /^Full conversation and execution details$/ }).click();
-    await page.locator('summary').filter({ hasText: /Tool calls and results/ }).click();
-    await page.locator('summary').filter({ hasText: 'function_call · 3' }).click();
+    await page.getByRole('button', { name: 'Full conversation and execution details', exact: true }).click();
+    await page.getByRole('button', { name: /Tool calls and results/ }).click();
+    await page.getByRole('button', { name: 'function_call · 3', exact: true }).click();
     assert.equal(await page.evaluate(() => window.contextContentReads), 0);
-    await page.locator('summary').filter({ hasText: /^Call arguments$/ }).click();
+    await page.getByRole('button', { name: 'Call arguments', exact: true }).click();
     await page.getByText(/deferred-tool-secret/).waitFor();
     assert.equal(await page.evaluate(() => window.contextContentReads), 1);
     assert.deepEqual(await page.evaluate(() => window.sessionReplayReads), {});
-    await page.locator('summary').filter({ hasText: /^Original request and response archives$/ }).click();
+    await page.getByRole('button', { name: 'Original request and response archives', exact: true }).click();
     await page.waitForFunction(() => Object.keys(window.sessionReplayReads).length > 0);
   } finally { await browser.close(); await server.close(); }
 });

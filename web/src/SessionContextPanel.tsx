@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import { Button, Select } from './design-system';
+import { Button, Disclosure, Select } from './design-system';
 import { useI18n } from './i18n.js';
 import { SessionContextDisclosure, SessionUserText } from './SessionContextContent.js';
 import { prependContextPage, type SessionContextItem, type SessionContextLoader, type SessionContextPage, type SessionResponseSummary } from './sessionContextReader.js';
@@ -15,9 +15,9 @@ function loaderIdentity(loader: SessionContextLoader) {
 
 export function DeferredSessionDetails({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
-  return <details onToggle={(event) => setOpen(event.currentTarget.open)}>
-    <summary>{label}</summary>{open ? children : null}
-  </details>;
+  return <Disclosure title={label} open={open} onOpenChange={setOpen}>
+    {open ? children : null}
+  </Disclosure>;
 }
 
 function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswers = true }: {
