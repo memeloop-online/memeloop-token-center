@@ -27,3 +27,5 @@ CREATE TABLE proxy_operational_terminals (
 );
 CREATE INDEX proxy_operational_terminals_key_time_idx
     ON proxy_operational_terminals (tenant_id, key_id, request_created_at, request_id);
+CREATE INDEX proxy_operational_terminals_time_idx
+    ON proxy_operational_terminals (request_created_at, tenant_id, key_id, request_id);

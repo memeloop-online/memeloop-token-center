@@ -688,11 +688,6 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "proxy operational completion independent of financial settlement",
         sql: include_str!("../../../migrations/common/0131_proxy_operational_terminals.sql"),
     },
-    Migration {
-        version: 132,
-        name: "date bounded operational statistics",
-        sql: include_str!("../../../migrations/common/0132_proxy_operational_statistics_time.sql"),
-    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1363,11 +1358,6 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 131,
         name: "proxy operational completion independent of financial settlement",
         sql: include_str!("../../../migrations/common/0131_proxy_operational_terminals.sql"),
-    },
-    Migration {
-        version: 132,
-        name: "date bounded operational statistics",
-        sql: include_str!("../../../migrations/common/0132_proxy_operational_statistics_time.sql"),
     },
 ];
 
