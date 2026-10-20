@@ -10,7 +10,7 @@ import '../../src/styles/metrics.css';
 import '../../src/operator/operator.css';
 
 declare global {
-  interface Window { usageAnalysisFixture: { calls: string[]; failSaves: boolean; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
+  interface Window { usageAnalysisFixture: { calls: string[]; failSaves: boolean; holdProjection?: string; releaseProjection?: () => void; aborted: number; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
 }
 
 const largeMetric = 1_250_000_000_000;
@@ -55,7 +55,7 @@ const credentials = Array.from({ length: 101 }, (_, index) => ({
   key_id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
 }));
 
-window.usageAnalysisFixture = { calls: [], failSaves: false, presets: { named: [], recent: [] } };
+window.usageAnalysisFixture = { calls: [], failSaves: false, aborted: 0, holdProjection: new URLSearchParams(location.search).get('holdProjection') ?? undefined, presets: { named: [], recent: [] } };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -67,7 +67,19 @@ function json(value: unknown, status = 200) {
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input.toString(), location.origin);
   window.usageAnalysisFixture.calls.push(`${url.pathname}${url.search}`);
-  if (url.pathname === '/internal/v1/usage-analysis') return json(analysis);
+  if (url.pathname === '/internal/v1/usage-analysis') {
+    const projection = url.searchParams.get('projection');
+    if (projection && window.usageAnalysisFixture.holdProjection === projection) await new Promise<void>((resolve, reject) => {
+      const abort = () => { window.usageAnalysisFixture.aborted += 1; reject(new DOMException('Aborted', 'AbortError')); };
+      init?.signal?.addEventListener('abort', abort, { once: true });
+      window.usageAnalysisFixture.releaseProjection = () => { init?.signal?.removeEventListener('abort', abort); resolve(); };
+    });
+    if (projection === 'output_rate') {
+      const zero = { ...metrics, requests: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, success: 0, failed: 0, generation_units: 0, avg_duration_ms: null, p95_duration_ms: null };
+      return json({ ...analysis, summary: zero, time_series: [{ ...zero, bucket_start: analysis.time_series[0].bucket_start }] });
+    }
+    return json({ ...analysis, summary: { ...metrics, output_rate: undefined }, time_series: analysis.time_series.map(point => ({ ...point, output_rate: undefined })) });
+  }
   if (url.pathname === '/internal/v1/keys') {
     const search = url.searchParams.get('search')?.toLowerCase() ?? '';
     const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);

@@ -18,8 +18,9 @@ import {
 
 export type UsageSummaryStats = Pick<OperatorUsageAnalysis, 'summary' | 'time_series'>;
 
-export function UsageSummaryMetrics({ stats, currency, timeZone = displayTimeZone() }: {
+export function UsageSummaryMetrics({ stats, currency, timeZone = displayTimeZone(), outputRateLoading = false }: {
   stats: UsageSummaryStats;
+  outputRateLoading?: boolean;
   /** Keep a portal credential's billing currency scoped to its own cards. */
   currency?: string;
   /** Bucket labels stay absolute; this only controls interactive display text. */
@@ -40,8 +41,8 @@ export function UsageSummaryMetrics({ stats, currency, timeZone = displayTimeZon
   const exactValue = (text: string, title?: string) => <span className="metric-number"><span className="metric-exact" title={title ?? text}>{text}</span></span>;
   const numeric = (label: string, value: number, trend: number[], tone = '') => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={timeZone} label={label} value={exactValue(number(value).text, number(value).title)} trend={trend} tone={tone} />;
   const summarySamples = summary.output_rate && Number.isFinite(summary.output_rate.requests) && summary.output_rate.requests >= 0 ? summary.output_rate.requests : seriesTpsSamples(points);
-  const tpsHint = <>{t('usage.averageTpsHint')} {summarySamples === null ? t('usage.tpsEligibleSamplesUnknown') : t('usage.tpsEligibleSamples', { count: formatNumber(summarySamples, locale, 0) })}</>;
-  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={timeZone} label={label} labelContent={<DetailTooltip content={tpsHint}><span tabIndex={0}>{label}</span></DetailTooltip>} value={exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
+  const tpsHint = <>{t('usage.averageTpsHint')} {outputRateLoading ? t('usage.outputRateLoading') : summarySamples === null ? t('usage.tpsEligibleSamplesUnknown') : t('usage.tpsEligibleSamples', { count: formatNumber(summarySamples, locale, 0) })}</>;
+  const tpsMetric = (label: string, value: ReturnType<typeof formatTps>, trend: Array<number | null>) => <AnalyticsMetric timestamps={points.map(point => point.bucket_start)} timeZone={timeZone} label={label} labelContent={<DetailTooltip content={tpsHint}><span tabIndex={0}>{label}</span></DetailTooltip>} value={outputRateLoading ? <span role="status">{t('common.loading')}</span> : exactValue(value.text, value.title)} title={value.title} formatSample={(sample) => formatTps(sample, locale).title ?? formatTps(sample, locale).text} trend={trend} />;
   const average = analyticsDuration(summary.avg_duration_ms, locale);
   const p95 = histogramP95(summary.p95_duration_ms, summary.p95_is_capped, locale);
   const averageTpsTrend = averageBucketTpsSeries(points);

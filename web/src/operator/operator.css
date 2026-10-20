@@ -179,8 +179,36 @@
 .typed-filter-dialog h3 { margin: 0; }
 .typed-filter-dialog h3 { font-size: 14px; margin-bottom: 9px; }
 
-.typed-filter-panel-controls { border-bottom: 1px solid var(--picker-border); margin-bottom: 16px; padding-bottom: 2px; }
-.typed-filter-panel-controls .usage-controls { background: transparent; border: 0; margin: 0; padding: 0; }
+/* The shared period controls reuse the usage-controls chrome; inside the
+   filter dialog they drop the standalone panel background and keep only a
+   separator from the condition rows below. */
+.typed-filter-dialog .usage-controls.typed-filter-period,
+:root[data-theme='light'] .typed-filter-dialog .usage-controls.typed-filter-period {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--picker-border);
+  margin: 0 0 6px;
+  padding: 0 0 14px;
+}
+
+.typed-filter-granularity {
+  color: var(--picker-muted);
+  display: grid;
+  font-size: var(--fontSizeBase200, 12px);
+  gap: 5px;
+  margin-top: 9px;
+  max-width: 240px;
+}
+
+.typed-filter-alias-picker {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.typed-filter-alias-picker .fui-Combobox { flex: 1 1 auto; min-width: 0; }
+.typed-filter-alias-error { font-size: var(--fontSizeBase200, 12px); overflow-wrap: anywhere; }
 
 .typed-filter-rows { display: grid; gap: 9px; margin: 16px 0; }
 
@@ -391,6 +419,11 @@
   .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
   .typed-filter-row .fui-Select,
   .typed-filter-row .fui-Select > select { min-height: 44px; }
+  .typed-filter-period .usage-presets .fui-Button,
+  .typed-filter-period .typed-filter-granularity .fui-Select,
+  .typed-filter-period .usage-custom-range .fui-Input,
+  .typed-filter-row .typed-filter-alias-picker .fui-Combobox,
+  .typed-filter-row .typed-filter-alias-picker .fui-Button { min-height: 44px; }
 }
 
 .provider-list .panel-title,

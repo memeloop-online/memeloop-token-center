@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { defaultUsageSelection, localDateTimeInput, nextUsageTab, statsQuery, usageAstFromSelection, usageAstIssue, usageSelectionFromAst, usageRange, type UsageSelection } from '../src/operator/usageState.js';
+import { defaultUsageSelection, localDateTimeInput, nextUsageTab, statsQuery, usageAstFromSelection, usageAstIssue, usageSelectionFromAst, usageSelectionFromDraft, usageRange, type UsageSelection } from '../src/operator/usageState.js';
 
 const operatorSource = await readFile(new URL('../src/operator/UsageAnalysis.tsx', import.meta.url), 'utf8');
 const usageStateSource = await readFile(new URL('../src/operator/usageState.ts', import.meta.url), 'utf8');
+const builderSource = await readFile(new URL('../src/operator/TypedFilterBuilder.tsx', import.meta.url), 'utf8');
+const pickerSource = await readFile(new URL('../src/operator/FilterCredentialAliasPicker.tsx', import.meta.url), 'utf8');
+const projectionSource = await readFile(new URL('../src/operator/hooks/useUsageProjection.ts', import.meta.url), 'utf8');
 const selfSource = await readFile(new URL('../src/self/UsagePage.tsx', import.meta.url), 'utf8');
 
 test('operator data is scoped to the exact token, tenant, and applied selection', () => {
   assert.match(operatorSource, /const scope = useMemo\(\(\) => \(\{\}\), \[token, tenant, applied, refresh\]\)/);
-  assert.match(operatorSource, /remote\?\.scope === scope/);
-  for (const status of ['loading', 'error', 'ready']) assert.match(operatorSource, new RegExp(`status: '${status}'`));
+  assert.match(projectionSource, /remote\?\.scope === scope/);
+  for (const status of ['loading', 'error', 'ready']) assert.match(projectionSource, new RegExp(`status: '${status}'`));
 });
 
 test('refresh re-fetches applied filters without silently applying the draft model', () => {
@@ -36,17 +39,48 @@ test('usage key alias filters are exposed and serialized', () => {
   assert.match(usageStateSource, /key_alias/);
 });
 
-test('usage filters use one shared panel with presets, explicit ranges, and credential choices', () => {
-  assert.match(operatorSource, /<TypedFilterBuilder[^>]+panelControls=/);
+test('usage filters share the request filter builder instead of a parallel form', () => {
+  // The page contributes no filter form of its own: period, credential, and
+  // conditions all live in the shared builder.
+  assert.doesNotMatch(operatorSource, /panelControls|panelActive|UsageCredentialAliasSelect/);
   assert.doesNotMatch(operatorSource, /<details className="usage-filter-disclosure"/);
-  assert.match(operatorSource, /usagePresets\.map/);
-  assert.match(operatorSource, /UsageCredentialAliasSelect/);
-  assert.match(operatorSource, /<Combobox[^>]+inlinePopup/);
-  assert.match(operatorSource, /keyListPath\(tenant, cursor, \{ search \}\)/);
-  assert.match(operatorSource, /keyListPage\(rows\)/);
-  assert.match(operatorSource, /appendDistinctKeys/);
-  assert.match(operatorSource, /credential\.alias/);
+  assert.match(operatorSource, /scope="usage"/);
+  assert.match(operatorSource, /usageSelection=\{selection\}/);
+  assert.match(operatorSource, /externalChips=\{externalFilterChips\}/);
   assert.match(operatorSource, /onClear=\{\(\) => \{ const next = defaultUsageSelection\(\);/);
+  // The credential alias picker is shared and reads paged aliases on demand.
+  assert.match(builderSource, /FilterCredentialAliasPicker/);
+  assert.match(pickerSource, /<Combobox[^>]+inlinePopup/);
+  assert.match(pickerSource, /keyListPath\(tenant, cursor, \{ search \}\)/);
+  assert.match(pickerSource, /keyListPage\(rows\)/);
+  assert.match(pickerSource, /appendDistinctKeys/);
+  assert.match(pickerSource, /credential\.alias/);
+  assert.match(pickerSource, /new AbortController\(\)/);
+});
+
+test('builder drafts reconcile quick-range presets, manual edits, and the usage default period', () => {
+  const now = Date.parse('2026-10-02T12:00:00Z');
+  const base: UsageSelection = { ...defaultUsageSelection(now), preset: '7d', resolvedAt: now };
+  const ast = usageAstFromSelection({ logical_operator: 'and', conditions: [] }, base);
+  assert.ok(ast);
+  // An untouched quick-range draft keeps its preset semantics on apply.
+  const kept = usageSelectionFromDraft(base, ast, now);
+  assert.equal(kept?.preset, '7d');
+  assert.equal(kept?.resolvedAt, now);
+  // A hand-edited time row becomes an explicit custom range.
+  const edited = { ...ast, conditions: ast.conditions.map((condition) => condition.field === 'created_at' ? { ...condition, value: { type: 'timestamp' as const, value: now - 3_600_000 } } : condition) };
+  const manual = usageSelectionFromDraft(base, edited, now);
+  assert.equal(manual?.preset, 'custom');
+  assert.equal(manual?.customFrom, localDateTimeInput(now - 3_600_000));
+  // Usage queries cannot be open-ended: a missing period defaults to 24h.
+  const noPeriod = { logical_operator: 'and' as const, conditions: ast.conditions.filter((condition) => condition.field !== 'created_at') };
+  const defaulted = usageSelectionFromDraft(base, noPeriod, now);
+  assert.equal(defaulted?.preset, '24h');
+  assert.equal(defaulted?.resolvedAt, now);
+  assert.equal(new URLSearchParams(statsQuery('', defaulted!)?.slice(1)).get('to_created_at'), String(now));
+  // Unsupported or duplicate conditions still fail loudly instead of being dropped.
+  const unsupported = { logical_operator: 'and' as const, conditions: [{ field: 'model' as const, operator: 'contains' as const, value: { type: 'model' as const, value: 'public-model' } }] };
+  assert.equal(usageSelectionFromDraft(base, unsupported, now), undefined);
 });
 
 test('preset and custom periods serialize to the same AST and statistics range', () => {

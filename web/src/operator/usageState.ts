@@ -82,6 +82,30 @@ export function usageSelectionFromAst(current: UsageSelection, ast: TypedFilterA
   return { ...current, ...period, filters };
 }
 
+/**
+ * Fold the filter builder's draft AST into a usage selection.  A quick-range
+ * preset keeps its semantics only while the single created_at window still
+ * matches the range that preset resolved to; a manual edit or a loaded preset
+ * becomes an explicit custom range.  Usage queries cannot be open-ended, so a
+ * draft without a created_at condition falls back to the last 24 hours rather
+ * than silently dropping the period.
+ */
+export function usageSelectionFromDraft(current: UsageSelection, draft: TypedFilterAst, now = Date.now()): UsageSelection | undefined {
+  const parsed = usageSelectionFromAst(current, draft);
+  if (!parsed) return undefined;
+  const period = draft.conditions.find((condition) => condition.field === 'created_at');
+  if (!period) {
+    return { ...parsed, preset: '24h', resolvedAt: now, customFrom: localDateTimeInput(now - 86_400_000), customTo: localDateTimeInput(now) };
+  }
+  if (current.preset !== 'custom' && period.operator === 'between' && period.value.type === 'timestamp' && period.upper?.type === 'timestamp') {
+    const expected = usageRange(current);
+    if (expected && Number(period.value.value) === expected.from && Number(period.upper.value) === expected.to) {
+      return { ...parsed, preset: current.preset, resolvedAt: current.resolvedAt ?? now };
+    }
+  }
+  return parsed;
+}
+
 export function usageAstFromSelection(ast: TypedFilterAst, selection: UsageSelection): TypedFilterAst | undefined {
   if (usageAstIssue(ast)) return undefined;
   const range = usageRange(selection);
