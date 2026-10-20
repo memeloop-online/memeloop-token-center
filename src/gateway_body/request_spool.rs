@@ -123,7 +123,9 @@ impl RequestSpoolAdmission {
                         .ok_or(RequestSpoolCaptureError::MemoryExhausted)
                 })
                 .transpose()?;
-            for piece in chunk.chunks(REQUEST_SPOOL_CHUNK_BYTES) {
+            for offset in (0..chunk.len()).step_by(REQUEST_SPOOL_CHUNK_BYTES) {
+                let end = (offset + REQUEST_SPOOL_CHUNK_BYTES).min(chunk.len());
+                let piece = &chunk[offset..end];
                 let next = capture
                     .length
                     .checked_add(piece.len())
@@ -135,7 +137,7 @@ impl RequestSpoolAdmission {
                 let write_metadata = metadata.clone();
                 let write_frame = frame_memory.clone();
                 let write_lease = capture.lease.clone();
-                let write_bytes = piece.to_vec();
+                let write_bytes = chunk.slice(offset..end);
                 #[cfg(test)]
                 let blocking_write = self.usage.blocking_write.clone();
                 let writing = tokio::task::spawn_blocking(move || {
@@ -145,7 +147,7 @@ impl RequestSpoolAdmission {
                     if let Some(pause) = blocking_write {
                         pause.block();
                     }
-                    let mut remaining = write_bytes.as_slice();
+                    let mut remaining = write_bytes.as_ref();
                     while !remaining.is_empty() {
                         let written = match std::io::Write::write(&mut writer, remaining) {
                             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
