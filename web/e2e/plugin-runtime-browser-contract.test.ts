@@ -2,8 +2,90 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
 import { createIsolatedFixtureServer as createServer } from './support/isolated-vite-server.js';
+
+for (const refresh of ['poll', 'manual'] as const) {
+  test(`Slow ${refresh} history read reaches review without background ticks superseding it`, { timeout: 60_000 }, async context => {
+    if (!existsSync(chromium.executablePath())) {
+      if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+      context.skip('Chromium not installed'); return;
+    }
+    let historyReads = 0;
+    let releaseHistory: () => void = () => undefined;
+    const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
+    let signalSlowRead: () => void = () => undefined;
+    const slowRead = new Promise<void>(resolve => { signalSlowRead = resolve; });
+    // Serve real HTTP responses so the browser fetch and independent status/history
+    // completion paths are exercised, without replacing application timers.
+    const server = await createServer({
+      root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent',
+      server: { host: '127.0.0.1', port: 0 },
+      plugins: [{ name: 'slow-runtime-http-fixture', configureServer(server) {
+        server.middlewares.use((request, response, next) => {
+          const path = request.url?.split('?')[0];
+          if (!path?.startsWith('/internal/v1/')) { next(); return; }
+          assert.equal(request.headers.authorization, 'Bearer operator-test');
+          const send = (value: unknown) => {
+            response.setHeader('Content-Type', 'application/json');
+            response.end(JSON.stringify(value));
+          };
+          if (path === '/internal/v1/plugins/runtime-access') {
+            send({ can_view_runtime: true, can_manage_runtime: true });
+          } else if (path === '/internal/v1/plugin-runtime/history') {
+            const read = ++historyReads;
+            const history = (status: string) => ({
+              runtime_enabled: true, installation_enabled: true, revisions: [], audit: [],
+              installations: [{ id: 'slow-job', inventory_id: 'slow-install', actor: 'service:operator', status,
+                packages: ['fixture-package'], completed_packages: status === 'review' ? 1 : 0,
+                base_revision: 1, review_digest: status === 'review' ? 'exact-review' : null,
+                review: null, failure_category: null, created_at: 1, updated_at: 2 }],
+            });
+            if (read === 1) send(history('installing'));
+            else {
+              signalSlowRead();
+              void historyGate.then(() => send(history('review')));
+            }
+          } else if (path === '/internal/v1/plugin-runtime/installer-network') {
+            send({ mode: 'default' });
+          } else if (path === '/internal/v1/plugin-runtime') {
+            send({ current: { revision: 1, inventory_id: 'baseline', reason: 'initial' }, candidates: [] });
+          } else {
+            response.statusCode = 404;
+            send({ error: { message: 'Unexpected fixture request' } });
+          }
+        });
+      } }],
+    });
+    await server.listen();
+    const address = server.httpServer!.address();
+    assert.ok(address && typeof address === 'object');
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    try {
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/plugin-runtime.html`);
+      await page.getByRole('button', { name: 'Tasks and version records' }).click();
+      await page.getByText('slow-install', { exact: true }).waitFor();
+      assert.equal(await page.getByRole('button', { name: 'Approve permissions', exact: true }).count(), 0);
+      if (refresh === 'manual') await page.getByRole('button', { name: 'Refresh runtime', exact: true }).click();
+      await slowRead;
+      // Keep the response pending across two actual 3-second poll intervals.
+      await delay(6500);
+      assert.equal(historyReads, 2, 'polling does not start a replacement while the history response is pending');
+      releaseHistory();
+      const approve = page.getByRole('button', { name: 'Approve permissions', exact: true });
+      await approve.waitFor({ timeout: 10_000 });
+      assert.equal(await approve.isDisabled(), true, 'permissions still require explicit manifest review');
+      await page.getByRole('button', { name: 'Review manifest and requested capabilities' }).waitFor();
+    } finally {
+      releaseHistory();
+      await browser.close();
+      await server.close();
+    }
+  });
+}
 
 test('Operator plugin page installs, explicitly reviews, publishes and rolls back despite broken active catalog', { timeout: 60_000 }, async context => {
   if (!existsSync(chromium.executablePath())) {

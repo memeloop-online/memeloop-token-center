@@ -150,7 +150,7 @@ async fn install_strategy(
 }
 
 #[tokio::test]
-async fn installed_hook_without_group_configuration_skips_candidate_health_snapshot() {
+async fn installed_hook_without_group_configuration_retains_native_candidates() {
     let upstream = MockServer::start().await;
     let label = "group-native-fast-path";
     let mut fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
@@ -162,14 +162,18 @@ async fn installed_hook_without_group_configuration_skips_candidate_health_snaps
         .execute(&pool)
         .await
         .unwrap();
-    // This isolated test database intentionally makes the larger batch query
-    // impossible. The native-only path needs only the group existence query.
-    sqlx::query("DROP TABLE upstream_account_health")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Use a real authorized candidate: the single batch must return no policy
+    // for its native group, without invoking the installed hook.
+    let route_id: String = sqlx::query_scalar(
+        "SELECT id FROM model_routes WHERE tenant_id = $1 AND upstream_account_id = $2",
+    )
+    .bind(tenant.to_string())
+    .bind(fixture.accounts[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let mut candidates = vec![crate::provider::AuthorizedUpstreamCandidate {
-        route_id: Uuid::now_v7(),
+        route_id: Uuid::parse_str(&route_id).unwrap(),
         account_id: fixture.accounts[0],
         driver: "openai".into(),
         transport_revision: 1,

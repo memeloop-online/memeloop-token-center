@@ -12,7 +12,7 @@ const TEXT_ROUTES: [&str; 5] = [
 #[tokio::test]
 async fn responses_empty_uploads_account_before_first_chunk_and_cancel() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = Arc::new(memory::ProxyMemoryBudget::new(64 * 1024 * 1024));
     let mut tasks = Vec::new();
     for index in 0..65 {
@@ -48,7 +48,7 @@ async fn responses_empty_uploads_account_before_first_chunk_and_cancel() {
 #[tokio::test]
 async fn responses_full_memory_rejects_before_poll_or_spool_open() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(1024 * 1024);
     let held = budget.reservation();
     assert!(held.try_grow(1024 * 1024, 1));
@@ -79,7 +79,7 @@ async fn responses_full_memory_rejects_before_poll_or_spool_open() {
 #[tokio::test]
 async fn responses_frame_budget_and_spool_owner_release_independently() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     for path in ["/v1/responses", "/v1/responses/compact"] {
         let budget = memory::ProxyMemoryBudget::new(128 * 1024);
         assert!(matches!(
@@ -145,7 +145,7 @@ async fn admit(
 #[tokio::test]
 async fn metered_text_reads_bypass_count_and_refund_unused_bytes() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
     for path in TEXT_ROUTES {
         let request = Request::post(path)
@@ -176,7 +176,7 @@ async fn metered_text_reads_bypass_count_and_refund_unused_bytes() {
 #[tokio::test]
 async fn metered_text_full_byte_budget_rejects_before_body_poll() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
     let held = budget.reservation();
     assert!(held.try_grow(16 * 1024 * 1024, 1));
@@ -202,7 +202,7 @@ async fn metered_text_full_byte_budget_rejects_before_body_poll() {
 #[tokio::test]
 async fn readers_without_complete_byte_admission_keep_the_count_gate() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(128 * 1024 * 1024);
     for path in [
         "/v1/images/generations",
@@ -239,7 +239,7 @@ async fn readers_without_complete_byte_admission_keep_the_count_gate() {
 #[tokio::test]
 async fn metered_text_length_and_chunk_rejections_release_bytes() {
     let directory = tempfile::tempdir().unwrap();
-    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned(), 1024 * 1024);
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
     for path in TEXT_ROUTES {
         for request in [

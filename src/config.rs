@@ -12,8 +12,6 @@ pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
-pub const DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 64 * 1024 * 1024;
-pub const MAX_RESPONSES_REQUEST_SPOOL_BYTES: u32 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
 pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
@@ -171,9 +169,6 @@ pub struct Config {
     /// Maximum `/v1/responses` request body size. It is separately admitted so
     /// its 16 MiB default cannot consume all general body-read capacity.
     pub responses_body_max_bytes: u32,
-    /// Process-local node-disk budget for authenticated Responses request spools.
-    #[serde(default = "default_responses_request_spool_bytes")]
-    pub responses_request_spool_bytes: u32,
     /// Absolute writable directory mounted only into gateway-capable roles.
     #[serde(default = "default_responses_request_spool_path")]
     pub responses_request_spool_path: String,
@@ -258,10 +253,6 @@ impl std::fmt::Debug for Config {
                 &self.gateway_body_read_concurrency,
             )
             .field("responses_body_max_bytes", &self.responses_body_max_bytes)
-            .field(
-                "responses_request_spool_bytes",
-                &self.responses_request_spool_bytes,
-            )
             .field(
                 "responses_request_spool_path",
                 &self.responses_request_spool_path,
@@ -459,10 +450,6 @@ impl Config {
                 "MTC_RESPONSES_BODY_MAX_BYTES",
                 DEFAULT_RESPONSES_BODY_MAX_BYTES,
             )?),
-            responses_request_spool_bytes: env_u32(
-                "MTC_RESPONSES_REQUEST_SPOOL_BYTES",
-                DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
-            )?,
             responses_request_spool_path: env_string(
                 "MTC_RESPONSES_REQUEST_SPOOL_PATH",
                 DEFAULT_RESPONSES_REQUEST_SPOOL_PATH,
@@ -546,10 +533,7 @@ impl Config {
                     std::path::Component::RootDir | std::path::Component::Normal(_)
                 )
             });
-        if self.responses_request_spool_bytes < self.responses_body_max_bytes
-            || self.responses_request_spool_bytes > MAX_RESPONSES_REQUEST_SPOOL_BYTES
-            || !valid_spool_path
-        {
+        if !valid_spool_path {
             return Err(ConfigError::InvalidResponsesRequestSpool);
         }
         Ok(())
@@ -566,7 +550,6 @@ impl Config {
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
-            responses_request_spool_bytes: DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES,
             responses_request_spool_path: std::env::temp_dir()
                 .join("memeloop-token-center-request-spool")
                 .to_string_lossy()
@@ -732,10 +715,6 @@ fn responses_body_max_bytes(value: u32) -> u32 {
     value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
 }
 
-const fn default_responses_request_spool_bytes() -> u32 {
-    DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
-}
-
 fn default_responses_request_spool_path() -> String {
     DEFAULT_RESPONSES_REQUEST_SPOOL_PATH.to_owned()
 }
@@ -755,7 +734,7 @@ pub enum ConfigError {
     )]
     InvalidProxyMemoryBudget,
     #[error(
-        "MTC_RESPONSES_REQUEST_SPOOL_BYTES must cover MTC_RESPONSES_BODY_MAX_BYTES and remain at most 2 GiB; MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
+        "MTC_RESPONSES_REQUEST_SPOOL_PATH must be an absolute non-root path without traversal components"
     )]
     InvalidResponsesRequestSpool,
     #[error(
@@ -787,6 +766,17 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_spool_budget_deserializes_and_is_removed_on_configuration_rewrite() {
+        let mut document =
+            serde_json::to_value(Config::for_test("sqlite::memory:".to_owned())).unwrap();
+        document["responses_request_spool_bytes"] = serde_json::json!(1);
+        let loaded: Config = serde_json::from_value(document).unwrap();
+        assert!(loaded.validate_proxy_memory_budget().is_ok());
+        let rewritten = serde_json::to_value(loaded).unwrap();
+        assert!(rewritten.get("responses_request_spool_bytes").is_none());
+    }
 
     #[test]
     fn terminal_projection_default_and_explicit_rollback_survive_configuration_loading() {
@@ -1040,17 +1030,8 @@ mod tests {
             config.responses_body_read_concurrency,
             DEFAULT_RESPONSES_BODY_READ_CONCURRENCY
         );
-        assert_eq!(
-            config.responses_request_spool_bytes,
-            DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES
-        );
         assert!(std::path::Path::new(&config.responses_request_spool_path).is_absolute());
-        config.responses_request_spool_bytes = config.responses_body_max_bytes - 1;
-        assert!(matches!(
-            config.validate_proxy_memory_budget(),
-            Err(ConfigError::InvalidResponsesRequestSpool)
-        ));
-        config.responses_request_spool_bytes = DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES;
+        assert!(config.validate_proxy_memory_budget().is_ok());
         config.responses_request_spool_path = "relative/request-spool".to_owned();
         assert!(matches!(
             config.validate_proxy_memory_budget(),

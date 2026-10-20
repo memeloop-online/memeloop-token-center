@@ -38,6 +38,168 @@ async fn management_request_with_token(
 }
 
 #[tokio::test]
+async fn session_title_uses_system_route_billing_and_bounded_first_latest_excerpts() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(json!({
+            "model":"gpt-5.6-sol","stream":false,"max_output_tokens":256
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"resp_session_title", "object":"response", "status":"completed",
+            "model":"gpt-5.6-sol",
+            "output":[{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"Session history diagnosis"}
+            ]}],
+            "usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("session-title", &upstream, 0).await;
+    let tenant = "compatibility-route-session-title";
+    let billing = fixture
+        .state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "title-billing-owner".into(),
+                alias: "system-title-billing".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[fixture.route_id],
+            &[],
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let saved = management_request(
+        &fixture,
+        "/internal/v1/filter-assistant/settings",
+        "PUT",
+        json!({"tenant_external_id":tenant,"model_route_id":fixture.route_id,
+            "billing_key_id":billing.key_id,"expected_updated_at":null}),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let owner = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let hints = crate::conversation::ConversationHints {
+        session_id: Some("title-http-session".into()),
+        ..Default::default()
+    };
+    let mut cluster = None;
+    for (index, content) in [
+        format!("First topic: diagnose history. {}", "首😀".repeat(5000)),
+        format!("Latest task: verify reset. {}", "尾😀".repeat(5000)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut transaction = fixture.state.db.begin_write_transaction().await.unwrap();
+        let observed = fixture
+            .state
+            .db
+            .record_conversation_observation_in_transaction(
+                &mut transaction,
+                crate::db::ConversationObservationInput {
+                    key: &owner,
+                    request_id: Uuid::now_v7(),
+                    request_json: &json!({"input":[{"role":"user","content":content}]}),
+                    hints: &hints,
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: 100 + index as i64,
+                    attach_request_record: false,
+                    content_materialized: false,
+                },
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        if let Some(previous) = cluster {
+            assert_eq!(previous, observed);
+        }
+        cluster = Some(observed);
+    }
+    let cluster = cluster.unwrap();
+    // Initial ingestion enqueues automatically; manual repeated requests
+    // coalesce with the same outstanding job rather than multiplying billing.
+    let title_path = format!(
+        "/internal/v1/sessions/{cluster}/title?tenant_external_id={tenant}&key_id={}",
+        owner.key_id
+    );
+    let initial = management_request(&fixture, &title_path, "GET", json!({})).await;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial: Value =
+        serde_json::from_slice(&to_bytes(initial.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(
+        initial["state"], "pending",
+        "initial ingestion queues a title"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            management_request(&fixture, &title_path, "POST", json!({}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    crate::api::session_titles::process_one(&fixture.state)
+        .await
+        .unwrap();
+    let response = management_request(&fixture, &title_path, "GET", json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let title: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(title["title"], "Session history diagnosis");
+    assert_eq!(title["state"], "ready");
+    let requests = upstream.received_requests().await.unwrap();
+    let wire: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let excerpts: Value = serde_json::from_str(wire["input"].as_str().unwrap()).unwrap();
+    assert!(
+        excerpts["beginning"]
+            .as_str()
+            .unwrap()
+            .contains("First topic")
+    );
+    assert!(excerpts["latest"].as_str().unwrap().contains("Latest task"));
+    for side in ["beginning", "latest"] {
+        assert!(excerpts[side].as_str().unwrap().chars().count() <= 1024);
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let recorded = sqlx::query(
+        "SELECT key_id, model_route_id, cost_micros FROM request_records WHERE key_id = $1",
+    )
+    .bind(billing.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(billing.key_id, owner.key_id);
+    assert_eq!(
+        recorded.get::<String, _>("key_id"),
+        billing.key_id.to_string()
+    );
+    assert_eq!(
+        recorded.get::<String, _>("model_route_id"),
+        fixture.route_id.to_string()
+    );
+    assert!(recorded.get::<i64, _>("cost_micros") > 0);
+    crate::api::session_titles::process_one(&fixture.state)
+        .await
+        .unwrap();
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn assistant_invokes_selected_route_and_bills_explicit_key_then_rejects_disabled_route() {
     let upstream = MockServer::start().await;
     let suggestion = json!({"logical_operator":"and","conditions":[{"field":"duration_ms","operator":"greater_than","value":{"type":"integer","value":2750}}]});

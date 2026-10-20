@@ -25,6 +25,50 @@ type BucketMember = (
 type StrategyBuckets = BTreeMap<(std::cmp::Reverse<i32>, String), Vec<BucketMember>>;
 type CandidateKey = (Uuid, Uuid, i64);
 
+/// Snapshot diagnostics deliberately exclude policy, identity and SQL data.
+/// Drop records interruption when the enclosing preparation budget expires.
+struct SnapshotPhase {
+    request_id: Uuid,
+    stage: &'static str,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl SnapshotPhase {
+    fn new(request_id: Uuid, stage: &'static str) -> Self {
+        let phase = Self {
+            request_id,
+            stage,
+            started: std::time::Instant::now(),
+            finished: false,
+        };
+        phase.emit("started");
+        phase
+    }
+
+    fn finish(mut self, outcome: &'static str) {
+        self.emit(outcome);
+        self.finished = true;
+    }
+
+    fn emit(&self, outcome: &'static str) {
+        tracing::info!(
+            request_id = %self.request_id,
+            stage = self.stage,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            outcome,
+        );
+    }
+}
+
+impl Drop for SnapshotPhase {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("not_completed");
+        }
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -315,11 +359,6 @@ async fn prepare_inner(
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
 ) -> Result<(), AppError> {
-    // This runs inside the whole-stage deadline, and avoids the larger
-    // candidate/group/health join for tenants retaining native scheduling.
-    if !state.db.has_group_routing_strategies(tenant_id).await? {
-        return Ok(());
-    }
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
     // an unbounded request stall. Only one blocking hook is ever outstanding.
@@ -341,10 +380,20 @@ async fn prepare_inner(
             )
         })
         .collect::<Vec<_>>();
+    // The authorized candidate batch already returns no bindings for native
+    // groups. A tenant-wide existence preflight would add a serial DB round
+    // trip inside the same 250ms preparation budget, without authorizing data.
+    let binding_snapshot = SnapshotPhase::new(request_id, "group_routing_candidate_snapshot");
     let bindings = state
         .db
         .candidate_group_strategies(tenant_id, &candidate_ids)
-        .await?
+        .await;
+    binding_snapshot.finish(if bindings.is_ok() {
+        "returned"
+    } else {
+        "error"
+    });
+    let bindings = bindings?
         .into_iter()
         .map(|(route, account, binding)| ((route, account, binding.generation), binding))
         .collect::<BTreeMap<_, _>>();
@@ -377,10 +426,17 @@ async fn prepare_inner(
         .iter()
         .map(|(key, scope)| (key.1, key.2, scope.id.clone()))
         .collect::<Vec<_>>();
+    let signal_snapshot = SnapshotPhase::new(request_id, "group_routing_transient_snapshot");
     let scoped_signals = state
         .db
         .group_routing_v2_transient_signals(&scoped_signal_keys)
-        .await?
+        .await;
+    signal_snapshot.finish(if scoped_signals.is_ok() {
+        "returned"
+    } else {
+        "error"
+    });
+    let scoped_signals = scoped_signals?
         .into_iter()
         .map(|entry| {
             (
@@ -429,7 +485,8 @@ async fn prepare_inner(
     let quota_observations = if quota_candidates.is_empty() {
         BTreeMap::new()
     } else {
-        match tokio::time::timeout_at(
+        let quota_snapshot = SnapshotPhase::new(request_id, "group_routing_quota_snapshot");
+        let result = tokio::time::timeout_at(
             hook_deadline,
             crate::upstream_quota::observations::routing_observations(
                 state,
@@ -438,8 +495,13 @@ async fn prepare_inner(
                 crate::db::unix_millis(),
             ),
         )
-        .await
-        {
+        .await;
+        quota_snapshot.finish(match &result {
+            Ok(Ok(_)) => "returned",
+            Ok(Err(_)) => "error",
+            Err(_) => "deadline",
+        });
+        match result {
             Ok(Ok(observations)) => observations,
             Ok(Err(error)) => {
                 tracing::warn!(%request_id, stage="group_routing_quota_fallback", reason="read_failed", error_category=error.diagnostic_category(), accounts=quota_candidates.len(), "quota observation unavailable; native order retained");

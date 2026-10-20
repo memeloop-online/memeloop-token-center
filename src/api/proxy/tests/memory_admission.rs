@@ -5,10 +5,8 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
     use axum::body::Body;
 
     let directory = tempfile::tempdir().unwrap();
-    let admission = crate::gateway_body::request_spool::RequestSpoolAdmission::new(
-        directory.path().to_owned(),
-        1024 * 1024,
-    );
+    let admission =
+        crate::gateway_body::request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let source = Bytes::from_static(br#"{"model":"gpt-5.6-sol","input":"source-backed"}"#);
     let spool = std::sync::Arc::new(
         admission

@@ -451,6 +451,32 @@ test("image quarantine reconciliation never implies successful delivery or a res
 });
 
 // Discovery embeds the generated JSON; keep it semantically equal to YAML.
+test("session context contracts expose bounded signed reads and separate title execution authority", () => {
+  const document = cloneDocument();
+  for (const prefix of ["/internal/v1", "/self/v1"]) {
+    const base = `${prefix}/sessions/{session_id}/requests/{request_id}/context`;
+    for (const suffix of ["", "/content"]) {
+      const operation = document.paths[base + suffix].get;
+      assert.deepEqual(operation.security, prefix === "/internal/v1" ? [{ serviceBearer: [] }] : [{ clientBearer: [] }]);
+      assert.equal(operation["x-required-scope"], prefix === "/internal/v1" ? "requests:read" : undefined);
+      assert.equal(operation.responses["200"].content["application/json"].schema.$ref,
+        `#/components/schemas/${suffix ? "SessionContextContent" : "SessionContextPage"}`);
+      assert.ok(operation.responses["404"]);
+      assert.ok(operation.responses["409"]);
+    }
+  }
+  const title = document.paths["/internal/v1/sessions/{session_id}/title"];
+  assert.equal(title.get["x-required-scope"], "requests:read");
+  assert.equal(title.post["x-required-scope"], "filter_assistant:execute");
+  assert.deepEqual(title.post["x-additional-required-scopes"], ["requests:read"]);
+  const schemas = document.components.schemas;
+  assert.equal(schemas.SessionContextPage.properties.items.maxItems, 32);
+  assert.equal(schemas.SessionContextContent.properties.content.maxLength, 16384);
+  assert.deepEqual(schemas.SessionContextContent.properties.representation.enum, ["semantic_context", "message_text"]);
+  assert.equal(schemas.SessionGeneratedTitle.properties.title.maxLength, 80);
+  assert.ok(schemas.SessionContextItem.required.includes("text_cursor"));
+});
+
 test("runtime discovery JSON matches the canonical OpenAPI contract", () => {
   const embedded = JSON.parse(readFileSync(new URL("../../openapi/openapi.json", import.meta.url), "utf8"));
   assert.deepEqual(embedded, cloneDocument());

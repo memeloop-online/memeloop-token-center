@@ -91,7 +91,17 @@ mod routing;
 pub use routing::egress;
 mod rows;
 mod session_analytics;
+mod session_reading;
+mod session_reading_lifecycle;
+pub(crate) use session_reading_lifecycle::merge_session_reading_in_transaction;
+mod session_responses;
+pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
+pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+mod session_titles;
+pub(crate) use session_titles::{
+    SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
+};
 mod tenants;
 mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;

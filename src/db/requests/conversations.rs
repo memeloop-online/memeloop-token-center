@@ -162,8 +162,11 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() == 0 {
-        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1")
+        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, projected_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
+        let completed = existing
+            .try_get::<Option<i64>, _>("projected_at")?
+            .is_some();
         if existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
             || existing.try_get::<String, _>("key_id")? != key.key_id.to_string()
             || existing.try_get::<String, _>("principal_id")? != key.principal_id.to_string()
@@ -182,12 +185,22 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
                 .try_get::<Option<String>, _>("key_snapshot_json")?
                 .as_deref()
                 != Some(key_snapshot.as_str())
-            || existing.try_get::<Option<String>, _>("semantic_snapshot_json")? != semantic_snapshot
+            || !semantic_payload::snapshot_matches(
+                existing
+                    .try_get::<Option<String>, _>("semantic_snapshot_json")?
+                    .as_deref(),
+                semantic_snapshot.as_deref(),
+                completed,
+            )
             || (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some()
         {
             return Err(AppError::Conflict(
                 "conversation projection evidence does not match its owner".into(),
             ));
+        }
+        if completed {
+            // A matching replay must not resurrect a consumed body payload.
+            return Ok(());
         }
     }
     if let Some((body, digest)) = payload {
@@ -545,12 +558,14 @@ impl Database {
             )
             .await?;
         }
+        let receipt = task.try_get::<Option<String>, _>("semantic_snapshot_json")?.as_deref().map(semantic_payload::completed_receipt);
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
         .bind(now)
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
+        .bind(receipt)
         .execute(&mut *transaction)
         .await?;
         if acknowledged.rows_affected() != 1 {
@@ -1068,6 +1083,15 @@ impl Database {
         .bind(candidate_edge_increment)
         .execute(&mut **transaction)
         .await?;
+        if client_name != Some("session-title")
+            && hints
+                .session_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
+            enqueue_initial_session_title(transaction, key.tenant_id, key.key_id, cluster_id)
+                .await?;
+        }
         if let Some(request_created_at) = request_created_at {
             let attached = sqlx::query(
                 "UPDATE request_records SET conversation_cluster_id = $1 WHERE id = $2 AND created_at = $3",
@@ -1184,11 +1208,15 @@ impl Database {
             candidate_edge_count: cluster_row.try_get("candidate_edge_count")?,
         };
         let limit = filter.limit.clamp(1, 200);
+        // Bound each ordered source before touching archive spools. Applying
+        // only the outer LIMIT makes large sessions hash-join the entire spool
+        // tables and sort the complete history just to display one page.
+        // Keep the cursor inside both sources as well as on the merged page.
         let request_rows = if let (Some(before_created_at), Some(before_request_id)) =
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 AND (created_at < $3 OR (created_at = $3 AND id < $4)) ORDER BY created_at DESC, id DESC LIMIT $5) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 AND (source_started_at < $3 OR (source_started_at = $3 AND archive_request_id < $4)) ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $5) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -1199,7 +1227,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM request_records r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $3) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -1626,6 +1654,14 @@ async fn merge_conversation_clusters_in_transaction(
     if target_cluster.rows_affected() != 1 {
         return Err(AppError::Internal);
     }
+    merge_session_reading_in_transaction(
+        transaction,
+        tenant_id,
+        key_id,
+        &source_cluster_id,
+        &target_cluster_id,
+    )
+    .await?;
     sqlx::query("DELETE FROM conversation_key_clusters WHERE key_id = $1 AND cluster_id = $2")
         .bind(key_id)
         .bind(&source_cluster_id)

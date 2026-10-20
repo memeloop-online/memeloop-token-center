@@ -58,6 +58,8 @@ async fn conversion_contract(url: &str) {
         .unwrap();
     for statement in [
         "DROP TABLE application_plugin_release_resolutions",
+        "DROP TABLE session_generated_titles",
+        "DROP TABLE session_response_summaries",
         "DROP TABLE plugin_installer_network_snapshots",
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
