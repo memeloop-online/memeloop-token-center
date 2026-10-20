@@ -637,11 +637,20 @@ pub(super) async fn authenticate_downstream(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedKey, AppError> {
+    use tracing::Instrument;
+
     let provided = downstream_credential(headers).ok_or(AppError::Unauthorized)?;
-    state
+    let authentication = state
         .db
-        .authenticate_key(provided, state.config.key_pepper.as_bytes())
-        .await
+        .authenticate_key(provided, state.config.key_pepper.as_bytes());
+    match proxy_diagnostics::CONTEXT.try_with(|context| context.request_id) {
+        Ok(request_id) => {
+            authentication
+                .instrument(tracing::info_span!("downstream_key_authentication", %request_id))
+                .await
+        }
+        Err(_) => authentication.await,
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
