@@ -18,6 +18,8 @@ use crate::{
     model::{AuthenticatedKey, TokenUsage, UsageReservation},
 };
 
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(remote = "UsageReservation")]
 struct ReservationWire {
@@ -317,6 +319,7 @@ struct Pending {
     activity: Option<ProxyLifecycleActivity>,
     retained: Option<Box<dyn Send>>,
     running: bool,
+    retry_after: tokio::time::Instant,
     durable: bool,
     applied: bool,
     reconcile: bool,
@@ -382,7 +385,7 @@ impl Journal {
                 journal.start_unknown(&database);
                 tokio::select! {
                     _ = journal.wake.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = tokio::time::sleep(RETRY_INTERVAL) => {},
                 }
                 drop(journal);
             }
@@ -499,6 +502,7 @@ impl Journal {
                 activity: None,
                 retained: Some(Box::new(retained)),
                 running: false,
+                retry_after: tokio::time::Instant::now(),
                 durable: false,
                 applied: false,
                 reconcile: false,
@@ -791,6 +795,7 @@ impl Journal {
                     activity: None,
                     retained: None,
                     running: false,
+                    retry_after: tokio::time::Instant::now(),
                     durable: true,
                     applied: false,
                     reconcile: false,
@@ -919,10 +924,9 @@ impl Journal {
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for entry in pending
-            .values_mut()
-            .filter(|entry| !entry.running && !entry.reconcile)
-        {
+        for entry in pending.values_mut().filter(|entry| {
+            !entry.running && !entry.reconcile && tokio::time::Instant::now() >= entry.retry_after
+        }) {
             entry.running = true;
             let journal = self.clone();
             let database = database.clone();
@@ -1102,6 +1106,7 @@ impl Journal {
             tracing::info!(%request_id, %receipt_id, financial_state = "settled", "terminal settlement acknowledged and receipt retired");
         } else if let Some(entry) = pending.get_mut(&receipt_id) {
             entry.running = false;
+            entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
             entry.durable = durable;
             entry.applied = applied;
             entry.reconcile = reconcile;
@@ -1131,6 +1136,105 @@ impl Drop for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unrelated_wakes_do_not_accelerate_failed_publications_or_delay_new_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("retry.db").display()
+        ))
+        .await
+        .unwrap();
+        let unavailable = directory.path().join("journal-is-a-file");
+        std::fs::write(&unavailable, b"not a directory").unwrap();
+        let journal = Journal::new(unavailable, database.clone());
+        journal.stop_for_test().await;
+        let reservation = UsageReservation {
+            id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            key_id: Uuid::now_v7(),
+            enforcement_mode: crate::model::EnforcementMode::MeteredUnlimited,
+            reserved_micros: 0,
+            input_micros_per_million: 1,
+            output_micros_per_million: 1,
+            price_tiers: Vec::new(),
+            rate_window_start: 0,
+            reserved_tokens: 16,
+        };
+        let snapshot = Snapshot::capture(
+            FinishProxyRequest {
+                request_id: Uuid::now_v7(),
+                tenant_id: Uuid::now_v7(),
+                reservation: &reservation,
+                input_token_ceiling: 8,
+                output_token_ceiling: 8,
+                requested_service_tier: None,
+                status_code: 200,
+                duration_ms: 1,
+                first_output_ms: None,
+                generation_duration_ms: None,
+                usage: TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+                usage_basis: Some(crate::model::RequestUsageBasis::ProviderReported),
+                terminal_cause: None,
+                error_code: None,
+                response_object: "gap://retry-test/response",
+                routing_session_id: None,
+                routing_terminal_observed_at: None,
+                conversation: None,
+            },
+            ProxyRequestUpstreamAttribution::KeepSelected,
+            None,
+            false,
+            "buffered_response_ready",
+        );
+        tokio::time::pause();
+        journal.submit_with_preparation(snapshot.clone(), (), async { None });
+        journal.start_pending(&database);
+        finish_attempts(&journal).await;
+        assert_eq!(journal.failed_publications_for_test(), 1);
+        for _ in 0..100 {
+            journal.start_pending(&database);
+            assert!(journal.tasks.lock().unwrap().is_empty());
+        }
+        let mut second = snapshot.clone();
+        second.request_id = Uuid::now_v7();
+        second.receipt_id = Uuid::now_v7();
+        journal.submit_with_preparation(second, (), async { None });
+        journal.start_pending(&database);
+        finish_attempts(&journal).await;
+        assert_eq!(journal.failed_publications_for_test(), 2);
+        tokio::time::advance(RETRY_INTERVAL).await;
+        journal.start_pending(&database);
+        finish_attempts(&journal).await;
+        assert_eq!(journal.failed_publications_for_test(), 4);
+        {
+            let pending = journal.pending.lock().unwrap();
+            assert_eq!(pending.len(), 2);
+            let retained = pending.get(&snapshot.receipt_id).unwrap();
+            assert!(!retained.durable);
+            assert!(!retained.applied);
+            assert!(retained.retained.is_some());
+            assert_eq!(
+                serde_json::to_value(&*retained.snapshot).unwrap(),
+                serde_json::to_value(snapshot).unwrap()
+            );
+        }
+        tokio::time::resume();
+        journal.stop_for_test().await;
+        database.close().await;
+    }
+
+    async fn finish_attempts(journal: &Journal) {
+        let tasks = std::mem::take(&mut *journal.tasks.lock().unwrap());
+        for (_, task) in tasks {
+            task.await.unwrap();
+        }
+    }
 
     fn owned_conversation() -> OwnedConversation {
         let mut key = AuthenticatedKey {

@@ -886,7 +886,7 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         .await
         .unwrap();
     fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        unavailable,
+        unavailable.clone(),
         fixture.state.db.independent_persistence_pool(),
     );
     let upstream = MockServer::start().await;
@@ -940,6 +940,27 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
             .await
             .unwrap();
     assert_eq!(state, "pending");
+    let charges: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(charges, 0);
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    tokio::fs::remove_file(unavailable).await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let recovered = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(recovered[0].request_id, record.request_id);
+    assert_eq!(
+        (recovered[0].input_tokens, recovered[0].output_tokens),
+        (3, 2)
+    );
+    assert_exactly_once_side_effects(&fixture, record.request_id, Some("resp-codex")).await;
     pool.close().await;
     fixture.state.pending_terminals.stop_for_test().await;
     upstream.verify().await;
