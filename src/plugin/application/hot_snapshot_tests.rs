@@ -18,20 +18,11 @@ async fn authority(directory: &std::path::Path) -> Arc<ApplicationPlugins> {
     .unwrap();
     db.migrate().await.unwrap();
     let runtime = PluginRuntime::load(None, db.clone()).unwrap();
-    let inventories = ["a", "b"]
-        .into_iter()
-        .map(|id| {
-            let root = directory.join(id);
-            std::fs::create_dir(&root).unwrap();
-            (
-                id.to_owned(),
-                PreinstalledInventory {
-                    root,
-                    grants: BTreeMap::new(),
-                },
-            )
-        })
-        .collect();
+    let roots = [("a", directory.join("a")), ("b", directory.join("b"))];
+    for (id, root) in &roots {
+        super::tests::write_inventory(root, *id == "b");
+    }
+    let inventories = super::tests::inventory(&db, &roots);
     Arc::new(ApplicationPlugins::new(db, inventories, &runtime).unwrap())
 }
 
@@ -49,7 +40,8 @@ async fn publish(authority: &ApplicationPlugins, id: &str, expected: i64) {
 }
 
 #[tokio::test]
-async fn hot_snapshot_survives_unavailable_database_inventory_and_load_locks_until_expiry() {
+async fn hot_snapshot_serves_beyond_45_seconds_with_unavailable_database_inventory_and_load_locks()
+{
     let directory = tempfile::tempdir().unwrap();
     let authority = authority(directory.path()).await;
     assert!(authority.current_snapshot().is_err());
@@ -78,17 +70,24 @@ async fn hot_snapshot_survives_unavailable_database_inventory_and_load_locks_unt
         &pinned,
         &authority.current_snapshot().unwrap().unwrap()
     ));
-    authority.current.write().unwrap().confirmed = Some(tokio::time::Instant::now() - PIN_DEADLINE);
-    assert!(matches!(
-        authority.current_snapshot(),
-        Err(AppError::Overloaded)
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(90)).await;
+    assert!(authority.refresh_current().await.is_err());
+    assert!(Arc::ptr_eq(
+        &pinned,
+        &authority.current_snapshot().unwrap().unwrap()
     ));
-    assert_eq!(authority.refresh_status()["ready"], false);
+    assert_eq!(authority.refresh_status()["ready"], true);
+    assert_eq!(
+        authority.refresh_status()["error"],
+        "snapshot_refresh_failed"
+    );
+    assert_eq!(work_counts(&authority), work);
     assert_eq!(pinned.receipt.revision, 1);
 }
 
 #[tokio::test]
-async fn observed_new_head_withdraws_old_authority_while_compiling_then_swaps_whole_snapshot() {
+async fn slow_new_head_serves_old_snapshot_then_swaps_verified_runtime_catalog_and_receipt() {
     let directory = tempfile::tempdir().unwrap();
     let authority = authority(directory.path()).await;
     publish(&authority, "a", 0).await;
@@ -101,7 +100,19 @@ async fn observed_new_head_withdraws_old_authority_while_compiling_then_swaps_wh
     let refreshing = authority.clone();
     let task = tokio::spawn(async move { refreshing.refresh_current().await });
     entering.await.unwrap();
-    assert!(authority.current_snapshot().is_err());
+    assert!(Arc::ptr_eq(
+        &historical,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(authority.refresh_status()["ready"], true);
+    assert_eq!(
+        historical
+            .providers
+            .get("example-oauth-http")
+            .unwrap()
+            .source,
+        "plugin:example-policy-rewrite@1.0.0"
+    );
     assert_eq!(authority.refresh_status()["revision"]["revision"], 1);
     assert_eq!(historical.receipt.revision, 1);
     release.send(()).unwrap();
@@ -109,6 +120,11 @@ async fn observed_new_head_withdraws_old_authority_while_compiling_then_swaps_wh
     let current = authority.current_snapshot().unwrap().unwrap();
     assert_eq!(current.receipt.revision, 2);
     assert_eq!(current.runtime.receipt.revision, 2);
+    assert_eq!(current.runtime.runtime().manifests()[0].version, "1.0.1");
+    assert_eq!(
+        current.providers.get("example-oauth-http").unwrap().source,
+        "plugin:example-policy-rewrite@1.0.1"
+    );
     assert!(!Arc::ptr_eq(&historical, &current));
     assert!(Arc::ptr_eq(
         &historical,
@@ -136,7 +152,15 @@ async fn missing_head_never_reverts_a_published_runtime_to_baseline_and_recovery
         .await
         .unwrap();
     assert!(authority.refresh_current().await.is_err());
-    assert!(authority.current_snapshot().is_err());
+    assert!(Arc::ptr_eq(
+        &pinned,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(authority.refresh_status()["ready"], true);
+    assert_eq!(
+        authority.refresh_status()["error"],
+        "snapshot_refresh_failed"
+    );
     assert_eq!(authority.refresh_status()["revision"]["revision"], 1);
     let restarted = Arc::new(
         ApplicationPlugins::new(
@@ -186,7 +210,15 @@ async fn head_changed_during_compilation_is_not_activated() {
         .unwrap();
     release.send(()).unwrap();
     assert!(matches!(task.await.unwrap(), Err(AppError::Conflict(_))));
-    assert!(authority.current_snapshot().is_err());
+    assert!(Arc::ptr_eq(
+        &original,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(authority.refresh_status()["ready"], true);
+    assert_eq!(
+        authority.refresh_status()["error"],
+        "snapshot_refresh_failed"
+    );
     authority.refresh_current().await.unwrap();
     assert!(Arc::ptr_eq(
         &original,
@@ -195,7 +227,7 @@ async fn head_changed_during_compilation_is_not_activated() {
 }
 
 #[tokio::test]
-async fn cancelled_refresh_retains_verified_object_and_reports_failure_without_reauthorizing_it() {
+async fn cancelled_refresh_keeps_serving_verified_snapshot_and_reports_failure() {
     let directory = tempfile::tempdir().unwrap();
     let authority = authority(directory.path()).await;
     publish(&authority, "a", 0).await;
@@ -210,7 +242,11 @@ async fn cancelled_refresh_retains_verified_object_and_reports_failure_without_r
     entering.await.unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    assert!(authority.current_snapshot().is_err());
+    assert!(Arc::ptr_eq(
+        &original,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(authority.refresh_status()["ready"], true);
     assert_eq!(
         authority.refresh_status()["error"],
         "snapshot_refresh_cancelled"
@@ -231,6 +267,31 @@ async fn cancelled_refresh_retains_verified_object_and_reports_failure_without_r
         2
     );
     assert_eq!(authority.refresh_status()["error"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = authority(directory.path()).await;
+    publish(&authority, "a", 0).await;
+    authority.refresh_current().await.unwrap();
+    let original = authority.current_snapshot().unwrap().unwrap();
+    let _cache = authority.snapshots.lock().await;
+    tokio::time::pause();
+    let refresh = authority.refresh_current();
+    tokio::pin!(refresh);
+    assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(46)).await;
+    assert!(matches!(refresh.await, Err(AppError::Overloaded)));
+    assert!(Arc::ptr_eq(
+        &original,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
+    assert_eq!(authority.refresh_status()["ready"], true);
+    assert_eq!(
+        authority.refresh_status()["error"],
+        "snapshot_refresh_failed"
+    );
 }
 
 #[tokio::test]

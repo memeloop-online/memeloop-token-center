@@ -118,7 +118,7 @@ pub struct ApplicationPlugins {
 #[derive(Default)]
 struct CurrentSnapshot {
     snapshot: Option<Arc<ApplicationPluginSnapshot>>,
-    confirmed: Option<tokio::time::Instant>,
+    initialized: bool,
     error: Option<&'static str>,
 }
 
@@ -585,10 +585,7 @@ impl ApplicationPlugins {
 
     pub fn current_snapshot(&self) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
         let current = self.current.read().map_err(|_| AppError::Internal)?;
-        if !current
-            .confirmed
-            .is_some_and(|confirmed| confirmed.elapsed() < PIN_DEADLINE)
-        {
+        if !current.initialized {
             return Err(AppError::Overloaded);
         }
         Ok(current.snapshot.clone())
@@ -599,7 +596,7 @@ impl ApplicationPlugins {
             return json!({"ready": false, "error": "snapshot_lock_failed"});
         };
         json!({
-            "ready": current.confirmed.is_some_and(|confirmed| confirmed.elapsed() < PIN_DEADLINE),
+            "ready": current.initialized,
             "revision": current.snapshot.as_ref().map(|snapshot| &snapshot.receipt),
             "error": current.error,
         })
@@ -611,23 +608,15 @@ impl ApplicationPlugins {
             current: &self.current,
             completed: false,
         };
-        let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(PIN_DEADLINE, async {
             let head = self.db.optional_application_plugin_head().await?;
             {
-                let mut current = self.current.write().map_err(|_| AppError::Internal)?;
-                if current.snapshot.as_ref().map(|snapshot| &snapshot.receipt) != head.as_ref() {
-                    current.confirmed = None;
-                }
+                let current = self.current.read().map_err(|_| AppError::Internal)?;
                 if head.is_none() && current.snapshot.is_some() {
                     return Err(AppError::Forbidden);
                 }
             }
             if head.is_none() && !self.db.application_plugin_history(None).await?.is_empty() {
-                self.current
-                    .write()
-                    .map_err(|_| AppError::Internal)?
-                    .confirmed = None;
                 return Err(AppError::Forbidden);
             }
             let snapshot = match head.as_ref() {
@@ -635,17 +624,13 @@ impl ApplicationPlugins {
                 None => None,
             };
             if self.db.optional_application_plugin_head().await? != head {
-                self.current
-                    .write()
-                    .map_err(|_| AppError::Internal)?
-                    .confirmed = None;
                 return Err(AppError::Conflict(
                     "plugin head changed during refresh".into(),
                 ));
             }
             let mut current = self.current.write().map_err(|_| AppError::Internal)?;
             let previous = std::mem::replace(&mut current.snapshot, snapshot);
-            current.confirmed = Some(started);
+            current.initialized = true;
             current.error = None;
             drop(current);
             drop(previous);

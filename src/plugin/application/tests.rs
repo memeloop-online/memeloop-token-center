@@ -10,7 +10,7 @@ use wit_parser::Resolve;
 
 const PROVIDER: &str = "example-oauth-http";
 
-fn write_inventory(root: &std::path::Path, second: bool) {
+pub(super) fn write_inventory(root: &std::path::Path, second: bool) {
     let package = root.join("example-policy-rewrite");
     std::fs::create_dir_all(&package).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
@@ -61,7 +61,10 @@ fn write_inventory(root: &std::path::Path, second: bool) {
     .unwrap();
 }
 
-fn inventory(db: &Database, roots: &[(&str, PathBuf)]) -> BTreeMap<String, PreinstalledInventory> {
+pub(super) fn inventory(
+    db: &Database,
+    roots: &[(&str, PathBuf)],
+) -> BTreeMap<String, PreinstalledInventory> {
     roots
         .iter()
         .map(|(id, root)| {
@@ -489,6 +492,14 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .unwrap();
         assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
         assert!(matches!(
+            authority_a.refresh_current().await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_current,
+            &authority_a.current_snapshot().unwrap().unwrap()
+        ));
+        assert!(matches!(
             authority_a
                 .pin_historical(warm_current.receipt.revision)
                 .await,
@@ -520,6 +531,14 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .await
             .unwrap();
         assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
+        assert!(matches!(
+            authority_a.refresh_current().await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_current,
+            &authority_a.current_snapshot().unwrap().unwrap()
+        ));
         assert!(matches!(
             authority_a
                 .pin_historical(warm_current.receipt.revision)
@@ -553,6 +572,12 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     assert!(authority_a.pin_historical(1).await.is_err());
     assert!(authority_a.stage("a").await.is_err());
     assert!(second.refresh_application_plugins().await.is_err());
+    let retained = second.clone().pin_application_plugins().await.unwrap();
+    assert_policy(&retained, false).await;
+    assert_provider_phases(&retained, false).await;
+    let mut cold_state = second.clone();
+    cold_state.application_plugins = Some(cold_authority.clone());
+    assert!(cold_state.refresh_application_plugins().await.is_err());
     for path in [
         "/internal/v1/plugins",
         "/internal/v1/provider-types",
@@ -560,7 +585,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         "/internal/v1/plugins/example-policy-rewrite/data/feed",
     ] {
         let response =
-            crate::api::router_for_role(second.clone(), crate::config::RuntimeRole::Control)
+            crate::api::router_for_role(cold_state.clone(), crate::config::RuntimeRole::Control)
                 .oneshot(
                     Request::get(path)
                         .header(
@@ -618,13 +643,8 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         available.pinned_application_plugins.as_ref().unwrap(),
     ));
     assert_provider_phases(&available, false).await;
-    authority_a.current.write().unwrap().confirmed =
-        Some(tokio::time::Instant::now() - Duration::from_secs(45));
-    assert_eq!(authority_a.refresh_status()["ready"], false);
-    assert!(matches!(
-        first.pin_application_plugins().await,
-        Err(AppError::Overloaded)
-    ));
+    assert_eq!(authority_a.refresh_status()["ready"], true);
+    assert!(first.pin_application_plugins().await.is_ok());
     assert_provider_phases(&pinned, false).await;
 }
 
