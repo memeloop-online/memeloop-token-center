@@ -3,6 +3,8 @@ use crate::db::test_support::PostgresTestDatabase;
 use crate::model::{RequestFinancialState, RequestLifecycleState, RequestUsageBasis};
 use rust_decimal::Decimal;
 
+mod conversation_projection;
+
 struct Fixture {
     isolated: Option<PostgresTestDatabase>,
     directory: Option<tempfile::TempDir>,

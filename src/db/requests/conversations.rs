@@ -1424,8 +1424,35 @@ async fn emit_conversation_projected_event_in_transaction(
     let event =
         allocate_request_event_cursor(transaction, unix_millis(), &tenant_id, &key_id, &request_id)
             .await?;
+    // Semantic completion does not imply financial settlement. An authenticated
+    // operational receipt may finish a request whose usage remains unknown.
+    // Keep the event's accounting fields sourced exclusively from the request;
+    // use the receipt only for runtime outcome and eligibility.
     let inserted = sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND completed_at IS NOT NULL UNION ALL SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5 AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)",
+        r#"INSERT INTO request_events (
+               event_id, tenant_id, key_id, request_id, event_at, event_kind,
+               protocol, model, status_code, duration_ms, input_tokens,
+               output_tokens, cost_micros, error_code)
+           SELECT $1, r.tenant_id, r.key_id, r.id, $2, 'projected',
+                  r.protocol, r.model,
+                  COALESCE(o.status_code, r.status_code),
+                  COALESCE(o.duration_ms, r.duration_ms),
+                  r.input_tokens, r.output_tokens, r.cost_micros,
+                  CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END
+             FROM request_records r
+             LEFT JOIN proxy_operational_terminals o
+               ON o.request_id = r.id AND o.request_created_at = r.created_at
+              AND o.tenant_id = r.tenant_id AND o.key_id = r.key_id
+              AND o.reservation_id = r.reservation_id
+            WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
+              AND (r.completed_at IS NOT NULL OR o.request_id IS NOT NULL)
+           UNION ALL
+           SELECT $1, tenant_id, key_id, request_id, $2, 'projected',
+                  protocol, model, status_code, duration_ms, input_tokens,
+                  output_tokens, cost_micros, NULLIF(error_code, '')
+             FROM terminal_projection_outbox
+            WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
+              AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)"#,
     )
     .bind(event.event_id)
     .bind(event.event_at)
