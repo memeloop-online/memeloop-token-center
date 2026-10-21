@@ -772,7 +772,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         (REQUESTS as i64 + 1, REQUESTS as i64, REQUESTS as i64 + 1, 0)
     );
     inspection.close().await;
-    database.close().await;
+    drop(database);
     isolated.cleanup().await;
 }
 
@@ -1275,7 +1275,7 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     .unwrap();
     assert_eq!(recovered, (1, 1, 1));
     inspection.close().await;
-    database.close().await;
+    drop(database);
     isolated.cleanup().await;
 }
 

@@ -101,6 +101,18 @@ async fn enqueue_contract(fixture: Fixture) {
 
 async fn contract(fixture: Fixture) {
     let request_id = fixture.claim.request_id;
+    let active_filter = LogicalSessionListFilter {
+        state: "active".into(),
+        limit: 10,
+        ..Default::default()
+    };
+    let active = fixture
+        .database
+        .operator_recent_sessions("operational-test", active_filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 1, "a running request must remain active");
+    assert_eq!(active[0].active_requests, 1);
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "retain history despite unknown usage"}]
     });
@@ -198,5 +210,47 @@ async fn contract(fixture: Fixture) {
         row.try_get::<String, _>("unknown_reason").unwrap(),
         "authoritative_usage_unavailable"
     );
+    assert!(
+        fixture
+            .database
+            .operator_recent_sessions("operational-test", active_filter.clone())
+            .await
+            .unwrap()
+            .is_empty(),
+        "runtime completion must leave the active filter while finance stays pending"
+    );
+    let session_id = row.try_get::<String, _>("conversation_cluster_id").unwrap();
+    assert!(
+        fixture
+            .database
+            .operator_session_summaries(
+                "operational-test",
+                &[(fixture.key.key_id, session_id.clone())],
+                active_filter,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "targeted realtime refresh must use the same runtime predicate"
+    );
+    for model in [None, Some("operational-model".into())] {
+        let sessions = fixture
+            .database
+            .operator_recent_sessions(
+                "operational-test",
+                LogicalSessionListFilter {
+                    state: "all".into(),
+                    limit: 10,
+                    model,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1, "completed history remains discoverable");
+        for session in sessions {
+            assert_eq!(session.active_requests, 0);
+        }
+    }
     fixture.close().await;
 }
