@@ -20,7 +20,7 @@ export function FilterCredentialAliasPicker({ disabled = false, onChange, tenant
   token: string;
   value: string;
 }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const [credentials, setCredentials] = useState<KeyView[]>([]);
   const [query, setQuery] = useState<string>();
   const [opened, setOpened] = useState(false);
@@ -63,7 +63,7 @@ export function FilterCredentialAliasPicker({ disabled = false, onChange, tenant
       <Option value="" text={t('common.all')}>{t('common.all')}</Option>
       {aliases.map((alias) => <Option key={alias} value={alias} text={alias}>{alias}</Option>)}
     </Combobox>
-    {nextCursor && <Button type="button" appearance="subtle" disabled={disabled || loading} onClick={() => setCursor(nextCursor)}>{locale === 'zh-CN' ? '加载更多凭据' : 'Load more credentials'}</Button>}
+    {nextCursor && <Button type="button" appearance="subtle" disabled={disabled || loading} onClick={() => setCursor(nextCursor)}>{t('credentials.loadMore')}</Button>}
     {error && <span className="typed-filter-alias-error" role="alert">{error}</span>}
   </span>;
 }
