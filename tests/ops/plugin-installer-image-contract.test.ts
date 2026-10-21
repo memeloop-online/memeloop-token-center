@@ -15,61 +15,32 @@ function cleanupOwnedImage(
   if (!providedImage) removeImage(image);
 }
 
-test('plugin installer image is patched, pinned, and non-root', (context) => {
+test('plugin installer image uses official pinned Cosign and is non-root', (context) => {
   const dockerfile = 'Dockerfile.plugin-installer';
   for (const needle of [
-    'ARG GO_IMAGE=golang:1.26.9-bookworm',
-    'https://codeload.github.com/sigstore/cosign/tar.gz/11926fa5bbbbde47e88fc006b625a17769b743b2',
-    'sha256:3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b',
-    'COPY packaging/cosign/v3.1.3-security.patch',
-    'git apply --unidiff-zero --check /tmp/v3.1.3-security.patch',
-    'GOTOOLCHAIN=local go mod verify',
+    'ARG GO_IMAGE=golang:1.27.3-bookworm',
     'ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot',
     'COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1',
     'ENV LD_LIBRARY_PATH=/usr/local/lib', 'USER 10001:10001',
     'ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]',
   ]) contains(dockerfile, needle);
-  excludes(dockerfile, 'github.com/sigstore/cosign/releases/download/');
   excludes(dockerfile, /^ARG\s+COSIGN_(?:VERSION|SHA|DIGEST|COMMIT)/m);
-  contains('Dockerfile', 'ARG GO_IMAGE=golang:1.26.9-bookworm');
+  contains('Dockerfile', 'ARG GO_IMAGE=golang:1.27.3-bookworm');
   contains('Dockerfile', '/usr/local/bin/cosign');
   contains('Dockerfile', '/usr/local/bin/install-plugin-oci');
-  contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.5"');
+  contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.4"');
   contains(dockerfile, '--features plugin-distribution,experimental-plugin-revisions');
   excludes('Cargo.toml', /^sigstore\s*=/m);
-  contains('packaging/cosign/v3.1.3-security.patch', '+\tgoogle.golang.org/grpc v1.83.2 // indirect');
-  contains('packaging/cosign/v3.1.3-security.patch', '+google.golang.org/grpc v1.83.2 h1:EManeRomTObA0BU7I8vXgg/78uE5MJ9M8B39EX2WscU=');
-  excludes('packaging/cosign/v3.1.3-security.patch', '+\tgoogle.golang.org/grpc v1.83.1 // indirect');
-  for (const needle of [
-    '+\tgithub.com/klauspost/compress v1.18.7 // indirect',
-    '+github.com/klauspost/compress v1.18.7 h1:aUyZsS4kH3QTKurYhAOwAHxllVPnOthb3vPfnF1Ehjw=',
-    '+github.com/klauspost/compress v1.18.7/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=',
-    '+\tgolang.org/x/net v0.60.0 // indirect',
-    '+golang.org/x/net v0.60.0 h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=',
-    '+golang.org/x/net v0.60.0/go.mod h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=',
-    '+\tgolang.org/x/crypto v0.57.0',
-    '+\tgolang.org/x/sys v0.48.0 // indirect',
-    '+\tgolang.org/x/term v0.46.0',
-    '+\tgolang.org/x/text v0.42.0 // indirect',
-    '+\tgolang.org/x/mod v0.41.0 // indirect',
-    '+golang.org/x/mod v0.41.0 h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=',
-    '+golang.org/x/mod v0.41.0/go.mod h1:Ek9pY8RKWXwsWvd3rQiHYtMqkjSUV+s1Rj7j4H5Ur6o=',
-    '+\tgolang.org/x/sync v0.23.0',
-    '+golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=',
-    '+golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=',
-  ]) contains('packaging/cosign/v3.1.3-security.patch', needle);
-  excludes('packaging/cosign/v3.1.3-security.patch', /^\+.*golang\.org\/x\/net v0\.58\.0/m);
-  excludes('packaging/cosign/v3.1.3-security.patch', /^\+.*github\.com\/klauspost\/compress v1\.18\.6/m);
   for (const builder of ['Dockerfile', dockerfile]) {
+    contains(builder, 'https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64');
+    contains(builder, 'sha256:424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa');
+    contains(builder, 'https://raw.githubusercontent.com/sigstore/cosign/0e48502cf5ef34e2e60bbd3617aa19945712f705/LICENSE');
+    contains(builder, 'sha256:c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4');
     contains(builder, 'go version -m /tmp/cosign');
-    contains(builder, 'golang.org/x/net[[:space:]]+v0\\.60\\.0[[:space:]]');
-    contains(builder, 'github.com/klauspost/compress[[:space:]]+v1\\.18\\.7[[:space:]]');
-    contains(builder, 'version.gitVersion=v3.1.3-mtc.5');
-    contains(builder, '"v3\\.1\\.3-mtc\\.5"');
-  }
-  for (const image of [dockerfile, 'Dockerfile.plugin-installer.release']) {
-    contains(image, 'io.memeloop.cosign.version="v3.1.3-mtc.5"');
-    contains(image, 'io.memeloop.cosign.upstream-commit="11926fa5bbbbde47e88fc006b625a17769b743b2"');
+    contains(builder, 'go1\\.27\\.3$');
+    contains(builder, 'github.com/klauspost/compress[[:space:]]+v1\\.20\\.1[[:space:]]');
+    excludes(builder, /\bgo\s+build\b/);
+    excludes(builder, 'v3.1.3-security.patch');
   }
   contains('.github/workflows/ci.yml', 'docker build --target cosign-builder --tag "$MTC_SIGNED_IMPORT_COSIGN_IMAGE" .');
   contains('src/plugin/application/descriptor_import.rs', 'std::env::var("MTC_SIGNED_IMPORT_COSIGN_IMAGE")');
@@ -95,10 +66,10 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     }
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{.Config.User}}', image]).trim(), '10001:10001');
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image]).trim(), '["/usr/local/bin/install-plugin-oci"]');
-    assert.equal(run('docker', ['image', 'inspect', '--format', '{{index .Config.Labels "io.memeloop.cosign.version"}}', image]).trim(), 'v3.1.3-mtc.5');
+    assert.equal(run('docker', ['image', 'inspect', '--format', '{{index .Config.Labels "io.memeloop.cosign.version"}}', image]).trim(), 'v3.1.4');
     const version = JSON.parse(run('docker', ['run', '--rm', '--entrypoint', '/usr/local/bin/cosign', image, 'version', '--json'])) as { gitVersion?: string; goVersion?: string };
-    assert.equal(version.gitVersion, 'v3.1.3-mtc.5');
-    assert.equal(version.goVersion, 'go1.26.9');
+    assert.equal(version.gitVersion, 'v3.1.4');
+    assert.equal(version.goVersion, 'go1.27.3');
     const help = run('docker', ['run', '--rm', image, '--help']);
     assert.match(help, /--inventory-file/);
     assert.match(help, /--inventory-entry-file/);
