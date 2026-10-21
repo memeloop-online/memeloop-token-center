@@ -16,6 +16,10 @@ use crate::{
     network::{self, OutboundScope},
 };
 
+// Background collection and normalization share one bounded budget. Parsing the
+// supported response bodies needs more fuel than a request-path plugin hook.
+const SERVICE_DATA_FUEL: u64 = 100_000_000;
+
 #[derive(Clone)]
 pub(crate) struct PluginServiceDataTarget {
     pub(crate) plugin_id: String,
@@ -346,7 +350,13 @@ impl PluginRuntime {
         );
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(epoch_deadline_ticks(timeout));
-        store.set_fuel(self.fuel).map_err(|_| {
+        // Preserve explicit execution-limit overrides used by component tests.
+        let fuel = if self.fuel == super::PLUGIN_FUEL {
+            SERVICE_DATA_FUEL
+        } else {
+            self.fuel.min(SERVICE_DATA_FUEL)
+        };
+        store.set_fuel(fuel).map_err(|_| {
             collection_failure(PluginServiceDataRefreshErrorCode::ComponentExecution)
         })?;
         let bindings = pre.instantiate(&mut store).map_err(|error| {
@@ -567,9 +577,8 @@ mod tests {
         }
     }
 
-    fn service_data_component() -> Vec<u8> {
-        let mut module = wat::parse_str(
-            r#"(module
+    fn service_data_component(collect_work: u32, normalize_work: u32) -> Vec<u8> {
+        let source = r#"(module
               (type $log (func (param i32 i32 i32 i32)))
               (type $kv-get (func (param i32 i32 i32)))
               (type $kv-put (func (param i32 i32 i32 i32 i32)))
@@ -587,7 +596,15 @@ mod tests {
               (global $heap (mut i32) (i32.const 8192))
               (data (i32.const 64) "{\22raw\22:\22ok\22}")
               (data (i32.const 128) "{\22status\22:\22healthy\22}")
+              (func $work (param $count i32)
+                block $done
+                  local.get $count i32.eqz br_if $done
+                  loop $again
+                    local.get $count i32.const 1 i32.sub local.tee $count br_if $again
+                  end
+                end)
               (func $collect (type $two-strings) (param i32 i32 i32 i32) (result i32)
+                i32.const COLLECT_WORK call $work
                 local.get 1 i32.const 16 i32.ne if unreachable end
                 local.get 3 i32.const 20 i32.ne if unreachable end
                 i32.const 256 i32.const 0 i32.store
@@ -596,6 +613,7 @@ mod tests {
                 i32.const 256)
               (func $collect-post (type $post-one) (param i32))
               (func $normalize (type $three-strings) (param i32 i32 i32 i32 i32 i32) (result i32)
+                i32.const NORMALIZE_WORK call $work
                 local.get 1 i32.const 17 i32.ne if unreachable end
                 local.get 3 i32.const 20 i32.ne if unreachable end
                 local.get 5 i32.const 12 i32.ne if unreachable end
@@ -619,9 +637,11 @@ mod tests {
               (export "cm32p2|memeloop:token-center/service-data-v1@0.2|normalize_post" (func $normalize-post))
               (export "cm32p2_memory" (memory $memory))
               (export "cm32p2_realloc" (func $realloc))
-              (export "cm32p2_initialize" (func $initialize)))"#,
-        )
-        .expect("parse service data fixture");
+              (export "cm32p2_initialize" (func $initialize)))"#;
+        let source = source
+            .replace("COLLECT_WORK", &collect_work.to_string())
+            .replace("NORMALIZE_WORK", &normalize_work.to_string());
+        let mut module = wat::parse_str(source).expect("parse service data fixture");
         let mut resolve = Resolve::default();
         let (package, _) = resolve
             .push_path("wit/token-center.wit")
@@ -639,45 +659,54 @@ mod tests {
             .expect("encode service data component")
     }
 
-    #[tokio::test]
-    async fn component_collector_and_normalizer_execute_under_the_service_data_world() {
+    fn service_data_manifest() -> Value {
+        json!({
+            "id": "service-data-fixture",
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": "collector.wasm",
+            "capabilities": [],
+            "contributions": {
+                "service_data": [{
+                    "id": "health",
+                    "component_adapter": {
+                        "api_version": "component-v1",
+                        "collector": "health-collector",
+                        "normalizer": "health-normalizer",
+                        "config": {"source": "fixture"}
+                    },
+                    "required_scope": "metrics:read",
+                    "response_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["status"],
+                        "properties": {"status": {"const": "healthy"}}
+                    },
+                    "fallback": {"status": "healthy"},
+                    "cache_ttl_seconds": 30,
+                    "timeout_millis": 2000,
+                    "max_body_bytes": 65536
+                }]
+            }
+        })
+    }
+
+    async fn service_data_runtime(
+        collect_work: u32,
+        normalize_work: u32,
+    ) -> (tempfile::TempDir, PluginRuntime) {
         let directory = tempfile::tempdir().unwrap();
         let plugins = directory.path().join("plugins");
         let package = plugins.join("service-data-fixture");
         fs::create_dir_all(&package).unwrap();
-        fs::write(package.join("collector.wasm"), service_data_component()).unwrap();
+        fs::write(
+            package.join("collector.wasm"),
+            service_data_component(collect_work, normalize_work),
+        )
+        .unwrap();
         fs::write(
             package.join("plugin.json"),
-            serde_json::to_vec(&json!({
-                "id": "service-data-fixture",
-                "version": "1.0.0",
-                "wit_version": "0.2.0",
-                "wasm": "collector.wasm",
-                "capabilities": [],
-                "contributions": {
-                    "service_data": [{
-                        "id": "health",
-                        "component_adapter": {
-                            "api_version": "component-v1",
-                            "collector": "health-collector",
-                            "normalizer": "health-normalizer",
-                            "config": {"source": "fixture"}
-                        },
-                        "required_scope": "metrics:read",
-                        "response_schema": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["status"],
-                            "properties": {"status": {"const": "healthy"}}
-                        },
-                        "fallback": {"status": "healthy"},
-                        "cache_ttl_seconds": 30,
-                        "timeout_millis": 2000,
-                        "max_body_bytes": 65536
-                    }]
-                }
-            }))
-            .unwrap(),
+            serde_json::to_vec(&service_data_manifest()).unwrap(),
         )
         .unwrap();
         let database = Database::connect(&format!(
@@ -687,6 +716,12 @@ mod tests {
         .await
         .unwrap();
         let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+        (directory, runtime)
+    }
+
+    #[tokio::test]
+    async fn component_collector_and_normalizer_execute_under_the_service_data_world() {
+        let (_directory, runtime) = service_data_runtime(0, 0).await;
         let target = runtime.service_data_targets().unwrap().remove(0);
         let collected = runtime.collect_component_service_data(&target).unwrap();
         assert_eq!(collected.data, json!({"status": "healthy"}));
@@ -695,5 +730,69 @@ mod tests {
             collected.origin,
             "plugin:service-data-fixture@1.0.0#health-collector"
         );
+    }
+
+    #[tokio::test]
+    async fn background_fuel_supports_larger_work_but_is_shared_and_bounded() {
+        // Each stage consumes about 60M fuel: above the request-hook budget,
+        // below the background budget, and over that budget when combined.
+        for (collect_work, normalize_work, succeeds) in [
+            (12_000_000, 0, true),
+            (0, 12_000_000, true),
+            (12_000_000, 12_000_000, false),
+        ] {
+            let (_directory, runtime) = service_data_runtime(collect_work, normalize_work).await;
+            assert_eq!(runtime.fuel, 5_000_000);
+            assert_eq!(super::super::PLUGIN_FUEL, 5_000_000);
+            let target = runtime.service_data_targets().unwrap().remove(0);
+            let result = runtime.collect_component_service_data(&target);
+            if succeeds {
+                assert_eq!(result.unwrap().data, json!({"status": "healthy"}));
+            } else {
+                let failure = result.err().expect("combined work exhausts shared fuel");
+                assert_eq!(
+                    failure.code,
+                    PluginServiceDataRefreshErrorCode::ComponentExecution
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn component_service_data_preserves_explicit_test_fuel_limits() {
+        let (_directory, mut runtime) = service_data_runtime(0, 0).await;
+        runtime.set_execution_limits_for_tests(Duration::from_secs(2), 1);
+        let target = runtime.service_data_targets().unwrap().remove(0);
+        let failure = runtime
+            .collect_component_service_data(&target)
+            .err()
+            .expect("explicit low fuel exhausts");
+        assert_eq!(
+            failure.code,
+            PluginServiceDataRefreshErrorCode::ComponentExecution
+        );
+    }
+
+    #[test]
+    fn service_data_timeout_boundary_matches_published_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/plugin-manifest.schema.json"))
+                .unwrap();
+        for (timeout, valid) in [(0, false), (10_000, true), (30_000, true), (30_001, false)] {
+            let mut candidate = service_data_manifest();
+            candidate["contributions"]["service_data"][0]["timeout_millis"] = json!(timeout);
+            let manifest: super::super::PluginManifest =
+                serde_json::from_value(candidate.clone()).unwrap();
+            assert_eq!(
+                super::super::validate_manifest(&manifest).is_ok(),
+                valid,
+                "runtime timeout boundary {timeout}"
+            );
+            assert_eq!(
+                crate::schema::validate_instance(&schema, &candidate).is_ok(),
+                valid,
+                "published schema timeout boundary {timeout}"
+            );
+        }
     }
 }
