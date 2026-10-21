@@ -39,7 +39,7 @@ test('plugin installer image uses official pinned Cosign and is non-root', (cont
     contains(builder, 'go version -m /tmp/cosign');
     contains(builder, 'go1\\.27\\.3$');
     contains(builder, 'github.com/klauspost/compress[[:space:]]+v1\\.20\\.1[[:space:]]');
-    excludes(builder, 'go build');
+    excludes(builder, /\bgo\s+build\b/);
     excludes(builder, 'v3.1.3-security.patch');
   }
   contains('.github/workflows/ci.yml', 'docker build --target cosign-builder --tag "$MTC_SIGNED_IMPORT_COSIGN_IMAGE" .');
