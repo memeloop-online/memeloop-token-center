@@ -2370,6 +2370,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         .await;
         assert_eq!(status, StatusCode::OK, "{published}");
         assert_eq!(published["revision"], 2);
+        state.refresh_application_plugins().await.unwrap();
         let (status, manifests) = call(
             &state,
             "GET",

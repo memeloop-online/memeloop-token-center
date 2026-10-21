@@ -95,6 +95,8 @@ pub struct RollbackApplicationPlugin {
 
 pub struct ApplicationPlugins {
     db: Database,
+    current: std::sync::RwLock<CurrentSnapshot>,
+    refresh: tokio::sync::Mutex<()>,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
     installation_policy_file: Option<PathBuf>,
@@ -111,6 +113,29 @@ pub struct ApplicationPlugins {
     compilations: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
+}
+
+#[derive(Default)]
+struct CurrentSnapshot {
+    snapshot: Option<Arc<ApplicationPluginSnapshot>>,
+    confirmed: Option<tokio::time::Instant>,
+    error: Option<&'static str>,
+}
+
+struct RefreshAttempt<'a> {
+    current: &'a std::sync::RwLock<CurrentSnapshot>,
+    completed: bool,
+}
+
+impl Drop for RefreshAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Ok(mut current) = self.current.write()
+        {
+            current.error = Some("snapshot_refresh_cancelled");
+            tracing::error!("application plugin snapshot refresh cancelled");
+        }
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -230,6 +255,8 @@ impl ApplicationPlugins {
         }
         Ok(Self {
             db,
+            current: std::sync::RwLock::new(CurrentSnapshot::default()),
+            refresh: tokio::sync::Mutex::new(()),
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
             installation_policy_file: None,
@@ -556,6 +583,83 @@ impl ApplicationPlugins {
         }
     }
 
+    pub fn current_snapshot(&self) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        let current = self.current.read().map_err(|_| AppError::Internal)?;
+        if !current
+            .confirmed
+            .is_some_and(|confirmed| confirmed.elapsed() < PIN_DEADLINE)
+        {
+            return Err(AppError::Overloaded);
+        }
+        Ok(current.snapshot.clone())
+    }
+
+    pub fn refresh_status(&self) -> serde_json::Value {
+        let Ok(current) = self.current.read() else {
+            return json!({"ready": false, "error": "snapshot_lock_failed"});
+        };
+        json!({
+            "ready": current.confirmed.is_some_and(|confirmed| confirmed.elapsed() < PIN_DEADLINE),
+            "revision": current.snapshot.as_ref().map(|snapshot| &snapshot.receipt),
+            "error": current.error,
+        })
+    }
+
+    pub async fn refresh_current(self: &Arc<Self>) -> Result<(), AppError> {
+        let _refresh = self.refresh.lock().await;
+        let mut attempt = RefreshAttempt {
+            current: &self.current,
+            completed: false,
+        };
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(PIN_DEADLINE, async {
+            let head = self.db.optional_application_plugin_head().await?;
+            {
+                let mut current = self.current.write().map_err(|_| AppError::Internal)?;
+                if current.snapshot.as_ref().map(|snapshot| &snapshot.receipt) != head.as_ref() {
+                    current.confirmed = None;
+                }
+                if head.is_none() && current.snapshot.is_some() {
+                    return Err(AppError::Forbidden);
+                }
+            }
+            if head.is_none() && !self.db.application_plugin_history(None).await?.is_empty() {
+                self.current
+                    .write()
+                    .map_err(|_| AppError::Internal)?
+                    .confirmed = None;
+                return Err(AppError::Forbidden);
+            }
+            let snapshot = match head.as_ref() {
+                Some(head) => Some(self.pin_revision(head.clone()).await?),
+                None => None,
+            };
+            if self.db.optional_application_plugin_head().await? != head {
+                self.current
+                    .write()
+                    .map_err(|_| AppError::Internal)?
+                    .confirmed = None;
+                return Err(AppError::Conflict(
+                    "plugin head changed during refresh".into(),
+                ));
+            }
+            let mut current = self.current.write().map_err(|_| AppError::Internal)?;
+            current.snapshot = snapshot;
+            current.confirmed = Some(started);
+            current.error = None;
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(AppError::Overloaded));
+        if let Err(error) = &result {
+            self.current.write().map_err(|_| AppError::Internal)?.error =
+                Some("snapshot_refresh_failed");
+            tracing::error!(%error, "application plugin snapshot refresh failed");
+        }
+        attempt.completed = true;
+        result
+    }
+
     async fn pin_revision(
         self: &Arc<Self>,
         head: ApplicationRevision,
@@ -724,5 +828,7 @@ fn validate_operation(expected: i64, key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod hot_snapshot_tests;
 #[cfg(test)]
 mod tests;

@@ -423,6 +423,7 @@ async fn descriptor_export_rejects_tampered_provenance_without_changing_warm_for
     export(&state, Some("release"), 1).await;
     let authority = state.application_plugins.as_ref().unwrap();
     let warm = authority.pin().await.unwrap();
+    state.refresh_application_plugins().await.unwrap();
     let before = state
         .db
         .plugin_descriptor_authority_snapshot()
