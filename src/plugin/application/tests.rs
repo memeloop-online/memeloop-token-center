@@ -193,7 +193,6 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().to_owned());
     let first = AppState::initialize(config.clone()).await.unwrap();
     let second = AppState::initialize(config.clone()).await.unwrap();
-    // Simulate the background lifecycle before accepting ready requests.
     first.refresh_application_plugins().await.unwrap();
     let authority_a = first.application_plugins.clone().unwrap();
     let authority_b = second.application_plugins.clone().unwrap();

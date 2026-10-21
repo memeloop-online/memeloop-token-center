@@ -335,6 +335,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
             }
             _ => {}
         }
+        gateway_state.refresh_application_plugins().await.unwrap();
         for (index, (name, path, request)) in cases.iter().enumerate() {
             let response = client
                 .post(format!("{gateway}{path}"))
