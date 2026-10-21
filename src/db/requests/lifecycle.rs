@@ -1491,6 +1491,11 @@ impl Database {
                 }
                 return Ok(result);
             }
+            if pending_receipt.is_some() && claimed.rows_affected() == 0 {
+                return Err(AppError::Conflict(
+                    "request completed without matching settlement receipt".into(),
+                ));
+            }
             if reap_orphan && claimed.rows_affected() == 1 {
                 let expires_at: Option<i64> = sqlx::query_scalar("SELECT proxy_owner_expires_at FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
                     .bind(&request_id).bind(&tenant_id).bind(&key_id).bind(&reservation_id)

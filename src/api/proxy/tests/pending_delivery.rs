@@ -820,6 +820,24 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
         serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
         receipt
     );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let terminal: (Option<i64>, Option<String>, i64) = sqlx::query_as(
+        "SELECT status_code, error_code, cost_micros FROM request_records WHERE id = $1",
+    )
+    .bind(receipt["request_id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal, (Some(504), Some("request_expired".into()), 0));
+    let authority: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, receipt_id FROM pending_proxy_settlements WHERE request_id = $1",
+    )
+    .bind(receipt["request_id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(authority, ("pending".into(), None));
+    pool.close().await;
     upstream.verify().await;
 }
 
