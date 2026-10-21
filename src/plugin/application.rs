@@ -33,7 +33,7 @@ mod retained_installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
 const PIN_DEADLINE: Duration = Duration::from_secs(45);
-// Shared by request pinning and administrative staging across all AppStates.
+// Shared by lifecycle loading and administrative staging across all AppStates.
 // An abandoned blocking compilation retains its permit until it really ends.
 static COMPILATION_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
@@ -644,9 +644,11 @@ impl ApplicationPlugins {
                 ));
             }
             let mut current = self.current.write().map_err(|_| AppError::Internal)?;
-            current.snapshot = snapshot;
+            let previous = std::mem::replace(&mut current.snapshot, snapshot);
             current.confirmed = Some(started);
             current.error = None;
+            drop(current);
+            drop(previous);
             Ok(())
         })
         .await
