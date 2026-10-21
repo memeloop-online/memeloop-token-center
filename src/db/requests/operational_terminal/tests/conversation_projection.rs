@@ -7,6 +7,7 @@ use crate::db::requests::conversations::{
 #[tokio::test]
 async fn sqlite_unknown_finance_allows_operational_conversation_projection() {
     contract(Fixture::sqlite().await).await;
+    enqueue_contract(Fixture::sqlite().await).await;
 }
 
 #[tokio::test]
@@ -15,6 +16,87 @@ async fn postgres_unknown_finance_allows_operational_conversation_projection() {
         return;
     };
     contract(fixture).await;
+    enqueue_contract(Fixture::postgres().await.unwrap()).await;
+}
+
+async fn enqueue_contract(fixture: Fixture) {
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "unknown usage"}]});
+    let hints = ConversationHints::default();
+    let conversation = ProxyConversationInput {
+        key: &fixture.key,
+        request_json: &body,
+        hints: &hints,
+        client_name: Some("Codex"),
+        upstream_response_id: None,
+    };
+    let receipt = Uuid::now_v7();
+    assert!(
+        fixture
+            .database
+            .enqueue_operational_conversation_projection(&fixture.claim, receipt, &conversation)
+            .await
+            .is_err()
+    );
+    fixture
+        .record(receipt, &fixture.operational(429))
+        .await
+        .unwrap();
+    let mut forged = fixture.claim.clone();
+    forged.fence = Uuid::now_v7();
+    assert!(
+        fixture
+            .database
+            .enqueue_operational_conversation_projection(&forged, receipt, &conversation)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .database
+            .enqueue_operational_conversation_projection(
+                &fixture.claim,
+                Uuid::now_v7(),
+                &conversation,
+            )
+            .await
+            .is_err()
+    );
+    for _ in 0..2 {
+        fixture
+            .database
+            .enqueue_operational_conversation_projection(&fixture.claim, receipt, &conversation)
+            .await
+            .unwrap();
+    }
+    let owner = Uuid::now_v7();
+    let tasks = fixture
+        .database
+        .claim_conversation_projection_tasks(owner, 1)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].request_id, fixture.claim.request_id);
+    assert!(
+        fixture
+            .database
+            .project_claimed_conversation_projection_task(owner, fixture.claim.request_id)
+            .await
+            .unwrap()
+    );
+    fixture
+        .database
+        .enqueue_operational_conversation_projection(&fixture.claim, receipt, &conversation)
+        .await
+        .unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(fixture.claim.request_id.to_string())
+    .fetch_one(&fixture.database.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "replay must not resurrect consumed content");
+    fixture.close().await;
 }
 
 async fn contract(fixture: Fixture) {

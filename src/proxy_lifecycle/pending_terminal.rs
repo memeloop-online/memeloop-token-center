@@ -1038,10 +1038,27 @@ impl Journal {
                                     }
                                 })
                         } else {
-                            database
-                                .mark_pending_proxy_settlement_unknown(claim)
-                                .await
-                                .map(|()| None)
+                            // Unknown usage must not prevent semantic history
+                            // from committing. Missing operational evidence is
+                            // retried before this entry enters reconciliation.
+                            let projection = if let Some(conversation) = input.conversation.as_ref() {
+                                database
+                                    .enqueue_operational_conversation_projection(
+                                        claim,
+                                        receipt_id,
+                                        conversation,
+                                    )
+                                    .await
+                            } else {
+                                Ok(())
+                            };
+                            match projection {
+                                Ok(()) => database
+                                    .mark_pending_proxy_settlement_unknown(claim)
+                                    .await
+                                    .map(|()| None),
+                                Err(error) => Err(error),
+                            }
                         }
                     } else {
                         finish_proxy_request_with_retry(&database, input, None, attribution)

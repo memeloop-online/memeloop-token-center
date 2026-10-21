@@ -210,6 +210,63 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
 }
 
 impl Database {
+    /// Retain conversation evidence without acknowledging financial settlement.
+    /// The operational receipt supplies a stable timestamp for exact replay.
+    pub(crate) async fn enqueue_operational_conversation_projection(
+        &self,
+        claim: &PendingProxySettlementClaim,
+        receipt_id: Uuid,
+        conversation: &ProxyConversationInput<'_>,
+    ) -> Result<(), AppError> {
+        if conversation.key.tenant_id != claim.tenant_id
+            || conversation.key.key_id != claim.key_id
+            || conversation.key.account_id != claim.account_id
+        {
+            return Err(AppError::NotFound);
+        }
+        let mut transaction = self.begin_write_transaction().await?;
+        let observed_at: Option<i64> = sqlx::query_scalar(
+            r#"SELECT o.completed_at FROM proxy_operational_terminals o
+               JOIN pending_proxy_settlements p
+                 ON p.request_id = o.request_id AND p.fence = o.fence
+                AND p.owner_token = o.owner_token AND p.contract_digest = o.contract_digest
+               WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3
+                 AND o.account_id = $4 AND o.reservation_id = $5
+                 AND o.owner_token = $6 AND o.fence = $7
+                 AND o.contract_digest = $8 AND o.receipt_id = $9"#,
+        )
+        .bind(claim.request_id.to_string())
+        .bind(claim.tenant_id.to_string())
+        .bind(claim.key_id.to_string())
+        .bind(claim.account_id.to_string())
+        .bind(claim.reservation_id.to_string())
+        .bind(claim.owner_token.to_string())
+        .bind(claim.fence.to_string())
+        .bind(&claim.contract_digest)
+        .bind(receipt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        // Runtime publication can race this background attempt. Absence is
+        // retryable; it is not a conflicting financial receipt.
+        let observed_at = observed_at.ok_or(AppError::NotFound)?;
+        enqueue_conversation_projection_in_transaction(
+            &mut transaction,
+            ConversationProjectionEnqueueInput {
+                request_id: claim.request_id,
+                key: conversation.key,
+                request_json: conversation.request_json,
+                hints: conversation.hints,
+                client_name: conversation.client_name,
+                upstream_response_id: conversation.upstream_response_id,
+                observed_at,
+                content_materialized: false,
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn materialize_conversation_content(
         &self,
         request_id: Uuid,
