@@ -659,6 +659,38 @@ mod tests {
             .expect("encode service data component")
     }
 
+    fn service_data_manifest() -> Value {
+        json!({
+            "id": "service-data-fixture",
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": "collector.wasm",
+            "capabilities": [],
+            "contributions": {
+                "service_data": [{
+                    "id": "health",
+                    "component_adapter": {
+                        "api_version": "component-v1",
+                        "collector": "health-collector",
+                        "normalizer": "health-normalizer",
+                        "config": {"source": "fixture"}
+                    },
+                    "required_scope": "metrics:read",
+                    "response_schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["status"],
+                        "properties": {"status": {"const": "healthy"}}
+                    },
+                    "fallback": {"status": "healthy"},
+                    "cache_ttl_seconds": 30,
+                    "timeout_millis": 2000,
+                    "max_body_bytes": 65536
+                }]
+            }
+        })
+    }
+
     async fn service_data_runtime(
         collect_work: u32,
         normalize_work: u32,
@@ -674,36 +706,7 @@ mod tests {
         .unwrap();
         fs::write(
             package.join("plugin.json"),
-            serde_json::to_vec(&json!({
-                "id": "service-data-fixture",
-                "version": "1.0.0",
-                "wit_version": "0.2.0",
-                "wasm": "collector.wasm",
-                "capabilities": [],
-                "contributions": {
-                    "service_data": [{
-                        "id": "health",
-                        "component_adapter": {
-                            "api_version": "component-v1",
-                            "collector": "health-collector",
-                            "normalizer": "health-normalizer",
-                            "config": {"source": "fixture"}
-                        },
-                        "required_scope": "metrics:read",
-                        "response_schema": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["status"],
-                            "properties": {"status": {"const": "healthy"}}
-                        },
-                        "fallback": {"status": "healthy"},
-                        "cache_ttl_seconds": 30,
-                        "timeout_millis": 2000,
-                        "max_body_bytes": 65536
-                    }]
-                }
-            }))
-            .unwrap(),
+            serde_json::to_vec(&service_data_manifest()).unwrap(),
         )
         .unwrap();
         let database = Database::connect(&format!(
@@ -768,5 +771,28 @@ mod tests {
             failure.code,
             PluginServiceDataRefreshErrorCode::ComponentExecution
         );
+    }
+
+    #[test]
+    fn service_data_timeout_boundary_matches_published_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../schemas/plugin-manifest.schema.json"))
+                .unwrap();
+        for (timeout, valid) in [(0, false), (10_000, true), (30_000, true), (30_001, false)] {
+            let mut candidate = service_data_manifest();
+            candidate["contributions"]["service_data"][0]["timeout_millis"] = json!(timeout);
+            let manifest: super::super::PluginManifest =
+                serde_json::from_value(candidate.clone()).unwrap();
+            assert_eq!(
+                super::super::validate_manifest(&manifest).is_ok(),
+                valid,
+                "runtime timeout boundary {timeout}"
+            );
+            assert_eq!(
+                crate::schema::validate_instance(&schema, &candidate).is_ok(),
+                valid,
+                "published schema timeout boundary {timeout}"
+            );
+        }
     }
 }
