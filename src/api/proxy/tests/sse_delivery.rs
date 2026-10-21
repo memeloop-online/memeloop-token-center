@@ -87,6 +87,12 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
     let fixture = codex_route_fixture("large-conversation-stream").await;
+    let retirement = fixture
+        .state
+        .pending_terminals
+        .hold_retirement_for_test()
+        .await;
+    let spool_reads = fixture.state.responses_request_spool.read_count_for_test();
     fixture
         .state
         .db
@@ -128,6 +134,11 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     let request_id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap())
         .expect("gateway request id");
     let finalization_gate = streaming::finalization_test_gate::install(request_id);
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 1,
+        "routing reads the source-backed request once"
+    );
 
     let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(
@@ -155,6 +166,63 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
 
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let settled: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pending_proxy_settlements WHERE request_id = $1 AND state = 'applied'",
+            )
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if settled == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("large source-backed request must financially settle");
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 1,
+        "terminal journal preparation must reuse the semantic projection without rereading raw input"
+    );
+    let mut receipts = tokio::fs::read_dir(fixture.state.pending_terminals.directory_for_test())
+        .await
+        .unwrap();
+    let mut found_receipt = false;
+    while let Some(entry) = receipts.next_entry().await.unwrap() {
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let bytes = tokio::fs::read(entry.path()).await.unwrap();
+        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+        if receipt["request_id"] != request_id.to_string() {
+            continue;
+        }
+        assert!(
+            bytes.len() < RETAINED_BYTES,
+            "journal must not copy raw padding"
+        );
+        assert_eq!(
+            receipt["conversation"]["request_json"],
+            json!({"input": "small semantic input"})
+        );
+        found_receipt = true;
+    }
+    assert!(
+        found_receipt,
+        "settled receipt is retained at the retirement gate"
+    );
+
     let rows = fixture
         .state
         .db
@@ -162,18 +230,32 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let cluster: Option<String> =
         sqlx::query_scalar("SELECT conversation_cluster_id FROM request_records WHERE id = $1")
             .bind(rows[0].request_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
-    pool.close().await;
     assert!(
         cluster.is_some(),
-        "terminal projection reparsed the raw request"
+        "terminal projection must preserve source-backed conversation membership"
     );
+    let expected_atoms =
+        crate::conversation::extract_atoms(&json!({"input": "small semantic input"}));
+    let expected_prefix = crate::conversation::build_prefix(&expected_atoms);
+    let leaf: Option<String> = sqlx::query_scalar(
+        "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leaf.as_deref(),
+        Some(expected_prefix.last().unwrap().node_hash.as_str())
+    );
+    pool.close().await;
+    drop(retirement);
 }
 
 #[tokio::test]
