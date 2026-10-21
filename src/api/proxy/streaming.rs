@@ -281,6 +281,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let codex_responses_progress_heartbeat =
                 is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);
             let mut transport_error: Option<&'static str> = None;
+            let mut codex_chat_translation_error = None;
             let mut response_bytes = 0_usize;
             let mut billable_queued = false;
             let mut delivered_billable = false;
@@ -592,6 +593,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     }
                                     Ok(None) => {}
                                     Err(error_code) => {
+                                        codex_chat_translation_error = Some(error_code);
                                         transport_error =
                                             Some(transport_error_with_downstream_precedence(
                                                 downstream_closed_observed
@@ -783,7 +785,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let local_response_boundary =
                 transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
             let sse_summary = sse_capture.map(|capture| {
-                capture.finish_summary_after_local_boundary(local_response_boundary)
+                let mut summary =
+                    capture.finish_summary_after_local_boundary(local_response_boundary);
+                lifecycle::apply_chat_translation_usage_evidence(
+                    &mut summary,
+                    codex_chat_translation_error,
+                );
+                summary
             });
             let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),

@@ -159,6 +159,43 @@ fn streaming_upstream_evidence(
     }
 }
 
+pub(super) fn apply_chat_translation_usage_evidence(
+    summary: &mut ResponsesSseSummary,
+    translation_error: Option<&str>,
+) {
+    if matches!(
+        translation_error,
+        Some(
+            "upstream_invalid_response"
+                | "upstream_invalid_usage"
+                | "upstream_response_terminal_conflict"
+        )
+    ) {
+        summary.usage_invalid = true;
+    }
+}
+
+fn trusted_streaming_terminal_usage(
+    summary: Option<&ResponsesSseSummary>,
+    transport_error: Option<&str>,
+) -> Option<TokenUsage> {
+    summary
+        .filter(|summary| {
+            matches!(
+                summary.outcome,
+                ResponsesSseOutcome::Completed { .. } | ResponsesSseOutcome::TerminatedIncomplete
+            ) && !summary.usage_invalid
+                && !summary.protocol_invalid
+                && !summary.observed_protocol_invalid
+                && (!matches!(summary.outcome, ResponsesSseOutcome::TerminatedIncomplete)
+                    || matches!(
+                        transport_error,
+                        None | Some("downstream_disconnected" | "downstream_backpressure")
+                    ))
+        })
+        .and_then(|summary| summary.usage.clone())
+}
+
 pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInput<'_>) {
     let StreamingFinalizationInput {
         output_timing,
@@ -202,22 +239,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     // erase trustworthy provider usage. A validated provider-declared incomplete
     // terminal also carries final counters; an unknown EOF or error never does.
     // Keep the cancellation status and validate reservation bounds below.
-    let terminal_usage = sse_summary
-        .as_ref()
-        .filter(|summary| {
-            matches!(
-                summary.outcome,
-                ResponsesSseOutcome::Completed { .. } | ResponsesSseOutcome::TerminatedIncomplete
-            ) && !summary.usage_invalid
-                && !summary.protocol_invalid
-                && !summary.observed_protocol_invalid
-                && (!matches!(summary.outcome, ResponsesSseOutcome::TerminatedIncomplete)
-                    || matches!(
-                        transport_error,
-                        None | Some("downstream_disconnected" | "downstream_backpressure")
-                    ))
-        })
-        .and_then(|summary| summary.usage.clone());
+    let terminal_usage = trusted_streaming_terminal_usage(sse_summary.as_ref(), transport_error);
     let mut usage = if error_code.is_some() {
         if let Some(usage) = terminal_usage {
             usage_basis = crate::model::RequestUsageBasis::ProviderReported;
@@ -405,6 +427,127 @@ mod tests {
             observed_protocol_invalid,
             independently_observed_protocol_invalid: observed_protocol_invalid,
             protocol_invalid,
+        }
+    }
+
+    #[test]
+    fn native_chat_terminal_conflict_invalidates_captured_usage() {
+        for conflicting in [false, true] {
+            let item = serde_json::json!({
+                "type": "message", "id": "msg-workbuddy", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "OK", "annotations": []}]
+            });
+            let mut terminal_item = item.clone();
+            if conflicting {
+                terminal_item["content"][0]["text"] = serde_json::json!("different");
+            }
+            let mut capture = ResponsesSseCapture::for_codex_responses();
+            let mut translator =
+                codex_transport::CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), true);
+            let mut transport_error = None;
+            for event in [
+                serde_json::json!({"type": "response.output_item.done", "output_index": 0,
+                    "item": item}),
+                serde_json::json!({"type": "response.completed", "response": {
+                    "id": "resp-workbuddy", "object": "response", "status": "completed",
+                    "output": [terminal_item],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }}),
+            ] {
+                let frame = format!("data: {event}\n\n");
+                capture.push(frame.as_bytes());
+                if let Err(error) = translator.translate_frame(frame.as_bytes()) {
+                    transport_error = Some(error);
+                }
+            }
+            let mut captured = capture.finish_summary();
+            assert!(matches!(
+                captured.outcome,
+                ResponsesSseOutcome::Completed { .. }
+            ));
+            assert!(captured.usage.is_some());
+            assert!(!captured.protocol_invalid);
+            apply_chat_translation_usage_evidence(&mut captured, transport_error);
+            let trusted = trusted_streaming_terminal_usage(Some(&captured), transport_error);
+            let terminal = classify_streaming_terminal(
+                200,
+                Protocol::OpenAiChat,
+                true,
+                transport_error,
+                Some(&captured),
+            );
+            if conflicting {
+                assert_eq!(transport_error, Some("upstream_invalid_response"));
+                assert_eq!(trusted, None);
+                assert_eq!(
+                    trusted_streaming_terminal_usage(
+                        Some(&captured),
+                        Some("downstream_disconnected")
+                    ),
+                    None
+                );
+                assert_eq!(
+                    (terminal.status_code, terminal.error_code),
+                    (502, Some("upstream_invalid_response"))
+                );
+                assert_eq!(
+                    streaming_upstream_evidence(
+                        false,
+                        transport_error,
+                        Some(&captured),
+                        terminal.error_code
+                    ),
+                    StreamingUpstreamEvidence::InvalidResponse
+                );
+            } else {
+                assert_eq!(transport_error, None);
+                assert_eq!(trusted, captured.usage);
+                let usage = trusted.unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+                assert_eq!((terminal.status_code, terminal.error_code), (200, None));
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_terminal_failures_reject_usage_but_delivery_loss_preserves_it() {
+        for completed in [false, true] {
+            for translation_error in [
+                None,
+                Some("upstream_invalid_response"),
+                Some("upstream_invalid_usage"),
+                Some("upstream_response_terminal_conflict"),
+            ] {
+                let outcome = if completed {
+                    ResponsesSseOutcome::Completed {
+                        response_id: Some("resp-valid".into()),
+                    }
+                } else {
+                    ResponsesSseOutcome::TerminatedIncomplete
+                };
+                let mut captured = summary(outcome, false, false);
+                captured.usage = Some(TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..TokenUsage::default()
+                });
+                apply_chat_translation_usage_evidence(&mut captured, translation_error);
+                for transport_error in [
+                    translation_error,
+                    Some("downstream_disconnected"),
+                    Some("downstream_backpressure"),
+                ] {
+                    assert_eq!(
+                        trusted_streaming_terminal_usage(Some(&captured), transport_error),
+                        if translation_error.is_some() {
+                            None
+                        } else {
+                            captured.usage.clone()
+                        }
+                    );
+                }
+            }
         }
     }
 
