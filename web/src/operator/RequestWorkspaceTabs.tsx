@@ -8,7 +8,7 @@ export function RequestWorkspaceTabs({ selected, onRequests, onGenerations, onSe
   onSessions: () => void;
 }) {
   const { t } = useI18n();
-  return <div className="segmented" role="group" aria-label={t('sessions.monitorMode')}>
+  return <div className="segmented request-workspace-tabs" role="group" aria-label={t('sessions.monitorMode')}>
     <ToggleButton appearance="subtle" checked={selected === 'requests'} onClick={onRequests}>{t('sessions.requestsMode')}</ToggleButton>
     <ToggleButton appearance="subtle" checked={selected === 'generations'} onClick={onGenerations}>{t('nav.generations')}</ToggleButton>
     <ToggleButton appearance="subtle" checked={false} onClick={onSessions}>{t('sessions.sessionsMode')}</ToggleButton>

@@ -219,8 +219,7 @@ async fn assert_explicit_usage_projections(
             "by_session",
             "heatmap",
         ] {
-            if !fields.contains(&field) && !(projection == "output_rate" && field == "time_series")
-            {
+            if !(fields.contains(&field) || projection == "output_rate" && field == "time_series") {
                 assert_eq!(body[field], serde_json::json!([]), "{projection}/{field}");
             }
         }

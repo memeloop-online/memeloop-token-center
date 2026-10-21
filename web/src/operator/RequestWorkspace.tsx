@@ -14,7 +14,7 @@ export function RequestWorkspace({ mode, onModeChange, ...props }: Omit<Componen
   const { t } = useI18n();
   if (mode === 'requests') return <RequestsPage {...props} onOpenGenerations={() => onModeChange('generations')} />;
   return <div className="request-generation-workspace">
-    <div className="panel-title traffic-heading"><h2>{t('nav.requests')}</h2><RequestWorkspaceTabs selected="generations" onRequests={() => onModeChange('requests')} onGenerations={() => undefined} onSessions={props.onOpenSessions} /></div>
+    <div className="panel-title traffic-heading"><h2>{t('sessions.requestsMode')}</h2><RequestWorkspaceTabs selected="generations" onRequests={() => onModeChange('requests')} onGenerations={() => undefined} onSessions={props.onOpenSessions} /></div>
     <Suspense fallback={<LoadingState label={t('common.loading')} />}><GenerationWorkspace token={props.token} tenant={props.tenant} writeTenant={props.writeTenant} /></Suspense>
   </div>;
 }

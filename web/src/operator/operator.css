@@ -236,6 +236,16 @@
 .typed-filter-assistant input,
 .typed-filter-save input { min-width: 0; }
 
+/* Native datetime controls size themselves to the formatted value plus the
+   picker indicator, which overflows the row card on narrow screens; clamp
+   both the Fluent wrapper and the native input to the grid cell. */
+.typed-filter-row .typed-filter-value[data-filter-field='created_at'] .fui-Input,
+.typed-filter-row .typed-filter-value[data-filter-field='created_at'] input[type='datetime-local'] {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+}
+
 .typed-filter-row:has(.typed-filter-value + .typed-filter-value) {
   grid-template-columns: minmax(110px, .75fr) minmax(110px, .75fr) minmax(150px, 1.2fr) minmax(150px, 1.2fr) minmax(40px, auto);
 }
@@ -1322,6 +1332,20 @@
   grid-template-columns: 1fr 1fr;
   margin-bottom: 18px;
   padding: 3px;
+}
+
+/* The shared requests workspace switcher has three segments; the legacy
+   .segmented grid stays two-column for the older two-option switchers.
+   minmax(0, 1fr) keeps all three tabs on one row sharing space equally down
+   to 320px, and the 44px floor keeps each tab touch-friendly. */
+.request-workspace-tabs {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.request-workspace-tabs .fui-Button {
+  justify-content: center;
+  min-height: 44px;
+  min-width: 0;
 }
 
 .traffic-heading-actions {
