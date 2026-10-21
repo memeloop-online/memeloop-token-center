@@ -42,7 +42,7 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
   }
   assert(row.reservation_status === "reserved" && row.state === "pending", "unknown must retain its original financial hold");
   assert(row.unknown_reason === "authoritative_usage_unavailable", "unknown responsibility must be annotated");
-  for (const field of ["ledger_count", "event_count", "fact_count", "observation_count"]) {
+  for (const field of ["ledger_count", "event_count", "fact_count"]) {
     assert(row[field] === 0, `unknown must have no financial side effects: ${field}`);
   }
   assert(row.operational_status === 502 && row.operational_error === "upstream_invalid_response", "real upstream failure must remain visible");
@@ -63,6 +63,34 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
   assert(row.spool_state === "pending" && row.spool_plain_bytes === 512 && row.chunk_plain_bytes === 512, "unknown request archive must remain durable, not be discarded");
   assert(typeof row.spool_cipher_bytes === "number" && Number.isSafeInteger(row.spool_cipher_bytes) && row.spool_cipher_bytes > 0, "retained request archive must have exact positive accounting");
   return row.spool_cipher_bytes;
+}
+
+export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
+  assert(row.observation_count === 1, "unknown must project exactly one conversation observation");
+  assert(row.projected_event_count === 1, "unknown must publish exactly one semantic projected event");
+  for (const field of ["projection_completed", "operational_completed"]) {
+    assert(typeof row[field] === "number" && row[field] > 0, "semantic projection must commit with operational evidence");
+    if (previous) assert(row[field] === previous[field], `semantic replay must preserve timestamp: ${field}`);
+  }
+  assert(row.projection_observed_at === row.operational_completed, "semantic projection must use its operational receipt timestamp");
+  for (const [field, owner] of Object.entries({
+    observation_request_id: "request_id", observation_key_id: "key_id",
+    cluster_tenant_id: "tenant_id", cluster_principal_id: "principal_id",
+    observation_cluster_id: "request_cluster_id",
+    projection_tenant_id: "tenant_id", projection_key_id: "key_id", projection_principal_id: "principal_id",
+    projected_event_tenant_id: "tenant_id", projected_event_key_id: "key_id",
+  })) {
+    assert(typeof row[owner] === "string" && row[owner] !== "" && row[field] === row[owner], `semantic projection must retain exact ownership: ${field}`);
+  }
+  const evidence = Object.fromEntries([
+    "request_id", "tenant_id", "key_id", "principal_id", "operational_receipt_id",
+    "observation_id", "observation_cluster_id", "projected_event_id",
+  ].map((field) => {
+    assert(typeof row[field] === "string" && row[field] !== "", `semantic evidence missing: ${field}`);
+    if (previous) assert(row[field] === previous[field], `semantic replay must preserve identity: ${field}`);
+    return [field, row[field]];
+  }));
+  return { ...evidence, observation_count: 1, projected_event_count: 1, projection_completed: row.projection_completed, operational_completed: row.operational_completed };
 }
 
 function pendingReceipt(directory: string, receiptId: string): PendingReceipt | undefined {
@@ -420,7 +448,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
     report.idle_native_allocator_bytes = nativeAllocatorEvidence(idleMetrics.body.toString("utf8"));
 
-    const drain = async (unknownRequestId?: string): Promise<Record<string, unknown>> => {
+    const drain = async (unknownRequestId?: string, previousSemantics?: Record<string, unknown>): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
       reader.exec("PRAGMA busy_timeout = 1000");
       try {
@@ -442,11 +470,29 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   (SELECT COUNT(*) FROM ledger_entries WHERE source = q.reservation_id) AS ledger_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
                   (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = q.id) AS fact_count,
-                  (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count
+                  (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count,
+                  (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'projected') AS projected_event_count,
+                  k.principal_id, q.conversation_cluster_id AS request_cluster_id,
+                  v.id AS observation_id, v.request_id AS observation_request_id,
+                  v.key_id AS observation_key_id, v.cluster_id AS observation_cluster_id,
+                  c.tenant_id AS cluster_tenant_id, c.principal_id AS cluster_principal_id,
+                  x.tenant_id AS projection_tenant_id, x.key_id AS projection_key_id,
+                  x.principal_id AS projection_principal_id, x.projected_at AS projection_completed,
+                  x.observed_at AS projection_observed_at,
+                  e.event_id AS projected_event_id, e.tenant_id AS projected_event_tenant_id,
+                  e.key_id AS projected_event_key_id
                 FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id
+                JOIN key_records k ON k.id = q.key_id AND k.tenant_id = q.tenant_id
                 JOIN pending_proxy_settlements p ON p.request_id = q.id AND p.reservation_id = r.id
+                  AND p.tenant_id = q.tenant_id AND p.key_id = q.key_id AND p.account_id = r.account_id
                 LEFT JOIN proxy_operational_terminals o ON o.request_id = p.request_id AND o.fence = p.fence AND o.contract_digest = p.contract_digest
+                  AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.account_id = p.account_id
+                  AND o.reservation_id = p.reservation_id AND o.owner_token = p.owner_token
                 LEFT JOIN request_archive_spools s ON s.request_id = p.request_id AND s.reservation_id = p.reservation_id
+                LEFT JOIN conversation_observations v ON v.request_id = q.id
+                LEFT JOIN conversation_clusters c ON c.id = v.cluster_id
+                LEFT JOIN conversation_projection_outbox x ON x.request_id = q.id
+                LEFT JOIN request_events e ON e.request_id = q.id AND e.event_kind = 'projected'
                 WHERE q.id = ?`).get(unknownRequestId);
               const receipt = typeof unknown?.operational_receipt_id === "string"
                 ? pendingReceipt(join(requestSpool, "pending-terminals-v1"), unknown.operational_receipt_id) : undefined;
@@ -454,12 +500,15 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 "state", "unknown_reason", "financial_completed", "reservation_status",
                 "operational_status", "operational_error", "operational_completed", "operational_receipt_id",
                 "spool_state", "spool_plain_bytes", "spool_cipher_bytes", "chunk_plain_bytes",
+                "observation_count", "projected_event_count", "projection_completed",
               ].map((field) => [field, unknown[field]])) : null;
               drainEvidence.durable_receipt_found = receipt !== undefined;
               if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing") {
                 await delay(100); continue;
               }
               retainedRequestCipherBytes = assertUnknownFinancialEvidence(unknown, receipt);
+              if (unknown.projection_completed === null) { await delay(100); continue; }
+              const semantics = assertUnknownSemanticEvidence(unknown, previousSemantics);
               unknownEvidence = {
                 request_id: unknownRequestId, receipt_id: receipt.receipt_id, fence: unknown.fence,
                 financial_state: "unknown", status_code: unknown.operational_status,
@@ -467,6 +516,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 completed_at: unknown.operational_completed, reservation_status: unknown.reservation_status,
                 reserved_micros: unknown.reserved_micros, retained_request_cipher_bytes: retainedRequestCipherBytes,
                 durable_journal: true, financial_ack: false, financial_side_effects: 0,
+                semantics,
               };
             }
             const row = reader.prepare("SELECT cipher_bytes, request_cipher_bytes, (SELECT COUNT(*) FROM request_records WHERE completed_at IS NULL) AS pending_requests, (SELECT COUNT(*) FROM usage_reservations WHERE status = 'reserved') AS unsettled_reservations FROM response_archive_spool_budget WHERE singleton = 1").get();
@@ -623,6 +673,32 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.recovered_rss_mib = recovered;
     report.duration_seconds = (performance.now() - started) / 1000;
     assert(!sampleFailure && memoryVerdict(idle, peak, recovered), "independent-process RSS peak/recovery gate failed");
+    const beforeReplay = report.phases.at(-1).drain.unknown_financial_responsibility;
+    const callsBeforeReplay = upstreamCalls;
+    if (sampler) clearInterval(sampler);
+    sampler = undefined;
+    await stop(service);
+    const replayLog = `${output}.replay.log`;
+    writeFileSync(replayLog, "");
+    service = spawn(binary, ["serve", "--role", "all"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    service.once("error", (error) => { sampleFailure = error; });
+    service.stdout?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
+    service.stderr?.on("data", (chunk: Buffer) => writeFileSync(replayLog, chunk, { flag: "a" }));
+    await deadline((async () => {
+      while (true) {
+        assert(!sampleFailure && service!.exitCode === null, "service exited during unknown receipt replay");
+        const replayed = readFileSync(replayLog, "utf8").split("\n").some((line) => {
+          let entry; try { entry = JSON.parse(line); } catch { return false; }
+          return entry.fields?.message === "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement"
+            && entry.fields?.request_id === beforeReplay.request_id && entry.fields?.receipt_id === beforeReplay.receipt_id;
+        });
+        if (replayed) break;
+        await delay(100);
+      }
+    })(), 30_000, "unknown receipt replay");
+    const replayDrain = await drain(beforeReplay.request_id, beforeReplay.semantics);
+    assert(upstreamCalls === callsBeforeReplay, "unknown journal replay must not dispatch upstream");
+    report.unknown_receipt_replay = { service_pid: service.pid, upstream_calls: upstreamCalls - callsBeforeReplay, drain: replayDrain };
     report.passed = true;
   } catch (error) {
     report.error = error instanceof Error ? error.message : String(error);

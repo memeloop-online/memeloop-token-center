@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertUnknownFinancialEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -57,7 +57,7 @@ test("drain exempts only one explicitly owned unknown hold and its exact durable
   assert.throws(() => archiveDrainReady(retained, -1), /retained archive bytes/u);
 });
 
-test("unknown requires real operational failure, retained matching receipt, hold and no financial effects", () => {
+test("unknown requires owned semantics exactly once while retaining its receipt, hold and no financial ACK", () => {
   const responseObject = 'inline-json:{"error":{"message":"upstream request failed","type":"upstream_error"}}';
   const claim = {
     request_id: "request", tenant_id: "tenant", key_id: "key", account_id: "account",
@@ -67,7 +67,13 @@ test("unknown requires real operational failure, retained matching receipt, hold
     ...claim, financial_completed: null, financial_status: null, actual_micros: null,
     receipt_id: null, receipt_digest: null, cost_micros: null, reserved_micros: 123,
     reservation_status: "reserved", state: "pending", unknown_reason: "authoritative_usage_unavailable",
-    ledger_count: 0, event_count: 0, fact_count: 0, observation_count: 0,
+    ledger_count: 0, event_count: 0, fact_count: 0, observation_count: 1, projected_event_count: 1,
+    principal_id: "principal", request_cluster_id: "cluster",
+    observation_id: "observation", observation_request_id: "request", observation_key_id: "key",
+    observation_cluster_id: "cluster", cluster_tenant_id: "tenant", cluster_principal_id: "principal",
+    projection_tenant_id: "tenant", projection_key_id: "key", projection_principal_id: "principal",
+    projection_completed: 1235, projection_observed_at: 1234, projected_event_id: "projected",
+    projected_event_tenant_id: "tenant", projected_event_key_id: "key",
     operational_status: 502, operational_error: "upstream_invalid_response",
     operational_stage: "buffered_response_ready", operational_completed: 1234,
     operational_receipt_id: "receipt", operational_response_object: responseObject,
@@ -83,10 +89,35 @@ test("unknown requires real operational failure, retained matching receipt, hold
     },
   };
   assert.equal(assertUnknownFinancialEvidence(row, receipt), 2048);
+  const semantics = assertUnknownSemanticEvidence(row);
+  assert.deepEqual(assertUnknownSemanticEvidence({ ...row }, semantics), semantics);
+  assert.equal(assertUnknownFinancialEvidence({ ...row }, receipt), 2048);
+  for (const count of [0, 2]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }), /exactly one conversation observation/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }), /exactly one semantic projected event/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }, semantics), /exactly one conversation observation/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }, semantics), /exactly one semantic projected event/u);
+  }
+  for (const field of [
+    "observation_request_id", "observation_key_id", "cluster_tenant_id", "cluster_principal_id",
+    "observation_cluster_id", "projection_tenant_id", "projection_key_id", "projection_principal_id",
+    "projected_event_tenant_id", "projected_event_key_id",
+  ]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "other-owner" }), /exact ownership/u);
+  }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_completed: null }), /projection must commit/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_observed_at: 999 }, semantics), /operational receipt timestamp/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_completed: 1236 }, semantics), /replay must preserve timestamp/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, operational_completed: 1235, projection_observed_at: 1235 }, semantics), /replay must preserve timestamp/u);
+  for (const field of ["observation_id", "projected_event_id", "operational_receipt_id"]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "" }), /semantic evidence missing/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "replacement" }, semantics), /replay must preserve identity/u);
+  }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_cluster_id: "replacement", request_cluster_id: "replacement" }, semantics), /replay must preserve identity/u);
   for (const field of ["financial_completed", "financial_status", "actual_micros", "receipt_id", "receipt_digest", "cost_micros"]) {
     assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: 0 }, receipt), /financial completion/u);
   }
-  for (const field of ["ledger_count", "event_count", "fact_count", "observation_count"]) {
+  for (const field of ["ledger_count", "event_count", "fact_count"]) {
     assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: 1 }, receipt), /financial side effects/u);
   }
   for (const field of Object.keys(claim)) {
