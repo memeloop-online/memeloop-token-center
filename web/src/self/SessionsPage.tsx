@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createSessionContextLoader } from '../sessionContextReader.js';
 import { api } from '../api';
 import { readArchiveRange, type ArchiveRangeLoader } from '../archiveRange';
 import { Button } from '../design-system';
@@ -25,6 +26,9 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
   const [generatedAt, setGeneratedAt] = useState(0);
   const [selected, setSelected] = useState<LogicalSessionSummary>();
   const [detail, setDetail] = useState<LogicalSessionDetail>();
+  const contextLoader = useMemo(() => detail ? createSessionContextLoader(detail.session_id, credential, (requestId, content) =>
+    `/self/v1/sessions/${encodeURIComponent(detail.session_id)}/requests/${encodeURIComponent(requestId)}/context${content ? '/content' : ''}`,
+  ) : undefined, [detail?.session_id, credential]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const listSequence = useRef(0);
@@ -182,7 +186,7 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
           {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchSessions(nextCursor, 'append')}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
         </section>
         <div className="session-detail-region">
-          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
+          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
         </div>
       </div>
     </article>

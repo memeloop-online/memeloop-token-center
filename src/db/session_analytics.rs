@@ -589,7 +589,13 @@ impl Database {
                               SELECT 1 FROM conversation_observations named_observation
                                WHERE named_observation.key_id = ranked.key_id
                                  AND named_observation.cluster_id = ranked.session_id
-                                 AND LOWER(named_observation.session_name) LIKE $8 ESCAPE '\'))
+                                 AND LOWER(named_observation.session_name) LIKE $8 ESCAPE '\')
+                           OR EXISTS (
+                              SELECT 1 FROM session_generated_titles generated_title
+                               WHERE generated_title.tenant_id = ranked.tenant_id
+                                 AND generated_title.key_id = ranked.key_id
+                                 AND generated_title.session_id = ranked.session_id
+                                 AND LOWER(generated_title.title) LIKE $8 ESCAPE '\'))
                       AND ($7 = '' OR EXISTS (
                               SELECT 1 FROM session_usage_hourly model_usage
                                WHERE model_usage.tenant_id = ranked.tenant_id
@@ -787,10 +793,13 @@ impl Database {
                 .bind(&query)
                 .bind(&before_key_id);
         }
-        session_summaries_from_rows(
+        let mut sessions = session_summaries_from_rows(
             session_query.fetch_all(&self.pool).await?,
             Some(limit as usize),
-        )
+        )?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn session_summaries(
@@ -851,7 +860,7 @@ impl Database {
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
                ), projected AS (
-                   SELECT key_record.tenant_id, projection.key_id,
+                   SELECT COALESCE(key_record.tenant_id, cluster.tenant_id) AS tenant_id, projection.key_id,
                           projection.cluster_id AS session_id,
                           projection.updated_at AS last_activity_at,
                           projection.request_count
@@ -859,9 +868,12 @@ impl Database {
                      JOIN conversation_key_clusters projection
                        ON projection.key_id = requested.key_id
                       AND projection.cluster_id = requested.session_id
-                     JOIN key_records key_record
+                     JOIN conversation_clusters cluster
+                       ON cluster.id = projection.cluster_id
+                     LEFT JOIN key_records key_record
                        ON key_record.id = projection.key_id
-                      AND key_record.tenant_id = $1
+                    WHERE COALESCE(key_record.tenant_id, cluster.tenant_id) = $1
+                      AND (key_record.id IS NULL OR key_record.tenant_id = cluster.tenant_id)
                ), archived AS (
                    SELECT archive.tenant_id, archive.key_id, archive.session_id,
                           archive.last_activity_at, archive.requests, archive.errors,
@@ -888,7 +900,7 @@ impl Database {
                ), filterable AS (
                    SELECT ranked.*
                      FROM ranked
-                     JOIN key_records filter_key
+                     LEFT JOIN key_records filter_key
                        ON filter_key.id = ranked.key_id
                       AND filter_key.tenant_id = ranked.tenant_id
                      LEFT JOIN completed
@@ -910,7 +922,7 @@ impl Database {
         let query_parameter = state_parameter + 2;
         write!(
             statement,
-            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.status_code IS NULL AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
+            "({0} = 'all' OR ({0} = 'active' AND active.active_requests > 0) OR ({0} = 'has_errors' AND COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0)) AND ({2} = '' OR LOWER(ranked.session_id) LIKE {2} ESCAPE '\\' OR LOWER(filter_key.alias) LIKE {2} ESCAPE '\\' OR EXISTS (SELECT 1 FROM conversation_observations named_observation WHERE named_observation.key_id = ranked.key_id AND named_observation.cluster_id = ranked.session_id AND LOWER(named_observation.session_name) LIKE {2} ESCAPE '\\') OR EXISTS (SELECT 1 FROM session_generated_titles generated_title WHERE generated_title.tenant_id = ranked.tenant_id AND generated_title.key_id = ranked.key_id AND generated_title.session_id = ranked.session_id AND LOWER(generated_title.title) LIKE {2} ESCAPE '\\')) AND ({1} = '' OR EXISTS (SELECT 1 FROM session_usage_hourly model_usage WHERE model_usage.tenant_id = ranked.tenant_id AND model_usage.key_id = ranked.key_id AND model_usage.session_id = ranked.session_id AND model_usage.model = {1}) OR EXISTS (SELECT 1 FROM request_records model_active WHERE model_active.tenant_id = ranked.tenant_id AND model_active.key_id = ranked.key_id AND COALESCE(model_active.conversation_cluster_id, 'unlinked:' || model_active.key_id) = ranked.session_id AND model_active.status_code IS NULL AND model_active.completed_at IS NULL AND model_active.model = {1}) OR EXISTS (SELECT 1 FROM session_archive_unlinked_requests model_archive WHERE model_archive.tenant_id = ranked.tenant_id AND model_archive.key_id = ranked.key_id AND COALESCE(model_archive.conversation_cluster_id, 'unlinked:' || model_archive.key_id) = ranked.session_id AND model_archive.model = {1}))",
             format_args!("${state_parameter}"),
             format_args!("${model_parameter}"),
             format_args!("${query_parameter}"),
@@ -1014,7 +1026,7 @@ impl Database {
                           ) AS activity_rank
                      FROM recent_activity
                )
-               SELECT recent.*, key_record.alias AS key_alias,
+               SELECT recent.*, COALESCE(key_record.alias, '__retired_credential__') AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
                       COALESCE(totals.cost_micros, 0) AS cost_micros,
                       COALESCE(completed.requests, 0) AS requests,
@@ -1040,7 +1052,7 @@ impl Database {
                            WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
                            ELSE 'error' END AS last_status
                  FROM recent
-                 JOIN key_records key_record
+                 LEFT JOIN key_records key_record
                    ON key_record.id = recent.key_id
                   AND key_record.tenant_id = recent.tenant_id
                  LEFT JOIN completed
@@ -1077,7 +1089,11 @@ impl Database {
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
         session_query = session_query.bind(&filter.state).bind(&model).bind(&query);
-        session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)
+        let mut sessions =
+            session_summaries_from_rows(session_query.fetch_all(&self.pool).await?, None)?;
+        self.apply_generated_session_titles(tenant_id, &mut sessions)
+            .await?;
+        Ok(sessions)
     }
 
     async fn unlinked_session_detail(

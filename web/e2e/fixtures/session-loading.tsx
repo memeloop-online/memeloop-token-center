@@ -73,6 +73,18 @@ if (new URLSearchParams(location.search).has('titles')) {
 }
 window.fetch = async (input, init) => {
   const url = String(input);
+  const requestUrl = new URL(url, location.origin);
+  if (requestUrl.pathname.endsWith('/title')) {
+    return new Response(JSON.stringify({ title: null, state: 'unavailable', error_code: null, updated_at: null }));
+  }
+  const contextMatch = /\/sessions\/([^/]+)\/requests\/([^/]+)\/context$/.exec(requestUrl.pathname);
+  if (contextMatch) {
+    return new Response(JSON.stringify({
+      contract_version: 'session_context_v1', representation: 'semantic_context',
+      session_id: decodeURIComponent(contextMatch[1]!), request_id: decodeURIComponent(contextMatch[2]!),
+      items: [], next_cursor: null,
+    }));
+  }
   if (url.includes('/keys?')) return new Response(JSON.stringify([]));
   const summaryBatch = url.includes('/sessions/summaries');
   if (summaryBatch && init?.method !== 'POST') {

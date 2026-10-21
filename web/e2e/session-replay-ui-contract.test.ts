@@ -33,6 +33,18 @@ test('replay reads are bounded, abortable, and accept only an exact request and 
   assert.doesNotMatch(replayView, /dangerouslySetInnerHTML|\beval\s*\(/);
 });
 
+test('reading hierarchy keeps full user text on the right and defers tool rendering', () => {
+  assert.match(replayView, /finalReplayResponse\(group\.map/);
+  assert.match(replayView, /open \? children : null/);
+  assert.match(replayView, /LazyDisclosure title=\{t\('sessionReplay\.responseDetails'\)\}/);
+  assert.match(replayView, /LazyDisclosure title=\{t\('sessionReplay\.toolCount'/);
+  assert.match(replayView, /LazyDisclosure title=\{t\('sessionReplay\.arguments'\)\}/);
+  assert.match(replayView, /LazyDisclosure title=\{t\('sessionReplay\.output'\)\}/);
+  assert.match(replayStyles, /grid-template-areas: "responses users"/);
+  assert.match(replayStyles, /\.session-replay-turns button b \{[^}]*white-space: pre-wrap/);
+  assert.doesNotMatch(replayStyles, /\.session-replay-turns button b \{[^}]*text-overflow: ellipsis/);
+});
+
 test('replay provides localized user-turn navigation, compact archive state, and responsive dark/light presentation', () => {
   assert.match(replayView, /title=\{fullText\}/);
   assert.match(replayView, /scrollIntoView\(\{ block: 'center', behavior: 'smooth' \}\)/);

@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Disclosure } from './design-system';
 import { ArchiveContentReader } from './ArchiveContentReader.js';
 import type { ArchiveRangeLoader } from './archiveRange.js';
 import {
   projectSessionReplay,
+  finalReplayResponse,
   SESSION_REPLAY_MAX_REQUESTS,
   SESSION_REPLAY_MAX_ITEMS,
   type ReplayUnknownReason,
@@ -84,9 +85,15 @@ function ArchiveText({ value, kind, t }: { value: string; kind: 'message' | 'too
   return <>
     {!expanded && <p className={`session-replay-preview ${kind}`}>{value}</p>}
     <div className={`session-replay-expand ${kind}`}><Disclosure open={expanded} onOpenChange={setExpanded} title={expanded ? t('sessionReplay.collapse') : t('sessionReplay.expand', { count: value.length.toLocaleString() })}>
-      {body}
+      {expanded ? body : null}
     </Disclosure></div>
   </>;
+}
+
+/** Disclosure itself retains children; gate expensive bodies explicitly. */
+function LazyDisclosure({ title, children, defaultOpen = false }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return <Disclosure title={title} open={open} onOpenChange={setOpen}>{open ? children : null}</Disclosure>;
 }
 
 function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t: Translate; summaryOnly?: boolean }) {
@@ -110,7 +117,9 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
     <header><b>{t('sessionReplay.toolCall')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
     <p className="session-replay-tool-name">{item.name ?? t('sessionReplay.unknown')}</p>
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
-    <ArchiveText kind="tool" t={t} value={item.arguments ?? unknownLabel(t, item.unknownFields.includes('arguments') ? 'missing_text' : null)} />
+    <LazyDisclosure title={t('sessionReplay.arguments')}>
+      <ArchiveText kind="tool" t={t} value={item.arguments ?? unknownLabel(t, item.unknownFields.includes('arguments') ? 'missing_text' : null)} />
+    </LazyDisclosure>
     <Disclosure title={t('request.technicalDetails')}>
       <dl>
         <div><dt>{t('sessionReplay.callId')}</dt><dd><code>{item.callId ?? t('sessionReplay.unknown')}</code></dd></div>
@@ -123,7 +132,9 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
   return <article className="session-replay-entry tool-result" data-replay-kind={item.kind}>
     <header><b>{t('sessionReplay.toolResult')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
     {item.name && <p className="session-replay-tool-name">{item.name}</p>}
-    <ArchiveText kind="tool" t={t} value={item.output ?? unknownLabel(t, item.unknownFields.includes('output') ? 'missing_text' : null)} />
+    <LazyDisclosure title={t('sessionReplay.output')}>
+      <ArchiveText kind="tool" t={t} value={item.output ?? unknownLabel(t, item.unknownFields.includes('output') ? 'missing_text' : null)} />
+    </LazyDisclosure>
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
     <Disclosure title={t('request.technicalDetails')}>
       <dl>
@@ -304,7 +315,12 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
     if (selectedTurn && !entries.some(entry => entry.identity === selectedTurn)) setSelectedTurn(undefined);
   }, [selectedTurn, turnIdentities]);
   const incompleteCount = archiveDetails.filter((request) => !request.archive_complete).length;
-  const activity = entries.filter((entry) => entry.item.kind !== 'unknown' && !(entry.item.kind === 'message' && entry.item.role === 'user'));
+  const requestGroups = new Map<string, ReplayEntry[]>();
+  for (const entry of entries) {
+    const group = requestGroups.get(entry.item.requestId) ?? [];
+    group.push(entry);
+    requestGroups.set(entry.item.requestId, group);
+  }
   const unreadCount = sourceRequests.length - archiveDetails.length;
 
   function retryUnread() {
@@ -321,7 +337,7 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
 
   if (!loadArchiveDetail) return null;
 
-  return <section className="session-replay" aria-label={t('sessionReplay.title')}>
+  return <section className="session-replay" data-replay-loading={archiveLoading} aria-label={t('sessionReplay.title')}>
     <header className="session-replay-heading">
       <div><span className="eyebrow">{t('sessionReplay.title')}</span><h3>{t('sessionReplay.content')}</h3></div>
       <div className="session-replay-status" role="status" aria-live="polite">
@@ -354,17 +370,29 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             onClick={() => selectTurn(turn)}
           ><span>{index + 1}</span><b>{fullText}</b></button></li>;
         })}</ol> : <p role="status">{archiveLoading ? t('sessionReplay.loading') : incompleteSnapshot ? t('sessionReplay.snapshotOnly') : t('sessionReplay.noUserTurns')}</p>}
-        <div className="session-replay-turn-heading"><span>{t('sessionReplay.activity')}</span><b>{incompleteSnapshot || (archiveLoading && !activity.length) ? '—' : activity.length}</b></div>
-        <ol>{activity.map((entry, index) => <li key={entry.identity}><button type="button" aria-pressed={selectedTurn === entry.identity} onClick={() => selectTurn(entry)}><span>{index + 1}</span><b>{entry.item.kind === 'message' ? entry.item.text || t('sessionReplay.agent') : entry.item.kind === 'tool_call' ? entry.item.name || t('sessionReplay.toolCall') : entry.item.kind === 'tool_result' ? entry.item.name || t('sessionReplay.toolResult') : ''}</b></button></li>)}</ol>
       </aside>
       <ol className="session-replay-feed" aria-label={t('sessionReplay.archiveSequence')}>
-        {entries.map((entry) => <li
+        {[...requestGroups].map(([requestId, group], groupIndex) => {
+          const final = finalReplayResponse(group.map(entry => entry.item));
+          const tools = group.filter(entry => entry.item.kind === 'tool_call' || entry.item.kind === 'tool_result');
+          return <li key={requestId} className={group.some(entry => entry.identity === selectedTurn) ? 'selected' : undefined} ref={node => {
+            for (const entry of group) {
+              if (node) entryRefs.current.set(entry.identity, node);
+              else entryRefs.current.delete(entry.identity);
+            }
+          }}>
+            <article className="session-replay-entry response-summary">
+              <header><b>{t('sessionReplay.responseNumber', { index: groupIndex + 1 })}</b></header>
+              {final?.text
+                ? <pre className="session-replay-body message">{final.text}</pre>
+                : <p>{t('sessionReplay.noFinalResponse')}</p>}
+              {tools.length > 0 && <small>{t('sessionReplay.toolCount', { count: tools.length })}</small>}
+            </article>
+            <LazyDisclosure title={t('sessionReplay.responseDetails')} defaultOpen={group.every(entry => entry.item.kind === 'unknown')}>
+              <ol className="session-replay-feed">
+        {group.filter(entry => entry.item.kind !== 'tool_call' && entry.item.kind !== 'tool_result').map((entry) => <li
           key={entry.identity}
           className={selectedTurn === entry.identity ? 'selected' : undefined}
-          ref={(node) => {
-            if (node) entryRefs.current.set(entry.identity, node);
-            else entryRefs.current.delete(entry.identity);
-          }}
         ><EntryContent entry={entry} t={t} summaryOnly={Boolean(loadArchiveRange) && entry.item.kind === 'unknown' && archiveDetails.some(request => request.request_id === entry.item.requestId
           && (entry.archiveBodies === 2 ? canTryFullArchive(request, 'request') && canTryFullArchive(request, 'response') : canTryFullArchive(request, entry.item.body)))} />
           {entry.item.kind === 'unknown' && loadArchiveRange && (() => {
@@ -378,6 +406,15 @@ export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadA
             />);
           })()}
         </li>)}
+              </ol>
+              {tools.length > 0 && <LazyDisclosure title={t('sessionReplay.toolCount', { count: tools.length })}>
+                {tools.map(entry => <LazyDisclosure key={entry.identity} title={`${entry.item.kind === 'tool_call' ? t('sessionReplay.toolCall') : t('sessionReplay.toolResult')} · ${entry.item.kind === 'tool_call' || entry.item.kind === 'tool_result' ? entry.item.name ?? t('sessionReplay.unknown') : ''}`}>
+                  <EntryContent entry={entry} t={t} />
+                </LazyDisclosure>)}
+              </LazyDisclosure>}
+            </LazyDisclosure>
+          </li>;
+        })}
       </ol>
     </div>
   </section>;

@@ -273,6 +273,18 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))
         .route(
+            "/internal/v1/sessions/{session_id}/title",
+            get(get_session_title).post(generate_session_title),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/context",
+            get(internal_session_context),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/context/content",
+            get(internal_session_context_content),
+        )
+        .route(
             "/internal/v1/sessions/summaries",
             post(internal_session_summaries),
         )
