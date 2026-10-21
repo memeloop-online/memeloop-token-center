@@ -1041,7 +1041,8 @@ impl Journal {
                             // Unknown usage must not prevent semantic history
                             // from committing. Missing operational evidence is
                             // retried before this entry enters reconciliation.
-                            let projection = if let Some(conversation) = input.conversation.as_ref() {
+                            let projection = if let Some(conversation) = input.conversation.as_ref()
+                            {
                                 database
                                     .enqueue_operational_conversation_projection(
                                         claim,

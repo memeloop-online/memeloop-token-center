@@ -67,12 +67,8 @@ async fn chat_transport_preserves_complete_incomplete_and_rejects_invalid_termin
             assert!(value["error"].is_object());
         }
         if finish_reason == "unknown" {
-            cancellation::assert_single_unknown_receipt(
-                &fixture,
-                502,
-                Some("upstream_stream"),
-            )
-            .await;
+            cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_stream"))
+                .await;
         } else {
             wait_for_request_settlement(&fixture, 1).await;
         }
