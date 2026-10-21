@@ -66,7 +66,11 @@ export function usageAstIssue(ast: TypedFilterAst): 'duplicate' | 'unsupported' 
 
 export function usageSelectionFromAst(current: UsageSelection, ast: TypedFilterAst, readPeriod = true): UsageSelection | undefined {
   if (usageAstIssue(ast) || (!readPeriod && ast.conditions.some((condition) => condition.field === 'created_at' || condition.field === 'key_alias'))) return undefined;
-  const filters = { ...emptyUsageFilters, keyAlias: current.filters.keyAlias, upstreamId: current.filters.upstreamId === 'unassigned' ? 'unassigned' : '' };
+  // A full draft (readPeriod) is authoritative: deleting the key_alias row
+  // clears the alias instead of resurrecting the previously applied one.  The
+  // legacy readPeriod=false path never carries key_alias rows, so it keeps the
+  // current alias for compatibility.
+  const filters = { ...emptyUsageFilters, keyAlias: readPeriod ? '' : current.filters.keyAlias, upstreamId: current.filters.upstreamId === 'unassigned' ? 'unassigned' : '' };
   let period = { preset: current.preset, customFrom: current.customFrom, customTo: current.customTo };
   for (const condition of ast.conditions) {
     if (readPeriod && condition.field === 'created_at' && condition.operator === 'between' && condition.value.type === 'timestamp' && condition.upper?.type === 'timestamp') {

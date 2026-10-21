@@ -104,6 +104,29 @@ test('preset and custom periods serialize to the same AST and statistics range',
   assert.equal(usageAstFromSelection(ast, custom), undefined);
 });
 
+test('deleting the credential alias row clears the applied alias while keeping model and period semantics', () => {
+  const now = Date.parse('2026-10-02T12:00:00Z');
+  const base: UsageSelection = { ...defaultUsageSelection(now), preset: '7d', resolvedAt: now, filters: { ...defaultUsageSelection(now).filters, model: 'public-model', keyAlias: 'client-a' } };
+  const ast = usageAstFromSelection({ logical_operator: 'and', conditions: [] }, base);
+  assert.ok(ast);
+  const pruned = { ...ast, conditions: ast.conditions.filter((condition) => condition.field !== 'key_alias') };
+  // A full draft no longer resurrects the alias the user just deleted.
+  const applied = usageSelectionFromDraft(base, pruned, now);
+  assert.ok(applied);
+  assert.equal(applied.filters.keyAlias, '');
+  assert.equal(applied.filters.model, 'public-model');
+  assert.equal(applied.preset, '7d');
+  assert.equal(applied.resolvedAt, now);
+  assert.equal(new URLSearchParams(statsQuery('', applied)?.slice(1)).get('key_alias'), null);
+  // Reopening a saved full AST without the alias starts from an empty alias too.
+  const reopened = usageSelectionFromAst(base, pruned);
+  assert.equal(reopened?.filters.keyAlias, '');
+  // The legacy draft path never carries key_alias rows, so it keeps the current alias.
+  const legacy = usageSelectionFromAst(base, { logical_operator: 'and', conditions: [{ field: 'model', operator: 'equals', value: { type: 'model', value: 'public-model' } }] }, false);
+  assert.equal(legacy?.filters.keyAlias, 'client-a');
+  assert.equal(legacy?.filters.model, 'public-model');
+});
+
 test('typed filters normalize independently of the chosen period', () => {
   const selection = defaultUsageSelection(Date.parse('2026-10-02T12:00:00Z'));
   const ast = { logical_operator: 'and' as const, conditions: [

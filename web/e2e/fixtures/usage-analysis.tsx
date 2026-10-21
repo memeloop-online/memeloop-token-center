@@ -10,7 +10,7 @@ import '../../src/styles/metrics.css';
 import '../../src/operator/operator.css';
 
 declare global {
-  interface Window { usageAnalysisFixture: { calls: string[]; failSaves: boolean; holdProjection?: string; releaseProjection?: () => void; aborted: number; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
+  interface Window { usageAnalysisFixture: { calls: string[]; failSaves: boolean; holdProjection?: string; failProjection?: string; releaseProjection?: () => void; aborted: number; presets: { named: Array<{ name: string; ast: unknown; updated_at: number }>; recent: unknown[] } } }
 }
 
 const largeMetric = 1_250_000_000_000;
@@ -55,7 +55,8 @@ const credentials = Array.from({ length: 101 }, (_, index) => ({
   key_id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
 }));
 
-window.usageAnalysisFixture = { calls: [], failSaves: false, aborted: 0, holdProjection: new URLSearchParams(location.search).get('holdProjection') ?? undefined, presets: { named: [], recent: [] } };
+const fixtureParams = new URLSearchParams(location.search);
+window.usageAnalysisFixture = { calls: [], failSaves: false, aborted: 0, holdProjection: fixtureParams.get('holdProjection') ?? undefined, failProjection: fixtureParams.get('failProjection') ?? undefined, presets: { named: [], recent: [] } };
 
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -74,6 +75,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       init?.signal?.addEventListener('abort', abort, { once: true });
       window.usageAnalysisFixture.releaseProjection = () => { init?.signal?.removeEventListener('abort', abort); resolve(); };
     });
+    if (projection && window.usageAnalysisFixture.failProjection === projection) return json({ error: { message: 'Projection failed' } }, 500);
     if (projection === 'output_rate') {
       const zero = { ...metrics, requests: 0, input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, cache_write_tokens: 0, success: 0, failed: 0, generation_units: 0, avg_duration_ms: null, p95_duration_ms: null };
       return json({ ...analysis, summary: zero, time_series: [{ ...zero, bucket_start: analysis.time_series[0].bucket_start }] });

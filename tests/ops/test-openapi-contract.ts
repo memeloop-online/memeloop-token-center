@@ -225,7 +225,18 @@ test("overview usage trends is an exact minimal projection of the full query con
   const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
   assert.deepEqual(trends.security, full.security);
   assert.equal(trends["x-required-scope"], full["x-required-scope"]);
-  assert.deepEqual(trends.parameters, full.parameters);
+  const sharedParameters = (operation: Obj) => operation.parameters.filter((parameter: Obj) => parameter.name !== "projection");
+  assert.deepEqual(sharedParameters(trends), sharedParameters(full));
+  for (const [operation, values] of [
+    [full, ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"]],
+    [trends, ["full", "trends"]],
+  ] as const) {
+    const projections = operation.parameters.filter((parameter: Obj) => parameter.name === "projection");
+    assert.equal(projections.length, 1, "each endpoint declares exactly one projection selector");
+    assert.equal(projections[0].in, "query");
+    assert.equal(projections[0].required, false);
+    assert.deepEqual(projections[0].schema, { type: "string", enum: values, default: "full" });
+  }
   assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
   const schema = document.components.schemas.UsageAnalysisTrends;
   const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
