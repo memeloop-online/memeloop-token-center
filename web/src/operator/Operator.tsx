@@ -38,11 +38,10 @@ const PricingPage = lazy(() => import('./pages/ManagementPages').then((module) =
 const ProvidersPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ProvidersPage })));
 const RoutesPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.RoutesPage })));
 const ServiceCredentialsPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ServiceCredentialsPage })));
-const GenerationsPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.GenerationsPage })));
 const OverviewPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.OverviewPage })));
 const UsagePage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.UsagePage })));
 const PluginsPage = lazy(() => import('./pages/PluginsPage').then((module) => ({ default: module.PluginsPage })));
-const RequestsPage = lazy(() => import('./pages/RequestsPage').then((module) => ({ default: module.RequestsPage })));
+const RequestWorkspace = lazy(() => import('./RequestWorkspace').then((module) => ({ default: module.RequestWorkspace })));
 const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })));
 const SystemSettingsPage = lazy(() => import('./pages/SystemSettingsPage').then((module) => ({ default: module.SystemSettingsPage })));
 const TenantManager = lazy(() => import('./TenantManager').then((module) => ({ default: module.TenantManager })));
@@ -64,7 +63,6 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'requests', label: 'nav.traffic', domId: 'traffic' },
   { route: 'sessions', label: 'sessions.sessionsMode', domId: 'sessions' },
   { route: 'usage', label: 'nav.usage', domId: 'usage' },
-  { route: 'generations', label: 'nav.generations', domId: 'generations' },
   { route: 'providers', label: 'nav.providers', domId: 'providers' },
   { route: 'proxy-groups', label: '', domId: 'proxy-groups' },
   { route: 'routes', label: 'nav.routes', domId: 'routes' },
@@ -76,6 +74,7 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
 ];
 
 function pageId(route: OperatorApplicationRoute) {
+  if (route === 'generations') return 'requests';
   if (route === 'service-credentials') return 'tenants';
   return navigation.find((item) => item.route === route)?.domId ?? route;
 }
@@ -235,10 +234,10 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
-        case 'requests': page = <RequestsPage {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
+        case 'requests':
+        case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
-        case 'generations': page = <GenerationsPage {...pageProps} />; break;
         case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
           if (!scope.tenants.some(value => value.external_id === tenant)) return;
           scope.setTenant(tenant);
@@ -279,7 +278,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       void guardedNavigation(() => { setProxyContext({}); scope.setTenant(tenant); });
     }}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => {
-      const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants';
+      const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants' || activeRoute === 'generations' && item.route === 'requests';
       return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : t(item.label)}</button>;
     })}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}

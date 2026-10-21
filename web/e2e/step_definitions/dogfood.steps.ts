@@ -172,7 +172,8 @@ Then('英文导航、主题色和响应式布局均正确且浏览器没有失�
 
 When('管理员进入请求统计', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?'));
+  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?')
+    && new URL(response.url()).searchParams.get('projection') === 'overview');
   await openAppRoute(page, 'operator', 'usage');
   await assertVisible(page.getByRole('heading', { name: '用量分析', exact: true }));
   await assertUsageTotalTokens(page, await usageResponse);
@@ -294,7 +295,7 @@ Then('点击失败状态 bucket 使用 error 并仅显示失败结果', async fu
   await failureBucket.click();
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), '状态');
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'error');
-  const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'status', value: 'error' });
   assert.equal(requestUrl.searchParams.get('status'), 'error');
   assert.notEqual(requestUrl.searchParams.get('status'), 'failure');
   await assertCount(statusPanel.locator('tbody tr'), 1);
@@ -312,7 +313,7 @@ Then('点击未分配上游使用 unassigned 并仅显示无上游结果', async
   const requestsBeforeClick = observation.requestUrls.length;
   const unassignedBucket = upstreamPanel.locator('.usage-filter-link').filter({ hasText: '未分配上游' });
   await unassignedBucket.click();
-  const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'upstream_account_id', value: 'unassigned' });
   assert.equal(requestUrl.searchParams.get('upstream_account_id'), 'unassigned');
   await assertCount(upstreamPanel.locator('tbody tr'), 1);
   await assertExactText(upstreamPanel.locator('tbody tr td').nth(1), '6');
@@ -329,7 +330,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   await openUsageDimension(page, '模型');
   let requestsBeforeClick = observation.requestUrls.length;
   await usageDimension(page, '模型').locator('.usage-filter-link').filter({ hasText: model }).click();
-  let requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  let requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'model', value: model });
   assert.equal(requestUrl.searchParams.get('model'), model);
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), model);
 
@@ -339,7 +340,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   const credentialBucket = usageDimension(page, '客户端凭据')
     .locator('.usage-filter-link').filter({ hasText: 'Browser E2E credential' });
   await credentialBucket.click();
-  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'key_id', value: seed.clientKeyId });
   assert.equal(requestUrl.searchParams.get('key_id'), seed.clientKeyId);
   assert.match(requestUrl.searchParams.get('key_id') ?? '', uuidPattern);
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), seed.clientKeyId);
@@ -348,7 +349,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   await openUsageDimension(page, '协议');
   requestsBeforeClick = observation.requestUrls.length;
   await usageDimension(page, '协议').locator('.usage-filter-link').filter({ hasText: 'OpenAI' }).click();
-  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'protocol', value: 'openai' });
   assert.equal(requestUrl.searchParams.get('protocol'), 'openai');
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'openai');
 
@@ -358,7 +359,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   const errorBucket = usageDimension(page, '错误码')
     .locator('.usage-filter-link').filter({ hasText: 'strict_fixture_error' });
   await errorBucket.click();
-  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'error_code', value: 'strict_fixture_error' });
   assert.equal(requestUrl.searchParams.get('error_code'), 'strict_fixture_error');
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'strict_fixture_error');
   const errorPanel = usageDimension(page, '错误码');
@@ -376,7 +377,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   const requestsBeforeClick = observation.requestUrls.length;
   const assignedBucket = upstreamPanel.locator('.usage-filter-link').filter({ hasText: seed.upstreamName });
   await assignedBucket.click();
-  const assignedUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
+  const assignedUrl = await nextStrictUsageUrl(observation, requestsBeforeClick, { projection: 'dimensions', parameter: 'upstream_account_id', value: seed.upstreamId });
   assert.equal(assignedUrl.searchParams.get('upstream_account_id'), seed.upstreamId);
   assert.match(assignedUrl.searchParams.get('upstream_account_id') ?? '', uuidPattern);
   await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), seed.upstreamId);
@@ -409,7 +410,11 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
 Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
-  const responsePromise = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?') && response.url().includes('granularity=auto'));
+  const responsePromise = page.waitForResponse((response) => {
+    if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
+    const url = new URL(response.url());
+    return url.searchParams.get('projection') === 'overview' && url.searchParams.get('granularity') === 'auto';
+  });
   const chart = page.locator('.usage-chart-card').first();
   await chart.getByRole('tab', { name: '数据', exact: true }).click();
   await chart.locator('.usage-chart-table tbody button').first().click();

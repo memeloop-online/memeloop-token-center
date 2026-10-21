@@ -22,6 +22,14 @@ export async function openAppRoute(
   surface: AppSurface,
   route: OperatorRoute | PortalRoute,
 ): Promise<void> {
+  if (surface === 'operator' && route === 'generations') {
+    await openAppRoute(page, 'operator', 'requests');
+    await page.locator('.traffic-heading-actions').getByRole('button', { name: /^(生成任务|Generation jobs)$/ }).click();
+    await page.locator('.operator-generations').waitFor();
+    assert.equal(new URL(page.url()).searchParams.get('view'), 'generations');
+    assert.equal(await page.locator('.app-navigation a[href="/operator?view=requests"]').getAttribute('aria-current'), 'page');
+    return;
+  }
   const href = `/${surface}?view=${route}`;
   const link = page.locator(`.app-navigation a[href="${href}"]`);
   await link.waitFor({ state: 'attached', timeout: 10_000 });
