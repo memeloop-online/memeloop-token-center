@@ -16,11 +16,12 @@ RUN git apply --unidiff-zero --check /tmp/v3.1.3-security.patch \
     && git apply --unidiff-zero /tmp/v3.1.3-security.patch \
     && GOTOOLCHAIN=local go mod verify \
     && GODEBUG=http2client=0 CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath \
-      -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.3-mtc.4 -X sigs.k8s.io/release-utils/version.gitCommit=11926fa5bbbbde47e88fc006b625a17769b743b2 -X sigs.k8s.io/release-utils/version.gitTreeState=clean -X sigs.k8s.io/release-utils/version.buildDate=2026-08-06T00:10:15Z' \
+      -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.3-mtc.5 -X sigs.k8s.io/release-utils/version.gitCommit=11926fa5bbbbde47e88fc006b625a17769b743b2 -X sigs.k8s.io/release-utils/version.gitTreeState=clean -X sigs.k8s.io/release-utils/version.buildDate=2026-08-06T00:10:15Z' \
       -o /tmp/cosign ./cmd/cosign \
     && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+golang.org/x/net[[:space:]]+v0\.60\.0[[:space:]]' \
+    && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+github.com/klauspost/compress[[:space:]]+v1\.18\.7[[:space:]]' \
     && /tmp/cosign version --json \
-      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.3-mtc\.4"'
+      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.3-mtc\.5"'
 
 FROM ${NODE_IMAGE} AS web-builder
 ARG NPM_REGISTRY=https://registry.npmjs.org

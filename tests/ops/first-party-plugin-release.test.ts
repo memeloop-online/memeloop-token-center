@@ -13,7 +13,7 @@ const root = new URL('../../', import.meta.url).pathname;
 const hash = (bytes: Buffer) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 
 test('typed command-output helper accepts only the reviewed version and an exact digest', () => {
-  assert.equal(checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3-mtc.4' }), '');
+  assert.equal(checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3-mtc.5' }), '');
   assert.throws(() => checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3-mtc.3' }));
   assert.throws(() => checkedCommandOutput('cosign-version', { gitVersion: 'v3.1.3' }));
   const digest = `sha256:${'a'.repeat(64)}`;
