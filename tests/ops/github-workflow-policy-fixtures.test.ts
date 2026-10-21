@@ -45,6 +45,12 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
         }
         case 'exporter-downgrade': buildStep.with.outputs = 'type=image,push=true'; break;
         case 'push-shorthand-conflict': buildStep.with.push = true; break;
+        case 'publish-dispatch-unprotected': publish.if = publish.if.replace(' && github.ref_protected == true', ''); break;
+        case 'publish-dispatch-any-ref': publish.if = publish.if.replace("github.ref == 'refs/heads/master' && github.ref_protected", 'github.ref_protected'); break;
+        case 'publish-dispatch-any-repository': publish.if = publish.if.replace(/github\.repository == 'memeloop-online\/memeloop-token-center' &&\s*/, ''); break;
+        case 'verify-dispatch-unprotected': verifier.if = verifier.if.replace(' && github.ref_protected == true', ''); break;
+        case 'verify-dispatch-any-ref': verifier.if = verifier.if.replace("github.ref == 'refs/heads/master' && github.ref_protected", 'github.ref_protected'); break;
+        case 'verify-dispatch-any-repository': verifier.if = verifier.if.replace(/github\.repository == 'memeloop-online\/memeloop-token-center' &&\s*/, ''); break;
         case 'verify-skipped-propagation': verifier.if = "github.event_name == 'push' && github.ref == 'refs/heads/master'"; break;
         default: throw new Error(`unknown mutation: ${mode}`);
       }
@@ -56,7 +62,8 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
       'top-permissions', 'publish-permissions', 'other-packages-write', 'other-write-all',
       'other-actions-write', 'other-extra-scope', 'rustsec-folded-ignore',
       'exporter-downgrade', 'push-shorthand-conflict',
-      'verify-skipped-propagation',
+      'verify-skipped-propagation', 'publish-dispatch-unprotected', 'publish-dispatch-any-ref',
+      'publish-dispatch-any-repository', 'verify-dispatch-unprotected', 'verify-dispatch-any-ref', 'verify-dispatch-any-repository',
     ]) { writeGood(); mutate(mode); expectRejected(mode); }
 
     writeGood();

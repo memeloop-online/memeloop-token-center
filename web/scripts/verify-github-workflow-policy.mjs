@@ -83,6 +83,11 @@ function verifyPublisher(job) {
     fail('publish-ghcr job is missing');
   }
   assertExactPermissions(job.permissions, { contents: 'read', packages: 'write' }, 'publish-ghcr');
+  const gate = typeof job.if === 'string' ? job.if.replace(/\s+/gu, ' ').trim() : '';
+  const admission = "always() && ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true')) || (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' && github.ref == 'refs/heads/master' && github.ref_protected == true)) && ";
+  if (!gate.startsWith(admission)) {
+    fail('publish-ghcr must admit dispatch only on protected master in the official repository');
+  }
 
   const expectedImages = [
     'ghcr.io/${{ github.repository_owner }}/memeloop-token-center',
@@ -127,7 +132,7 @@ function verifyReleaseVerifier(job) {
     fail('verify-ghcr-release must depend only on publish-ghcr');
   }
   const gate = typeof job.if === 'string' ? job.if.replace(/\s+/gu, ' ').trim() : '';
-  const expectedGate = "always() && github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && needs.publish-ghcr.result == 'success'";
+  const expectedGate = "always() && ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) || (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' && github.ref == 'refs/heads/master' && github.ref_protected == true)) && needs.publish-ghcr.result == 'success'";
   if (gate !== expectedGate) {
     fail('verify-ghcr-release must run after skipped ancestors only when publish-ghcr succeeded');
   }
