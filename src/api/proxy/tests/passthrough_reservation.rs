@@ -385,7 +385,7 @@ async fn ordinary_missing_metadata_cancellation_before_headers_preserves_unknown
         .await
         .unwrap();
         assert_eq!(account, held_account);
-        assert_eq!(account.0, 1_000_000);
+        assert_eq!(account.0 + account.1, 1_000_000);
         assert!(account.1 > 0);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
         pool.close().await;

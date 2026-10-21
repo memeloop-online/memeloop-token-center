@@ -734,10 +734,31 @@ async fn upstream_rate_limit_status_is_preserved_but_its_body_is_sanitized() {
     assert!(!body.contains("must-not-reach-client"));
     assert!(!body.contains("provider-sensitive-token"));
 
-    let requests = state.db.list_requests(issued.key_id, 10).await.unwrap();
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let requests = state.db.list_requests(issued.key_id, 10).await.unwrap();
+            if requests.len() == 1
+                && requests[0]
+                    .operational_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.financial_state == crate::model::RequestFinancialState::Unknown
+                    })
+            {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream rejection must become operationally terminal without settling unknown usage");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status_code, Some(429));
     assert_eq!(requests[0].error_code.as_deref(), Some("http_429"));
+    assert!(requests[0].completed_at.is_none());
+    assert!(requests[0].usage.tokens.is_none());
+    assert!(requests[0].billing.cost.is_none());
+    upstream.verify().await;
 }
 
 #[tokio::test]

@@ -196,7 +196,7 @@ async fn admitted_upstream_failure_keeps_its_original_terminal() {
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     fixture.state.early_requests.drain_for_test().await;
     let rows = fixture
         .state
