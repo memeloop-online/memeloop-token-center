@@ -221,6 +221,37 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (url.pathname === '/internal/v1/provider-types') return json([{ id: 'kimi', display_name: 'Kimi' }]);
     if (url.pathname === '/internal/v1/upstreams') return json([{ id: 'account-personal', name: 'Personal Kimi', driver: 'kimi', status: 'active' }, { id: 'account-team', name: 'Team Kimi', driver: 'kimi', status: 'active' }]);
     if (url.pathname === '/internal/v1/route-groups') return json([{ id: '00000000-0000-4000-8000-000000000002', name: 'Research group', member_ids: ['00000000-0000-4000-8000-000000000001'], member_count: 1, created_at: 1, updated_at: 1 }]);
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog')) {
+      // The granted route sorts outside the first keyset page; the workspace
+      // must keep paging before it can name the grant.
+      const pagedCatalog = [
+        ...Array.from({ length: 150 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Paged model ${index + 1}`, upstream_model: 'kimi-paged', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 10_000 - index })),
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', upstream_model: 'kimi-spark', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [], created_at: 1_000 },
+      ];
+      const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);
+      const beforeId = url.searchParams.get('before_id') ?? 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+      const limit = Number(url.searchParams.get('limit') ?? '100');
+      return json(pagedCatalog.filter((route) => route.created_at < beforeCreatedAt || (route.created_at === beforeCreatedAt && route.id < beforeId)).slice(0, limit));
+    }
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog-exact')) {
+      // Exactly two full pages. The loader must issue one more read, accept
+      // the empty answer as the end of the catalog, and still resolve the
+      // grant sitting at the page boundary.
+      const exactCatalog = [
+        ...Array.from({ length: 199 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Exact model ${index + 1}`, upstream_model: 'kimi-exact', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 20_000 - index })),
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', upstream_model: 'kimi-spark', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [], created_at: 1_000 },
+      ];
+      const beforeCreatedAt = Number(url.searchParams.get('before_created_at') ?? Number.MAX_SAFE_INTEGER);
+      const beforeId = url.searchParams.get('before_id') ?? 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+      const limit = Number(url.searchParams.get('limit') ?? '100');
+      return json(exactCatalog.filter((route) => route.created_at < beforeCreatedAt || (route.created_at === beforeCreatedAt && route.id < beforeId)).slice(0, limit));
+    }
+    if (url.pathname === '/internal/v1/model-routes' && parameters.has('paged-route-catalog-stuck')) {
+      // Always answers the same full page regardless of the cursor. The
+      // loader must report an incomplete catalog instead of paging forever.
+      const stuckPage = Array.from({ length: 100 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Stuck model ${index + 1}`, upstream_model: 'kimi-stuck', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 30_000 - index }));
+      return json(stuckPage);
+    }
     if (url.pathname === '/internal/v1/model-routes') return json([
       { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
       { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },

@@ -1623,15 +1623,47 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     };
     routeRequest.current = request;
     setRouteError('');
-    try {
-      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: request.controller.signal });
+    // The route list endpoint is keyset-paginated (newest first, one hundred
+    // rows per read at most). Grant resolution needs the complete catalog, so
+    // walk every cursor page instead of treating the first page as the full
+    // directory.
+    const ownsActiveRequest = () => {
       const active = routeRequest.current;
-      if (!active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+      return Boolean(active && active.generation === request.generation && active.scopeGeneration === request.scopeGeneration && scopeGeneration.current === request.scopeGeneration && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant);
+    };
+    const routePageSize = 100;
+    try {
+      const nextRoutes: ModelRouteView[] = [];
+      const visitedCursors = new Set<string>();
+      let beforeCreatedAt: number | undefined;
+      let beforeId: string | undefined;
+      // Termination is the API's own end-of-pagination signal: a short page
+      // means the catalog is exhausted. A repeated or malformed cursor is an
+      // invalid server response, not a reason to cap the route count.
+      while (true) {
+        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
+        if (beforeCreatedAt !== undefined && beforeId) {
+          routeQuery.set('before_created_at', String(beforeCreatedAt));
+          routeQuery.set('before_id', beforeId);
+        }
+        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: request.controller.signal });
+        if (request.controller.signal.aborted || !ownsActiveRequest()) return;
+        nextRoutes.push(...page);
+        if (page.length < routePageSize) break;
+        const last = page.at(-1);
+        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) {
+          throw new Error(t('providerCatalog.routesIncomplete'));
+        }
+        const cursor = `${last.created_at} ${last.id}`;
+        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
+        visitedCursors.add(cursor);
+        beforeCreatedAt = last.created_at; beforeId = last.id;
+      }
+      if (!ownsActiveRequest()) return;
       routeRequest.current = undefined;
       setRoutes(nextRoutes); setRouteError('');
     } catch (reason) {
-      const active = routeRequest.current;
-      if (request.controller.signal.aborted || !active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+      if (request.controller.signal.aborted || !ownsActiveRequest()) return;
       routeRequest.current = undefined;
       setRouteError(messageOf(reason, t('common.requestFailed')));
     }
@@ -1773,7 +1805,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       showSecret({ value: result.key, kind: 'issued', alias: value.alias, displayId: crypto.randomUUID() });
       setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
-      if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+      // A cancelled request is a normal outcome, not a failure: never surface
+      // the browser's raw abort message as a page error.
+      if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
       if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
@@ -1955,7 +1989,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); showSecret({ value: created.key, kind: 'issued', displayId: crypto.randomUUID() });
           setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
         } catch (reason) {
-          if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
+          if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(messageOf(reason, t('common.requestFailed')));
         } finally {
           if (secretRequest.current === controller) secretRequest.current = undefined;
           if (ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) finishSecretOperation(operation);
