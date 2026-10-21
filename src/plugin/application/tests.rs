@@ -10,7 +10,7 @@ use wit_parser::Resolve;
 
 const PROVIDER: &str = "example-oauth-http";
 
-fn write_inventory(root: &std::path::Path, second: bool) {
+pub(super) fn write_inventory(root: &std::path::Path, second: bool) {
     let package = root.join("example-policy-rewrite");
     std::fs::create_dir_all(&package).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
@@ -61,7 +61,10 @@ fn write_inventory(root: &std::path::Path, second: bool) {
     .unwrap();
 }
 
-fn inventory(db: &Database, roots: &[(&str, PathBuf)]) -> BTreeMap<String, PreinstalledInventory> {
+pub(super) fn inventory(
+    db: &Database,
+    roots: &[(&str, PathBuf)],
+) -> BTreeMap<String, PreinstalledInventory> {
     roots
         .iter()
         .map(|(id, root)| {
@@ -193,6 +196,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().to_owned());
     let first = AppState::initialize(config.clone()).await.unwrap();
     let second = AppState::initialize(config.clone()).await.unwrap();
+    first.refresh_application_plugins().await.unwrap();
     let authority_a = first.application_plugins.clone().unwrap();
     let authority_b = second.application_plugins.clone().unwrap();
     let baseline = first.clone().pin_application_plugins().await.unwrap();
@@ -268,6 +272,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     assert!(Arc::ptr_eq(&initial, &authority_a.pin().await.unwrap()));
     inspection_pool.close().await;
 
+    first.refresh_application_plugins().await.unwrap();
     // A request is blocked after policy; B publishes while it is parked. No
     // sleeps, time thresholds, or notification delivery are involved.
     let (policy_done, wait_policy) = tokio::sync::oneshot::channel();
@@ -299,6 +304,8 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .revision,
         2
     );
+    first.refresh_application_plugins().await.unwrap();
+    second.refresh_application_plugins().await.unwrap();
     let fresh = first.clone().pin_application_plugins().await.unwrap();
     assert_policy(&fresh, true).await;
     assert_provider_phases(&fresh, true).await;
@@ -329,6 +336,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     ));
 
     let restarted = AppState::initialize(config).await.unwrap();
+    restarted.refresh_application_plugins().await.unwrap();
     assert_provider_phases(
         &restarted.clone().pin_application_plugins().await.unwrap(),
         true,
@@ -346,6 +354,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         .unwrap();
     assert_eq!(rolled.revision, 3);
     assert_eq!(rolled.inventory_id, "a");
+    second.refresh_application_plugins().await.unwrap();
     assert_control_revision(&second, "1.0.0", 3).await;
     assert_provider_phases(
         &second.clone().pin_application_plugins().await.unwrap(),
@@ -439,6 +448,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     let cold_authority = Arc::new(
         ApplicationPlugins::new(first.db.clone(), trusted.clone(), &first.plugins).unwrap(),
     );
+    first.refresh_application_plugins().await.unwrap();
     let warm_counts = pin_work_counts(&authority_a);
     std::fs::rename(&a_root, directory.join("removed-inventory-a")).unwrap();
     let offline_inventory = directory.join("offline-inventory.json");
@@ -482,6 +492,14 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .unwrap();
         assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
         assert!(matches!(
+            authority_a.refresh_current().await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_current,
+            &authority_a.current_snapshot().unwrap().unwrap()
+        ));
+        assert!(matches!(
             authority_a
                 .pin_historical(warm_current.receipt.revision)
                 .await,
@@ -514,6 +532,14 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
             .unwrap();
         assert!(matches!(authority_a.pin().await, Err(AppError::Forbidden)));
         assert!(matches!(
+            authority_a.refresh_current().await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(Arc::ptr_eq(
+            &warm_current,
+            &authority_a.current_snapshot().unwrap().unwrap()
+        ));
+        assert!(matches!(
             authority_a
                 .pin_historical(warm_current.receipt.revision)
                 .await,
@@ -545,6 +571,13 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     );
     assert!(authority_a.pin_historical(1).await.is_err());
     assert!(authority_a.stage("a").await.is_err());
+    assert!(second.refresh_application_plugins().await.is_err());
+    let retained = second.clone().pin_application_plugins().await.unwrap();
+    assert_policy(&retained, false).await;
+    assert_provider_phases(&retained, false).await;
+    let mut cold_state = second.clone();
+    cold_state.application_plugins = Some(cold_authority.clone());
+    assert!(cold_state.refresh_application_plugins().await.is_err());
     for path in [
         "/internal/v1/plugins",
         "/internal/v1/provider-types",
@@ -552,7 +585,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
         "/internal/v1/plugins/example-policy-rewrite/data/feed",
     ] {
         let response =
-            crate::api::router_for_role(second.clone(), crate::config::RuntimeRole::Control)
+            crate::api::router_for_role(cold_state.clone(), crate::config::RuntimeRole::Control)
                 .oneshot(
                     Request::get(path)
                         .header(
@@ -566,7 +599,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
                 .unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             "{path} must not use baseline"
         );
     }
@@ -597,9 +630,21 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     inspection_pool.close().await;
     std::fs::rename(directory.join("removed-inventory-b"), &b_root).unwrap();
     std::fs::rename(directory.join("removed-inventory-a"), &a_root).unwrap();
+    first.refresh_application_plugins().await.unwrap();
     let pinned = first.clone().pin_application_plugins().await.unwrap();
     first.db.close().await;
-    assert!(first.pin_application_plugins().await.is_err());
+    assert!(first.refresh_application_plugins().await.is_err());
+    let refresh_status = authority_a.refresh_status();
+    assert_eq!(refresh_status["ready"], true);
+    assert_eq!(refresh_status["error"], "snapshot_refresh_failed");
+    let available = first.clone().pin_application_plugins().await.unwrap();
+    assert!(Arc::ptr_eq(
+        pinned.pinned_application_plugins.as_ref().unwrap(),
+        available.pinned_application_plugins.as_ref().unwrap(),
+    ));
+    assert_provider_phases(&available, false).await;
+    assert_eq!(authority_a.refresh_status()["ready"], true);
+    assert!(first.pin_application_plugins().await.is_ok());
     assert_provider_phases(&pinned, false).await;
 }
 
@@ -751,6 +796,7 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         .publish(publish("empty", 0), "empty-initial")
         .await
         .unwrap();
+    state.refresh_application_plugins().await.unwrap();
     let previous = state.clone().pin_application_plugins().await.unwrap();
     assert!(previous.providers.get(PROVIDER).is_none());
     authority.status().await.unwrap();
@@ -784,6 +830,7 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         .publish(publish("new", 1), "new-contract")
         .await
         .unwrap();
+    state.refresh_application_plugins().await.unwrap();
     let current = state.clone().pin_application_plugins().await.unwrap();
     assert!(
         current
@@ -945,6 +992,7 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         )
         .await
         .unwrap();
+    state.refresh_application_plugins().await.unwrap();
     assert!(
         state
             .clone()
@@ -1078,6 +1126,7 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     assert!(cold_authority.pin_historical(2).await.is_err());
     let mut cold_state = state.clone();
     cold_state.application_plugins = Some(cold_authority);
+    cold_state.refresh_application_plugins().await.unwrap();
     let (status, _) = application_json(
         &cold_state,
         RuntimeRole::Control,
@@ -1112,6 +1161,7 @@ async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision()
     ));
     config.plugin_inventory_file = Some(inventory_path.to_str().unwrap().to_owned());
     let state = AppState::initialize(config.clone()).await.unwrap();
+    state.refresh_application_plugins().await.unwrap();
     assert!(
         state
             .clone()
@@ -1163,6 +1213,7 @@ async fn runtime_management_rejects_scoped_credentials_and_forged_candidate_fiel
         .unwrap()
         .with_application_plugin_inventory(BTreeMap::new())
         .unwrap();
+    state.refresh_application_plugins().await.unwrap();
     let body = json!({"inventory_id":"a", "expected_revision":0});
     state.db.create_tenant("tenant", None).await.unwrap();
     for tenant in [None, Some("tenant".to_owned())] {
