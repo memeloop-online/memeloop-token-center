@@ -9,7 +9,7 @@ use std::{process::Stdio, time::Duration};
 #[cfg(feature = "plugin-distribution")]
 pub const COSIGN_VERIFIER_FILENAME: &str = "cosign";
 #[cfg(feature = "plugin-distribution")]
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.4";
+pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.5";
 #[cfg(feature = "experimental-plugin-revisions")]
 const PLUGIN_INSTALLER_FILENAME: &str = "install-plugin-oci";
 
