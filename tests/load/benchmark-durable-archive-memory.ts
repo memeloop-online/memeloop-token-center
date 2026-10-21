@@ -26,6 +26,10 @@ type PendingReceipt = {
   response_object: string; claim: Record<string, unknown>; operational_terminal: Record<string, unknown>;
   reservation: { id: string; reserved_micros: number };
 };
+type ArchiveGapBaseline = {
+  successful_request_archive_gaps: number; successful_response_archive_gaps: number;
+  request_persistence: Record<string, number>; persistence: Record<string, number>;
+};
 const SAFE_UPSTREAM_ERROR = '{"error":{"message":"upstream request failed","type":"upstream_error"}}';
 
 export function archiveDrainReady(row: Record<string, unknown>, retainedRequestCipherBytes?: number): boolean {
@@ -206,6 +210,13 @@ export function assertArchiveGapEvidence(requestGaps: number, responseGaps: numb
     assert(capacity !== undefined && Number.isSafeInteger(capacity) && capacity >= 0, `${purpose} capacity rejection counter must be present and valid`);
     assert(gaps <= capacity, `${purpose} archive gaps (${gaps}) must be accounted for by explicit bounded capacity rejection (${capacity})`);
   }
+}
+
+export function assertArchiveReplayGapEvidence(requestGaps: number, responseGaps: number, request: Record<string, number>, response: Record<string, number>, baseline: ArchiveGapBaseline): void {
+  assertArchiveGapEvidence(baseline.successful_request_archive_gaps, baseline.successful_response_archive_gaps, baseline.request_persistence, baseline.persistence);
+  assert(requestGaps === baseline.successful_request_archive_gaps, "journal replay must preserve the previously accounted request archive gaps");
+  assert(responseGaps === baseline.successful_response_archive_gaps, "journal replay must preserve the previously accounted response archive gaps");
+  assertArchiveGapEvidence(0, 0, request, response);
 }
 
 export function allocatorEvidence(metrics: string): Record<string, number> {
@@ -448,7 +459,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.idle_allocator_bytes = allocatorEvidence(idleMetrics.body.toString("utf8"));
     report.idle_native_allocator_bytes = nativeAllocatorEvidence(idleMetrics.body.toString("utf8"));
 
-    const drain = async (unknownRequestId?: string, previousSemantics?: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const drain = async (unknownRequestId?: string, previousSemantics?: Record<string, unknown>, archiveGapBaseline?: ArchiveGapBaseline): Promise<Record<string, unknown>> => {
       const reader = new DatabaseSync(database, { readOnly: true });
       reader.exec("PRAGMA busy_timeout = 1000");
       try {
@@ -538,7 +549,11 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 const requestPersistence = requestPersistenceEvidence(metricsText);
                 const requestGaps = Number(successfulGaps?.request_gaps);
                 const responseGaps = Number(successfulGaps?.response_gaps);
-                assertArchiveGapEvidence(requestGaps, responseGaps, requestPersistence, persistence);
+                if (archiveGapBaseline) {
+                  assertArchiveReplayGapEvidence(requestGaps, responseGaps, requestPersistence, persistence, archiveGapBaseline);
+                } else {
+                  assertArchiveGapEvidence(requestGaps, responseGaps, requestPersistence, persistence);
+                }
                 const processMemoryEvidence = processMemory(service!.pid!);
                 return { ...row, unknown_financial_responsibility: unknownEvidence, permits: gauges, persistence, request_persistence: requestPersistence, rss_mib: processMemoryEvidence.rss_mib, process_memory: processMemoryEvidence, allocator_bytes: allocatorEvidence(metricsText), native_allocator_bytes: nativeAllocatorEvidence(metricsText), successful_archive_gaps: requestGaps + responseGaps, successful_request_archive_gaps: requestGaps, successful_response_archive_gaps: responseGaps };
               }
@@ -673,7 +688,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
     report.recovered_rss_mib = recovered;
     report.duration_seconds = (performance.now() - started) / 1000;
     assert(!sampleFailure && memoryVerdict(idle, peak, recovered), "independent-process RSS peak/recovery gate failed");
-    const beforeReplay = report.phases.at(-1).drain.unknown_financial_responsibility;
+    const beforeReplayDrain = report.phases.at(-1).drain;
+    const beforeReplay = beforeReplayDrain.unknown_financial_responsibility;
     const callsBeforeReplay = upstreamCalls;
     if (sampler) clearInterval(sampler);
     sampler = undefined;
@@ -696,7 +712,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
         await delay(100);
       }
     })(), 30_000, "unknown receipt replay");
-    const replayDrain = await drain(beforeReplay.request_id, beforeReplay.semantics);
+    const replayDrain = await drain(beforeReplay.request_id, beforeReplay.semantics, beforeReplayDrain);
     assert(upstreamCalls === callsBeforeReplay, "unknown journal replay must not dispatch upstream");
     report.unknown_receipt_replay = { service_pid: service.pid, upstream_calls: upstreamCalls - callsBeforeReplay, drain: replayDrain };
     report.passed = true;

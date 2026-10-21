@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertArchiveReplayGapEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -159,6 +159,31 @@ test("request and response gaps require their own bounded queue evidence", () =>
   assert.throws(() => assertArchiveGapEvidence(0, 0, request, { ...response, failed: 1 }), /capture failures/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, retention_limit: 1 }, response), /retention limit/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, request, { failed: 0 }), /capacity rejection counter/u);
+});
+
+test("journal replay preserves accounted gaps across process counter reset without accepting new gaps or failures", () => {
+  const baseline = {
+    successful_request_archive_gaps: 4, successful_response_archive_gaps: 2,
+    request_persistence: { accepted: 3, capacity: 4, failed: 0, retention_limit: 0 },
+    persistence: { accepted: 4, capacity: 2, failed: 0 },
+  };
+  const request = { accepted: 0, capacity: 0, failed: 0, retention_limit: 0 };
+  const response = { accepted: 0, capacity: 0, failed: 0 };
+  assertArchiveReplayGapEvidence(4, 2, request, response, baseline);
+  assert.throws(() => assertArchiveGapEvidence(4, 2, request, response), /request archive gaps/u);
+  for (const gaps of [3, 5]) {
+    assert.throws(() => assertArchiveReplayGapEvidence(gaps, 2, { ...request, capacity: 10 }, response, baseline), /preserve.*request archive gaps/u);
+  }
+  for (const gaps of [1, 3]) {
+    assert.throws(() => assertArchiveReplayGapEvidence(4, gaps, request, { ...response, capacity: 10 }, baseline), /preserve.*response archive gaps/u);
+  }
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, response, { ...baseline, request_persistence: { ...baseline.request_persistence, capacity: 3 } }), /request archive gaps/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, response, { ...baseline, persistence: { ...baseline.persistence, capacity: 1 } }), /response archive gaps/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, failed: 1 }, response, baseline), /capture failures/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, { ...response, failed: 1 }, baseline), /capture failures/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, retention_limit: 1 }, response, baseline), /retention limit/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, capacity: NaN }, response, baseline), /capacity rejection counter/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, { failed: 0 }, baseline), /capacity rejection counter/u);
 });
 
 test("allocator evidence preserves every jemalloc state", () => {
