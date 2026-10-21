@@ -165,7 +165,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     'unknown cost must not have matched a minimum cost of zero');
   await assertCount(requestPanel.locator('tbody tr'), 1);
   await assertContains(requestPanel.locator('tbody'), '429');
-  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
+  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务返回了错误状态');
   assert.doesNotMatch(await requestPanel.locator('tbody').innerText(), /http_429/);
   await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
   const requestDrawer = page.getByRole('dialog');
