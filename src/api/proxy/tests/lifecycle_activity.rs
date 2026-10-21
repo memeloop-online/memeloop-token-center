@@ -111,10 +111,27 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         assert!(String::from_utf8_lossy(&bytes).contains("response.completed"));
     }
     server.await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        fixture.state.proxy_lifecycles.wait_for_idle(),
-    )
+    tokio::time::timeout(Duration::from_secs(5), async {
+        fixture.state.proxy_lifecycles.wait_for_idle().await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let owner = Uuid::now_v7();
+        loop {
+            let ready: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records q LEFT JOIN proxy_operational_terminals o ON o.request_id = q.id LEFT JOIN pending_proxy_settlements p ON p.request_id = q.id WHERE q.key_id = $1 AND (q.completed_at IS NOT NULL OR (o.completed_at IS NOT NULL AND p.unknown_reason IS NOT NULL))")
+                .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+            if ready == 65 {
+                for request_id in fixture.state.db.claim_terminal_projection_tasks(owner, 32).await.unwrap() {
+                    assert!(fixture.state.db.project_claimed_terminal_projection_task(owner, request_id).await.unwrap());
+                }
+                let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'")
+                    .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+                if finished == 64 {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        pool.close().await;
+    })
     .await
     .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();

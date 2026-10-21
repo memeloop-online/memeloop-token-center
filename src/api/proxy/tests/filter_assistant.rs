@@ -175,6 +175,7 @@ async fn session_title_uses_system_route_billing_and_bounded_first_latest_excerp
     for side in ["beginning", "latest"] {
         assert!(excerpts[side].as_str().unwrap().chars().count() <= 1024);
     }
+    responses_transport::wait_for_key_settlement(&fixture.state, billing.key_id).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let recorded = sqlx::query(
         "SELECT key_id, model_route_id, cost_micros FROM request_records WHERE key_id = $1",

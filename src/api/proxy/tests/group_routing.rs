@@ -428,6 +428,7 @@ async fn gateway_wasm_zero_transient_cooldown_recovers_only_after_durable_succes
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    responses_transport::wait_for_key_settlement(&fixture.state, fixture.key_id).await;
     fixture.state.routing_persistence.drain_for_test().await;
     let recovered = health(&fixture, tenant, generation).await;
     assert_eq!(recovered.consecutive_failures, 0);
