@@ -3,8 +3,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use axum::body::Body;
@@ -54,6 +55,7 @@ impl RequestSpoolAdmission {
         memory: Option<&Arc<super::memory::ProxyMemoryReservation>>,
         request_metadata_bytes: usize,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        let mut timing = CaptureTiming::new();
         let metadata = memory
             .map(|memory| {
                 memory
@@ -73,13 +75,18 @@ impl RequestSpoolAdmission {
         if declared_content_length.is_some_and(|length| length > maximum) {
             return Err(RequestSpoolCaptureError::TooLarge);
         }
+        timing.begin("directory");
         prepare_directory(self.directory.as_ref()).await?;
+        timing.finish_wait();
         let directory = self.directory.clone();
         let opening_metadata = metadata.clone();
         let opening_lease = lease.clone();
         #[cfg(test)]
         let blocking_open = self.usage.blocking_open.clone();
+        timing.begin("open");
+        let opening_timing = timing.open.submit();
         let opening = tokio::task::spawn_blocking(move || {
+            let _timing = opening_timing.start();
             let _opening_metadata = opening_metadata;
             let owner = tempfile::tempfile_in(directory.as_ref())?;
             opening_lease
@@ -101,6 +108,7 @@ impl RequestSpoolAdmission {
             .await
             .map_err(|_| RequestSpoolCaptureError::Unavailable)?
             .map_err(spool_io_error)?;
+        timing.finish_wait();
         let mut capture = RequestSpoolCapture {
             owner: Some(Arc::new(owner)),
             writer,
@@ -110,8 +118,14 @@ impl RequestSpoolAdmission {
         };
 
         let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            timing.begin("read");
+            let chunk = stream.next().await;
+            timing.finish_wait();
+            let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
+            timing.frames += 1;
+            timing.bytes = timing.bytes.saturating_add(chunk.len());
             if chunk.len() > maximum.saturating_sub(capture.length) {
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
@@ -140,7 +154,10 @@ impl RequestSpoolAdmission {
                 let write_bytes = chunk.slice(offset..end);
                 #[cfg(test)]
                 let blocking_write = self.usage.blocking_write.clone();
+                timing.begin("write");
+                let writing_timing = timing.write.submit();
                 let writing = tokio::task::spawn_blocking(move || {
+                    let _timing = writing_timing.start();
                     let _write_metadata = write_metadata;
                     let _write_frame = write_frame;
                     #[cfg(test)]
@@ -171,6 +188,7 @@ impl RequestSpoolAdmission {
                     .await
                     .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                     .map_err(spool_io_error)?;
+                timing.finish_wait();
                 capture.hasher.update(piece);
                 capture.length = next;
             }
@@ -180,6 +198,7 @@ impl RequestSpoolAdmission {
             .take()
             .ok_or(RequestSpoolCaptureError::Unavailable)?;
         let digest = *capture.hasher.finalize().as_bytes();
+        timing.begin("completed");
         Ok(RequestSpool {
             owner,
             length: capture.length,
@@ -198,6 +217,144 @@ impl RequestSpoolAdmission {
     #[cfg(test)]
     pub(crate) fn read_count_for_test(&self) -> usize {
         self.read_count.load(Ordering::Acquire)
+    }
+}
+
+// One safe summary per capture, including early returns and cancellation.
+// Blocking tasks retain only counters, never the observation owner or payload.
+struct CaptureTiming {
+    request_id: Option<uuid::Uuid>,
+    started: Instant,
+    pending_since: Instant,
+    stage: &'static str,
+    directory: Duration,
+    read_wait: Duration,
+    open_wait: Duration,
+    write_wait: Duration,
+    frames: usize,
+    bytes: usize,
+    open: Arc<BlockingTiming>,
+    write: Arc<BlockingTiming>,
+}
+
+impl CaptureTiming {
+    fn new() -> Self {
+        let started = Instant::now();
+        Self {
+            request_id: crate::api::current_gateway_diagnostic_request_id(),
+            started,
+            pending_since: started,
+            stage: "admission",
+            directory: Duration::ZERO,
+            read_wait: Duration::ZERO,
+            open_wait: Duration::ZERO,
+            write_wait: Duration::ZERO,
+            frames: 0,
+            bytes: 0,
+            open: Arc::default(),
+            write: Arc::default(),
+        }
+    }
+
+    fn begin(&mut self, stage: &'static str) {
+        self.stage = stage;
+        self.pending_since = Instant::now();
+    }
+
+    fn finish_wait(&mut self) {
+        match self.stage {
+            "directory" => self.directory += self.pending_since.elapsed(),
+            "read" => self.read_wait += self.pending_since.elapsed(),
+            "open" => self.open_wait += self.pending_since.elapsed(),
+            "write" => self.write_wait += self.pending_since.elapsed(),
+            _ => {}
+        }
+        self.begin("processing");
+    }
+}
+
+impl Drop for CaptureTiming {
+    fn drop(&mut self) {
+        let stage = self.stage;
+        self.finish_wait();
+        let request_id = self.request_id.map(|id| id.to_string());
+        tracing::info!(
+            request_id = request_id.as_deref(),
+            phase = "gateway_request_spool_timing",
+            outcome = if stage == "completed" {
+                "completed"
+            } else {
+                "not_completed"
+            },
+            stage,
+            elapsed_us = self.started.elapsed().as_micros() as u64,
+            directory_us = self.directory.as_micros() as u64,
+            read_wait_us = self.read_wait.as_micros() as u64,
+            open_wait_us = self.open_wait.as_micros() as u64,
+            write_wait_us = self.write_wait.as_micros() as u64,
+            open_queue_us = self.open.queue_us.load(Ordering::Relaxed),
+            open_io_us = self.open.io_us.load(Ordering::Relaxed),
+            open_submitted = self.open.submitted.load(Ordering::Relaxed),
+            open_finished = self.open.finished.load(Ordering::Relaxed),
+            write_queue_us = self.write.queue_us.load(Ordering::Relaxed),
+            write_io_us = self.write.io_us.load(Ordering::Relaxed),
+            write_submitted = self.write.submitted.load(Ordering::Relaxed),
+            write_finished = self.write.finished.load(Ordering::Relaxed),
+            frames = self.frames,
+            bytes = self.bytes,
+            "gateway request spool timing summary"
+        );
+    }
+}
+
+#[derive(Default)]
+struct BlockingTiming {
+    queue_us: AtomicU64,
+    io_us: AtomicU64,
+    submitted: AtomicUsize,
+    finished: AtomicUsize,
+}
+
+impl BlockingTiming {
+    fn submit(self: &Arc<Self>) -> SubmittedTiming {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        SubmittedTiming {
+            counters: self.clone(),
+            submitted: Instant::now(),
+        }
+    }
+}
+
+struct SubmittedTiming {
+    counters: Arc<BlockingTiming>,
+    submitted: Instant,
+}
+
+impl SubmittedTiming {
+    fn start(self) -> RunningTiming {
+        let started = Instant::now();
+        self.counters.queue_us.fetch_add(
+            started.duration_since(self.submitted).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        RunningTiming {
+            counters: self.counters,
+            started,
+        }
+    }
+}
+
+struct RunningTiming {
+    counters: Arc<BlockingTiming>,
+    started: Instant,
+}
+
+impl Drop for RunningTiming {
+    fn drop(&mut self) {
+        self.counters
+            .io_us
+            .fetch_add(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.counters.finished.fetch_add(1, Ordering::Relaxed);
     }
 }
 
