@@ -8,7 +8,7 @@ FROM ${RUNTIME_IMAGE}
 LABEL org.opencontainers.image.title="MemeLoop Token Center OCI plugin installer" \
       org.opencontainers.image.description="Digest-pinned OCI plugin installer with Cosign v3.1.3 security backports" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      io.memeloop.cosign.version="v3.1.3-mtc.4" \
+      io.memeloop.cosign.version="v3.1.3-mtc.5" \
       io.memeloop.cosign.upstream-commit="11926fa5bbbbde47e88fc006b625a17769b743b2"
 ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign

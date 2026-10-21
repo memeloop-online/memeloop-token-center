@@ -8,8 +8,9 @@ components:
 
 - Sigstore Cosign, built from upstream commit
   `11926fa5bbbbde47e88fc006b625a17769b743b2` with the checked-in security
-  patch under `packaging/cosign/`, including `golang.org/x/net v0.60.0` and its
-  required companion modules, identified as `v3.1.3-mtc.4`. Its upstream Apache-2.0 license is included
+  patch under `packaging/cosign/`, including `golang.org/x/net v0.60.0`, its
+  required companion modules, and `github.com/klauspost/compress v1.18.7`,
+  identified as `v3.1.3-mtc.5`. Its upstream Apache-2.0 license is included
   as `third-party-licenses/cosign-LICENSE`.
 - The source-vendored `rust_decimal` crate. Its MIT license is included as
   `third-party-licenses/rust_decimal-LICENSE`.
