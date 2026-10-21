@@ -316,7 +316,9 @@ test('usage overview renders before precise output speed and loads only the sele
     await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=dimensions')));
     await page.locator('.usage-dimension-picker').getByRole('button', { name: 'Sessions', exact: true }).click();
     await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=sessions')));
-    await page.getByRole('tab', { name: 'Heatmap', exact: true }).click();
+    // The tab label comes from central i18n ('Usage heatmap'); use the stable
+    // tab id and let the projection call below prove the semantic navigation.
+    await page.locator('#usage-tab-heatmap').click();
     await page.waitForFunction(() => window.usageAnalysisFixture.calls.some(path => path.includes('projection=heatmap')));
     await page.getByRole('tab', { name: 'Overview', exact: true }).click();
     await page.locator('.usage-metrics').waitFor();
