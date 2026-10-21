@@ -49,6 +49,19 @@ export function usageRange(selection: Pick<UsageSelection, 'preset' | 'customFro
   return { from, to };
 }
 
+/**
+ * The precise output-rate (TPS) projection joins per-request samples over the
+ * whole applied range; production analysis shows that join exceeds the latency
+ * budget once the range spans a week, for presets and custom ranges alike.
+ */
+const usageTpsRangeLimitMs = 7 * 86_400_000;
+
+/** Eligibility must follow the applied range, never the unapplied selection draft. */
+export function usageOutputRateEligible(selection: Pick<UsageSelection, 'preset' | 'customFrom' | 'customTo' | 'resolvedAt'>) {
+  const range = usageRange(selection);
+  return range !== undefined && range.to - range.from < usageTpsRangeLimitMs;
+}
+
 export function usageAstIssue(ast: TypedFilterAst): 'duplicate' | 'unsupported' | undefined {
   if (ast.logical_operator !== 'and') return 'unsupported';
   const expectedTypes: Partial<Record<TypedFilterCondition['field'], TypedFilterCondition['value']['type']>> = { created_at: 'timestamp', model: 'model', key_id: 'uuid', key_alias: 'text', upstream_account_id: 'uuid', protocol: 'protocol', status: 'status', error_code: 'text' };

@@ -326,6 +326,77 @@ test('usage overview renders before precise output speed and loads only the sele
   } finally { await browser.close(); await server.close(); }
 });
 
+test('usage overview skips the precise output speed whenever the applied range spans seven days or more', { timeout: 45_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for usage projection assertions');
+    return test.skip('a local Chromium runtime is required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.clock.install({ time: new Date('2026-10-02T12:00:00Z') });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/usage-analysis.html`);
+    await page.locator('.usage-metrics').waitFor();
+    const overviewCalls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length);
+    const rateCalls = () => page.evaluate(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=output_rate')).length);
+    const tpsCard = page.locator('.usage-metrics .analytics-metric').filter({ hasText: 'Average TPS' });
+
+    // The default 24-hour range still loads the precise rate independently.
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.some((path) => path.includes('projection=output_rate')));
+    await tpsCard.locator('.metric-exact').waitFor();
+    assert.equal(await rateCalls(), 1);
+    assert.equal(await tpsCard.locator('.metric-exact').innerText(), '0.21');
+
+    const applyRange = async (pick: () => Promise<void>) => {
+      const before = await overviewCalls();
+      await page.getByRole('button', { name: 'Filter', exact: true }).click();
+      const dialog = page.getByRole('dialog');
+      await pick();
+      await dialog.getByRole('button', { name: 'Apply filters' }).click();
+      await page.waitForFunction((count) => window.usageAnalysisFixture.calls.filter((path) => path.includes('/usage-analysis?') && path.includes('projection=overview')).length > count, before);
+    };
+    const fillCustomRange = async (from: string, to: string) => {
+      const dialog = page.getByRole('dialog');
+      await dialog.getByRole('button', { name: 'Custom' }).click();
+      await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').first().fill(from);
+      await dialog.locator('.typed-filter-row [data-filter-field="created_at"] input').last().fill(to);
+    };
+
+    // Exactly seven days meets the threshold: no precise query, no stale value.
+    await applyRange(() => page.getByRole('dialog').getByRole('button', { name: 'Last 7 days' }).click());
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'the 7-day preset must not request the precise output rate');
+    assert.equal((await tpsCard.locator('.metric-value').innerText()).trim(), '—', 'the previous TPS value must not leak into the longer range');
+    assert.match(await tpsCard.locator('.analytics-metric-note').innerText(), /not calculated for long ranges/);
+    assert.equal(await tpsCard.locator('.metric-exact').count(), 0, 'an omitted TPS never fabricates an exact value');
+    assert.equal(await tpsCard.locator('svg').count(), 0, 'an omitted TPS renders no trend');
+
+    // The 30-day preset follows the same rule.
+    await applyRange(() => page.getByRole('dialog').getByRole('button', { name: 'Last 30 days' }).click());
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'the 30-day preset must not request the precise output rate');
+
+    // A custom range longer than seven days is covered by the same span rule.
+    await applyRange(() => fillCustomRange('2026-09-01T00:00', '2026-09-10T00:00'));
+    await tpsCard.locator('.analytics-metric-note').waitFor();
+    assert.equal(await rateCalls(), 1, 'a custom range of seven days or more must not request the precise output rate');
+
+    // Narrowing below seven days restores the precise query and value.
+    await applyRange(() => fillCustomRange('2026-09-01T00:00', '2026-09-07T23:59:59.999'));
+    await page.waitForFunction(() => window.usageAnalysisFixture.calls.filter((path) => path.includes('projection=output_rate')).length >= 2);
+    await tpsCard.locator('.metric-exact').waitFor();
+    assert.equal(await rateCalls(), 2, 'narrowing back below seven days restores exactly one precise read');
+    assert.equal(await tpsCard.locator('.metric-exact').innerText(), '0.21');
+    assert.equal(await tpsCard.locator('.analytics-metric-note').count(), 0, 'the omission note disappears once TPS is available again');
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('usage dimension picker stays usable while a projection is pending or failed', { timeout: 45_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
