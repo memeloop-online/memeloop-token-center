@@ -34,18 +34,50 @@ async fn send_official_responses_with_key(state: &AppState, key: &str, body: &Va
         .unwrap()
 }
 
-async fn wait_for_key_settlement(state: &AppState, key_id: Uuid) {
+pub(super) async fn wait_for_key_settlement(state: &AppState, key_id: Uuid) {
     tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rows = state.db.list_requests(key_id, 10).await.unwrap();
-            if rows.len() == 1 && rows[0].status_code.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for_financial_events(state, key_id, 1).await;
     })
     .await
     .unwrap();
+}
+
+pub(super) async fn wait_for_financial_events(state: &AppState, key_id: Uuid, expected: usize) {
+    let pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let owner = Uuid::now_v7();
+    loop {
+        let rows = state.db.list_requests(key_id, 10).await.unwrap();
+        if rows.len() == expected && rows.iter().all(|row| row.completed_at.is_some()) {
+            for request_id in state
+                .db
+                .claim_terminal_projection_tasks(owner, 10)
+                .await
+                .unwrap()
+            {
+                assert!(
+                    state
+                        .db
+                        .project_claimed_terminal_projection_task(owner, request_id)
+                        .await
+                        .unwrap()
+                );
+            }
+            let finished: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'",
+            )
+            .bind(key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if finished == expected as i64 {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -568,7 +600,7 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 )
                 .await;
             } else {
-                wait_for_request_settlement(&fixture, 1).await;
+                wait_for_key_settlement(&fixture.state, fixture.key_id).await;
             }
             let rows = fixture
                 .state
@@ -738,6 +770,8 @@ async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish()
         if rejected {
             cancellation::assert_unknown_receipt(&fixture, request_id, 499, "client_cancelled", 0)
                 .await;
+        } else {
+            wait_for_key_settlement(&fixture.state, fixture.key_id).await;
         }
         let terminal = sqlx::query("SELECT q.status_code, q.output_tokens, q.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM request_records q WHERE q.id = $1")
             .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();

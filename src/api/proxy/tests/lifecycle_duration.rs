@@ -140,10 +140,10 @@ async fn stream_fixture(
 }
 
 async fn assert_terminal(fixture: &CodexRouteFixture, request_id: Uuid, status: i64) {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        fixture.state.proxy_lifecycles.wait_for_idle(),
-    )
+    tokio::time::timeout(Duration::from_secs(5), async {
+        fixture.state.proxy_lifecycles.wait_for_idle().await;
+        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 1).await;
+    })
     .await
     .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();

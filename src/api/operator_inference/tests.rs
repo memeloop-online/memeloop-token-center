@@ -291,7 +291,7 @@ async fn successful_inference(anthropic: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let rows = state.db.list_requests(key.key_id, 10).await.unwrap();
-            if rows.len() == 1 && rows[0].status_code.is_some() {
+            if rows.len() == 1 && rows[0].completed_at.is_some() {
                 break;
             }
             tokio::task::yield_now().await;
