@@ -7,7 +7,7 @@ export function checkedCommandOutput(mode: string, value: unknown): string {
   assert(value && typeof value === 'object' && !Array.isArray(value), 'expected command output object');
   const output = value as Record<string, unknown>;
   if (mode === 'cosign-version') {
-    assert.equal(output.gitVersion, 'v3.1.3-mtc.4', 'reviewed Cosign compatibility version required');
+    assert.equal(output.gitVersion, 'v3.1.4', 'reviewed Cosign compatibility version required');
     return '';
   }
   assert.equal(mode, 'oras-push', 'unknown command output mode');
