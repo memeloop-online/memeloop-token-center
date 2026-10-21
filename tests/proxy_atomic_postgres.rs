@@ -20,6 +20,9 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "support/postgres_isolation.rs"]
+mod postgres_isolation;
+
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -458,6 +461,10 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         return;
     };
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    // Claims are global within a database, not scoped to this test's tenant.
+    // Failed earlier integration binaries may leave older eligible jobs.
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
+    let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 96).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
@@ -764,6 +771,9 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         materialized,
         (REQUESTS as i64 + 1, REQUESTS as i64, REQUESTS as i64 + 1, 0)
     );
+    inspection.close().await;
+    database.close().await;
+    isolated.cleanup().await;
 }
 
 #[tokio::test]
@@ -1033,6 +1043,8 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
         return;
     };
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
+    let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
     let inspection = PgPool::connect(&database_url).await.unwrap();
@@ -1262,6 +1274,9 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     .await
     .unwrap();
     assert_eq!(recovered, (1, 1, 1));
+    inspection.close().await;
+    database.close().await;
+    isolated.cleanup().await;
 }
 
 #[tokio::test]
