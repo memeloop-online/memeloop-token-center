@@ -511,6 +511,95 @@ mod tests {
     }
 
     #[test]
+    fn native_chat_delta_and_terminal_output_kinds_must_agree_for_trusted_usage() {
+        for refusal_delta in [false, true] {
+            for conflicting in [false, true] {
+                let mut capture = ResponsesSseCapture::for_codex_responses();
+                let mut translator = codex_transport::CodexChatStreamTranslator::new(
+                    Uuid::nil(),
+                    "public".into(),
+                    true,
+                );
+                let refusal_terminal = refusal_delta != conflicting;
+                let content = if refusal_terminal {
+                    serde_json::json!({"type": "refusal", "refusal": "no"})
+                } else {
+                    serde_json::json!({"type": "output_text", "text": "yes", "annotations": []})
+                };
+                for event in [
+                    serde_json::json!({"type": "response.created",
+                        "response": {"id": "resp-kind", "status": "in_progress"}}),
+                    serde_json::json!({
+                        "type": if refusal_delta { "response.refusal.delta" } else { "response.output_text.delta" },
+                        "delta": if refusal_delta { "no" } else { "yes" }
+                    }),
+                ] {
+                    let frame = format!("data: {event}\n\n");
+                    capture.push(frame.as_bytes());
+                    translator.translate_frame(frame.as_bytes()).unwrap();
+                }
+                let event = serde_json::json!({"type": "response.completed", "response": {
+                    "id": "resp-kind", "object": "response", "status": "completed",
+                    "output": [{"type": "message", "id": "msg-kind", "role": "assistant",
+                        "status": "completed", "content": [content]}],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }});
+                let frame = format!("data: {event}\n\n");
+                capture.push(frame.as_bytes());
+                let translation_error = translator.translate_frame(frame.as_bytes()).err();
+                assert_eq!(
+                    translation_error,
+                    conflicting.then_some("upstream_invalid_response")
+                );
+                let mut captured = capture.finish_summary();
+                assert!(matches!(
+                    captured.outcome,
+                    ResponsesSseOutcome::Completed { .. }
+                ));
+                assert!(!captured.usage_invalid);
+                let usage = captured.usage.clone().unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+                apply_chat_translation_usage_evidence(&mut captured, translation_error);
+                for transport_error in [
+                    translation_error,
+                    Some("downstream_disconnected"),
+                    Some("downstream_backpressure"),
+                ] {
+                    assert_eq!(
+                        trusted_streaming_terminal_usage(Some(&captured), transport_error),
+                        if conflicting {
+                            None
+                        } else {
+                            Some(usage.clone())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_native_chat_output_preserves_valid_terminal_usage() {
+        let event = serde_json::json!({"type": "response.completed", "response": {
+            "id": "resp-search", "object": "response", "status": "completed",
+            "output": [{"type": "web_search_call", "id": "search-call", "status": "completed",
+                "action": {"type": "search", "query": "synthetic"}}],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        }});
+        let frame = format!("data: {event}\n\n");
+        let mut capture = ResponsesSseCapture::for_codex_responses();
+        capture.push(frame.as_bytes());
+        let mut translator =
+            codex_transport::CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), true);
+        let translation_error = translator.translate_frame(frame.as_bytes()).err();
+        assert_eq!(translation_error, Some("upstream_unsupported_chat_output"));
+        let mut captured = capture.finish_summary();
+        apply_chat_translation_usage_evidence(&mut captured, translation_error);
+        let usage = trusted_streaming_terminal_usage(Some(&captured), translation_error).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+    }
+
+    #[test]
     fn semantic_terminal_failures_reject_usage_but_delivery_loss_preserves_it() {
         for completed in [false, true] {
             for translation_error in [
