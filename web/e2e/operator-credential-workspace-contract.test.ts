@@ -477,6 +477,45 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     assert.equal(policyWrites[0].path, '/internal/v1/keys/key-form/policy');
     assert.equal(JSON.parse(policyWrites[0].body!).max_concurrency, 3);
     await policies.close();
+
+    const pagedCatalog = await browser.newPage();
+    await pagedCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await pagedCatalog.goto(`${fixture('client-form')}&paged-route-catalog`);
+    await pagedCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    await pagedCatalog.waitForFunction(() => window.credentialFixture.calls.some((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')), undefined, { timeout: 10_000 });
+    await pagedCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
+    await pagedCatalog.getByRole('menuitem', { name: 'Route access', exact: true }).click();
+    const pagedRouting = pagedCatalog.locator('.routing-editor');
+    const pagedPreview = pagedRouting.getByRole('region', { name: 'Authorization scope preview' });
+    await pagedPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
+    assert.equal(await pagedPreview.getByText(/Unknown route/).count(), 0, 'a grant stored beyond the first catalog page resolves its route name once paging completes');
+    await pagedRouting.getByRole('button', { name: 'Individual model grants (1)', exact: true }).click();
+    assert.match(await pagedRouting.locator('.selection-chip').innerText(), /Spark disabled/, 'the paged-in grant stays selected under its own name');
+    await pagedCatalog.close();
+
+    const exactCatalog = await browser.newPage();
+    await exactCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await exactCatalog.goto(`${fixture('client-form')}&paged-route-catalog-exact`);
+    await exactCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    // Two full pages are followed by one empty read: the empty page, not a
+    // route count, is what ends the walk.
+    await exactCatalog.waitForFunction(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')).length === 2, undefined, { timeout: 10_000 });
+    await exactCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
+    await exactCatalog.getByRole('menuitem', { name: 'Route access', exact: true }).click();
+    const exactRouting = exactCatalog.locator('.routing-editor');
+    const exactPreview = exactRouting.getByRole('region', { name: 'Authorization scope preview' });
+    await exactPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
+    assert.equal(await exactPreview.getByText(/Unknown route/).count(), 0, 'a catalog sized to an exact page multiple still resolves every grant');
+    await exactCatalog.close();
+
+    const stuckCatalog = await browser.newPage();
+    await stuckCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await stuckCatalog.goto(`${fixture('client-form')}&paged-route-catalog-stuck`);
+    await stuckCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    await stuckCatalog.getByRole('alert').filter({ hasText: 'The existing route list could not be loaded completely. Try again.' }).first().waitFor();
+    const stuckReads = await stuckCatalog.evaluate(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?')).length);
+    assert.equal(stuckReads, 2, 'a non-advancing cursor fails after the repeated page instead of paging forever');
+    await stuckCatalog.close();
   } finally {
     await browser.close();
     await server.close();
