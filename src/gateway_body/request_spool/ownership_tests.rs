@@ -293,6 +293,60 @@ async fn cancelled_blocking_open_and_write_keep_memory_and_file_until_task_finis
     }
 }
 
+struct OwnedFrame {
+    bytes: Vec<u8>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for OwnedFrame {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[tokio::test]
+async fn blocking_write_shares_transport_frame_and_releases_it_after_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let pause = Arc::new(BlockingPause::default());
+    let resume = ResumeOnDrop(pause.clone());
+    let mut spool = RequestSpoolAdmission::new(directory.path().to_owned());
+    Arc::get_mut(&mut spool.usage).unwrap().blocking_write = Some(pause.clone());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let frame_bytes = REQUEST_SPOOL_CHUNK_BYTES * 2 + 17;
+    let body = Body::from(Bytes::from_owner(OwnedFrame {
+        bytes: vec![b'x'; frame_bytes],
+        dropped: dropped.clone(),
+    }));
+    let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
+    let memory = budget.reservation();
+    let active_spool = spool.clone();
+    let capture = tokio::spawn(async move {
+        active_spool
+            .capture_with_memory(body, frame_bytes, Some(frame_bytes), Some(&memory), 0)
+            .await
+    });
+    pause.wait_started().await;
+    let charged = budget.snapshot().0;
+    assert!(charged >= frame_bytes);
+    capture.abort();
+    assert!(matches!(capture.await, Err(error) if error.is_cancelled()));
+    assert_eq!(dropped.load(Ordering::Acquire), 0);
+    assert_eq!(budget.snapshot().0, charged);
+    assert_eq!(spool.snapshot().active_files, 1);
+    drop(resume);
+    pause.wait_finished().await;
+    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    assert_eq!(budget.snapshot().0, 0);
+    assert_eq!(spool.snapshot().used_bytes, 0);
+    assert_eq!(spool.snapshot().active_files, 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn slow_uploads_and_retained_spools_above_former_aggregate_limit_remain_independent() {
     const UPLOAD_BYTES: usize = 12 * 1024 * 1024;
