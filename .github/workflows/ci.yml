@@ -5,13 +5,14 @@ on:
     branches: [master]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   # Pull requests share a group by PR number so a new head cancels only its
-  # obsolete run. Every push receives its own group: master validation can
+  # obsolete run. Every push or dispatch receives its own group: validation can
   # therefore overlap, while the publisher still emits only immutable SHA tags.
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -654,7 +655,7 @@ jobs:
       binary_artifact: memory-binary-${{ github.sha }}
 
   release-input-assembly:
-    if: github.event_name == 'pull_request' && needs.changes.outputs.memory == 'true'
+    if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.memory == 'true'
     needs: [changes, memory-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -697,11 +698,14 @@ jobs:
 
   publish-ghcr:
     if: >-
-      always() && github.event_name == 'push' &&
-      (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true') &&
+      always() &&
+      ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true')) ||
+       (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' &&
+        github.ref == 'refs/heads/master' && github.ref_protected == true)) &&
       needs.changes.result == 'success' && needs.repository-security.result == 'success' &&
       needs.dependency-security.result == 'success' && needs.api-contract.result == 'success' &&
       needs.packaging.result == 'success' && needs.memory-binary.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' || needs.release-input-assembly.result == 'success') &&
       (needs.web.result == 'success' || (needs.changes.outputs.web == 'false' && needs.web.result == 'skipped')) &&
       (needs.rust.result == 'success' || (needs.changes.outputs.rust == 'false' && needs.rust.result == 'skipped')) &&
       (needs.migration-smoke.result == 'success' || (needs.changes.outputs.migration == 'false' && needs.migration-smoke.result == 'skipped')) &&
@@ -717,6 +721,7 @@ jobs:
       - packaging
       - memory-acceptance
       - memory-binary
+      - release-input-assembly
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -844,8 +849,10 @@ jobs:
 
   verify-ghcr-release:
     if: >-
-      always() && github.event_name == 'push' &&
-      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
+      always() &&
+      ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
+       (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' &&
+        github.ref == 'refs/heads/master' && github.ref_protected == true)) &&
       needs.publish-ghcr.result == 'success'
     needs: [publish-ghcr]
     runs-on: ubuntu-latest
@@ -883,7 +890,7 @@ jobs:
 
   publish-github-release:
     if: >-
-      always() && needs.changes.outputs.is_version_tag == 'true' &&
+      always() && github.event_name == 'push' && needs.changes.outputs.is_version_tag == 'true' &&
       needs.verify-ghcr-release.result == 'success' && needs.memory-binary.result == 'success'
     needs: [changes, memory-binary, verify-ghcr-release]
     runs-on: ubuntu-latest
@@ -1041,9 +1048,9 @@ jobs:
       - name: Validate fail-closed expensive CI scope detection
         run: node --test tests/ops/ci-scope-contract.test.ts
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
       - name: Build the cached hardened plugin installer contract image
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -1054,12 +1061,12 @@ jobs:
           cache-from: type=gha,scope=plugin-installer
           cache-to: type=gha,mode=max,scope=plugin-installer
       - name: Build and exercise the hardened plugin installer image
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         env:
           MTC_PLUGIN_INSTALLER_IMAGE: mtc-plugin-installer-contract:${{ github.run_id }}
         run: node --test tests/ops/plugin-installer-image-contract.test.ts
       - name: Validate the unchanged plugin installer contract statically
-        if: needs.changes.outputs.plugin_installer != 'true' || github.event_name != 'pull_request'
+        if: needs.changes.outputs.plugin_installer != 'true' || (github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch')
         env:
           MTC_SKIP_DOCKER_BUILD: "1"
         run: node --test tests/ops/plugin-installer-image-contract.test.ts

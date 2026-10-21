@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 
 const SCOPE = 'expensive CI scope detection';
 const [eventName = '', changedPathsValue = '', outputValue = ''] = process.argv.slice(2);
-if (!['pull_request', 'push'].includes(eventName)) {
+if (!['pull_request', 'push', 'workflow_dispatch'].includes(eventName)) {
   throw new Error(`${SCOPE}: unsupported event ${JSON.stringify(eventName)}`);
 }
 if (changedPathsValue === '' || outputValue === '') {
@@ -67,11 +67,14 @@ function parseNameStatus(value: string): Change[] {
   return changes;
 }
 
+// A manual run has no push range or PR merge to optimize. It always runs every
+// gate, without reading diff files or consulting event-specific Git metadata.
+const manual = eventName === 'workflow_dispatch';
 const verifiedMergeMode = changedPathsValue === '--verified-merge';
-const merge = verifiedMergeMode ? (eventName === 'pull_request' ? checkedOutMergeDiff() : checkedOutPushDiff()) : undefined;
-const forceFull = verifiedMergeMode && merge === undefined;
-if (forceFull) console.warn(`${SCOPE}: merge checkout could not be verified; running all gates`);
-const changes = parseNameStatus(verifiedMergeMode ? merge?.input ?? '' : readFileSync(changedPathsValue, 'utf8'));
+const merge = !manual && verifiedMergeMode ? (eventName === 'pull_request' ? checkedOutMergeDiff() : checkedOutPushDiff()) : undefined;
+const forceFull = manual || (verifiedMergeMode && merge === undefined);
+if (forceFull && !manual) console.warn(`${SCOPE}: merge checkout could not be verified; running all gates`);
+const changes = parseNameStatus(manual ? '' : verifiedMergeMode ? merge?.input ?? '' : readFileSync(changedPathsValue, 'utf8'));
 const paths = changes.flatMap(({ paths }) => paths);
 if (eventName === 'pull_request' && !forceFull && changes.length === 0) {
   throw new Error(`${SCOPE}: a pull request must resolve at least one changed path`);
