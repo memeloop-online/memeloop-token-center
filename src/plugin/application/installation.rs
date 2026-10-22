@@ -3196,6 +3196,65 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
             .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
             .await
             .unwrap();
+        // A failed old attempt may already have a successfully verified package.
+        // Retry must keep the frozen full base, but discard that attempt's paths
+        // and checkpoints before accepting freshly verified output.
+        state
+            .db
+            .finish_plugin_installation(&record.id, &record.attempt_id, None)
+            .await
+            .unwrap();
+        assert!(!authority.inventory.read().await.contains_key("upgraded"));
+        assert_eq!(
+            state
+                .db
+                .optional_application_plugin_head()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let (retry, run) = state
+            .db
+            .begin_plugin_installation(
+                "upgraded",
+                &json!([reference]),
+                "upgrade-request",
+                "upgrade-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        assert_eq!(record.id, retry.id);
+        assert_ne!(record.attempt_id, retry.attempt_id);
+        assert!(retry.checkpoints.is_empty());
+        let old_root = root;
+        let record = retry;
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        claim_inventory_root(&root, &record.attempt_id).unwrap();
+        std::fs::create_dir(root.join("new-plugin")).unwrap();
+        for file in ["plugin.json", ".mtc-oci-install.json"] {
+            std::fs::copy(
+                old_root.join("new-plugin").join(file),
+                root.join("new-plugin").join(file),
+            )
+            .unwrap();
+        }
+        let checkpoints = BTreeMap::from([(
+            reference.clone(),
+            package_checkpoint(&root, &reference, &trust).await.unwrap(),
+        )]);
+        state
+            .db
+            .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
+            .await
+            .unwrap();
         // Missing/failed installation, a stale trust policy, or duplicate package
         // IDs cannot authorize removing any frozen grant.
         assert!(
