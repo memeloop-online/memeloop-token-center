@@ -321,14 +321,18 @@ fn gateway_body_admission_rejection(
                 reason = rejection.reason.label(),
                 "gateway request body rejected"
             );
-            (
+            let mut response = (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({"error": {
                     "code": "request_body_too_large",
                     "message": "request body exceeds the supported limit"
                 }})),
             )
-                .into_response()
+                .into_response();
+            response
+                .extensions_mut()
+                .insert(crate::server::RejectedUpload);
+            response
         }
     }
 }
@@ -677,6 +681,9 @@ fn single_header(headers: &HeaderMap, name: impl axum::http::header::AsHeaderNam
     }
     Some(value)
 }
+
+#[cfg(test)]
+mod http1_rejection_tests;
 
 #[cfg(test)]
 mod tests {

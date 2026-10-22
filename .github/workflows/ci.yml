@@ -403,6 +403,8 @@ jobs:
         run: |
           cargo test --locked --all-features --lib -- --ignored --exact db::tests::terminal_projection::semantic_isolation::postgres_semantic_payload_recovers_without_source_or_duplicate_finance
           cargo test --locked --all-features --lib -- --ignored --exact db::tests::terminal_projection::semantic_retry::postgres_semantic_projection_retries_only_confirmed_statement_rollback
+      - name: Verify HTTP/1 body rejection delivery over real TCP sockets
+        run: cargo test --locked --all-features --lib api::auth::http1_rejection_tests:: -- --nocapture
       - run: cargo test --locked --all-targets --all-features --no-fail-fast
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
