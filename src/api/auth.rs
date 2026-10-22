@@ -342,7 +342,11 @@ fn gateway_body_admission_rejection(
                 reason = rejection.reason.label(),
                 "gateway request body rejected"
             );
-            classified_body_rejection(rejection)
+            let mut response = classified_body_rejection(rejection);
+            response
+                .extensions_mut()
+                .insert(crate::server::RejectedUpload);
+            response
         }
     }
 }
@@ -687,6 +691,9 @@ fn single_header(headers: &HeaderMap, name: impl axum::http::header::AsHeaderNam
     }
     Some(value)
 }
+
+#[cfg(test)]
+mod http1_rejection_tests;
 
 #[cfg(test)]
 mod tests {

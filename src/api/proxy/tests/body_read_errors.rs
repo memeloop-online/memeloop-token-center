@@ -64,6 +64,13 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
                 (StatusCode::PAYLOAD_TOO_LARGE, "request_body_too_large")
             };
             assert_eq!(response.status(), status, "{path}");
+            assert!(
+                response
+                    .extensions()
+                    .get::<crate::server::RejectedUpload>()
+                    .is_some(),
+                "{path}: admission rejection keeps HTTP/1 teardown protection"
+            );
             let request_id =
                 Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
             let body = to_bytes(response.into_body(), 4096).await.unwrap();
