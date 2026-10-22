@@ -197,7 +197,7 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                             capture.await.unwrap(),
                             Err(GatewayBodyAdmissionError::Rejected(rejection))
                                 if rejection.route_class == GatewayBodyRouteClass::Responses
-                                    && rejection.reason == GatewayBodyRejectionReason::BodyReadRejected
+                                    && rejection.reason == GatewayBodyRejectionReason::BodyLimitExceeded
                         ));
                     } else if frame_allowance == 0 {
                         assert!(matches!(

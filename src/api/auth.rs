@@ -95,12 +95,8 @@ pub(super) async fn authenticate_control_before_body(
             Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
                 return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
             }
-            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
-                return Ok(control_body_rejection(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_body_too_large",
-                    "request body exceeds the supported limit",
-                ));
+            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(rejection)) => {
+                return Ok(classified_body_rejection(rejection));
             }
         };
         // Keep the permit through parsing and handler execution. Releasing it
@@ -146,6 +142,30 @@ fn control_body_rejection(
         Json(json!({"error": {"code": code, "message": message}})),
     )
         .into_response()
+}
+
+fn classified_body_rejection(rejection: crate::gateway_body::GatewayBodyRejection) -> Response {
+    let (status, code, message) = match rejection.reason {
+        crate::gateway_body::GatewayBodyRejectionReason::BodyReadRejected => (
+            StatusCode::BAD_REQUEST,
+            "request_body_read_failed",
+            "request body could not be read",
+        ),
+        crate::gateway_body::GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit
+        | crate::gateway_body::GatewayBodyRejectionReason::BodyLimitExceeded => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            "request body exceeds the supported limit",
+        ),
+        crate::gateway_body::GatewayBodyRejectionReason::CapacityExhausted => {
+            return gateway_body_capacity_rejection();
+        }
+    };
+    let mut response = control_body_rejection(status, code, message);
+    response
+        .extensions_mut()
+        .insert(crate::error::PublicErrorCode(code));
+    response
 }
 
 pub(super) async fn authenticate_gateway_before_body(
@@ -315,20 +335,14 @@ fn gateway_body_admission_rejection(
             // any part of the rejected request body.
             tracing::warn!(
                 request_id = %request_id,
+                stage = "gateway_request_body",
                 route_class = rejection.route_class.label(),
                 declared_content_length = ?rejection.declared_content_length,
                 limit_bytes = rejection.limit_bytes,
                 reason = rejection.reason.label(),
                 "gateway request body rejected"
             );
-            let mut response = (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({"error": {
-                    "code": "request_body_too_large",
-                    "message": "request body exceeds the supported limit"
-                }})),
-            )
-                .into_response();
+            let mut response = classified_body_rejection(rejection);
             response
                 .extensions_mut()
                 .insert(crate::server::RejectedUpload);
@@ -430,12 +444,8 @@ pub(super) async fn admit_cloud_webhook_before_body(
         Err(crate::gateway_body::GatewayBodyAdmissionError::UnsupportedEncoding) => {
             return Ok(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response());
         }
-        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
-            return Ok(control_body_rejection(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_body_too_large",
-                "request body exceeds the supported limit",
-            ));
+        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(rejection)) => {
+            return Ok(classified_body_rejection(rejection));
         }
     };
     Ok(next.run(request).await)
