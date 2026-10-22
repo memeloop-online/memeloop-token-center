@@ -205,3 +205,10 @@ use crate::db::CreateModelRouteInput;
 
 #[cfg(test)]
 mod tests;
+
+/// Read an existing server-owned correlation ID without creating a new identity.
+pub(crate) fn current_gateway_diagnostic_request_id() -> Option<uuid::Uuid> {
+    proxy_diagnostics::CONTEXT
+        .try_with(|context| context.request_id)
+        .ok()
+}
