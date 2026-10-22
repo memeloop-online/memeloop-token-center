@@ -218,7 +218,9 @@ async fn http1_never_ending_rejected_upload_does_not_block_shutdown() {
     let server = Server::start().await;
     let mut socket = TcpStream::connect(server.address).await.unwrap();
     socket
-        .write_all(&server.headers("Content-Length: 18446744073709551615\r\n"))
+        // Keep the declared length representable by Hyper's internal decoded
+        // length (u64::MAX is a sentinel and is rejected before admission).
+        .write_all(&server.headers("Content-Length: 1099511627776\r\n"))
         .await
         .unwrap();
     let (mut read, mut write) = socket.into_split();
