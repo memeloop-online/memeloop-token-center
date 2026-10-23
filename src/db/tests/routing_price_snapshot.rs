@@ -28,7 +28,7 @@ async fn single_checkout_price_snapshot(database: &Database) {
             .unwrap();
     }
     database
-        .upsert_model_price(&model, "EUR", Decimal::TEN, Decimal::TEN)
+        .upsert_model_price(&model, "CNY", Decimal::TEN, Decimal::TEN)
         .await
         .unwrap();
 
@@ -120,7 +120,7 @@ async fn single_checkout_price_snapshot(database: &Database) {
     assert_eq!(legacy.input_micros_per_million, 10_000_000);
     assert!(legacy.tiers.is_empty());
     assert!(matches!(
-        database.model_price(&model, "CNY").await,
+        database.model_price(&model, "EUR").await,
         Err(AppError::UnpricedModel)
     ));
     assert!(matches!(
