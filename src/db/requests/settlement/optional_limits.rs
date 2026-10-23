@@ -522,6 +522,85 @@ async fn sqlite_optional_rate_limits_preserve_prepaid_finance_and_recovery() {
 }
 
 #[tokio::test]
+async fn postgres_unset_rates_do_not_wait_for_preexisting_rate_window_lock() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let fixture = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let database = Database::connect_with_max(fixture.url(), 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let (key, price) = credential(&database, KeyPolicy::default(), Decimal::from(1000)).await;
+    let now = unix_millis();
+    let window_start = now / 60_000 * 60_000;
+    sqlx::query("INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 11, 123)")
+        .bind(key.key_id.to_string()).bind(window_start)
+        .execute(&database.pool).await.unwrap();
+    let mut blocker = database.begin_write_transaction().await.unwrap();
+    let original: (i64, i64) = sqlx::query_as(
+        "SELECT requests, tokens FROM rate_limit_windows WHERE key_id = $1 AND window_start = $2 FOR UPDATE",
+    )
+    .bind(key.key_id.to_string()).bind(window_start)
+    .fetch_one(&mut *blocker).await.unwrap();
+    assert_eq!(original, (11, 123));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let reservation = reserve_at(&database, &key, &price, 500_000, now)
+            .await
+            .unwrap();
+        let mut transaction = database.begin_write_transaction().await.unwrap();
+        let resized = resize_usage_reservation_in_transaction(
+            &mut transaction,
+            &key,
+            &price,
+            &reservation,
+            0,
+            650_000,
+            now,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(resized.reserved_tokens, 650_000);
+        assert_eq!(resized.reserved_micros, 650_000);
+        let held = database.key_limit_snapshot(key.key_id).await.unwrap();
+        assert_eq!(held.available_balance, "999.35");
+        assert_eq!(held.reserved_balance, "0.65");
+        assert_eq!(held.concurrency.active, 1);
+        assert_eq!(database.settle_usage(&resized, 20, 30).await.unwrap(), 50);
+        assert_eq!(database.settle_usage(&resized, 20, 30).await.unwrap(), 50);
+        let settled = database.key_limit_snapshot(key.key_id).await.unwrap();
+        assert_eq!(settled.available_balance, "999.99995");
+        assert_eq!(settled.reserved_balance, "0");
+        assert_eq!(settled.concurrency.active, 0);
+        let ledger = database
+            .list_account_ledger(key.account_id, 100)
+            .await
+            .unwrap();
+        let usage: Vec<_> = ledger
+            .iter()
+            .filter(|entry| entry.kind == "usage")
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].amount, "-0.00005");
+    })
+    .await
+    .expect("unconfigured rates must not wait for an unrelated rate-window writer");
+
+    let unchanged: (i64, i64) = sqlx::query_as(
+        "SELECT requests, tokens FROM rate_limit_windows WHERE key_id = $1 AND window_start = $2",
+    )
+    .bind(key.key_id.to_string())
+    .bind(window_start)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, original);
+    blocker.rollback().await.unwrap();
+    database.close().await;
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn postgres_optional_rate_limits_preserve_prepaid_finance_and_recovery() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
