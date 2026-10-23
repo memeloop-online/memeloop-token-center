@@ -459,7 +459,15 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for entry in pending.values_mut().filter(|entry| {
-            entry.durable && entry.reconcile && entry.conversation_enqueued && !entry.running
+            entry.durable
+                && entry.reconcile
+                && !entry.running
+                && !(entry.unknown_annotated
+                    && entry.snapshot.claim.is_some()
+                    && entry.snapshot.usage_basis
+                        != Some(crate::model::RequestUsageBasis::ProviderReported)
+                    && entry.snapshot.conversation.is_some()
+                    && !entry.conversation_enqueued)
         }) {
             if let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
                 snapshot.conversation = None;
@@ -702,13 +710,17 @@ impl Journal {
     }
 
     #[cfg(test)]
-    pub(crate) async fn retained_conversation_for_test(&self, receipt_id: Uuid) -> bool {
+    pub(crate) async fn idle_conversation_retained_for_test(
+        &self,
+        receipt_id: Uuid,
+    ) -> Option<bool> {
         self.reap().await;
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&receipt_id)
-            .is_some_and(|entry| entry.snapshot.conversation.is_some())
+            .filter(|entry| !entry.running)
+            .map(|entry| entry.snapshot.conversation.is_some())
     }
 
     #[cfg(test)]

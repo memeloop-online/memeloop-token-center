@@ -623,6 +623,97 @@ async fn committed_receipt_replays_after_worker_loss_before_retirement_without_d
 }
 
 #[tokio::test]
+async fn provider_reported_authority_arbitration_keeps_durable_bytes_and_releases_memory() {
+    for already_finished in [false, true] {
+        let fixture = codex_route_fixture("pending-authority-memory").await;
+        let held = fixture.state.pending_terminals.hold_writer_for_test().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                completed_codex_sse("authority conflict retains original usage"),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "authority conflict", "stream": false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&delivered)
+                .contains("authority conflict retains original usage")
+        );
+        let record = wait_for_operational(&fixture).await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        if already_finished {
+            sqlx::query("UPDATE request_records SET completed_at = $1, status_code = 504, error_code = 'request_expired' WHERE id = $2")
+                .bind(crate::db::unix_millis()).bind(record.request_id.to_string())
+                .execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("UPDATE pending_proxy_settlements SET fence = $1 WHERE request_id = $2")
+                .bind(Uuid::now_v7().to_string())
+                .bind(record.request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        drain_archive_capture(&fixture).await;
+        assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+        drop(held);
+        let (path, receipt) = wait_for_receipt(&fixture).await;
+        let durable = tokio::fs::read(&path).await.unwrap();
+        let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt["usage_basis"], "provider_reported");
+        assert_eq!(receipt["usage"]["input_tokens"], 3);
+        assert_eq!(receipt["usage"]["output_tokens"], 2);
+        assert!(receipt["conversation"].is_object());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture.state.pending_terminals.requires_arbitration_for_test(receipt_id)
+                    && fixture.state.pending_terminals.idle_conversation_retained_for_test(receipt_id).await == Some(false)
+                {
+                    let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+                    if used == 0 && retained == 0 {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("durable authority arbitration must release payload and memory without retiring evidence");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), durable);
+        let financial: (String, Option<String>, String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT p.state, p.receipt_id, r.status, r.actual_micros, \
+             (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
+             (SELECT COUNT(*) FROM request_events WHERE request_id = p.request_id AND event_kind = 'finished') \
+             FROM pending_proxy_settlements p JOIN usage_reservations r ON r.id = p.reservation_id WHERE p.request_id = $1",
+        ).bind(record.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            financial,
+            (
+                "pending".to_owned(),
+                None,
+                "reserved".to_owned(),
+                None,
+                0,
+                0
+            )
+        );
+        assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
+        pool.close().await;
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn changed_owned_key_receipt_conflicts_and_is_not_retired_after_commit() {
     for field in ["alias", "currency", "credential_generation", "policy"] {
         assert_committed_receipt_replay_preserves_owned_key(Some(field)).await;
@@ -1099,6 +1190,13 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_unknown_projection BEFORE INSERT ON conversation_projection_outbox \
+         BEGIN SELECT RAISE(ABORT, 'UNKNOWN_PROJECTION_PRIVATE_CANARY'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -1149,13 +1247,20 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     .expect("unknown finance must retain its durable receipt");
     let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
     assert!(original["conversation"].is_object());
-    assert!(
-        fixture
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture
             .state
             .pending_terminals
-            .retained_conversation_for_test(receipt_id)
+            .idle_conversation_retained_for_test(receipt_id)
             .await
-    );
+            != Some(true)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unknown awaiting its operational receipt must survive idle reap");
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1207,6 +1312,34 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
         serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
         original
     );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture
+            .state
+            .pending_terminals
+            .idle_conversation_retained_for_test(receipt_id)
+            .await
+            != Some(true)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operational unknown acknowledgement must not discard a still-unqueued conversation");
+    let enqueued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(enqueued, 0);
+    if !restart {
+        assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    }
+    sqlx::query("DROP TRIGGER fail_unknown_projection")
+        .execute(&pool)
+        .await
+        .unwrap();
     let payload: String = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(payload) = sqlx::query_scalar::<_, String>(
@@ -1228,6 +1361,25 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
         serde_json::from_str::<Value>(&payload).unwrap(),
         original["conversation"]["request_json"]
     );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .state
+                .pending_terminals
+                .idle_conversation_retained_for_test(receipt_id)
+                .await
+                == Some(false)
+            {
+                let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+                if used == 0 && retained == 0 {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unknown with durable semantic enqueue must release its conversation and memory");
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state
@@ -1332,8 +1484,25 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     assert_eq!(receipt["receipt_id"], original.0);
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
+    assert!(receipt["conversation"].is_null());
     assert!(path.exists(), "runtime ACK is not a financial receipt ACK");
     release.send(()).unwrap();
     server.await.unwrap();
+    drain_archive_capture(&fixture).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+            if used == 0 && retained == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operational unknown without a remaining conversation must release memory");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
+        receipt
+    );
     pool.close().await;
 }
