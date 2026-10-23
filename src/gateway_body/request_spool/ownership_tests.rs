@@ -105,16 +105,58 @@ async fn admit(
     if let Some(length) = declared {
         request = request.header(header::CONTENT_LENGTH, length);
     }
-    admit_gateway_request_body_with_memory(
-        request.body(body).unwrap(),
-        Arc::new(tokio::sync::Semaphore::new(0)),
-        Arc::new(tokio::sync::Semaphore::new(0)),
-        BUDGET_BYTES as usize,
-        crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-        Some(budget),
-        spool,
-    )
-    .await
+    let (mut parts, body) = request.body(body).unwrap().into_parts();
+    let memory = budget.reservation();
+    let maximum = declared
+        .unwrap_or(BUDGET_BYTES as usize)
+        .min(BUDGET_BYTES as usize);
+    let owner = spool
+        .capture_with_memory(
+            body,
+            maximum,
+            declared,
+            Some(&memory),
+            std::mem::size_of_val(&parts)
+                .saturating_add(parts.uri.to_string().len())
+                .saturating_add(parts.headers.iter().fold(0usize, |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<(
+                            axum::http::HeaderName,
+                            axum::http::HeaderValue,
+                        )>())
+                        .saturating_add(name.as_str().len())
+                        .saturating_add(value.as_bytes().len())
+                })),
+        )
+        .await
+        .map_err(|error| match error {
+            super::RequestSpoolCaptureError::MemoryExhausted => {
+                GatewayBodyAdmissionError::CapacityExhausted
+            }
+            super::RequestSpoolCaptureError::StorageFull => {
+                GatewayBodyAdmissionError::RequestSpoolStorageFull
+            }
+            super::RequestSpoolCaptureError::Unavailable => {
+                GatewayBodyAdmissionError::RequestSpoolUnavailable
+            }
+            super::RequestSpoolCaptureError::TooLarge => crate::gateway_body::rejected_body(
+                GatewayBodyRouteClass::Responses,
+                declared.map(|length| length as u64),
+                BUDGET_BYTES as usize,
+                GatewayBodyRejectionReason::BodyLimitExceeded,
+            ),
+            super::RequestSpoolCaptureError::BodyReadRejected => {
+                crate::gateway_body::rejected_body(
+                    GatewayBodyRouteClass::Responses,
+                    declared.map(|length| length as u64),
+                    BUDGET_BYTES as usize,
+                    GatewayBodyRejectionReason::BodyReadRejected,
+                )
+            }
+        })?;
+    parts.extensions.insert(memory);
+    parts.extensions.insert(Arc::new(owner));
+    Ok(Request::from_parts(parts, Body::empty()))
 }
 
 async fn metadata_charge(path: &str, declared: Option<usize>) -> usize {

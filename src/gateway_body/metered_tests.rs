@@ -72,16 +72,102 @@ async fn small_declared_responses_cancel_without_spool_and_release_memory() {
         let task =
             tokio::spawn(async move { admit(request, Some(&active_budget), &active_spool).await });
         polled.await.unwrap();
-        assert_eq!(
-            budget.snapshot().0,
-            16 * 1024 * 1024 * memory::REQUEST_MEMORY_WEIGHT
-        );
+        assert_eq!(budget.snapshot().0, 64 * 1024);
         assert_eq!(spool.snapshot().active_files, 0);
         assert!(!directory.path().join("unused").exists());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(budget.snapshot().0, 0);
         assert_eq!(spool.snapshot().used_bytes, 0);
+    }
+}
+
+#[tokio::test]
+async fn small_responses_share_byte_budget_while_waiting_for_eof_and_cancel() {
+    let directory = tempfile::tempdir().unwrap();
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().join("unused"));
+    let budget = Arc::new(memory::ProxyMemoryBudget::new(8 * 1024 * 1024));
+    let mut tasks = Vec::new();
+    for index in 0..65 {
+        let (started, polled) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(
+            futures_util::stream::once(async {
+                Ok::<_, Infallible>(bytes::Bytes::from_static(b"{}"))
+            })
+            .chain(futures_util::stream::once(async move {
+                let _ = started.send(());
+                std::future::pending::<Result<bytes::Bytes, Infallible>>().await
+            })),
+        );
+        let path = if index % 2 == 0 {
+            "/v1/responses"
+        } else {
+            "/v1/responses/compact"
+        };
+        let request = Request::post(path)
+            .header(header::CONTENT_LENGTH, 2)
+            .body(body)
+            .unwrap();
+        let active_budget = budget.clone();
+        let active_spool = spool.clone();
+        tasks.push(tokio::spawn(async move {
+            admit(request, Some(&active_budget), &active_spool).await
+        }));
+        polled.await.unwrap();
+        assert_eq!(budget.snapshot().0, (index + 1) * 64 * 1024);
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert!(!directory.path().join("unused").exists());
+    }
+    for (index, task) in tasks.into_iter().enumerate() {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.snapshot().0, (64 - index) * 64 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn small_responses_charge_actual_frames_and_reject_false_lengths() {
+    let directory = tempfile::tempdir().unwrap();
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().join("unused"));
+    for path in ["/v1/responses", "/v1/responses/compact"] {
+        let budget = memory::ProxyMemoryBudget::new(64 * 1024);
+        assert!(matches!(
+            admit(
+                Request::post(path)
+                    .header(header::CONTENT_LENGTH, 2)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                Some(&budget),
+                &spool,
+            )
+            .await,
+            Err(GatewayBodyAdmissionError::CapacityExhausted)
+        ));
+        assert_eq!(budget.snapshot().0, 0);
+        for declared in [0, 1, 2] {
+            let error = admit(
+                Request::post(path)
+                    .header(header::CONTENT_LENGTH, declared)
+                    .body(Body::from(vec![b'x'; 16 * 1024 * 1024 + 1]))
+                    .unwrap(),
+                Some(&budget),
+                &spool,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, GatewayBodyAdmissionError::Rejected(rejection)
+                if rejection.route_class == GatewayBodyRouteClass::Responses
+                    && rejection.reason == GatewayBodyRejectionReason::BodyLimitExceeded
+                    && rejection.declared_content_length == Some(declared)
+                    && rejection.limit_bytes == 16 * 1024 * 1024)
+            );
+            assert_eq!(budget.snapshot().0, 0);
+        }
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert!(!directory.path().join("unused").exists());
     }
 }
 
