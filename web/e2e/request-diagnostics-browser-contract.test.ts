@@ -303,25 +303,27 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await ceiling.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
     assert.doesNotMatch(await ceiling.innerText(), /8,?560\.91/);
     const ceilingCost = ceiling.locator('.request-detail-primary > div').last().locator('span[tabindex="0"]');
-    assert.equal(await ceilingCost.innerText(), '$0.00');
+    assert.equal(await ceilingCost.innerText(), '$<0.01');
     await ceilingCost.focus();
-    const ceilingCostTip = page.getByRole('tooltip').filter({ hasText: 'cost is 0' });
+    const ceilingCostTip = page.getByRole('tooltip').filter({ hasText: 'conservative contract ceiling' });
     await ceilingCostTip.waitFor();
+    assert.match(await ceilingCostTip.innerText(), /0\.001234/);
+    assert.doesNotMatch(await ceilingCostTip.innerText(), /cost is 0/);
 
     await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html?usage-basis=not_observed`);
     const failedUnobservedRow = page.locator('tbody tr').first();
     const failedUnobservedDiagnostics = page.locator('[data-fixture-request="recorded"] .request-diagnostics');
     await failedUnobservedDiagnostics.waitFor();
-    assert.equal(await failedUnobservedRow.locator('.request-cost-cell').innerText(), '$0.00');
+    assert.equal(await failedUnobservedRow.locator('.request-cost-cell').innerText(), '$35.00');
     const failedUnobservedCost = failedUnobservedDiagnostics.locator('.request-detail-primary > div').last();
     assert.equal(await failedUnobservedCost.locator('b').innerText(), 'Cost');
-    assert.equal(await failedUnobservedCost.locator('span[tabindex="0"]').innerText(), '$0.00');
-    assert.doesNotMatch(await failedUnobservedRow.locator('.request-cost-cell').innerText(), /35/);
+    assert.equal(await failedUnobservedCost.locator('span[tabindex="0"]').innerText(), '$35.00');
     const failedUnobservedCostValue = failedUnobservedRow.locator('.request-cost-cell .request-value-info');
     await failedUnobservedCostValue.focus();
-    const failedUnobservedCostTooltip = page.getByRole('tooltip').filter({ hasText: 'cost is 0' });
+    const failedUnobservedCostTooltip = page.getByRole('tooltip').filter({ hasText: 'Locally settled amount' });
     await failedUnobservedCostTooltip.waitFor();
-    assert.match(await failedUnobservedCostTooltip.innerText(), /cost is 0/);
+    assert.match(await failedUnobservedCostTooltip.innerText(), /35/);
+    assert.doesNotMatch(await failedUnobservedCostTooltip.innerText(), /cost is 0/);
   } catch (reason) {
     const diagnostics = await fixtureDiagnostics(page, current.value, history, pageErrors, consoleErrors);
     process.stderr.write(`request-diagnostics browser contract failed: ${JSON.stringify(diagnostics)}\n`);

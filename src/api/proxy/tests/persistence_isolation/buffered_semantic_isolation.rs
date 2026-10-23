@@ -126,6 +126,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
         .execute(&mut *budget_holder)
         .await
         .unwrap();
+    let journal_writer = state.pending_terminals.hold_writer_for_test().await;
     let endpoint = upstream.uri();
     let request_state = state.clone();
     let request = tokio::spawn(async move {
@@ -166,11 +167,29 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "admitted exactly once"
     );
-    let row =
-        sqlx::query("SELECT request_id, tenant_id, key_id FROM conversation_semantic_payloads")
+    let charges_before_ack: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'")
             .fetch_one(&holder_pool)
             .await
             .unwrap();
+    assert_eq!(charges_before_ack, 0);
+    drop(journal_writer);
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = sqlx::query(
+                "SELECT request_id, tenant_id, key_id FROM conversation_semantic_payloads",
+            )
+            .fetch_optional(&holder_pool)
+            .await
+            .unwrap()
+            {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned semantic payload must persist after delivery while content locks remain held");
     let request_id: String = row.get("request_id");
     let request_id = Uuid::parse_str(&request_id).unwrap();
     let charges: i64 =

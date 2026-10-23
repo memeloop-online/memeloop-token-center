@@ -85,7 +85,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
             WHERE request.tenant_id = $1
               AND ($2 = '' OR request.key_id = $2)
               AND request.status_code IS NULL
-              AND request.completed_at IS NULL
+              AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
@@ -155,7 +155,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
               AND COALESCE(request.conversation_cluster_id,
                       'unlinked:' || request.key_id) = recent.session_id
               AND request.status_code IS NULL
-              AND request.completed_at IS NULL
+              AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
             GROUP BY request.tenant_id, request.key_id,
                      COALESCE(request.conversation_cluster_id,
                          'unlinked:' || request.key_id)
@@ -523,7 +523,7 @@ impl Database {
                     WHERE request.tenant_id = $1
                       AND ($2 = '' OR request.key_id = $2)
                       AND request.status_code IS NULL
-                      AND request.completed_at IS NULL
+                      AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
@@ -855,7 +855,7 @@ impl Database {
                       AND COALESCE(request.conversation_cluster_id,
                               'unlinked:' || request.key_id) = requested.session_id
                       AND request.status_code IS NULL
-                      AND request.completed_at IS NULL
+                      AND request.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = request.id AND operational.request_created_at = request.created_at AND operational.tenant_id = request.tenant_id AND operational.key_id = request.key_id AND operational.reservation_id = request.reservation_id)
                     GROUP BY request.tenant_id, request.key_id,
                              COALESCE(request.conversation_cluster_id,
                                  'unlinked:' || request.key_id)
@@ -1245,6 +1245,7 @@ impl Database {
                 }
                 Ok(ConversationRequestView {
                     request: RequestView {
+                        operational_terminal: None,
                         egress: None,
                         usage_basis: super::requests::request_usage_basis_from_row(&row)?,
                         compaction: None,

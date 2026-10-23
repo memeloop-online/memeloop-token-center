@@ -24566,6 +24566,17 @@
           "session_context"
         ],
         "properties": {
+          "operational_terminal": {
+            "description": "Independently persisted execution completion on request list/detail projections. Null or absent means no such observation is available, not proof that execution is still running. Event and historical projections may omit this field. This observation does not settle usage, release a financial hold, or authorize journal deletion.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestOperationalTerminal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "egress": {
             "description": "Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.",
             "oneOf": [
@@ -24627,7 +24638,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Terminal accounting timestamp in Unix milliseconds; null while pending or when the historical record lacks a terminal timestamp."
+            "description": "Terminal accounting timestamp in Unix milliseconds. May remain null after execution has failed, been cancelled, or succeeded while financial settlement is pending or unknown. Use operational_terminal.completed_at for independently recorded execution completion; historical records may lack either timestamp."
           },
           "source_completed_at": {
             "type": [
@@ -24667,7 +24678,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Recorded execution outcome. An independently recorded client failure or cancellation remains visible even when a later authoritative usage receipt completes financial settlement."
           },
           "duration_ms": {
             "type": [
@@ -24761,6 +24773,9 @@
               "null"
             ],
             "enum": [
+              "gateway_pre_admission",
+              "upstream_http_status",
+              "client_disconnected",
               "upstream_transport_timeout",
               "upstream_transport_outer_deadline",
               "upstream_transport_connection_reset",
@@ -24777,7 +24792,18 @@
               "upstream_stream_read_error",
               null
             ],
-            "description": "Allowlisted transport cause recorded by the winning terminal transaction. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive."
+            "description": "Allowlisted cause recorded in an operational or financial terminal fact. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive."
+          },
+          "failure_diagnostic": {
+            "description": "Fixed diagnostic for a recorded allowlisted cause. Uses the recorded operational stage when available; null if the cause is unknown. Never contains arbitrary supplier messages or request contents.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestFailureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "archive_state": {
             "$ref": "#/components/schemas/RequestArchiveState"
@@ -24802,6 +24828,111 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        }
+      },
+      "RequestOperationalTerminal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "completed_at",
+          "stage",
+          "financial_state"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Actual observed execution completion in Unix milliseconds, preserved across durable replay rather than replaced with the recovery time."
+          },
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "upstream_response_headers",
+              "upstream_response_body",
+              "response_delivery",
+              "buffered_response_ready",
+              null
+            ],
+            "description": "Observed execution phase at completion; null when no phase was captured. Never reconstructed from a historical status code."
+          },
+          "financial_state": {
+            "$ref": "#/components/schemas/RequestFinancialState"
+          }
+        },
+        "examples": [
+          {
+            "completed_at": 1792195200000,
+            "stage": "response_delivery",
+            "financial_state": "unknown"
+          }
+        ]
+      },
+      "RequestFinancialState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "unknown",
+          "applied"
+        ],
+        "description": "State of the separate settlement authority. Pending awaits an authoritative financial receipt; unknown records unavailable authoritative usage; applied acknowledges the committed financial receipt. Pending or unknown retains financial responsibility and any existing hold, and does not imply zero usage or zero cost. This is independent of the execution lifecycle and is not a journal-deletion ACK."
+      },
+      "RequestFailureDiagnostic": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "stage",
+          "source",
+          "reason"
+        ],
+        "properties": {
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "pre_admission",
+              "upstream_response_headers",
+              "upstream_response_body",
+              "response_delivery",
+              "buffered_response_ready",
+              null
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "gateway",
+              "upstream_http_response",
+              "downstream_connection",
+              "upstream"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "gateway_pre_admission",
+              "upstream_http_status",
+              "client_disconnected",
+              "upstream_transport_timeout",
+              "upstream_transport_outer_deadline",
+              "upstream_transport_connection_reset",
+              "upstream_transport_http2_reset",
+              "upstream_transport_http2_goaway",
+              "upstream_transport_body",
+              "upstream_transport_decode",
+              "upstream_transport_request",
+              "upstream_transport_other",
+              "upstream_http2_reset",
+              "upstream_http2_goaway",
+              "upstream_read_timeout",
+              "upstream_request_timeout",
+              "upstream_stream_read_error"
             ]
           }
         }
@@ -24844,7 +24975,7 @@
           "failed",
           "cancelled"
         ],
-        "description": "Execution lifecycle, independent from the persisted product error code."
+        "description": "Execution lifecycle, independent from financial settlement and the persisted product error code. Failed, cancelled, or succeeded execution can coexist with pending or unknown financial settlement."
       },
       "RequestArchiveState": {
         "type": "string",

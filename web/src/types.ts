@@ -12,6 +12,11 @@ export interface RequestFailureDiagnostic {
 }
 
 export interface RequestView {
+  operational_terminal?: {
+    completed_at: number;
+    stage: 'upstream_response_headers' | 'upstream_response_body' | 'response_delivery' | 'buffered_response_ready' | null;
+    financial_state: 'pending' | 'unknown' | 'applied';
+  } | null;
   /** Recorded token provenance; null/absence is historical unknown, not provider actual. */
   usage_basis?: 'provider_reported' | 'provider_estimated' | 'contract_ceiling' | 'not_observed' | null;
   /** Explicit client context-compaction evidence only; absent/null is unknown. */
@@ -21,7 +26,7 @@ export interface RequestView {
   request_id: string;
   /** Server receipt time in Unix milliseconds; it is not an upstream start time. */
   created_at: number;
-  /** Server-recorded terminal completion time, when this history source retained it. */
+  /** Financial completion time; execution can finish before settlement. */
   completed_at?: number | null;
   protocol: string;
   model: string;
@@ -32,7 +37,7 @@ export interface RequestView {
   cached_input_tokens?: number;
   cache_write_tokens?: number;
   output_tokens: number;
-  cost: string;
+  cost: string | null;
   /** Stable final upstream assignment, not a routing-attempt history. */
   upstream_account_id?: string | null;
   /** Stable final model-route assignment, not a routing-attempt history. */
@@ -208,6 +213,7 @@ export type RequestEventKind = 'started' | 'finished' | 'projected' | 'archive_b
 export type RequestArchiveState = 'capturing' | 'pending' | 'uploading' | 'metadata_only' | 'bound' | 'gap';
 
 export interface RequestEvent {
+  operational_terminal?: RequestView['operational_terminal'];
   usage_basis?: RequestView['usage_basis'];
   compaction?: true | null;
   first_output_ms?: number | null;
@@ -231,7 +237,7 @@ export interface RequestEvent {
   duration_ms: number | null;
   input_tokens: number;
   output_tokens: number;
-  cost: string;
+  cost: string | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
   failure_diagnostic?: RequestFailureDiagnostic | null;

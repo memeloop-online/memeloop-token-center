@@ -195,20 +195,8 @@ async fn strict_chat_success_with_a_non_sse_body_fails_closed_before_delivery() 
         .unwrap();
     assert!(!String::from_utf8_lossy(&body).contains("must-not-forward"));
     upstream.verify().await;
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_response")
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_response"))
+        .await;
 }
 
 #[tokio::test]
@@ -255,25 +243,9 @@ async fn strict_chat_logprobs_and_named_failure_keep_usage_unobserved() {
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("logprobs"));
     assert!(body.contains("response.failed"));
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_failed_response")
-    );
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
+        .await;
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -300,21 +272,13 @@ async fn strict_chat_empty_named_event_fails_without_contract_charge() {
             b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n".as_slice(),
         ].concat(),
     );
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_incomplete_response")
-    );
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_incomplete_response"),
+    )
+    .await;
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -343,17 +307,9 @@ async fn strict_chat_empty_logprobs_preamble_fails_without_contract_charge() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("\"content\":[]"));
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -437,36 +393,8 @@ async fn strict_chat_usage_failures_do_not_promote_reservations_to_actual_cost()
             String::from_utf8_lossy(&body).contains("\"content\":\"ok\""),
             "{label} must exercise settlement after a delivered stream chunk",
         );
-        wait_for_request_settlement(&fixture, 1).await;
-        let rows = fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1, "{label}");
-        assert_eq!(rows[0].status_code, Some(502), "{label}");
-        assert!(rows[0].error_code.is_some(), "{label}");
-        assert_eq!(
-            (rows[0].input_tokens, rows[0].output_tokens),
-            (0, 0),
-            "{label}"
-        );
-        assert_eq!(
-            rows[0].usage_basis,
-            Some(crate::model::RequestUsageBasis::NotObserved),
-            "{label}"
-        );
-        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-        let actual_micros: i64 = sqlx::query_scalar(
-            "SELECT r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
-        )
-        .bind(rows[0].request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-        assert_eq!(actual_micros, 0, "{label} has no observed actual usage");
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+        let receipt = cancellation::single_unknown_receipt(&fixture).await;
+        assert_eq!(receipt["status_code"], 502, "{label}");
+        assert!(receipt["error_code"].as_str().is_some(), "{label}");
     }
 }

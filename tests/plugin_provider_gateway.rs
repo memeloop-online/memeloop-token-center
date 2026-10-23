@@ -430,6 +430,13 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     let requests = state.db.list_requests(key.key_id, 10).await.unwrap();
     assert_eq!(requests.len(), 2);
+    let request_ids = requests
+        .iter()
+        .map(|request| request.request_id)
+        .collect::<Vec<_>>();
+    wait_for_bound_plugin_archives(&state, &request_ids).await;
+    let requests = state.db.list_requests(key.key_id, 10).await.unwrap();
+    assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| {
         request.model == "example-rewritten"
             && request.status_code == Some(200)
@@ -451,12 +458,6 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .await
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
-
-    let request_ids = requests
-        .iter()
-        .map(|request| request.request_id)
-        .collect::<Vec<_>>();
-    wait_for_bound_plugin_archives(&state, &request_ids).await;
 
     for request in requests {
         let refs = state
@@ -544,11 +545,21 @@ async fn component_provider_does_not_replay_after_the_server_accepts_the_prepare
         .authenticate_key(&key, state.config.key_pepper.as_bytes())
         .await
         .unwrap();
-    let requests = state
-        .db
-        .list_requests(authenticated.key_id, 10)
-        .await
-        .unwrap();
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let requests = state
+                .db
+                .list_requests(authenticated.key_id, 10)
+                .await
+                .unwrap();
+            if requests.len() == 1 && requests[0].operational_terminal.is_some() {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("plugin disconnect reached its operational terminal");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status_code, Some(502));
     assert_eq!(
@@ -576,6 +587,7 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut pending = request_ids.to_vec();
+    let mut financial_pending = request_ids.to_vec();
     let mut stream = response.into_body().into_data_stream();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut buffered = String::new();
@@ -593,25 +605,31 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 let Ok(event) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
-                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
-                    continue;
-                }
                 let Some(request_id) = event["request_id"]
                     .as_str()
                     .and_then(|value| Uuid::parse_str(value).ok())
                 else {
                     continue;
                 };
-                pending.retain(|candidate| *candidate != request_id);
-                if pending.is_empty() {
+                if event["event_kind"] == "archive_bound" && event["archive_state"] == "bound" {
+                    pending.retain(|candidate| *candidate != request_id);
+                }
+                if event["event_kind"] == "finished" {
+                    financial_pending.retain(|candidate| *candidate != request_id);
+                }
+                if pending.is_empty() && financial_pending.is_empty() {
                     return;
                 }
             }
         }
     })
     .await
-    .expect("plugin request archives reached bound state");
+    .expect("plugin requests reached financial completion and bound archives");
     assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    assert!(
+        financial_pending.is_empty(),
+        "missing financial completions: {financial_pending:?}"
+    );
     shutdown.send(true).unwrap();
     worker.await.unwrap();
 }

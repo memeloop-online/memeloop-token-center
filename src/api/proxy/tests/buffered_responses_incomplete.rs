@@ -66,7 +66,12 @@ async fn chat_transport_preserves_complete_incomplete_and_rejects_invalid_termin
         } else {
             assert!(value["error"].is_object());
         }
-        wait_for_request_settlement(&fixture, 1).await;
+        if finish_reason == "unknown" {
+            cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_stream"))
+                .await;
+        } else {
+            wait_for_request_settlement(&fixture, 1).await;
+        }
         let rows = fixture
             .state
             .db
@@ -99,7 +104,13 @@ async fn chat_transport_preserves_complete_incomplete_and_rejects_invalid_termin
                 delivered.as_ref()
             );
         }
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+        if finish_reason == "unknown" {
+            assert!(rows[0].completed_at.is_none());
+            assert!(rows[0].usage.tokens.is_none());
+            assert!(rows[0].billing.cost.is_none());
+        } else {
+            assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+        }
         upstream.verify().await;
     }
 }
@@ -260,7 +271,16 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
         } else {
             assert!(delivered_json["error"].is_object());
         }
-        wait_for_request_settlement(&fixture, 1).await;
+        if valid_usage {
+            wait_for_request_settlement(&fixture, 1).await;
+        } else {
+            cancellation::assert_single_unknown_receipt(
+                &fixture,
+                502,
+                Some("upstream_failed_response"),
+            )
+            .await;
+        }
         let rows = fixture
             .state
             .db
@@ -281,26 +301,26 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             row.lifecycle_state,
             crate::model::RequestLifecycleState::Failed
         );
-        assert_eq!(
-            row.usage_basis,
-            Some(if valid_usage {
-                crate::model::RequestUsageBasis::ProviderReported
-            } else {
-                crate::model::RequestUsageBasis::NotObserved
-            })
-        );
-        assert_eq!(
-            (row.input_tokens, row.cached_input_tokens, row.output_tokens),
-            if valid_usage { (10, 6, 2) } else { (0, 0, 0) }
-        );
-        assert_eq!(
-            row.cost.parse::<Decimal>().unwrap(),
-            if valid_usage {
-                Decimal::new(20, 6)
-            } else {
-                Decimal::ZERO
-            }
-        );
+        if valid_usage {
+            assert_eq!(
+                row.usage_basis,
+                Some(crate::model::RequestUsageBasis::ProviderReported)
+            );
+        } else {
+            assert!(row.usage.tokens.is_none());
+            assert_eq!(row.billing.cost, None);
+        }
+        if valid_usage {
+            assert_eq!(
+                (row.input_tokens, row.cached_input_tokens, row.output_tokens),
+                (10, 6, 2)
+            );
+            assert_eq!(row.cost.parse::<Decimal>().unwrap(), Decimal::new(20, 6));
+            assert_exactly_once_side_effects(&fixture, row.request_id, None).await;
+        } else {
+            assert!(row.completed_at.is_none());
+            assert!(row.usage_basis.is_none());
+        }
         assert_eq!(
             row.error_code.as_deref(),
             Some(if !valid_usage {
@@ -317,15 +337,24 @@ async fn buffered_incomplete_preserves_http_and_settles_only_valid_actual_usage_
             .all_request_events_after(0, None, 500)
             .await
             .unwrap();
-        let finished = events
-            .iter()
-            .find(|event| event.request_id == row.request_id && event.event_kind == "finished")
-            .unwrap();
-        assert_eq!(finished.status_code, row.status_code);
-        assert_eq!(finished.lifecycle_state, row.lifecycle_state);
-        assert_eq!(finished.error_code, row.error_code);
-        assert_exactly_once_side_effects(&fixture, row.request_id, None).await;
-        drain_completed_response_archive(&fixture).await;
+        if valid_usage {
+            let finished = events
+                .iter()
+                .find(|event| event.request_id == row.request_id && event.event_kind == "finished")
+                .unwrap();
+            assert_eq!(finished.status_code, row.status_code);
+            assert_eq!(finished.lifecycle_state, row.lifecycle_state);
+            assert_eq!(finished.error_code, row.error_code);
+            drain_completed_response_archive(&fixture).await;
+        } else {
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.request_id == row.request_id
+                        && event.event_kind == "finished")
+            );
+        }
+        drain_archive_capture(&fixture).await;
         let refs = fixture
             .state
             .db

@@ -43,6 +43,7 @@ async fn malformed_strict_chat_output_never_releases_half_open_admission() {
             "stream": true, "stream_options": {"include_usage": true}, "max_tokens":16});
         let first = send_chat_usage_request(&fixture, &body).await;
         assert_eq!(first.status(), StatusCode::OK);
+        let request_id = Uuid::parse_str(first.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
         let mut stream = first.into_body().into_data_stream();
         let frame = tokio::time::timeout(Duration::from_secs(3), futures_util::StreamExt::next(&mut stream))
             .await.unwrap().unwrap().unwrap();
@@ -61,10 +62,21 @@ async fn malformed_strict_chat_output_never_releases_half_open_admission() {
         server.await.unwrap();
         // The rejected probe contender is admitted to the request ledger before
         // account-lease selection, so its 503 is a second terminal record.
-        wait_for_request_settlement(&fixture, 2).await;
+        cancellation::assert_unknown_receipt(
+            &fixture, request_id, 502, "upstream_incomplete_response", 0,
+        ).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
+                if rows.iter().any(|row| row.request_id != request_id && row.completed_at.is_some()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
         let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.completed_at.is_some()));
+        assert!(rows.iter().filter(|row| row.request_id != request_id).all(|row| row.completed_at.is_some()));
         let malformed = rows.iter().find(|row| row.status_code == Some(502))
             .expect("malformed stream must finish with a protocol failure");
         assert_eq!(malformed.error_code.as_deref(), Some("upstream_incomplete_response"));
@@ -112,7 +124,8 @@ async fn completed_only_codex_with_invalid_usage_never_records_recovery() {
         let _ = to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        wait_for_request_settlement(&fixture, 1).await;
+        let receipt = cancellation::single_unknown_receipt(&fixture).await;
+        assert_eq!(receipt["status_code"], 502);
         wait_for_account_failure_count(&fixture, 2).await;
         assert!(
             !fixture
@@ -341,7 +354,7 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
                 .unwrap();
             if rows
                 .iter()
-                .filter(|row| row.status_code == Some(200))
+                .filter(|row| row.status_code == Some(200) && row.completed_at.is_some())
                 .count()
                 == 2
             {

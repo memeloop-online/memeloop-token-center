@@ -124,6 +124,12 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("upstream request failed"));
     assert!(!String::from_utf8_lossy(&body).contains("high demand secret"));
+    cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_invalid_content_type"),
+    )
+    .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let actual: String = sqlx::query_scalar(
         "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -157,9 +163,8 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_content_type")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    drain_completed_response_archive(&fixture).await;
-    assert_response_archives_omit(&fixture, "temporary high demand secret").await;
+    sse_delivery::assert_unknown_response_archives_omit(&fixture, "temporary high demand secret")
+        .await;
     pool.close().await;
     upstream.verify().await;
 }
@@ -195,6 +200,8 @@ async fn buffered_codex_output_with_malformed_usage_is_rejected_before_delivery(
         .await
         .unwrap();
     assert!(!String::from_utf8_lossy(&response_body).contains("private billable output"));
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -206,8 +213,7 @@ async fn buffered_codex_output_with_malformed_usage_is_rejected_before_delivery(
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_usage")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    assert_response_archives_omit(&fixture, "private billable output").await;
+    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private billable output").await;
     upstream.verify().await;
 }
 
@@ -265,6 +271,7 @@ async fn buffered_codex_cache_usage_is_settled_at_distinct_prices() {
         "resp-cache-priced"
     );
 
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
@@ -471,7 +478,8 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
         String::from_utf8_lossy(&body).contains("delivered before invalid usage"),
         "billable output must reach the downstream before terminal validation"
     );
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -484,7 +492,6 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_usage")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     tokio::time::timeout(
         Duration::from_secs(3),
         fixture.state.proxy_lifecycles.wait_for_idle(),
@@ -546,7 +553,8 @@ async fn streaming_codex_rejects_output_items_before_response_identity() {
     assert!(!delivered.contains("item-private"));
     assert!(!delivered.contains("response.completed"));
 
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_response"))
+        .await;
     let rows = fixture
         .state
         .db
@@ -559,8 +567,7 @@ async fn streaming_codex_rejects_output_items_before_response_identity() {
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_response")
     );
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_eq!(rows[0].billing.cost, None);
     let refs = fixture
         .state
         .db

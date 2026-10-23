@@ -16,13 +16,34 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(!response.headers().contains_key(header::RETRY_AFTER));
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 1
+                && rows[0]
+                    .operational_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.financial_state == crate::model::RequestFinancialState::Unknown
+                    })
+            {
+                break rows;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("memory rejection must become operationally terminal within the original budget");
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert!(rows[0].completed_at.is_none());
+    assert!(rows[0].usage.tokens.is_none());
+    assert!(rows[0].billing.cost.is_none());
     assert_eq!(
         rows[0].error_code.as_deref(),
         Some("upstream_response_memory_capacity")

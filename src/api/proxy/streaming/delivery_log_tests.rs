@@ -29,47 +29,85 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogCapture {
     }
 }
 
-#[test]
-fn delivery_phase_preserves_results_and_records_cancelled_waits() {
+#[tokio::test(start_paused = true)]
+async fn delivery_preserves_results_and_records_cancelled_capacity_waits() {
     use futures_util::FutureExt;
+    use tracing::instrument::WithSubscriber;
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
+        .json()
         .without_time()
         .with_writer(capture.clone())
         .finish();
     let request_id = Uuid::now_v7();
-    let context = proxy_diagnostics::Context::for_request(request_id);
-    tracing::subscriber::with_default(subscriber, || {
-        let success = observe_delivery_transition(context, "delivery_prepare", async {
-            Ok::<_, AppError>(false)
-        })
-        .now_or_never()
-        .unwrap()
-        .unwrap();
-        assert!(!success, "observing a database result must not change it");
-        let failure = observe_delivery_transition(context, "delivery_confirm", async {
-            Err::<(), _>(AppError::Conflict("SECRET_PHASE_CANARY".into()))
-        })
-        .now_or_never()
-        .unwrap();
-        assert!(matches!(failure, Err(AppError::Conflict(_))));
-        assert!(
-            observe_delivery_transition(
-                context,
-                "delivery_prepare",
-                std::future::pending::<Result<(), AppError>>()
+    async {
+        let mut waits = wait_diagnostics::WaitDiagnostics::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut queued = false;
+        let bytes = Bytes::from_static(b"DELIVERY_PAYLOAD_PRIVATE_CANARY");
+        for billable in [false, true] {
+            let delivered = send_frame(
+                FrameDelivery {
+                    waits: &mut waits,
+                    sender: &sender,
+                    queued: &mut queued,
+                    probe: None,
+                },
+                SseDeliveryFrame {
+                    bytes: bytes.clone(),
+                    billable,
+                    terminal: false,
+                },
             )
-            .now_or_never()
-            .is_none()
+            .await
+            .unwrap();
+            assert_eq!(delivered, billable);
+            assert_eq!(queued, billable);
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), bytes);
+        }
+        sender.send(Ok(bytes.clone())).await.unwrap();
+        let mut pending = Box::pin(send_frame(
+            FrameDelivery {
+                waits: &mut waits,
+                sender: &sender,
+                queued: &mut queued,
+                probe: None,
+            },
+            SseDeliveryFrame {
+                bytes,
+                billable: true,
+                terminal: true,
+            },
+        ));
+        assert!(pending.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(pending);
+        assert!(queued);
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap(),
+            Bytes::from_static(b"DELIVERY_PAYLOAD_PRIVATE_CANARY")
         );
-    });
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        waits.emit(request_id, "lifecycle_interrupted");
+    }
+    .with_subscriber(subscriber)
+    .await;
     let rendered = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    assert!(rendered.contains(&request_id.to_string()));
-    assert!(rendered.contains("completed"));
-    assert!(rendered.contains("state_conflict"));
-    assert!(rendered.contains("not_completed"));
-    assert!(!rendered.contains("SECRET_PHASE_CANARY"));
+    let event: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let fields = &event["fields"];
+    assert_eq!(fields["request_id"], request_id.to_string());
+    assert_eq!(fields["stage"], "stream_wait_summary");
+    assert_eq!(fields["owner_outcome"], "lifecycle_interrupted");
+    assert_eq!(fields["transport_terminal"], "not_observed");
+    assert_eq!(fields["downstream_capacity_pending_ms"], 1000);
+    assert_eq!(fields["max_downstream_capacity_pending_ms"], 1000);
+    assert_eq!(fields["upstream_pending_ms"], 0);
+    assert!(!rendered.contains("DELIVERY_PAYLOAD_PRIVATE_CANARY"));
+    assert!(!rendered.contains("delivery_prepare"));
+    assert!(!rendered.contains("delivery_confirm"));
 }
 
 #[tokio::test]
@@ -93,10 +131,8 @@ async fn owned_delivery_keeps_ingress_clock_without_task_local_inheritance() {
                 context.elapsed_millis_at(started + Duration::from_secs(5)),
                 5000
             );
-            for name in ["delivery_prepare", "delivery_confirm"] {
-                observe_delivery_transition(context, name, async { Ok::<_, AppError>(()) })
-                    .await
-                    .unwrap();
+            for name in ["terminal_delivery", "stream_terminal_settlement"] {
+                proxy_diagnostics::Phase::new(context, name).finish("completed", None, None);
             }
         }
         .with_subscriber(subscriber),
@@ -119,9 +155,10 @@ async fn owned_delivery_keeps_ingress_clock_without_task_local_inheritance() {
     }
 }
 
-#[test]
-fn delivery_failure_log_uses_only_fixed_safe_fields() {
-    const CANARY: &str = "DELIVERY_DATABASE_SECRET_CANARY";
+#[tokio::test]
+async fn delivery_failure_log_uses_only_fixed_safe_fields() {
+    use tracing::instrument::WithSubscriber;
+    const CANARY: &str = "DELIVERY_PAYLOAD_SECRET_CANARY";
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -130,20 +167,45 @@ fn delivery_failure_log_uses_only_fixed_safe_fields() {
         .finish();
     let request_id = Uuid::now_v7();
 
-    tracing::subscriber::with_default(subscriber, || {
-        log_delivery_state_failure(
-            request_id,
-            "delivery_prepare",
-            &AppError::Conflict(CANARY.to_owned()),
+    async {
+        let mut waits = wait_diagnostics::WaitDiagnostics::default();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let mut queued = false;
+        let phase = proxy_diagnostics::Phase::new(
+            proxy_diagnostics::Context::for_request(request_id),
+            "terminal_delivery",
         );
-        log_delivery_state_failure(request_id, "delivery_confirm", &AppError::Internal);
-    });
+        let failure = send_frame(
+            FrameDelivery {
+                waits: &mut waits,
+                sender: &sender,
+                queued: &mut queued,
+                probe: None,
+            },
+            SseDeliveryFrame {
+                bytes: Bytes::from_static(CANARY.as_bytes()),
+                billable: true,
+                terminal: true,
+            },
+        )
+        .await;
+        assert_eq!(failure, Err("downstream_disconnected"));
+        assert!(!queued);
+        let error_code = failure.unwrap_err();
+        phase.finish(error_code, None, None);
+        waits.terminal(error_code);
+        waits.emit(request_id, "lifecycle_returned");
+    }
+    .with_subscriber(subscriber)
+    .await;
 
     let rendered = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(rendered.contains(&request_id.to_string()));
-    assert!(rendered.contains("delivery_prepare"));
-    assert!(rendered.contains("delivery_confirm"));
-    assert!(rendered.contains("state_conflict"));
-    assert!(rendered.contains("internal"));
+    assert!(rendered.contains("terminal_delivery"));
+    assert!(rendered.contains("stream_wait_summary"));
+    assert!(rendered.contains("downstream_disconnected"));
+    assert!(!rendered.contains("delivery_prepare"));
+    assert!(!rendered.contains("delivery_confirm"));
     assert!(!rendered.contains(CANARY));
 }

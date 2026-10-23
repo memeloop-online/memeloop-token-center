@@ -84,6 +84,8 @@ pub(crate) use requests::EarlyRequestTerminal;
 pub(crate) use requests::pending_settlement::{
     PendingProxySettlementAck, PendingProxySettlementClaim, PendingProxySettlementEvidence,
 };
+#[allow(unused_imports)] // Separately owned API journal integration.
+pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck};
 mod rotation;
 mod routing;
 pub use routing::egress;

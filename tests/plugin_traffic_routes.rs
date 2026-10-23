@@ -347,6 +347,42 @@ struct HintRoutingFixture {
     unauthorized_account_id: uuid::Uuid,
 }
 
+async fn wait_for_hint_terminal(fixture: &HintRoutingFixture, financial: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let requests = fixture
+                .state
+                .db
+                .list_requests(fixture.issued.key_id, 10)
+                .await
+                .unwrap();
+            if requests.len() == 1 {
+                let request = &requests[0];
+                if financial {
+                    if request.completed_at.is_some() {
+                        break;
+                    }
+                } else if request
+                    .operational_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.financial_state
+                            == memeloop_token_center::model::RequestFinancialState::Unknown
+                    })
+                {
+                    assert!(request.completed_at.is_none());
+                    assert!(request.usage.tokens.is_none());
+                    assert_eq!(request.billing.cost, None);
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hint request reached its explicit financial or unknown terminal");
+}
+
 async fn hint_routing_fixture(
     label: &str,
     preferred_uri: String,
@@ -668,18 +704,45 @@ async fn assert_selected_malformed_candidate_fails_closed(
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     preferred.verify().await;
     standby.verify().await;
+    wait_for_hint_terminal(&fixture, true).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let terminal: (i64, String, i64) = sqlx::query_as(
-        "SELECT request.status_code, request.error_code,
+        "SELECT COALESCE(request.status_code, operational.status_code), COALESCE(request.error_code, operational.error_code),
                 (SELECT COUNT(*) FROM usage_reservations reservation
                  WHERE reservation.key_id = request.key_id)
          FROM request_records request
+         LEFT JOIN proxy_operational_terminals operational ON operational.request_id = request.id
          WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
     )
     .bind(fixture.issued.key_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
+    let financial: (String, Option<i64>, i64, i64) = sqlx::query_as(
+        "SELECT reservation.status, reservation.actual_micros,
+                (SELECT COUNT(*) FROM ledger_entries WHERE source = reservation.id),
+                (SELECT COUNT(*) FROM request_events WHERE request_id = request.id AND event_kind = 'finished')
+         FROM request_records request JOIN usage_reservations reservation ON reservation.id = request.reservation_id
+         WHERE request.key_id = $1",
+    )
+    .bind(fixture.issued.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(financial, ("settled".to_owned(), Some(0), 1, 1));
+    let requests = fixture
+        .state
+        .db
+        .list_requests(fixture.issued.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].completed_at.is_some());
+    assert_eq!(requests[0].billing.cost.as_deref(), Some("0"));
+    assert_eq!(
+        requests[0].usage_basis,
+        Some(memeloop_token_center::model::RequestUsageBasis::NotObserved)
+    );
     pool.close().await;
     assert_eq!(terminal, (502, "upstream_candidate_invalid".to_owned(), 1));
 }
@@ -748,6 +811,7 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
     assert_eq!(body["choices"][0]["message"]["content"], "standby");
     preferred.verify().await;
     standby.verify().await;
+    wait_for_hint_terminal(&fixture, true).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let persisted: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT request.upstream_account_id, reservation.reserved_tokens, rate_window.tokens,

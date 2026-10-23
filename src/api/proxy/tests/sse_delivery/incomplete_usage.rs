@@ -102,25 +102,14 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
             .unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         assert!(!String::from_utf8_lossy(&body).contains("PRIVATE_PROVIDER_ERROR"));
-        wait_for_request_settlement(&fixture, 1).await;
-        let rows = fixture
-            .state
-            .db
-            .list_requests(fixture.key_id, 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            rows[0].usage_basis,
-            Some(crate::model::RequestUsageBasis::NotObserved),
+        let receipt = cancellation::single_unknown_receipt(&fixture).await;
+        assert_eq!(receipt["status_code"], 502, "{defect}");
+        assert!(
+            receipt["error_code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty()),
             "{defect}"
         );
-        assert_eq!(
-            (rows[0].input_tokens, rows[0].output_tokens),
-            (0, 0),
-            "{defect}"
-        );
-        assert_eq!(rows[0].cost, "0", "{defect}");
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
         upstream.verify().await;
     }
 }

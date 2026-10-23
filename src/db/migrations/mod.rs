@@ -693,6 +693,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "deferred session final response reading",
         sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
     },
+    Migration {
+        version: 133,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0133_proxy_operational_terminals.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1368,6 +1373,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 132,
         name: "deferred session final response reading",
         sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
+    },
+    Migration {
+        version: 133,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0133_proxy_operational_terminals.sql"),
     },
 ];
 

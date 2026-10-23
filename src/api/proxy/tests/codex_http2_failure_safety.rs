@@ -196,7 +196,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("untrusted-diagnostic"));
     assert!(!body.contains("upstream_http2_reset"));
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let expected_attempts = if matches!(
         failure,
@@ -230,7 +230,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].cost, "0");
+    assert_eq!(rows[0].billing.cost, None);
     let expected_error = match failure {
         Failure::PreHeaderReset
         | Failure::PreHeaderRefusedReset
@@ -264,11 +264,12 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .all_request_events_after(0, None, 500)
         .await
         .unwrap();
-    let finished = events
-        .iter()
-        .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
-        .unwrap();
-    assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
+    );
+    assert_eq!(receipt["terminal_cause"].as_str(), expected_cause);
     let (expected_account, expected_route) = if matches!(
         failure,
         Failure::RejectedPriorReset
@@ -289,14 +290,8 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     } else {
         (fixture.upstream_account_id, fixture.route_id)
     };
-    assert_exactly_once_side_effects_for(
-        &fixture,
-        rows[0].request_id,
-        None,
-        expected_account,
-        expected_route,
-    )
-    .await;
+    assert_eq!(rows[0].upstream_account_id, Some(expected_account));
+    assert_eq!(rows[0].route_id, Some(expected_route));
 }
 
 #[tokio::test]

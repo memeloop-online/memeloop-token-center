@@ -210,6 +210,63 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
 }
 
 impl Database {
+    /// Retain conversation evidence without acknowledging financial settlement.
+    /// The operational receipt supplies a stable timestamp for exact replay.
+    pub(crate) async fn enqueue_operational_conversation_projection(
+        &self,
+        claim: &PendingProxySettlementClaim,
+        receipt_id: Uuid,
+        conversation: &ProxyConversationInput<'_>,
+    ) -> Result<(), AppError> {
+        if conversation.key.tenant_id != claim.tenant_id
+            || conversation.key.key_id != claim.key_id
+            || conversation.key.account_id != claim.account_id
+        {
+            return Err(AppError::NotFound);
+        }
+        let mut transaction = self.begin_write_transaction().await?;
+        let observed_at: Option<i64> = sqlx::query_scalar(
+            r#"SELECT o.completed_at FROM proxy_operational_terminals o
+               JOIN pending_proxy_settlements p
+                 ON p.request_id = o.request_id AND p.fence = o.fence
+                AND p.owner_token = o.owner_token AND p.contract_digest = o.contract_digest
+               WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3
+                 AND o.account_id = $4 AND o.reservation_id = $5
+                 AND o.owner_token = $6 AND o.fence = $7
+                 AND o.contract_digest = $8 AND o.receipt_id = $9"#,
+        )
+        .bind(claim.request_id.to_string())
+        .bind(claim.tenant_id.to_string())
+        .bind(claim.key_id.to_string())
+        .bind(claim.account_id.to_string())
+        .bind(claim.reservation_id.to_string())
+        .bind(claim.owner_token.to_string())
+        .bind(claim.fence.to_string())
+        .bind(&claim.contract_digest)
+        .bind(receipt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        // Runtime publication can race this background attempt. Absence is
+        // retryable; it is not a conflicting financial receipt.
+        let observed_at = observed_at.ok_or(AppError::NotFound)?;
+        enqueue_conversation_projection_in_transaction(
+            &mut transaction,
+            ConversationProjectionEnqueueInput {
+                request_id: claim.request_id,
+                key: conversation.key,
+                request_json: conversation.request_json,
+                hints: conversation.hints,
+                client_name: conversation.client_name,
+                upstream_response_id: conversation.upstream_response_id,
+                observed_at,
+                content_materialized: false,
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     async fn materialize_conversation_content(
         &self,
         request_id: Uuid,
@@ -1424,8 +1481,35 @@ async fn emit_conversation_projected_event_in_transaction(
     let event =
         allocate_request_event_cursor(transaction, unix_millis(), &tenant_id, &key_id, &request_id)
             .await?;
+    // Semantic completion does not imply financial settlement. An authenticated
+    // operational receipt may finish a request whose usage remains unknown.
+    // Keep the event's accounting fields sourced exclusively from the request;
+    // use the receipt only for runtime outcome and eligibility.
     let inserted = sqlx::query(
-        "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5 AND completed_at IS NOT NULL UNION ALL SELECT $1, tenant_id, key_id, request_id, $2, 'projected', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, NULLIF(error_code, '') FROM terminal_projection_outbox WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5 AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)",
+        r#"INSERT INTO request_events (
+               event_id, tenant_id, key_id, request_id, event_at, event_kind,
+               protocol, model, status_code, duration_ms, input_tokens,
+               output_tokens, cost_micros, error_code)
+           SELECT $1, r.tenant_id, r.key_id, r.id, $2, 'projected',
+                  r.protocol, r.model,
+                  COALESCE(o.status_code, r.status_code),
+                  COALESCE(o.duration_ms, r.duration_ms),
+                  r.input_tokens, r.output_tokens, r.cost_micros,
+                  CASE WHEN o.request_id IS NOT NULL THEN o.error_code ELSE r.error_code END
+             FROM request_records r
+             LEFT JOIN proxy_operational_terminals o
+               ON o.request_id = r.id AND o.request_created_at = r.created_at
+              AND o.tenant_id = r.tenant_id AND o.key_id = r.key_id
+              AND o.reservation_id = r.reservation_id
+            WHERE r.id = $3 AND r.tenant_id = $4 AND r.key_id = $5
+              AND (r.completed_at IS NOT NULL OR o.request_id IS NOT NULL)
+           UNION ALL
+           SELECT $1, tenant_id, key_id, request_id, $2, 'projected',
+                  protocol, model, status_code, duration_ms, input_tokens,
+                  output_tokens, cost_micros, NULLIF(error_code, '')
+             FROM terminal_projection_outbox
+            WHERE request_id = $3 AND tenant_id = $4 AND key_id = $5
+              AND NOT EXISTS (SELECT 1 FROM request_records WHERE id = $3)"#,
     )
     .bind(event.event_id)
     .bind(event.event_at)
@@ -1895,6 +1979,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
             }
             Ok(ConversationRequestView {
                 request: RequestView {
+                    operational_terminal: None,
                     egress: None,
                     usage_basis,
                     compaction: row

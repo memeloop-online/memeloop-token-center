@@ -8,8 +8,8 @@ import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
-import { requestErrorCopy, requestFailureCause, requestStatusCopy } from './requestStatusPresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestSettlementPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
+import { requestCompletedAt, requestErrorCopy, requestFailureCause, requestStatusCopy } from './requestStatusPresentation';
 import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
@@ -102,7 +102,8 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
 function requestTokenBreakdown(request: RequestView) {
   const cachedInputTokens = request.cached_input_tokens;
   const cacheWriteTokens = request.cache_write_tokens;
-  if (cachedInputTokens === undefined || cacheWriteTokens === undefined) return undefined;
+  if (typeof request.input_tokens !== 'number' || typeof request.output_tokens !== 'number'
+    || typeof cachedInputTokens !== 'number' || typeof cacheWriteTokens !== 'number') return undefined;
   return {
     input: Math.max(0, request.input_tokens - cachedInputTokens - cacheWriteTokens),
     cached: cachedInputTokens,
@@ -112,13 +113,14 @@ function requestTokenBreakdown(request: RequestView) {
 }
 
 function requestTokenDetails(request: RequestView, locale: Parameters<typeof formatNumber>[1], t: ReturnType<typeof useI18n>['t']) {
+  if (requestSettlementPending(request)) return requestUsageCopy(request, locale).hint;
   const breakdown = requestTokenBreakdown(request);
   if (breakdown) return t('request.tokenBreakdown', { input: formatNumber(breakdown.input, locale), cached: formatNumber(breakdown.cached, locale), cacheWrite: formatNumber(breakdown.cacheWrite, locale), output: formatNumber(breakdown.output, locale) });
   return [
-    `${t('usage.inputTokens')}: ${formatNumber(request.input_tokens, locale)}`,
-    `${t('usage.outputTokens')}: ${formatNumber(request.output_tokens, locale)}`,
-    request.cached_input_tokens !== undefined ? `${t('usage.cachedTokens')}: ${formatNumber(request.cached_input_tokens, locale)}` : '',
-    request.cache_write_tokens !== undefined ? `${t('usage.cacheWriteTokens')}: ${formatNumber(request.cache_write_tokens, locale)}` : '',
+    `${t('usage.inputTokens')}: ${typeof request.input_tokens === 'number' ? formatNumber(request.input_tokens, locale) : '—'}`,
+    `${t('usage.outputTokens')}: ${typeof request.output_tokens === 'number' ? formatNumber(request.output_tokens, locale) : '—'}`,
+    request.cached_input_tokens != null ? `${t('usage.cachedTokens')}: ${formatNumber(request.cached_input_tokens, locale)}` : '',
+    request.cache_write_tokens != null ? `${t('usage.cacheWriteTokens')}: ${formatNumber(request.cache_write_tokens, locale)}` : '',
   ].filter(Boolean).join(' · ');
 }
 
@@ -126,7 +128,7 @@ function RequestTokenSummary({ request }: { request: RequestView }) {
   const { locale, t } = useI18n();
   const pending = requestIsPending(request);
   const obscured = !pending && !requestUsageIsActual(request);
-  const tokenDisplay = formatMetricDisplay(request.input_tokens + request.output_tokens, locale);
+  const tokenDisplay = formatMetricDisplay(obscured ? null : request.input_tokens + request.output_tokens, locale);
   const tokenDetails = pending ? t('request.pendingUsage') : requestTokenDetails(request, locale, t);
   const uncachedInput = nonCachedRequestInput(request);
   const basis = requestUsageCopy(request, locale);
@@ -244,10 +246,11 @@ export function RequestDiagnostics({
   const credential = requestCredentialLabel(request, undefined);
   const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
   const duration = formatDurationDisplay(request.duration_ms, locale);
-  const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${request.completed_at == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(request.completed_at).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
+  const completedAt = requestCompletedAt(request);
+  const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${completedAt == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(completedAt).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
   const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
-  const settlement = <DetailTooltip content={t('request.pendingUsage')}><span tabIndex={0}>{zh ? '待结算' : 'Awaiting settlement'}</span></DetailTooltip>;
+  const settlement = <DetailTooltip content={costCopy.hint}><span tabIndex={0}>{costCopy.label}</span></DetailTooltip>;
   const failureCause = pending || requestStatusCopy(request, locale).cause ? null : requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
   const supplierDetail = requestStatusCopy(request, locale).supplierDetail;
 
@@ -256,7 +259,7 @@ export function RequestDiagnostics({
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', principalDisplayName(request.credential_identity?.principal_external_id, t)], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
       <div className="request-token-cell"><b>{t('request.tokens')}</b><RequestTokenSummary request={request} /></div>
-      <div><b>{t('request.cost')}</b>{pending ? settlement : <DetailTooltip content={costCopy.unknown ? `${costCopy.hint} ${costCopy.ledgerLabel}: ${cost.title ?? cost.text}` : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
+      <div><b>{t('request.cost')}</b>{requestSettlementPending(request) ? settlement : <DetailTooltip content={costCopy.unknown ? costCopy.hint : `${cost.title ?? missing} ${costCopy.hint}`}><span tabIndex={0} aria-label={costCopy.unknown ? costCopy.label : undefined}>{costCopy.unknown ? '—' : cost.text}</span></DetailTooltip>}</div>
     </section>
     <section className="request-detail-group" aria-label={zh ? '交付与性能' : 'Delivery and performance'}>
       <div><b>{zh ? '最终上游' : 'Final upstream'}</b><RequestMetadata label={upstreamName || (request.upstream_account_id ? (zh ? '未命名上游' : 'Unnamed upstream') : missing)} fields={[[t('request.upstreamId'), request.upstream_account_id]]} /></div>
@@ -321,8 +324,9 @@ export function RequestTable({
                 ? `${locale === 'zh-CN' ? '服务账号' : 'Service account'}: ${upstreamNames?.get(request.upstream_account_id)?.trim() || (locale === 'zh-CN' ? '账号名称不可用' : 'Account name unavailable')}`
                 : '',
             ].filter(Boolean).join(' · ');
-            const durationSummary = request.completed_at != null
-              ? `${t('request.completedAt')}: ${new Date(request.completed_at).toLocaleString(locale)}`
+            const completedAt = requestCompletedAt(request);
+            const durationSummary = completedAt != null
+              ? `${t('request.completedAt')}: ${new Date(completedAt).toLocaleString(locale)}`
               : '';
             const pending = requestIsPending(request);
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: '—' };

@@ -18,7 +18,7 @@ import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
 import { RequestOverflowReconciliation } from '../traffic/requestOverflowReconciliation';
 import {
-  emptyTypedFilterAst, mergeRefreshedRequestPage,
+  emptyTypedFilterAst, mergeRefreshedRequestPage, requestViewFromEvent,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
@@ -43,6 +43,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const { t } = useI18n();
   const diagnosticLabels = { requestId: t('request.correlationId'), streamInterrupted: t('request.streamInterrupted') };
   const [requests, setRequests] = useState<RequestView[]>([]);
+  const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [loading, setLoading] = useState(false);
@@ -75,6 +76,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     }, ticket => startOverflowRefresh.current(ticket));
   }
   const loadAbort = useRef<AbortController | null>(null);
+  const operationalAbort = useRef<AbortController | null>(null);
+  const reconciledOperationalEvents = useRef(new Map<string, string>());
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
@@ -138,6 +141,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       const current = requestsRef.current;
       const page = mergeBatchedRequestPage(mergeRefreshedRequestPage(current, next, current.length > 100), new Map(liveEventsRef.current), next.next_cursor !== null, loadedHistoryIds.current);
       setRequests(page.requests); setHasOlder(page.hasOlder);
+      setSnapshotRevision(value => value + 1);
       succeeded = true;
       if (errorSource.current === 'refresh') {
         errorSource.current = undefined;
@@ -170,6 +174,8 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // for a completed authoritative refresh while the foreground lane owns it.
     overflowRefresh.current?.setBlocked(true);
     cancelOverflowRefresh(true);
+    operationalAbort.current?.abort();
+    reconciledOperationalEvents.current.clear();
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -199,6 +205,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
           : next.requests);
         setHasOlder(next.next_cursor !== null);
       }
+      setSnapshotRevision(value => value + 1);
     } catch (reason) {
       if (request === sequence.current && !controller.signal.aborted) {
         if (!older) { setRequests([]); setHasOlder(false); }
@@ -226,6 +233,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     // new scope's batch is recreated empty after this commit, so any future
     // overflow still arrives as a strictly larger revision.
     loadedHistoryIds.current.clear();
+    reconciledOperationalEvents.current.clear();
     previousOverflowRevision.current = streamOverflowRevision;
     onProtectRequests?.([]);
     cancelOverflowRefresh(false, true);
@@ -295,6 +303,48 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   useEffect(() => {
     syncOverflowRefreshBlocked();
   }, [filters, loading, streamPaused]);
+
+  useEffect(() => {
+    if (!token || !tenant || loadingRef.current || streamPaused || typedFiltersActive(filters)) return;
+    const controller = new AbortController();
+    operationalAbort.current = controller;
+    const currentScope = { token, tenant, filters };
+    const requestSequence = sequence.current;
+    const visibleIds = new Set(requestsRef.current.map(request => request.request_id));
+    for (const requestId of reconciledOperationalEvents.current.keys()) {
+      if (!visibleIds.has(requestId)) reconciledOperationalEvents.current.delete(requestId);
+    }
+    for (const request of requestsRef.current) {
+      const event = liveEventsRef.current.get(request.request_id);
+      const completedAt = event?.completed_at;
+      const retainedTerminal = typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at;
+      if (!request.operational_terminal || request.operational_terminal.financial_state === 'applied'
+        || !event || (event.event_kind !== 'finished' && event.event_kind !== 'projected' && !retainedTerminal)
+        || reconciledOperationalEvents.current.get(request.request_id) === event.event_id) continue;
+      void api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal })
+        .then(next => {
+          const latest = scope.current;
+          if (controller.signal.aborted || paused.current || loadingRef.current || sequence.current !== requestSequence
+            || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters
+            || next.request_id !== request.request_id || !next.operational_terminal) return;
+          reconciledOperationalEvents.current.set(request.request_id, event.event_id);
+          setRequests(current => current.map(row => {
+            if (row.request_id !== request.request_id || row.operational_terminal?.financial_state === 'applied') return row;
+            const retained = liveEventsRef.current.get(row.request_id);
+            return retained ? requestViewFromEvent(retained, next) ?? next : next;
+          }));
+        })
+        .catch(reason => {
+          if (controller.signal.aborted) return;
+          errorSource.current = 'refresh';
+          setError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels));
+        });
+    }
+    return () => {
+      controller.abort();
+      if (operationalAbort.current === controller) operationalAbort.current = null;
+    };
+  }, [streamRevision, snapshotRevision, streamPaused, filters, loading, token, tenant, writeTenant]);
 
   async function openRequestDetail(requestId: string) {
     if (selectedRequestId.current !== requestId) setDetail(undefined);
