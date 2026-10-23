@@ -1484,22 +1484,33 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     assert_eq!(receipt["receipt_id"], original.0);
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
-    assert!(receipt["conversation"].is_null());
+    assert!(receipt["conversation"].is_object());
     assert!(path.exists(), "runtime ACK is not a financial receipt ACK");
     release.send(()).unwrap();
     server.await.unwrap();
     drain_archive_capture(&fixture).await;
+    let receipt_id = Uuid::parse_str(&original.0).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
-            if used == 0 && retained == 0 {
+            if used == 0
+                && retained == 0
+                && fixture
+                    .state
+                    .pending_terminals
+                    .idle_conversation_retained_for_test(receipt_id)
+                    .await
+                    == Some(false)
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("operational unknown without a remaining conversation must release memory");
+    .expect(
+        "durable semantic enqueue must release the in-memory conversation and every memory permit",
+    );
     assert_eq!(
         serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
         receipt
