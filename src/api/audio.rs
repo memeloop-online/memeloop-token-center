@@ -1158,7 +1158,7 @@ mod tests {
                     alias: "audio".to_owned(),
                     currency: "USD".to_owned(),
                     policy: KeyPolicy {
-                        tokens_per_minute: 1,
+                        tokens_per_minute: Some(1),
                         ..KeyPolicy::default()
                     },
                     initial_balance: Decimal::TEN,
@@ -1443,7 +1443,7 @@ mod tests {
                     alias: "audio-cancel".to_owned(),
                     currency: "USD".to_owned(),
                     policy: KeyPolicy {
-                        max_concurrency: 1,
+                        max_concurrency: Some(1),
                         ..KeyPolicy::default()
                     },
                     initial_balance: Decimal::TEN,
@@ -1502,7 +1502,7 @@ mod tests {
             let snapshot = state.db.key_limit_snapshot(issued.key_id).await.unwrap();
             if snapshot.concurrency.active == 0 {
                 settled = true;
-                assert_eq!(snapshot.concurrency.remaining, 1);
+                assert_eq!(snapshot.concurrency.remaining, Some(1));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

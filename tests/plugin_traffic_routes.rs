@@ -424,7 +424,8 @@ async fn hint_routing_fixture_with_database(
     let tenant = format!("hint-routing-{label}");
     let model = format!("hint-routing-model-{label}");
     let (tokens_per_minute, initial_balance) = credential_capacity
-        .unwrap_or_else(|| (KeyPolicy::default().tokens_per_minute, Decimal::TEN));
+        .map(|(limit, balance)| (Some(limit), balance))
+        .unwrap_or((None, Decimal::TEN));
     let mut route_ids = Vec::new();
     let mut account_ids = Vec::new();
     for (name, uri, priority) in [
@@ -483,7 +484,7 @@ async fn hint_routing_fixture_with_database(
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
                     tokens_per_minute,
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance,

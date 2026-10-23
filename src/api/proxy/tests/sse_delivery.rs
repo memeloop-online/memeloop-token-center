@@ -99,7 +99,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                tokens_per_minute: 32 * 1024 * 1024,
+                tokens_per_minute: Some(32 * 1024 * 1024),
                 ..KeyPolicy::default()
             },
         )

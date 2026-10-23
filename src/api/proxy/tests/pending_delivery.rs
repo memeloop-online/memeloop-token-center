@@ -773,7 +773,7 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
     drop(held);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let changed_policy = crate::model::KeyPolicy {
-        requests_per_minute: 7,
+        requests_per_minute: Some(7),
         ..Default::default()
     };
     sqlx::query("UPDATE key_records SET alias = 'changed after terminal', currency = 'EUR', credential_generation = credential_generation + 1, policy_json = $1 WHERE id = $2")

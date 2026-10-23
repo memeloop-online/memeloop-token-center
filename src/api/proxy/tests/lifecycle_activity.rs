@@ -42,9 +42,9 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                max_concurrency: 100,
-                requests_per_minute: 1000,
-                tokens_per_minute: 10_000_000,
+                max_concurrency: Some(100),
+                requests_per_minute: Some(1000),
+                tokens_per_minute: Some(10_000_000),
                 ..KeyPolicy::default()
             },
         )

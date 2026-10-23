@@ -146,7 +146,7 @@ async fn optional_output_financial_contract(
                 alias: unique.clone(),
                 currency: "USD".into(),
                 policy: KeyPolicy {
-                    max_concurrency: 2,
+                    max_concurrency: Some(2),
                     lifetime_budget: budget.map(|amount| Decimal::new(amount, 6).to_string()),
                     ..KeyPolicy::default()
                 },

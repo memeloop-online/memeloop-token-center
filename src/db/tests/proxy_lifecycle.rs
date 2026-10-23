@@ -83,7 +83,8 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
                     currency: "USD".to_owned(),
                     policy: KeyPolicy {
                         enforcement_mode: mode,
-                        max_concurrency: 8,
+                        requests_per_minute: Some(60),
+                        max_concurrency: Some(8),
                         ..KeyPolicy::default()
                     },
                     initial_balance: Decimal::TEN,
@@ -524,7 +525,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
                 policy: KeyPolicy {
                     // This fixture deliberately keeps several reservations in flight while it
                     // exercises independent reconciliation and lock-order scenarios below.
-                    max_concurrency: 16,
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -546,7 +547,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
                 alias: "late-streaming-parent-legacy".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    max_concurrency: 8,
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -568,7 +569,7 @@ async fn postgres_late_streaming_parent_atomically_reconciles_committed_child_cl
                 alias: "late-streaming-parent-foreign".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    max_concurrency: 8,
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -1390,7 +1391,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
                 alias: "online-projection-lock".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    max_concurrency: 16,
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -1695,7 +1696,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     enforcement_mode: EnforcementMode::MeteredUnlimited,
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,
@@ -2225,9 +2226,9 @@ async fn concurrent_proxy_starts_serialize_in_sqlite() {
                 alias: "proxy-start-race".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100_000,
-                    tokens_per_minute: 100_000_000,
-                    max_concurrency: 32,
+                    requests_per_minute: Some(100_000),
+                    tokens_per_minute: Some(100_000_000),
+                    max_concurrency: Some(32),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(1_000),
@@ -2301,8 +2302,8 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 alias: "proxy-atomic".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),
@@ -2833,8 +2834,8 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
                 alias: "proxy-race".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),

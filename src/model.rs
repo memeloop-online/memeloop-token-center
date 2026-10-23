@@ -50,12 +50,12 @@ pub struct KeyPolicy {
     #[doc(hidden)]
     #[serde(default, skip_serializing)]
     pub allowed_models: Vec<String>,
-    #[serde(default = "default_rpm")]
-    pub requests_per_minute: u32,
-    #[serde(default = "default_tpm")]
-    pub tokens_per_minute: u64,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrency: u32,
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     #[serde(default)]
     pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
@@ -68,12 +68,12 @@ pub struct KeyPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPolicyInput {
-    #[serde(default = "default_rpm")]
-    pub requests_per_minute: u32,
-    #[serde(default = "default_tpm")]
-    pub tokens_per_minute: u64,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrency: u32,
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     #[serde(default)]
     pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
@@ -120,9 +120,9 @@ impl Default for KeyPolicy {
     fn default() -> Self {
         Self {
             allowed_models: Vec::new(),
-            requests_per_minute: default_rpm(),
-            tokens_per_minute: default_tpm(),
-            max_concurrency: default_concurrency(),
+            requests_per_minute: None,
+            tokens_per_minute: None,
+            max_concurrency: None,
             enforcement_mode: EnforcementMode::Prepaid,
             daily_budget: None,
             weekly_budget: None,
@@ -131,23 +131,62 @@ impl Default for KeyPolicy {
     }
 }
 
-fn default_rpm() -> u32 {
-    60
-}
-
-fn default_tpm() -> u64 {
-    100_000
-}
-
-fn default_concurrency() -> u32 {
-    4
-}
-
 #[cfg(test)]
 mod key_policy_contract_tests {
     use serde_json::json;
 
     use super::{EnforcementMode, KeyPolicy, KeyPolicyInput};
+
+    #[test]
+    fn optional_rate_limits_preserve_explicit_limits_without_injecting_defaults() {
+        for value in [
+            json!({}),
+            json!({
+                "requests_per_minute": null,
+                "tokens_per_minute": null,
+                "max_concurrency": null
+            }),
+        ] {
+            let policy: KeyPolicyInput = serde_json::from_value(value.clone()).unwrap();
+            let encoded = serde_json::to_value(policy).unwrap();
+            assert_eq!(
+                encoded,
+                serde_json::to_value(KeyPolicyInput::default()).unwrap()
+            );
+            let stored: KeyPolicy = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(stored).unwrap();
+            assert_eq!(encoded, serde_json::to_value(KeyPolicy::default()).unwrap());
+            for field in [
+                "requests_per_minute",
+                "tokens_per_minute",
+                "max_concurrency",
+            ] {
+                assert!(encoded[field].is_null());
+            }
+        }
+        let numeric = json!({
+            "requests_per_minute": 60,
+            "tokens_per_minute": 100000,
+            "max_concurrency": 4
+        });
+        let stored: KeyPolicy = serde_json::from_value(numeric.clone()).unwrap();
+        let public: KeyPolicyInput = serde_json::from_value(numeric.clone()).unwrap();
+        assert_eq!(stored.requests_per_minute, Some(60));
+        assert_eq!(stored.tokens_per_minute, Some(100000));
+        assert_eq!(stored.max_concurrency, Some(4));
+        let encoded = serde_json::to_value(stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(KeyPolicy::from(public)).unwrap(),
+            encoded
+        );
+        for field in [
+            "requests_per_minute",
+            "tokens_per_minute",
+            "max_concurrency",
+        ] {
+            assert_eq!(encoded[field], numeric[field]);
+        }
+    }
 
     #[test]
     fn public_policy_defaults_to_prepaid_and_round_trips_metered_unlimited() {
@@ -266,17 +305,17 @@ pub struct KeyAliasView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyRateLimitSnapshot {
-    pub limit: u64,
+    pub limit: Option<u64>,
     pub used: u64,
-    pub remaining: u64,
-    pub reset_at: i64,
+    pub remaining: Option<u64>,
+    pub reset_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyConcurrencySnapshot {
-    pub limit: u32,
+    pub limit: Option<u32>,
     pub active: u64,
-    pub remaining: u64,
+    pub remaining: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

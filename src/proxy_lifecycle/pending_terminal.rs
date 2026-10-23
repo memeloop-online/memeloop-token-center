@@ -39,9 +39,12 @@ struct ReservationWire {
 #[serde(remote = "crate::model::KeyPolicy", deny_unknown_fields)]
 struct PolicyWire {
     allowed_models: Vec<String>,
-    requests_per_minute: u32,
-    tokens_per_minute: u64,
-    max_concurrency: u32,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    requests_per_minute: Option<u32>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    tokens_per_minute: Option<u64>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    max_concurrency: Option<u32>,
     enforcement_mode: crate::model::EnforcementMode,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     daily_budget: Option<String>,
@@ -1308,9 +1311,9 @@ mod tests {
             credential_generation: 17,
             policy: crate::model::KeyPolicy {
                 allowed_models: vec!["legacy-snapshot-only".into()],
-                requests_per_minute: 23,
-                tokens_per_minute: 4567,
-                max_concurrency: 8,
+                requests_per_minute: Some(23),
+                tokens_per_minute: Some(4567),
+                max_concurrency: Some(8),
                 enforcement_mode: crate::model::EnforcementMode::MeteredUnlimited,
                 daily_budget: Some("12.34".into()),
                 weekly_budget: Some("56.78".into()),
@@ -1351,9 +1354,9 @@ mod tests {
         assert_eq!(restored.key.currency, "USD");
         assert_eq!(restored.key.credential_generation, 17);
         assert_eq!(restored.key.policy.allowed_models, ["legacy-snapshot-only"]);
-        assert_eq!(restored.key.policy.requests_per_minute, 23);
-        assert_eq!(restored.key.policy.tokens_per_minute, 4567);
-        assert_eq!(restored.key.policy.max_concurrency, 8);
+        assert_eq!(restored.key.policy.requests_per_minute, Some(23));
+        assert_eq!(restored.key.policy.tokens_per_minute, Some(4567));
+        assert_eq!(restored.key.policy.max_concurrency, Some(8));
         assert_eq!(
             restored.key.policy.enforcement_mode,
             crate::model::EnforcementMode::MeteredUnlimited
@@ -1364,6 +1367,24 @@ mod tests {
             restored.key.policy.lifetime_budget.as_deref(),
             Some("90.12")
         );
+    }
+
+    #[test]
+    fn owned_key_roundtrip_retains_unconfigured_rates_as_null() {
+        let mut captured = owned_conversation();
+        captured.key.policy.requests_per_minute = None;
+        captured.key.policy.tokens_per_minute = None;
+        captured.key.policy.max_concurrency = None;
+        let encoded = serde_json::to_value(&captured).unwrap();
+        for field in [
+            "requests_per_minute",
+            "tokens_per_minute",
+            "max_concurrency",
+        ] {
+            assert!(encoded["key"]["policy"][field].is_null());
+        }
+        let restored: OwnedConversation = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
     }
 
     #[test]
