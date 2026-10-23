@@ -232,6 +232,7 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         refs.request_archive_state,
         crate::model::RequestArchiveState::Gap
     );
+    wait_for_request_settlement(&fixture, 1).await;
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
     pool.close().await;
