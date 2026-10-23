@@ -5128,7 +5128,7 @@ async fn cache_tier_request_cost(world: &mut TokenCenterWorld, cost: f64, tokens
             .json::<Value>()
             .await
             .expect("cache-aware stats JSON");
-        if stats["summary"]["total_requests"] == 1 {
+        if stats["summary"]["total_requests"] == 1 && stats["summary"]["total_cost"].is_string() {
             assert_eq!(
                 stats["summary"]["input_tokens"]
                     .as_i64()
@@ -5188,7 +5188,7 @@ async fn cache_write_request_cost(world: &mut TokenCenterWorld, cost: f64, token
             .json::<Value>()
             .await
             .expect("cache-write stats JSON");
-        if stats["summary"]["total_requests"] == 1 {
+        if stats["summary"]["total_requests"] == 1 && stats["summary"]["total_cost"].is_string() {
             assert_eq!(
                 stats["summary"]["input_tokens"]
                     .as_i64()
@@ -8191,7 +8191,13 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
 #[then("the delivered invalid stream is an unobserved failure without response lineage")]
 async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::OK));
-    let requests = wait_for_invalid_stream_terminal_request(world).await;
+    let requests = tokio::time::timeout(Duration::from_secs(2), async {
+        let requests = wait_for_invalid_stream_terminal_request(world).await;
+        wait_for_projected_conversation_requests(world, 1).await;
+        requests
+    })
+    .await
+    .expect("invalid stream terminal and conversation projection before original deadline");
     assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
     assert_eq!(requests[0]["status_code"], 502, "{requests}");
     assert_eq!(
