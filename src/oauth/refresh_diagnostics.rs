@@ -18,15 +18,45 @@ pub enum OAuthRefreshFailureKind {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRefreshPhase {
+    BeforeHeaders,
+    ResponseBody,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthRefreshTimeoutSource {
+    HttpClient,
+    OperationDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthRefreshObservation {
+    pub phase: OAuthRefreshPhase,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
+    pub connector_failure: bool,
+    pub timeout_source: Option<OAuthRefreshTimeoutSource>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OAuthRefreshFailure {
     pub kind: OAuthRefreshFailureKind,
     pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<OAuthRefreshObservation>,
 }
 
 impl OAuthRefreshFailure {
     pub(crate) fn new(kind: OAuthRefreshFailureKind, http_status: Option<u16>) -> Self {
-        Self { kind, http_status }
+        Self {
+            kind,
+            http_status,
+            observation: None,
+        }
     }
 
     pub(crate) fn requires_reauthorization(self) -> bool {
@@ -114,6 +144,8 @@ pub(crate) struct OAuthRefreshStatus {
     pub http_status: Option<u16>,
     pub reauthorization_required: bool,
     pub automatic_refresh_paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_observation: Option<OAuthRefreshObservation>,
 }
 
 pub(crate) struct OAuthRefreshMetadata {
@@ -184,6 +216,9 @@ impl OAuthRefreshMetadata {
                     refresh_state,
                     OAuthRefreshState::OutcomeUnknown | OAuthRefreshState::ReauthorizationRequired
                 ),
+            failure_observation: diagnostic
+                .as_ref()
+                .and_then(|value| value.failure.observation),
         }
     }
 }
@@ -286,6 +321,33 @@ mod tests {
         assert_eq!(status.access_state, OAuthAccessState::Unknown);
         assert!(!status.reauthorization_required);
         assert!(!status.automatic_refresh_paused);
+    }
+
+    #[test]
+    fn legacy_diagnostics_do_not_invent_phase_and_new_observations_are_fenced() {
+        let legacy = r#"{"version":1,"credential_generation":7,"attempt_created_at":5,"attempt_finished_at":9,"outcome":"outcome_unknown","failure":{"kind":"timeout","http_status":null}}"#;
+        let mut source = metadata();
+        source.diagnostic_json = Some(legacy.into());
+        assert!(source.status(30).failure_observation.is_none());
+        let mut current = OAuthRefreshDiagnostic::from_json(legacy, 7).unwrap();
+        current.failure.observation = Some(OAuthRefreshObservation {
+            phase: OAuthRefreshPhase::BeforeHeaders,
+            elapsed_ms: 30_737,
+            budget_ms: 120_000,
+            connector_failure: false,
+            timeout_source: Some(OAuthRefreshTimeoutSource::HttpClient),
+        });
+        let encoded = serde_json::to_string(&current).unwrap();
+        assert!(encoded.len() < 2048);
+        for (generation, expected) in [(7, current.failure.observation), (8, None)] {
+            let mut source = metadata();
+            source.generation = generation;
+            source.diagnostic_json = Some(encoded.clone());
+            let status = source.status(30);
+            assert_eq!(status.failure_observation, expected);
+            assert!(!status.reauthorization_required);
+            assert!(status.automatic_refresh_paused);
+        }
     }
 
     #[test]
