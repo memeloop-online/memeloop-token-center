@@ -389,49 +389,34 @@ impl Database {
     }
 
     pub async fn model_price(&self, model: &str, currency: &str) -> Result<ModelPrice, AppError> {
-        let row = sqlx::query(
-            "SELECT id, input_micros_per_million, output_micros_per_million FROM model_prices WHERE model = $1 AND currency = $2",
-        )
-        .bind(model)
-        .bind(currency.to_uppercase())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::UnpricedModel)?;
-        let tiers = self.model_price_tiers(model, currency).await?;
-        Ok(ModelPrice {
-            id: parse_uuid(row.try_get("id")?)?,
-            input_micros_per_million: row.try_get("input_micros_per_million")?,
-            output_micros_per_million: row.try_get("output_micros_per_million")?,
-            tiers,
-        })
-    }
-
-    async fn model_price_tiers(
-        &self,
-        model: &str,
-        currency: &str,
-    ) -> Result<Vec<ModelPriceTier>, AppError> {
         let rows = sqlx::query(
-            "SELECT service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = $1 AND currency = $2 ORDER BY CASE WHEN service_tier = 'default' THEN 0 ELSE 1 END, service_tier",
+            "SELECT p.id, p.input_micros_per_million, p.output_micros_per_million, t.service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million, t.cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source FROM model_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency WHERE p.model = $1 AND p.currency = $2 ORDER BY CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
         )
         .bind(model)
         .bind(currency.to_uppercase())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ModelPriceTier {
-                    service_tier: row.try_get("service_tier")?,
-                    input_micros_per_million: row.try_get("input_micros_per_million")?,
-                    cached_input_micros_per_million: row
-                        .try_get("cached_input_micros_per_million")?,
-                    cache_write_micros_per_million: row
-                        .try_get("cache_write_micros_per_million")?,
-                    output_micros_per_million: row.try_get("output_micros_per_million")?,
-                    source: row.try_get("source")?,
-                })
-            })
-            .collect()
+        let row = rows.first().ok_or(AppError::UnpricedModel)?;
+        let mut price = ModelPrice {
+            id: parse_uuid(row.try_get("id")?)?,
+            input_micros_per_million: row.try_get("input_micros_per_million")?,
+            output_micros_per_million: row.try_get("output_micros_per_million")?,
+            tiers: Vec::new(),
+        };
+        for row in rows {
+            let Some(service_tier) = row.try_get::<Option<String>, _>("service_tier")? else {
+                continue;
+            };
+            price.tiers.push(ModelPriceTier {
+                service_tier,
+                input_micros_per_million: row.try_get("tier_input_micros_per_million")?,
+                cached_input_micros_per_million: row.try_get("cached_input_micros_per_million")?,
+                cache_write_micros_per_million: row.try_get("cache_write_micros_per_million")?,
+                output_micros_per_million: row.try_get("tier_output_micros_per_million")?,
+                source: row.try_get("source")?,
+            });
+        }
+        Ok(price)
     }
 
     async fn model_price_view_from_base_row(
