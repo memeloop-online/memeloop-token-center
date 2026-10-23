@@ -6708,6 +6708,7 @@ async fn create_and_use_policy_credential(world: &mut TokenCenterWorld) {
 
     call_model(world, "gpt-test".to_owned()).await;
     assert_eq!(world.status, Some(StatusCode::OK));
+    wait_for_settled_request_stats(world, 1).await;
     let key_view = world
         .client
         .get(format!("{}/self/v1/key", world.service_url))
@@ -6722,6 +6723,7 @@ async fn create_and_use_policy_credential(world: &mut TokenCenterWorld) {
         .as_str()
         .expect("continuity available balance")
         .to_owned();
+    assert_eq!(world.expected_balance, "9.99999");
 }
 
 #[when("the service suspends and reactivates that credential")]
@@ -7578,6 +7580,10 @@ async fn stats_contain_request(world: &mut TokenCenterWorld, requests: i64, toke
 
 async fn wait_for_settled_request_stats(world: &TokenCenterWorld, expected: usize) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
+        let state = world.state.as_ref().expect("state");
+        let inspection = AnyPool::connect(&state.config.database_url)
+            .await
+            .expect("connect settled request inspection pool");
         loop {
             let requests = world
                 .client
@@ -7589,16 +7595,25 @@ async fn wait_for_settled_request_stats(world: &TokenCenterWorld, expected: usiz
                 .json::<Value>()
                 .await
                 .expect("settled request history JSON");
-            if requests.as_array().is_some_and(|rows| {
+            let completed = requests.as_array().is_some_and(|rows| {
                 rows.len() >= expected
                     && rows
                         .iter()
                         .all(|request| request["completed_at"].as_i64().is_some())
-            }) {
+            });
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM terminal_projection_outbox WHERE key_id = $1 AND projected_at IS NULL",
+            )
+            .bind(world.stable_key_id.expect("settled key id").to_string())
+            .fetch_one(&inspection)
+            .await
+            .expect("pending account and statistics projections");
+            if completed && pending == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        inspection.close().await;
     })
     .await
     .expect("authoritative usage must settle before statistics are asserted");
@@ -8192,8 +8207,30 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
 async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::OK));
     let requests = tokio::time::timeout(Duration::from_secs(2), async {
-        let requests = wait_for_invalid_stream_terminal_request(world).await;
-        wait_for_projected_conversation_requests(world, 1).await;
+        let (requests, ()) = tokio::join!(wait_for_invalid_stream_terminal_request(world), async {
+            loop {
+                let clusters = world
+                    .client
+                    .get(format!("{}/self/v1/conversations", world.service_url))
+                    .bearer_auth(&world.current_key)
+                    .send()
+                    .await
+                    .expect("invalid stream conversation clusters")
+                    .json::<Value>()
+                    .await
+                    .expect("invalid stream conversation clusters JSON");
+                let represented = clusters
+                    .as_array()
+                    .expect("invalid stream conversation cluster array")
+                    .iter()
+                    .map(|cluster| cluster["request_count"].as_u64().expect("request count"))
+                    .sum::<u64>();
+                if represented >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
         requests
     })
     .await
