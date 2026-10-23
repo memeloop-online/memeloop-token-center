@@ -632,6 +632,13 @@ impl Database {
         &self,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
         let started = tokio::time::Instant::now();
+        if let Some(deadline) = self.gateway_archive_retry_deadline() {
+            return Box::pin(self.begin_gateway_archive_transaction(deadline))
+                .await
+                .inspect_err(|error| {
+                    self.observe_pool_timeout("write_transaction", started, error);
+                });
+        }
         // SQLite's default deferred transaction can fail immediately with
         // SQLITE_BUSY when a read-before-write transaction races another
         // writer: the shared lock cannot be upgraded after that writer has

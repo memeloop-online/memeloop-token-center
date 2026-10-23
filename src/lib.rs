@@ -370,6 +370,14 @@ impl AppState {
         self
     }
 
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub async fn refresh_application_plugins(&self) -> Result<(), error::AppError> {
+        if let Some(authority) = &self.application_plugins {
+            authority.refresh_current().await?;
+        }
+        Ok(())
+    }
+
     /// Called once at a request entry point. A cloned request state retains the
     /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
     pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
@@ -379,7 +387,7 @@ impl AppState {
             if !state.application_plugins_pinned
                 && let Some(authority) = &state.application_plugins
             {
-                if let Some(snapshot) = authority.pin_if_published().await? {
+                if let Some(snapshot) = authority.current_snapshot()? {
                     state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;

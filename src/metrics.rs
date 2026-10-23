@@ -919,7 +919,8 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
-    pub gateway_body_rejections: [[u64; 3]; 4],
+    pub gateway_body_rejections: [[u64; crate::gateway_body::GATEWAY_BODY_REJECTION_REASON_COUNT];
+        crate::gateway_body::GATEWAY_BODY_ROUTE_CLASS_COUNT],
     pub proxy_memory_used_bytes: usize,
     pub proxy_memory_limit_bytes: usize,
     pub retained_request_memory_used_bytes: usize,

@@ -63,6 +63,22 @@ immutable history of every attempt. Kimi errors are typed without logging
 provider response content; unsupported provider error formats remain unknown.
 This change does not recover or reauthorize existing production accounts.
 
+New Kimi network failures optionally include a bounded `failure.observation`
+in the existing durable diagnostic, projected as `failure_observation`:
+`phase` (`before_headers` or `response_body`), monotonic `elapsed_ms`,
+`budget_ms`, `connector_failure`, and `timeout_source` (`http_client`,
+`operation_deadline`, or null). `before_headers` means the HTTP execute future
+has not yielded response headers; it does not prove the POST was delivered or
+identify a DNS/TLS phase. Body-reader failures do not invent a timeout source.
+The observation starts after the durable dispatch marker completes, not when
+the lease is claimed. No URL, error string, token or response body is retained.
+
+Old diagnostics remain readable without invented observations. Older binaries
+with strict diagnostic decoders ignore diagnostics containing the new optional
+field; deploy the reader alongside the writer to retain detailed presentation.
+Replay protection uses lease/pending state, not these optional observations.
+This addition does not change that protection or restore a lost remote result.
+
 ## Kimi timeout and recovery boundary
 
 Kimi refresh has a 120-second request and operation budget, replacing the

@@ -4,6 +4,7 @@ mod cursor;
 mod kimi;
 mod normalize;
 pub(crate) mod observations;
+mod proxy;
 pub(crate) mod reset;
 mod retry;
 
@@ -790,7 +791,9 @@ async fn read_codex(
             &account.config,
         )
         .map_err(|_| "quota_transport_failed")?;
-    let credential = &selection.credential;
+    let credential = selection.credential.clone();
+    let credential = &credential;
+    let routes = proxy::Routes::from_selection(selection).await?;
     let observation_started_at = unix_millis();
     let recovery_fence = match state
         .db
@@ -863,21 +866,23 @@ async fn read_codex(
         proxy_url: credential.proxy().map(|(url, _)| url),
     };
     let (usage, reset) = tokio::join!(
-        get_codex_json(
+        get_codex_json_with_routes(
             &http,
             auth.clone(),
             USAGE_URL,
             QuotaRequestContext::for_account(account, "usage", trigger),
             budget,
             session,
+            Some(&routes),
         ),
-        get_codex_json(
+        get_codex_json_with_routes(
             &http,
             auth,
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits", trigger),
             budget,
             session,
+            Some(&routes),
         ),
     );
     let observed_at = unix_millis();
@@ -1020,9 +1025,28 @@ async fn get_codex_json(
     budget: QuotaBudget,
     session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
+    get_codex_json_with_routes(http, auth, url, context, budget, session, None).await
+}
+
+async fn get_codex_json_with_routes(
+    http: &wreq::Client,
+    auth: CodexQuotaAuth<'_>,
+    url: &str,
+    context: QuotaRequestContext,
+    budget: QuotaBudget,
+    session: &retry::ReadSession<'_>,
+    routes: Option<&proxy::Routes>,
+) -> Result<Value, &'static str> {
     let deadline = session.deadline;
+    let route_index = std::sync::atomic::AtomicUsize::new(0);
+    let attempt = std::sync::atomic::AtomicUsize::new(0);
     session
         .run(context, || async {
+            let attempt = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let route = route_index.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(routes) = routes {
+                routes.log_attempt(context, route, attempt, budget);
+            }
             let started = tokio::time::Instant::now();
             let mut request = http
                 .get(url)
@@ -1053,12 +1077,16 @@ async fn get_codex_json(
             if context.endpoint_kind == "credits" {
                 request = request.header("openai-beta", "codex-1");
             }
-            if let Some(proxy_url) = auth.proxy_url {
+            if let Some(proxy_url) = routes.map_or(auth.proxy_url, |routes| routes.proxy_url(route))
+            {
                 request = request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| {
                     retry::Failure::terminal("quota_destination_invalid", "client")
                 })?);
             }
             let response = request.send().await.map_err(|error| {
+                if let Some(routes) = routes {
+                    routes.advance_on_failure(&route_index, &error);
+                }
                 if tokio::time::Instant::now() >= deadline {
                     retry::Failure::terminal("quota_timeout", "deadline")
                 } else {

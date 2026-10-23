@@ -26,6 +26,7 @@ use crate::{
 mod anthropic_bridge;
 mod archive_terminal;
 mod body_read_activity;
+mod body_read_errors;
 mod buffered_responses_incomplete;
 mod cancellation;
 mod chat_sse_usage;

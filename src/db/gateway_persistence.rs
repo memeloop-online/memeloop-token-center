@@ -20,6 +20,10 @@ const TASK_LIMIT: usize = 16;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const JOB_TIMEOUT: Duration = Duration::from_secs(2);
 
+tokio::task_local! {
+    static ARCHIVE_DEADLINE: (Arc<GatewayPersistence>, tokio::time::Instant);
+}
+
 #[cfg(test)]
 tokio::task_local! {
     static TEST_CAPTURE_BEFORE_DISPATCH: Arc<GatewayPersistence>;
@@ -34,6 +38,8 @@ pub(super) struct GatewayPersistence {
     capacity: AtomicU64,
     failed: AtomicU64,
     retention_limit: AtomicU64,
+    #[cfg(test)]
+    busy_retries: AtomicU64,
 }
 
 impl GatewayPersistence {
@@ -74,6 +80,8 @@ impl GatewayPersistence {
             capacity: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             retention_limit: AtomicU64::new(0),
+            #[cfg(test)]
+            busy_retries: AtomicU64::new(0),
         })
     }
 
@@ -89,6 +97,49 @@ impl GatewayPersistence {
 }
 
 impl Database {
+    pub(super) fn gateway_archive_retry_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.pool_role != "gateway_archive" || !matches!(self.backend, DatabaseBackend::Sqlite) {
+            return None;
+        }
+        ARCHIVE_DEADLINE
+            .try_with(|(owner, deadline)| {
+                Arc::ptr_eq(owner, &self.gateway_persistence).then_some(*deadline)
+            })
+            .ok()
+            .flatten()
+    }
+
+    pub(super) async fn begin_gateway_archive_transaction(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        loop {
+            let error = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+                Ok(transaction) => return Ok(transaction),
+                Err(error) => error,
+            };
+            if !matches!(&error, sqlx::Error::Database(error) if error.code().as_deref() == Some("5"))
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Err(error);
+            }
+            #[cfg(test)]
+            self.gateway_persistence
+                .busy_retries
+                .fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+            )
+            .await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(error);
+            }
+        }
+    }
+
     pub(crate) fn gateway_persistence_metrics(&self) -> String {
         let persistence = &self.gateway_persistence;
         format!(
@@ -156,7 +207,7 @@ impl Database {
             let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
             tokio::spawn(async move {
                 let _permits = permits;
-                let result = tokio::time::timeout_at(deadline, async {
+                let capture = async {
                     let _writer = database
                         .gateway_persistence
                         .writer
@@ -166,10 +217,13 @@ impl Database {
                     if let Err(error) = database.publish_proxy_started_event(identity).await {
                         tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
                     }
-                    let retained = crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
+                    let retained =
+                        crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
                     let body = retained.as_ref().map_or_else(
                         || body.clone(),
-                        |retained| crate::api::proxy::archive_retention::encode_json_body(&body, retained),
+                        |retained| {
+                            crate::api::proxy::archive_retention::encode_json_body(&body, retained)
+                        },
                     );
                     drop(retained);
                     database
@@ -180,7 +234,12 @@ impl Database {
                             compression_enabled,
                         )
                         .await
-                })
+                };
+                let result = tokio::time::timeout_at(
+                    deadline,
+                    ARCHIVE_DEADLINE
+                        .scope((database.gateway_persistence.clone(), deadline), capture),
+                )
                 .await;
                 match result {
                     Ok(Ok(())) => {}

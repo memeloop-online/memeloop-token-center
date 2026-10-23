@@ -307,7 +307,7 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
-fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
+pub(crate) fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
     match error {
         sqlx::Error::Configuration(_) => "configuration",
         sqlx::Error::Database(error) if error.code().as_deref() == Some("57014") => {

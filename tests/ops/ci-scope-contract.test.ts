@@ -11,7 +11,7 @@ function encoded(changes: readonly Change[]): string {
   return changes.flatMap(([status, ...paths]) => [status, ...paths]).join('\0') + (changes.length === 0 ? '' : '\0');
 }
 
-function scopes(event: 'pull_request' | 'push', changes: readonly Change[]): Record<string, string> {
+function scopes(event: 'pull_request' | 'push' | 'workflow_dispatch', changes: readonly Change[]): Record<string, string> {
   const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-scope-contract-'));
   try {
     const changed = join(temporary, 'changed.z');
@@ -146,6 +146,28 @@ test('the focused plugin UI workflow is manual because mandatory web CI already 
     'e2e/plugin-ui-slot-browser-contract.test.ts',
     'e2e/operator-plugin-projection-browser-contract.test.ts',
   ]) assert.match(contract, /^e2e\/[^/]+-contract\.test\.ts$/);
+});
+
+test('manual CI always runs every gate without push, PR, checkout, or changed-path metadata', () => {
+  assert.deepEqual(scopes('workflow_dispatch', [['M', 'web/src/App.tsx']]), fullPlugin);
+  assert.deepEqual(scopes('workflow_dispatch', [['M', 'tests/ops/contract-helpers.ts']]), fullPlugin);
+  assert.deepEqual(scopes('workflow_dispatch', []), fullPlugin);
+  const temporary = mkdtempSync(join(tmpdir(), 'mtc-ci-dispatch-scope-'));
+  try {
+    for (const input of ['--verified-merge', join(temporary, 'nonexistent-diff.z')]) {
+      const output = join(temporary, 'out');
+      writeFileSync(output, '');
+      const result = run(process.execPath, [join(repository, 'scripts/ci/detect-expensive-ci-scopes.ts'), 'workflow_dispatch', input, output], {
+        cwd: temporary,
+        env: { ...process.env, GITHUB_SHA: 'invalid', PR_HEAD_SHA: '', GITHUB_EVENT_BEFORE: '', GITHUB_EVENT_AFTER: '' },
+      });
+      assert.deepEqual(Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=', 2))), fullPlugin);
+      const evidence = JSON.parse(result);
+      assert.equal(evidence.force_full, true);
+      assert.equal(evidence.change_count, 0);
+      assert.equal(evidence.comparison_base, undefined);
+    }
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
 });
 
 test('pushes and malformed or empty pull-request diffs fail closed', () => {

@@ -763,14 +763,74 @@ impl Database {
             return Err(AppError::Unauthorized);
         }
         let (secret_hash, _) = crypto::hash_credential(value, pepper);
+        let started = tokio::time::Instant::now();
+        let connection = self.pool.acquire().await;
+        let acquire_elapsed = started.elapsed();
+        if let Err(error) = &connection {
+            self.observe_key_authentication("acquire", acquire_elapsed, None, Some(error));
+        }
+        let mut connection = connection?;
+        let started = tokio::time::Instant::now();
         let row = sqlx::query(
             "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation JOIN tenants t ON t.id = k.tenant_id AND t.status = 'active' WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
         )
         .bind(secret_hash)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+        .fetch_optional(&mut *connection)
+        .await;
+        let elapsed = started.elapsed();
+        drop(connection);
+        self.observe_key_authentication(
+            "query",
+            acquire_elapsed,
+            Some(elapsed),
+            row.as_ref().err(),
+        );
+        let row = row?.ok_or(AppError::Unauthorized)?;
         super::authenticated_key_from_row(row, value, pepper)
+    }
+
+    fn observe_key_authentication(
+        &self,
+        phase: &'static str,
+        acquire_elapsed: std::time::Duration,
+        query_elapsed: Option<std::time::Duration>,
+        error: Option<&sqlx::Error>,
+    ) {
+        let pool_size = self.pool.size();
+        let pool_idle = self.pool.num_idle();
+        let acquire_elapsed_ms = acquire_elapsed.as_millis() as u64;
+        let query_elapsed_ms = query_elapsed.map(|elapsed| elapsed.as_millis() as u64);
+        if let Some(error) = error {
+            tracing::warn!(
+                operation = "authenticate_key",
+                pool_role = self.pool_role,
+                phase,
+                outcome = "failed",
+                error_kind = crate::error::sqlx_error_kind(error),
+                acquire_elapsed_ms,
+                query_elapsed_ms,
+                pool_max = self.pool.options().get_max_connections(),
+                pool_size,
+                pool_idle,
+                pool_in_use = (pool_size as usize).saturating_sub(pool_idle),
+                acquire_timeout_ms = self.pool.options().get_acquire_timeout().as_millis() as u64,
+                "client key authentication database observation"
+            );
+        } else {
+            tracing::debug!(
+                operation = "authenticate_key",
+                pool_role = self.pool_role,
+                phase,
+                outcome = "completed",
+                acquire_elapsed_ms,
+                query_elapsed_ms,
+                pool_max = self.pool.options().get_max_connections(),
+                pool_size,
+                pool_idle,
+                pool_in_use = (pool_size as usize).saturating_sub(pool_idle),
+                "client key authentication database observation"
+            );
+        }
     }
     pub async fn key_view(&self, key: &AuthenticatedKey) -> Result<KeyView, AppError> {
         let row = sqlx::query(
@@ -1345,6 +1405,10 @@ fn key_budget_snapshot(
         reset_at: configured.and(reset_at),
     })
 }
+
+#[cfg(test)]
+#[path = "key_authentication_tests.rs"]
+mod key_authentication_tests;
 
 #[cfg(test)]
 mod tests {
