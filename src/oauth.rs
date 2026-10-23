@@ -16,7 +16,10 @@ mod refresh_diagnostics;
 pub(crate) use refresh_diagnostics::{
     OAuthRefreshDiagnostic, OAuthRefreshMetadata, OAuthRefreshOutcome, OAuthRefreshStatus,
 };
-pub use refresh_diagnostics::{OAuthRefreshFailure, OAuthRefreshFailureKind};
+pub use refresh_diagnostics::{
+    OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshObservation, OAuthRefreshPhase,
+    OAuthRefreshTimeoutSource,
+};
 pub(crate) mod managed;
 
 pub(crate) use adapter::{refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter};

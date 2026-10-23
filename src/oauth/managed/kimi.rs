@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 use crate::{
     error::AppError,
     network,
-    oauth::{OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshRequestGuard},
+    oauth::{
+        OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshObservation, OAuthRefreshPhase,
+        OAuthRefreshRequestGuard, OAuthRefreshTimeoutSource,
+    },
     provider::UpstreamCredential,
 };
 
@@ -50,6 +53,28 @@ fn failed() -> AppError {
 
 fn refresh_failure(kind: OAuthRefreshFailureKind, http_status: Option<u16>) -> AppError {
     AppError::OAuthRefresh(OAuthRefreshFailure::new(kind, http_status))
+}
+
+fn observed_failure(
+    error: AppError,
+    phase: OAuthRefreshPhase,
+    started: tokio::time::Instant,
+    connector_failure: bool,
+    timeout_source: Option<OAuthRefreshTimeoutSource>,
+) -> AppError {
+    match error {
+        AppError::OAuthRefresh(mut failure) => {
+            failure.observation = Some(OAuthRefreshObservation {
+                phase,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                budget_ms: TIMEOUT.as_millis() as u64,
+                connector_failure,
+                timeout_source,
+            });
+            AppError::OAuthRefresh(failure)
+        }
+        error => error,
+    }
 }
 
 fn rejected_refresh(status: u16, bytes: &[u8]) -> AppError {
@@ -300,6 +325,7 @@ async fn refresh_with_client(
         .build()
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     request_guard.mark_request_started().await?;
+    let started = tokio::time::Instant::now();
     let mut response_status = None;
     let operation = async {
         let response = match client.execute(request).await {
@@ -308,21 +334,35 @@ async fn refresh_with_client(
                 if error.is_connect() {
                     request_guard.mark_request_not_sent(&error).await?;
                 }
-                return Err(refresh_failure(
-                    if error.is_timeout() {
-                        OAuthRefreshFailureKind::Timeout
-                    } else {
-                        OAuthRefreshFailureKind::Network
-                    },
-                    None,
+                return Err(observed_failure(
+                    refresh_failure(
+                        if error.is_timeout() {
+                            OAuthRefreshFailureKind::Timeout
+                        } else {
+                            OAuthRefreshFailureKind::Network
+                        },
+                        None,
+                    ),
+                    OAuthRefreshPhase::BeforeHeaders,
+                    started,
+                    error.is_connect(),
+                    error
+                        .is_timeout()
+                        .then_some(OAuthRefreshTimeoutSource::HttpClient),
                 ));
             }
         };
         let status = response.status().as_u16();
         response_status = Some(status);
-        let bytes = super::super::bounded_body(response)
-            .await
-            .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)))?;
+        let bytes = super::super::bounded_body(response).await.map_err(|_| {
+            observed_failure(
+                refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)),
+                OAuthRefreshPhase::ResponseBody,
+                started,
+                false,
+                None,
+            )
+        })?;
         if status != 200 {
             return Err(rejected_refresh(status, &bytes));
         }
@@ -330,7 +370,19 @@ async fn refresh_with_client(
     };
     let bytes = tokio::time::timeout(TIMEOUT, operation)
         .await
-        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Timeout, response_status))??;
+        .map_err(|_| {
+            observed_failure(
+                refresh_failure(OAuthRefreshFailureKind::Timeout, response_status),
+                if response_status.is_some() {
+                    OAuthRefreshPhase::ResponseBody
+                } else {
+                    OAuthRefreshPhase::BeforeHeaders
+                },
+                started,
+                false,
+                Some(OAuthRefreshTimeoutSource::OperationDeadline),
+            )
+        })??;
     let response: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
@@ -670,6 +722,17 @@ mod tests {
             panic!("expected a classified refresh failure");
         };
         assert_eq!(failure.http_status, status);
+        let observation = failure.observation.unwrap();
+        assert_eq!(
+            observation.phase,
+            if status.is_some() {
+                OAuthRefreshPhase::ResponseBody
+            } else {
+                OAuthRefreshPhase::BeforeHeaders
+            }
+        );
+        assert_eq!(observation.budget_ms, 120_000);
+        assert!(!observation.connector_failure);
         assert!(matches!(
             failure.kind,
             OAuthRefreshFailureKind::Timeout | OAuthRefreshFailureKind::ResponseBody
@@ -683,6 +746,57 @@ mod tests {
     #[tokio::test]
     async fn refresh_timeout_before_headers_does_not_invent_a_status_or_replay() {
         assert_stalled_refresh_preserves_observed_status(None).await;
+    }
+
+    #[tokio::test]
+    async fn shorter_client_timeout_is_not_reported_as_the_operation_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let (release, released) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = http1_request::read_bounded_http1_request(&mut socket)
+                .await
+                .unwrap();
+            assert_eq!(request.method, "POST");
+            let _ = released.await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .read_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let guard = UnsentRequestGuard {
+            started: AtomicBool::new(false),
+            not_sent: AtomicBool::new(false),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            refresh_with_client(&client, &credential("fixture-device"), &endpoint, &guard),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        release.send(()).unwrap();
+        server.await.unwrap();
+        let AppError::OAuthRefresh(failure) = error else {
+            panic!("expected classified refresh failure");
+        };
+        let observation = failure.observation.unwrap();
+        assert_eq!(failure.kind, OAuthRefreshFailureKind::Timeout);
+        assert_eq!(observation.phase, OAuthRefreshPhase::BeforeHeaders);
+        assert!(observation.elapsed_ms >= 100);
+        assert!(observation.elapsed_ms < 120_000);
+        assert_eq!(observation.budget_ms, 120_000);
+        assert_eq!(
+            observation.timeout_source,
+            Some(OAuthRefreshTimeoutSource::HttpClient)
+        );
+        assert!(!observation.connector_failure);
+        assert!(guard.started.load(Ordering::SeqCst));
+        assert!(!guard.not_sent.load(Ordering::SeqCst));
+        assert!(!failure.requires_reauthorization());
     }
 
     #[tokio::test]
